@@ -702,6 +702,7 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
     attention={'attention':attention['attention']+open_items['attention'],
                'attention_total':attention['attention_total']+open_items['attention_total'],
                'attention_more':((attention['attention_more'] or 0)+(open_items['attention_more'] or 0)) or None}
+    if open_items.get('open_items_cut'):attention['open_items_cut']=open_items['open_items_cut']
     newer=None;excluded_cursor=None;next_action=review_next.get(review['review_state'],p['next_action'] if p else 'Read the task description, acceptance criteria and any history, then publish a checkpoint.')
     # Outstanding directions persist independently of cursor freshness: an
     # acknowledged-but-unresolved direction stays visible on a current checkpoint,
@@ -1101,6 +1102,10 @@ def format_brief(result):
             lines.append('Reference [%s, %s]: %s (%s)'%(item['authority_kind'],item['trust'],item['text'],item['source']))
         else:
             lines.append('Reference review [%s, %s]: %s (%s)'%(item['due'],item['trust'],item['text'],item['source']))
+    if result.get('open_items_cut'):
+        lines.append('Open items: a cap cut this read (%d item anchors, %d read; records cut on %s); read items list'
+                     %(result['open_items_cut']['anchors'],result['open_items_cut']['anchors_read'],
+                       ', '.join(result['open_items_cut']['records_cut']) or 'none'))
     if result.get('attention_more'):
         lines.append('More attention: %d (ref list --due expired; proposal list; capability list; items list; questions --for OWNER)'%result['attention_more'])
     if result.get('reference_drafts_matching'):

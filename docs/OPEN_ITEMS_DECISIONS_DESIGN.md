@@ -664,7 +664,16 @@ short of the per-anchor cap - costs 74 ms with 400 anchors (760 record comments)
 2,000 (3,680). One anchor at the 2,000-record cap parses in 118 ms, so the theoretical bound is
 2,000 such anchors, about 4 minutes, which no writer can reach without first hitting the item cap
 of §11.4 with every anchor at its record cap. `items list` and `questions --for` parse every anchor:
-65 ms for 400 and 321 ms for 2,000, after their two `bd` reads. A standalone `items list` /
+65 ms for 400 and 321 ms for 2,000.
+
+**Corrected in slice 1 review (kittrial-5bb.127): a standalone read is one `bd export --all`, not a
+labelled `bd list` plus a `bd show`.** Measured on real bd 1.2.2 by the reviewer, at 400 / 2,000 item
+anchors: `bd list --label` 0.25 / 0.43 s; `bd show --include-comments` of every anchor 13.7 to 15.2 /
+70.9 s (815 kB / 4.1 MB out), which is near the kit's 120 s `bd` timeout; `bd export --all` 0.55 /
+1.8 s, the same rows with labels and comments, closed anchors included. So `items list|get` and
+`questions --for|get` each make exactly one `bd export --all` call (the read `brief` already makes),
+and `items get ONE` costs the same as a list. The endpoint passes the export's raw stdout to the
+reader, which parses it line by line under a fixed depth rule (§13, slice 1). A standalone `items list` /
 `questions --for` costs one labelled `bd list` of the item anchors plus one `bd show` of their
 comments. A standalone `decisions list` is a **different** read: it costs one full
 `bd list --all --limit 0` of the project's rows, filtered to the decision issues by the predicate in
@@ -1307,7 +1316,42 @@ from "an item was dropped from a list" to "an item is still `open` and nobody lo
    live here: it moves to slice 3 with the records it reads. This is the rollback target slice 0
    protects.
 
-   **Built in kittrial-5bb.127**, in `open_items.py`, with these choices stated:
+   **Built in kittrial-5bb.127**, in `open_items.py`, with these choices stated (the slice 1 review
+   added the first five):
+   * **A closure counts only when every link is sound** (review B1). For a question whose newest
+     revision says `resolved`, all of these must hold, or the question reads `open`, `conflicted`,
+     with the broken link named in `warnings`:
+     * the resolution that revision names is an attested `resolved` `item-resolution-v1`;
+     * it names an answer that `closes` (§7.1);
+     * that answer's `question_sha256` and `options_offered` match revision N, the revision its
+       `question_revision` names;
+     * the resolution's `revision` is N;
+     * the closing revision is attested, is revision N+1, and repeats revision N's kind, text,
+       options and addressee;
+     * no `reopened` resolution comes after the closing resolution.
+   * **Which revisions an item is made of.**
+     * The first readable revision fixes the kind: a revision of another kind is refused
+       (`kind-change`), never adopted.
+     * Once an attested revision exists, an unattested revision that changes any content field
+       (`kind`, `text`, `source`, `owner`, `task`, `for`, `options`, `recommended`, `due_by`) is
+       refused (`unattested-change`). An unattested state move with the same content (block,
+       unblock) is adopted.
+     * `submitted_by` on each revision names the writer of that revision; corrected here, as §4.1
+       left it open.
+   * **An item anchor** is a row with the exact `open-item` label **and** an exact v1 record comment
+     (`reserved_comments.is_record_anchor`, the rule that hides it). A row a contributor labels
+     `open-item` without a record is an ordinary row: it is not read, not reported and not counted
+     against `ITEM_ANCHORS_MAX` (review P2 a). The exact label is not reserved: slice 0 chose not to,
+     because projects may already use it, and counting only real anchors removes the harm.
+   * **Caps keep the newest.** Above `RECORDS_PER_ANCHOR_MAX` the newest 2,000 record comments are
+     read, and `coverage.cut` is set on the item, the list (`records_cut` names the anchors) and the
+     brief (`open_items_cut`, plus a line in the text brief).
+   * **Answers shown.** `answer` is only the answer a sound closure rests on; the newest answer that
+     closes nothing is shown only as `answer_that_closes_nothing`.
+   * **Depth rule** (review B3). An export row nested deeper than `ROW_NESTING_MAX = 750` is reported
+     unreadable without being parsed. The count is one pass without recursion, so no interpreter
+     limit decides the answer. This is the value kittrial-5bb.169 proposes for
+     `record_json.ROW_NESTING_MAX`; the module counts depth itself until that lands.
    * **Effective state.** A question whose stored state is `resolved` but whose closure does not rest
      on an answer that `closes` (§7.1) reads `state: open`, keeps `stored_state: resolved`, and is
      `conflicted` with a warning; so the three question counts always add up to `total`.
@@ -1321,9 +1365,8 @@ from "an item was dropped from a list" to "an item is still `open` and nobody lo
      `record_json.NESTING_MAX`) `malformed-record`, and a decision comment on an item anchor
      `misplaced-record`.
    * **Unreadable rows.** An anchor with no readable revision is listed under `unreadable` with its
-     warnings. A `bd show` answer that cannot be parsed is retried one id at a time and each id that
-     still fails is listed under `unreadable`; a `bd list` answer that cannot be parsed falls back to
-     the export, row by row, and each row it cannot parse is listed as not known to be an anchor.
+     warnings. An export row that cannot be parsed (too deep, or not JSON) is listed under
+     `unreadable` when its text names the `open-item` label, the only rows that can be anchors.
    * **Coverage.** Every list and get says how many anchors and records were read and whether a cap
      cut the read.
    * **Fixtures.** No writer exists, so every test record is hand-built from the tables of §4 by

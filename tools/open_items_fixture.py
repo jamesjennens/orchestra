@@ -20,6 +20,13 @@ Real bd, on the coordination host of a SCRATCH runtime only:
 
 OPERATOR should be on that runtime's operator allowlist, so host-route records read
 attested. It prints one JSON summary (ids written, counts by expected state, seconds).
+
+Each bd call is tried three times (waits 2 s and 4 s), and every failure prints bd's
+stderr. Every completed step is recorded in a state file (default
+ROOT/open_items_fixture.PROJECT.state.json, or --state FILE), so after a stop the same
+command resumes from the step that failed. A retried `create` whose first attempt
+actually succeeded leaves one extra empty row labelled open-item; it holds no record, so
+the reader never counts it (it is not an anchor).
 """
 import argparse
 import json
@@ -115,6 +122,9 @@ class MemorySink:
     def write_entry(self, entry):
         self.journal[entry['sha256']] = entry
 
+    def do(self, key, action):
+        return action()
+
     def all_rows(self):
         return [self.rows[key] for key in sorted(self.rows)]
 
@@ -122,13 +132,43 @@ class MemorySink:
 class BdSink:
     """Raw bd writes on a scratch runtime (no endpoint, so no reserved-prefix guard)."""
 
-    def __init__(self, root, project, actor):
+    ATTEMPTS = 3
+
+    def __init__(self, root, project, actor, state=None, pause=None):
         import admin
         self.admin, self.root, self.project, self.actor = admin, Path(root), project, actor
         self.journal = self.admin.project_dir(self.root, project) / oi.OWNER_ANSWERS_JOURNAL
+        self.state_path = Path(state) if state else self.root / ('open_items_fixture.%s.state.json' % project)
+        self.pause = pause
+        try:
+            self.state = json.loads(self.state_path.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            self.state = {}
+
+    def do(self, key, action):
+        """Run one step once: a step already recorded in the state file is skipped, so
+        a run that stopped resumes where it stopped with the same ids."""
+        if key in self.state:
+            return self.state[key]
+        result = action()
+        self.state[key] = result
+        temporary = self.state_path.with_suffix('.tmp')
+        temporary.write_text(json.dumps(self.state), encoding='utf-8')
+        temporary.replace(self.state_path)
+        return result
 
     def run(self, argv, actor=None):
-        return self.admin.run_bd(self.root, self.project, ['--actor', actor or self.actor, *argv])
+        command = ['--actor', actor or self.actor, *argv]
+        for attempt in range(1, self.ATTEMPTS + 1):
+            try:
+                return self.admin.run_bd(self.root, self.project, command)
+            except Exception as error:
+                stderr = (getattr(error, 'stderr', None) or str(error)).strip()
+                print('bd %s failed (attempt %d of %d): %s' % (' '.join(argv[:2]), attempt, self.ATTEMPTS, stderr),
+                      file=sys.stderr)
+                if attempt == self.ATTEMPTS:
+                    raise SystemExit('stopped; run the same command again to resume from %s' % self.state_path)
+                (self.pause or time.sleep)(2 ** attempt)
 
     def create(self, title, labels):
         reply = json.loads(self.run(['create', '--title', title[:60], '--type', 'task', '--no-inherit-labels',
@@ -160,34 +200,36 @@ def build(sink, items=10, questions=5, operator='operator', task=None, owner='pe
     serial = 0
     for index in range(items):
         state = ('open', 'open', 'open', 'open', 'open', 'open', 'blocked', 'blocked', 'resolved', 'resolved')[index % 10]
-        rid = sink.create('Item %d' % index, {oi.FAMILY_LABEL, oi.STATE_LABEL_PREFIX + 'open'})
+        tag = 'item%d' % index
+        rid = sink.do(tag + ':create', lambda: sink.create('Item %d' % index, {oi.FAMILY_LABEL, oi.STATE_LABEL_PREFIX + 'open'}))
         record = item_record(rid, text='Item %d: something to follow up' % index, task=task, owner=owner,
                              submitted_by=block(operator), due_by='2026-10-%02d' % (1 + index % 28))
-        sink.comment(rid, body(oi.OPEN_ITEM_PREFIX, record), operator)
+        sink.do(tag + ':rev1', lambda: sink.comment(rid, body(oi.OPEN_ITEM_PREFIX, record), operator))
         if state == 'blocked':
             record = item_record(rid, revision=2, text=record['text'], task=task, owner=owner,
                                  submitted_by=block(operator), due_by=record['due_by'], state='blocked',
                                  state_note='Waiting on the release')
-            sink.comment(rid, body(oi.OPEN_ITEM_PREFIX, record), operator)
+            sink.do(tag + ':rev2', lambda: sink.comment(rid, body(oi.OPEN_ITEM_PREFIX, record), operator))
         elif state == 'resolved':
             serial += 1
             resolution = resolution_record(rid, 1, by=block(operator), serial=serial)
-            rcid = sink.comment(rid, body(oi.ITEM_RESOLUTION_PREFIX, resolution), operator)
+            rcid = sink.do(tag + ':resolution', lambda: sink.comment(rid, body(oi.ITEM_RESOLUTION_PREFIX, resolution), operator))
             record = item_record(rid, revision=2, text=record['text'], task=task, owner=owner,
                                  submitted_by=block(operator), due_by=record['due_by'], state='resolved',
                                  resolved_by=rcid)
-            sink.comment(rid, body(oi.OPEN_ITEM_PREFIX, record), operator)
-        sink.relabel(rid, {oi.FAMILY_LABEL, oi.STATE_LABEL_PREFIX + state})
-        sink.close(rid)
+            sink.do(tag + ':rev2', lambda: sink.comment(rid, body(oi.OPEN_ITEM_PREFIX, record), operator))
+        sink.do(tag + ':labels', lambda: sink.relabel(rid, {oi.FAMILY_LABEL, oi.STATE_LABEL_PREFIX + state}))
+        sink.do(tag + ':close', lambda: sink.close(rid))
         expected[rid] = (state, None)
     options = [{'id': 'keep', 'text': 'Keep it'}, {'id': 'drop', 'text': 'Drop it'}]
     for index in range(questions):
         shape = ('open', 'open', 'owner', 'relayed', 'unjournaled')[index % 5]
-        rid = sink.create('Question %d' % index, {oi.FAMILY_LABEL, oi.STATE_LABEL_PREFIX + 'open'})
+        tag = 'question%d' % index
+        rid = sink.do(tag + ':create', lambda: sink.create('Question %d' % index, {oi.FAMILY_LABEL, oi.STATE_LABEL_PREFIX + 'open'}))
         question = item_record(rid, kind='question', text='Question %d: keep the old path?' % index, task=task,
                                owner=owner, for_=owner, options=options, recommended='keep',
                                submitted_by=block(operator), due_by='2026-11-%02d' % (1 + index % 28))
-        sink.comment(rid, body(oi.OPEN_ITEM_PREFIX, question), operator)
+        sink.do(tag + ':rev1', lambda: sink.comment(rid, body(oi.OPEN_ITEM_PREFIX, question), operator))
         state, closed_by = 'open', None
         if shape != 'open':
             serial += 1
@@ -195,18 +237,18 @@ def build(sink, items=10, questions=5, operator='operator', task=None, owner='pe
             by = block(operator, person=owner if authority == 'owner' else None)
             answer = answer_record(question, authority=authority, option='keep', by=by, serial=serial,
                                    words='Keep it, for now (%d).' % index)
-            acid = sink.comment(rid, body(oi.OWNER_ANSWER_PREFIX, answer), operator)
+            acid = sink.do(tag + ':answer', lambda: sink.comment(rid, body(oi.OWNER_ANSWER_PREFIX, answer), operator))
             if shape != 'unjournaled':
-                sink.write_entry(journal_entry(answer, acid))
+                sink.do(tag + ':entry', lambda: sink.write_entry(journal_entry(answer, acid)))
                 state, closed_by = 'resolved', authority
             resolution = resolution_record(rid, 1, answer=acid, by=by, serial=serial)
-            rcid = sink.comment(rid, body(oi.ITEM_RESOLUTION_PREFIX, resolution), operator)
+            rcid = sink.do(tag + ':resolution', lambda: sink.comment(rid, body(oi.ITEM_RESOLUTION_PREFIX, resolution), operator))
             closed = item_record(rid, revision=2, kind='question', text=question['text'], task=task, owner=owner,
                                  for_=owner, options=options, recommended='keep', submitted_by=block(operator),
                                  due_by=question['due_by'], state='resolved', resolved_by=rcid)
-            sink.comment(rid, body(oi.OPEN_ITEM_PREFIX, closed), operator)
-            sink.relabel(rid, {oi.FAMILY_LABEL, oi.STATE_LABEL_PREFIX + 'resolved'})
-        sink.close(rid)
+            sink.do(tag + ':rev2', lambda: sink.comment(rid, body(oi.OPEN_ITEM_PREFIX, closed), operator))
+            sink.do(tag + ':labels', lambda: sink.relabel(rid, {oi.FAMILY_LABEL, oi.STATE_LABEL_PREFIX + 'resolved'}))
+        sink.do(tag + ':close', lambda: sink.close(rid))
         expected[rid] = (state, closed_by)
     return expected
 
@@ -221,12 +263,13 @@ def main(argv=None):
     parser.add_argument('--task', default=None, help='a task the items are about, for the brief kinds')
     parser.add_argument('--owner', default='person:james')
     parser.add_argument('--scratch', action='store_true', help='required: this writes raw records')
+    parser.add_argument('--state', default=None, help='resume file (default: ROOT/open_items_fixture.PROJECT.state.json)')
     args = parser.parse_args(argv)
     if not args.scratch:
         parser.error('this writes raw open-item records past the endpoint guard; run it only on a scratch '
                      'runtime, and say so with --scratch')
     started = time.monotonic()
-    expected = build(BdSink(args.root, args.project, args.actor), args.items, args.questions, args.actor,
+    expected = build(BdSink(args.root, args.project, args.actor, args.state), args.items, args.questions, args.actor,
                      args.task, args.owner)
     counts = {}
     for state, closed_by in expected.values():

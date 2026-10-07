@@ -492,22 +492,45 @@ def _answer_view(answer, clip_words=LIST_TEXT_MAX):
     return view
 
 
-def item_view(row, operators=(), journal=None, current=None):
-    """One item anchor as every read sees it (design 4.5). Never raises.
+CONTENT_FIELDS = ('kind', 'text', 'source', 'owner', 'task', 'for', 'options', 'recommended', 'due_by')
+QUESTION_FIELDS = ('kind', 'text', 'for', 'options')
+# Depth rule for an export row (kittrial-5bb.127 review B3): a row nested deeper than this
+# is reported unreadable WITHOUT being parsed, so the result never depends on the
+# interpreter's recursion limit. 750 is the value kittrial-5bb.169 proposes for
+# record_json.ROW_NESTING_MAX; this module counts depth itself until that lands.
+ROW_NESTING_MAX = 750
+_DEPTH_TOKEN = re.compile(r'\\.|["\[\]{}]', re.DOTALL)
+_ROW_ID = re.compile(r'"id"\s*:\s*"([A-Za-z0-9][A-Za-z0-9_.-]{0,160})"')
+_ANCHOR_LABEL = '"%s"' % FAMILY_LABEL
 
-    Returns a dict with `state` (the effective state) and the derived words, or, when
-    the anchor holds no readable revision, `state: 'unreadable'` with the reason. Every
-    record comment that is not used is named in `warnings`, so nothing is dropped
-    silently.
-    """
-    current = current or datetime.date.today()
-    anchor = row.get('id')
-    warnings = []
-    comments = sorted((c for c in row.get('comments') or [] if isinstance(c, dict)), key=_comment_key)
-    parsed = {'open-item': [], 'item-resolution': [], 'owner-answer': []}
-    seen = 0
-    capped = False
-    for comment in comments:
+
+def nesting_exceeds(text, limit=ROW_NESTING_MAX):
+    """True when `text` nests brackets deeper than `limit` outside string literals.
+    One pass, no recursion: the same scan as record_json.nesting, with a bound."""
+    if text.count('[') + text.count('{') <= limit:
+        return False
+    depth = 0
+    in_string = False
+    for match in _DEPTH_TOKEN.finditer(text):
+        token = match.group()
+        if token == '"':
+            in_string = not in_string
+        elif in_string or token[0] == '\\':
+            continue
+        elif token in '[{':
+            depth += 1
+            if depth > limit:
+                return True
+        else:
+            depth -= 1
+    return False
+
+
+def _classify(comments):
+    """Split an anchor's comments into record comments of the three item kinds (in
+    comment order) and warnings for everything that only looks like one."""
+    records, warnings = [], []
+    for order, comment in enumerate(comments):
         text = comment.get('text')
         if not isinstance(text, str):
             continue
@@ -517,179 +540,264 @@ def item_view(row, operators=(), journal=None, current=None):
         cid = str(comment.get('id'))
         kind = record_comment_kind(text)
         if kind is None or kind[0] == 'unknown' or kind[1] is None:
-            # A comment that starts like a record but is not one (no newline after the
-            # version, `-vx`, ...): hidden from every surface by slice 0, never a record.
+            # Starts like a record but is not one (no newline after the version, `-vx`):
+            # hidden from every surface by slice 0, never a record.
             warnings.append({'code': 'not-a-record', 'comment_id': cid,
                              'detail': 'starts like an open-item record but is not one; it is ignored'})
-            continue
-        if kind[0] == 'coordinator-decision':
+        elif kind[0] == 'coordinator-decision':
             warnings.append({'code': 'misplaced-record', 'comment_id': cid,
                              'detail': 'a coordinator decision belongs on a decision issue, not an item anchor'})
-            continue
-        if kind[0] not in PARSERS:
+        elif kind[0] not in PARSERS:
             warnings.append({'code': 'not-a-record', 'comment_id': cid, 'detail': 'unknown kind %s' % kind[0]})
-            continue
-        if kind[2] == 'unsupported':
+        elif kind[2] == 'unsupported':
             warnings.append({'code': 'unsupported-record', 'comment_id': cid,
                              'detail': '%s-v%s is newer than this kit' % (kind[0], kind[1])})
-            continue
-        if text != view or not text.startswith(PREFIXES):
+        elif text != view:
             warnings.append({'code': 'malformed-record', 'comment_id': cid,
                              'detail': '%s: the prefix is not exact (byte order mark or CRLF)' % kind[0]})
-            continue
-        seen += 1
-        if seen > RECORDS_PER_ANCHOR_MAX:
-            capped = True
-            break
+        else:
+            records.append((order, kind[0], comment))
+    return records, warnings
+
+
+def _adopt(revisions, operators, warnings, conflicted):
+    """The revisions the item is made of, in revision order (design 4.5, review B1).
+
+    The first readable revision fixes the kind: a later revision of another kind is
+    refused, never adopted. Once an attested revision exists, an unattested revision
+    that changes any content field is refused, so it never changes what an attested one
+    said; an unattested state move (block, unblock) with the same content is adopted.
+    Two different records claiming one revision number keep the first and are reported.
+    """
+    adopted = []
+    attested = False
+    for revision in sorted(revisions, key=lambda r: (r['record']['revision'], r['order'])):
+        record = revision['record']
+        revision['trust'] = trust_of(record['submitted_by'], revision['author'], operators)
+        if adopted:
+            previous = adopted[-1]['record']
+            if record['revision'] == previous['revision']:
+                if record['sha256'] != previous['sha256']:
+                    conflicted.append('two different records claim revision %d' % record['revision'])
+                continue
+            if record['kind'] != adopted[0]['record']['kind']:
+                warnings.append({'code': 'kind-change', 'comment_id': revision['comment_id'],
+                                 'detail': 'revision %d changes the kind from %s to %s; refused'
+                                           % (record['revision'], adopted[0]['record']['kind'], record['kind'])})
+                continue
+            if attested and revision['trust'] != 'attested' \
+                    and any(record[f] != previous[f] for f in CONTENT_FIELDS):
+                warnings.append({'code': 'unattested-change', 'comment_id': revision['comment_id'],
+                                 'detail': 'revision %d is unattested and changes what an attested revision '
+                                           'said; refused' % record['revision']})
+                continue
+        adopted.append(revision)
+        attested = attested or revision['trust'] == 'attested'
+    if adopted and adopted[0]['record']['revision'] != 1:
+        warnings.append({'code': 'missing-revision', 'detail': 'revision 1 is not readable'})
+    return adopted
+
+
+def _question_closure(newest, adopted, resolutions, answers):
+    """(answer, problem) for the closure of a question whose newest revision says
+    `resolved` (design 9.3, review B1). A closure counts only when every link is sound:
+    the resolution the revision names is an attested `resolved` resolution; it names an
+    answer that `closes`; that answer answered revision N of the question, whose sha256
+    and options it repeats; the closing revision is attested, is revision N+1 and repeats
+    revision N's kind, text, options and addressee; no later `reopened` resolution
+    withdraws it."""
+    record = newest['record']
+    resolution = resolutions.get(record['resolved_by'])
+    if resolution is None or resolution['record']['disposition'] != 'resolved':
+        return None, 'the closing revision names no resolved item-resolution-v1 (resolved_by %s)' % record['resolved_by']
+    if resolution['trust'] != 'attested':
+        return None, 'the closing resolution is unattested'
+    if newest['trust'] != 'attested':
+        return None, 'the closing revision is unattested'
+    answer = answers.get(resolution['record']['answer'])
+    if answer is None:
+        return None, 'the closing resolution names no readable answer'
+    if not answer['closes']:
+        return None, 'the answer the closure rests on is not trusted'
+    number = answer['record']['question_revision']
+    asked = next((r for r in adopted if r['record']['revision'] == number), None)
+    if asked is None or asked['record']['sha256'] != answer['record']['question_sha256'] \
+            or asked['record']['options'] != answer['record']['options_offered']:
+        return None, 'the answer does not match revision %d of the question as asked' % number
+    if resolution['record']['revision'] != number or record['revision'] != number + 1 \
+            or any(record[f] != asked['record'][f] for f in QUESTION_FIELDS):
+        return None, 'the closing revision is not the unchanged revision after the one answered'
+    if any(r['record']['disposition'] == 'reopened' and r['order'] > resolution['order']
+           for r in resolutions.values()):
+        return None, 'a later reopen withdrew this closure'
+    return answer, None
+
+
+def item_view(row, operators=(), journal=None, current=None):
+    """One item anchor as every read sees it (design 4.5). Never raises.
+
+    Returns a dict with `state` (the effective state) and the derived words, or, when
+    the anchor holds no readable revision, `state: 'unreadable'` with the reason. Every
+    record comment that is not used is named in `warnings`, so nothing is dropped
+    silently. Above RECORDS_PER_ANCHOR_MAX record comments the NEWEST are read and the
+    view says it was cut.
+    """
+    current = current or datetime.date.today()
+    anchor = row.get('id')
+    comments = sorted((c for c in row.get('comments') or [] if isinstance(c, dict)), key=_comment_key)
+    candidates, warnings = _classify(comments)
+    total = len(candidates)
+    cut = total > RECORDS_PER_ANCHOR_MAX
+    if cut:
+        warnings.append({'code': 'records-cap', 'detail': 'this anchor holds %d record comments; only the newest '
+                                                          '%d were read' % (len(candidates), RECORDS_PER_ANCHOR_MAX)})
+        candidates = candidates[-RECORDS_PER_ANCHOR_MAX:]
+    coverage = {'records': total, 'records_read': len(candidates), 'cut': cut}
+    parsed = {'open-item': [], 'item-resolution': [], 'owner-answer': []}
+    for order, kind, comment in candidates:
+        cid = str(comment.get('id'))
         try:
-            record = PARSERS[kind[0]](text, anchor)
+            record = PARSERS[kind](comment['text'], anchor)
         except Malformed as error:
             warnings.append({'code': 'malformed-record', 'comment_id': cid, 'detail': str(error)})
             continue
-        parsed[kind[0]].append({'record': record, 'comment_id': cid, 'author': comment.get('author'),
-                                'at': comment.get('created_at')})
-    coverage = {'records_read': min(seen, RECORDS_PER_ANCHOR_MAX), 'cut': capped}
-    if capped:
-        warnings.append({'code': 'records-cap', 'detail': 'this anchor holds more than %d record comments; '
-                                                          'only the first %d were read'
-                                                          % (RECORDS_PER_ANCHOR_MAX, RECORDS_PER_ANCHOR_MAX)})
-    revisions = parsed['open-item']
-    if not revisions:
+        parsed[kind].append({'record': record, 'comment_id': cid, 'author': comment.get('author'), 'order': order})
+    conflicted = []
+    adopted = _adopt(parsed['open-item'], operators, warnings, conflicted)
+    if not adopted:
         return {'id': anchor, 'state': 'unreadable', 'warnings': warnings, 'coverage': coverage,
                 'reason': 'the anchor holds no readable open-item-v1 revision'}
-    conflicted = []
-    by_number = {}
-    for revision in revisions:
-        number = revision['record']['revision']
-        if number in by_number and by_number[number]['record']['sha256'] != revision['record']['sha256']:
-            conflicted.append('two different records claim revision %d' % number)
-        by_number.setdefault(number, revision)
-    newest = by_number[max(by_number)]
-    if 1 not in by_number:
-        warnings.append({'code': 'missing-revision', 'detail': 'revision 1 is not readable'})
+    newest = adopted[-1]
     record = newest['record']
-    if any(r['record']['kind'] != record['kind'] for r in revisions):
-        conflicted.append('the kind changed between revisions')
-    resolutions = {r['comment_id']: r for r in parsed['item-resolution']}
+    question = record['kind'] == 'question'
+    resolutions = {}
     for resolution in parsed['item-resolution']:
         resolution['trust'] = trust_of(resolution['record']['by'], resolution['author'], operators)
-    answers = parsed['owner-answer']
-    for answer in answers:
+        resolutions.setdefault(resolution['comment_id'], resolution)
+    answers = {}
+    for answer in parsed['owner-answer']:
         answer['trust'] = trust_of(answer['record']['by'], answer['author'], operators)
         answer['journal'] = journal_entry_matches(journal, answer['record'], answer['comment_id'])
-        answer['closes'] = answer['trust'] == 'attested' and answer['journal']
-        if not answer['closes']:
-            warnings.append({'code': 'untrusted-answer', 'comment_id': answer['comment_id'],
-                             'detail': 'not attested on the host or web route, or no matching .owner-answers '
-                                       'entry: shown, but it closes nothing'})
-    question = record['kind'] == 'question'
-    for answer in answers:
-        # Rules 2 and 3 of design 9.3, re-applied on read: the answer is for the
-        # question's addressee, and an owner answer was written by the addressee.
         wrong = []
+        if answer['trust'] != 'attested':
+            wrong.append('not attested on the host or web route')
+        if not answer['journal']:
+            wrong.append('no matching .owner-answers entry')
+        # Rules 2 and 3 of design 9.3, re-applied on read.
         if answer['record']['owner'] != record['for']:
             wrong.append('the answer names %s, but the question is for %s' % (answer['record']['owner'], record['for']))
         if answer['record']['authority'] == 'owner' and answer['record']['by']['person'] != record['for']:
             wrong.append('authority owner, but the writer is mapped to %s, not %s'
                          % (answer['record']['by']['person'], record['for']))
-        if wrong and answer['closes']:
-            answer['closes'] = False
-            warnings.append({'code': 'untrusted-answer', 'comment_id': answer['comment_id'], 'detail': '; '.join(wrong)})
+        answer['closes'] = not wrong
+        if wrong:
+            warnings.append({'code': 'untrusted-answer', 'comment_id': answer['comment_id'],
+                             'detail': 'shown, but it closes nothing: ' + '; '.join(wrong)})
+        answers.setdefault(answer['comment_id'], answer)
     state = record['state']
     closed_by = None
+    closing = None
     resolution = None
-    if state in CLOSED_STATES:
+    if state in CLOSED_STATES and question:
+        closing, problem = _question_closure(newest, adopted, resolutions, answers) if state == 'resolved' \
+            else (None, 'a question is closed only by an answer, never superseded')
+        if problem:
+            conflicted.append(problem)
+        else:
+            closed_by = closing['record']['authority']
+            resolution = resolutions[record['resolved_by']]
+    elif state in CLOSED_STATES:
         resolution = resolutions.get(record['resolved_by']) if record['resolved_by'] else None
         if resolution is None or resolution['record']['disposition'] != state:
             conflicted.append('state %s has no matching item-resolution-v1 (resolved_by %s)'
                               % (state, record['resolved_by']))
             resolution = None
-        elif question:
-            named = next((a for a in answers if a['comment_id'] == resolution['record']['answer']), None)
-            if state != 'resolved' or named is None or not named['closes']:
-                conflicted.append('the closure does not rest on a trusted answer')
-            else:
-                closed_by = named['record']['authority']
-    effective = state
-    if question and state in CLOSED_STATES and closed_by is None:
-        effective = 'open'          # an untrusted or missing closure closes nothing (design 9.3 rule 7)
-    reopened = [r for r in parsed['item-resolution'] if r['record']['disposition'] == 'reopened']
+    # A question whose closure is not sound closes nothing (design 9.3 rule 7).
+    effective = 'open' if question and state in CLOSED_STATES and closed_by is None else state
+    reopened = [r for r in resolutions.values() if r['record']['disposition'] == 'reopened']
+    reopened.sort(key=lambda r: r['order'])
     reopened_by = reopened[-1]['comment_id'] if reopened and effective in ('open', 'blocked') else None
-    answers_newest = list(reversed(answers))
     for problem in conflicted:
         warnings.append({'code': 'conflicted', 'detail': problem})
+    answers_newest = sorted(answers.values(), key=lambda a: a['order'], reverse=True)
     return {'id': anchor, 'revision': record['revision'], 'kind': record['kind'], 'state': effective,
             'stored_state': state, 'state_note': record['state_note'], 'owner': record['owner'],
             'task': record['task'], 'due_by': record['due_by'], 'due': due_of(record['due_by'], current),
             'for': record['for'], 'options': record['options'], 'recommended': record['recommended'],
             'text': record['text'], 'source': record['source'], 'provenance': record['provenance'],
-            'submitted_by': record['submitted_by'],
-            'trust': trust_of(record['submitted_by'], newest['author'], operators),
+            'submitted_by': record['submitted_by'], 'trust': newest['trust'],
             'record': record, 'record_comment_id': newest['comment_id'],
             'revisions': [{'revision': r['record']['revision'], 'comment_id': r['comment_id'],
-                           'sha256': r['record']['sha256']} for r in revisions],
-            'resolved_by': record['resolved_by'], 'resolution': resolution,
+                           'sha256': r['record']['sha256'], 'trust': r['trust']} for r in adopted],
+            'resolved_by': record['resolved_by'], 'resolution': resolution, 'closing_answer': closing,
             'answers': answers_newest, 'closed_by': closed_by, 'reopened_by': reopened_by,
             'conflicted': bool(conflicted), 'warnings': warnings, 'coverage': coverage}
 
 
+def is_anchor(row):
+    """An item anchor: the exact `open-item` label AND an exact v1 record comment of the
+    family (reserved_comments.is_record_anchor, the rule that hides it). A row a
+    contributor labelled `open-item` with no record is an ordinary row: it is not read,
+    not reported and not counted against ITEM_ANCHORS_MAX (review P2 a)."""
+    from reserved_comments import is_record_anchor
+    return isinstance(row.get('id'), str) and FAMILY_LABEL in (row.get('labels') or []) and is_record_anchor(row)
+
+
 def ledger(rows, operators=(), journal=None, current=None):
     """Every item anchor among `rows` as `item_view` sees it, in id order, cut at
-    ITEM_ANCHORS_MAX with the cut reported. `rows` that the export marked malformed are
-    returned as unreadable when they are known to be anchors."""
-    anchors = sorted((row for row in rows if isinstance(row, dict) and isinstance(row.get('id'), str)
-                      and FAMILY_LABEL in (row.get('labels') or [])), key=lambda row: row['id'])
-    cut = len(anchors) > ITEM_ANCHORS_MAX
+    ITEM_ANCHORS_MAX with the cut reported, and whether any anchor's records were cut."""
+    anchors = sorted((row for row in rows if isinstance(row, dict) and is_anchor(row)), key=lambda row: row['id'])
     views = [item_view(row, operators, journal, current) for row in anchors[:ITEM_ANCHORS_MAX]]
-    return views, {'anchors': len(anchors), 'anchors_read': len(views), 'cut': cut}
+    records_cut = [view['id'] for view in views if view['coverage']['cut']]
+    return views, {'anchors': len(anchors), 'anchors_read': len(views), 'records_cut': records_cut,
+                   'cut': len(anchors) > ITEM_ANCHORS_MAX or bool(records_cut)}
+
+
+def parse_export(text):
+    """The rows of one `bd export --all`, the rows that could not be read, and the
+    count of other lines.
+
+    Parsed here, line by line, not by the endpoint's JSON policy: a row nested deeper
+    than ROW_NESTING_MAX is reported unreadable without being parsed, so no interpreter
+    limit decides the answer (review B3). A row that cannot be parsed is reported only
+    when its text names the `open-item` label, the only rows that can be anchors."""
+    rows, unreadable, other = [], [], 0
+    for line in (text or '').splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if not line.startswith('{'):
+            other += 1
+            continue
+        found = _ROW_ID.search(line)
+        reason = None
+        if nesting_exceeds(line):
+            reason = 'nested deeper than %d levels' % ROW_NESTING_MAX
+        else:
+            try:
+                row = json.loads(line)
+            except (ValueError, RecursionError) as error:
+                reason = 'not JSON (%s)' % type(error).__name__
+            else:
+                if isinstance(row, dict):
+                    rows.append(row)
+                else:
+                    other += 1
+                continue
+        if _ANCHOR_LABEL in line:
+            unreadable.append({'id': found.group(1) if found else None,
+                               'reason': 'this row cannot be read (%s); it may be an item anchor' % reason})
+    return rows, unreadable, other
 
 
 def read_anchor_rows(run):
-    """The item anchors with their comments, and the rows that could not be read.
+    """Every row of the project in one `bd export --all`, plus the unreadable ones.
 
-    One `bd list --label open-item`, then one `bd show --include-comments` of those
-    ids. A list or show answer that cannot be parsed (a row nested thousands of levels
-    deep) is never fatal and never silently dropped: a show is retried one id at a time
-    and each id that still cannot be parsed is reported unreadable; a list falls back to
-    the export, row by row, and reports each malformed row it cannot place.
-    """
-    from keyed_entries import AnchoredKind, NATIVE_FAILURES, all_missing
-    unreadable = []
-    try:
-        listed = record_json.loads(run(['list', '--label', FAMILY_LABEL, '--all', '--limit', '0', '--json']) or '[]')
-    except ValueError:
-        rows = record_json.loads_rows(run(['export', '--all']))
-        anchors = [row for row in rows if not row.get('malformed') and FAMILY_LABEL in (row.get('labels') or [])]
-        for row in rows:
-            if row.get('malformed'):
-                unreadable.append({'id': row.get('id'), 'reason': 'this row cannot be parsed (%s), so it is not '
-                                   'known whether it is an item anchor' % row.get('error')})
-        return anchors, unreadable
-    ids = sorted({row['id'] for row in listed or [] if isinstance(row, dict) and isinstance(row.get('id'), str)})
-
-    def show(chunk):
-        try:
-            text = run(['show', *chunk, '--json', '--include-comments'])
-        except NATIVE_FAILURES as error:
-            if all_missing(error):
-                return []
-            raise
-        shown = record_json.loads(text or '[]')
-        shown = shown if isinstance(shown, list) else [shown]
-        return [row for row in shown if isinstance(row, dict) and row.get('id') in chunk]
-
-    if not ids:
-        return [], unreadable
-    try:
-        return show(ids), unreadable
-    except ValueError:
-        pass
-    rows = []
-    for one in ids:
-        try:
-            rows.extend(show([one]))
-        except ValueError as error:
-            unreadable.append({'id': one, 'reason': 'this item anchor cannot be parsed (%s)' % error})
+    One bd call: the export brief already reads returns the rows with their labels and
+    comments, closed anchors included (review B2: `bd show` of every anchor took 15 s at
+    400 anchors and over 70 s at 2,000 on real bd; the export took 0.55 s and 1.8 s).
+    `run` must return the raw stdout, not the endpoint's decoded document."""
+    rows, unreadable, _ = parse_export(run(['export', '--all']))
     return rows, unreadable
 
 
@@ -744,9 +852,19 @@ def _list_entry(view):
                                         'conflicted', 'warnings')}
     entry['text'] = {'text': view['text'][:LIST_TEXT_MAX], 'omitted_chars': max(0, len(view['text']) - LIST_TEXT_MAX)}
     entry['source'] = {'text': view['source'], 'omitted_chars': 0}
-    entry['answer'] = _answer_view(view['answers'][0]) if view['answers'] else None
+    entry.update(_answer_fields(view, LIST_TEXT_MAX))
     entry['answers'] = len(view['answers'])
+    entry['coverage'] = view['coverage']
     return entry
+
+
+def _answer_fields(view, clip):
+    """`answer` is only the answer a sound closure rests on (review P2 c). The newest
+    answer that closes nothing, if any, is shown only as `answer_that_closes_nothing`."""
+    closing = view['closing_answer']
+    other = next((a for a in view['answers'] if a is not closing and not a['closes']), None)
+    return {'answer': None if closing is None else _answer_view(closing, clip),
+            'answer_that_closes_nothing': None if other is None else _answer_view(other, clip)}
 
 
 def _get_entry(view):
@@ -839,11 +957,7 @@ def _question_entry(view, full=False):
              'due': view['due'], 'closed_by': view['closed_by'], 'reopened_by': view['reopened_by'],
              'asked_by': view['submitted_by']['actor'], 'trust': view['trust'], 'conflicted': view['conflicted'],
              'warnings': view['warnings']}
-    closing = None
-    if view['closed_by'] is not None and view['resolution'] is not None:
-        closing = next((a for a in view['answers'] if a['comment_id'] == view['resolution']['record']['answer']), None)
-    shown = closing or (view['answers'][0] if view['answers'] else None)
-    entry['answer'] = None if shown is None else _answer_view(shown, ANSWER_WORDS_MAX if full else LIST_TEXT_MAX)
+    entry.update(_answer_fields(view, ANSWER_WORDS_MAX if full else LIST_TEXT_MAX))
     if full:
         entry['answers'] = [_answer_view(answer, ANSWER_WORDS_MAX) for answer in view['answers']]
         entry['resolution'] = _get_entry(view)['resolution']
@@ -897,7 +1011,7 @@ def read_questions(args, rows, unreadable=(), operators=(), journal=None, curren
 
 
 def read(action, args, run, operators=(), journal=None):
-    """The endpoint read of `items` or `questions`: one labelled list plus one show."""
+    """The endpoint read of `items` or `questions`: one `bd export --all` (raw stdout)."""
     if any(token in ('--help', '-h') for token in args) or args[:1] == ['help']:
         return help_payload(action)
     rows, unreadable = read_anchor_rows(run)
@@ -933,7 +1047,7 @@ def brief_attention(rows, task_row, operators=(), journal=None, current=None, li
     rows = [row for row in rows if isinstance(row, dict) and FAMILY_LABEL in (row.get('labels') or [])
             and any(isinstance(c, dict) and isinstance(c.get('text'), str) and needle in c['text']
                     for c in row.get('comments') or [])]
-    views, _ = ledger(rows, operators, journal, current)
+    views, cut = ledger(rows, operators, journal, current)
     live = [v for v in views if v['state'] in ('open', 'blocked') and v['task'] == task]
     order = {'expired': 0, 'due-soon': 1, 'ok': 2, 'unset': 3}
     live.sort(key=lambda v: (order[v['due']], v['id']))
@@ -943,4 +1057,9 @@ def brief_attention(rows, task_row, operators=(), journal=None, current=None, li
     items += [{'kind': 'owner-question', 'id': v['id'], 'due': v['due'], 'for': v['for'],
                'text': v['text'][:200], 'source': 'questions get ' + v['id']} for v in questions[:limit]]
     total = len(live) + len(questions)
-    return {'attention': items, 'attention_total': total, 'attention_more': (total - len(items)) or None}
+    result = {'attention': items, 'attention_total': total, 'attention_more': (total - len(items)) or None}
+    if cut['cut']:
+        # A cap stopped the read (review P2 b): say so, so the brief is never silently partial.
+        result['open_items_cut'] = {'anchors': cut['anchors'], 'anchors_read': cut['anchors_read'],
+                                    'records_cut': cut['records_cut']}
+    return result

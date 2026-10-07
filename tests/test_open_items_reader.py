@@ -12,6 +12,7 @@ import copy
 import datetime
 import io
 import json
+import os
 import sys
 import tempfile
 import types
@@ -49,6 +50,7 @@ class Ledger:
     def __init__(self):
         self.sink = fx.MemorySink()
         self.serial = 0
+        self.newest = {}
 
     def anchor(self):
         return self.sink.create('item', {oi.FAMILY_LABEL})
@@ -61,6 +63,7 @@ class Ledger:
         record = fx.item_record(rid, kind='question', for_=OWNER, options=OPTIONS, submitted_by=fx.block(OPERATOR),
                                 **extra)
         self.post(rid, oi.OPEN_ITEM_PREFIX, record)
+        self.newest[rid] = record
         return rid, record
 
     def answer(self, rid, question, authority='relayed', journal=True, author=OPERATOR, by=None, **extra):
@@ -82,6 +85,7 @@ class Ledger:
                                 options=question['options'], submitted_by=fx.block(OPERATOR), state=state,
                                 resolved_by=None if disposition == 'reopened' else rcid)
         self.post(rid, oi.OPEN_ITEM_PREFIX, record)
+        self.newest[rid] = record
         return rcid
 
     def view(self, case, rid, operators=(OPERATOR,)):
@@ -176,7 +180,7 @@ class DerivationTests(unittest.TestCase):
         expected = fx.build(sink, 20, 10, OPERATOR, task='kit-task')
         views, cut = oi.ledger(sink.all_rows(), (OPERATOR,), journal_dir(self, sink), TODAY)
         self.assertEqual({v['id']: (v['state'], v['closed_by']) for v in views}, expected)
-        self.assertEqual(cut, {'anchors': 30, 'anchors_read': 30, 'cut': False})
+        self.assertEqual(cut, {'anchors': 30, 'anchors_read': 30, 'records_cut': [], 'cut': False})
 
     def test_owner_and_relayed_closures(self):
         for authority in ('owner', 'relayed'):
@@ -230,7 +234,7 @@ class DerivationTests(unittest.TestCase):
         rcid = self.ledger.close(rid, question, first, disposition='reopened', revision=3)
         view = self.ledger.view(self, rid)
         self.assertEqual((view['state'], view['closed_by'], view['reopened_by']), ('open', None, rcid))
-        second, _ = self.ledger.answer(rid, question, 'owner', words='No, drop it.', option='drop')
+        second, _ = self.ledger.answer(rid, self.ledger.newest[rid], 'owner', words='No, drop it.', option='drop')
         self.ledger.close(rid, question, second, revision=4)
         view = self.ledger.view(self, rid)
         self.assertEqual((view['state'], view['closed_by'], view['reopened_by']), ('resolved', 'owner', None))
@@ -309,7 +313,8 @@ class DerivationTests(unittest.TestCase):
             self.ledger.post(rid, oi.OPEN_ITEM_PREFIX, fx.item_record(rid, revision=revision))
         with patch.object(oi, 'RECORDS_PER_ANCHOR_MAX', 3):
             view = self.ledger.view(self, rid)
-        self.assertEqual((view['revision'], view['coverage']), (3, {'records_read': 3, 'cut': True}))
+        # The NEWEST records are kept: revisions 3, 4 and 5, so the item reads revision 5.
+        self.assertEqual((view['revision'], view['coverage']), (5, {'records': 5, 'records_read': 3, 'cut': True}))
         self.assertIn('records-cap', [w['code'] for w in view['warnings']])
         for _ in range(3):
             other = self.ledger.anchor()
@@ -318,6 +323,10 @@ class DerivationTests(unittest.TestCase):
             listed = oi.read_items(['list'], self.ledger.sink.all_rows(), [], (), None, TODAY)
         self.assertEqual(listed['coverage']['anchors'], 4)
         self.assertEqual((listed['coverage']['anchors_read'], listed['coverage']['cut']), (2, True))
+        # The records cap shows at the list level too.
+        with patch.object(oi, 'RECORDS_PER_ANCHOR_MAX', 3):
+            listed = oi.read_items(['list'], self.ledger.sink.all_rows(), [], (), None, TODAY)
+        self.assertEqual((listed['coverage']['cut'], listed['coverage']['records_cut']), (True, [rid]))
 
 
 class CommandTests(unittest.TestCase):
@@ -390,57 +399,260 @@ class CommandTests(unittest.TestCase):
             self.questions('get', blocker)
 
 
+def export_text(rows, deep=(), depth=3000):
+    """`bd export --all` as real bd prints it: one JSON row per line."""
+    lines = []
+    for row in rows:
+        if row['id'] in deep:
+            text = json.dumps(dict(row, metadata=None))
+            lines.append(text.replace('"metadata": null', '"metadata": ' + '[' * depth + ']' * depth))
+        else:
+            lines.append(json.dumps(row))
+    return '\n'.join(lines) + '\n'
+
+
 class NativeReadTests(unittest.TestCase):
-    """read_anchor_rows: one list and one show; an unparseable answer is never fatal."""
+    """One `bd export --all`; an unreadable row is reported, never fatal, never interpreter-bound."""
 
     def setUp(self):
         self.sink = fx.MemorySink()
         fx.build(self.sink, 4, 0, OPERATOR)
         self.calls = []
 
-    def run_bd(self, rows, deep=()):
+    def run_bd(self, rows, **deep):
         def run(argv):
-            self.calls.append(argv[0])
-            if argv[0] == 'list':
-                return json.dumps([{'id': r['id'], 'labels': r['labels']} for r in rows])
-            if argv[0] == 'show':
-                ids = [a for a in argv[1:] if not a.startswith('--')]
-                if any(i in deep for i in ids):
-                    return '[' + '[' * 3000 + ']' * 3000 + ']'
-                return json.dumps([r for r in rows if r['id'] in ids])
-            if argv[0] == 'export':
-                # A row that is broken JSON on every interpreter (deep nesting is not: the
-                # bare parser of the export accepts more depth on some Python versions).
-                return '\n'.join('{"id": "%s", "x": [1, ' % r['id'] if r['id'] in deep
-                                 else json.dumps(r) for r in rows)
-            raise AssertionError(argv)
+            self.calls.append(list(argv))
+            if argv != ['export', '--all']:
+                raise AssertionError('unexpected bd call %r' % (argv,))
+            return export_text(rows, **deep)
         return run
 
-    def test_one_list_and_one_show(self):
+    def test_one_export_and_nothing_else(self):
         rows, unreadable = oi.read_anchor_rows(self.run_bd(self.sink.all_rows()))
-        self.assertEqual((len(rows), unreadable, self.calls), (4, [], ['list', 'show']))
+        self.assertEqual((len(rows), unreadable, self.calls), (4, [], [['export', '--all']]))
 
-    def test_an_unparseable_row_in_show_is_isolated_and_reported(self):
-        rows, unreadable = oi.read_anchor_rows(self.run_bd(self.sink.all_rows(), deep={'kit-2'}))
-        self.assertEqual(sorted(r['id'] for r in rows), ['kit-1', 'kit-3', 'kit-4'])
-        self.assertEqual([u['id'] for u in unreadable], ['kit-2'])
+    def test_a_deep_row_is_unreadable_on_every_interpreter(self):
+        for depth in (oi.ROW_NESTING_MAX + 1, 1100, 3000):
+            with self.subTest(depth=depth):
+                rows, unreadable = oi.read_anchor_rows(self.run_bd(self.sink.all_rows(), deep={'kit-2'}, depth=depth))
+                self.assertEqual(sorted(r['id'] for r in rows), ['kit-1', 'kit-3', 'kit-4'])
+                self.assertEqual([u['id'] for u in unreadable], ['kit-2'])
+                self.assertIn('nested deeper than 750 levels', unreadable[0]['reason'])
+        # The rule is a count, not the parser's limit: it never calls the parser on such a row.
+        with patch.object(oi.json, 'loads', side_effect=AssertionError('parsed')):
+            self.assertTrue(oi.nesting_exceeds('[' * 751 + ']' * 751))
+            self.assertFalse(oi.nesting_exceeds('[' * 750 + ']' * 750))
+            self.assertFalse(oi.nesting_exceeds('"' + '[' * 900 + '"'))
 
-    def test_an_unparseable_list_falls_back_to_the_export(self):
-        rows = self.sink.all_rows()
+    def test_a_shallow_deep_row_still_reads(self):
+        rows, unreadable = oi.read_anchor_rows(self.run_bd(self.sink.all_rows(), deep={'kit-2'}, depth=200))
+        self.assertEqual((len(rows), unreadable), (4, []))
 
-        def run(argv):
-            self.calls.append(argv[0])
-            if argv[0] == 'list':
-                return '[' + '[' * 3000
-            return self.run_bd(rows, deep={'kit-3'})(argv)
-        found, unreadable = oi.read_anchor_rows(run)
-        self.assertEqual(sorted(r['id'] for r in found), ['kit-1', 'kit-2', 'kit-4'])
-        self.assertEqual([u['id'] for u in unreadable], ['kit-3'])
-        self.assertIn('not known whether it is an item anchor', unreadable[0]['reason'])
+    def test_broken_rows_and_noise(self):
+        text = export_text(self.sink.all_rows()) + '{"id": "kit-9", "labels": ["open-item"], "x": [1,\n' \
+            + '{"id": "kit-10", "labels": ["ops"], "x": [1,\nwarning: something\n'
+        rows, unreadable, other = oi.parse_export(text)
+        self.assertEqual((len(rows), [u['id'] for u in unreadable], other), (4, ['kit-9'], 1))
 
-    def test_an_unlabelled_project_reads_nothing(self):
-        rows, unreadable = oi.read_anchor_rows(lambda argv: '[]')
-        self.assertEqual((rows, unreadable), ([], []))
+    def test_only_rows_with_a_record_are_anchors(self):
+        # Review P2 a: a contributor may label any row `open-item` (the exact label is not
+        # reserved); without an exact record it is an ordinary row, never counted or reported.
+        rows = self.sink.all_rows() + [{'id': 'kit-50', 'labels': ['open-item'], 'comments': []},
+                                       {'id': 'kit-51', 'labels': ['open-item'],
+                                        'comments': [{'id': '90', 'text': 'Kind: open-item-v1{}'}]}]
+        with patch.object(oi, 'ITEM_ANCHORS_MAX', 4):
+            listed = oi.read_items(['list'], rows, [], (OPERATOR,), None, TODAY)
+        self.assertEqual((listed['total'], listed['unreadable'], listed['coverage']['cut']), (4, [], False))
+        got = oi.read_items(['get', 'kit-4'], rows, [], (OPERATOR,), None, TODAY)
+        self.assertEqual(got['id'], 'kit-4')
+
+
+class ClosureAttackTests(unittest.TestCase):
+    """Review B1: a planted revision or resolution never makes a question read closed."""
+
+    def setUp(self):
+        self.ledger = Ledger()
+        self.rid, self.question = self.ledger.question()
+        self.cid, self.answer = self.ledger.answer(self.rid, self.question, 'owner')
+
+    def plant(self, prefix, record, author='mallory'):
+        return self.ledger.post(self.rid, prefix, record, author)
+
+    def assert_open(self, why, conflicted=True):
+        view = self.ledger.view(self, self.rid)
+        self.assertEqual((view['state'], view['closed_by'], view['conflicted']), ('open', None, conflicted),
+                         view['warnings'])
+        self.assertIn(why, ' '.join(w['detail'] for w in view['warnings']))
+        counts = oi.read_questions(['--for', OWNER], self.ledger.sink.all_rows(), [], (OPERATOR,),
+                                   journal_dir(self, self.ledger.sink), TODAY)
+        self.assertEqual((counts['open'], counts['closed_by_owner']), (1, 0))
+        self.assertIsNone(counts['items'][0]['answer'])
+        return view
+
+    def test_the_sound_closure_reads_closed(self):
+        self.ledger.close(self.rid, self.question, self.cid)
+        view = self.ledger.view(self, self.rid)
+        self.assertEqual((view['state'], view['closed_by'], view['conflicted']), ('resolved', 'owner', False))
+
+    def test_a_planted_revision_after_a_reopen(self):
+        rcid = self.ledger.close(self.rid, self.question, self.cid)
+        self.ledger.close(self.rid, self.question, self.cid, disposition='reopened', revision=3)
+        self.plant(oi.OPEN_ITEM_PREFIX, fx.item_record(self.rid, revision=4, kind='question', for_=OWNER,
+                                                       options=OPTIONS, state='resolved', resolved_by=rcid,
+                                                       submitted_by=fx.block('mallory')))
+        self.assert_open('unattested')
+
+    def test_an_operator_closure_after_a_reopen_is_withdrawn(self):
+        rcid = self.ledger.close(self.rid, self.question, self.cid)
+        self.ledger.close(self.rid, self.question, self.cid, disposition='reopened', revision=3)
+        # Even an attested revision 4 naming the old resolution does not undo the reopen.
+        self.ledger.post(self.rid, oi.OPEN_ITEM_PREFIX,
+                         fx.item_record(self.rid, revision=4, kind='question', for_=OWNER, options=OPTIONS,
+                                        state='resolved', resolved_by=rcid, submitted_by=fx.block(OPERATOR)))
+        self.assert_open('not the unchanged revision after the one answered')
+
+    def test_a_planted_closing_revision_with_other_text(self):
+        resolution = fx.resolution_record(self.rid, 1, answer=self.cid, by=fx.block(OPERATOR), serial=9)
+        rcid = self.ledger.post(self.rid, oi.ITEM_RESOLUTION_PREFIX, resolution)
+        other = [{'id': 'keep', 'text': 'Yes, delete it'}, {'id': 'drop', 'text': 'No'}]
+        self.plant(oi.OPEN_ITEM_PREFIX, fx.item_record(self.rid, revision=2, kind='question', for_=OWNER, options=other,
+                                                       text='Delete the production database?', state='resolved',
+                                                       resolved_by=rcid, submitted_by=fx.block('mallory')))
+        # Refused outright: the item is still revision 1 as asked, open, not conflicted.
+        view = self.assert_open('unattested', conflicted=False)
+        self.assertEqual((view['text'], view['revision']), (self.question['text'], 1))
+        self.assertIn('unattested-change', [w['code'] for w in view['warnings']])
+
+    def test_an_attested_closing_revision_must_repeat_the_question(self):
+        resolution = fx.resolution_record(self.rid, 1, answer=self.cid, by=fx.block(OPERATOR), serial=9)
+        rcid = self.ledger.post(self.rid, oi.ITEM_RESOLUTION_PREFIX, resolution)
+        self.ledger.post(self.rid, oi.OPEN_ITEM_PREFIX,
+                         fx.item_record(self.rid, revision=2, kind='question', for_=OWNER, options=OPTIONS,
+                                        text='Another question', state='resolved', resolved_by=rcid,
+                                        submitted_by=fx.block(OPERATOR)))
+        self.assert_open('not the unchanged revision after the one answered')
+
+    def test_a_planted_resolution_and_revision_under_a_real_answer(self):
+        resolution = fx.resolution_record(self.rid, 1, answer=self.cid, by=fx.block('mallory'), serial=9)
+        rcid = self.plant(oi.ITEM_RESOLUTION_PREFIX, resolution)
+        self.plant(oi.OPEN_ITEM_PREFIX, fx.item_record(self.rid, revision=2, kind='question', for_=OWNER,
+                                                       options=OPTIONS, state='resolved', resolved_by=rcid,
+                                                       submitted_by=fx.block('mallory')))
+        self.assert_open('unattested')
+
+    def test_a_planted_resolution_alone(self):
+        resolution = fx.resolution_record(self.rid, 1, answer=self.cid, by=fx.block('mallory'), serial=9)
+        rcid = self.plant(oi.ITEM_RESOLUTION_PREFIX, resolution)
+        self.ledger.post(self.rid, oi.OPEN_ITEM_PREFIX,
+                         fx.item_record(self.rid, revision=2, kind='question', for_=OWNER, options=OPTIONS,
+                                        state='resolved', resolved_by=rcid, submitted_by=fx.block(OPERATOR)))
+        self.assert_open('the closing resolution is unattested')
+
+    def test_an_answer_to_another_revision(self):
+        changed = dict(self.question, text='Changed after the answer')
+        changed = fx.sealed({k: v for k, v in changed.items() if k != 'sha256'})
+        stale = dict(self.answer, question_sha256=changed['sha256'])
+        stale = fx.sealed({k: v for k, v in stale.items() if k != 'sha256'})
+        cid = self.ledger.post(self.rid, oi.OWNER_ANSWER_PREFIX, stale)
+        self.ledger.sink.write_entry(fx.journal_entry(stale, cid))
+        self.ledger.close(self.rid, self.question, cid)
+        self.assert_open('does not match revision 1 of the question as asked')
+
+    def test_a_closing_revision_that_skips_one(self):
+        self.ledger.close(self.rid, self.question, self.cid, revision=3)
+        self.assert_open('not the unchanged revision after the one answered')
+
+    def test_a_kind_change_is_refused_not_adopted(self):
+        self.plant(oi.OPEN_ITEM_PREFIX, fx.item_record(self.rid, revision=2, kind='blocker',
+                                                       submitted_by=fx.block('mallory')))
+        view = self.ledger.view(self, self.rid)
+        self.assertEqual((view['kind'], view['revision']), ('question', 1))
+        self.assertIn('kind-change', [w['code'] for w in view['warnings']])
+        listed = oi.read_questions(['--for', OWNER], self.ledger.sink.all_rows(), [], (OPERATOR,), None, TODAY)
+        self.assertEqual((listed['total'], listed['open']), (1, 1))
+
+    def test_an_unattested_state_move_with_the_same_content_is_adopted(self):
+        blocked = fx.item_record(self.rid, revision=2, kind='question', for_=OWNER, options=OPTIONS, state='blocked',
+                                 state_note='Waiting', submitted_by=fx.block('coordinator', 'endpoint'))
+        self.ledger.post(self.rid, oi.OPEN_ITEM_PREFIX, blocked, 'coordinator')
+        self.assertEqual(self.ledger.view(self, self.rid)['state'], 'blocked')
+
+    def test_the_unclosing_answer_is_shown_only_under_its_own_name(self):
+        self.ledger.answer(self.rid, self.question, 'owner', journal=False, words='Planted words')
+        listed = oi.read_items(['list'], self.ledger.sink.all_rows(), [], (OPERATOR,),
+                               journal_dir(self, self.ledger.sink), TODAY)['items'][0]
+        self.assertIsNone(listed['answer'])
+        self.assertEqual(listed['answer_that_closes_nothing']['words']['text'], 'Planted words')
+        self.assertFalse(listed['answer_that_closes_nothing']['closes'])
+
+
+class TrustDetailTests(unittest.TestCase):
+    def test_the_author_must_be_the_actor_even_among_operators(self):
+        block = fx.block(OPERATOR)
+        self.assertEqual(oi.trust_of(block, 'operator2', (OPERATOR, 'operator2')), 'unattested')
+        ledger = Ledger()
+        rid, question = ledger.question()
+        cid, _ = ledger.answer(rid, question, 'relayed', author='operator2')
+        ledger.close(rid, question, cid)
+        self.assertIsNone(ledger.view(self, rid, (OPERATOR, 'operator2'))['closed_by'])
+
+    def entry_case(self, mutate):
+        ledger = Ledger()
+        rid, question = ledger.question()
+        cid, answer = ledger.answer(rid, question, 'relayed', journal=False)
+        ledger.close(rid, question, cid)
+        folder = journal_dir(self, ledger.sink)
+        mutate(folder, answer, cid)
+        return oi.item_view(ledger.sink.rows[rid], (OPERATOR,), folder, TODAY)['closed_by']
+
+    def test_a_symlinked_entry_or_journal_closes_nothing(self):
+        def entry_link(folder, answer, cid):
+            target = folder / 'elsewhere.json'
+            target.write_text(json.dumps(fx.journal_entry(answer, cid)), encoding='utf-8')
+            os.symlink(target, folder / oi.OWNER_ANSWERS_JOURNAL / (answer['sha256'] + '.json'))
+
+        def folder_link(folder, answer, cid):
+            real = folder / 'real'
+            real.mkdir()
+            (real / (answer['sha256'] + '.json')).write_text(json.dumps(fx.journal_entry(answer, cid)),
+                                                              encoding='utf-8')
+            (folder / oi.OWNER_ANSWERS_JOURNAL).rmdir()
+            os.symlink(real, folder / oi.OWNER_ANSWERS_JOURNAL, target_is_directory=True)
+        try:
+            for mutate in (entry_link, folder_link):
+                self.assertIsNone(self.entry_case(mutate))
+        except (OSError, NotImplementedError):
+            self.skipTest('cannot create symlinks here')
+
+    def test_an_oversized_entry_closes_nothing(self):
+        def big(folder, answer, cid):
+            text = json.dumps(fx.journal_entry(answer, cid))
+            (folder / oi.OWNER_ANSWERS_JOURNAL / (answer['sha256'] + '.json')).write_text(
+                text + ' ' * oi.JOURNAL_ENTRY_MAX_BYTES, encoding='utf-8')
+
+        def exact(folder, answer, cid):
+            (folder / oi.OWNER_ANSWERS_JOURNAL / (answer['sha256'] + '.json')).write_text(
+                json.dumps(fx.journal_entry(answer, cid)), encoding='utf-8')
+        self.assertIsNone(self.entry_case(big))
+        self.assertEqual(self.entry_case(exact), 'relayed')
+
+    def test_byte_order_mark_and_crlf_prefixes_are_named(self):
+        ledger = Ledger()
+        rid, question = ledger.question()
+        text = fx.body(oi.OPEN_ITEM_PREFIX, question)
+        ledger.sink.comment(rid, '﻿' + text, OPERATOR)
+        ledger.sink.comment(rid, text.replace('\n', '\r\n', 1), OPERATOR)
+        details = [w['detail'] for w in ledger.view(self, rid)['warnings']]
+        self.assertEqual(details, ['open-item: the prefix is not exact (byte order mark or CRLF)'] * 2)
+
+    def test_operator_person_only_on_the_host_route(self):
+        self.assertTrue(oi._block_ok(fx.block('alice')))
+        self.assertFalse(oi._block_ok({'actor': 'alice', 'route': 'web', 'identity': 'verified',
+                                       'person': 'operator:alice'}))
+        self.assertFalse(oi._block_ok({'actor': 'alice', 'route': 'host', 'identity': 'verified',
+                                       'person': 'operator:bob'}))
+        with self.assertRaises(ValueError):
+            oi._attribution({'actor': 'alice', 'route': 'web', 'identity': 'verified', 'person': 'operator:alice'}, 'by')
 
 
 class BriefTests(unittest.TestCase):
@@ -457,6 +669,27 @@ class BriefTests(unittest.TestCase):
         self.assertEqual((result['attention_total'], result['attention_more']), (11 + 3, 14 - 6))
         self.assertEqual(oi.brief_attention(self.sink.all_rows(), {'id': 'other'}, (), None, TODAY),
                          {'attention': [], 'attention_total': 0, 'attention_more': None})
+
+    def test_only_items_about_the_task_count(self):
+        other = fx.MemorySink('oth')
+        fx.build(other, 10, 5, OPERATOR, task='other-task')
+        rows = self.sink.all_rows() + other.all_rows()
+        result = oi.brief_attention(rows, {'id': 'trial-task'}, (OPERATOR,), self.journal, TODAY)
+        self.assertEqual((result['attention_total'], result['attention_more']), (14, 8))
+        self.assertTrue(all(i['id'].startswith('kit-') for i in result['attention']))
+        other_result = oi.brief_attention(rows, {'id': 'other-task'}, (OPERATOR,), None, TODAY)
+        self.assertTrue(all(i['id'].startswith('oth-') for i in other_result['attention']))
+        self.assertNotIn('open_items_cut', result)
+
+    def test_a_cut_read_is_said_in_the_brief(self):
+        import briefing
+        import test_briefing as tb
+        with patch.object(oi, 'RECORDS_PER_ANCHOR_MAX', 1):
+            result = oi.brief_attention(self.sink.all_rows(), {'id': 'trial-task'}, (OPERATOR,), self.journal, TODAY)
+            self.assertTrue(result['open_items_cut']['records_cut'])
+            brief = briefing.brief(tb.rows() + self.sink.all_rows(), tb.PROJECT, tb.TASK, operators=[OPERATOR],
+                                   journal=self.journal)
+        self.assertIn('Open items: a cap cut this read', briefing.format_brief(brief))
 
     def test_brief_renders_them_after_every_other_kind(self):
         import briefing
@@ -493,21 +726,18 @@ class EndpointTests(unittest.TestCase):
         for entry in self.sink.journal.values():
             (self.project / oi.OWNER_ANSWERS_JOURNAL / (entry['sha256'] + '.json')).write_text(json.dumps(entry))
         self.native = []
+        self.deep = set()
 
     def fake_run(self, argv, env, timeout=None):
         command = list(map(str, argv))
         command = command[command.index('--sandbox') + 1:]
         if command[:1] == ['--actor']:
             command = command[2:]
-        self.native.append(command[0])
-        rows = self.sink.all_rows()
-        if command[0] == 'list':
-            stdout = json.dumps([{'id': r['id'], 'labels': r['labels']} for r in rows])
-        elif command[0] == 'show':
-            stdout = json.dumps([r for r in rows if r['id'] in command])
-        else:
+        self.native.append(command)
+        if command != ['export', '--all']:
             raise AssertionError(command)
-        return types.SimpleNamespace(returncode=0, stdout=stdout, stderr='')
+        return types.SimpleNamespace(returncode=0, stdout=export_text(self.sink.all_rows(), deep=self.deep),
+                                     stderr='')
 
     def execute(self, action, args):
         request = {'project': 'p', 'actor': 'alice', 'action': action, 'args': args, 'attachments': {}}
@@ -517,16 +747,28 @@ class EndpointTests(unittest.TestCase):
                 patch.object(self.endpoint, 'run_guarded', side_effect=AssertionError('guarded')):
             return self.endpoint.execute(self.root, request)
 
-    def test_both_reads_are_one_list_and_one_show_and_never_guarded(self):
+    def test_both_reads_are_one_export_and_never_guarded(self):
         reply = self.execute('questions', ['--for', OWNER])
         self.assertEqual(reply['returncode'], 0, reply)
         result = json.loads(reply['stdout'])
         self.assertEqual((result['total'], result['closed_by_owner'], result['closed_relayed']), (5, 1, 1))
-        self.assertEqual(self.native, ['list', 'show'])
+        self.assertEqual(self.native, [['export', '--all']])
         reply = self.execute('items', ['list'])
         self.assertEqual(json.loads(reply['stdout'])['total'], 9)
         help_reply = json.loads(self.execute('items', ['--help'])['stdout'])
         self.assertTrue(help_reply['read_only'])
+
+    def test_a_deep_row_does_not_fail_the_project_through_the_endpoint(self):
+        # Review B3: the endpoint's JSON policy used to decode the rows and raise
+        # RecursionError on 3.10/3.11. 3000 levels, on every interpreter CI runs.
+        self.deep = {'p-1'} if 'p-1' in self.sink.rows else {sorted(self.sink.rows)[0]}
+        for action, args in (('items', ['list']), ('questions', ['--for', OWNER]),
+                             ('items', ['get', sorted(self.sink.rows)[1]])):
+            reply = self.execute(action, args)
+            self.assertEqual(reply['returncode'], 0, reply)
+        listed = json.loads(self.execute('items', ['list'])['stdout'])
+        self.assertEqual([u['id'] for u in listed['unreadable']], sorted(self.deep))
+        self.assertEqual(listed['total'], 8)
 
     def test_the_client_routes_both_actions(self):
         import client
@@ -540,6 +782,50 @@ class EndpointTests(unittest.TestCase):
                                                'alice', '--'] + argv), contextlib.redirect_stdout(io.StringIO()):
                 client.main()
         self.assertEqual(calls, [('items', ['list']), ('questions', ['--for', OWNER])])
+
+
+class FixtureGeneratorTests(unittest.TestCase):
+    """Review P2 e: the real-bd generator retries, prints bd's stderr and resumes."""
+
+    def test_it_retries_reports_and_resumes(self):
+        import subprocess
+        import admin
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / 'projects' / 'trial').mkdir(parents=True)
+            counter = {'rows': 0, 'comments': 0, 'calls': 0}
+            fail_at = {7}
+
+            def bd(r, name, argv):
+                counter['calls'] += 1
+                if counter['calls'] in fail_at:
+                    raise subprocess.CalledProcessError(1, 'bd', stderr='database is locked')
+                if argv[2] == 'create':
+                    counter['rows'] += 1
+                    return json.dumps({'id': 'trial-%d' % counter['rows']})
+                if argv[2] == 'comments':
+                    counter['comments'] += 1
+                    return json.dumps({'id': str(counter['comments'])})
+                return '{}'
+            argv = ['--root', str(root), '--project', 'trial', '--actor', OPERATOR, '--items', '3',
+                    '--questions', '2', '--scratch']
+            err = io.StringIO()
+            with patch.object(admin, 'run_bd', side_effect=bd), patch.object(fx.time, 'sleep'), \
+                    contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                self.assertEqual(fx.main(argv), 0)            # one failure, retried
+                self.assertIn('database is locked', err.getvalue())
+                first_rows = counter['rows']
+                fail_at.update(range(counter['calls'] + 1, counter['calls'] + 10))
+                state = root / 'open_items_fixture.trial.state.json'
+                state.unlink()
+                with self.assertRaises(SystemExit) as stop:   # three failures in a row stop it
+                    fx.main(argv)
+                self.assertIn('resume', str(stop.exception.code))
+                fail_at.clear()
+                self.assertEqual(fx.main(argv), 0)            # the same command resumes
+            recorded = json.loads(state.read_text(encoding='utf-8'))
+            self.assertEqual(len([k for k in recorded if k.endswith(':create')]), 5)
+            self.assertEqual(counter['rows'], first_rows + 5)
 
 
 class ReadOnlyTests(unittest.TestCase):
