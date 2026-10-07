@@ -109,6 +109,10 @@ class WorkerTests(unittest.TestCase):
 
 
 class Held(test_http_agents.AgentHarness):
+    def setUp(self):
+        super().setUp()
+        self.service.LOGIN_WAIT_SECONDS = 0          # a refusal is at once here; the wait for a place is WaitTests
+
     def held(self, limit, source='local', count=None):
         """Log-ins that stay in flight: the worker does not answer until `release` is set."""
         release, entered = threading.Event(), []
@@ -243,8 +247,9 @@ class ShareTests(Held):
         release, entered, threads, answers = self.held(places, source=self.ONE, count=per_address or places)
         return release, entered, threads, answers
 
-    def test_the_share_is_half_of_the_places(self):
-        self.assertEqual((http_auth.Service.LOGINS_PER_ADDRESS, http_auth.Service.LOGINS_AT_ONCE), (8, 16))
+    def test_the_share_is_a_quarter_of_the_places(self):
+        self.assertEqual((http_auth.Service.LOGINS_PER_ADDRESS, http_auth.Service.LOGINS_AT_ONCE), (4, 16))
+        self.assertEqual((http_auth.Service.LOGIN_WAIT_SECONDS, http_auth.Service.LOGIN_WAITERS_PER_ADDRESS), (2.0, 12))
 
     def test_a_shared_source_has_no_share_and_the_places_in_all_still_bound_it(self):
         """Everybody behind a trusted proxy that forwards no address (the SSH tunnel): not one client."""
@@ -387,6 +392,164 @@ class ShareTests(Held):
         self.assertEqual((self.service._logins, self.service._logins_by_address), (0, {}))
         self.assertEqual(self.service.login(ADMIN, PASSWORD, source=self.ONE)['user']['username'], ADMIN)
         self.assertEqual(self.service.logins_turned_away, 0)
+
+
+class WaitTests(Held):
+    """A log-in over its address's share waits a short time for one of that address's places (the coordinator's
+    decision after the measurements): an office behind one router is one address, and an instant refusal sent six
+    of its ten people away at nine in the morning. A flooding address gains nothing by it."""
+    ONE, OTHER = '192.0.2.7', '192.0.2.8'
+
+    def parked(self, address, count, within=10):
+        until = time.monotonic() + within
+        while time.monotonic() < until and self.service._logins_waiting.get(address, 0) != count:
+            time.sleep(0.01)
+        self.assertEqual(self.service._logins_waiting.get(address, 0), count)
+
+    def test_ten_people_at_one_address_all_get_in_at_the_first_try(self):
+        self.service.LOGIN_WAIT_SECONDS = http_auth.Service.LOGIN_WAIT_SECONDS
+        self.assertEqual(self.service.LOGINS_PER_ADDRESS, 4)
+        barrier, results, waits, most = threading.Barrier(10), [], [], []
+
+        def person():
+            barrier.wait(30)
+            started = time.monotonic()
+            try:
+                results.append(self.service.login(ADMIN, PASSWORD, source=self.ONE)['user']['username'])
+            except HttpError as error:
+                results.append(error.status)
+            waits.append(time.monotonic() - started)
+        people = [threading.Thread(target=person) for _ in range(10)]
+        for one in people:
+            one.start()
+        while any(one.is_alive() for one in people):
+            most.append((self.service._logins_by_address.get(self.ONE, 0), self.service._logins_waiting.get(self.ONE, 0)))
+            time.sleep(0.002)
+        self.assertEqual(results, [ADMIN] * 10)
+        self.assertLessEqual(max(in_flight for in_flight, _ in most), 4)                # the share held throughout
+        self.assertLess(max(waits), http_auth.Service.LOGIN_WAIT_SECONDS + 1.5)
+        self.assertEqual((self.service.logins_turned_away, self.service._logins, self.service._logins_by_address,
+                          self.service._logins_waiting), (0, 0, {}, {}))
+
+    def test_a_waiter_gets_the_place_when_one_of_its_address_is_freed(self):
+        self.service.LOGINS_PER_ADDRESS = 2
+        release, entered, threads, answers = self.held(6, source=self.ONE, count=2)
+        self.service.LOGIN_WAIT_SECONDS = 30
+        took = []
+
+        def waiter():
+            started = time.monotonic()
+            try:
+                self.service.login('nobody-waiting', 'a wrong password', source=self.ONE)
+            except HttpError as error:
+                took.append((error.status, time.monotonic() - started))
+        thread = threading.Thread(target=waiter)
+        thread.start()
+        self.parked(self.ONE, 1)
+        self.assertEqual((self.service._logins, self.service._logins_by_address), (2, {self.ONE: 2}))    # it holds no place while it waits
+        release.set()
+        thread.join(30)
+        self.assertEqual(took[0][0], 401)                             # it was checked: it got a place, long before its wait ran out
+        self.assertLess(took[0][1], 20)
+        for held in threads:
+            held.join(30)
+        self.assertEqual((self.service._logins, self.service._logins_by_address, self.service._logins_waiting), (0, {}, {}))
+
+    def test_a_waiter_whose_time_runs_out_is_refused_as_before_and_nothing_is_counted_or_cleared(self):
+        key = self.service._throttle_key(ADMIN, self.ONE)
+        self.service.LOGIN_WAIT_SECONDS = 0
+        for _ in range(2):
+            with self.assertRaises(HttpError):
+                self.service.login(ADMIN, 'a wrong password', source=self.ONE)
+        self.assertEqual(len(self.service._failures[key]), 2)
+        self.service.LOGINS_PER_ADDRESS = 2
+        release, entered, threads, answers = self.held(6, source=self.ONE, count=2)
+        self.service.LOGIN_WAIT_SECONDS = 0.4
+        audited = len(self.service.state.get('audit') or [])
+        for password in (PASSWORD, 'a wrong password'):
+            started = time.monotonic()
+            with self.assertRaises(HttpError) as refused:
+                self.service.login(ADMIN, password, source=self.ONE)
+            waited = time.monotonic() - started
+            error = refused.exception
+            self.assertEqual((error.status, error.code, error.message, error.retry_after), (503, 'busy', self.service.LOGIN_BUSY_ADDRESS, 5))
+            self.assertGreaterEqual(waited, 0.35)                      # it did wait
+            self.assertLess(waited, 5)
+        self.assertEqual(len(entered), 1)                              # nothing was checked for them
+        self.assertEqual(len(self.service._failures[key]), 2)          # neither counted nor cleared
+        self.assertEqual(len(self.service.state.get('audit') or []), audited)
+        self.assertEqual((self.service.logins_turned_away, self.service.logins_turned_away_for_address, self.service._logins_waiting),
+                         (2, 2, {}))
+        release.set()
+        for thread in threads:
+            thread.join(30)
+
+    def test_only_so_many_of_one_address_wait_and_one_more_is_refused_at_once(self):
+        self.service.LOGINS_PER_ADDRESS = 2
+        self.service.LOGIN_WAITERS_PER_ADDRESS = 3
+        release, entered, threads, answers = self.held(8, source=self.ONE, count=2)
+        self.service.LOGIN_WAIT_SECONDS = 30
+        done = []
+
+        def waiter(index):
+            try:
+                self.service.login('nobody-w%d' % index, 'a wrong password', source=self.ONE)
+            except HttpError as error:
+                done.append(error.status)
+        waiters = [threading.Thread(target=waiter, args=(index,)) for index in range(3)]
+        for thread in waiters:
+            thread.start()
+        self.parked(self.ONE, 3)
+        started = time.monotonic()
+        with self.assertRaises(HttpError) as refused:
+            self.service.login(ADMIN, PASSWORD, source=self.ONE)
+        self.assertLess(time.monotonic() - started, 2)                 # at once, not after the 30 s
+        self.assertEqual(refused.exception.message, self.service.LOGIN_BUSY_ADDRESS)
+        self.assertEqual(self.service._logins_waiting, {self.ONE: 3})
+        release.set()
+        for thread in waiters + threads:
+            thread.join(30)
+        self.assertEqual((sorted(done), self.service._logins_waiting, self.service._logins), ([401, 401, 401], {}, 0))
+
+    def test_the_waiters_of_one_address_take_nothing_from_another(self):
+        self.service.LOGINS_PER_ADDRESS = 2
+        self.service.LOGINS_AT_ONCE = 4
+        release, entered, threads, answers = self.held(4, source=self.ONE, count=2)
+        self.service.LOGIN_WAIT_SECONDS = 30
+        waiters = [threading.Thread(target=lambda: self.assertRaises(HttpError, self.service.login, 'nobody', 'x' * 12, source=self.ONE))
+                   for _ in range(5)]
+        for thread in waiters:
+            thread.start()
+        self.parked(self.ONE, 5)
+        # Five wait; the other address has its two places, and they are places, not waits.
+        others = [threading.Thread(target=lambda: self.assertRaises(HttpError, self.service.login, 'nobody', 'x' * 12, source=self.OTHER))
+                  for _ in range(2)]
+        for thread in others:
+            thread.start()
+        until = time.monotonic() + 10
+        while time.monotonic() < until and self.service._logins < 4:
+            time.sleep(0.01)
+        self.assertEqual((self.service._logins, self.service._logins_by_address, self.service._logins_waiting),
+                         (4, {self.ONE: 2, self.OTHER: 2}, {self.ONE: 5}))
+        release.set()
+        for thread in waiters + others + threads:
+            thread.join(60)
+        self.assertEqual((self.service._logins, self.service._logins_by_address, self.service._logins_waiting), (0, {}, {}))
+
+    def test_a_shared_source_and_the_places_in_all_do_not_wait(self):
+        self.service.LOGINS_AT_ONCE = 2
+        release, entered, threads, answers = self.held(2, source=self.ONE)
+        self.service.LOGIN_WAIT_SECONDS = 30
+        for kwargs in ({'source': self.OTHER}, {'source': '127.0.0.1', 'shared_source': True}):
+            started = time.monotonic()
+            with self.assertRaises(HttpError) as refused:
+                self.service.login(ADMIN, PASSWORD, **kwargs)
+            self.assertLess(time.monotonic() - started, 2)
+            self.assertEqual(refused.exception.message, self.service.LOGIN_BUSY)       # every place taken: at once, as before
+        self.assertEqual(self.service._logins_waiting, {})
+        release.set()
+        for thread in threads:
+            thread.join(30)
 
 
 if __name__ == '__main__':

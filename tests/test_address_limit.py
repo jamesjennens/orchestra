@@ -438,6 +438,7 @@ class ProxyTests(AddressCase):
         # With the share at one and as if one counted log-in of each address were in flight: from the tunnel
         # address and from the host itself another still gets in; a forwarded client address is held to its share.
         self.service.LOGINS_PER_ADDRESS = 1
+        self.service.LOGIN_WAIT_SECONDS = 0                       # the wait for a place has its own tests
         with self.service._logins_guard:
             self.service._logins_by_address.update({PROXY: 1, B: 1, FAR: 1})
         self.assertEqual(self.get(PROXY, method='POST', path='/v1/sessions', body=body)[0], 201)
@@ -540,7 +541,7 @@ class SettingTests(unittest.TestCase):
                     self.assertEqual(stopped.exception.code, 2)
                     self.assertIn(flag + ' ' + sentence, said.getvalue())
                     self.assertFalse((Path(tmp)/'state.json').exists())
-        for words, share in (([], 8), (['--logins-per-address', '3'], 3), (['--logins-per-address', '16'], 16)):
+        for words, share in (([], 4), (['--logins-per-address', '3'], 3), (['--logins-per-address', '16'], 16)):
             with self.subTest(words=words), self.folder() as tmp:
                 made = []
 
@@ -552,7 +553,7 @@ class SettingTests(unittest.TestCase):
                         http_service.main(['--state', str(Path(tmp)/'state.json'), '--backend', 'inprocess', '--port', '0']
                                           + words)
                 self.assertEqual(made[0].LOGINS_PER_ADDRESS, share)
-        self.assertEqual(http_service.Service.LOGINS_PER_ADDRESS, 8)              # the class is not changed by a setting
+        self.assertEqual(http_service.Service.LOGINS_PER_ADDRESS, 4)              # the class is not changed by a setting
         for words, expected in (([], 100), (['--connections-per-address', '7'], 7), (['--connections-per-address', '200'], 200)):
             with self.folder() as tmp:
                 made = []

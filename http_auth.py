@@ -912,6 +912,8 @@ class Service:
         self.public_url = (public_url or '').rstrip('/') or None
         self._failures = {}
         self._logins_guard = threading.Lock()
+        self._logins_room = threading.Condition(self._logins_guard)   # told whenever a log-in ends
+        self._logins_waiting = {}        # address group -> its log-ins waiting for one of its places
         self._logins = 0
         self._logins_by_address = {}     # address group -> its log-ins in flight
         self.logins_turned_away = 0
@@ -1337,13 +1339,25 @@ class Service:
     #: Of those places, how many one client address may hold (its ``address_group``; the
     #: address is the forwarded one only when a trusted proxy sent it). Without it about 20
     #: looping connections from one address, with no credentials, held all 16 places and
-    #: kept every log-in out for as long as they ran (review of kittrial-5bb.170). Half:
-    #: an office behind one address is the ordinary case and must not meet the share when
-    #: its people log in together; one address still cannot take every place, two acting
-    #: together can. Whatever one address sends, eight places are left to the others, and
-    #: somebody with a place waits behind at most fifteen checks. 0: no share per address
-    #: (the service's own settings do not offer it: they take 1 to LOGINS_AT_ONCE).
-    LOGINS_PER_ADDRESS = 8
+    #: kept every log-in out for as long as they ran (review of kittrial-5bb.170). A quarter:
+    #: whatever one address sends, twelve places are left to the others, somebody with a
+    #: place waits behind at most fifteen checks, and it takes four addresses acting
+    #: together to fill them all. (Half was tried and measured: two addresses were then
+    #: enough, and a person at another address waited several seconds to not at all behind
+    #: one flooding address with a full audit log.) 0: no share per address (the service's
+    #: own settings do not offer it: they take 1 to LOGINS_AT_ONCE).
+    LOGINS_PER_ADDRESS = 4
+    #: A log-in over its address's share is not turned away at once: it waits this long for
+    #: one of its address's places. An office behind one router is one address, and its
+    #: people logging in together at nine in the morning are each checked in a tenth of a
+    #: second: the fifth to the tenth wait a moment and get in, where an instant refusal sent
+    #: six of ten away. A flooding address gains nothing: it still holds four places and no
+    #: more. After the wait the answer is the refusal it always was.
+    LOGIN_WAIT_SECONDS = 2.0
+    #: How many log-ins of one address may wait like that at once; one more is refused at
+    #: once. Each waiter holds its connection's thread, so this bounds what a flooding
+    #: address can park: 4 in flight and 12 waiting, however many connections it has.
+    LOGIN_WAITERS_PER_ADDRESS = 12
     LOGIN_BUSY_ADDRESS = ('Too many log-ins from your address are being checked at this moment. '
                           'Try again in a few seconds.')
 
@@ -1356,18 +1370,37 @@ class Service:
         connection has no limit per address; the places in all still bound it.
         """
         group = None if shared_source else address_group(source or 'local')
-        with self._logins_guard:
-            mine = self._logins_by_address.get(group, 0)
-            if group is not None and self.LOGINS_PER_ADDRESS and mine >= self.LOGINS_PER_ADDRESS:
-                refused = self.LOGIN_BUSY_ADDRESS
-                self.logins_turned_away_for_address += 1
-            elif self._logins >= self.LOGINS_AT_ONCE:
-                refused = self.LOGIN_BUSY
-            else:
-                refused = None
-                self._logins += 1
-                if group is not None:
-                    self._logins_by_address[group] = mine + 1
+        with self._logins_room:
+            until, waiting = None, False
+            while True:
+                mine = self._logins_by_address.get(group, 0)
+                if group is not None and self.LOGINS_PER_ADDRESS and mine >= self.LOGINS_PER_ADDRESS:
+                    # Over its address's share: a short wait for one of that address's places.
+                    if until is None:
+                        until = time.monotonic() + self.LOGIN_WAIT_SECONDS
+                        waiting = self._logins_waiting.get(group, 0) < self.LOGIN_WAITERS_PER_ADDRESS
+                        if waiting:
+                            self._logins_waiting[group] = self._logins_waiting.get(group, 0) + 1
+                    left = until - time.monotonic()
+                    if waiting and left > 0:
+                        self._logins_room.wait(left)
+                        continue
+                    refused = self.LOGIN_BUSY_ADDRESS
+                    self.logins_turned_away_for_address += 1
+                elif self._logins >= self.LOGINS_AT_ONCE:
+                    refused = self.LOGIN_BUSY
+                else:
+                    refused = None
+                    self._logins += 1
+                    if group is not None:
+                        self._logins_by_address[group] = mine + 1
+                break
+            if waiting:
+                parked = self._logins_waiting.get(group, 0) - 1
+                if parked > 0:
+                    self._logins_waiting[group] = parked
+                else:
+                    self._logins_waiting.pop(group, None)
             if refused:
                 self.logins_turned_away += 1
         if refused:
@@ -1378,7 +1411,7 @@ class Service:
         try:
             return self._login(username, password, source, request_id)
         finally:
-            with self._logins_guard:
+            with self._logins_room:
                 self._logins -= 1
                 if group is not None:
                     left = self._logins_by_address.get(group, 0) - 1
@@ -1386,6 +1419,7 @@ class Service:
                         self._logins_by_address[group] = left
                     else:
                         self._logins_by_address.pop(group, None)
+                self._logins_room.notify_all()            # a place is free: whoever waits for one of this address's looks again
 
     def _login(self, username, password, source, request_id):
         try:
