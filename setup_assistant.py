@@ -248,6 +248,12 @@ def build_config(
         config["host"] = request.host
         config["endpoint"] = request.endpoint
         config["root"] = request.root
+        # The interpreter that runs the endpoint on the SERVER. Only written when asked
+        # for: a config without it keeps the client's python3 default, and on RHEL 8 a
+        # bare python3 is platform-python 3.6, which cannot run the endpoint
+        # (kittrial-5bb.182).
+        if request.python:
+            config["python"] = request.python
     else:
         config["endpoint"] = request.endpoint
         config["root"] = request.root
@@ -646,7 +652,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--root", help="Beads runtime root on the server")
     parser.add_argument("--checkout", help="local checkout path recorded in the config")
     parser.add_argument("--actor", help="actor name/id; distinguishes actors in the default credential key")
-    parser.add_argument("--python", help="Python interpreter for the local transport")
+    parser.add_argument("--python",
+                        help="Python interpreter that runs the endpoint: on the server for the ssh "
+                             "transport, locally for the local transport (default: python3; an office "
+                             "install uses its bundled interpreter under install/current)")
     parser.add_argument("--service", action="append", default=[], metavar="NAME=ADDRESS",
                         help="optional project service address; repeatable")
     parser.add_argument("--credential-key",

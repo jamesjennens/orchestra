@@ -14,8 +14,9 @@ user site directory; not ``-I``, which would also drop the script's directory fr
 ``sys.path``). ``restrict`` leads the options so the user rc file and any capability a
 later OpenSSH adds are off by default.
 
-Why: ``client.py`` runs the endpoint as ``ssh HOST "python3 endpoint.py --root ROOT"``
-and the endpoint takes its HTTP authority from *its own* launch flags, so every
+Why: ``client.py`` runs the endpoint as ``ssh HOST "PYTHON endpoint.py --root ROOT"``,
+where ``PYTHON`` is the interpreter the client config names (``python3`` when it names
+none), and the endpoint takes its HTTP authority from *its own* launch flags, so every
 authority rule in the kit (the operator allowlist on host commands, writes that stay
 ``unverified``, the reserved comment prefixes, the HTTP actor-shape reservation) binds
 only a caller who cannot choose that command line. A contributor key with an ordinary
