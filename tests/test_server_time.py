@@ -12,6 +12,7 @@ import json
 import re
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -31,6 +32,14 @@ except ImportError:  # endpoint needs fcntl (POSIX)
     endpoint = None
 
 SHAPE = re.compile(r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\+00:00')
+
+#: The moment the service's clock is set to in the tests of the web service, and a minute later:
+#: a whole second of TODAY. They were a date written here (2026-10-06T07:50:12Z), and from the
+#: moment that date was a day old a stored answer of that time had run out on the service's real
+#: clock, so its retry was a new request: one test failed on every machine from then on.
+WRITE = float(int(time.time()))
+RETRY = WRITE + 60.0
+AT, AT_RETRY = http_authority.server_time(WRITE), http_authority.server_time(RETRY)
 
 
 class ClockTests(unittest.TestCase):
@@ -487,34 +496,34 @@ class HttpTests(test_http_agents.AgentHarness):
         self.assertNotIn('server_time', json.dumps(refused.data))
 
     def test_the_time_is_the_services_clock_where_no_endpoint_stands_behind_it(self):
-        with mock.patch.object(self.store, 'now', return_value=1791273012.4):
+        with mock.patch.object(self.store, 'now', return_value=WRITE + 0.4):
             made = self.request('POST', '/v1/accounts', {'username': 'zoe'}, token=self.admin, key='account-key-0001')
-        self.assertEqual((made.status, made.data['server_time']), (201, '2026-10-06T07:50:12+00:00'))
+        self.assertEqual((made.status, made.data['server_time']), (201, AT))
 
     def test_the_same_request_sent_again_is_answered_with_the_time_of_the_write(self):
         path = '/v1/projects/%s/tasks' % self.project
-        with mock.patch.object(self.store, 'now', return_value=1791273012.0):
+        with mock.patch.object(self.store, 'now', return_value=WRITE):
             first = self.request('POST', path, {'title': 'a task'}, token=self.admin, key='task-key-0002')
-        with mock.patch.object(self.store, 'now', return_value=1791273072.0):
+        with mock.patch.object(self.store, 'now', return_value=RETRY):
             again = self.request('POST', path, {'title': 'a task'}, token=self.admin, key='task-key-0002')
             other = self.request('POST', path, {'title': 'another'}, token=self.admin, key='task-key-0003')
         self.assertEqual((first.status, again.status), (201, 201))
-        self.assertEqual(first.data['server_time'], '2026-10-06T07:50:12+00:00')
+        self.assertEqual(first.data['server_time'], AT)
         self.assertEqual(again.data, first.data)
-        self.assertEqual(other.data['server_time'], '2026-10-06T07:51:12+00:00')
+        self.assertEqual(other.data['server_time'], AT_RETRY)
 
     def test_the_endpoints_time_is_passed_through_and_used_once(self):
         """On the endpoint backend the time is the endpoint's: its envelope's, not the service's clock."""
-        reply = {'returncode': 0, 'stdout': '{"id": "pp-1"}\n', 'stderr': '', 'server_time': '2026-10-06T07:50:12+00:00'}
+        reply = {'returncode': 0, 'stdout': '{"id": "pp-1"}\n', 'stderr': '', 'server_time': AT}
         self.assertEqual(http_service.EndpointBackend._checked(reply), {'id': 'pp-1'})
-        self.assertEqual(http_service.written_at(self.service), '2026-10-06T07:50:12+00:00')
+        self.assertEqual(http_service.written_at(self.service), AT)
         with mock.patch.object(self.store, 'now', return_value=1791277200.0):
             self.assertEqual(http_service.written_at(self.service), '2026-10-06T09:00:00+00:00')   # used once
         # A read's envelope has none, and a refusal's is not taken.
         http_service.EndpointBackend._checked({'returncode': 0, 'stdout': '[]\n', 'stderr': ''})
         with self.assertRaises(http_service.HttpError):
             http_service.EndpointBackend._checked({'returncode': 2, 'stdout': '', 'stderr': 'ValueError: no\n',
-                                                   'server_time': '2026-10-06T07:50:12+00:00'})
+                                                   'server_time': AT})
         with mock.patch.object(self.store, 'now', return_value=1791277200.0):
             self.assertEqual(http_service.written_at(self.service), '2026-10-06T09:00:00+00:00')
 
@@ -539,11 +548,11 @@ class HttpTests(test_http_agents.AgentHarness):
             connection.request('POST', '/v1/accounts', body=json.dumps({'username': username}), headers=headers)
             response = connection.getresponse()
             return response.status, json.loads(response.read())
-        with mock.patch.object(self.service, 'create_user', side_effect=fails_after_an_endpoint_write),                 mock.patch.object(self.store, 'now', return_value=1791273012.0):
+        with mock.patch.object(self.service, 'create_user', side_effect=fails_after_an_endpoint_write),                 mock.patch.object(self.store, 'now', return_value=WRITE):
             self.assertEqual(post('amy')[0], 409)
             status, made = post('amy')                            # the same connection, so the same thread
         self.assertEqual(left, [True])
-        self.assertEqual((status, made['server_time']), (201, '2026-10-06T07:50:12+00:00'))
+        self.assertEqual((status, made['server_time']), (201, AT))
 
 class HeaderTests(test_http_agents.AgentHarness):
     """`X-Server-Time`: the same value, on every carried-out write, whatever the shape of the body."""
@@ -588,15 +597,15 @@ class HeaderTests(test_http_agents.AgentHarness):
     def test_a_list_answer_has_the_header_and_its_retry_has_the_time_of_the_write(self):
         path = '/v1/projects/%s/tasks/%s' % (self.project, self.task)
         with self.list_answers():
-            with mock.patch.object(self.store, 'now', return_value=1791273012.0):
+            with mock.patch.object(self.store, 'now', return_value=WRITE):
                 first = self.request('PATCH', path, {'title': 'renamed', 'version': 1}, token=self.admin, key='change-key-0001')
-            with mock.patch.object(self.store, 'now', return_value=1791273072.0):
+            with mock.patch.object(self.store, 'now', return_value=RETRY):
                 again = self.request('PATCH', path, {'title': 'renamed', 'version': 1}, token=self.admin, key='change-key-0001')
                 other = self.request('PATCH', path, {'title': 'renamed twice', 'version': 2}, token=self.admin, key='change-key-0002')
         self.assertEqual((first.status, type(first.data)), (200, list))
-        self.assertEqual(self.stamp(first), '2026-10-06T07:50:12+00:00')
-        self.assertEqual((again.status, again.data, self.stamp(again)), (200, first.data, '2026-10-06T07:50:12+00:00'))
-        self.assertEqual(self.stamp(other), '2026-10-06T07:51:12+00:00')
+        self.assertEqual(self.stamp(first), AT)
+        self.assertEqual((again.status, again.data, self.stamp(again)), (200, first.data, AT))
+        self.assertEqual(self.stamp(other), AT_RETRY)
 
     def test_the_header_of_a_list_answer_is_the_endpoints_time_when_an_endpoint_wrote(self):
         """Not the service's clock: the endpoint's envelope said when the write was carried out."""
@@ -609,7 +618,7 @@ class HeaderTests(test_http_agents.AgentHarness):
             http_service.WRITTEN.at = '2026-10-06T07:49:59+00:00'       # what EndpointBackend._checked takes from the envelope
             return [result]
         path = '/v1/projects/%s/tasks/%s' % (self.project, self.task)
-        with mock.patch.object(self.backend, 'invoke', invoke), mock.patch.object(self.store, 'now', return_value=1791273012.0):
+        with mock.patch.object(self.backend, 'invoke', invoke), mock.patch.object(self.store, 'now', return_value=WRITE):
             first = self.request('PATCH', path, {'title': 'renamed', 'version': 1}, token=self.admin, key='change-key-0011')
             again = self.request('PATCH', path, {'title': 'renamed', 'version': 1}, token=self.admin, key='change-key-0011')
         self.assertEqual((type(first.data), self.stamp(first), self.stamp(again)),
@@ -624,8 +633,8 @@ class HeaderTests(test_http_agents.AgentHarness):
         self.assertIsNone(http_service.written_at(self.service))
         self.assertRegex(http_service.written_at(self.service), SHAPE)          # used once: the next write has the clock
         # A replayed answer that has its time keeps it.
-        http_service.EndpointBackend._checked(dict(reply, server_time='2026-10-06T07:50:12+00:00'))
-        self.assertEqual(http_service.written_at(self.service), '2026-10-06T07:50:12+00:00')
+        http_service.EndpointBackend._checked(dict(reply, server_time=AT))
+        self.assertEqual(http_service.written_at(self.service), AT)
         real = self.backend.invoke
 
         def replays(route, *args, **kwargs):
@@ -648,32 +657,32 @@ class HeaderTests(test_http_agents.AgentHarness):
         def with_its_time(route, *args, **kwargs):
             result = real(route, *args, **kwargs)
             return dict(result, server_time='2026-10-06T07:49:59+00:00') if route == 'tasks.create' else result
-        with mock.patch.object(self.backend, 'invoke', with_its_time), mock.patch.object(self.store, 'now', return_value=1791273012.0):
+        with mock.patch.object(self.backend, 'invoke', with_its_time), mock.patch.object(self.store, 'now', return_value=WRITE):
             made = self.request('POST', '/v1/projects/%s/tasks' % self.project, {'title': 'x'}, token=self.admin)
         self.assertEqual((made.data['server_time'], self.stamp(made)), ('2026-10-06T07:49:59+00:00', '2026-10-06T07:49:59+00:00'))
 
     def test_the_stored_answer_has_the_time_where_it_is_not_the_answer_that_was_sent(self):
         """An agent is made: the answer carries its secret once, what is stored for a retry does not. Both have the time."""
         body = {'name': 'Kestrel', 'working_directory': '/home/priya/work/kestrel'}
-        with mock.patch.object(self.store, 'now', return_value=1791273012.0):
+        with mock.patch.object(self.store, 'now', return_value=WRITE):
             first = self.request('POST', '/v1/agents', body, token=self.admin, key='agent-key-0001')
-        with mock.patch.object(self.store, 'now', return_value=1791273072.0):
+        with mock.patch.object(self.store, 'now', return_value=RETRY):
             again = self.request('POST', '/v1/agents', body, token=self.admin, key='agent-key-0001')
         self.assertEqual((first.status, first.data['server_time'], self.stamp(first)),
-                         (201, '2026-10-06T07:50:12+00:00', '2026-10-06T07:50:12+00:00'))
+                         (201, AT, AT))
         self.assertIn(again.status, (200, 201))
         self.assertNotEqual(again.data, first.data)                    # the secret is not delivered twice
         self.assertEqual((again.data.get('server_time'), self.stamp(again)),
-                         ('2026-10-06T07:50:12+00:00', '2026-10-06T07:50:12+00:00'))
+                         (AT, AT))
 
     def test_the_retry_of_an_object_answer_has_the_header_of_the_write(self):
         path = '/v1/projects/%s/tasks' % self.project
-        with mock.patch.object(self.store, 'now', return_value=1791273012.0):
+        with mock.patch.object(self.store, 'now', return_value=WRITE):
             first = self.request('POST', path, {'title': 'keyed'}, token=self.admin, key='task-key-0009')
-        with mock.patch.object(self.store, 'now', return_value=1791273072.0):
+        with mock.patch.object(self.store, 'now', return_value=RETRY):
             again = self.request('POST', path, {'title': 'keyed'}, token=self.admin, key='task-key-0009')
-        self.assertEqual(self.stamp(first), '2026-10-06T07:50:12+00:00')
-        self.assertEqual((again.data, self.stamp(again)), (first.data, '2026-10-06T07:50:12+00:00'))
+        self.assertEqual(self.stamp(first), AT)
+        self.assertEqual((again.data, self.stamp(again)), (first.data, AT))
 
     def test_an_answer_stored_before_the_time_was_kept_beside_it(self):
         """Its retry has the header from an object body's own field, and none where the body has no field."""
@@ -718,22 +727,21 @@ class HeaderTests(test_http_agents.AgentHarness):
         for state in ('in_progress', 'unknown'):
             self.store.records.put('idempotency', digest, {
                 'principal': principal.user_id, 'project_id': self.project, 'route': 'tasks.create x', 'request_hash': 'h',
-                'state': state, 'status': None, 'response': {'server_time': '2026-10-06T07:50:12+00:00'},
-                'written_at': '2026-10-06T07:50:12+00:00', 'expires_at': self.service._now() + 600})
+                'state': state, 'status': None, 'response': {'server_time': AT},
+                'written_at': AT, 'expires_at': self.service._now() + 600})
             self.assertIsNone(self.service.idempotency_written_at(principal, self.project, 'tasks.create x', 'held-key-0001'))
         record = self.store.records.get('idempotency', digest)
         record['state'] = 'committed'
         self.store.records.put('idempotency', digest, record)
         self.assertEqual(self.service.idempotency_written_at(principal, self.project, 'tasks.create x', 'held-key-0001'),
-                         '2026-10-06T07:50:12+00:00')
+                         AT)
 
 
 class ResultRowTests(test_http_agents.AgentHarness):
     """Review of revision 2: with the service's idempotency row gone or not committed and its result row there,
     the retry is answered from the result row, the endpoint is not asked, and the time was the service's clock at
     the retry (written 19:18:06, sent again 6 s later: 19:18:12)."""
-    WRITE, RETRY = 1791273012.0, 1791273072.0
-    AT = '2026-10-06T07:50:12+00:00'
+    WRITE, RETRY, AT = WRITE, RETRY, AT
 
     def setUp(self):
         super().setUp()
