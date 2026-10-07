@@ -123,6 +123,11 @@ class RecogniserTests(unittest.TestCase):
         self.assertIsNone(bd_refusals.refusal(1, json_error('wrote the row; its note cannot be empty, retrying'), ''))
         self.assertIsNone(bd_refusals.refusal(1, '[' * 3000, ''))                   # and never a RecursionError
 
+    def test_a_sentence_that_carries_the_callers_long_text_is_cut(self):
+        title = '-' + 'x' * 450
+        found = bd_refusals.refusal(1, '', 'Error: title "%s" looks like a flag (starts with \'-\').\n  Run \'bd create --help\'\n' % title)
+        self.assertEqual((INVALID, bd_refusals.SHOWN), (found[0], len(found[1])))
+
     def test_the_envelope_is_a_refusal_with_its_kind_and_bds_sentence(self):
         answer = bd_refusals.envelope(INVALID, 'title cannot be empty')
         self.assertEqual(answer, {'returncode': 2, 'stdout': '', 'stderr': 'ValueError: bd refused: title cannot be empty\n',
