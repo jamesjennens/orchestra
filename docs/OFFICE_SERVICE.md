@@ -128,13 +128,18 @@ interpreter. `install` verifies the artifact digest and inner archives, extracts
 to `releases/<ID>`, checks the bundled interpreter version and that bd and dolt
 start on this host, then switches
 `current` by atomic symlink rename. It preserves the prior release as
-`previous`. A repeated release ID is refused; install a new immutable ID.
+`previous`. A release ID names one build for good: another build under an ID
+that is installed is refused ("Release ID already installed, and what is
+installed under it is not this archive"); give it an ID of its own. The SAME
+release installed again is not unpacked a second time: see "Going forward again
+after a rollback" below.
 
 ```sh
 <INSTALLER_PYTHON> office_release.py install --archive <RELEASE_TARBALL> \
   --sha256 <RELEASE_SHA256> --install-root <INSTALL_ROOT>
 <INSTALLER_PYTHON> office_release.py verify --install-root <INSTALL_ROOT>
 <INSTALLER_PYTHON> office_release.py rollback --install-root <INSTALL_ROOT>
+<INSTALLER_PYTHON> office_release.py activate --install-root <INSTALL_ROOT> --release <ID>
 ```
 
 Stop the supervised process before switching releases, then start it from the
@@ -145,6 +150,35 @@ release active. Rollback switches code and interpreter; it never rolls back
 the mutable runtime. Preserve a verified backup before any upgrade whose state
 format changes. The support team's release record should include artifact
 digest, source commit, UAT verification output and the previous release ID.
+
+**Going forward again after a rollback.** `rollback` makes `previous` the current
+release and keeps the one it left as `previous`; that release stays installed
+under `releases/<ID>`. To return to it, or to any other release that is still
+installed:
+
+- `install` its archive again, exactly as the first time. The archive is checked
+  against `--sha256`; the installed release must be that archive (its stored
+  manifest is the archive's, byte for byte: the same build ID, source and
+  interpreter digests); the bundled interpreter, bd and dolt are started from the
+  installed release as a first install starts them; then `current` is switched to
+  it and what was current becomes `previous`. Nothing is unpacked or written under
+  `releases/`. It prints `Current release is now <ID> (it was installed already;
+  its manifest is this archive's)` and the restart reminder. If the release is
+  the current one already, it says so and changes nothing.
+- `activate --release <ID>` when the archive is no longer at hand: the same
+  start checks and the same switch, by the folder name under `releases/`. It
+  says that the release was not compared with an archive.
+
+`rollback` itself prints which of the two to use for the release it has just
+left. (Before kittrial-5bb.189 `install` answered `Release ID already installed`
+for it, and the only way forward was a second `rollback`, which swaps the two
+links back but which nothing mentioned, or a new build of the same source under
+another ID.) What these do not check: an installed release is not hashed file by
+file, because nothing but its manifest was stored to compare with; a release
+whose files were changed after it was installed is caught only if its interpreter,
+bd or dolt no longer start. As with every switch: stop the supervised process
+first and start it from the new `current`; `add-project`'s printed paths name a
+release where there is no `install/current` link and must be printed again.
 
 Binary pins on rollback. Roll back only to a release that knows both pinned bd
 archives. A release built before kittrial-5bb.161 knows only the `bd` (upstream)
@@ -438,6 +472,10 @@ taking the memory of the host or the log-in of everybody else:
   at this moment. Try again in a few seconds." At most 12 log-ins of one
   address wait like that at once (one more is refused at once), so an address
   parks at most 12 of the service's threads however many connections it has.
+  Parked log-ins have no bound of their own beyond those 12 per address: many
+  addresses can each park 12, and what bounds them in all is the 200
+  connections. A log-in that wakes when every one of the 16 places is taken is
+  answered like anybody else ("Too many people are logging in at this moment").
   `"logins_per_address": N` in the service configuration changes the share
   (1 to 16); the 2 seconds and the 12 are fixed.
 

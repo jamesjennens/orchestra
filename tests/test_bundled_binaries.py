@@ -350,13 +350,13 @@ class BuildCheckTests(ReleaseFixture):
         self.bundle('bd', self.KEEPS_WRITING)
         marker = self.base/'writer-ran'
         prefix = 'office-release-check-'
-        before = set(Path(tempfile.gettempdir()).glob(prefix+'*'))
+        before = set(self.scratch.glob(prefix+'*'))                 # the tool's own scratch folder (the fixture's setUp)
         with mock.patch.dict(os.environ, {'K166_MARKER': str(marker)}):
             done, output = self.try_build('leaves-an-event-lock')
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(done.stdout.strip(), '%s  %s' % (sha(output.read_bytes()), output))
         self.assertTrue(marker.exists(), 'the stub bd did not run its writer')
-        self.assertEqual(set(Path(tempfile.gettempdir()).glob(prefix+'*')) - before, set())
+        self.assertEqual(set(self.scratch.glob(prefix+'*')) - before, set())
 
     def test_a_scratch_that_cannot_be_removed_is_said_and_still_builds(self):
         """kittrial-5bb.166 item 4: cleanup never fails a build, but the build must say it stayed."""
@@ -561,10 +561,10 @@ class InstallCheckTests(ReleaseFixture):
         root = self.base/'installation'
         self.assertEqual(self.install(self.build('verify-scratch'), root).returncode, 0)
         prefix = 'office-release-verify-'
-        before = set(Path(tempfile.gettempdir()).glob(prefix+'*'))
+        before = set(self.scratch.glob(prefix+'*'))                 # the tool's own scratch folder (the fixture's setUp)
         verified = self.run_tool('verify', '--install-root', root)
         self.assertEqual(verified.returncode, 0, verified.stderr)
-        self.assertEqual(set(Path(tempfile.gettempdir()).glob(prefix+'*')) - before, set())
+        self.assertEqual(set(self.scratch.glob(prefix+'*')) - before, set())
 
 
 @unittest.skipUnless(LINUX, 'bootstrap installs Linux binaries only')

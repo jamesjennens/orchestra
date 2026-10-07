@@ -44,6 +44,32 @@ Handoff checks the expected current owner, journals the operation, records nativ
 
 When a handoff request exists, its task, original owner and destination are stored in the request journal. A completed direct transfer settles only the matching pending request. If the native owner update succeeded but its response was lost, an authorized retry reconciles the durable receipt before applying the current-owner check; conflicting request or receipt identities fail closed. Queue reads validate the full request journal before state or owner filtering so malformed records remain visible, including empty filtered pages.
 
+### Claim, handoff and the coordinator's take-over
+
+**The one who has a task changes in three ways, and they are not the same.**
+
+- A **claim** takes a task that is free and open. It never takes a task from somebody:
+  bd's own claim refuses a held task ("issue already claimed by NAME") and one that is
+  not open, on the host route (`update TASK --claim`) and over the web alike.
+- A **handoff** moves a task from its owner to another worker and leaves a trail: the
+  owner (or the receiver's request the owner accepts) runs `handoff TASK --file`, or an
+  operator with the owner's or coordinator's authorization runs `admin.py handoff`; the
+  operation is journalled and the task carries the intent and completion records.
+- A **take-over by the coordinator** is the plain update on the host route,
+  `update TASK --assignee ACTOR --status in_progress`. It only changes the row: no
+  record of who gave what to whom, no check that the old holder agreed, nothing in the
+  review chain. It is what a coordinator uses when a task must move and its holder is
+  gone or the task was never properly held; it is not refused, and there is no web
+  route for it. Prefer the handoff whenever the old holder or an operator can make one,
+  and say in a comment on the task why the row was changed when it was not.
+
+**A task that is in progress and has nobody.** A host update can leave a task
+`in_progress` with no assignee. It cannot be claimed, by anybody, on either route: bd
+answers "issue not claimable: status in_progress" (over the web: 409 "Task is not open
+(it is in progress)"). The coordinator settles it on the host route: gives it to
+somebody (`update TASK --assignee ACTOR`), or sets it open again (`update TASK --status
+open`), after which the first claim takes it. (Measured on bd 1.2.2.)
+
 ## Structured contribution delivery
 
 Read `b review example-task`. It returns `latest_comment_id`, the current contribution and unresolved review requests. Copy `latest_comment_id` into `previous` for every new operation; use null only for the first operation. Each new assertion has a new operation ID; uncertain retries retain the exact original payload/actor.

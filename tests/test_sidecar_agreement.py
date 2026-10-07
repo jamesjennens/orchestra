@@ -458,11 +458,27 @@ class ReadSidecarTests(unittest.TestCase):
     def test_the_descriptor_is_closed_when_the_type_check_refuses(self):
         fifo = self.base / 'alpha.coordination.json'
         os.mkfifo(str(fifo))
-        before = len(os.listdir('/proc/self/fd'))
+        target = os.path.realpath(str(fifo))
+
+        def left_open():
+            """The descriptors of this process that are open on the FIFO: what THIS test could leak.
+
+            It counted every descriptor of the process before and after and failed once in CI with
+            "577 != 729": descriptors that earlier tests had left were collected meanwhile, so there
+            were fewer afterwards (kittrial-5bb.186).
+            """
+            found = 0
+            for name in os.listdir('/proc/self/fd'):
+                try:
+                    found += os.readlink('/proc/self/fd/' + name) == target
+                except OSError:
+                    pass                                                # closed while we looked
+            return found
+        self.assertEqual(left_open(), 0)
         with patch.object(Path, 'is_file', return_value=True):          # reach the open and fstat
             for _ in range(20):
                 self.assertEqual(admin.read_sidecar(fifo), (None, 'it is not a regular file'))
-        self.assertEqual(len(os.listdir('/proc/self/fd')), before)
+        self.assertEqual(left_open(), 0)
 
     def deployment_with(self, **record):
         root = self.base / ('pins-%d' % len(list(self.base.iterdir())))

@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "operation_id": "caprev-f6f22e9029234a248fe90e70725f4c3e",
+  "revision": 5,
+  "expected_sha256": "db5ec9b95cf3ae251c63e8f51e9addddf27e24dc7ee888b29e99b17a4c575888",
+  "key": "http.task-write-fields",
+  "name": "What a task create and a task change take over HTTP",
+  "aliases": [
+    "task update fields",
+    "PATCH task unknown field",
+    "nothing to change",
+    "bind actor label",
+    "task actor binding",
+    "No updates specified"
+  ],
+  "summary": "Task create takes priority: an integer 0 to 4 (bd's default 2 when absent or null), passed to the endpoint on create and on change; a value outside that answers 422. Each write route refuses a field it does not take with 422 invalid_payload before the idempotency key is reserved, naming the field and what the route takes: task create and change, claim, checkpoint, member, worker credential, agent create, agent change, account create. The route judges the caller's right first, so a caller with no right keeps its 401/403/404; on the agent routes the refusal comes after the ownership lookup and the grant check. The table of what each route takes is the class attributes of ApiHandler beside _task_change (TASK_CREATE_FIELDS to ACCOUNT_CREATE_FIELDS, TASK_CHANGE_FIELDS); refuse_unknown_fields is the one refusal they share. A field a route takes whose value is null is absent; a field it does not take is refused whatever its value. EndpointBackend._command never builds a bd update with nothing in it, and Service.bind_actor binds an actor in a task write as claim, checkpoint and review do.",
+  "requirements": [],
+  "anchors": [
+    "docs/HTTP_DEPLOYMENT.md#what-a-task-change-takes"
+  ],
+  "code": [
+    "http_service.py::ApiHandler._task_change",
+    "http_service.py::refuse_unknown_fields",
+    "http_service.py::ApiHandler._bind_task_actor",
+    "http_service.py::ApiHandler.agents_create",
+    "http_service.py::ApiHandler.agents_update",
+    "http_service.py::EndpointBackend._command",
+    "http_service.py::InProcessBackend._task_create",
+    "http_auth.py::Service.check_agent_grant",
+    "http_auth.py::Service.bind_actor"
+  ],
+  "tests": [
+    "tests/test_http_field_table.py",
+    "tests/test_task_change_fields.py"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "http",
+    "tasks",
+    "identity"
+  ]
+}

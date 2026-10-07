@@ -1081,7 +1081,14 @@ A refusal keeps nothing: the idempotency key is free and no audit entry of outco
 **Taking a task over** is a separate, explicit act and has no web route today. An
 owner who needs a task moved asks the project's coordinator, who reassigns it on the
 host route (`update TASK --assignee ACTOR --status in_progress`); that plain update
-is not a claim and is not refused.
+is not a claim and is not refused. How it stands beside the handoff, which leaves a
+trail and should be preferred, is in docs/REVIEWS.md ("Claim, handoff and the
+coordinator's take-over") and docs/OPERATIONAL_WORKFLOW.md.
+
+**A task that is in progress with nobody** (a host update can leave one) cannot be
+claimed: bd answers "issue not claimable: status in_progress" and the route says 409
+"Task is not open (it is in progress)". The coordinator gives it to somebody or sets
+it open again on the host route; then the first claim takes it.
 
 Before kittrial-5bb.187 this route sent bd that plain update of status and assignee,
 and bd carried it out whatever the row was: a second member's claim took the task
@@ -1342,7 +1349,8 @@ checkpoint, member change, worker credential issue, agent create, agent change a
 create answer a body that carries a field the route does not take with **422 `invalid_payload`**,
 naming the field and the fields the route does take, with the names again in `error.detail`
 (`unsupported`, `takes`); nothing is written and the idempotency key is not reserved. A field
-whose value is null is treated as absent, and every body the released web and Python clients
+the route TAKES whose value is null is treated as absent; a field it does not take is refused
+whatever its value, null included. Every body the released web and Python clients
 send (`web/js/api.js`, `http_client.py`) is inside the route's set. Every one of these routes
 judges the caller's right first, so a caller with no right keeps its 401, 403 or 404 instead of
 being shown the route's field list.
