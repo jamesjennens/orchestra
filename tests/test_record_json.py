@@ -249,6 +249,8 @@ class NoUnguardedParseTests(unittest.TestCase):
         # coordination.py and one more in endpoint.py (kittrial-5bb.113 revision 2): the merge
         # slot row as bd prints it, whose metadata a contributor could once write.
         # reserved_comments.py (revision 3): the lines of a `dep add --file` list of edges.
+        # endpoint.py's fourth (kittrial-5bb.188): the rows of one `bd export --all`, read to
+        # judge a worker credential's name by the rows the project already holds.
         self.assertEqual({name: count for name, count in uses.items() if count}, {
             # admin.py reads the review-writes audit history through the guard
             # (kittrial-5bb.110 item 3): a deeply nested audit file used to crash
@@ -260,7 +262,7 @@ class NoUnguardedParseTests(unittest.TestCase):
             # The fourth (kittrial-5bb.191) reads the office service configuration that
             # `add-project --office-config` names, for its public_url: an operator's file.
             'admin.py': 4,
-            'briefing.py': 3, 'coordination.py': 3, 'endpoint.py': 3, 'export_requirements.py': 1, 'feedback.py': 3, 'guidance.py': 3,
+            'briefing.py': 3, 'coordination.py': 3, 'endpoint.py': 4, 'export_requirements.py': 1, 'feedback.py': 3, 'guidance.py': 3,
             'handoff.py': 1, 'http_service.py': 2, 'lifecycle.py': 1, 'recovery.py': 1, 'requirements.py': 1, 'reserved_comments.py': 1,
             'review_recommendations.py': 2, 'review_workflow.py': 4, 'work.py': 1, 'worker_gate.py': 1})
 

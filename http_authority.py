@@ -619,16 +619,23 @@ class AuthorityConfig:
     The trusted HTTP service passes these to the canonical endpoint as *launch*
     arguments, exactly as it passes ``--root``. They are never read from the request
     body, so an SSH-shaped request cannot redirect the live-authority read or make
-    ``file_lock`` create a lock at a caller-chosen path.
+    ``file_lock`` create a lock at a caller-chosen path. ``service_namespace`` is the
+    service's own actor namespace (``--actor-namespace``, default ``http``), carried for
+    the same reason: at use the endpoint must refuse a name the service was started under,
+    and only its launcher knows it (kittrial-5bb.188 item 3).
     """
 
-    __slots__ = ('store', 'lock')
+    __slots__ = ('store', 'lock', 'service_namespace')
 
-    def __init__(self, store, lock=None):
+    def __init__(self, store, lock=None, service_namespace=None):
         if not isinstance(store, str) or not store:
             raise ValueError('AuthorityConfig.store must be a non-empty path')
         self.store = store
         self.lock = lock or (store + '.lock')
+        if service_namespace is None:
+            import actor_names
+            service_namespace = actor_names.SERVICE_NAMESPACE
+        self.service_namespace = service_namespace
 
 
 def principal_key(request, authority_configured=False):
@@ -1978,12 +1985,28 @@ def descriptor_actor_denial(request, authority_config, reserved):
     * inside that credential's own namespace (``NAME`` or ``NAME/...``),
     * when the namespace is nobody else's (``actor_names.collision``): not a session actor
       of the project or a name of that shape, not a name on the operator or verifier
-      list, not the service's own namespace.
+      list, not the web service's own namespace -- the one it was launched with, which
+      ``AuthorityConfig.service_namespace`` carries (kittrial-5bb.188 item 3), not only
+      ``http`` -- and not a name that reads as another (a leading or trailing dot or
+      dash, an ``@host``).
+
+    A credential issued before kittrial-5bb.188 carries no ``actor_rows_checked`` mark, so
+    it is judged again by the project's own tracker rows (one bd export): a name the
+    tracker was already holding before the credential existed is somebody else's, and the
+    write is refused. Rows inside the lifetime of an earlier credential of the SAME name,
+    issued by the same owner for the same project and not itself refused by the row rule,
+    are not held against it (kittrial-5bb.188 item 3); a credential the kit has since
+    judged (``actor_rows_checked`` or ``actor_rows_refused``) or a superuser waived
+    (``actor_waived``) carries a settled outcome and is not read against the tracker again
+    (items 4 and 5). An export that yields no rows at all is a host fault answered
+    ``fault: "tracker"`` (item 1), never "the tracker holds nothing".
 
     ``reserved`` is called only when a namespace has to be judged and returns the host's
-    names (``sessions``, ``operators``, ``verifiers``). A request without a descriptor is
-    not judged here: on the SSH path there is none, and the service's own reads carry
-    none; a write the service sends without one is refused by ``run_guarded``.
+    names (``sessions``, ``operators``, ``verifiers``, and ``authors`` from the tracker
+    when asked with ``rows=`` and the earlier credentials' lifetimes with ``own=``). A
+    request without a descriptor is not judged here: on the SSH path there is none, and the
+    service's own reads carry none; a write the service sends without one is refused by
+    ``run_guarded``.
     """
     if authority_config is None:
         return None
@@ -2007,7 +2030,30 @@ def descriptor_actor_denial(request, authority_config, reserved):
     if not actor_names.inside(actor, namespace):
         return _envelope(126, stderr='The actor is outside the namespace of the credential the live-authority '
                                      'descriptor names\n', authority_status=403)
-    reason = actor_names.collision(namespace, **reserved())
+    service = getattr(authority_config, 'service_namespace', actor_names.SERVICE_NAMESPACE)
+    service = (service, actor_names.SERVICE_NAMESPACE)
+    reason = actor_names.collision(namespace, service=service, **reserved())
+    if reason is None and credential.get('actor_rows_refused'):
+        # Judged by the rows at an earlier write and refused then: refuse again without a
+        # read (kittrial-5bb.188 item 5). The stored reason is the kit's own rule word.
+        stored = credential.get('actor_rows_refused')
+        reason = stored if isinstance(stored, str) and stored else actor_names.ROWS
+    elif reason is None and not (credential.get('actor_rows_checked') or credential.get('actor_waived')):
+        # Issued before the row rule, or never judged: the project's own rows decide
+        # (kittrial-5bb.188 items 1 and 5). Rows inside an earlier same-name credential's own
+        # lifetime that the row rule did not refuse are not held against this one (item 3);
+        # a superuser's waiver (item 4) is its own settled mark and skips this.
+        issued = credential.get('created_at')
+        own = actor_names.own_intervals(state.get('credentials') or {}, namespace,
+                                        credential.get('user_id'), credential.get('project_id'),
+                                        exclude=authority.get('credential_id'))
+        try:
+            reason = actor_names.collision(namespace, service=service,
+                                           **reserved(rows=issued if isinstance(issued, str) and issued else True,
+                                                      own=own))
+        except actor_names.TrackerUnreadable as unreadable:
+            # Not a refusal of the request: the tracker could not be read (item 1).
+            return _envelope(2, stderr='%s\n' % unreadable, fault='tracker')
     if reason is not None:
         return _envelope(126, stderr='%s\n' % actor_names.refusal(namespace, reason), authority_status=403)
     return None

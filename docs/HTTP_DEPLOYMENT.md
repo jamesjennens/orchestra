@@ -1105,15 +1105,30 @@ as a real installation does.
 A worker credential writes under the actor namespace its issuer chose (`actor` when it
 is issued): `NAME`, or a label `NAME/...`. The tracker's rows carry that name and
 nothing else, and the review workflow asks "is the caller the assignee, is it the
-author" of the name. So the name must be nobody else's (kittrial-5bb.184). A namespace
-is refused when its head, the part before the first `/`, compared without regard to
-case, is the head of:
+author" of the name. So the name must be nobody else's (kittrial-5bb.184, extended by
+kittrial-5bb.188). A namespace is refused when its head, the part before the first `/`,
+compared without regard to case, is the head of:
 
+- a name the project's tracker already holds as an author or assignee
+  (kittrial-5bb.188): a plain host name is somebody on this host even when it is
+  neither a registered session nor on a list, so a name that already writes rows may
+  not be taken by a credential;
 - a session actor registered in the project;
 - any name with the shape of a session actor (`session-<uuid>`), registered or not: the
   server makes those;
 - a name on the operator list or the verifier list of the installation;
-- the web service's own namespace (`http`, or what `--actor-namespace` set).
+- the web service's own namespace (`http`, or what `--actor-namespace` set), at issue
+  and, since kittrial-5bb.188, at use too: the endpoint backend is launched with the
+  namespace the service was started under and refuses it beside `http`, and the
+  in-process backend refuses the namespace it was built with. So a credential issued
+  before this under `NS/...` stops when the service runs `--actor-namespace NS`, and
+  `admin.py credential-actors --service-namespace NS` is the listing that names it.
+
+A name that *reads* as another is refused as well (kittrial-5bb.188): a head that
+begins or ends with `.` or `-`, or that carries an `@` (`im2-coordinator.`,
+`im2-coordinator-`, `im2-coordinator@desk`). The review workflow reads those as authors
+other than `im2-coordinator`; the kit refuses them rather than choosing a normal form
+that would silently rename somebody.
 
 A name with the shape of another account's or agent's id was already refused. A
 credential without `actor` writes under its issuer's own account id, as before.
@@ -1123,7 +1138,32 @@ credential cannot write as NAME: that is a name on the operator list. Choose ano
 name.", with the rule in `error.detail` and never another name of the host's. Nothing
 is kept, the idempotency key included. Only somebody who may issue a credential is
 told: a contributor is answered 403 and an outsider 404 whatever the name. If the host
-cannot be asked, nothing is issued.
+cannot be asked, nothing is issued. **Cost of the row read:** judging a name by the
+project's rows is one `bd export --all` for that project (one bd process against its
+running database), paid once per issue attempt and never by an ordinary write: see
+"Credentials that already have such a name" below. **An answer that is not a whole
+tracker is a host fault, not a tracker with no names** (kittrial-5bb.188 review of item 1;
+revision-3 item 3(1)): every project this kit makes holds at least the merge slot, so a
+`bd export --all` that exits 0 and prints nothing, a line cut short, a nonzero exit, text
+that is not rows, or rows **without the merge-slot row** answers **503 `unavailable`**,
+"The tracker could not be read just now. Nothing was changed; try again shortly.", and the
+idempotency key is free. The same broken answer at use is the same 503, never 422. A
+superuser may pass `"allow_actor": true` together with `"allow_actor_reason"` -- 1 to 500
+characters saying WHY, which must pass the kit's plain-text rule (`guidance`'s: no control,
+bidi, zero-width, C1, tag or variation-selector character; a tab, newline or carriage
+return is allowed) -- to take a name the tracker already holds. Only that rule is waived,
+never a session, an operator, a verifier or the service's own namespace. Anybody else
+sending `allow_actor` is answered 403, a value that is not true or false is 422, a missing,
+empty, longer-than-500 or hidden-character reason is 422, and a reason with no waiver is
+422. The waiver is recorded on the credential as its
+own mark (`actor_waived`, holding `by`, `reason` and `at`) and **not** as
+`actor_rows_checked`; the audit entry is a `credentials.issue` whose reason says a waiver
+was used and why ("waiver used for worker credential actor NAME: WHY"), with the waiving
+account in the same entry; and the owner's credential list carries `actor_waived` and
+`actor_allowed` ("allowed by NAME on DATE"), with `actor_refused` null.
+`admin.py credential-actors` shows the same: `collides` null,
+`refused_when_it_writes` false, `waived` true and the who/why/when fields. A waived
+credential writes.
 
 **At use**, the endpoint itself refuses: a request the web service sends with its
 descriptor under a name that does not have the shape of a web id is written only by a
@@ -1136,6 +1176,60 @@ list afterwards (and it writes again when the name is taken off). It still READS
 reads carry no name into the tracker. A signed-in account and an agent write under
 their own id as before; over SSH nothing changes.
 
+**A credential's own rows are not held against it.** A credential issued by this code
+records that the tracker was read and the name was free when it was issued (or that a
+superuser waived the row rule): from then on every row under that name is its own, and no
+write of its reads the tracker at all. A credential that carries no such record -- one
+issued by an earlier kit -- is judged by the tracker **once, at its first write after the
+upgrade**, by the rows older than the moment it was issued (a row within five minutes of
+it counts as its own, because the credential's stamp is the web service's clock and a
+row's is the host's). The outcome is then kept ON THE CREDENTIAL: `actor_rows_checked`
+when the name was free, or `actor_rows_refused` (the rule word) when the tracker held it.
+Every later write reads no tracker, and a refused one is refused without one, so an old
+credential pays that one `bd export --all` once and not on every write. The marks are
+written by the service, which owns the state; there is no route that changes a credential
+(`PATCH`/`PUT` are 404) and the issue route takes no such field, so the keeping cannot be
+reached from a request. A **concurrent first write** may run the export twice; both
+answer the same way and write the same mark, so the outcome is idempotent. An export that
+answers no rows at all is the host fault above: 503, nothing written, and no mark kept. A
+credential the settle marked refused is shown as refused in the owner's list even though
+that list reads no rows from the host: it reads the stored `actor_rows_refused` mark
+(revision-3 item 3(3)).
+
+**Renewing a credential under its own name is not a collision** (kittrial-5bb.188 item
+3). The row rule above is about *somebody else's* rows; an owner renewing the name its own
+credential wrote as is not taking somebody else's name. Rows are therefore not held
+against a new credential of the same head, same owner and same project when they lie
+inside an earlier credential's own lifetime. How that is known: the state keeps each
+credential's issuer, namespace, project, issuance (`created_at`/`issued_raw`), revocation
+time (`revoked_at`) and expiry (`expires_at`); an earlier credential lends the window from
+its issuance to the **earlier of its revocation and its expiry**, and only when the row
+rule did not refuse it (`actor_rows_refused` absent). A predecessor that merely EXPIRED
+therefore stops lending its name at the expiry, even though it was never revoked
+(revision-3 item 1), and the five-minute clock allowance is only for the START of the
+life: a row after the lifetime ends is never that credential's own (revision-3 item 1).
+It **fails closed** when any of that cannot be read -- no predecessor, a different owner
+or project, an unreadable issuance, a revoked credential with no revocation time, a
+present-but-unreadable expiry, or a predecessor the rule refused all lend nothing, so the
+rows stay somebody else's and the name is refused. A renewal is still refused when the
+tracker holds rows older than the predecessor (the host actor's own rows), because those
+are outside its lifetime.
+
+**What the rule does not hold, and does not cover.** Not held, by design: a name the
+tracker knows only from a task it **closed** or a task it **changed** (the tracker's
+events are not in `bd export --all`); rows in **another project** of the installation
+(the rule is per project); an old credential whose name the tracker holds only as an
+**assignee** on a row whose `updated_at` is after the credential was issued (an assignee
+is dated by `updated_at`, per `actor_names.tracker_marks`); and a row up to **300 s**
+older than an old credential, which counts as its own (the issuance-stamp allowance).
+These are stated, not closed. **Not covered** are the look-alike names that are still
+issued because they are neither a leading/trailing dot or dash nor an `@host`: a trailing
+underscore (`opus-worker-lane_`), a doubled dash or dot (`opus--worker-lane`,
+`opus..worker-lane`), a dash/underscore/dot swap (`opus_worker_lane`, `opus.worker.lane`),
+an added digit (`opus-worker-lane2`), a `0` for an `o` (`im2-coordinat0r`), and a label
+with a trailing dot under a good head (`night-crew/x.`). They are listed as not covered
+rather than refused, so an operator knows the rule's edge.
+
 **Before this**, a project owner could issue a credential named as the host
 coordinator's session and with it create a task, claim one, contribute, answer the
 changes requested of the coordinator on the coordinator's own task and write its
@@ -1146,21 +1240,48 @@ the operation journal keeps the credential's id beside the actor for about 30 da
 
 **Credentials that already have such a name.** The list of a project's credentials
 (`GET .../worker-credentials`) carries `actor_refused` for each: `null`, or the
-sentence. The owner revokes it and issues one under another name. For the whole
+sentence. The owner revokes it and issues one under another name. That list asks the
+host only for the cheap rules (sessions, the lists, the service's namespace) and does
+NOT read the tracker, so it stays a cheap page: a credential refused for the rows alone
+is named by the host command below, which is an operator's read. For the whole
 installation an operator runs, on the host:
 
 ```sh
 python3 admin.py --root /path/to/runtime credential-actors --state /path/to/http-state.json
 ```
 
+Add `--service-namespace NS` when the service was started with `--actor-namespace NS`
+(without it the command judges `http` only, and a credential named under `NS` is not
+marked).
+
 It reads and changes nothing. For every worker credential with a name it prints the
 project, the label, the name, who issued it, when it was last used, `collides` (the
 rule, or `null`), and `tracker_rows`: whether the project's tracker already has rows
-under that name. For a name that collides those rows may be the real actor's or the
-credential's. For a name that does not, they are what a credential under that name
-wrote, or an actor from before sessions were registered: the kit does not refuse such
-a name (a credential reissued under its own earlier name must still work, and the rows
-cannot tell the two apart), so it is worth a look when nobody remembers issuing it.
+under that name. `collides` holds the row rule too, judged the same way the endpoint
+judges it (the rows older than the credential's own issuance), so a credential issued by
+an earlier kit under a plain name the project was already using is listed as refused,
+while the rows a credential wrote itself are not held against it. For a name that does
+not collide, `tracker_rows` still says whether the tracker holds rows under it: what a
+credential under that name wrote, or an actor from before sessions were registered. That
+is worth a look when nobody remembers issuing it.
+
+**Who may ask whether a name is taken.** The endpoint's `actor-standing` answers a
+caller with the rule word only (`null`, or which rule) and never the host's names, no
+session id and no list contents. Asked with `tracker`, it ALSO reads the project's rows
+(one `bd export --all`); the answer is the same rule word either way, never a name from
+the rows. Because that read costs a whole export, **`tracker` is refused unless the
+caller is the web service**: the flag is read only when the endpoint was launched with
+the service's authority store, so a host client over SSH (whose wrapper refuses every
+launch flag) cannot make the endpoint read a tracker by sending it, and it is answered
+422 "actor-standing with rows is for the web service only; nothing was changed". The
+owner's own list and the issue route's row read are the service's, which is why the
+answer exists at all. Over the web only somebody who may administer the project is told:
+a contributor is answered 403 and an outsider 404 whatever the name. kittrial-5bb.188
+item 5 was the owner's question whether the host route should tell everybody; the
+recommendation left with that task is to keep the cheap answer as it is, and, if it is
+narrowed, to gate it on the live-authority descriptor that only the web service presents,
+leaving the SSH path alone. No decision is built here beyond the service-only rule read.
+
 
 ### What an agent needs to write a checkpoint
 

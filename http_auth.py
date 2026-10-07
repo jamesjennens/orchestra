@@ -1985,7 +1985,7 @@ class Service:
 
     # -- worker credentials ----------------------------------------------------
     def issue_credential(self, principal, project_id, *, label=None, scopes=None,
-                         actor=None, request_id=None):
+                         actor=None, request_id=None, actor_checked=False, actor_waived=None):
         if principal is None or principal.via == 'credential':
             raise forbidden('A worker credential cannot issue another credential')
         with self.store.lock:
@@ -2020,6 +2020,12 @@ class Service:
                 'label': label or 'worker',
                 'scopes': list(requested),
                 'actor': actor,
+                # The backend read the project's tracker rows and this name was free when it
+                # was issued: every row under it from now on is this credential's own, so no
+                # later write needs to read the tracker again (kittrial-5bb.188 item 1). A
+                # credential issued before that rule has no mark and is judged against the
+                # tracker ONCE, at its first write (item 5).
+                'actor_rows_checked': bool(actor_checked),
                 'token_hash': token_hash(secret),
                 'created_at': now_iso(self._now()),
                 'issued_raw': self._raw_now(),
@@ -2027,20 +2033,36 @@ class Service:
                 'expires_at': moment + self.credential_ttl,
                 'revoked': False,
             }
+            if isinstance(actor_waived, dict):
+                # A superuser allowed a name the tracker already holds (kittrial-5bb.188 item
+                # 4). Its own mark, NOT actor_rows_checked: who used the waiver, why, and when.
+                credential['actor_waived'] = {
+                    'by': actor_waived.get('by'),
+                    'reason': actor_waived.get('reason'),
+                    'at': now_iso(self._now()),
+                }
             self.state['credentials'][credential['id']] = credential
             self.state['credential_tokens'][token_hash(secret)] = credential['id']
             self.store.save()
-        return {'id': credential['id'], 'project': project_id, 'label': credential['label'],
-                'scopes': list(requested), 'actor': actor, 'secret': secret,
-                'expires_at': now_iso(credential['expires_at']), 'secret_available': True}
+        answer = {'id': credential['id'], 'project': project_id, 'label': credential['label'],
+                  'scopes': list(requested), 'actor': actor, 'secret': secret,
+                  'expires_at': now_iso(credential['expires_at']), 'secret_available': True}
+        if 'actor_waived' in credential:
+            answer['actor_waived'] = dict(credential['actor_waived'])
+        return answer
 
     def credential_view(self, credential):
-        return {'id': credential['id'], 'project': credential['project_id'],
+        view = {'id': credential['id'], 'project': credential['project_id'],
                 'agent': credential.get('agent_id'),
                 'label': credential['label'], 'scopes': list(credential['scopes']),
                 'actor': credential.get('actor'), 'revoked': credential['revoked'],
                 'created_at': credential['created_at'], 'last_used': credential.get('last_used'),
                 'expires_at': now_iso(credential['expires_at'])}
+        # A waived name is shown as allowed, by whom and when (kittrial-5bb.188 item 4): it is
+        # not colliding and it does write. Never actor_rows_checked: the two are distinct.
+        if isinstance(credential.get('actor_waived'), dict):
+            view['actor_waived'] = dict(credential['actor_waived'])
+        return view
 
     def revoke_credential(self, principal, project_id, credential_id, request_id=None):
         if principal is None or principal.via == 'credential':
@@ -2057,6 +2079,10 @@ class Service:
             if credential['revoked']:
                 return {'id': credential_id, 'revoked': True}
             credential['revoked'] = True
+            # The revocation instant bounds a later renewal's claim to this credential's rows
+            # (kittrial-5bb.188 item 3). A record revoked before this field existed carries no
+            # time and lends nothing, which is the fail-closed reading.
+            credential['revoked_at'] = now_iso(self._now())
             self.store.save()
         return {'id': credential_id, 'revoked': True}
 
@@ -2110,6 +2136,10 @@ class Service:
                 view = self.credential_view(credential)
                 view['user_id'] = credential.get('user_id')
                 view['user_name'] = self._owner_name(credential.get('user_id'))
+                if isinstance(view.get('actor_waived'), dict):
+                    # The owner list names the person who allowed the name, not only their id
+                    # (kittrial-5bb.188 item 4).
+                    view['actor_waived']['by_name'] = self._owner_name(view['actor_waived'].get('by'))
                 items.append(view)
         items.sort(key=lambda c: (c['created_at'] or '', c['id']))
         return items
