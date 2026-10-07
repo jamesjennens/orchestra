@@ -353,17 +353,28 @@ class ShareTests(Held):
         self.assertEqual(refused.exception.message, self.service.LOGIN_BUSY)
         self.assertEqual(self.service.logins_turned_away_for_address, 0)
 
-    def test_over_http_the_address_is_the_one_the_request_came_from(self):
+    def test_over_http_the_refusal_is_503_busy_with_retry_after_and_the_same_for_any_name(self):
+        """Asked with the service's method as the web route asks it, for a client address (the harness itself
+        connects from the service's own host, which has no share: tests/test_address_limit.py has that over HTTP)."""
         self.service.LOGINS_PER_ADDRESS = 1
-        release, entered, threads, answers = self.held(4, source='127.0.0.1', count=1)
-        bodies = []
+        release, entered, threads, answers = self.held(4, source=self.ONE, count=1)
+        errors = []
         for name, password in ((ADMIN, PASSWORD), ('nobody-at-all', 'x' * 12)):
-            answer = self.request('POST', '/v1/sessions', {'username': name, 'password': password})
-            self.assertEqual((answer.status, answer.headers.get('retry-after')), (503, '5'))
-            bodies.append(dict(answer.data['error']))
-        self.assertEqual(bodies[0], bodies[1])
-        self.assertEqual(bodies[0], {'code': 'busy', 'message': self.service.LOGIN_BUSY_ADDRESS})
+            with self.assertRaises(HttpError) as refused:
+                self.service.login(name, password, source=self.ONE, shared_source=False)
+            errors.append((refused.exception.status, refused.exception.code, refused.exception.message, refused.exception.retry_after))
+        self.assertEqual(errors[0], errors[1])
+        self.assertEqual(errors[0], (503, 'busy', self.service.LOGIN_BUSY_ADDRESS, 5))
         self.assertEqual(self.service.logins_turned_away_for_address, 2)
+
+    def test_over_http_a_log_in_from_the_services_own_host_is_not_held_to_a_share(self):
+        self.service.LOGINS_PER_ADDRESS = 1
+        with self.service._logins_guard:
+            self.service._logins_by_address['127.0.0.1'] = 1          # as if one counted log-in of that address were in flight
+        for _ in range(3):
+            answer = self.request('POST', '/v1/sessions', {'username': ADMIN, 'password': PASSWORD})
+            self.assertEqual(answer.status, 201, answer.data)
+        self.assertEqual((self.service.logins_turned_away, self.service._logins_by_address), (0, {'127.0.0.1': 1}))
 
     def test_a_log_in_that_ends_in_any_way_gives_the_address_its_place_back(self):
         self.service.LOGINS_PER_ADDRESS = 1

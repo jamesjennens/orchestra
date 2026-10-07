@@ -433,17 +433,40 @@ class ProxyTests(AddressCase):
             self.assertEqual(self.forwarded(FAR, method='POST', path='/v1/sessions', body=body)[0], 201)
             self.assertEqual(self.forwarded('not an address', method='POST', path='/v1/sessions', body=body)[0], 201)
             self.assertEqual(self.get(B, method='POST', path='/v1/sessions', body=body)[0], 201)
-        self.assertEqual(seen, [(PROXY, True), (FAR, False), (PROXY, True), (B, False)])
-        # With the share at one and a log-in from the tunnel address held in flight, another from it still gets in.
+        # B is the service's own host too (a loopback address that is not the named proxy): shared as well.
+        self.assertEqual(seen, [(PROXY, True), (FAR, False), (PROXY, True), (B, True)])
+        # With the share at one and as if one counted log-in of each address were in flight: from the tunnel
+        # address and from the host itself another still gets in; a forwarded client address is held to its share.
         self.service.LOGINS_PER_ADDRESS = 1
         with self.service._logins_guard:
-            self.service._logins_by_address[PROXY] = 1                # as if one counted log-in of that address were in flight
+            self.service._logins_by_address.update({PROXY: 1, B: 1, FAR: 1})
         self.assertEqual(self.get(PROXY, method='POST', path='/v1/sessions', body=body)[0], 201)
         self.assertEqual(self.get(B, method='POST', path='/v1/sessions', body=body)[0], 201)
-        with self.service._logins_guard:
-            self.service._logins_by_address[B] = 1
-        status, answer, _ = self.get(B, method='POST', path='/v1/sessions', body=body)
+        status, answer, _ = self.forwarded(FAR, method='POST', path='/v1/sessions', body=body)
         self.assertEqual((status, answer['error']['message']), (503, self.service.LOGIN_BUSY_ADDRESS))
+        self.assertEqual(self.forwarded(OTHER, method='POST', path='/v1/sessions', body=body)[0], 201)
+
+    @needs_addresses
+    def test_with_no_proxy_named_the_services_own_host_is_shared_and_ten_at_once_get_in(self):
+        """The loopback default with no trusted_proxies at all: the other shape of a first install."""
+        self.serve(client_seconds=30)
+        self.service.LOGINS_PER_ADDRESS = 2                       # far below ten, to show that it is not what holds them
+        body = {'username': ADMIN, 'password': PASSWORD}
+        results, barrier = [], threading.Barrier(10)
+
+        def one(address):
+            barrier.wait(30)
+            results.append(self.get(address, method='POST', path='/v1/sessions', body=body)[0])
+        people = [threading.Thread(target=one, args=('127.0.0.1' if index % 2 else A,)) for index in range(10)]
+        for person in people:
+            person.start()
+        for person in people:
+            person.join(60)
+        self.assertEqual(sorted(results), [201] * 10)
+        self.assertEqual((self.service.logins_turned_away, self.service._logins_by_address), (0, {}))
+        # A forwarded header from the host itself is not believed where no proxy is named: still the host, still shared.
+        self.assertEqual(self.get(A, method='POST', path='/v1/sessions', body=body, headers={'X-Forwarded-For': FAR})[0], 201)
+        self.assertEqual(self.service._logins_by_address, {})
 
     @needs_addresses
     def test_no_limit_per_forwarded_address_when_it_is_set_to_nought(self):

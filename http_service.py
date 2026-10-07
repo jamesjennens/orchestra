@@ -2744,6 +2744,26 @@ class ApiHandler(BaseHTTPRequestHandler):
             return value.split(',')[0].strip().lower()
         return None
 
+    def _source_is_shared(self):
+        """Whether this request's source is an address everybody arrives from, not one client's.
+
+        True where no client address was forwarded and the peer is the service's own host
+        (loopback: the SSH tunnel of a first install, or a proxy on the host that was not
+        named) or a trusted proxy. In both the people behind it cannot be told apart, so a
+        share per address would be one share for all of them: ten people logging in at nine
+        in the morning would be turned away for each other. Such a log-in is held to the
+        places in all only. With a forwarded address from a trusted proxy the source is that
+        client's, and it has its share.
+        """
+        if self._forwarded_group() is not None:
+            return False
+        if self._peer_is_trusted_proxy():
+            return True
+        try:
+            return ipaddress.ip_address(self._peer_address().split('%', 1)[0]).is_loopback
+        except ValueError:
+            return False
+
     def _forwarded_group(self):
         """The address group a trusted proxy forwarded this request for; None for any other request."""
         if not self._peer_is_trusted_proxy():
@@ -3231,11 +3251,9 @@ class ApiHandler(BaseHTTPRequestHandler):
     @route('POST', r'/v1/sessions', anonymous=True, csrf=False)
     def sessions_create(self, ctx):
         payload = ctx.payload or {}
-        # Everybody behind a trusted proxy that forwards no address (the SSH tunnel) arrives from the
-        # proxy's own address: that is not one client, and has no share per address of the log-in places.
         result = self.service.login(payload.get('username'), payload.get('password'),
                                     source=self._source(), request_id=ctx.request_id,
-                                    shared_source=self._peer_is_trusted_proxy() and self._forwarded_group() is None)
+                                    shared_source=self._source_is_shared())
         self._set_cookie_token = result['session_token']
         self._current_request_id = ctx.request_id
         return 201, {'session': {'token': result['session_token'],
