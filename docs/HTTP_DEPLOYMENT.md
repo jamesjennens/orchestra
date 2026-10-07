@@ -1215,6 +1215,43 @@ reused with a different request payload": send the corrected request with a new
 key. An operator has nothing to clean up; the `unknown` audit entries of that time
 record requests that changed nothing.
 
+**A task's title**, on create and on a change, is text, not blank, and at most 500
+characters (bd's own limit). Anything else answers 422 before the key is looked at:
+"Task title must be text and not empty", "Task title must be 500 characters or less
+(it has 600)". A description that is not text is refused the same way.
+
+**When bd itself refuses** (kittrial-5bb.185). bd says no in several forms: a JSON
+object `{"error": ...}` with exit 1, a line `Error: ...` on standard error, and for a
+row it cannot find `Error resolving ID: no issue found matching ...`. The endpoint
+handed bd's exit code on as it came, everything that was not 0 was kept as an
+operation whose outcome is unknown, and the caller was told **503 "The operation may
+have committed; reconcile with the same idempotency key"** for an empty title, a
+title of 600 characters or a task that does not exist, with the key kept and an
+audit entry of outcome `unknown` each time. Now:
+
+- a refusal bd makes before it writes is a refusal: the endpoint answers return code
+  2 with bd's sentence and releases the operation identity; the service answers **404
+  "Task not found"** when bd found no row of that name and **422** with bd's sentence
+  otherwise. Nothing is kept, the key serves the corrected request, and no `unknown`
+  entry is written;
+- a refusal is recognised by its form AND its sentence together (`bd_refusals.py`):
+  "no issue found matching", "validation failed for issue", "... cannot be empty",
+  "invalid priority" and "invalid status", a title that "looks like a flag". A failure that merely has the form of a refusal (a JSON
+  error with another sentence, the database's own sentence) is **still an outcome
+  nobody knows**, as before: that is the side to err on. A bd that changes its
+  sentences falls back to that, and `tests/test_bd_refusals.py` notices it when it
+  runs against a real bd;
+- **a read is never said to "may have committed"**. A task that does not exist is 404
+  on every task route (read, change, claim, checkpoint, review); any other read of
+  the tracker that fails answers **503 `unavailable`**, "The tracker could not be
+  read just now. Nothing was changed; try again shortly.", and a key sent with it
+  is free.
+
+A key that was left reserved by such an answer before this: the same request is now
+answered 422 or 404 before the key is looked at; the key lapses a day after it was
+first used; until then a different body under it answers 409, and the corrected
+request goes with a new key.
+
 **The actor of a task write is the caller's own.** Task create and task change take
 an optional `actor`, the attribution label, under the rule of a claim, a checkpoint
 and a review: a signed-in member may name only their own account; a worker

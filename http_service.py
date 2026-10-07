@@ -1138,9 +1138,14 @@ def refuse_unknown_fields(payload, allowed, where, takes=None):
     unknown = sorted(str(name) for name in set(payload) - set(allowed))
     if not unknown:
         return
+    # The names in the detail are cut as the sentence cuts them (review of kittrial-5bb.181, done
+    # for a task change in kittrial-5bb.185 and here for every route that uses this): a name is
+    # given back only when it is a plain identifier, never a 300-character or a made-up one whole.
     raise invalid('%s does not take: %s. %s takes: %s'
                   % (where, unsupported_fields_text(unknown), where, ', '.join(named)),
-                  {'unsupported': unknown[:UNSUPPORTED_FIELDS_SHOWN], 'takes': list(named)})
+                  {'unsupported': [name if UNSUPPORTED_FIELD_NAME.match(name) else '<non-identifier name>'
+                                   for name in unknown[:UNSUPPORTED_FIELDS_SHOWN]],
+                   'takes': list(named)})
 
 
 def queue_order(item):
@@ -1432,7 +1437,8 @@ class EndpointBackend:
         reply = self._endpoint(action, project, actor, args, attachments,
                                operation_id=operation_id, authority=authority,
                                require_authority=require_authority, route=route)
-        return self._checked(reply, action)
+        # Without a descriptor the service only reads (every write it sends carries one).
+        return self._checked(reply, action, reading=authority is None)
 
     #: How much of a canonical refusal's last line is handed on. A checkpoint refusal lists
     #: every problem with the record (kittrial-5bb.113), so it gets room for all of them.
@@ -1463,8 +1469,14 @@ class EndpointBackend:
         return text if text is not None and BASE_REFUSAL.fullmatch(text) else None
 
     @classmethod
-    def _checked(cls, reply, action=None):
-        """The payload of one canonical reply, or the HttpError its return code means."""
+    def _checked(cls, reply, action=None, reading=False):
+        """The payload of one canonical reply, or the HttpError its return code means.
+
+        ``reading`` says that the request could not have written: its failure is then never
+        "the outcome may be unknown" (kittrial-5bb.185: a change of a task that does not exist
+        began with a read of it, bd said it found none, and the caller was told that the change
+        may have been made).
+        """
         code = reply.get('returncode') if isinstance(reply, dict) else None
         if code == 0 and isinstance(reply.get('server_time'), str):
             # The endpoint's time of the write it carried out, for the body of the answer of
@@ -1484,6 +1496,8 @@ class EndpointBackend:
                 raise unauthenticated(detail or 'Authentication is no longer valid')
             raise forbidden(detail or 'Authority was revoked before the canonical write')
         if code == 124:
+            if reading:
+                raise cls._unread()
             raise uncertain('Canonical command timed out; outcome may be unknown')
         if code == 75:
             # The endpoint was occupied (a wait for a lock ran out): the request may simply be
@@ -1496,9 +1510,23 @@ class EndpointBackend:
             said = stderr.strip().splitlines()[-1] if stderr.strip() else None
             detail = said[:cls._detail_limit(action, said)] if said else None
             if code == 2:
+                if reply.get('refused') == 'not-found':
+                    # bd found no row of that name (bd_refusals): the thing asked about is not there.
+                    raise not_found('Task not found')
                 raise invalid('Canonical command rejected the request', detail)
+            if reading:
+                raise cls._unread()
             raise uncertain('Canonical command failed; outcome may be unknown')
         return _canonical_payload(stdout)
+
+    #: Said when a read of the tracker failed: nothing was changed, and nothing is to reconcile.
+    UNREAD = 'The tracker could not be read just now. Nothing was changed; try again shortly.'
+
+    @classmethod
+    def _unread(cls):
+        failure = HttpError(503, 'unavailable', cls.UNREAD)
+        failure.nothing_done = True
+        return failure
 
     #: Said when the endpoint reports that the server's configuration file cannot be read.
     CONFIGURATION_UNREADABLE = ("The server's configuration cannot be read, so this request was not carried out. "
@@ -3396,8 +3424,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         if all(payload.get(name) is None for name in self.TASK_CHANGES):
             raise invalid('Nothing to change. %s' % takes, {'takes': list(self.TASK_CHANGES)})
         title, description, status, priority = (payload.get(name) for name in self.TASK_CHANGES)
-        if title is not None and (not isinstance(title, str) or not title.strip()):
-            raise invalid('Task title must be text and not empty')
+        if title is not None:
+            self._task_title(title)
         if description is not None and not isinstance(description, str):
             raise invalid('Task description must be text')
         if status is not None and status not in ('open', 'closed'):
@@ -3406,6 +3434,19 @@ class ApiHandler(BaseHTTPRequestHandler):
             raise invalid('Task priority must be an integer 0-4')
         self._bind_task_actor(ctx, payload)
         return payload
+
+    #: bd's own limit for a title (bd 1.2.2: "title must be 500 characters or less"). A longer
+    #: one on a change is not even refused by bd's check: the database refuses it.
+    TASK_TITLE_MAX = 500
+
+    def _task_title(self, title):
+        """A task's title is text, not blank, and no longer than bd takes; else the refusal."""
+        # Not blank: at least one character that can be seen. A title of spaces, or of one control
+        # character (review of kittrial-5bb.185: bd stores it), is no title.
+        if not isinstance(title, str) or not any(ch.isprintable() and not ch.isspace() for ch in title):
+            raise invalid('Task title must be text and not empty')
+        if len(title) > self.TASK_TITLE_MAX:
+            raise invalid('Task title must be %d characters or less (it has %d)' % (self.TASK_TITLE_MAX, len(title)))
 
     def _bind_task_actor(self, ctx, payload):
         """An ``actor`` in the body of a task write is the caller's own label or it is refused.
@@ -4476,6 +4517,11 @@ class ApiHandler(BaseHTTPRequestHandler):
             # does. Only then is a field the route does not take refused, not dropped
             # (kittrial-5bb.183 item 2). This is the same lookup update_agent() makes.
             self.service.get_agent(ctx.principal, ctx.params['aid'])
+            if 'projects' in payload:
+                # And so is the grant (kittrial-5bb.183 review, P3): a project the agent's owner
+                # cannot see keeps the service's own 404 whether or not the body also carries a
+                # field the route does not take. Nothing is written by the check.
+                self.service.check_agent_grant(ctx.principal, payload.get('projects'), owner_id=record['owner'])
             refuse_unknown_fields(payload, self.AGENT_UPDATE_FIELDS, 'An agent change')
             result = self.service.update_agent(ctx.principal, ctx.params['aid'], payload)
             return result, result
@@ -4976,6 +5022,12 @@ class ApiHandler(BaseHTTPRequestHandler):
         if priority is not None and (type(priority) is not int or not 0 <= priority <= 4):
             raise invalid('Task priority must be an integer 0-4')
         payload['attachments'] = validate_attachments(payload.get('attachments'))
+        # The title is checked here as on a change, before the key is reserved (kittrial-5bb.185):
+        # an empty one and one of 600 characters went to bd, which refused them, and the caller
+        # was told that the task may have been made. A blank one bd stored as it came.
+        self._task_title(payload.get('title'))
+        if payload.get('description') is not None and not isinstance(payload['description'], str):
+            raise invalid('Task description must be text')
         self._bind_task_actor(ctx, payload)
 
         def create():

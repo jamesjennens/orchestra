@@ -820,10 +820,10 @@ class EndpointResultRowTests(test_http_review_fixes.EndpointCase):
         alex, project = self.setup_project()
         real_checked = http_service.EndpointBackend._checked.__func__
 
-        def checked(cls, reply, action=None):
+        def checked(cls, reply, action=None, **more):
             if isinstance(reply, dict) and reply.get('returncode') == 0 and action == 'bd' and envelope_time:
                 reply = dict(reply, server_time=envelope_time)       # what the real endpoint's envelope carries for a write
-            return real_checked(cls, reply, action)
+            return real_checked(cls, reply, action, **more)
         lose = lambda digest, status, response, written_at=None: self.service.idempotency_release(digest)
         with mock.patch.object(http_service.EndpointBackend, '_checked', classmethod(checked)), \
                 mock.patch.object(self.service, 'idempotency_commit', lose):

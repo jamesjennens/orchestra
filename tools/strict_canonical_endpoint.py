@@ -110,6 +110,11 @@ class Canonical:
                 description = source.read_text(encoding='utf-8') if source.exists() else ''
             labels = [label for label in option('--labels', '').split(',') if label]
             issue_type = option('--type', 'task')
+            # As bd 1.2.2 refuses a title (measured, kittrial-5bb.185): exit 1, the sentence on standard error.
+            if not title:
+                return 1, '', 'Error: validation failed for issue : title is required\n'
+            if len(title) > 500:
+                return 1, '', 'Error: validation failed for issue : title must be 500 characters or less (got %d)\n' % len(title)
             # bd stores priority as a number and defaults to 2 (kittrial-5bb.183).
             priority = option('--priority', '2')
             if '--dry-run' in rest:
@@ -152,7 +157,9 @@ class Canonical:
                 return 0, json.dumps(found), ''
             row = next((r for r in self.rows() if r['id'] == (rest[0] if rest else '')), None)
             if row is None:
-                return 2, '', 'task not found'
+                # As bd 1.2.2 answers a show of a row it cannot find (measured, kittrial-5bb.185).
+                return 1, json.dumps({'error': 'no issues found matching the provided IDs', 'schema_version': 1}, indent=2) + '\n', \
+                    'Error fetching %s: no issue found matching "%s"\n' % ((rest[0] if rest else ''), (rest[0] if rest else ''))
             return 0, json.dumps(row), ''
         if command == 'close':
             task = rest[0] if rest else ''
@@ -167,6 +174,14 @@ class Canonical:
             return 0, text, ''
         if command == 'update':
             task = rest[0] if rest else ''
+            if '--title' in rest and rest.index('--title') + 1 < len(rest):
+                # As bd 1.2.2 (measured, kittrial-5bb.185): an empty title is refused in bd's JSON
+                # form; one over 500 characters is refused by the DATABASE, a bare sentence.
+                wanted = rest[rest.index('--title') + 1]
+                if not wanted:
+                    return 1, json.dumps({'error': 'title cannot be empty', 'schema_version': 1}, indent=2) + '\n', ''
+                if len(wanted) > 500:
+                    return 1, '', "%s' is too large for column 'title'\n" % wanted
             if not [token for token in rest[1:] if token != '--json']:
                 # As bd 1.2.2 does (measured, kittrial-5bb.181): an update that names no
                 # change is answered with these words and exit 0, and nothing is written.
@@ -291,6 +306,11 @@ def dispatch(canonical, request, tmp, run=None):
             raise ValueError('Command is outside the contributor interface')
         final = materialize(args, attachments, tmp)
         code, stdout, stderr = canonical.bd(final)
+        # endpoint.py's reading of a refusal bd makes before it writes (kittrial-5bb.185).
+        import bd_refusals
+        refused = bd_refusals.refusal(code, stdout, stderr)
+        if refused is not None:
+            return bd_refusals.envelope(*refused)
         return envelope(code, stdout, stderr)
     if action == 'checkpoint':
         from briefing import execute as briefing_execute
