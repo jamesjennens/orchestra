@@ -1985,7 +1985,7 @@ class Service:
 
     # -- worker credentials ----------------------------------------------------
     def issue_credential(self, principal, project_id, *, label=None, scopes=None,
-                         actor=None, request_id=None):
+                         actor=None, request_id=None, actor_checked=False):
         if principal is None or principal.via == 'credential':
             raise forbidden('A worker credential cannot issue another credential')
         with self.store.lock:
@@ -2020,6 +2020,12 @@ class Service:
                 'label': label or 'worker',
                 'scopes': list(requested),
                 'actor': actor,
+                # The backend read the project's tracker rows and this name was free (or a
+                # superuser allowed it) when it was issued: every row under it from now on is
+                # this credential's own, so no later write needs to read the tracker again
+                # (kittrial-5bb.188 item 1). A credential issued before that rule has no mark
+                # and is judged against the tracker at each write.
+                'actor_rows_checked': bool(actor_checked),
                 'token_hash': token_hash(secret),
                 'created_at': now_iso(self._now()),
                 'issued_raw': self._raw_now(),

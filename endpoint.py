@@ -6,7 +6,9 @@ service adds ``--authority-store``/``--authority-lock`` (and ``--require-authori
 for mutations) to the launch command; those are server-side configuration and are
 never taken from the request body. An SSH-shaped request therefore cannot choose the
 live-authority document or the lock path, and can only omit the check because it has
-no HTTP principal at all.
+no HTTP principal at all. ``--service-namespace`` is the web service's own actor
+namespace (``http`` unless it was started with another): at use the endpoint refuses a
+credential named under it, and only its launcher knows it (kittrial-5bb.188 item 3).
 """
 import argparse
 import fcntl
@@ -407,12 +409,35 @@ def configuration_fault(root,error):
     try:return Path(os.fsdecode(error.filename))==Path(root)/'deployment.private.json'
     except (TypeError,ValueError):return False       # it names no file, or a descriptor
 
-def reserved_actors(root,path):
+def tracker_actors(root,path,before=None):
+    """The names this project's tracker already holds as an author or assignee, older than
+    ``before`` (all of them when it is None); kittrial-5bb.188 item 1.
+
+    One ``bd export --all`` for the project, through the same read ``admin.py
+    credential-actors`` makes: a bd process that opens the project's database. That is the
+    cost of judging a plain name by the rows it has, and it is paid where the rule is
+    applied, never by every write (docs/HTTP_DEPLOYMENT.md says so). A project whose
+    tracker cannot be read raises, so the caller refuses rather than reading it as empty."""
+    import actor_names
+    from admin import run_bd
+    text=run_bd(root,path.name,['export','--all'])
+    rows=[record_json.loads(line) for line in text.splitlines() if line.strip()]
+    return actor_names.tracker_names(actor_names.tracker_marks(rows),before)
+
+def reserved_actors(root,path,rows=False):
     """The names a worker credential's namespace may not be, as this host has them: the
-    project's registered session actors and the installation's operator and verifier lists."""
+    project's registered session actors, the installation's operator and verifier lists, and
+    (only when ``rows`` asks for it) the project's tracker rows.
+
+    ``rows`` is False (no tracker read, the cheap rule), True (every row, for a name being
+    issued) or the instant the credential was issued, so that a credential's own rows are
+    not held against it."""
     from sessions import registered_actors
-    return {'sessions':registered_actors(path),'operators':sorted(configured_operators(root)),
+    names={'sessions':registered_actors(path),'operators':sorted(configured_operators(root)),
             'verifiers':sorted(configured_verifiers(root))}
+    if rows:
+        names['authors']=sorted(tracker_actors(root,path,None if rows is True else rows))
+    return names
 
 def execute(root,request,authority_config=None,require_authority=False):
     # Two actions exist only for the web service and name no existing project
@@ -443,7 +468,7 @@ def execute(root,request,authority_config=None,require_authority=False):
     if denied is not None:return denied
     # And a name WITHOUT that shape, sent by the web service with a descriptor, is written only
     # by a worker credential inside a namespace that is nobody else's (kittrial-5bb.184).
-    denied=descriptor_actor_denial(request,authority_config,lambda:reserved_actors(root,path))
+    denied=descriptor_actor_denial(request,authority_config,lambda rows=False:reserved_actors(root,path,rows))
     if denied is not None:return denied
     if request.get('action')=='session':
         from sessions import execute as session_execute
@@ -514,11 +539,13 @@ def execute(root,request,authority_config=None,require_authority=False):
         # Read-only (kittrial-5bb.184): for each name asked about, why a worker credential may
         # not write under it, or null. The web service asks before it issues one and when it
         # lists them. The answer says which rule, never the host's names. No lock, no write.
+        # With ``tracker`` set it also reads the project's rows, which is one bd export: the
+        # service asks for that only at issue (kittrial-5bb.188 item 1).
         import actor_names
         names=request.get('args',[])
         if not isinstance(names,list) or not 1<=len(names)<=200 or any(not isinstance(n,str) or not 0<len(n)<=96 or '\0' in n for n in names):
             raise ValueError('Use actor-standing with 1 to 200 names')
-        reserved=reserved_actors(root,path)
+        reserved=reserved_actors(root,path,bool(request.get('tracker')))
         return {'returncode':0,'stdout':json.dumps({'schema_version':1,'names':{n:actor_names.collision(n,**reserved) for n in names}})+'\n','stderr':''}
     if action=='setup-status':
         # Read-only (kittrial-5bb.118): what the host knows about this project's setup,
@@ -877,10 +904,13 @@ def main():
     p.add_argument('--authority-lock',help='server-side authority lock (defaults to STORE.lock)')
     p.add_argument('--require-authority',action='store_true',
                    help='refuse a mutation that omits the live-authority descriptor')
+    p.add_argument('--service-namespace',
+                   help="the web service's own actor namespace (default http): a name the "
+                        'service was started under is refused at use too (kittrial-5bb.188 item 3)')
     a=p.parse_args()
     authority_config=None
     if a.authority_store:
-        authority_config=AuthorityConfig(a.authority_store,a.authority_lock)
+        authority_config=AuthorityConfig(a.authority_store,a.authority_lock,a.service_namespace)
     try:
         text=sys.stdin.read(2_000_001)
         if len(text)>2_000_000:raise ValueError('Request exceeds 2 MB')

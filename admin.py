@@ -4551,7 +4551,7 @@ def authorized_keys(root,key_file,role='both',python=None,comment=None):
         print('warning: the operator line is unrestricted service-account shell access; '+OPERATOR_KEY_NOTE,
               file=sys.stderr)
 
-def credential_actors(root,state_path):
+def credential_actors(root,state_path,service_namespace=None):
     """Every worker credential of the web service with the name it writes under, and whether
     that name is somebody else's on this host (kittrial-5bb.184). Reads; changes nothing.
 
@@ -4567,6 +4567,14 @@ def credential_actors(root,state_path):
     actor's or the credential's: the rows cannot tell. For a name that does not, they are
     what a credential under that name wrote, or an old actor from before sessions were
     registered: worth a look when nobody remembers issuing it.
+
+    ``collides`` now holds the rows in too (kittrial-5bb.188 item 1): a plain name the tracker
+    was already holding before the credential was issued is refused when it writes, and the
+    credential is listed here. A credential issued after that rule carries
+    ``actor_rows_checked`` and is judged only against the rows older than its own issuance, so
+    the rows it wrote itself are not held against it. ``service_namespace`` is the namespace
+    the web service was started with (its ``--actor-namespace``), when the operator says so:
+    a credential named under it is refused at use too (kittrial-5bb.188 item 3).
     """
     import actor_names
     from datetime import datetime,timezone
@@ -4586,7 +4594,7 @@ def credential_actors(root,state_path):
     projects={}
     def project(name):
         if name not in projects:
-            found={'on_host':False,'sessions':[],'names':None}
+            found={'on_host':False,'sessions':[],'marks':None}
             try:path=project_dir(root,name)
             except ValueError:path=None
             if path is not None and (path/'.beads/metadata.json').is_file():
@@ -4594,15 +4602,9 @@ def credential_actors(root,state_path):
                 found['sessions']=registered_actors(path)
                 try:
                     rows=[json.loads(line) for line in run_bd(root,name,['export','--all']).splitlines() if line.strip()]
-                    names=set()
-                    for row in rows:
-                        for key in ('assignee','created_by'):
-                            if isinstance(row.get(key),str):names.add(actor_names.head(row[key]))
-                        for comment in row.get('comments') or []:
-                            if isinstance(comment,dict) and isinstance(comment.get('author'),str):names.add(actor_names.head(comment['author']))
-                    found['names']=names
+                    found['marks']=actor_names.tracker_marks(rows)
                 except (subprocess.CalledProcessError,OSError,ValueError,RecursionError):
-                    found['names']=None                # the tracker could not be read: said as null, not as "no rows"
+                    found['marks']=None                # the tracker could not be read: said as null, not as "no rows"
             projects[name]=found
         return projects[name]
     out=[]
@@ -4612,13 +4614,19 @@ def credential_actors(root,state_path):
         namespace=credential.get('actor')
         if not isinstance(namespace,str) or not namespace:continue         # it writes under its issuer's own account id
         name=credential.get('project_id')
-        host=project(name) if isinstance(name,str) else {'on_host':False,'sessions':[],'names':None}
-        reason=actor_names.collision(namespace,sessions=host['sessions'],operators=listed_operators,verifiers=listed_verifiers)
+        host=project(name) if isinstance(name,str) else {'on_host':False,'sessions':[],'marks':None}
+        issued=credential.get('created_at')
+        before=issued if isinstance(issued,(str,int,float)) and not isinstance(issued,bool) else None
+        authors=None if host['marks'] is None else actor_names.tracker_names(host['marks'],before)
+        reason=actor_names.collision(namespace,sessions=host['sessions'],operators=listed_operators,
+                                     verifiers=listed_verifiers,authors=authors or (),
+                                     service=(service_namespace,actor_names.SERVICE_NAMESPACE)
+                                     if service_namespace else actor_names.SERVICE_NAMESPACE)
         issuer=users.get(credential.get('user_id')) if isinstance(users.get(credential.get('user_id')),dict) else {}
         out.append({'credential':identifier,'project':name,'project_on_host':host['on_host'],'label':credential.get('label'),
                     'actor':namespace,'collides':reason,'revoked':bool(credential.get('revoked')),
                     'refused_when_it_writes':reason is not None,
-                    'tracker_rows':None if host['names'] is None else actor_names.head(namespace) in host['names'],
+                    'tracker_rows':None if host['marks'] is None else actor_names.head(namespace) in {n for n,_ in host['marks']},
                     'issued_by':credential.get('user_id'),'issued_by_username':issuer.get('username'),
                     'created_at':moment(credential.get('created_at')),'last_used':moment(credential.get('last_used')),
                     'expires_at':moment(credential.get('expires_at'))})
@@ -4777,6 +4785,9 @@ def main():
                    help='with --disposition released (or failed on a receipt with no recorded actor), open the request ID to any actor')
     a=sub.add_parser('service');a.add_argument('action',choices=['start','stop','restart','status'])
     a=sub.add_parser('credential-actors',help='list the web service\'s worker credentials and whether the name each writes under is somebody else\'s on this host (reads only)')
+    a.add_argument('--service-namespace',default=None,metavar='NS',dest='service_namespace',
+                   help='the namespace the web service was started with (its --actor-namespace): a credential named '
+                        'under it is listed as refused too. Without it only http is judged')
     a.add_argument('--state',required=True,help='the web service state document (the --state of http_service.py)')
     a=sub.add_parser('record-store')
     a.add_argument('--state',required=True,
@@ -4926,7 +4937,7 @@ def main():
         print(json.dumps(guidance_report,sort_keys=True,indent=2))
     elif args.command=='service':print(service(root,args.action))
     elif args.command=='credential-actors':
-        report=credential_actors(root,args.state)
+        report=credential_actors(root,args.state,getattr(args,'service_namespace',None))
         print(json.dumps(report,indent=2,sort_keys=True))
         if report['colliding_and_not_revoked']:
             print('%d worker credential(s) write under a name that is somebody else\'s on this host. Each is refused '

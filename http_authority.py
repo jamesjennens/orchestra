@@ -619,16 +619,23 @@ class AuthorityConfig:
     The trusted HTTP service passes these to the canonical endpoint as *launch*
     arguments, exactly as it passes ``--root``. They are never read from the request
     body, so an SSH-shaped request cannot redirect the live-authority read or make
-    ``file_lock`` create a lock at a caller-chosen path.
+    ``file_lock`` create a lock at a caller-chosen path. ``service_namespace`` is the
+    service's own actor namespace (``--actor-namespace``, default ``http``), carried for
+    the same reason: at use the endpoint must refuse a name the service was started under,
+    and only its launcher knows it (kittrial-5bb.188 item 3).
     """
 
-    __slots__ = ('store', 'lock')
+    __slots__ = ('store', 'lock', 'service_namespace')
 
-    def __init__(self, store, lock=None):
+    def __init__(self, store, lock=None, service_namespace=None):
         if not isinstance(store, str) or not store:
             raise ValueError('AuthorityConfig.store must be a non-empty path')
         self.store = store
         self.lock = lock or (store + '.lock')
+        if service_namespace is None:
+            import actor_names
+            service_namespace = actor_names.SERVICE_NAMESPACE
+        self.service_namespace = service_namespace
 
 
 def principal_key(request, authority_configured=False):
@@ -1978,12 +1985,23 @@ def descriptor_actor_denial(request, authority_config, reserved):
     * inside that credential's own namespace (``NAME`` or ``NAME/...``),
     * when the namespace is nobody else's (``actor_names.collision``): not a session actor
       of the project or a name of that shape, not a name on the operator or verifier
-      list, not the service's own namespace.
+      list, not the web service's own namespace -- the one it was launched with, which
+      ``AuthorityConfig.service_namespace`` carries (kittrial-5bb.188 item 3), not only
+      ``http`` -- and not a name that reads as another (a leading or trailing dot or
+      dash, an ``@host``).
+
+    A credential issued before kittrial-5bb.188 carries no ``actor_rows_checked`` mark, so
+    it is judged again by the project's own tracker rows (one bd export): a name the
+    tracker was already holding before the credential existed is somebody else's, and the
+    write is refused. A credential issued by this code has the mark -- the tracker was
+    read and the name was free (or a superuser allowed it) when it was issued -- so its
+    own rows are never held against it and an ordinary write reads no tracker at all.
 
     ``reserved`` is called only when a namespace has to be judged and returns the host's
-    names (``sessions``, ``operators``, ``verifiers``). A request without a descriptor is
-    not judged here: on the SSH path there is none, and the service's own reads carry
-    none; a write the service sends without one is refused by ``run_guarded``.
+    names (``sessions``, ``operators``, ``verifiers``, and ``authors`` from the tracker
+    when asked with ``rows=``). A request without a descriptor is not judged here: on the
+    SSH path there is none, and the service's own reads carry none; a write the service
+    sends without one is refused by ``run_guarded``.
     """
     if authority_config is None:
         return None
@@ -2007,7 +2025,14 @@ def descriptor_actor_denial(request, authority_config, reserved):
     if not actor_names.inside(actor, namespace):
         return _envelope(126, stderr='The actor is outside the namespace of the credential the live-authority '
                                      'descriptor names\n', authority_status=403)
-    reason = actor_names.collision(namespace, **reserved())
+    service = getattr(authority_config, 'service_namespace', actor_names.SERVICE_NAMESPACE)
+    service = (service, actor_names.SERVICE_NAMESPACE)
+    reason = actor_names.collision(namespace, service=service, **reserved())
+    if reason is None and not credential.get('actor_rows_checked'):
+        # Issued before the row rule: the project's own rows still decide (kittrial-5bb.188).
+        issued = credential.get('created_at')
+        reason = actor_names.collision(namespace, service=service,
+                                       **reserved(rows=issued if isinstance(issued, str) and issued else True))
     if reason is not None:
         return _envelope(126, stderr='%s\n' % actor_names.refusal(namespace, reason), authority_status=403)
     return None

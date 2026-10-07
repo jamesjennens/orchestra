@@ -483,6 +483,7 @@ def main():
     parser.add_argument('--authority-store')
     parser.add_argument('--authority-lock')
     parser.add_argument('--require-authority', action='store_true')
+    parser.add_argument('--service-namespace', default='http')
     arguments = parser.parse_args()
     try:
         request = json.loads(sys.stdin.read(2_000_001))
@@ -527,8 +528,13 @@ def main():
     config = None
     if http_authority is not None and hasattr(http_authority, 'AuthorityConfig') and \
             arguments.authority_store:
-        config = http_authority.AuthorityConfig(arguments.authority_store,
-                                                arguments.authority_lock)
+        try:
+            config = http_authority.AuthorityConfig(arguments.authority_store,
+                                                    arguments.authority_lock,
+                                                    arguments.service_namespace)
+        except TypeError:                      # an older kit's AuthorityConfig takes two
+            config = http_authority.AuthorityConfig(arguments.authority_store,
+                                                    arguments.authority_lock)
     canonical.authority_config = config
     # The instrumented runner is the effect's only route to native state: a refusal
     # raised before its first write is proven pre-effect and keeps rc=2.
@@ -550,13 +556,26 @@ def main():
         if denied is not None:
             print(json.dumps(denied))
             return
-        # endpoint.py's rule for a name WITHOUT the shape of a web id (kittrial-5bb.184). This
-        # stub has no session registry and no deployment file: the names its host "has" are
-        # read from <root>/reserved-actors.json when a test put one there.
-        def reserved():
+        # endpoint.py's rule for a name WITHOUT the shape of a web id (kittrial-5bb.184), with the
+        # project's tracker rows (kittrial-5bb.188 item 1). This stub has no session registry, no
+        # deployment file and no bd: the names its host "has" are read from
+        # <root>/reserved-actors.json when a test put one there. `author-rows` is a planted list
+        # of {"name": ..., "when": ...} and stands in for one bd export; `authors` is the plain
+        # list a test that does not care about the boundary can plant instead.
+        def reserved(rows=False):
             planted = root / 'reserved-actors.json'
             names = json.loads(planted.read_text(encoding='utf-8')) if planted.is_file() else {}
-            return {key: names.get(key, []) for key in ('sessions', 'operators', 'verifiers')}
+            found = {key: names.get(key, []) for key in ('sessions', 'operators', 'verifiers')}
+            if rows:
+                import actor_names
+                marks = [(str(item.get('name') or ''), actor_names.instant(item.get('when')))
+                         for item in (names.get('author-rows') or names.get('author_rows') or [])
+                         if isinstance(item, dict)]
+                if marks:
+                    found['authors'] = sorted(actor_names.tracker_names(marks, None if rows is True else rows))
+                else:
+                    found['authors'] = names.get('authors', [])
+            return found
         denied = http_authority.descriptor_actor_denial(request, config, reserved) \
             if http_authority is not None and hasattr(http_authority, 'descriptor_actor_denial') else None
         if denied is not None:
@@ -565,7 +584,8 @@ def main():
         if request.get('action') == 'actor-standing':
             import actor_names
             print(json.dumps(envelope(0, stdout=json.dumps({'schema_version': 1, 'names': {
-                name: actor_names.collision(name, **reserved()) for name in request.get('args') or []}}))))
+                name: actor_names.collision(name, **reserved(bool(request.get('tracker'))))
+                for name in request.get('args') or []}}))))
             return
         if request.get('action') == 'set-onboarding':
             # endpoint.py's service-only action (kittrial-5bb.118 part 2): the kit's own

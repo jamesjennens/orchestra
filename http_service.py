@@ -436,23 +436,31 @@ class InProcessBackend:
     PROPOSALS = False
     # Everything here is service-local, so a project is created by the HTTP route itself.
     PROJECT_CREATE = 'create'
+    #: This backend has no host tracker, so a credential's name is judged by its shape and the
+    #: service's namespace only; no row rule is applied or recorded (kittrial-5bb.188 item 4).
+    ACTOR_ROWS = False
 
-    def __init__(self, service):
+    def __init__(self, service, actor_namespace=None):
+        import actor_names
         self.service = service
+        self.actor_namespace = actor_namespace or actor_names.SERVICE_NAMESPACE
         self.faults = {}
 
     def fail_next(self, route, times=1):
         """Test hook: commit, then raise :class:`UncertainOutcome` for the next call(s)."""
         self.faults[route] = times
 
-    def actor_standing(self, project_id, names):
+    def actor_standing(self, project_id, names, rows=False):
         """For each name: why a worker credential may not write under it, or None.
 
-        This backend has no host, so no session actors and no operator list: what is left of
-        ``actor_names.collision`` is the shape of a session actor and the service's namespace.
+        This backend has no host, so no session actors, no operator list and no tracker rows:
+        what is left of ``actor_names.collision`` is the shape of a session actor, a
+        look-alike name, and the namespace this service was started with (``rows`` is accepted
+        and ignored, so the routes need not know which backend they are on).
         """
         import actor_names
-        return {name: actor_names.collision(name) for name in names}
+        service = (self.actor_namespace, actor_names.SERVICE_NAMESPACE)
+        return {name: actor_names.collision(name, service=service) for name in names}
 
     @property
     def state(self):
@@ -481,6 +489,18 @@ class InProcessBackend:
                 # the clock now, which is the time of the retry (kittrial-5bb.97).
                 WRITTEN.at = self.service.result_written_at(result_key) or False
                 return self.service.result_get(result_key)
+            # The at-use rule the endpoint applies, applied here too (kittrial-5bb.188 item 4):
+            # this backend has no endpoint, so without this an earlier credential under a name
+            # it refuses at issue goes on writing. It is after the stored answer, so an exact
+            # retry of a write that already committed still returns that answer. What it knows
+            # is the name's shape, a look-alike, and the namespace the service was started
+            # with; it has no host lists and no tracker rows.
+            if getattr(principal, 'via', None) == 'credential':
+                import actor_names
+                namespace = getattr(principal, 'actor', None)
+                reason = self.actor_standing(project_id, [namespace]).get(namespace)
+                if reason is not None:
+                    raise forbidden(actor_names.refusal(namespace, reason))
             result = self._dispatch(route, principal, project_id, payload)
             from http_authority import server_time
             WRITTEN.at = server_time(self.service._now())
@@ -1238,6 +1258,10 @@ class EndpointBackend:
         'list_feedback': 'the canonical feedback command ships with kittrial-5bb.13',
     }
     PROPOSALS = True
+    #: The endpoint owns the project's tracker rows and reads them when asked to
+    #: (kittrial-5bb.188 item 1): a credential issued through this backend records that the
+    #: name was verified row-free, so its ordinary writes need no such read.
+    ACTOR_ROWS = True
 
     def __init__(self, python, endpoint, root, *, service, actor_namespace='http',
                  timeout=150, runner=None, create_timeout=900):
@@ -1287,18 +1311,21 @@ class EndpointBackend:
     # (kittrial-5bb.80). The HTTP project id is the canonical project name.
     PROJECT_CREATE = 'register'
 
-    def actor_standing(self, project_id, names):
+    def actor_standing(self, project_id, names, rows=False):
         """For each name: why a worker credential may not write under it, or None (kittrial-5bb.184).
 
-        One read through the endpoint, which owns the session registry and the operator and
-        verifier lists and answers with the rule, never with the names. This service's own
+        One read through the endpoint, which owns the session registry, the operator and
+        verifier lists and (when ``rows`` asks) the project's tracker rows, and answers with the
+        rule, never with the names. ``rows`` is one ``bd export --all``: the issue route asks for
+        it, the credential listing does not (kittrial-5bb.188 item 1). This service's own
         namespace is judged here, because only the service knows what it was started with.
         """
         import actor_names
         names = [name for name in names if isinstance(name, str) and name]
         if not names:
             return {}
-        answer = self._run('actor-standing', project_id, self.actor_namespace + '/read', names)
+        answer = self._run('actor-standing', project_id, self.actor_namespace + '/read', names,
+                           extra={'tracker': True} if rows else None)
         found = answer.get('names') if isinstance(answer, dict) else None
         if not isinstance(found, dict):
             raise uncertain('The host did not say which names are taken')
@@ -1342,15 +1369,18 @@ class EndpointBackend:
         return True
 
     def _endpoint(self, action, project, actor, args, attachments=None, operation_id=None,
-                  authority=None, require_authority=False, route=None, check_usable=True, timeout=None):
+                  authority=None, require_authority=False, route=None, check_usable=True, timeout=None,
+                  extra=None):
         """One answer of the canonical endpoint; its mark of a configuration fault is raised here.
 
         Here and not where a route reads the answer, so that no route can hand the
         endpoint's line (the path of the file, the parser's or the system's words) to the
         person: some routes read a return code of 2 their own way (kittrial-5bb.156 review).
+        ``extra`` adds one named field to the request the service sends (kittrial-5bb.188:
+        ``tracker`` asks the host to read the project's rows for this answer).
         """
         reply = self._ask(action, project, actor, args, attachments, operation_id, authority,
-                          require_authority, route, check_usable, timeout)
+                          require_authority, route, check_usable, timeout, extra)
         if isinstance(reply, dict) and reply.get('returncode') == 2 and reply.get('fault') == 'configuration':
             # The server's own configuration file cannot be read: the endpoint's line names the
             # file and the parser's words. Those are for the operator, in this service's log;
@@ -1364,7 +1394,7 @@ class EndpointBackend:
         return reply
 
     def _ask(self, action, project, actor, args, attachments, operation_id, authority,
-             require_authority, route, check_usable, timeout):
+             require_authority, route, check_usable, timeout, extra=None):
         if isinstance(project, str):
             # A record the backend will not serve is refused here, before any endpoint
             # process starts: a `proj_...` id (no canonical project can be behind it;
@@ -1396,6 +1426,8 @@ class EndpointBackend:
         import subprocess
         payload = {'project': project, 'actor': actor, 'action': action, 'args': args,
                    'attachments': attachments or {}}
+        if extra:
+            payload.update({key: value for key, value in extra.items() if value is not None})
         # The operation identity and the authority descriptor travel with the
         # mutation: the endpoint reserves the identity and re-validates live
         # authority immediately before the canonical effect. The descriptor carries
@@ -1411,7 +1443,8 @@ class EndpointBackend:
             payload['route'] = route
         argv = [self.python, self.endpoint, '--root', self.root,
                 '--authority-store', self.authority_store,
-                '--authority-lock', self.authority_lock]
+                '--authority-lock', self.authority_lock,
+                '--service-namespace', self.actor_namespace]
         if require_authority:
             argv.append('--require-authority')
         try:
@@ -1428,10 +1461,10 @@ class EndpointBackend:
             raise uncertain('Canonical endpoint returned an invalid response')
 
     def _run(self, action, project, actor, args, attachments=None, operation_id=None,
-             authority=None, require_authority=False, route=None):
+             authority=None, require_authority=False, route=None, extra=None):
         reply = self._endpoint(action, project, actor, args, attachments,
                                operation_id=operation_id, authority=authority,
-                               require_authority=require_authority, route=route)
+                               require_authority=require_authority, route=route, extra=extra)
         return self._checked(reply, action)
 
     #: How much of a canonical refusal's last line is handed on. A checkpoint refusal lists
@@ -3365,7 +3398,7 @@ class ApiHandler(BaseHTTPRequestHandler):
     TASK_CLAIM_FIELDS = ('actor',)
     CHECKPOINT_BODY_FIELDS = EndpointBackend.CHECKPOINT_FIELDS + ('actor',)
     MEMBER_FIELDS = ('role',)
-    CREDENTIAL_ISSUE_FIELDS = ('label', 'scopes', 'actor')
+    CREDENTIAL_ISSUE_FIELDS = ('label', 'scopes', 'actor', 'allow_actor')
     AGENT_CREATE_FIELDS = ('name', 'tool', 'working_directory', 'machine', 'notes',
                            'projects', 'scopes')
     AGENT_UPDATE_FIELDS = ('name', 'tool', 'working_directory', 'machine', 'notes',
@@ -4340,12 +4373,25 @@ class ApiHandler(BaseHTTPRequestHandler):
         # is an operator's or a session's, which is not for every member to probe.
         self._project(ctx, CAP_PROJECT_ADMIN)
         named = payload.get('actor')
+        # An operator's allowance for a name the project's tracker already holds (kittrial-5bb.188
+        # item 1): a superuser only, and only for the row rule -- never for a session, an
+        # operator, a verifier or the service's own namespace.
+        allowed = payload.get('allow_actor') is True
+        if 'allow_actor' in payload and not isinstance(payload.get('allow_actor'), bool):
+            raise invalid('allow_actor must be true or false')
+        if allowed and not ctx.principal.superuser:
+            raise forbidden('Only a superuser may allow a name the project\'s tracker already holds')
+        checked = False
         if isinstance(named, str) and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.@/-]{0,63}', named):
             # A worker credential writes under this name, and the tracker's rows carry the name
             # and nothing else: under a host actor's name it IS that actor (kittrial-5bb.184).
-            # Refused before the key is reserved; the endpoint refuses the same again at use.
-            reason = self.backend.actor_standing(ctx.params['pid'], [named]).get(named)
-            if reason is not None:
+            # A name the tracker already holds is refused too (kittrial-5bb.188 item 1), which is
+            # one bd export for this project. Refused before the key is reserved; the endpoint
+            # refuses the same again at use.
+            reason = self.backend.actor_standing(ctx.params['pid'], [named],
+                                                 rows=self.backend.ACTOR_ROWS).get(named)
+            checked = self.backend.ACTOR_ROWS and (reason is None or (allowed and reason == actor_names.ROWS))
+            if reason is not None and not checked:
                 raise invalid(actor_names.refusal(named, reason, actor_names.CHOOSE), {'actor': named, 'rule': reason})
 
         def issue():
@@ -4356,7 +4402,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                                                    label=payload.get('label'),
                                                    scopes=payload.get('scopes'),
                                                    actor=payload.get('actor'),
-                                                   request_id=ctx.request_id)
+                                                   request_id=ctx.request_id,
+                                                   actor_checked=checked)
             public = {'operation': 'credentials.issue', 'credential': result}
             stored = {'operation': 'credentials.issue',
                       'credential': {k: v for k, v in result.items() if k != 'secret'},
@@ -6355,7 +6402,7 @@ def build_backend(service, args):
         return EndpointBackend(args.endpoint_python, args.endpoint, args.root,
                                service=service, actor_namespace=args.actor_namespace,
                                timeout=args.endpoint_timeout, create_timeout=getattr(args, 'create_timeout', 900))
-    return InProcessBackend(service)
+    return InProcessBackend(service, getattr(args, 'actor_namespace', None))
 
 
 def main(argv=None):
