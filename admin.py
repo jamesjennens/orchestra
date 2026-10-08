@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
 """Operator commands for an isolated, user-systemd Beads/Dolt deployment."""
+import sys
+if sys.version_info < (3, 10):
+    # Before every other import, and in syntax Python 3.6 reads: an older interpreter failed in
+    # an import further down, with a traceback that hid the cause (kittrial-5bb.191).
+    sys.stderr.write('admin.py needs Python 3.10 or newer and was started with Python %d.%d.%d (%s). '
+                     'Nothing was carried out. Run it with Python 3.10 or newer; on an office installation that is the bundled interpreter, INSTALL_ROOT/current/python-runtime/....\n'
+                     % (sys.version_info[0], sys.version_info[1], sys.version_info[2], sys.executable))
+    sys.exit(2)
 import argparse
 import base64
 import contextlib
@@ -1794,9 +1802,14 @@ def worker_client_setup(root,name):
                        'interpreter below name the release that printed them and must be printed '
                        'again after an upgrade')
         local_note=('the same paths, which name this release, so print them again after an upgrade')
+    # The server's own host name is what an operator types first, and it need not resolve from
+    # the worker's network (kittrial-5bb.191: the first use of this route from another machine).
+    host_note=('WORKER_SSH_HOST must lead to a name or address the worker\'s machine can reach; this\n'
+               'server\'s own host name may not resolve from the worker\'s network.')
     return (f'Worker client configuration for {name} (save as client.local.json in the worker\'s own\n'
             f'directory and replace WORKER_SSH_HOST with that worker\'s SSH alias; this kit endpoint serves\n'
             f'every project, so do not point it at a project-specific wrapper). {endpoint_note}:\n{config}\n'
+            f'{host_note}\n'
             f'Bootstrap command (replace ACTOR with the actor returned by worker.py start or session\n'
             f'register):\n  python client.py --config client.local.json --project {name} --actor ACTOR -- onboard\n'
             f'An agent that runs on the server itself uses the local transport instead (no SSH and no\n'

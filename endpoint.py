@@ -10,6 +10,14 @@ no HTTP principal at all. ``--service-namespace`` is the web service's own actor
 namespace (``http`` unless it was started with another): at use the endpoint refuses a
 credential named under it, and only its launcher knows it (kittrial-5bb.188 item 3).
 """
+import sys
+if sys.version_info < (3, 10):
+    # Before every other import, and in syntax Python 3.6 reads: an older interpreter failed in
+    # an import further down, with a traceback that hid the cause (kittrial-5bb.191).
+    sys.stderr.write('endpoint.py needs Python 3.10 or newer and was started with Python %d.%d.%d (%s). '
+                     'Nothing was carried out. Set "python" in the client configuration to an interpreter of 3.10 or newer on the server; on an office installation that is the bundled one, INSTALL_ROOT/current/python-runtime/..., as add-project prints it.\n'
+                     % (sys.version_info[0], sys.version_info[1], sys.version_info[2], sys.executable))
+    sys.exit(2)
 import argparse
 import fcntl
 import json
