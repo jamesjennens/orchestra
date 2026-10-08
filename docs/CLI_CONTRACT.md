@@ -30,6 +30,46 @@ Every request is one JSON object on stdin; every response is one JSON object on 
 - On validation or transport failure, `returncode` is nonzero (`2` for endpoint
   validation), `stdout` is empty, and `stderr` starts with the error type
   (`ValueError: ...`). Automation should parse stdout only when the exit code is `0`.
+- **The server's time of a write** (additive). The answer of a write that was carried
+  out has one more field, `"server_time": "2026-10-06T07:50:12+00:00"`: the endpoint
+  host's clock, UTC with its offset, whole seconds. Cite it where a record says when
+  something happened, in place of your own clock. The client prints it as one line on
+  its standard error after the endpoint's own diagnostics, `server_time:
+  2026-10-06T07:50:12+00:00`; standard output and a `--out` file are exactly what they
+  were. Rules:
+  - a refusal, a busy answer and an uncertain answer carry none (nothing was written at
+    a known time), and neither does a read, including the reads of an action that can
+    also write (`work`, `review TASK`, `brief`, `handoff TASK`), a `--dry-run`, and the
+    help of a command (`create --help`). Help is a help flag that is ON: bare, or with a
+    value bd reads as true; given more than once, the last one decides, as in bd.
+    `--help=false` (also `--help=0`, `-h=false`) is a flag bd accepts and then carries
+    the command out, so such a request is a write like any other: stamped, and its
+    outcome kept as unknown when it fails after bd was called. A flag between a verb and
+    its subcommand changes nothing: `comments --json add ID TEXT` is the write that
+    `comments add ID TEXT --json` is;
+  - the writes are: every bd write (`create`, `update`, `close`, `reopen`, `comments
+    add`, `dep add`, `remove`, `relate` and `unrelate`, ...), `review --file`, `handoff`
+    with a payload (a request, an acceptance, a decline), `checkpoint`, the lifecycle,
+    coordinate and requirement actions, the keyed records (`ref`, `capability`,
+    `proposal`), `session register`, `session resume` and `session run start`,
+    `heartbeat` and `end`, `guidance ack`, and `feedback` (add and correct);
+  - **a request that is already recorded carries none.** Where the kit recognises its
+    own record (the same `operation_id` in a lifecycle fact, a review record, a handoff,
+    a session registration, an acknowledgement, a feedback entry), the second answer
+    says so (`reconciled`, or the record it found) and writes nothing, so it has no
+    time of its own. The time of the first answer is the time of the write; keep it, or
+    read the record's own `created_at`;
+  - a request that is sent again with a transport operation identity (the HTTP
+    service's `Idempotency-Key`, which it hands to the endpoint) is answered from the
+    endpoint's journal with the stored answer, time included, and the field `replayed:
+    true`. An answer stored by a kit from before this field is replayed as it was
+    stored, without a time;
+  - the time is taken when the write has been carried out and is cut to the whole
+    second, while bd rounds its own times: a `created_at` or `updated_at` of the row
+    can read one second later than `server_time`. It is the host's wall clock, so it is
+    not monotonic across a step of that clock;
+  - an older endpoint sends no such field and the client then prints nothing; an older
+    client ignores the field.
 
 Native commands can succeed (exit `0`) while printing warnings. The endpoint forwards
 those warnings on `stderr` and keeps the success JSON clean; it does not silently drop
@@ -689,15 +729,24 @@ If the endpoint cannot answer, the local result is still returned, with
    with `trust: accepted` and pointers that are `live: resolved` is the answer.
 2. **On a miss** (`records_found: false`, or only candidates), use the code
    `candidates` the same lookup returned, then search the checkout by hand.
-3. **Update the index with what you found:**
+3. **Feed what you found back — as a file, never as a live write:**
    - it exists under another name: `capability propose-alias KEY "<phrase that missed>"
-     --evidence POINTER`;
-   - it is not indexed at all: `capability propose --file capability.json`, a draft
-     with the pointers you found.
-4. **A pending alias or a draft is never authoritative.** Until an operator accepts
-   it, it only lifts a candidate (`match: candidate`, `trust: draft`,
-   `alias_state: proposed`). Do not cite one as the accepted meaning of a capability,
-   and check its pointers yourself before relying on them.
+     --evidence POINTER` (that route is still a live contributor write);
+   - it is not indexed at all: write the payload file and carry it in your delivery —
+     one JSON file per record, conventionally `capability-proposals/<key>.json`, named
+     in your contribution summary. **Do not run `capability propose` or
+     `capability revise`:** the endpoint accepts either payload, but the process does
+     not use a live write from a lane, so the worker carries the payload as a file, the
+     reviewer judges it with the change, and the coordinator writes it into the index
+     after integration and accepts the meaning at release. With no delivery in flight,
+     hand the payload to the coordinator.
+4. **The payload is judged, not yet authoritative.** The check proves **location, not
+   meaning**: `code`, `tests` and `anchors` must resolve at the commit the check runs
+   at, which for a carried payload is the integrated commit, after the coordinator
+   writes it. Until an operator accepts the meaning, cite neither the payload nor a
+   pending alias as the accepted meaning of a capability — a pending alias only lifts a
+   candidate (`match: candidate`, `alias_state: proposed`) — and check the pointers
+   yourself before relying on them.
 
 **Writing.**
 - **`propose` and `revise`** take a closed JSON payload:
@@ -742,8 +791,10 @@ If the endpoint cannot answer, the local result is still returned, with
   - `submitted_by_agent` is `false` until then.
 
 Acceptance, retirement, alias rejection and a verified alias proposal are operator
-commands ([operations](OPERATIONS.md#operator-commands)). There is no demotion in slice 1a: the
-design's "demote" (section 4) is covered by retiring the key for now.
+commands ([operations](OPERATIONS.md#operator-commands)). There is no demotion: an accepted
+revision of a key is never weakened or withdrawn in place. The operator supersedes the key
+with a named successor (`admin.py capability-retire`) or accepts a later revision of it
+(design section 4).
 
 **Batch acceptance results** (`admin.py capability-apply`). Each item names the newest
 revision the operator reviewed, by `revision` and `record_sha256`, and gets one result:
@@ -1556,6 +1607,7 @@ it by failing.
 | Command | Option | Range |
 | --- | --- | --- |
 | every command | JSON nesting in a request, a `--file` attachment or a payload argument | at most 64 levels; deeper is refused with `JSON nested too deeply (more than 64 levels)`, exit 2, nothing written |
+| tracker export / bd rows | JSON nesting in an issue row (`bd export --all`, `bd list`, `bd show`) | at most 750 levels (ROW_NESTING_MAX); rows of 751 to about 980 levels, which earlier kits read normally, are now malformed (a catalog anchor at 751 levels reads accepted before and malformed now) |
 | `work` | `--limit`, `--handoff-limit` | 1..100 |
 | `work` | `--offset`, `--handoff-offset` | >= 0 |
 | `work` | `--state` | one of the documented review states |
@@ -1760,6 +1812,23 @@ and content hashes are durable, so an uncertain create is reconciled with the sa
 request ID instead of creating a duplicate.
 
 ## Backward compatibility
+
+Unreadable native reference, capability and proposal rows are classified by their
+ID's membership in native label-filtered reads. Contributor-controlled titles and
+labels inside unreadable JSON are not classification evidence. Reference and
+capability catalogs name unreadable anchors as malformed (their exact key may be
+unknown); get reports that the selected key exists but cannot be read. These
+anchors stay out of work and remain in the anchors read. Healthy rows retain the
+existing label-plus-record rule and healthy reads need no extra membership reads.
+
+Unreadable lifecycle events use the complete native `list --type event --all
+--limit 0 --json` ID set, through the same helper. A failed event selection or an
+unreadable selected event refuses lifecycle writes with the operator repair
+sentence. Since its parent and dimension cannot be trusted, lifecycle reads of
+that snapshot report unknown instead of an older passed fact. The contributor
+endpoint currently permits creating an event and changing native type to/from
+event; a retyped ordinary row joins event membership, and a retyped event leaves
+it. Type membership alone never makes readable event content a trusted fact.
 
 Consumers should key on documented fields, tolerate additional fields, and treat any
 nonzero exit code as failure. The envelope, `work` top-level shape, `brief`

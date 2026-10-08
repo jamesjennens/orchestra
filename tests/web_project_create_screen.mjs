@@ -4,7 +4,7 @@
 // observations; the Python test asserts on it.
 //
 // argv: shim URL, api.js URL, work.js URL, admin.js URL, setup.js URL, base URL, phase
-// ("create" or "stopped"), then name=token=userId triples (admin, olive, carl).
+// ("create", "stopped" or "chips"), then name=token=userId triples (admin, olive, carl).
 const [shimUrl, apiUrl, workUrl, adminUrl, setupUrl, base, phase, ...people] = process.argv.slice(2);
 await import(shimUrl);
 const { createApi } = await import(apiUrl);
@@ -92,6 +92,18 @@ if (phase === 'create') {
     buttons: texts(editor(), 'BUTTON') };
   const guidance = page2.all((e) => e.tagName === 'LI').find((li) => li.attributes['data-step'] === 'guidance');
   out.guidanceHasNoForm = guidance.all((e) => e.tagName === 'FORM').length === 0;
+} else if (phase === 'chips') {
+  // The superuser's list names what each entry is, in words.
+  const list = await work.incompleteCreations(who.admin);
+  out.chips = list.all((e) => e.attributes['data-creation']).map((e) => [e.attributes['data-creation'], e.attributes['data-state'], e.textContent.slice(0, 200)]);
+  // "alpha" has been retired on the host meanwhile: its creator is told so on the name, with no notice and no link.
+  const session = await who.olive.api.current();
+  const form = work.hostCreatePanel(who.olive, session.project_host_create).querySelector('form');
+  form.querySelector('#new_project_id').value = 'alpha';
+  await form.dispatch('submit');
+  const notice = form.querySelector('#host-create-yours');
+  out.retired = { shown: !notice.hidden, links: form.all((e) => e.tagName === 'A').map((a) => a.attributes.href),
+    nameError: fieldError(form, 'new_project_id'), went: who.olive.went.slice() };
 } else {
   // The server stops half way through creating "beta".
   const session = await who.olive.api.current();
@@ -110,6 +122,12 @@ if (phase === 'create') {
   form.querySelector('#new_project_id').value = 'gamma';
   await form.dispatch('submit');
   out.limit = fieldError(form, 'new_project_id');
+  // A name olive already has by her own creation: a notice with a link, and no error on the name.
+  form.querySelector('#new_project_id').value = 'alpha';
+  await form.dispatch('submit');
+  const notice = form.querySelector('#host-create-yours');
+  out.yours = { shown: !notice.hidden, text: notice.textContent, links: notice.all((e) => e.tagName === 'A').map((a) => a.attributes.href),
+    nameError: fieldError(form, 'new_project_id'), went: who.olive.went.slice() };
   out.after = (await who.olive.api.current()).project_host_create;
 }
 // ASCII only on the way out: the page texts carry typographic quotes, and the reader of

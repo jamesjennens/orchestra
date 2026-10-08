@@ -61,6 +61,14 @@ SSH remains the default configuration:
 {"host":"beads-team","endpoint":"/home/beads/beads-team-kit/endpoint.py","root":"/home/beads/beads-runtime"}
 ```
 
+`python` is optional and names one interpreter executable. Over SSH it is the interpreter that runs the endpoint **on the server**, not one on your machine; without it the server's `python3` is used. The endpoint needs Python 3.10 or newer, and on RHEL 8 the host's `python3` is 3.6, so a configuration for an office installation names the bundled interpreter through `install/current` (`add-project` prints exactly this, with the real paths):
+
+```json
+{"host":"beads-team","python":"<INSTALL_ROOT>/current/python-runtime/<PATH>","endpoint":"<INSTALL_ROOT>/current/kit/endpoint.py","root":"<RUNTIME_ROOT>"}
+```
+
+`host` is an SSH alias or `user@host` that resolves **from your machine**: a server's own host name may not resolve from another network. An endpoint started with an interpreter that is too old says so and does nothing, and the client shows it: `SSH failed (2); ... endpoint.py needs Python 3.10 or newer and was started with Python 3.6.8 (/usr/bin/python3). Nothing was carried out. Set "python" in the client configuration ...`. `client.py`, `admin.py` and `office_service.py` say the same of themselves.
+
 For a terminal already on the Linux coordination server, explicitly select local transport:
 
 ```json
@@ -212,13 +220,13 @@ contract; a historical verification does not by itself restore a superseded scop
 
 `--rollback` (or `"rollback": true` in the payload) is the explicit rollback (rev2 item 2, rev3 item 1/3.1). It moves the environment's live release back to R: every task in R's membership is re-recorded live at R (`live=live` under R's scope, with a current scope and `deployed=passed` so the readers show R), and every task live in that environment that R does not carry is marked `live=superseded` **under that environment's live scope** — which may be older than the task's current scope, so a task whose newest scope is another environment is still superseded correctly — with its evidence untouched, so it reads `deployed=unknown` and `deployed_delivery=null`. The command resolves both lists locally (Git ancestry), prints them as `targets`/`superseded`, and sends them in one payload. Three cases are refused before the first write, on the client and at the endpoint: a rollback in an environment with nothing deployed (it would act as a full deploy); a rollback to a release that was never deployed in that environment; and a hand-built payload that names the same task as both a target and superseded. The additive `supersede` field remains accepted on explicit caller payloads; the plain CLI selection does not generate it. `supersede_scopes` can name historical scopes of dropped as well as carried tasks. For a DROPPED task the task-level and the scope-level write both name its environment-live scope; both receipts are kept deliberately so the move is auditable per task and per scope, and the tests pin both (kittrial-5bb.119 added point 3). Negative facts are written before the carried tasks are re-lived. A plain incremental deploy needs no rollback flag.
 
-Because the selection is a subset, `targets` in the input file is an optional caller subset: task names, or full `{task,source_commit,integration_commit}` entries the command checks against its resolution (a caller may also leave it empty). `--target TASK` adds one name and may repeat; `--page-size N --page P` page through a large resolution. One request still covers at most 200 targets, so the command splits the write into request groups of `--chunk-size` (default 25, or 15 for a `--live-verified` run that carries new targets) and the project lock is released between groups: the whole operation can therefore cover more than 200 tasks, and no single request approaches the client's 150 s timeout. Before the first group request the command resolves EVERY target and checks EVERY derived operation id for a conflicting planted fact against the one export, so a conflict or a stale target in a later group writes nothing instead of completing the earlier groups (item 3); it prints one progress line per group on stderr and, if a group fails, prints the JSON report naming `groups_completed`/`groups_total` and the failure. `--dry-run` prints `expected_seconds`, a conservative ESTIMATE for the resolved page and not a guaranteed bound, computed per NATIVE WRITE (1.5 s per native `set-state` process plus 15 s of request overhead): a new target costs THREE writes — scope, deployed and live — and FOUR with `--live-verified` on a first deployment (the extra `live-verified` fact), while a verify-only target costs ONE. When the task already carries a fact's target value, `_apply_fact` rewrites the label through `pending` first, so that fact costs one extra process: a `--live-verified` run to a second environment of already-labelled tasks pays six (or seven once they were verified before) processes for four facts, and `expected_seconds` counts those, so it does not come in under the measured cost (kittrial-5bb.139 item 2). The report also prints `planned_writes` (planned facts) and `planned_state_changes` (the native processes the estimate is priced from). rev3 item 3.3 measured 201 targets at 438 s with three writes each. Two clean re-measurements of this revision's kit on real bd 1.2.2 + Dolt (2026-10-05) measured 0.43 to 0.57 s per `bd` process and up to 0.92 s per planned fact on the slowest case: 25 targets took 32 to 38 s and 75 processes for a plain first deployment, 12 to 14 s and 25 processes for a verify-only run, and 79 to 92 s and 175 processes for a first `--live-verified` deployment to a second environment. The estimate keeps 1.5 s per planned fact, which also covers the reviewer's measured 1.47 s per planned fact, and it replaced the old per-TARGET figure that had been taken under a concurrent suite (kittrial-5bb.119 items 3 and 4). Because a 25-target first `--live-verified` group runs at about the client's 150 s timeout (the reviewer measured 139 s; the estimate is 165 s), such a run uses a SMALLER default group (15 targets) and prints a warning saying why; an explicit `--chunk-size` whose group estimates over 150 s also prints a warning, so no single request can time out. It stays an estimate and can still be exceeded on a slower host. Measured on the authoritative Linux host against a synthetic 900-row export (300 decoy tasks, 200 target tasks, 400 lifecycle events): 200 targets took **0.106 s with ONE export and 400 native writes** (0.0005 s per target), and the exact retry took 0.131 s and reconciled every target; the same 200 targets with `live_verified` took 0.123 s with one export and 600 writes. That harness replaces the `bd` binary, so it isolates the change that matters — the pre-fix path paid a full export per fact (measured by the reviewer at 731 s, 3.65 s per target, 249 s for the exact retry); with one export per request the remaining cost is the native writes themselves, now bounded per group.
+Because the selection is a subset, `targets` in the input file is an optional caller subset: task names, or full `{task,source_commit,integration_commit}` entries the command checks against its resolution (a caller may also leave it empty). `--target TASK` adds one name and may repeat; `--page-size N --page P` page through a large resolution. One request still covers at most 200 targets, so the command splits the write into request groups of `--chunk-size` (when unset, the group is DERIVED from the native-write count of the page: one group may cost 90 native `set-state` processes — the 150 s client limit at the 1.5 s per-write figure — so a plain first deployment keeps the historical 25-target group at 75 writes, while a release to a further environment of already-labelled tasks uses a smaller one) and the project lock is released between groups: the whole operation can therefore cover more than 200 tasks, and no single request approaches the client's 150 s timeout. Before the first group request the command resolves EVERY target and checks EVERY derived operation id for a conflicting planted fact against the one export, so a conflict or a stale target in a later group writes nothing instead of completing the earlier groups (item 3); it prints one progress line per group on stderr and, if a group fails, prints the JSON report naming `groups_completed`/`groups_total` and the failure. `--dry-run` prints `expected_seconds`, a conservative ESTIMATE for the resolved page and not a guaranteed bound, computed per NATIVE WRITE (1.5 s per native `set-state` process plus 15 s of request overhead): a new target costs THREE writes — scope, deployed and live — and FOUR with `--live-verified` on a first deployment (the extra `live-verified` fact), while a verify-only target costs ONE. When the task already carries a fact's target value, `_apply_fact` rewrites the label through `pending` first, so that fact costs one extra process: a `--live-verified` run to a second environment of already-labelled tasks pays six (or seven once they were verified before) processes for four facts, and `expected_seconds` counts those, so it does not come in under the measured cost (kittrial-5bb.139 item 2). The report also prints `planned_writes` (planned facts) and `planned_state_changes` (the native processes the estimate is priced from); for a rollback or a `--live-verified` roll-forward BOTH are an UPPER count of the re-lived targets, because a target already at the release scope and already live there costs fewer processes than the three facts a page-level estimate assumes, while the paired task-level and scope-level supersede facts of a dropped task are counted one process each (kittrial-5bb.139 review item 3). rev3 item 3.3 measured 201 targets at 438 s with three writes each. Two clean re-measurements of this revision's kit on real bd 1.2.2 + Dolt (2026-10-05) measured 0.43 to 0.57 s per `bd` process and up to 0.92 s per planned fact on the slowest case: 25 targets took 32 to 38 s and 75 processes for a plain first deployment, 12 to 14 s and 25 processes for a verify-only run, and 79 to 92 s and 175 processes for a first `--live-verified` deployment to a second environment. The estimate keeps 1.5 s per planned fact, which also covers the reviewer's measured 1.47 s per planned fact, and it replaced the old per-TARGET figure that had been taken under a concurrent suite (kittrial-5bb.119 items 3 and 4). Because the default group is derived from the native-write count, the kit no longer warns about a size it chose itself: a plain release of 25 already-labelled targets to a second environment is 125 native writes (202.5 s) at a fixed 25, so the derived group is 18 targets (90 writes, a 150.0 s estimate), a 25-target first `--live-verified` deployment is 100 writes so the group is 22, and the worst case (a `--live-verified` release to a second environment of already-labelled, already-verified tasks, seven processes per target) is 12 targets; the negative facts of a rollback ride the first group, so they are paid out of the same budget, and the run prints a warning saying why its group is smaller than the plain default. An explicit `--chunk-size` is still honoured and its group is judged against the same 150 s limit, so it may still warn; no single request is meant to time out. It stays an estimate and can still be exceeded on a slower host. Measured on the authoritative Linux host against a synthetic 900-row export (300 decoy tasks, 200 target tasks, 400 lifecycle events): 200 targets took **0.106 s with ONE export and 400 native writes** (0.0005 s per target), and the exact retry took 0.131 s and reconciled every target; the same 200 targets with `live_verified` took 0.123 s with one export and 600 writes. That harness replaces the `bd` binary, so it isolates the change that matters — the pre-fix path paid a full export per fact (measured by the reviewer at 731 s, 3.65 s per target, 249 s for the exact retry); with one export per request the remaining cost is the native writes themselves, now bounded per group.
 
 Each target keeps its own `source_commit`/`integration_commit` and adds the release `release_id` and `environment`, so the recorded scope is the one a hand-written scope event would have. Every target is verified against ONE export read once for the whole request, and every derived per-task operation ID is checked for a conflicting planted fact, before the first write: a stale target or a used ID refuses the whole group and nothing is written.
 
 The endpoint then records the scope event (only when it differs from the task's current scope), one `deployed=passed` fact carrying the shared evidence block and the target's optional `note`, one `live=live` liveness fact (rev2 item 4), and, with `--live-verified` or `"live_verified": true`, one `live-verified=passed` fact. A verify-only target gets ONLY the `live-verified` fact, written under that release's recorded scope. A superseded task gets ONLY the `live=superseded` fact, written under the live scope of the payload's environment. The note rides the deployed fact ONLY: the scope event keeps exactly its four scope fields, so a kit that predates the optional fields (and rejects unknown ones) still reads the scope. Add `"note": "..."` (one line, up to 500 characters) to a target for a per-task note. Deterministic per-task operation IDs reconcile a still-current exact receipt. If its liveness assertion has since changed, the whole request is refused before writes, saying a new operation ID is needed **and naming the operation ID from the request file**, not the derived per-task id the caller never chose (kittrial-5bb.119 added point 4). Use a new ID for a new rollback or roll-forward, and for changed evidence or notes; keep an ID only to reconcile the same still-current or interrupted operation.
 
-**Why a first `--live-verified` deployment costs about twice a plain one.** It is more native writes, not a slower one. When a task already carries the target label — the common case when the same tasks are released to a second environment — `_apply_fact` moves that label through an intermediate `pending` value before it sets the target value, so a `--live-verified` deployment of already-labelled tasks issues six `bd set-state` processes per target for four recorded facts, or seven once an earlier run also verified the task (then `live-verified` is rewritten through `pending` too), against three processes for three facts on a plain first deployment. The measured per-process cost is unchanged (0.43 to 0.57 s across this revision's two clean runs, 0.78 to 0.86 s on the reviewer's loaded one); `expected_seconds` counts NATIVE STATE CHANGES, including the extra `pending` writes, so the second-environment case is not understated (kittrial-5bb.139 item 2); the plain default group stays 25 because its 127.5 s estimate is inside the 150 s timeout while the same run measured about half, and the 1.5 s per-native-write figure already covers the measured 1.0 s floor (kittrial-5bb.139 item 3).
+**Why a first `--live-verified` deployment costs about twice a plain one.** It is more native writes, not a slower one. When a task already carries the target label — the common case when the same tasks are released to a second environment — `_apply_fact` moves that label through an intermediate `pending` value before it sets the target value, so a `--live-verified` deployment of already-labelled tasks issues six `bd set-state` processes per target for four recorded facts, or seven once an earlier run also verified the task (then `live-verified` is rewritten through `pending` too), against three processes for three facts on a plain first deployment. The measured per-process cost is unchanged (0.43 to 0.57 s across this revision's two clean runs, 0.78 to 0.86 s on the reviewer's loaded one); `expected_seconds` counts NATIVE STATE CHANGES, including the extra `pending` writes, so the second-environment case is not understated (kittrial-5bb.139 item 2); the plain default group stays 25 for a first deployment because its 75 native writes are inside the 90-write per-request budget (a 127.5 s estimate, about half measured) while a release to a further environment of already-labelled tasks uses a smaller group instead of warning about the kit's own default (kittrial-5bb.139 review item 1), and the 1.5 s per-native-write figure already covers the measured 1.0 s floor (kittrial-5bb.139 item 3).
 
 **Two behaviour changes against the previous kit (kittrial-5bb.119 added point 5).** (1) Reusing one release operation ID for a DIFFERENT release or environment is now refused with exit code 1 and `operation ID already used for different content (release/environment); a new operation ID is needed`; a kit that predates the guard returned exit code 0 and released nothing, because the derived per-task ids still matched. (2) `--live-verified` on a later release also verifies a still-live EARLIER task: the carried task's verification is filed under the scope that really carries its deployment (`verify_scope`), so a later release verifies the earlier one without moving the task's current scope. Both are deliberate.
 
@@ -233,6 +241,54 @@ Because the release scope becomes each target's current scope, the six-fact read
 Ancestry is checked ONLY in the client: the endpoint re-verifies that each target's `source_commit`/`integration_commit` is a trusted `integrated=passed` scope in its own export, but it does not run git and cannot tell whether that commit is an ancestor of the release. The target list is therefore an assertion under the kit's existing trust model, like `commit`/`base_commit` in contribution review.
 
 When a selected target's `source_commit` is not the task's current contribution (a release shipping a superseded revision, or a revision replaced while its successor awaits review), the dry run and the result carry a `flags`/`flag` entry naming the delivery and the current contribution, and `brief`/`work` show `deployed_delivery` (release, environment, source and integration commit), `deployed_delivery_is_current_contribution` and `deployed_live`. The four `deployed_delivery` values are PLAIN STRINGS clipped at 160 characters — the shape the field was released with — so a hostile or oversized `release_id` cannot flow through unclipped (rev2 item 6.1; rev1's excerpt objects were reverted).
+
+## Register capabilities with the release
+
+The capability index is kept true at delivery and release, not left to a separate sweep
+(kittrial-5bb.179). Three steps:
+
+1. **The delivery carries the payload file, and the worker does not write the index.** A
+   contribution that adds or changes something a user or an agent can rely on carries its
+   capability proposal payload as a file in the delivery — conventionally
+   `capability-proposals/<key>.json`, one file per record — named in the contribution
+   summary. The payload is the closed record set of the design: a key, a name, aliases, a
+   one-sentence `summary`, requirements, anchors, `code`, `tests`, an owner and tags. There
+   is no "check" field and no commit field in it; the check records the commit it was run
+   at. The reviewer judges that claim with the change. A delivery that removes or weakens a
+   capability states in the same delivery that its entry must be revised or retired, and
+   carries either the revised payload file or the successor key: retiring is
+   `admin.py capability-retire`, operator-only, and it needs a successor key. This kit has
+   no demotion.
+2. **The coordinator writes the payload and accepts the meaning at release, after
+   integration.** Once the delivery is integrated the coordinator runs `capability propose`
+   or `capability revise` for the payload file, then accepts the meaning at release
+   (`admin.py capability-apply`), with the release as its evidence. Writing the record only
+   after integration is the point: a record written from a lane is in the release check set
+   while its work is still in review, so a release cut before that work lands checks the
+   draft against main, its pointers are missing, and it reads `drifted`.
+3. **The release verifies the index.** In a clean checkout at the integrated commit:
+
+   ```sh
+   python client.py --config client.local.json --project example --actor alex/session1 -- \
+       capability check --repo . --payloads payloads.json
+   admin.py capability-verify example --actor OPERATOR --file payloads.json
+   ```
+
+   The payload file is **generated from the records, never kept by hand**. With no
+   `--key`, `capability check` pages every capability the endpoint holds and writes one
+   payload per accepted or draft record **whose check the checkout can decide**: a record
+   whose pointers are all `unknown` gets none and reads `not-recordable`, so a record
+   proposed or accepted after this kit was built is covered with no new flag, file or edit.
+   `--key` narrows the generated set for one run only; the release step uses no `--key`.
+
+**A release is not finished until `capability-verify` passes for every accepted entry.** A
+failing **draft** does not fail the release — nobody has accepted its meaning and it is not
+in the index the release speaks for — but it is listed in the release record with its key,
+the pointers that did not resolve and an owner, and left to that owner. A check that always fails
+teaches everyone to ignore the result, so list the entry and its owner in the release record
+rather than carrying it release after release. What an entry may claim, who may propose and
+accept, and what a rollback does to entries are in the
+[capability design](CAPABILITY_INDEX_DESIGN.md#13-registration-with-delivery-and-release-kittrial-5bb179).
 
 ## Read what a deployed release still owes
 
@@ -338,6 +394,36 @@ Operator runbook for a stuck reservation:
 3. If no issue exists and the receipt records an actor, release it (the original actor resubmits). If you must hand the ID to another actor, add `--any-actor`.
 4. If no issue exists and the receipt records **no** actor, pass `--any-actor` on this first release (a plain release is refused); then any actor may resubmit the same request ID.
 5. Never delete the reservation or allocate a new request ID to bypass a refusal.
+
+## Who has a task: claim, handoff, take-over
+
+**The one who has a task changes in three ways, and they are not the same.**
+
+- A **claim** takes a task that is free and open. It never takes a task from somebody:
+  bd's own claim refuses a held task ("issue already claimed by NAME") and one that is
+  not open, on the host route (`update TASK --claim`) and over the web alike.
+- A **handoff** moves a task from its owner to another worker and leaves a trail: the
+  owner (or the receiver's request the owner accepts) runs `handoff TASK --file`, or an
+  operator with the owner's or coordinator's authorization runs `admin.py handoff`; the
+  operation is journalled and the task carries the intent and completion records.
+- A **take-over by the coordinator** is the plain update on the host route,
+  `update TASK --assignee ACTOR --status in_progress`. It only changes the row: no
+  record of who gave what to whom, no check that the old holder agreed, nothing in the
+  review chain. It is what a coordinator uses when a task must move and its holder is
+  gone or the task was never properly held; it is not refused, and there is no web
+  route for it. Prefer the handoff whenever the old holder or an operator can make one,
+  and say in a comment on the task why the row was changed when it was not.
+
+**A task that is in progress and has nobody.** A host update can leave a task
+`in_progress` with no assignee. It cannot be claimed, by anybody, on either route: bd
+answers "issue not claimable: status in_progress" (over the web: 409 "Task is not open
+(it is in progress)"). The coordinator settles it on the host route: gives it to
+somebody (`update TASK --assignee ACTOR`), or sets it open again (`update TASK --status
+open`), after which the first claim takes it. (Measured on bd 1.2.2.)
+
+The handoff's payload and its recovery are in [resume and contribution reviews](REVIEWS.md)
+("Replacement worker: explicit handoff"); what the web claim route answers is in
+[HTTP deployment](HTTP_DEPLOYMENT.md) ("Claiming a task").
 
 ## Integrate through one project-wide merge slot
 

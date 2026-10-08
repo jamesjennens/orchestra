@@ -19,9 +19,9 @@ loginctl show-user beads -p Linger
 systemctl --user is-active beads-team.service
 ```
 
-The database listens on loopback only. Its generated credential is stored in the runtime's `deployment.private.json` (0600); runtime permissions are 0700. Contributors do not need the SQL password. Do not publish this directory or open the database port on the network. The installer configures metrics off for this deployment.
+The database listens on loopback only. Its generated credential is stored in the runtime's `deployment.private.json` (0600); runtime permissions are 0700. **The file is required**: since kittrial-5bb.156 every write through the endpoint reads it (and the password in it) before anything else, so a runtime without it, or with a file the endpoint's user cannot read, refuses every write with the endpoint's own line naming the file (over the web: 503 `server_configuration`). `prepare` writes it; a scratch runtime made by hand for a check needs one too. Contributors do not need the SQL password. Do not publish this directory or open the database port on the network. The installer configures metrics off for this deployment.
 
-The kit runs `bd`, `dolt`, the HTTP service and the endpoint with `HOME` set to `<runtime>/home` and `BD_DISABLE_METRICS=1`, so Beads keeps its configuration inside the runtime and its usage metrics stay off; the kit writes nothing to the service account's own home directory. A runtime created before this change keeps working without a `home` directory: the environment variable alone keeps metrics off. Rollback note: an older kit reads Beads' configuration from the account's home directory instead, so before rolling back make sure `~/.config/bd/config.yaml` there has metrics disabled (`bd metrics off` as that account), or Beads turns its metrics on for a runtime that was created by this kit. Dolt's own global configuration is pinned to the runtime by `DOLT_ROOT_PATH` and is unaffected.
+The kit runs `bd`, `dolt`, the HTTP service and the endpoint with `HOME` set to `<runtime>/home` and `BD_DISABLE_METRICS=1`, so Beads keeps its configuration inside the runtime and its usage metrics stay off; the kit writes nothing to the service account's own home directory. What that variable suppresses is bd's own telemetry, not anything the kit adds: with metrics on, bd 1.2.2 leaves a detached child that writes `$HOME/.config/bd/config.yaml` (`metrics: disabled: false`, upstream's event endpoint) and queues usage events under `$HOME/.beads/eventsData/` (`*.evtq` and `eventkit.lock`) just after a command such as `bd --version` returns. `bd metrics off` and `BD_DISABLE_METRICS=1` stop that child; the release tool sets the variable for its own run checks for the same reason (kittrial-5bb.166), and starts `dolt` there with `DOLT_DISABLE_EVENT_FLUSH=1` so that `dolt version` does not re-execute itself as a detached `dolt send-metrics` child (see docs/OFFICE_SERVICE.md; dolt's `metrics.disabled` global setting alone does not stop it). A runtime created before this change keeps working without a `home` directory: the environment variable alone keeps metrics off. Rollback note: an older kit reads Beads' configuration from the account's home directory instead, so before rolling back make sure `~/.config/bd/config.yaml` there has metrics disabled (`bd metrics off` as that account), or Beads turns its metrics on for a runtime that was created by this kit. Dolt's own global configuration is pinned to the runtime by `DOLT_ROOT_PATH` and is unaffected.
 
 If initial installation fails, it stops the service and preserves files for inspection. Do not rerun by deleting the runtime: investigate the service journal first. Repeating installation of an already initialized deployment checks its pins, port and connectivity.
 
@@ -89,6 +89,158 @@ Confinement binds the key to the endpoint, not to an actor. A confined key still
 self-declares its actor on every request, exactly as an unconfined one does; what the
 forced command protects is the operator-gated and reserved operations, which a contributor
 key could otherwise reach by running `admin.py` or `bd` directly.
+
+### Bind a key to its projects
+
+A confined key may name any project of the runtime. To bind it, print its line with the
+projects it may use (kittrial-5bb.193; rule 1 of
+[COORDINATORS_PER_PROJECT_DESIGN.md](COORDINATORS_PER_PROJECT_DESIGN.md)):
+
+```sh
+python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime \
+  authorized-keys --key-file ~/alex.pub --project alpha --project beta
+```
+
+The printed line carries `--project alpha --project beta` after `--endpoint`, and repeats
+the names in the key comment (`orchestra-projects=alpha,beta`) so the file can be read by
+eye; the binding is the arguments, never the comment. Only that line is printed: the
+operator line is a shell, and a shell is every project. Each name must be a project of
+this runtime. The client configuration does not change (`"forced_command": true`, as for
+any confined key), and the project stays in the request.
+
+What a bound key is answered: for one of its projects, exactly what any caller is
+answered. For any other project, whatever the action (raw `bd`, `session register`,
+reviews, the merge slot, lifecycle facts, views, everything the endpoint has), `ValueError:
+Unknown/uninitialized project`, the answer for a project that does not exist: the key
+cannot tell another project from none. Nothing of the other project is read first. The
+three actions that exist only for the web service answer that they are available only to
+the web service.
+
+What it does not do: the key still names its own actor, any actor, inside its projects. Name
+a principal as well (below) to confine the actor too. And it binds only a key whose ONLY line
+in `authorized_keys` is the bound one. A key that also has an unrestricted or an unbound line
+is not bound: replace that line. A line printed by an earlier release of the kit is served
+by that release's wrapper, which knows no `--project` and refuses the line outright (its
+own argument check), or, if the line names no project, binds nothing.
+
+Read what is installed, without changing anything:
+
+```sh
+python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime authorized-keys-list
+```
+
+It reads `~/.ssh/authorized_keys` of the account that runs it (`--file` for another file)
+and prints, for every line: its number, the key's type, fingerprint (as `ssh-keygen -l`
+prints it) and comment, and its `kind`: `unrestricted` (no `command=`: the account's
+shell, outside every rule of the kit), `confined` (the kit's forced command, any project),
+`bound` (with its `projects`), `other-command` (a `command=` that is not the kit's
+wrapper; said, not judged) or `unreadable`. For the kit's lines it also prints `other_kit`
+(the wrapper or the endpoint the line names is not the installed kit's file: after an
+upgrade of an office installation, a line that names `releases/<ID>` keeps running that
+release), `names_release` (it is the installed kit today but names its release folder, so
+it becomes `other_kit` at the next upgrade), `other_root`, `missing`, arguments the wrapper
+does not know and projects that are not projects. `attention` lists the line numbers to
+look at. `principal` is the principal named on the line (`lane:NAME` or `person:NAME`), or
+null. The summary counts both kinds of binding: `bound` for every bound line and
+`principal-bound` for the lines that name a principal; a line bound only to a principal is
+`bound`, not `confined`. A repeated principal (`--principal` twice) and an ill-formed one
+are under attention, because the wrapper refuses such a key.
+
+### Bind a key to its principal
+
+A confined key may name any actor. To bind it to a principal - a lane, in the
+`lane:NAME` form (`person:NAME` is accepted too, and is a different principal) - name
+the principal when the line is printed (kittrial-5bb.194; rule 2 of
+[COORDINATORS_PER_PROJECT_DESIGN.md](COORDINATORS_PER_PROJECT_DESIGN.md)):
+
+```sh
+python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime \
+  authorized-keys --key-file ~/alex.pub --principal lane:orc-coord --project alpha
+```
+
+`--principal` and `--project` are independent: a key may be bound to projects, to a
+principal, or to both. The printed line carries `--principal lane:orc-coord` after the
+projects and repeats it in the key comment (`orchestra-principal=lane:orc-coord`); the
+binding is the argument, never the comment. Only the confined contributor line is printed,
+as with `--project`: an operator line has a shell and cannot be bound. A line that names a
+principal twice is refused, as a project named twice is.
+
+What a key bound to a principal is answered: a request whose actor the project's session
+registry (`projects/PROJECT/.sessions.json`) gives to that principal is served exactly as
+any caller is; every other action is refused before anything runs, whichever actor the
+request names, with a sentence naming the principal and the actor. An actor that has no
+entry has no principal and is not this key's. **The exception is a session registration**:
+`session register` under a bound key is allowed and records the new actor under the key's
+principal, so the new session can then act through that key. It is the only exception, and
+only when the first argument is exactly `register`; a `session resume`, `session run` or
+`session show` as another actor is refused like any other action. `session show` prints the
+principal the actor belongs to (`principal`); on an installation that has never written an
+owners map the key is omitted, so the answer is the one this kit gave before rule 2.
+
+An actor that existed before the key was bound (an older coordinator, a legacy name with no
+registration) keeps its name and its history if it is given to the principal once by the
+writing host command:
+
+```sh
+python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime \
+  adopt-actor alpha alex/session1 --principal lane:orc-coord --actor OPERATOR \
+  --reason "the lane he coordinates in"
+```
+
+The command refuses a name that appears nowhere in the project (no session registration, no
+owner entry and no tracker row names it), so the audit is not a place to invent an actor. It
+refuses a name on the deployment operator allowlist that another principal owns in another
+project: the one operator list must mean the same lane everywhere. It records in
+`<runtime>/actor-adoptions.audit.json` who gave which actor to which principal, when and why
+(`admin.py actor-adoptions [PROJECT]` prints it), and reports `previous` when it moved an
+actor this project already gave to a different principal. It writes nothing when the project
+already gives the actor to this principal.
+
+**Moving an actor that another principal already owns is not the same plain command.** Once
+a project's registry gives an actor to a principal, `adopt-actor` refuses to give it to
+another unless the command names the owner it has now with `--from PRINCIPAL`; the audit
+entry for such a change carries `"moved": true` beside `previous`. Without `--from` the
+refusal changes nothing, so one mistyped actor cannot take a lane's identity and record away.
+**Nothing removes an owner**: there is no command that takes an actor back to "no principal",
+and a wrong owner is corrected with `adopt-actor ... --from`. The audit is a short history:
+it keeps the newest 200 entries and drops the oldest silently; it is a record of recent
+adoptions, not a complete ledger (the registry's owners map is the authority).
+
+**What this section does not do.** Rule 2 binds only BOUND keys. A line with no
+`--principal`, a key bound only to projects, and a line printed by an older release all act
+as every actor until slice 4 (bound keys only), and a line of an older release stays outside
+even then. A lane still passes its own work until rule 3 (slice 6): its actor may approve its
+own contribution and take its own merge slot. A principal named with no `--project` reaches
+every project of the installation by registering there first; `--principal` alone limits the
+names a key may use, not the projects it can reach. And `operators add` does not look at the
+owners maps: an actor adopted by two principals and listed afterwards belongs to both, in its
+own project each. Adopt or move an actor before putting its name on the operator list.
+
+`session register` under a bound key is unbounded, and every bound request parses the whole
+registry: one lane can slow the others by registering in a loop (the registry was 16.6 kB
+with 53 entries in the review's run, and 40 registrations took 35 s). Nothing here caps that;
+slice 4's bound-keys-only rule and the operator list are what bound who may register.
+
+Removing a coordinator whose lane is simply replaced: remove its `authorized_keys` line (its
+principal binding goes with the key), and do not start with `operators remove
+--confirm-revoke`, which makes every void, integration revert, retraction and proposal record
+it authored stop counting. Take a name off the operator list only when that effect is what is
+wanted.
+
+**Downgrade limit.** The registry gains one key, `owners` (actor to principal). This kit
+writes that key only when it is non-empty: an installation that configures nothing still
+writes the registry exactly as before, and an older kit reads it. Once an actor is adopted,
+or a session is registered under a bound key, the registry carries `owners`, and an older
+kit's validator refuses a registry with the unknown key. That older kit then refuses
+`session show`, `session resume`, `session register`, `session run start` and
+`actor-standing` for the project, **and `admin.py backup PROJECT` fails for it with status
+incomplete**; every key bound with `--principal` is refused (its wrapper does not know the
+argument), while `bd` itself, `work` and `review` keep working. Before rolling back to a kit
+without rule 2, remove that map from `projects/PROJECT/.sessions.json` first (and the binding
+from the keys), or the older kit cannot read the registry, cannot back the project up, and
+refuses every such key. The same applies to a coordination-sidecar backup taken after an
+adoption. [OFFICE_SERVICE.md](OFFICE_SERVICE.md) repeats this beside "Binary pins on
+rollback".
 
 ### sshd settings the boundary needs
 
@@ -201,7 +353,7 @@ history](#malformed-structured-history) (`void-record`).
 | `reference-apply PROJECT --actor OPERATOR --file batch.json` | accept a batch of reference entries under one F3 decision: the payload has `items` of `{key, revision, record_sha256}` (each the newest draft reviewed) in place of the single entry's fields. It behaves exactly as the `capability-apply` batch below: one receipt per item keyed `(operation_id, key)`, `accepted`, `already-accepted`, `refused` or `uncertain` per item, a refused item does not stop the others, the coordination lock is taken per item, at most 100 items, and re-running the same batch resumes it. Read the totals, not the exit code: see the `capability-apply` row | the deployment operator allowlist, checked before any write, and F3 evidence |
 | `reference-reconcile PROJECT --operation-id ID --actor ACTOR --reason TEXT --disposition ...` | finish a reference operation whose real write was uncertain; `complete` needs `--issue-id` and refuses an anchor that has no live revision record, because its propose stopped or every record it held is voided (re-run the original `ref propose` with its `operation_id` first; if that payload is lost, use `anchor-release`) | the deployment operator allowlist, checked before the receipt is read; then confirmation of the native record state |
 | `capability-apply PROJECT --actor OPERATOR --file batch.json` | accept a batch of capabilities under one F3 decision: `items` of `{key, revision, record_sha256}` (each the newest draft reviewed). The command writes one acceptance record and one receipt per item, keyed `(operation_id, key)`, in list order. It reports `accepted`, `already-accepted`, `refused` or `uncertain` per item; an uncertain item stops the batch, and re-running the same batch resumes it. The command exits 0 when the batch ran, even if items were refused, so read the totals it prints: `accepted`, `refused`, `stopped` (an uncertain write stopped the batch) and `complete`, which is true only when every item was accepted. A changed list needs a new `operation_id`. The coordination lock is taken per item and released between items, with a 50 ms pause while it is free, so other writers wait behind at most one item; each item re-checks its `revision` and `record_sha256` under its own hold. An item takes about 3 seconds (two reads and four writes), so 100 items take 5 to 6 minutes: prefer batches of about 20. `operation: "draft"` with full content writes a direct accepted revision 1 | the deployment operator allowlist, checked before any write, and F3 evidence |
-| `capability-retire PROJECT --actor OPERATOR --file retire.json` | supersede the newest revision of a key by a `successor` key, with evidence. The successor must exist, and a cycle is refused. A retired key refuses `revise` and acceptance. This also stands in for the design's "demote" in slice 1a | the deployment operator allowlist and F3 evidence |
+| `capability-retire PROJECT --actor OPERATOR --file retire.json` | supersede the newest revision of a key by a `successor` key, with evidence. The successor must exist, and a cycle is refused. A retired key refuses `revise` and acceptance. This is the only route that withdraws an accepted entry: the design has no demotion, so an accepted revision is never weakened or withdrawn in place (design section 4) | the deployment operator allowlist and F3 evidence |
 | `capability-alias-reject PROJECT --actor OPERATOR --file reject.json` | reject a pending alias (`{schema_version, key, alias, reason}`); lookup then ignores it | the deployment operator allowlist |
 | `capability-alias-propose PROJECT --actor OPERATOR --file alias.json` | propose an alias as a verified operator (`{schema_version, key, alias, evidence?}`). This is the only route that writes `identity: verified`; `capability propose-alias` through the endpoint always writes `unverified`, even for an operator's actor name | the deployment operator allowlist |
 | `capability-verify PROJECT --actor ACTOR --file payloads.json` | record capability checks as **verified**. The file is what `capability check --repo . --payloads payloads.json` wrote at the commit being verified (one payload, or `{schema_version, items}` of up to 500). Each item is one capability and takes the coordination lock on its own; the result is `recorded`, `already-recorded` or `refused` per item, and re-running the file is safe. This is the only route that writes a verified check: `capability check --record` through the endpoint always writes an unverified report | the deployment operator allowlist or the `verifiers` list, both checked before any read |
@@ -230,6 +382,8 @@ history](#malformed-structured-history) (`void-record`).
 | `guidance-status PROJECT --actor OPERATOR` | print who has acknowledged which guidance version, with the current text, the previous text, the history, `up_to_date`, `behind` and `stale`, and who cleared the guidance, when and which version (`clear_record`, `clears`) (the authoritative read; the endpoint's `guidance status` shows no guidance text) | the deployment operator allowlist |
 | `clear-guidance PROJECT --actor OPERATOR` | remove `GUIDANCE.md` and `.guidance.json` and write the local `.guidance-clear.json` record (who, when, cleared version; shown by `guidance-status`); guidance then reads `present: false`. A record already there that is not valid is kept as `.guidance-clear.json.invalid.<UTC time>`, and the command says so. A symlinked `GUIDANCE.md` is refused and needs a manual delete | the deployment operator allowlist |
 | `compact-guidance-acks PROJECT --actor OPERATOR` | drop acknowledgements for versions other than the current and previous one; the record keeps `acks_compacted_by`/`acks_compacted_at` (also kept across later sets) as the audit trail | the deployment operator allowlist |
+| `adopt-actor PROJECT ACTOR --principal lane:NAME --actor OPERATOR --reason TEXT [--from lane:OWNER]` | give an existing actor to a principal (a lane) in one project's session registry, so a key bound to that principal may act as it. It refuses a name that appears nowhere in the project, and it refuses to move an actor another principal already owns unless `--from` names that owner. It refuses a name on the operator allowlist that another principal owns in another project, records the change in `<runtime>/actor-adoptions.audit.json` (with `moved` on a move), and writes nothing when the actor already belongs to this principal. See [Bind a key to its principal](#bind-a-key-to-its-principal) | the deployment operator allowlist (the `--actor`), checked before any write |
+| `actor-adoptions [PROJECT]` | read the adoption audit: who gave which actor to which principal, when and why | none: read-only |
 
 All five are shell-trusted: access to the service account's shell is the boundary.
 `requirement-apply`, `requirement-backfill`, `void-record` and `anchor-release` also
@@ -319,6 +473,8 @@ history.
   once every installation runs a kit that accepts it. Until then a restored project
   has no clear record; the removed guidance record itself stays in the project's most
   recent coordination backup, if one was taken.
+
+**Every upgrade and rollback: restart the web service in the same step as the files (kittrial-5bb.156).** Where the web interface runs (`http_service.py --backend endpoint`), the service is a long-running process and the endpoint is started anew for each request. Replacing the kit's files therefore changes the endpoint at once and the service only when it is restarted, and a service of the other kit left running applies its own rules to the new endpoint's answers (seen: it registered a half-made project whose creation record is damaged, which the new service refuses). Replace the files and restart the service together; see docs/HTTP_DEPLOYMENT.md.
 
 **Upgrading to this kit, and rolling back from it (kittrial-5bb.105).** The plain-text
 rule is checked when guidance is read as well as when it is set, so a change of rule
@@ -685,6 +841,24 @@ Restore compatibility, exactly:
 
 This kit is therefore the oldest one a deployment may roll back to once any of those records exist.
 
+**Open items, owner questions and decisions: slice 0 (kittrial-5bb.126).** This release adds the names of `docs/OPEN_ITEMS_DECISIONS_DESIGN.md` and nothing that writes them. It changes behaviour in exactly two ways:
+- **Raw record comments:** a raw `bd comments add` whose body starts `Kind: open-item-v`, `Kind: item-resolution-v`, `Kind: owner-answer-v` or `Kind: coordinator-decision-v` (any version) is refused, like every other record prefix. Such comments, if any exist, are hidden from the shared surfaces; an item anchor (a row labelled `open-item` that carries an item, resolution or answer record) is hidden; a decision issue stays visible and only its record comment is hidden.
+- **Labels:** every `open-item:` label is reserved: no contributor adds, removes or replaces one on any row. The exact label `open-item` stays an ordinary label.
+
+It also names two journals, `.open-item-requests/` (a receipt journal, validated and counted as a reservation like the three above) and `.owner-answers/` (the host-issued journal, validated by its own entry validator like `.integration-reverts/`, with the fixed entry shape of the design's §11.2.1). No kit writes either yet, and a backup collects each only when its directory exists, so a backup taken by this kit is restorable by the previous kit exactly as before.
+
+Rollback and restore, exactly:
+- **Older kits cannot restore such a backup at all.** Once a backup carries either journal, every kit before this one:
+  - refuses its `restore-new` with `ValueError: Invalid coordination backup path`, and leaves nothing behind;
+  - refuses `restore-new --without-coordination` of it too, so not even the native data can be restored with an older kit;
+  - takes its own backup of a project that has the journals without error and **silently leaves both journals out**, so that backup no longer carries them.
+
+  The way out is to restore with this kit or a newer one (`admin.py` from a checkout is enough). Nothing creates either journal until open-item writes are turned on in a later release, so with writes off none of this can arise.
+- **This kit:** a malformed `.owner-answers/` entry or `.open-item-requests/` receipt refuses the backup before the native sync and the restore before its first write.
+- **The four kinds are not void targets yet:** `void-record` refuses them as an unsupported target kind, as before, until the release with their reader.
+
+At deploy time, list the projects that already use an `open-item` label: `python3 admin.py --root RUNTIME open-item-label-check [PROJECT...]`. It reads each initialized project once (no lock, no write), prints JSON naming every row carrying `open-item` or an `open-item:` label, and exits 1 when any project uses one or could not be read. A project whose `.beads/metadata.json` does not record the Dolt server coordinates is reported unreadable and bd is not run for it: bd would otherwise create an embedded database inside the project and list nothing. A project that does must choose another label for its own use before open-item writes are turned on for it; the later release that adds the switch refuses it.
+
 **Requirement proposals: triage runs on the host.** A contributor submits a proposal through the client (`proposal submit`). Everything that rests on operator authority is a host command, because over SSH the actor is self-declared: `proposal-review`, `proposal-decide` and `proposal-settings` above. A stored settings record counts only when its native author is on the operator allowlist, and a stored disposition when its author is on the allowlist or is an HTTP account (the web service wrote it for a member with `reviews.approve`, see [HTTP deployment](HTTP_DEPLOYMENT.md#requirement-proposals)); removing an operator makes their dispositions inert (the proposal reads its earlier state) and re-adding them restores it.
 
 - **Session-start step: map the coordinator before its first disposition.** The no-self rules compare people, not actor strings, so an unmapped actor is refused with "map this actor first". A new coordinator session brings a new `session-<uuid>` actor: after it registers, run `admin.py proposal-settings PROJECT --actor OPERATOR --map-actor session-<uuid> --to person:<name>`. To map a person once for all their sessions, use `--namespace <name> --to person:<name>`: it matches every session registered under `<name>`, `<name>/...` or `<name>-...` (see the name with `session show ACTOR`). A host operator who has no session, such as `james`, is matched by a namespace equal to that actor name.
@@ -739,7 +913,7 @@ A row is hidden as a record anchor only when it carries one of the labels `refer
 - **Revocation.** `verifiers remove ACTOR` requires `--confirm-revoke`. Afterwards every check that actor recorded reads `reported`, and drift that only their passes had cleared reappears. Nothing is deleted: re-adding the actor restores the reading. An actor who is also an operator stays trusted.
 - **Backup and restore.** Each project's coordination sidecar records the list beside `operators`, for information. `restore-new` never re-grants it on its own. When the backup records verifiers this host does not list, the restore prints them, says they were **NOT** restored, and their checks read `reported`. Re-grant one with `verifiers add ACTOR`, or pass `--restore-verifiers` to re-establish the whole recorded list. `--restore-operators` does not re-grant verifiers.
 - **One caller can fill the failing-report pool.** Every contributor posting through the endpoint is `unverified` until SSH actors are bound to people (kittrial-5bb.68), so they share one pool of 5 open failing reports per project. One caller can fill it, and then every other contributor's failing report is refused, naming the cap, until those failures are cleared. To clear them, an operator or listed verifier records a passing check at an integrated commit for each drifted capability (`capability check --payloads`, then `capability-verify`); `capability list` shows which ones read `drifted`. If the reports are noise, that pass is still the way to clear them, because a report is never deleted.
-- **Integration step.** At the integrated commit, in a clean checkout: `capability check --repo . --payloads payloads.json`, then on the coordination host `admin.py capability-verify PROJECT --actor OPERATOR --file payloads.json`. The payloads file is created private (mode 0600) and is never written through a symbolic link. Drift clears only on such a verified pass at a commit the project's lifecycle evidence records as integrated; a reverted integration does not count.
+- **Integration step.** At the integrated commit, in a clean checkout: `capability check --repo . --payloads payloads.json`, then on the coordination host `admin.py capability-verify PROJECT --actor OPERATOR --file payloads.json`. The payloads file is created private (mode 0600) and is never written through a symbolic link. Drift clears only on such a verified pass at a commit the project's lifecycle evidence records as integrated; a reverted integration does not count. **The payload file is generated from the records, not kept by hand:** with no `--key` the client writes one payload for every accepted or draft capability the endpoint holds **whose check the checkout can decide** — a record whose pointers are all `unknown` gets none and reads `not-recordable` — so a record added since the last release is covered with no edit. The release is not finished until `capability-verify` passes for every accepted entry; a failing **draft** does not fail the release, but it is listed in the release record with its key, the pointers that did not resolve and an owner. A delivery carries its capability proposal payload as a file named in its contribution summary, and the coordinator writes it into the index only after the delivery is integrated (kittrial-5bb.179).
 - **Rolling back below this kit.** An older kit keeps every record, hides them as before and simply reports no `verification`. It never rewrites or removes `views/CAPABILITIES.md`, so after a rollback delete `projects/PROJECT/views/CAPABILITIES.md` by hand; otherwise the last page rendered stays readable through `view` with its old export stamp.
 
 `add-project` initializes the project, provisions its merge slot (idempotently) and performs an initial backup, so a freshly provisioned project can run `merge-create`/`merge-check`/`merge-acquire` without a manual slot setup. A project whose slot is missing refuses `merge-check`/`merge-acquire`/`merge-release` with an error naming the `merge-create` operation, which is the manual repair. `backup` captures both the native backup directory and `backups/PROJECT.coordination.json`. The sidecar preserves pending child-request reservations and merge context outside Dolt. Keep this pair together. A pending marker is written before synchronization and becomes complete only after native sync succeeds; restore refuses an incomplete sidecar.
@@ -1033,6 +1207,8 @@ ones. The list below of what fails on an older kit is also incomplete: proposal,
 disposition, contribution-settings and requirement-revision comments, and a lifecycle
 record stored as a state reason (which the listing command does not print, because it reads
 only comments), fail reads there too.
+
+Resetting issue metadata with `bd update ISSUE --metadata "{}"` merges into existing metadata (a no-op); clearing it requires `bd update ISSUE --unset-metadata KEY`, which removes the key and both kits recover.
 
 The kit refuses JSON nested more than 64 levels deep wherever it parses text that
 somebody else wrote: a record comment, a `--file` attachment, a payload argument, a
@@ -1441,7 +1617,7 @@ timer below applies to deployments that use a user systemd manager.
 
 Edit `templates/beads-backup.service` for the installation paths, then copy it and `templates/beads-backup.timer` into the service account's `~/.config/systemd/user/`. Its `ExecStart` uses `backup --all`, so the one timer covers every project initialized in that runtime, including projects added later, and every run writes the `backup-status.json` record described above. Enable with `systemctl --user daemon-reload` and `systemctl --user enable --now beads-backup.timer`. Check `systemctl --user list-timers`, the service journal, and `backup-status --require-complete`; lingering must already be enabled for unattended operation. The timer performs same-host backup only. Configure off-machine copying, its completeness gate and retention separately; the timer does not copy anything off the host. These templates do not replace an existing team's backup schedule, and an existing installation that already runs a long-sync wrapper for this runtime keeps it. Once this kit's native step is deployed, that wrapper's monkeypatched `run_bd` and its `--timeout` ceiling are dead code: `admin.py backup` performs the native step itself through the Dolt SQL client (bounded by the 30-minute ceiling), and the wrapper's `dolt-backup-state.json` marker is no longer written or read by the kit.
 
-`add-project` reads every installed `~/.config/systemd/user/beads-*backup*.service` unit for the account — `beads-backup.service` is only one of the names a deployment may use — and reports factually which units it read. It states that a `backup --all` unit covers every project; a recognised long-sync wrapper for this runtime is reported as covering only the projects its `--project` arguments name (a wrapper that names no project is not coverage of anything), because a project added later needs another wrapper line. It prints the exact `ExecStart` to add when a unit that names projects individually does not cover every project (a project list is replaced with the durable form; named projects and `--all` are never combined in one command) and never steers an operator off an existing wrapper. An absent or unreadable unit is reported as no coverage rather than assumed fine, and a unit that runs the backup through `sh -c` is deliberately still reported as not backing up the runtime: only a recognised `admin.py` or wrapper `ExecStart` can be attributed to this runtime with certainty, and a wrong "already covered" answer could leave a project silently off the schedule, so the conservative direction is the safe one (it can prompt a double-check, never hide a gap). It reads the unit files only — it never edits, installs or enables a unit — and systemd drop-ins (`*.service.d/*.conf`) are not inspected, so the report is about the unit files themselves and not about a drop-in override.
+`add-project` reads every installed `~/.config/systemd/user/beads-*backup*.service` unit for the account — `beads-backup.service` is only one of the names a deployment may use — and reports factually which units it read. It states that a `backup --all` unit covers every project; a recognised long-sync wrapper for this runtime is reported as covering only the projects its `--project` arguments name (a wrapper that names no project is not coverage of anything), because a project added later needs another wrapper line. Where no unit covers the project it prints, each under its own label, the shell command that runs a backup of every project now (`PYTHON KIT/admin.py --root ROOT backup --all`, as the service account pastes it), the `ExecStart` line for a schedule (a line of the unit file, not a shell command, with the unit directory it goes in) and the check to run afterwards (kittrial-5bb.200: it used to print the `ExecStart` line alone, which pasted into a shell answers `Permission denied`). It prints the exact `ExecStart` to add when a unit that names projects individually does not cover every project (a project list is replaced with the durable form; named projects and `--all` are never combined in one command) and never steers an operator off an existing wrapper. An absent or unreadable unit is reported as no coverage rather than assumed fine, and a unit that runs the backup through `sh -c` is deliberately still reported as not backing up the runtime: only a recognised `admin.py` or wrapper `ExecStart` can be attributed to this runtime with certainty, and a wrong "already covered" answer could leave a project silently off the schedule, so the conservative direction is the safe one (it can prompt a double-check, never hide a gap). It reads the unit files only — it never edits, installs or enables a unit — and systemd drop-ins (`*.service.d/*.conf`) are not inspected, so the report is about the unit files themselves and not about a drop-in override.
 
 ### Local and Windows clients
 

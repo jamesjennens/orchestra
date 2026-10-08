@@ -210,7 +210,7 @@ class EndpointTests(AgentTask, fixes.EndpointCase):
         template = self.brief()['checkpoint_template']
         body = dict(template['body'], intent='i', acceptance='a', summary='x' * 1001, next_action='y' * 601,
                     schema_version=3, activity_cursor='!!!',
-                    open_items=[{'id': 'a', 'kind': 'worry', 'text': 't', 'source': 's'}], surprise=True)
+                    open_items=[{'id': 'a', 'kind': 'worry', 'text': 't', 'source': 's'}])
         answer = self.request('POST', template['send_to'], body, token=self.agent)
         self.assertEqual(422, answer.status, answer.data)
         error = answer.data['error']

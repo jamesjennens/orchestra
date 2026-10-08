@@ -31,11 +31,13 @@ that.
 """
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import re
 import secrets
 import sqlite3
+import sys
 import threading
 import time
 from pathlib import Path
@@ -237,12 +239,84 @@ def now_iso(timestamp):
     return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(timestamp))
 
 
+def address_group(address):
+    """What the limit per address counts as one client.
+
+    An IPv4 address is itself; an IPv6 address is its /64, because one line is given a whole
+    /64 and its holder can use any address in it; an IPv4 address written as IPv6
+    (``::ffff:a.b.c.d``) is that IPv4 address. Anything that is not an address is itself.
+    """
+    text = str(address)
+    try:
+        parsed = ipaddress.ip_address(text.split('%', 1)[0])
+    except ValueError:
+        return text
+    if parsed.version == 6:
+        if parsed.ipv4_mapped is not None:
+            return str(parsed.ipv4_mapped)
+        return str(ipaddress.ip_network((int(parsed) >> 64 << 64, 64)))
+    return str(parsed)
+
+
 # ------------------------------------------------------------------- password verifier
+class _PasswordWorker:
+    """Every scrypt computation of the process runs in this one long-lived thread (kittrial-5bb.170).
+
+    One computation takes 16 MiB. The web service serves each connection in a thread of
+    its own, and the C allocator keeps a freed block of that size in the arena of the
+    thread that asked for it: 190 log-in attempts on 190 connections left 3 GB resident
+    (measured; with one arena, 71 MB), although the checks ran one after another. With
+    one thread asking, one arena holds it: what stays is one computation's worth, however
+    many connections ask and whatever the allocator's settings are.
+
+    The caller waits for its own result; an error of the computation is raised in the
+    caller, as if it had computed there. A process that forks gets a new worker.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._jobs = None
+        self._thread = None
+        self._pid = None
+
+    def _start(self):
+        import queue
+        self._jobs = queue.Queue()
+        self._pid = os.getpid()
+        self._thread = threading.Thread(target=self._run, args=(self._jobs,), name='password-worker', daemon=True)
+        self._thread.start()
+
+    @staticmethod
+    def _run(jobs):
+        while True:
+            arguments, done = jobs.get()
+            try:
+                done['result'] = hashlib.scrypt(arguments[0], **arguments[1])
+            except BaseException as error:  # noqa: BLE001 - handed to the caller, which raises it
+                done['error'] = error
+            done['event'].set()
+
+    def scrypt(self, password, **parameters):
+        with self._lock:
+            if self._thread is None or self._pid != os.getpid() or not self._thread.is_alive():
+                self._start()
+            jobs = self._jobs
+        done = {'event': threading.Event()}
+        jobs.put(((password, parameters), done))
+        done['event'].wait()
+        if 'error' in done:
+            raise done['error']
+        return done['result']
+
+
+_PASSWORD_WORKER = _PasswordWorker()
+
+
 def hash_password(password, *, n=SCRYPT_N, r=SCRYPT_R, p=SCRYPT_P):
     _validate_password(password)
     salt = os.urandom(SCRYPT_SALT)
-    derived = hashlib.scrypt(password.encode('utf-8'), salt=salt, n=n, r=r, p=p,
-                             dklen=SCRYPT_DKLEN)
+    derived = _PASSWORD_WORKER.scrypt(password.encode('utf-8'), salt=salt, n=n, r=r, p=p,
+                                      dklen=SCRYPT_DKLEN)
     return 'scrypt$%d$%d$%d$%s$%s' % (n, r, p, salt.hex(), derived.hex())
 
 
@@ -254,8 +328,8 @@ def verify_password(verifier, password):
         if scheme != 'scrypt':
             return False
         salt_bytes, expected = bytes.fromhex(salt), bytes.fromhex(digest)
-        derived = hashlib.scrypt(password.encode('utf-8'), salt=salt_bytes, n=int(n),
-                                 r=int(r), p=int(p), dklen=len(expected))
+        derived = _PASSWORD_WORKER.scrypt(password.encode('utf-8'), salt=salt_bytes, n=int(n),
+                                          r=int(r), p=int(p), dklen=len(expected))
     except (ValueError, TypeError, MemoryError, OverflowError):
         return False
     return hmac.compare_digest(derived, expected)
@@ -681,6 +755,9 @@ class Store:
         self.path = Path(path)
         self.clock = clock
         self.lock = threading.RLock()
+        #: Since when the state in memory holds something the file does not, on this store's
+        #: clock: a save could not have the state lock. None when the file is current.
+        self.unsaved_since = None
         self.state = self._load()
         self.records = RecordStore(
             self.path.with_name(self.path.name + RECORD_STORE_SUFFIX),
@@ -731,7 +808,38 @@ class Store:
         if moved:
             self.save()
 
-    def save(self):
+    #: How long :meth:`save_soon` waits for the state lock the first time (kittrial-5bb.156).
+    SOON_WAIT = 5.0
+
+    def save_soon(self, what='a last-use stamp'):
+        """Save, without making the caller wait a minute for it. Returns whether it was saved.
+
+        For what a request's answer does not depend on: the last-use stamp every
+        authenticated request leaves, and the audit entry of a refusal. The first time the
+        state lock cannot be had within :attr:`SOON_WAIT` seconds the change stays in
+        memory, and until a save succeeds every further call tries once without waiting,
+        so requests sent together do not queue behind one another. The whole state is
+        written by every save, so the next save that succeeds writes what was left; a
+        write that goes to the endpoint saves first (``EndpointBackend._endpoint``),
+        because the endpoint reads a session's idle deadline from the file.
+
+        What follows from a stamp that is not saved, both ways: if the service stops
+        before the next save the last use is lost and the session reads as idle sooner
+        (the safe side); nothing lets a session live past its deadline.
+        """
+        with self.lock:
+            first = self.unsaved_since is None
+            try:
+                self.save(wait=self.SOON_WAIT if first else 0.0)
+                return True
+            except TimeoutError as waited:
+                if first:
+                    print('busy: %s was not saved, the state lock could not be had; it is kept in memory and '
+                          'written with the next save: %s' % (what, ascii(str(waited)[:400])),
+                          file=sys.stderr, flush=True)
+                return False
+
+    def save(self, wait=60.0):
         # One unique temporary per write, then an atomic replace. A fixed
         # ``<name>.tmp`` would let a second writer (or a stale process) clobber an
         # in-flight snapshot before it is renamed, so the name carries the pid and a
@@ -742,23 +850,37 @@ class Store:
         # same file around live-authority re-validation plus its effect, so an
         # authority change persisted here (revocation, membership, disable) is either
         # committed before the endpoint's check or serialized after the effect.
-        with self.lock, file_lock(str(self.path) + '.lock'):
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = self.path.with_name(
-                '%s.%d.%s.tmp' % (self.path.name, os.getpid(), secrets.token_hex(4)))
-            text = json.dumps(self.state, ensure_ascii=False, indent=2) + '\n'
+        with self.lock:
             try:
-                with open(temporary, 'w', encoding='utf-8') as handle:
-                    handle.write(text)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                os.replace(temporary, self.path)
-            except BaseException:
-                try:
-                    os.unlink(temporary)
-                except OSError:
-                    pass
+                with file_lock(str(self.path) + '.lock', timeout=wait):
+                    self._write()
+            except TimeoutError:
+                # Whatever this save was to write is in memory only, until a save succeeds.
+                if self.unsaved_since is None:
+                    self.unsaved_since = self.clock()
                 raise
+
+    def _write(self):
+        """Write the whole state to the file. The caller holds both locks."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_name(
+            '%s.%d.%s.tmp' % (self.path.name, os.getpid(), secrets.token_hex(4)))
+        text = json.dumps(self.state, ensure_ascii=False, indent=2) + '\n'
+        try:
+            with open(temporary, 'w', encoding='utf-8') as handle:
+                handle.write(text)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, self.path)
+            if self.unsaved_since is not None:
+                self.unsaved_since = None
+                print('The state is saved again; what was kept in memory is written.', file=sys.stderr, flush=True)
+        except BaseException:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+            raise
 
 
 # --------------------------------------------------------------------------- service
@@ -789,6 +911,13 @@ class Service:
         #: setup/resume snippets. It is deployment configuration, never request data.
         self.public_url = (public_url or '').rstrip('/') or None
         self._failures = {}
+        self._logins_guard = threading.Lock()
+        self._logins_room = threading.Condition(self._logins_guard)   # told whenever a log-in ends
+        self._logins_waiting = {}        # address group -> its log-ins waiting for one of its places
+        self._logins = 0
+        self._logins_by_address = {}     # address group -> its log-ins in flight
+        self.logins_turned_away = 0
+        self.logins_turned_away_for_address = 0
         self.lookup_max = lookup_max
         self.lookup_window = lookup_window
         self._lookups = {}
@@ -1036,13 +1165,15 @@ class Service:
             return {'allowed': used < grant['limit'], 'limit': grant['limit'], 'used': used,
                     'reason': None if used < grant['limit'] else 'limit'}
 
-    def register_host_created(self, principal, project_id, name, creation):
+    def register_host_created(self, principal, project_id, name, creation, operation=None):
         """Write the web record of a project the host has just finished creating.
 
         The creator is the only member, as owner. ``registered_by`` is set so that this
         kit and the one before it serve the record (the earlier kit reads that mark as
         "a superuser stood behind this mapping"; here a superuser stood behind the
-        grant). ``host_created`` says how the record came to be.
+        grant). ``host_created`` says how the record came to be; its ``operation`` is the
+        digest of the request's identity, by which the creator's exact repeat of that
+        request is known again (kittrial-5bb.156).
         """
         with self.store.lock:
             self._refresh_authority(principal)
@@ -1059,7 +1190,7 @@ class Service:
                 'created_at': now_iso(self._now()), 'archived': False,
                 'registered_by': principal.user_id,
                 'host_created': {'by': principal.user_id, 'at': now_iso(self._now()),
-                                 'adopted': bool(creation.get('adopted')),
+                                 'adopted': bool(creation.get('adopted')), 'operation': operation,
                                  'grant_limit': None if user.get('superuser') else (grant or {}).get('limit'),
                                  'granted_by': None if user.get('superuser') else (grant or {}).get('granted_by')},
             }
@@ -1199,8 +1330,98 @@ class Service:
         key = self._throttle_key(username, source)
         self._failures.setdefault(key, []).append(self._now())
 
-    def login(self, username, password, source='local', request_id=None):
-        """Uniform failure response; never reveals whether the account exists."""
+    #: Log-in attempts in flight at once: one being checked and the rest waiting their turn
+    #: (the check is made under the state lock, one at a time, about 0.1 s each). One more is
+    #: answered busy at once, before any check, so that a flood of attempts costs neither
+    #: memory nor a queue without end (kittrial-5bb.170).
+    LOGINS_AT_ONCE = 16
+    LOGIN_BUSY = 'Too many people are logging in at this moment. Try again in a few seconds.'
+    #: Of those places, how many one client address may hold (its ``address_group``; the
+    #: address is the forwarded one only when a trusted proxy sent it). Without it about 20
+    #: looping connections from one address, with no credentials, held all 16 places and
+    #: kept every log-in out for as long as they ran (review of kittrial-5bb.170). A quarter:
+    #: whatever one address sends, twelve places are left to the others, somebody with a
+    #: place waits behind at most fifteen checks, and it takes four addresses acting
+    #: together to fill them all. (Half was tried and measured: two addresses were then
+    #: enough, and a person at another address waited several seconds to not at all behind
+    #: one flooding address with a full audit log.) 0: no share per address (the service's
+    #: own settings do not offer it: they take 1 to LOGINS_AT_ONCE).
+    LOGINS_PER_ADDRESS = 4
+    #: A log-in over its address's share is not turned away at once: it waits this long for
+    #: one of its address's places. An office behind one router is one address, and its
+    #: people logging in together at nine in the morning are each checked in a tenth of a
+    #: second: the fifth to the tenth wait a moment and get in, where an instant refusal sent
+    #: six of ten away. A flooding address gains nothing: it still holds four places and no
+    #: more. After the wait the answer is the refusal it always was.
+    LOGIN_WAIT_SECONDS = 2.0
+    #: How many log-ins of one address may wait like that at once; one more is refused at
+    #: once. Each waiter holds its connection's thread, so this bounds what a flooding
+    #: address can park: 4 in flight and 12 waiting, however many connections it has.
+    LOGIN_WAITERS_PER_ADDRESS = 12
+    LOGIN_BUSY_ADDRESS = ('Too many log-ins from your address are being checked at this moment. '
+                          'Try again in a few seconds.')
+
+    def login(self, username, password, source='local', request_id=None, shared_source=False):
+        """Uniform failure response; never reveals whether the account exists.
+
+        ``shared_source``: the source is not one client's address but the address everybody
+        arrives from (a trusted proxy that forwarded no address: the SSH tunnel of the
+        first install). Such a log-in has no share per address to be held to, as its
+        connection has no limit per address; the places in all still bound it.
+        """
+        group = None if shared_source else address_group(source or 'local')
+        with self._logins_room:
+            until, waiting = None, False
+            while True:
+                mine = self._logins_by_address.get(group, 0)
+                if group is not None and self.LOGINS_PER_ADDRESS and mine >= self.LOGINS_PER_ADDRESS:
+                    # Over its address's share: a short wait for one of that address's places.
+                    if until is None:
+                        until = time.monotonic() + self.LOGIN_WAIT_SECONDS
+                        waiting = self._logins_waiting.get(group, 0) < self.LOGIN_WAITERS_PER_ADDRESS
+                        if waiting:
+                            self._logins_waiting[group] = self._logins_waiting.get(group, 0) + 1
+                    left = until - time.monotonic()
+                    if waiting and left > 0:
+                        self._logins_room.wait(left)
+                        continue
+                    refused = self.LOGIN_BUSY_ADDRESS
+                    self.logins_turned_away_for_address += 1
+                elif self._logins >= self.LOGINS_AT_ONCE:
+                    refused = self.LOGIN_BUSY
+                else:
+                    refused = None
+                    self._logins += 1
+                    if group is not None:
+                        self._logins_by_address[group] = mine + 1
+                break
+            if waiting:
+                parked = self._logins_waiting.get(group, 0) - 1
+                if parked > 0:
+                    self._logins_waiting[group] = parked
+                else:
+                    self._logins_waiting.pop(group, None)
+            if refused:
+                self.logins_turned_away += 1
+        if refused:
+            # Nothing was checked and nothing is counted against the name or the address, and
+            # no count is cleared either. Not audited per attempt: a flood must not fill the
+            # audit log.
+            raise busy(refused, retry_after=5)
+        try:
+            return self._login(username, password, source, request_id)
+        finally:
+            with self._logins_room:
+                self._logins -= 1
+                if group is not None:
+                    left = self._logins_by_address.get(group, 0) - 1
+                    if left > 0:
+                        self._logins_by_address[group] = left
+                    else:
+                        self._logins_by_address.pop(group, None)
+                self._logins_room.notify_all()            # a place is free: whoever waits for one of this address's looks again
+
+    def _login(self, username, password, source, request_id):
         try:
             self._check_throttle(username, source)
         except HttpError:
@@ -1275,7 +1496,8 @@ class Service:
                 session['last_used'] = moment
                 session['last_used_raw'] = self._raw_now()
                 session['idle_expires'] = moment + self.session_idle
-                self.store.save()
+                # The answer of a request does not wait a minute for this stamp (kittrial-5bb.156).
+                self.store.save_soon()
                 return Principal(user['id'], user['display_name'], user['superuser'],
                                  'session', user['id'], csrf=session['csrf'],
                                  session_hash=digest)
@@ -1305,7 +1527,7 @@ class Service:
                     if not isinstance(agent, dict) or not agent.get('enabled'):
                         raise unauthenticated('Agent is disabled')
                     agent['last_seen_at'] = now_iso(self._now())
-                self.store.save()
+                self.store.save_soon()
                 # A credential carries ONLY the authority granted by its type, project
                 # and scopes. It never inherits the issuing account's global superuser
                 # authority: ``superuser`` is always False here, and scopes are the
@@ -1679,6 +1901,11 @@ class Service:
     def project_view(self, principal, project_id):
         project, role = self.require_project(principal, project_id)
         view = dict(project)
+        made = view.get('host_created')
+        if isinstance(made, dict) and 'operation' in made:
+            # The digest that recognises the creator's own repeat is the service's own: no other
+            # account or body can match it, and no reader needs it (kittrial-5bb.156 review).
+            view['host_created'] = {key: value for key, value in made.items() if key != 'operation'}
         # The repository as today's rule reads it (kittrial-5bb.123): a stored value that
         # no longer passes is withheld and flagged; a passing one carries the note that it
         # is information, wherever a member or an agent credential reads the project.
@@ -1758,7 +1985,7 @@ class Service:
 
     # -- worker credentials ----------------------------------------------------
     def issue_credential(self, principal, project_id, *, label=None, scopes=None,
-                         actor=None, request_id=None):
+                         actor=None, request_id=None, actor_checked=False, actor_waived=None):
         if principal is None or principal.via == 'credential':
             raise forbidden('A worker credential cannot issue another credential')
         with self.store.lock:
@@ -1793,6 +2020,12 @@ class Service:
                 'label': label or 'worker',
                 'scopes': list(requested),
                 'actor': actor,
+                # The backend read the project's tracker rows and this name was free when it
+                # was issued: every row under it from now on is this credential's own, so no
+                # later write needs to read the tracker again (kittrial-5bb.188 item 1). A
+                # credential issued before that rule has no mark and is judged against the
+                # tracker ONCE, at its first write (item 5).
+                'actor_rows_checked': bool(actor_checked),
                 'token_hash': token_hash(secret),
                 'created_at': now_iso(self._now()),
                 'issued_raw': self._raw_now(),
@@ -1800,20 +2033,36 @@ class Service:
                 'expires_at': moment + self.credential_ttl,
                 'revoked': False,
             }
+            if isinstance(actor_waived, dict):
+                # A superuser allowed a name the tracker already holds (kittrial-5bb.188 item
+                # 4). Its own mark, NOT actor_rows_checked: who used the waiver, why, and when.
+                credential['actor_waived'] = {
+                    'by': actor_waived.get('by'),
+                    'reason': actor_waived.get('reason'),
+                    'at': now_iso(self._now()),
+                }
             self.state['credentials'][credential['id']] = credential
             self.state['credential_tokens'][token_hash(secret)] = credential['id']
             self.store.save()
-        return {'id': credential['id'], 'project': project_id, 'label': credential['label'],
-                'scopes': list(requested), 'actor': actor, 'secret': secret,
-                'expires_at': now_iso(credential['expires_at']), 'secret_available': True}
+        answer = {'id': credential['id'], 'project': project_id, 'label': credential['label'],
+                  'scopes': list(requested), 'actor': actor, 'secret': secret,
+                  'expires_at': now_iso(credential['expires_at']), 'secret_available': True}
+        if 'actor_waived' in credential:
+            answer['actor_waived'] = dict(credential['actor_waived'])
+        return answer
 
     def credential_view(self, credential):
-        return {'id': credential['id'], 'project': credential['project_id'],
+        view = {'id': credential['id'], 'project': credential['project_id'],
                 'agent': credential.get('agent_id'),
                 'label': credential['label'], 'scopes': list(credential['scopes']),
                 'actor': credential.get('actor'), 'revoked': credential['revoked'],
                 'created_at': credential['created_at'], 'last_used': credential.get('last_used'),
                 'expires_at': now_iso(credential['expires_at'])}
+        # A waived name is shown as allowed, by whom and when (kittrial-5bb.188 item 4): it is
+        # not colliding and it does write. Never actor_rows_checked: the two are distinct.
+        if isinstance(credential.get('actor_waived'), dict):
+            view['actor_waived'] = dict(credential['actor_waived'])
+        return view
 
     def revoke_credential(self, principal, project_id, credential_id, request_id=None):
         if principal is None or principal.via == 'credential':
@@ -1830,6 +2079,10 @@ class Service:
             if credential['revoked']:
                 return {'id': credential_id, 'revoked': True}
             credential['revoked'] = True
+            # The revocation instant bounds a later renewal's claim to this credential's rows
+            # (kittrial-5bb.188 item 3). A record revoked before this field existed carries no
+            # time and lends nothing, which is the fail-closed reading.
+            credential['revoked_at'] = now_iso(self._now())
             self.store.save()
         return {'id': credential_id, 'revoked': True}
 
@@ -1883,6 +2136,10 @@ class Service:
                 view = self.credential_view(credential)
                 view['user_id'] = credential.get('user_id')
                 view['user_name'] = self._owner_name(credential.get('user_id'))
+                if isinstance(view.get('actor_waived'), dict):
+                    # The owner list names the person who allowed the name, not only their id
+                    # (kittrial-5bb.188 item 4).
+                    view['actor_waived']['by_name'] = self._owner_name(view['actor_waived'].get('by'))
                 items.append(view)
         items.sort(key=lambda c: (c['created_at'] or '', c['id']))
         return items
@@ -2110,6 +2367,18 @@ class Service:
                     owner_id not in self.state['memberships'].get(pid, {}):
                 raise not_found('Project not found')
         return granted
+
+    def check_agent_grant(self, principal, projects, owner_id=None):
+        """Judge an agent grant without writing anything (kittrial-5bb.183 review item 1).
+
+        ``create_agent`` calls :meth:`_agent_projects` on the way in; the route calls this
+        first so that a caller with no right over a named project keeps the service's own
+        404 (a project the owner cannot see, or one that does not exist) instead of being
+        answered the route's unknown-field refusal and its field list.
+        """
+        with self.store.lock:
+            self._refresh_authority(principal)
+            return self._agent_projects(principal, projects, owner_id=owner_id)
 
     def _agent(self, agent_id):
         agent = self.state['agents'].get(agent_id)
@@ -2588,14 +2857,42 @@ class Service:
             })
         return digest
 
-    def idempotency_commit(self, digest, status, response):
+    def idempotency_commit(self, digest, status, response, written_at=None):
+        """Keep the answer of a committed write for a retry; ``written_at`` is the server's time of the write.
+
+        The time is kept beside the answer and not only in it, because an answer that is a
+        JSON list or empty has no field for it and its retry must carry the same header
+        (kittrial-5bb.97).
+        """
         if digest is None:
             return
         with self.store.lock:
             record = self.store.records.get('idempotency', digest)
             if record is not None:
                 record.update(state='committed', status=status, response=response)
+                if written_at is not None:
+                    record['written_at'] = written_at
                 self.store.records.put('idempotency', digest, record)
+
+    def idempotency_written_at(self, principal, project_id, route, key):
+        """The server's time kept with the committed answer of this request, or None.
+
+        An answer stored before the time was kept beside it has it only in its body, when
+        that is an object with ``server_time``.
+        """
+        if key is None:
+            return None
+        digest = self._idempotency_key(principal, project_id, route, key)
+        with self.store.lock:
+            record = self.store.records.get('idempotency', digest)
+        if not isinstance(record, dict) or record.get('state') != 'committed':
+            return None
+        kept = record.get('written_at')
+        if isinstance(kept, str):
+            return kept
+        body = record.get('response')
+        inside = body.get('server_time') if isinstance(body, dict) else None
+        return inside if isinstance(inside, str) else None
 
     def idempotency_unknown(self, digest):
         if digest is None:
@@ -2624,10 +2921,23 @@ class Service:
         """Whether the record store holds a result for ``key`` (a stored ``None`` counts)."""
         return self.store.records.get('result', key) is not None
 
-    def result_put(self, key, value):
-        """Record one committed canonical result with time-only retention."""
-        self.store.records.put('result', key, {'result': value},
-                              ttl=self.result_retention)
+    def result_put(self, key, value, written_at=None):
+        """Record one committed canonical result with time-only retention.
+
+        ``written_at`` is the server's time of the write, kept with the result: a retry
+        that is answered from this row (its idempotency row gone, or never committed) must
+        carry the time of the write and not the time of the retry (kittrial-5bb.97).
+        """
+        record = {'result': value}
+        if isinstance(written_at, str):
+            record['written_at'] = written_at
+        self.store.records.put('result', key, record, ttl=self.result_retention)
+
+    def result_written_at(self, key):
+        """The server's time kept with the result for ``key``; None when there is no row or it kept none."""
+        record = self.store.records.get('result', key)
+        kept = record.get('written_at') if isinstance(record, dict) else None
+        return kept if isinstance(kept, str) else None
 
     # -- HTTP-facing copies (never expose secrets) -----------------------------
     def export_state(self):

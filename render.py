@@ -27,11 +27,15 @@ def render(rows,dest,operators=None,verifiers=None):
     stamp=datetime.now(timezone.utc).isoformat(timespec='seconds')
     banner=f'Exported {stamp}. Query Beads for current state. Do not hand-edit generated files.\n\n'
     valid=re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,160}')
-    ids={r['id'] for r in rows}
-    if len(ids)!=len(rows) or any(not valid.fullmatch(x) for x in ids):raise ValueError('Invalid/duplicate issue ID')
+    rows_with_id=[r for r in rows if isinstance(r,dict) and r.get('id')]
+    unparseable_rows=[r for r in rows if not (isinstance(r,dict) and r.get('id'))]
+    malformed_rows=[r for r in rows_with_id if r.get('malformed')]
+    ids={r['id'] for r in rows_with_id}
+    if len(ids)!=len(rows_with_id) or any(not valid.fullmatch(x) for x in ids):raise ValueError('Invalid/duplicate issue ID')
     def parent(r):return next((d['depends_on_id'] for d in r.get('dependencies',[]) if d.get('type')=='parent-child'),None)
     entries={};daily=defaultdict(list);backlinks=defaultdict(list)
-    for r in rows:
+    for r in rows_with_id:
+        if r.get('malformed'):continue
         for c in r.get('comments') or []:
             cid=str(c['id'])
             if not valid.fullmatch(cid):raise ValueError('Invalid comment ID')
@@ -43,6 +47,13 @@ def render(rows,dest,operators=None,verifiers=None):
         for relation,target in re.findall(r'(?im)^(Supersedes|Contradicts|Supports|Comments-on):\s*([A-Za-z0-9_.-]+)\s*$',c.get('text','')):
             if target in entries:backlinks[target].append((relation.lower(),eid,date))
     current=['# Current project work\n\n',banner,'[Daily journal](journal/INDEX.md) | [All records](INDEX.md)\n\n']
+    if malformed_rows or unparseable_rows:
+        current.append('## Malformed issue records\n\n')
+        for r in sorted(malformed_rows,key=lambda x:x['id']):
+            current.append(f'- [{r["id"]}](jobs/{r["id"]}.md): {r.get("title", "Malformed issue row")}\n')
+        if unparseable_rows:
+            current.append(f'- {len(unparseable_rows)} unparseable issue row(s) could not be read.\n')
+        current.append('\n')
     from work import queue
     # ONE source of truth for reads: the same server-side operator allowlist the
     # endpoint supplies to `work`/`review`/`brief`. Without it a valid void is
@@ -77,13 +88,17 @@ def render(rows,dest,operators=None,verifiers=None):
                 values.append(f'[{value}](jobs/{entry["event_id"]}.md)' if entry['event_id'] else value)
             current.append('| ['+fact['id']+'](jobs/'+fact['id']+'.md) | '+' | '.join(values+[cell(scope.get(k)) for k in ('source_commit','integration_commit','release_id','environment')])+' |\n')
         current.append('\n')
-    for r in sorted(rows,key=lambda x:x['id']):
+    for r in sorted(rows_with_id,key=lambda x:x['id']):
         rid=r['id'];par=parent(r)
+        if r.get('malformed'):
+            body=f'# {rid}: {r.get("title", "Malformed issue row")}\n\n'+banner+f'**Status:** {r.get("status") or "unknown"} | **Assignee:** {r.get("assignee") or "unassigned"}\n\n## Error\n\n{r.get("error", "Malformed issue row")}\n\n'
+            write(dest/'jobs'/f'{rid}.md',body)
+            continue
         body=f'# {rid}: {r["title"]}\n\n'+banner+f'**Status:** {r["status"]} | **Assignee:** {r.get("assignee") or "unassigned"}\n\n'
         if par:body+=f'Parent: [{par}]({par}.md)\n\n'
         for field in ('description','design','acceptance_criteria','notes'):
             if r.get(field):body+=f'## {field.replace("_"," ").title()}\n\n{r[field]}\n\n'
-        children=[x for x in rows if parent(x)==rid]
+        children=[x for x in rows_with_id if parent(x)==rid]
         if children:body+='## Tasks\n\n'+''.join(f'- [{x["id"]}: {x["title"]}]({x["id"]}.md) — {x["status"]}\n' for x in children)+'\n'
         for c in r.get('comments') or []:
             eid=f'{rid}-c{c["id"]}';date=entries[eid][2]
@@ -98,11 +113,14 @@ def render(rows,dest,operators=None,verifiers=None):
             current.extend(f'- [{x["id"]}: {x["title"]}](jobs/{x["id"]}.md) — {x["status"]}\n' for x in active[:8])
             if len(active)>8:current.append(f'- {len(active)-8} more tasks on the job page.\n')
             current.append('\n')
-    standalone=[r for r in rows if not parent(r) and r.get('issue_type')!='epic' and r['status']!='closed']
+    standalone=[r for r in rows_with_id if not parent(r) and r.get('issue_type')!='epic' and r['status']!='closed']
     if standalone:current.append('## Standalone tasks and decisions\n\n'+''.join(f'- [{r["id"]}: {r["title"]}](jobs/{r["id"]}.md)\n' for r in standalone[:20]))
     for day,parts in daily.items():write(dest/'journal'/f'{day}.md',f'# {day} (UTC)\n\n'+banner+'\n---\n\n'.join(parts))
     write(dest/'journal/INDEX.md','# Daily journal\n\n'+banner+''.join(f'- [{d}]({d}.md)\n' for d in sorted(daily)))
-    write(dest/'INDEX.md','# All records\n\n'+banner+''.join(f'- [{r["id"]}: {r["title"]}](jobs/{r["id"]}.md) — {r["status"]}\n' for r in sorted(rows,key=lambda x:x['id'])))
+    index_items=[f'- [{r["id"]}: {r["title"]}](jobs/{r["id"]}.md) — {r["status"]}\n' for r in sorted(rows_with_id,key=lambda x:x['id'])]
+    if unparseable_rows:
+        index_items.append(f'- {len(unparseable_rows)} unparseable issue row(s)\n')
+    write(dest/'INDEX.md','# All records\n\n'+banner+''.join(index_items))
     write(dest/'issues.jsonl',''.join(json.dumps(r,ensure_ascii=False)+'\n' for r in rows))
     write(dest/'CURRENT.md',''.join(current))
     write(dest/'COORDINATION.md',''.join(current))

@@ -1681,23 +1681,56 @@ def require_integrated_follow_on(payload, state, ordered, rows, task, assignee=N
         # Recorded as an integration, but not under a listed operator's name: say who recorded
         # it and what to do, so a coordinator who is not on the operator list sees it at once.
         found, recorder = found
-        unlisted = ('it was recorded as an integration commit by %s, who is not a listed operator of this '
-                    'installation. Integrations must be recorded by a listed operator for a later base to count: '
-                    'an operator adds the recorder (admin.py operators add) or records the integration' % recorder)
+        unlisted = BASE_WHY_UNLISTED % recorder
     else:
         unlisted = None
-    why = {None: 'this project has no passed integrated fact that names it as an integration commit',
-           'unlisted': unlisted,
-           'earlier': 'this project recorded it as an integration commit before the prior integration, or in the '
-                      'same second, not after it',
-           'reverted': 'an operator revert names it'}[found]
-    raise ValueError('Contribution base_commit must be the prior integration commit %s, or an integration commit '
-                     'this project recorded after it (a passed integrated fact on any task, recorded by a listed '
-                     'operator, not reverted)%s. '
-                     '%s is not accepted: %s'
-                     % (evidence['integration_commit'],
-                        '; the newest such commit is %s' % newest if newest else '; none is recorded yet',
-                        payload['base_commit'], why))
+    why = {None: BASE_WHY_NEVER, 'unlisted': unlisted, 'earlier': BASE_WHY_EARLIER, 'reverted': BASE_WHY_REVERTED}[found]
+    raise ValueError(BASE_RULE % (evidence['integration_commit'], BASE_NEWEST % newest if newest else BASE_NONE_YET,
+                                  payload['base_commit'], why))
+
+
+#: The follow-on base refusal, in its parts: the rule, the newest acceptable later commit (or
+#: none), the refused base and one of four reasons. The text is unchanged since
+#: kittrial-5bb.155; the parts are named so that :data:`BASE_REFUSAL` is built from them.
+BASE_RULE = ('Contribution base_commit must be the prior integration commit %s, or an integration commit '
+             'this project recorded after it (a passed integrated fact on any task, recorded by a listed '
+             'operator, not reverted)%s. '
+             '%s is not accepted: %s')
+BASE_NEWEST = '; the newest such commit is %s'
+BASE_NONE_YET = '; none is recorded yet'
+BASE_WHY_NEVER = 'this project has no passed integrated fact that names it as an integration commit'
+BASE_WHY_EARLIER = ('this project recorded it as an integration commit before the prior integration, or in the '
+                    'same second, not after it')
+BASE_WHY_REVERTED = 'an operator revert names it'
+BASE_WHY_UNLISTED = ('it was recorded as an integration commit by %s, who is not a listed operator of this '
+                     'installation. Integrations must be recorded by a listed operator for a later base to count: '
+                     'an operator adds the recorder (admin.py operators add) or records the integration')
+#: How the refusal shows a recorder: the name in quotes when it is a plain name, else these words.
+RECORDER_NAME = r'[A-Za-z0-9_.:@/-]{1,80}'
+RECORDER_UNNAMED = 'an actor'
+
+
+def _base_refusal():
+    """The whole refusal as a pattern: the kit's own words around commit ids and a plain recorder name.
+
+    The web service hands a canonical refusal on up to 200 characters, and this sentence is
+    longer (kittrial-5bb.158). It may hand THIS one on whole, because a line that matches
+    holds nothing but the kit's text, hexadecimal commit ids and a recorder name of the
+    shape above. A line with anything else in a commit's place (a scope may name any string
+    as its integration commit) does not match, and is cut as before.
+    """
+    commit = r'[0-9A-Fa-f]{7,64}'
+    recorder = '(?:"%s"|%s)' % (RECORDER_NAME, re.escape(RECORDER_UNNAMED))
+    reasons = '(?:%s)' % '|'.join([re.escape(BASE_WHY_NEVER), re.escape(BASE_WHY_EARLIER), re.escape(BASE_WHY_REVERTED),
+                                   re.escape(BASE_WHY_UNLISTED).replace('%s', recorder)])
+    newest = '(?:%s|%s)' % (re.escape(BASE_NEWEST).replace('%s', commit), re.escape(BASE_NONE_YET))
+    pattern = re.escape(BASE_RULE)
+    for part in (commit, newest, commit, reasons):
+        pattern = pattern.replace('%s', part, 1)
+    return re.compile(pattern)
+
+
+BASE_REFUSAL = _base_refusal()
 
 
 def _recorded_at(value):
@@ -1781,8 +1814,8 @@ def recorded_integrations(rows, task, prior, operators=None, journal=None):
                 # Later, and recorded by somebody who is not a listed operator: not a base. The
                 # name is shown only when it is a plain actor name; it is caller text.
                 actor = fact.get('actor')
-                shown = '"%s"' % actor if isinstance(actor, str) and re.fullmatch(r'[A-Za-z0-9_.:@/-]{1,80}', actor) \
-                    else 'an actor'
+                shown = '"%s"' % actor if isinstance(actor, str) and re.fullmatch(RECORDER_NAME, actor) \
+                    else RECORDER_UNNAMED
                 reading = ('unlisted', shown)
             # A commit recorded more than once: a revert wins, then a later recording by a
             # listed operator, then a later one by anybody else, then an earlier one.
@@ -1864,6 +1897,8 @@ def execute(rows, task, actor, payload, run, operators=None, journal=None, revie
     if len(matches) != 1 or matches[0].get('issue_type') == 'event':
         raise ValueError('Task missing, duplicated or is an event')
     issue = matches[0]
+    if issue.get('malformed'):
+        raise ValueError('Task %s is malformed: %s' % (task, issue.get('error') or 'cannot parse row'))
     closed = issue.get('status') == 'closed'
     ordered, voids, invalid, refused, positions, reverts, invalid_reverts = history(issue, operators, journal)
     state = projection(ordered, voids, invalid, refused, positions, reverts, invalid_reverts, closed=closed)

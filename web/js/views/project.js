@@ -67,13 +67,22 @@ export async function overview(ctx, { pid }) {
     const partial = page.review_states_complete === false
       ? h('p', { class: 'small muted', role: 'note' }, 'Review state is not known for some tasks shown here (closed tasks, or more tasks than one read covers); they show their status only.')
       : null;
+    const unread = (page.unreadable || []).length;
+    const unreadable = unread
+      ? h('p', { class: 'small', role: 'note' }, unread === 1 ? 'One task on the server cannot be read' : unread + ' tasks on the server cannot be read',
+          ' (' + (page.unreadable || []).join(', ') + ')',
+          '. Everything else is shown. Ask an operator of the server to repair ', unread === 1 ? 'it.' : 'them.',
+          page.review_states_unavailable ? ' Until then review states are not shown here.' : '')
+      : null;
     tableHost.replaceChildren(
+      ...(unreadable ? [unreadable] : []),
       rows.length ? h('div', { class: 'table-wrap' }, h('table', null,
         h('caption', { class: 'visually-hidden' }, 'Tasks in ' + project.name),
         h('thead', null, h('tr', null, h('th', { scope: 'col' }, 'Task'), h('th', { scope: 'col' }, 'State'), h('th', { scope: 'col', class: 'hide-narrow' }, 'Assignee'), h('th', { scope: 'col', class: 'hide-narrow' }, 'Next action'), h('th', { scope: 'col', class: 'hide-narrow' }, 'Updated'))),
         h('tbody', null, rows.map((t) => h('tr', { class: 'row-link', onclick: (e) => { if (e.target.tagName !== 'A') ctx.go(`/p/${pid}/t/${t.id}`); } },
-          h('td', null, h('a', { class: 'title', href: ctx.href(`/p/${pid}/t/${t.id}`) }, t.title), h('div', { class: 'sub' }, t.priority != null ? [priority(t.priority), ' · '] : null, h('span', { class: 'mono' }, t.id))),
-          h('td', null, t.review_state && t.review_state !== 'none' ? reviewChip(t.review_state) : statusChip(t.status)),
+          h('td', null, h('a', { class: 'title', href: ctx.href(`/p/${pid}/t/${t.id}`) }, t.title || t.id), h('div', { class: 'sub' }, t.priority != null ? [priority(t.priority), ' · '] : null, h('span', { class: 'mono' }, t.id))),
+          // A row the server could not read is listed, and says so (kittrial-5bb.169).
+          h('td', null, t.unreadable ? h('span', { class: 'chip crit' }, 'Cannot be read') : t.review_state && t.review_state !== 'none' ? reviewChip(t.review_state) : statusChip(t.status)),
           h('td', { class: 'hide-narrow' }, t.assignee_name || h('span', { class: 'muted' }, 'Unclaimed')),
           h('td', { class: 'hide-narrow' }, t.next_action ? t.next_action.text : h('span', { class: 'muted' }, '—')),
           h('td', { class: 'hide-narrow muted' }, t.updated_at ? time(t.updated_at) : '')))))) :
@@ -155,9 +164,20 @@ export async function reviews(ctx, { pid }) {
 export async function feedback(ctx, { pid }) {
   const project = await load(ctx, pid);
   const list = h('div', { class: 'panel' });
+  const adding = h('div');
   async function draw() {
     let data;
-    try { data = await ctx.api.feedback(pid); } catch (error) { list.replaceChildren(errorState(error, draw)); return; }
+    try { data = await ctx.api.feedback(pid); } catch (error) {
+      if (error && error.status === 501) {
+        // A server that keeps no feedback answers 501 to reading and to sending it. That is
+        // not a fault to try again: say that it is not there, and offer no form that can only fail.
+        adding.replaceChildren();
+        list.replaceChildren(h('div', { role: 'status' }, empty('Feedback is not available on this server',
+          'This Orchestra server does not keep feedback yet, so none can be read or sent from this page. Until it does, write what you found on the task it concerns, or tell the people who run the project.')));
+        return;
+      }
+      list.replaceChildren(errorState(error, draw)); return;
+    }
     list.replaceChildren(data.items.length ? h('ul', { class: 'timeline panel-body', 'aria-label': 'Feedback' }, data.items.map((f) => h('li', null,
       h('span', { class: 'dot ' + (f.status === 'resolved' ? 'ok' : 'warn'), 'aria-hidden': 'true' }),
       h('div', null,
@@ -167,7 +187,6 @@ export async function feedback(ctx, { pid }) {
         f.triage ? h('p', { class: 'small muted' }, 'Triage: ', f.triage) : null)))) :
       empty('No feedback yet', 'Problems, ideas and friction reported by the team appear here.'));
   }
-  draw();
   const form = h('form', { class: 'form', novalidate: true },
     field({ id: 'fb-text', label: 'What happened, or what would help?', type: 'textarea', maxlength: 2000, hint: 'Up to 2,000 characters. Visible to project members.' }),
     h('div', null, h('button', { type: 'submit', class: 'primary' }, 'Submit feedback')));
@@ -179,9 +198,11 @@ export async function feedback(ctx, { pid }) {
     const saved = await act(form.querySelector('button'), () => ctx.api.addFeedback(pid, { text }), { success: 'Feedback submitted' });
     if (saved) { form.reset(); draw(); }
   });
+  if (canWrite(project) && !project.archived) adding.replaceChildren(h('section', { class: 'panel' }, h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Add feedback')), h('div', { class: 'panel-body' }, form)));
+  draw();
   return h('div', { class: 'stack' },
     pageHead({ crumbs: crumbs(ctx, project, 'Feedback'), title: 'Feedback', lede: 'Reading feedback does not resolve it. Open items stay open until someone triages them.' }),
-    canWrite(project) && !project.archived ? h('section', { class: 'panel' }, h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Add feedback')), h('div', { class: 'panel-body' }, form)) : null,
+    adding,
     list);
 }
 

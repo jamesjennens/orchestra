@@ -94,4 +94,30 @@ out.unchecked = [setup.summary({ remaining: 0, unchecked: 1 }), setup.summary({ 
   const again = await setup.page(ctx, { pid: project });
   out.noWarning = again.all((e) => e.tagName === 'DIV' && e.attributes['data-warning']).length;
 }
+// kittrial-5bb.200: what a step gives to copy, each entry under its own label. The API is a stand-in.
+{
+  const data = (step) => ({ project: { id: 'p1', name: 'P', repository: null }, remaining: 1, unchecked: 0, host: 'available',
+    steps: [{ id: 'backup', title: 'Backup', state: 'todo', detail: 'd', who: 'operator', who_text: 'An operator', link: null,
+      note: 'n', ...step }] });
+  const fake = (step) => ({ api: { projectSetup: async () => data(step) }, href: (path) => '#' + path, go() {} });
+  const shown = async (step) => {
+    const page = await setup.page(fake(step), { pid: 'p1' });
+    const li = page.all((e) => e.tagName === 'LI')[0];
+    const blocks = li.all((e) => e.tagName === 'DIV' && e.attributes['data-command']);
+    return { kinds: blocks.map((b) => b.attributes['data-command']),
+      texts: li.all((e) => e.tagName === 'PRE').map((pre) => pre.textContent),
+      labels: blocks.map((b) => b.all((e) => e.tagName === 'STRONG')[0].textContent),
+      buttons: blocks.map((b) => b.all((e) => e.tagName === 'BUTTON')[0].textContent), text: li.textContent };
+  };
+  const run = '/opt/py/bin/python3 /opt/kit/admin.py --root /srv/rt backup --all';
+  out.labelled = await shown({ command: run, commands: [
+    { kind: 'shell', label: 'Run a backup now (a shell command)', text: run, note: 'It does not schedule anything.', replace: [] },
+    { kind: 'unit-line', label: 'The line for a schedule (not a shell command)', text: 'ExecStart=' + run,
+      note: 'It goes in the [Service] section of a unit.', replace: [] },
+    { kind: 'shell', label: 'Check', text: '/opt/py/bin/python3 /opt/kit/admin.py --root /srv/rt backup-status --require-complete', note: null, replace: [] }] });
+  const older = await shown({ command: 'admin.py set-guidance p1 --actor OPERATOR --file FILE' });
+  out.older = { kinds: older.kinds, texts: older.texts, buttons: older.buttons };
+  const none = await shown({ command: null, commands: [] });
+  out.none = { kinds: none.kinds, texts: none.texts, buttons: none.buttons };
+}
 console.log(JSON.stringify(out));

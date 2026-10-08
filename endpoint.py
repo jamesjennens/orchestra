@@ -6,18 +6,30 @@ service adds ``--authority-store``/``--authority-lock`` (and ``--require-authori
 for mutations) to the launch command; those are server-side configuration and are
 never taken from the request body. An SSH-shaped request therefore cannot choose the
 live-authority document or the lock path, and can only omit the check because it has
-no HTTP principal at all.
+no HTTP principal at all. ``--service-namespace`` is the web service's own actor
+namespace (``http`` unless it was started with another): at use the endpoint refuses a
+credential named under it, and only its launcher knows it (kittrial-5bb.188 item 3).
 """
+import sys
+if sys.version_info < (3, 10):
+    # Before every other import, and in syntax Python 3.6 reads: an older interpreter failed in
+    # an import further down, with a traceback that hid the cause (kittrial-5bb.191).
+    sys.stderr.write('endpoint.py needs Python 3.10 or newer and was started with Python %d.%d.%d (%s). '
+                     'Nothing was carried out. Set "python" in the client configuration to an interpreter of 3.10 or newer on the server; on an office installation that is the bundled one, INSTALL_ROOT/current/python-runtime/..., as add-project prints it.\n'
+                     % (sys.version_info[0], sys.version_info[1], sys.version_info[2], sys.executable))
+    sys.exit(2)
 import argparse
 import fcntl
 import json
+import os
 import record_json
 import re
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from admin import environment,project_dir,root_path,operators as configured_operators,verifiers as configured_verifiers,review_workflow_writes as configured_review_writes
+from admin import ConfigurationUnreadable,deployment_document,deployment_password,environment,project_dir,root_path,operators as configured_operators,verifiers as configured_verifiers,review_workflow_writes as configured_review_writes
+import bd_refusals
 import native
 from coordination import is_merge_slot, merge_slot_sentence
 from render import render
@@ -27,9 +39,9 @@ from reserved_comments import (carries_record_label, check_raw_request, comment_
                                first_reserved_label, is_record_anchor, label_guard_request,
                                operator_only_in_args, raw_file_flag_in_args,
                                is_merge_slot_id, shown_token, write_targets, MERGE_SLOT_LABEL, MERGE_SLOT_SUFFIX,
-                               reserved_label_in_args, refuse_http_actor, status_change_targets,
+                               reserved_label_in_args, refuse_http_actor, status_change_targets, title_change_targets,
                                unresolved_bd_flags)
-from http_authority import AuthorityConfig, NativeRunner, CAP_PROJECT_ADMIN, http_actor_denial, journal_path, run_guarded
+from http_authority import AuthorityConfig, NativeRunner, CAP_PROJECT_ADMIN, descriptor_actor_denial, http_actor_denial, journal_path, run_guarded, stamp_write
 
 ALLOWED={'list','show','ready','search','count','create','update','close','reopen','comments','dep','state','lint'}
 # Legacy name kept for operators reading this file; enforcement is the
@@ -70,7 +82,7 @@ def _native_labels(root,path,actor,task):
     p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','--actor',actor,'show',task,'--json'],env=environment(root),capture_output=True,text=True,encoding='utf-8',timeout=60)
     if p.returncode:raise ValueError('Could not read the current labels of %s before the label write, so the reserved-label guard cannot verify it: %s'%(task,(p.stderr or p.stdout).strip()))
     try:rows=json.loads(p.stdout)
-    except ValueError:raise ValueError('Could not parse the current labels of %s before the label write; refusing.'%(task,))
+    except (ValueError, RecursionError):raise ValueError('Could not parse the current labels of %s before the label write; refusing.'%(task,))
     if isinstance(rows,dict):rows=[rows]
     if not isinstance(rows,list):raise ValueError('Unexpected native read for %s; refusing the label write.'%(task,))
     matched={}
@@ -90,7 +102,7 @@ def _native_comments(root,path,actor,task):
     p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','--actor',actor,'comments',task,'--json'],env=environment(root),capture_output=True,text=True,encoding='utf-8',timeout=60)
     if p.returncode:raise ValueError('Could not read the comments of %s before the label write, so the record-anchor guard cannot verify it; refusing.'%(task,))
     try:rows=json.loads(p.stdout)
-    except ValueError:raise ValueError('Could not parse the comments of %s before the label write; refusing.'%(task,))
+    except (ValueError, RecursionError):raise ValueError('Could not parse the comments of %s before the label write; refusing.'%(task,))
     if not isinstance(rows,list):raise ValueError('Unexpected comment read for %s; refusing the label write.'%(task,))
     return rows
 
@@ -145,7 +157,7 @@ def _native_anchor_rows(root,path,actor,tokens):
                      capture_output=True,text=True,encoding='utf-8',timeout=60)
     if p.returncode:raise ValueError('Could not read %s before the status write, so the record-anchor guard cannot verify it: %s'%(', '.join(tokens),(p.stderr or p.stdout).strip()))
     try:rows=json.loads(p.stdout)
-    except ValueError:raise ValueError('Could not parse the current rows of %s before the status write; refusing.'%(', '.join(tokens),))
+    except (ValueError, RecursionError):raise ValueError('Could not parse the current rows of %s before the status write; refusing.'%(', '.join(tokens),))
     if isinstance(rows,dict):rows=[rows]
     if not isinstance(rows,list):raise ValueError('Unexpected native read for %s; refusing the status change.'%(', '.join(tokens),))
     resolved={}
@@ -196,6 +208,35 @@ def _guard_record_anchor_status(root,path,args,actor):
         if is_merge_slot(row):
             raise ValueError('Refusing to %s %s: %s. Its holder changes only through `coordinate`.'
                              %(command,canonical,merge_slot_sentence(canonical)))
+
+def _guard_record_anchor_title(root,path,args,actor,rows=None):
+    """Read-before-write guard: the title of a record anchor is not changed through bd (kittrial-5bb.97).
+
+    The kit finds a reference, proposal, settings or capability record by its anchor's
+    title, so a renamed anchor is a record nobody finds again. The same rows as
+    `_guard_record_anchor_status` protects. Requirement and brd-section records are worked
+    as tasks and are renamed like tasks.
+
+    ``rows`` are the rows `_guard_named_rows` has just read for this write (without their
+    comments). An anchor carries a record type label, so only a row with such a label can
+    be one, and only those are read again, with their comments, in one native read: a
+    title change on ordinary rows costs no read beyond the one every write makes
+    (kittrial-5bb.113). Without ``rows`` every named row is read.
+    """
+    targets=title_change_targets(args)
+    if targets is None:return
+    if targets=='unnamed':
+        raise ValueError('Refusing update --title: name exactly the issue(s) to change; bd would otherwise act on the '
+                         'last touched issue, which cannot be checked for a record anchor.')
+    if rows is not None:
+        targets=[row['id'] for row in rows if carries_record_label(row)]
+        if not targets:return
+    read=_native_anchor_rows(root,path,actor,targets)
+    for token in targets:
+        canonical,row=read[token]
+        if is_record_anchor(row):
+            raise ValueError('Refusing to update the title of %s: it is a reference/proposal/settings/capability record '
+                             'anchor, and its title is how the kit finds it.'%canonical)
 
 #: bd 1.2.2's structured answer when `show ID` resolved to no single row. bd prints it both
 #: for an id that does not exist and for an id that is an ambiguous prefix of several; only
@@ -343,8 +384,140 @@ def _guard_named_rows(root,path,name,args,attachments,actor):
                                  %(command,row['id'],merge_slot_sentence(row['id'])))
             raise ValueError('Refusing %s on %s: %s. Nothing but `coordinate` writes it; its merge-create operation repairs a damaged slot.'
                              %(command,row['id'],merge_slot_sentence(row['id'])))
+    return rows
 
-def execute(root,request,authority_config=None,require_authority=False):
+def guarded_write(root,request,journal,effect,**options):
+    """``run_guarded``, after the server's configuration has been read (kittrial-5bb.156).
+
+    Every write that reserves an operation identity needs ``deployment.private.json``: bd
+    takes its password from it. Read for the first time inside the guarded write, a file cut
+    short or closed to this user left the operation "outcome unknown" with nothing written,
+    and its idempotency key unusable until that expired (seen on real bd). Read here, it
+    refuses the write with nothing done and nothing reserved. The password is asked for as
+    well as the file: a file that parses and has none failed in the same place (seen on real
+    bd too). Only these writes read it ahead of time: an action that needs nothing from the
+    file is not stopped by its damage, and one that reads it on the way fails there, as it
+    always did.
+    """
+    # Whatever is at the name, or nothing: a file that is missing, a directory, a dangling
+    # link or a FIFO failed in the same place as a damaged one, after the reservation
+    # (review of revision 2). No write of this kind works without the file.
+    deployment_document(root/'deployment.private.json')
+    deployment_password(root)
+    return run_guarded(request,journal,effect,**options)
+
+def configuration_fault(root,error):
+    """Whether ``error`` is a failure to read the server's own configuration file.
+
+    The kit's class for a file that is not JSON, not text or not an object; and an
+    ``OSError`` that names that file (it cannot be opened: closed to this user, a directory,
+    gone while the service runs).
+    """
+    if isinstance(error,ConfigurationUnreadable):return True
+    if not isinstance(error,OSError) or isinstance(error,TimeoutError):return False
+    try:return Path(os.fsdecode(error.filename))==Path(root)/'deployment.private.json'
+    except (TypeError,ValueError):return False       # it names no file, or a descriptor
+
+def tracker_actors(root,path,before=None,own=()):
+    """The names this project's tracker already holds as an author or assignee, older than
+    ``before`` (all of them when it is None); kittrial-5bb.188 item 1.
+
+    One ``bd export --all`` for the project, through the same read ``admin.py
+    credential-actors`` makes: a bd process that opens the project's database. That is the
+    cost of judging a plain name by the rows it has, and it is paid where the rule is
+    applied, never by every write (docs/HTTP_DEPLOYMENT.md says so). A tracker that cannot
+    be read raises, and so does an answer that is not a whole tracker -- an export that
+    parses to no rows, that fails partway (a cut line, a non-JSON word, a bd that exits
+    nonzero), or that carries rows but not the project's merge slot
+    (``actor_names.TrackerUnreadable``): every project this kit makes holds that slot, so an
+    answer without it did not come from a whole read and is a host fault, not "the tracker
+    holds no names" (kittrial-5bb.188 review of item 1, revision-3 item 3). ``own`` are the
+    lifetimes of earlier credentials of the same name whose rows are not held against this
+    one (item 3)."""
+    import actor_names
+    from admin import run_bd
+    try:
+        text=run_bd(root,path.name,['export','--all'])
+        rows=[record_json.loads(line) for line in text.splitlines() if line.strip()]
+    except (subprocess.SubprocessError,OSError,ValueError,RecursionError):
+        # bd could not answer, or answered something that is not rows: a host fault, never an
+        # empty tracker and never a rejection of the caller's request.
+        raise actor_names.TrackerUnreadable()
+    if not any(isinstance(row,dict) for row in rows) or not any(is_merge_slot(row) for row in rows):
+        raise actor_names.TrackerUnreadable()
+    return actor_names.tracker_names(actor_names.tracker_marks(rows),before,own)
+
+def reserved_actors(root,path,rows=False,own=()):
+    """The names a worker credential's namespace may not be, as this host has them: the
+    project's registered session actors, the installation's operator and verifier lists, and
+    (only when ``rows`` asks for it) the project's tracker rows.
+
+    ``rows`` is False (no tracker read, the cheap rule), True (every row, for a name being
+    issued) or the instant the credential was issued, so that a credential's own rows are
+    not held against it. ``own`` are the earlier same-name credentials' lifetimes whose rows
+    are not held either (kittrial-5bb.188 item 3)."""
+    from sessions import registered_actors
+    names={'sessions':registered_actors(path),'operators':sorted(configured_operators(root)),
+            'verifiers':sorted(configured_verifiers(root))}
+    if rows:
+        names['authors']=sorted(tracker_actors(root,path,None if rows is True else rows,own))
+    return names
+
+#: The actions that exist only for the web service: they name no existing project.
+SERVICE_ONLY_ACTIONS=('create-project','project-creations','creation-standing')
+
+def key_project_refusal(request,key_projects):
+    """Refuse, for a key bound to projects, a request that is not for one of them.
+
+    Rule 1 of docs/COORDINATORS_PER_PROJECT_DESIGN.md (kittrial-5bb.193). ``key_projects``
+    comes from the endpoint's own launch flags (``--key-project``, which only the forced
+    command of an authorized_keys line passes) and is None for every other caller, who is
+    not looked at. It is asked before anything else in ``execute``: nothing of another
+    project is read, and the answer for another project is the answer for a project that
+    does not exist, so a bound key cannot tell the two apart.
+    """
+    if key_projects is None:return
+    action=request.get('action') if isinstance(request,dict) else None
+    if action in SERVICE_ONLY_ACTIONS:
+        raise ValueError('%s is available only to the web service'%action)
+    project=request.get('project') if isinstance(request,dict) else None
+    if not isinstance(project,str) or project not in key_projects:
+        raise ValueError('Unknown/uninitialized project')
+
+def key_principal_refusal(request,path,key_principal):
+    """Refuse, for a key bound to a principal, a request whose actor that principal does not own.
+
+    Rule 2 of docs/COORDINATORS_PER_PROJECT_DESIGN.md (kittrial-5bb.194). ``key_principal``
+    comes from the endpoint's own launch flags (``--key-principal``, which only the forced
+    command of an authorized_keys line passes) and is None for every other caller, who is
+    not looked at. A session registration is the one exception: it makes the new actor the
+    key's principal's, so it is answered before that actor exists (sessions.execute writes
+    the entry). Every other action must name an actor the project's registry gives to this
+    principal; an actor with no entry has no principal, so a bound key cannot act as it.
+    """
+    if key_principal is None:return
+    action=request.get('action') if isinstance(request,dict) else None
+    args=request.get('args') if isinstance(request,dict) else None
+    if action=='session' and isinstance(args,list) and args[:1]==['register']:return
+    actor=request.get('actor') if isinstance(request,dict) else None
+    from sessions import owners
+    owned=owners(path)
+    if not isinstance(actor,str) or owned.get(actor)!=key_principal:
+        raise ValueError('This key is bound to principal %s and may act only as actors that principal '
+                         'registered in this project; %s is not one of them'
+                         % (key_principal,actor if isinstance(actor,str) and actor else repr(actor)))
+
+def execute(root,request,authority_config=None,require_authority=False,key_projects=None,key_principal=None):
+    key_project_refusal(request,key_projects)
+    # Rule 2: a key bound to a principal is refused the web-only actions here, before their
+    # name is looked at. The gate proper needs the project's registry and is asked below,
+    # after the project is known; this structural refusal means no action at all is answered
+    # before the gate, so an action added above it later cannot slip past (kittrial-5bb.194
+    # review, mutant N1; slice 1 does the same for a key bound to projects).
+    if key_principal is not None:
+        answered=request.get('action') if isinstance(request,dict) else None
+        if answered in SERVICE_ONLY_ACTIONS:
+            raise ValueError('%s is available only to the web service'%answered)
     # Two actions exist only for the web service and name no existing project
     # (kittrial-5bb.118 part 2); project_creation holds them, with what stops other callers.
     if request.get('action')=='create-project':
@@ -367,9 +540,16 @@ def execute(root,request,authority_config=None,require_authority=False):
     if unfinished:raise ValueError('Unknown/uninitialized project: '+unfinished)
     actor=request.get('actor','')
     refuse_http_actor(actor,authority_config is not None)
+    # Rule 2 (kittrial-5bb.194): a key bound to a principal acts only as that principal's
+    # actors in this project. Asked before any action runs; the registry is the only source.
+    key_principal_refusal(request,path,key_principal)
     # Launched by the HTTP service, an HTTP-shaped actor still needs the verified
     # descriptor on every action, with or without --require-authority (review 01a10262).
     denied=http_actor_denial(request,authority_config)
+    if denied is not None:return denied
+    # And a name WITHOUT that shape, sent by the web service with a descriptor, is written only
+    # by a worker credential inside a namespace that is nobody else's (kittrial-5bb.184).
+    denied=descriptor_actor_denial(request,authority_config,lambda rows=False,own=():reserved_actors(root,path,rows,own))
     if denied is not None:return denied
     if request.get('action')=='session':
         from sessions import execute as session_execute
@@ -383,9 +563,15 @@ def execute(root,request,authority_config=None,require_authority=False):
             return stdout
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
-            result=session_execute(path,name,args,export,actor=actor)
+            result=session_execute(path,name,args,export,actor=actor,principal=key_principal)
         result['provenance'] = {'kit': report(Path(__file__).resolve().parent, 'kit')}
-        return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(session_warnings)}
+        answer={'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(session_warnings)}
+        # The session writes are not guarded writes; they carry the server's time all the same
+        # (kittrial-5bb.97). show and run status only read.
+        # A request that is already recorded writes nothing (`reconciled`) and carries none.
+        writes=args[:1] in (['register'],['resume']) or (args[:1]==['run'] and args[1:2] in (['start'],['heartbeat'],['end']))
+        if writes and result.get('reconciled') is not True:stamp_write(answer)
+        return answer
     if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.@/-]{0,95}',actor):raise ValueError('Supply a short contributor/session actor')
     action=request.get('action','bd')
     if action in ('handoff','review','work'):
@@ -406,13 +592,18 @@ def execute(root,request,authority_config=None,require_authority=False):
         review_writes=configured_review_writes(root,warnings=switch_warnings)
         run_warnings.extend(switch_warnings)
         def work_effect():
-            return {'returncode':0,'stdout':json.dumps(work_execute(path,actor,action,args,request.get('attachments',{}),runner,
-                                                                    operators=configured_operators(root),
-                                                                    verifiers=configured_verifiers(root),
-                                                                    review_writes=review_writes),ensure_ascii=False,indent=2)+'\n','stderr':''.join(run_warnings)}
+            result=work_execute(path,actor,action,args,request.get('attachments',{}),runner,
+                                operators=configured_operators(root),
+                                verifiers=configured_verifiers(root),
+                                review_writes=review_writes)
+            # A handoff request and a decline are recorded in the kit's handoff journal and move
+            # nothing in bd, so the runner saw no write; they are writes all the same (review
+            # of kittrial-5bb.97). One that was already recorded (`reconciled`) wrote nothing.
+            if action=='handoff' and len(args)==2 and isinstance(result,dict) and result.get('reconciled') is False:runner.wrote=True
+            return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False,indent=2)+'\n','stderr':''.join(run_warnings)}
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
-            return run_guarded(request,journal_path(path),work_effect,
+            return guarded_write(root,request,journal_path(path),work_effect,
                                authority_config=authority_config,
                                require_authority=require_authority,runner=runner)
     if action=='set-onboarding':
@@ -425,6 +616,26 @@ def execute(root,request,authority_config=None,require_authority=False):
     if action in ('onboard','docs'):
         from onboarding import execute as onboard
         return {'returncode':0,'stdout':onboard(Path(__file__).resolve().parent,path,name,actor,action,request.get('args',[]),endpoint=Path(__file__).resolve()),'stderr':''}
+    if action=='actor-standing':
+        # Read-only (kittrial-5bb.184): for each name asked about, why a worker credential may
+        # not write under it, or null. The web service asks before it issues one and when it
+        # lists them. The answer says which rule, never the host's names. No lock, no write.
+        # With ``tracker`` set it also reads the project's rows, which is one bd export: the
+        # service asks for that only at issue (kittrial-5bb.188 item 1), and only the service
+        # may ask (item 6): the flag is a launch-argument service, so a caller over SSH (no
+        # authority store) cannot make the endpoint read a tracker by sending it.
+        import actor_names
+        names=request.get('args',[])
+        if not isinstance(names,list) or not 1<=len(names)<=200 or any(not isinstance(n,str) or not 0<len(n)<=96 or '\0' in n for n in names):
+            raise ValueError('Use actor-standing with 1 to 200 names')
+        tracker=request.get('tracker')
+        if tracker and authority_config is None:
+            raise ValueError('actor-standing with rows is for the web service only; nothing was changed')
+        own=request.get('own') if tracker else None
+        own=own if isinstance(own,list) else ()
+        rows=tracker if isinstance(tracker,str) else bool(tracker)
+        reserved=reserved_actors(root,path,rows,own)
+        return {'returncode':0,'stdout':json.dumps({'schema_version':1,'names':{n:actor_names.collision(n,**reserved) for n in names}})+'\n','stderr':''}
     if action=='setup-status':
         # Read-only (kittrial-5bb.118): what the host knows about this project's setup,
         # for the web setup page. States, versions and times only; never guidance or
@@ -466,7 +677,8 @@ def execute(root,request,authority_config=None,require_authority=False):
             result=guidance.state(path,actor)
         else:
             result=guidance.read(path,args,actor)
-        return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False,indent=2)+'\n','stderr':''}
+        answer={'returncode':0,'stdout':json.dumps(result,ensure_ascii=False,indent=2)+'\n','stderr':''}
+        return stamp_write(answer) if subcommand=='ack' and result.get('reconciled') is not True else answer
     if action=='anchors':
         # Read-only (kittrial-5bb.71): which rows are record anchors, by the predicate
         # every surface uses (reserved_comments.is_record_anchor), in ONE native read:
@@ -479,6 +691,7 @@ def execute(root,request,authority_config=None,require_authority=False):
         # recorded reads as an ordinary row, exactly like one whose writer crashed.
         from reserved_comments import ANCHOR_READ_IDS_MAX, record_anchor_ids
         ids=request.get('args') or []
+        raw_rows=[]
         if (not isinstance(ids,list) or len(ids)>ANCHOR_READ_IDS_MAX or len(set(ids))!=len(ids)
                 or any(not isinstance(x,str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,160}',x) for x in ids)):
             raise ValueError('anchors takes no arguments, or at most %d distinct task ids'%ANCHOR_READ_IDS_MAX)
@@ -488,15 +701,32 @@ def execute(root,request,authority_config=None,require_authority=False):
             except (ValueError,AttributeError):missing=False
             if missing:
                 # Every listed row was deleted after the list: none is an anchor.
-                rows,warnings=[],completed.stderr or ''
+                warnings=completed.stderr or ''
             else:
                 stdout,warnings=native.split(completed)
-                rows=json.loads(stdout or '[]')
-                rows=[r for r in (rows if isinstance(rows,list) else [rows]) if isinstance(r,dict) and r.get('id') in ids]
+                raw_rows=record_json.loads_array_rows(stdout or '[]')
+                unreadable=[r for r in raw_rows if isinstance(r,dict) and r.get('malformed')]
+                if unreadable:
+                    unreadable_report='Unreadable issue row(s): %s' % ', '.join(
+                        '%s (%s)' % (r.get('id') or 'unknown', r.get('error') or 'malformed') for r in unreadable)
+                    warnings=(warnings + '\n' + unreadable_report).strip() if warnings else unreadable_report
         else:
             stdout,warnings=native.split(native.run(native.argv(root,path,actor,['export','--all']),environment(root)))
-            rows=[json.loads(line) for line in stdout.splitlines() if line.strip()]
-        return {'returncode':0,'stdout':json.dumps({'schema_version':1,'anchors':record_anchor_ids(rows)})+'\n','stderr':warnings}
+            raw_rows=record_json.loads_rows(stdout)
+            unreadable=[r for r in raw_rows if isinstance(r,dict) and r.get('malformed')]
+            if unreadable:
+                unreadable_report='Unreadable issue row(s): %s' % ', '.join(
+                    '%s (%s)' % (r.get('id') or 'unknown', r.get('error') or 'malformed') for r in unreadable)
+                warnings=(warnings + '\n' + unreadable_report).strip() if warnings else unreadable_report
+        from reserved_comments import RECORD_ANCHOR_LABELS
+        def anchor_run(argv):
+            result,warning=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
+            if warning:anchor_warnings.append(warning)
+            return result
+        anchor_warnings=[]
+        classified=record_json.classify(raw_rows,anchor_run,sorted(RECORD_ANCHOR_LABELS)) if raw_rows else []
+        if anchor_warnings:warnings=(warnings+'\n'+'\n'.join(anchor_warnings)).strip()
+        return {'returncode':0,'stdout':json.dumps({'schema_version':1,'anchors':record_anchor_ids(classified)})+'\n','stderr':warnings}
     if action=='ref':
         # The reference catalog (.41 slice 1, kittrial-5bb.66). Reads (get, list, find, help)
         # read their own key, or the catalog in two native reads (reference_records), take no
@@ -543,7 +773,7 @@ def execute(root,request,authority_config=None,require_authority=False):
             return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
-            return run_guarded(request,journal_path(path),ref_effect,
+            return guarded_write(root,request,journal_path(path),ref_effect,
                                authority_config=authority_config,
                                require_authority=require_authority,runner=runner)
     if action=='capability':
@@ -591,7 +821,7 @@ def execute(root,request,authority_config=None,require_authority=False):
             return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
-            return run_guarded(request,journal_path(path),capability_effect,
+            return guarded_write(root,request,journal_path(path),capability_effect,
                                authority_config=authority_config,
                                require_authority=require_authority,runner=runner)
     if action=='proposal':
@@ -629,7 +859,7 @@ def execute(root,request,authority_config=None,require_authority=False):
             return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
-            return run_guarded(request,journal_path(path),proposal_effect,
+            return guarded_write(root,request,journal_path(path),proposal_effect,
                                authority_config=authority_config,
                                require_authority=require_authority,runner=runner)
     if action in ('brief','history','checkpoint'):
@@ -648,7 +878,7 @@ def execute(root,request,authority_config=None,require_authority=False):
                                                              verifiers=configured_verifiers(root)),'stderr':''.join(run_warnings)}
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
-            return run_guarded(request,journal_path(path),briefing_effect,
+            return guarded_write(root,request,journal_path(path),briefing_effect,
                                authority_config=authority_config,
                                require_authority=require_authority,runner=runner)
     if action in ('lifecycle','coordinate','requirement'):
@@ -673,7 +903,7 @@ def execute(root,request,authority_config=None,require_authority=False):
             return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
-            return run_guarded(request,journal_path(path),lifecycle_effect,
+            return guarded_write(root,request,journal_path(path),lifecycle_effect,
                                authority_config=authority_config,
                                require_authority=require_authority,runner=runner)
     if action == 'feedback':
@@ -684,7 +914,8 @@ def execute(root,request,authority_config=None,require_authority=False):
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
             result=feedback_execute(path/'.feedback.jsonl',actor,args,request.get('attachments',{}))
-        return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''}
+        answer={'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''}
+        return answer if args[:1]==['list'] or result.get('reconciled') is True else stamp_write(answer)
     if action=='view':
         target=request.get('path','CURRENT.md')
         viewroot=(path/'views').resolve();view=(viewroot/target).resolve()
@@ -695,8 +926,15 @@ def execute(root,request,authority_config=None,require_authority=False):
             fcntl.flock(lock,fcntl.LOCK_EX)
             p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','export','--all'],env=environment(root),capture_output=True,text=True,encoding='utf-8',timeout=120)
             if p.returncode:return {'returncode':p.returncode,'stdout':p.stdout,'stderr':p.stderr}
-            rows=[json.loads(line) for line in p.stdout.splitlines() if line.strip()]
-            return {'returncode':0,'stdout':json.dumps(render(rows,path/'views',configured_operators(root),configured_verifiers(root)))+'\n','stderr':p.stderr}
+            rows=record_json.loads_rows(p.stdout)
+            from reserved_comments import RECORD_ANCHOR_LABELS
+            def refresh_run(argv):
+                stdout,warning=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
+                if warning:refresh_warnings.append(warning)
+                return stdout
+            refresh_warnings=[]
+            rows=record_json.classify(rows,refresh_run,sorted(RECORD_ANCHOR_LABELS)+['gt:slot'], ['event','gate'])
+            return {'returncode':0,'stdout':json.dumps(render(rows,path/'views',configured_operators(root),configured_verifiers(root)))+'\n','stderr':p.stderr+''.join(refresh_warnings)}
     if action!='bd':raise ValueError('Unknown action')
     args=request.get('args',[])
     if not isinstance(args,list) or not args or any(not isinstance(a,str) or '\0' in a for a in args):raise ValueError('Expected argument list')
@@ -761,15 +999,21 @@ def execute(root,request,authority_config=None,require_authority=False):
             fcntl.flock(lock,fcntl.LOCK_EX)
             # First the rows the write names (an existing id given to create, a write that names
             # none, the merge slot); then the guards that read what those rows carry.
-            _guard_named_rows(root,path,name,args,request.get('attachments',{}),actor)
+            named=_guard_named_rows(root,path,name,args,request.get('attachments',{}),actor)
             _guard_record_anchor_status(root,path,args,actor)
+            _guard_record_anchor_title(root,path,args,actor,named)
             _guard_reserved_labels(root,path,args,actor)
             def bd_dispatch(argv):
                 p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','--actor',actor,*argv],env=environment(root),capture_output=True,text=True,encoding='utf-8',timeout=120)
+                # When bd itself says no, before it writes, that is a refusal and not an outcome
+                # nobody knows (kittrial-5bb.185): the identity is released and the caller is told
+                # bd's sentence. Only what bd_refusals recognises; anything else is handed on as it came.
+                refused=bd_refusals.refusal(p.returncode,p.stdout,p.stderr)
+                if refused is not None:return bd_refusals.envelope(*refused)
                 return {'returncode':p.returncode,'stdout':p.stdout,'stderr':p.stderr}
             runner=NativeRunner(bd_dispatch)
             def bd_effect():return runner(final)
-            return run_guarded(request,journal_path(path),bd_effect,
+            return guarded_write(root,request,journal_path(path),bd_effect,
                                authority_config=authority_config,
                                require_authority=require_authority,runner=runner)
 
@@ -779,15 +1023,36 @@ def main():
     p.add_argument('--authority-lock',help='server-side authority lock (defaults to STORE.lock)')
     p.add_argument('--require-authority',action='store_true',
                    help='refuse a mutation that omits the live-authority descriptor')
+    p.add_argument('--service-namespace',
+                   help="the web service's own actor namespace (default http): a name the "
+                        'service was started under is refused at use too (kittrial-5bb.188 item 3)')
+    p.add_argument('--key-project',action='append',metavar='NAME',
+                   help='a project the calling SSH key is bound to (repeatable; passed only by '
+                        'ssh_forced_command.py from the authorized_keys line): every request for '
+                        'another project is refused (kittrial-5bb.193)')
+    p.add_argument('--key-principal',metavar='NAME',
+                   help='the principal the calling SSH key belongs to (passed only by '
+                        'ssh_forced_command.py from the authorized_keys line): every request whose '
+                        'actor that principal does not own in the project is refused, except a '
+                        'session registration, which makes the new actor its own (kittrial-5bb.194)')
     a=p.parse_args()
     authority_config=None
     if a.authority_store:
-        authority_config=AuthorityConfig(a.authority_store,a.authority_lock)
+        authority_config=AuthorityConfig(a.authority_store,a.authority_lock,a.service_namespace)
     try:
+        if a.key_project is not None and a.authority_store:
+            # A key line is not the web service, and the service passes no such flag.
+            raise ValueError('--key-project is for an SSH key line and cannot be combined with --authority-store')
+        if a.key_principal is not None and a.authority_store:
+            raise ValueError('--key-principal is for an SSH key line and cannot be combined with --authority-store')
+        from admin import validate_name
+        key_projects=None if a.key_project is None else frozenset(validate_name(name) for name in a.key_project)
+        from sessions import valid_principal
+        key_principal=None if a.key_principal is None else valid_principal(a.key_principal,'--key-principal')
         text=sys.stdin.read(2_000_001)
         if len(text)>2_000_000:raise ValueError('Request exceeds 2 MB')
         answer=execute(root_path(a.root),record_json.loads(text),authority_config=authority_config,
-                       require_authority=a.require_authority)
+                       require_authority=a.require_authority,key_projects=key_projects,key_principal=key_principal)
     except subprocess.TimeoutExpired:
         answer={'returncode':124,'stdout':'','stderr':'Command timed out; mutation outcome may be uncertain. Inspect state before retrying.\n'}
     except TimeoutError as waited:
@@ -796,6 +1061,18 @@ def main():
         answer={'returncode':75,'stdout':'','stderr':'Busy: %s. Nothing was done; try again shortly.\n'%waited}
     except Exception as e:
         answer={'returncode':2,'stdout':'','stderr':f'{type(e).__name__}: {e}\n'}
+        import actor_names
+        if isinstance(e,actor_names.TrackerUnreadable):
+            # The export answered no rows: a host fault, not a refusal of the request. The
+            # service reads this mark and answers 503 "nothing was changed" (kittrial-5bb.188
+            # item 1); `fault` is how it tells a read the service may retry from a rejection.
+            answer['fault']='tracker'
+        if configuration_fault(a.root,e):
+            # Not a fault of the request: the server's own configuration file cannot be read.
+            # The line names the file, as it does for the operator; `fault` lets the web service
+            # say it in its own words and keep the path to its log (kittrial-5bb.156).
+            if isinstance(e,ConfigurationUnreadable):answer['stderr']=f'ValueError: {e}\n'
+            answer['fault']='configuration'
     print(json.dumps(answer,ensure_ascii=False))
 
 if __name__=='__main__':main()

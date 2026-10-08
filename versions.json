@@ -6,6 +6,25 @@
     "sha256": "8140098a51d3b81d5548d1c5e6db1a2d9930e5d141efe2a4bff7d079c4d321e8",
     "member": "bd"
   },
+  "bd_static": {
+    "version": "1.2.2",
+    "sha256": "018bfe5186a5eee10d283639559b7b116921951258b93eae896041e48f79793d",
+    "member": "bd",
+    "binary_sha256": "54340258d9e579a73de667b21d2abac9c28100c6f2dd873f6fff1ea2c1a07b1b",
+    "archive": "beads_1.2.2_linux_amd64_static.tar.gz",
+    "obtain": "No download: build it with tools/build_bd_static.sh WORKDIR (the archive is WORKDIR/out/beads_1.2.2_linux_amd64_static.tar.gz) and check its sha256 against this entry. tools/office_release.py build takes it with --bd-archive.",
+    "built_from": {
+      "script": "tools/build_bd_static.sh",
+      "image": "golang@sha256:b54cbf583d390341599d7bcbc062425c081105cc5ef6d170ced98ef9d047c716",
+      "go": "go1.26.2",
+      "repository": "https://github.com/gastownhall/beads.git",
+      "tag": "v1.2.2",
+      "commit": "6c124203e771433a3550c348771a5b5e27fd3c21",
+      "go_sum_sha256": "ad753874d566d22c81da097ed3d8d59f2f17ff6e69a437aca914ad178a488efb",
+      "flags": "CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -tags gms_pure_go -ldflags \"-s -w -X main.Version=1.2.2 -X main.Build=6c124203e -X main.Commit=6c124203e771433a3550c348771a5b5e27fd3c21 -X main.Branch=HEAD\" ./cmd/bd"
+    },
+    "needs": "statically linked: no C library. Server mode only (bd init --server), which is the only mode the kit uses."
+  },
   "dolt": {
     "version": "2.2.0",
     "url": "https://github.com/dolthub/dolt/releases/download/v2.2.0/dolt-linux-amd64.tar.gz",

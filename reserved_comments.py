@@ -192,6 +192,14 @@ CAPABILITY_ENTRY_PREFIX = 'Kind: capability-entry-v1\n'
 CAPABILITY_ACCEPTANCE_PREFIX = 'Kind: capability-acceptance-v1\n'
 CAPABILITY_VERIFICATION_PREFIX = 'Kind: capability-verification-v1\n'
 CAPABILITY_ALIAS_PREFIX = 'Kind: capability-alias-v1\n'
+# kittrial-5bb.126, slice 0 of docs/OPEN_ITEMS_DECISIONS_DESIGN.md (open items, owner
+# questions and coordinator decisions). Names only: no writer and no reader exists yet.
+# The four prefixes are reserved before any record can be written, so a rollback to
+# this kit can never let a raw path plant one (design 11.2).
+OPEN_ITEM_PREFIX = 'Kind: open-item-v1\n'
+ITEM_RESOLUTION_PREFIX = 'Kind: item-resolution-v1\n'
+OWNER_ANSWER_PREFIX = 'Kind: owner-answer-v1\n'
+COORDINATOR_DECISION_PREFIX = 'Kind: coordinator-decision-v1\n'
 
 RESERVED = (
     (REVIEW_PREFIX, 'contribution/review record', 'review TASK --file payload.json'),
@@ -214,11 +222,16 @@ RESERVED = (
     (CAPABILITY_ACCEPTANCE_PREFIX, 'capability acceptance evidence', 'admin.py capability-apply'),
     (CAPABILITY_VERIFICATION_PREFIX, 'capability verification', 'capability check --record (capability verify)'),
     (CAPABILITY_ALIAS_PREFIX, 'capability alias', 'capability propose-alias|alias-reject'),
+    (OPEN_ITEM_PREFIX, 'open item', 'items add|revise|block|unblock|resolve|reopen or questions ask'),
+    (ITEM_RESOLUTION_PREFIX, 'open item resolution', 'items resolve|reopen or questions answer'),
+    (OWNER_ANSWER_PREFIX, 'owner answer', 'questions answer on the coordination host or in the web interface'),
+    (COORDINATOR_DECISION_PREFIX, 'coordinator decision',
+     'decisions record on the coordination host or in the web interface'),
 )
 
 PREFIXES = tuple(prefix for prefix, _, _ in RESERVED)
 
-# Every version of the nine record kinds is reserved, not only v1 (kittrial-5bb.64
+# Every version of the record kinds is reserved, not only v1 (kittrial-5bb.64
 # review item `smaller` b): otherwise a raw `Kind: capability-entry-v7` would be
 # writable and then hidden. A later writer of vN ships its own tolerant-reader step.
 _RECORD_KIND_RESERVATIONS = {
@@ -232,6 +245,11 @@ _RECORD_KIND_RESERVATIONS = {
     'capability-verification': ('capability verification', 'capability check --record (capability verify)'),
     'capability-alias': ('capability alias', 'capability propose-alias|alias-reject'),
     'review-recommendation': ('review recommendation', 'review TASK --file payload.json (operation recommend)'),
+    'open-item': ('open item', 'items add|revise|block|unblock|resolve|reopen or questions ask'),
+    'item-resolution': ('open item resolution', 'items resolve|reopen or questions answer'),
+    'owner-answer': ('owner answer', 'questions answer on the coordination host or in the web interface'),
+    'coordinator-decision': ('coordinator decision',
+                             'decisions record on the coordination host or in the web interface'),
 }
 _RECORD_KIND_ANY_VERSION = re.compile(
     r'Kind: (%s)-v[0-9]+\n' % '|'.join(re.escape(kind) for kind in _RECORD_KIND_RESERVATIONS))
@@ -720,9 +738,13 @@ def raw_file_flag_in_args(args):
 # a real record anchor - a row that also carries a v1 record comment of the same
 # family (see is_record_anchor) - where endpoint._guard_reserved_labels refuses
 # replacing or removing its labels.
+# kittrial-5bb.126 adds `open-item:`, the item anchor's state labels (open items design
+# 5); the family label `open-item` itself is exact and not value-reserved, for the
+# reason above. `admin.py open-item-label-check` lists the projects already using
+# either before a later slice turns writes on.
 RESERVED_LABEL_PREFIXES = ('request:', 'request-content:', 'requirement:',
                            'reference:', 'reference-key:', 'proposal:', 'proposal-key:',
-                           'capability:', 'capability-key:')
+                           'capability:', 'capability-key:', 'open-item:')
 # `gt:slot` marks a project's merge slot (coordination.MERGE_SLOT_LABEL). One
 # `--remove-label gt:slot` by a contributor put the slot back among claimable work
 # and a claim then jammed it (kittrial-5bb.113 review), so no contributor adds,
@@ -845,11 +867,15 @@ RECORD_ANCHOR_FAMILIES = {
     'contribution-settings': (CONTRIBUTION_SETTINGS_PREFIX,),
     'capability': (CAPABILITY_ENTRY_PREFIX, CAPABILITY_ACCEPTANCE_PREFIX,
                    CAPABILITY_VERIFICATION_PREFIX, CAPABILITY_ALIAS_PREFIX),
+    # kittrial-5bb.126. There is deliberately no family for coordinator-decision: its
+    # native decision issue is a real work item and stays visible; only the comment hides.
+    'open-item': (OPEN_ITEM_PREFIX, ITEM_RESOLUTION_PREFIX, OWNER_ANSWER_PREFIX),
 }
 RECORD_ANCHOR_LABELS = frozenset(RECORD_ANCHOR_FAMILIES)
 RECORD_COMMENT_FAMILIES = ('Kind: reference-', 'Kind: requirement-proposal-',
                            'Kind: proposal-disposition-', 'Kind: contribution-settings-',
-                           'Kind: capability-')
+                           'Kind: capability-', 'Kind: open-item-', 'Kind: item-resolution-',
+                           'Kind: owner-answer-', 'Kind: coordinator-decision-')
 _RECORD_KIND = re.compile(r'Kind: ([a-z][a-z-]*?)-v([1-9][0-9]{0,5})\n')
 # Versions after 1 that this kit reads, as (kind, version).
 SUPPORTED_LATER_VERSIONS = frozenset({('reference-entry', 2), ('reference-entry', 3)})
@@ -883,6 +909,9 @@ def is_record_anchor(row):
     """
     if not isinstance(row, dict):
         return False
+    if row.get('malformed'):
+        import record_json
+        return record_json.selected(row, RECORD_ANCHOR_LABELS)
     labels = row.get('labels')
     comments = row.get('comments')
     if not isinstance(labels, (list, tuple)) or not isinstance(comments, list):
@@ -900,7 +929,9 @@ def is_record_anchor(row):
 
 
 def is_record_comment(text):
-    """True for a reference/proposal/settings/capability record comment, any version.
+    """True for a reference/proposal/settings/capability record comment, any version, and
+    (kittrial-5bb.126) for an open-item, item-resolution, owner-answer or
+    coordinator-decision record comment, which no kit writes yet.
 
     The view drops a leading BOM and folds CRLF, as the reserved-prefix guard
     does, so a lookalike is hidden too.
@@ -914,7 +945,7 @@ def is_record_comment(text):
 def record_comment_kind(text):
     """(kind, version, state) for a record comment, else None.
 
-    `state` is `supported` for a v1 record of one of the nine designed kinds, and for
+    `state` is `supported` for a v1 record of one of the designed kinds, and for
     the later versions in SUPPORTED_LATER_VERSIONS (reference-entry-v2, kittrial-5bb.98, and
     reference-entry-v3, kittrial-5bb.104),
     and `unsupported` for anything else (an unknown version or kind), so a later slice's
@@ -1312,6 +1343,23 @@ def status_change_targets(args):
         return (command, None)
     targets = [token for token in operands if not token.startswith('@attachment:')]
     return (command, targets or None)
+
+
+def title_change_targets(args):
+    """The ids an `update` that changes a title names, for the record-anchor guard (kittrial-5bb.97).
+
+    ``None`` when the invocation is not an `update` with `--title` (bd 1.2.2 has no short
+    flag for it). Otherwise the positional ids; or the string ``'unnamed'`` when the scan
+    is ambiguous (an unknown flag) or names no row: bd would then act on the row it touched
+    last, which the guard cannot check, so the caller fails closed.
+    """
+    if not isinstance(args, list) or not args or args[0] != 'update':
+        return None
+    flags, operands, unknown = _bd_scan(args, 'update')
+    if not any(name == '--title' for name, _ in flags):
+        return None
+    targets = [token for token in operands if not token.startswith('@attachment:')]
+    return 'unnamed' if unknown or not targets else targets
 
 
 # ---------------------------------------------------------------------------

@@ -162,8 +162,8 @@ def help_options(action):
     ]
     if action == 'work':
         return [
-            {'flag': '--mine', 'description': 'show only tasks owned by the requesting actor'},
-            {'flag': '--owner ACTOR', 'description': 'show only tasks owned by ACTOR (mutually exclusive with --mine)'},
+            {'flag': '--mine', 'description': 'show only tasks owned by the requesting actor (malformed rows remain visible)'},
+            {'flag': '--owner ACTOR', 'description': 'show only tasks owned by ACTOR (mutually exclusive with --mine; malformed rows remain visible)'},
             {'flag': '--state STATE', 'description': 'filter by review state: ' + ', '.join(WORK_STATES)},
             {'flag': '--limit N', 'description': 'page size %d..%d (default 20)' % (WORK_LIMIT_MIN, WORK_LIMIT_MAX)},
             {'flag': '--offset N', 'description': 'page offset >= %d (default 0)' % WORK_OFFSET_MIN},
@@ -300,12 +300,50 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
     from reserved_comments import is_record_anchor
     from review_workflow import author_key
     from coordination import is_merge_slot
+    malformed_named=[]
+    unparseable_count=0
     for row in rows:
+        if not isinstance(row,dict):
+            unparseable_count+=1
+            continue
+        if row.get('malformed'):
+            rid=row.get('id')
+            if rid:
+                if rid not in malformed_named:malformed_named.append(rid)
+            else:
+                unparseable_count+=1
+                continue
+            if record_json.selected(row, ['gt:slot'], ['event','gate']):continue
+            if is_record_anchor(row):continue
+            if a.state and a.state!='error':continue
+            items.append({'open_items':None,'checkpoint_at':None,'newer_activity':None,
+                          'pending_change_requests':[],
+                          'task':rid,'title':str(row.get('title',''))[:200],'owner':None,
+                          'status':'unknown','review_state':'error',
+                          'contribution_id':None,'commit':None,'pending_review_items':0,
+                          'pending_handoff_requests':[],
+                          'pending_handoff_total':0,
+                          'pending_handoff_next_offset':None,
+                          'lifecycle':{},'lifecycle_scope':{},
+                          'lifecycle_matches_contribution':None,
+                          'deployed_delivery':None,
+                          'deployed_delivery_is_current_contribution':None,
+                          'deployed_live':'unknown',
+                          'integration':None,'workflow_state':None,'error':row.get('error') or 'Malformed issue row',
+                          'review_request':False,'review_requests':[],
+                          'recommended':False,'recommended_by':[],
+                          'integration_disagreements':[],'integration_warnings':[],
+                          'newer_activity_by_others':None,'newer_activity_own':None,
+                          'newer_activity_coverage':None,'unresolved_directions':None})
+            continue
         # The merge slot is an internal record (kittrial-5bb.113): on real bd it is a
         # row of type task, so the type alone never excluded it.
         if row.get('issue_type') in ('event','gate') or is_merge_slot(row):continue
         # Record anchors (kittrial-5bb.64) are never work, whatever their status.
         if is_record_anchor(row):continue
+        if not row.get('id'):
+            unparseable_count+=1
+            continue
         task_reverts=revert_map.get(row['id'],[])
         task_scopes=evidence.get(row['id']) if scopes is None else scopes.get(row['id'])
         try:review=workflow(row,task_scopes,operators=operators,reverts=task_reverts,journal=journal,
@@ -428,13 +466,20 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
                       'integration_disagreements':disagreements,'integration_warnings':integration_warnings})
     priority={'changes-requested':0,'error':1,'awaiting-review':2,'legacy-review-ready':2,'awaiting-integration':3}
     items.sort(key=lambda r:(priority.get(r['review_state'],4),r['task']))
+    coverage='Fresh current view; structured review takes precedence over legacy review-ready labels. Lifecycle facts remain independent; malformed handoff journals are surfaced as errors.'
+    if malformed_named:
+        coverage+=' Malformed issue rows: %s.'%(', '.join(malformed_named))
+    if unparseable_count:
+        coverage+=' %d unparseable issue row(s).'%unparseable_count
     result={'owner':owner,'total':len(items),'items':items[a.offset:a.offset+a.limit],'next_offset':a.offset+a.limit if a.offset+a.limit<len(items) else None,
-            'coverage':'Fresh current view; structured review takes precedence over legacy review-ready labels. Lifecycle facts remain independent; malformed handoff journals are surfaced as errors.'}
+            'coverage':coverage}
     # .1 adds checkpoint attention after constructing the page. This is separate
     # from the review/handoff/HTTP queue fields and parses only displayed tasks.
     from briefing import checkpoint_queue_fields
-    task_rows={row['id']:row for row in rows}
-    for item in result['items']:item.update(checkpoint_queue_fields(rows,task_rows[item['task']],checkpoint_states.get(item['task'])))
+    task_rows={row['id']:row for row in rows if isinstance(row,dict) and row.get('id')}
+    for item in result['items']:
+        if item['task'] in task_rows:
+            item.update(checkpoint_queue_fields(rows,task_rows[item['task']],checkpoint_states.get(item['task'])))
     if journal is not None:
         # The standing guidance channel (kittrial-5bb.99): every work queue page
         # carries the current guidance version, so a worker that only runs `work`
@@ -486,14 +531,17 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
         # Structured output is already JSON; accept the flag consistently with brief/show/work.
         args=[token for token in args if token!='--json']
     if action=='work':
-        rows=[json.loads(line) for line in run(['export','--all']).splitlines() if line.strip()]
+        rows=record_json.loads_rows(run(['export','--all']))
+        from reserved_comments import RECORD_ANCHOR_LABELS
+        rows=record_json.classify(rows,run,sorted(RECORD_ANCHOR_LABELS)+['gt:slot'], ['event','gate'])
         return queue(rows,actor,args,path/'.handoff-requests', operators=operators, journal=path,
                      reference_attention=True, verifiers=verifiers)
     if len(args) not in (1,2):raise ValueError('Use review TASK [--file payload.json] or handoff TASK --file payload.json')
     task=args[0]
     if action=='review' and len(args)==1:
         from briefing import task_row
-        rows=[json.loads(line) for line in run(['export','--all']).splitlines() if line.strip()]
+        from lifecycle import read_event_rows
+        rows=read_event_rows(run)
         issue=task_row(rows,task)
         from review_state import scopes_for
         return workflow(issue,scopes_for(rows,task),operators=operators,journal=path)
@@ -511,7 +559,8 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
             from handoff import disposition as handoff_disposition
             return handoff_disposition(path,actor,payload,run)
         return handoff(path,actor,payload,run)
-    rows=[json.loads(line) for line in run(['export','--all']).splitlines() if line.strip()]
+    from lifecycle import read_event_rows
+    rows=read_event_rows(run)
     if payload.get('operation')=='recommend':
         # A reviewer's recommendation (kittrial-5bb.115) is a record beside the review
         # chain: it has its own writer and never passes through the chain's.

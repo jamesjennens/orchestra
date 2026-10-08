@@ -44,6 +44,32 @@ Handoff checks the expected current owner, journals the operation, records nativ
 
 When a handoff request exists, its task, original owner and destination are stored in the request journal. A completed direct transfer settles only the matching pending request. If the native owner update succeeded but its response was lost, an authorized retry reconciles the durable receipt before applying the current-owner check; conflicting request or receipt identities fail closed. Queue reads validate the full request journal before state or owner filtering so malformed records remain visible, including empty filtered pages.
 
+### Claim, handoff and the coordinator's take-over
+
+**The one who has a task changes in three ways, and they are not the same.**
+
+- A **claim** takes a task that is free and open. It never takes a task from somebody:
+  bd's own claim refuses a held task ("issue already claimed by NAME") and one that is
+  not open, on the host route (`update TASK --claim`) and over the web alike.
+- A **handoff** moves a task from its owner to another worker and leaves a trail: the
+  owner (or the receiver's request the owner accepts) runs `handoff TASK --file`, or an
+  operator with the owner's or coordinator's authorization runs `admin.py handoff`; the
+  operation is journalled and the task carries the intent and completion records.
+- A **take-over by the coordinator** is the plain update on the host route,
+  `update TASK --assignee ACTOR --status in_progress`. It only changes the row: no
+  record of who gave what to whom, no check that the old holder agreed, nothing in the
+  review chain. It is what a coordinator uses when a task must move and its holder is
+  gone or the task was never properly held; it is not refused, and there is no web
+  route for it. Prefer the handoff whenever the old holder or an operator can make one,
+  and say in a comment on the task why the row was changed when it was not.
+
+**A task that is in progress and has nobody.** A host update can leave a task
+`in_progress` with no assignee. It cannot be claimed, by anybody, on either route: bd
+answers "issue not claimable: status in_progress" (over the web: 409 "Task is not open
+(it is in progress)"). The coordinator settles it on the host route: gives it to
+somebody (`update TASK --assignee ACTOR`), or sets it open again (`update TASK --status
+open`), after which the first claim takes it. (Measured on bd 1.2.2.)
+
 ## Structured contribution delivery
 
 Read `b review example-task`. It returns `latest_comment_id`, the current contribution and unresolved review requests. Copy `latest_comment_id` into `previous` for every new operation; use null only for the first operation. Each new assertion has a new operation ID; uncertain retries retain the exact original payload/actor.
@@ -104,6 +130,18 @@ Anything else is refused with zero native writes, in one sentence that names the
 1. **The exact prior commit is only as strong as who may record an integrated fact.** A follow-on based on exactly the prior revision's integration commit is accepted whoever recorded that integration, as it has been since `follows` exists. A contributor whose contribution was approved by somebody else can record `integrated=passed` for it herself, at a commit of her choosing, and base the follow-on there. The approval by a different person cannot be forged this way; the reviewer of the follow-on still checks its base.
 2. **Over SSH an actor name is a declared label.** "Recorded by a listed operator" means "recorded under an operator's name": a caller who reaches the endpoint and names itself as an operator passes. Over HTTP the actor is the authenticated account or agent, which a contributor cannot choose.
 
+What a coordinator needs to know about the operator list here (kittrial-5bb.158):
+
+* **The list is read when the follow-on is checked, not when the integration was recorded.** Listing a recorder makes everything already recorded under that name count as a later base from that moment; removing one makes all of it stop counting. Nothing is stamped on the fact itself.
+* **Names match exactly: the whole name, with case.** `Ops` is not `ops`; `ops-2` is not `ops`; an entry that is the beginning of a name (a truncated entry) matches nobody. A recorder that is refused is named in the sentence as it was recorded, so the entry to add can be copied from it.
+* **Being on the operator list grants the other operator powers too**: writing void and revert records, and whatever else `admin.py` checks the list for. Listing the coordinator so that its integrations count is a decision about those as well; the other way is to have a listed operator record the integrations.
+* **With no list configured, no later base counts.** A follow-on based on exactly the prior integration commit is still accepted.
+* **When a commit was recorded more than once**, a revert wins, then a listed operator's later recording, then an unlisted later one, then an earlier one. So a commit recorded before the prior integration and again later by somebody not listed is refused with the reason that names that recorder: the one that can be acted on.
+
+**Over HTTP the refusal arrives whole** (kittrial-5bb.158). The web service hands a canonical refusal on up to 200 characters; cut there, this sentence lost its reason, the recorder's name and what an operator does. For this sentence, and only when the line is nothing but the kit's own words around hexadecimal commit ids and a recorder name of the plain shape (`review_workflow.BASE_REFUSAL`), the limit is 1500, and the sentence is the `message` of the 422 as well as its `detail`. A recorder's name is constrained twice: the lifecycle action accepts only letters, digits and `_.@/-` for an actor, and the sentence repeats a name only if it is such a name of at most 80 characters (otherwise it says "an actor"). A scope may name any string as its integration commit; a refusal that would repeat such a string is not this sentence and is cut at 200 as before.
+
+**If `deployment.private.json` cannot be read**, the review action fails like every other action. Over SSH the endpoint's line names the file, as its busy line names the lock file it waited for; the caller there is somebody who was given the endpoint. Over the web service see docs/HTTP_DEPLOYMENT.md.
+
 What an installation should do meanwhile: put its coordinator on the operator list (`admin.py operators add NAME`) and have the coordinator record the integrations. Where integrations were recorded by somebody who is not listed, follow-ons based on exactly the prior integration commit keep working, and a later base is refused with the sentence above until an operator lists the recorder or records the integration.
 
 **What this rule cannot know.** The endpoint has no Git repository. It cannot tell that a recorded integration commit really descends from the prior one, only that the project recorded it, later, as an integration. Two release lines in one project, or a fact recorded with a wrong commit, would pass. A commit of main that no lifecycle fact names (a fix-up made directly on main) is never accepted: base the follow-on on the nearest recorded integration commit. The reviewer verifies the base, as for any contribution.
@@ -113,6 +151,48 @@ Native comment authors are **attribution, not authentication**, on the SSH/endpo
 Integration is decided per scope (ANY-scope, any-pass-wins), so recording a newer lifecycle scope for other work does not make a genuinely integrated prior un-followable. That rule fixes base selection when one commit has several passing scopes: the accepted `base_commit` is the **newest passing** scope's `integration_commit`, so once a second scope records `integrated=passed` for the same commit the older scope's `integration_commit` is **refused** even though that pass is not retracted; conversely a pass recorded earlier under one scope is not undone by a later `integrated=failed` under another scope, and that earlier pass's `integration_commit` is still **accepted**, unless that exact integration commit has been reverted by an explicit revert record (see "Reverting integrated work" below). `integration.newest_fact` reports the newest matching value so this is auditable. With no trusted scoped evidence at all, `integration.fact` is `unknown` and the gate fails closed: there is deliberately no separate "no scoped evidence" fallback branch.
 
 `follows` asserts that the new change builds on the prior revision rather than retracting it: what stays visible for the prior contribution is its **record, commit and relation** in `review TASK`/`brief` under `prior_contributions`, where each replaced revision carries the `relation` (`follows` or `supersedes`) that replaced it as current. Every prior entry also carries the same additive `integration` block as the current contribution, computed from that entry's own FULL commit over the same scopes, so the read says whether the replaced revision is integrated. Its scoped lifecycle facts are not re-scoped: they are valid only under their own lifecycle scope, stay recorded in lifecycle history and `show`/`history`, and disappear from the top-level `lifecycle`/`lifecycle_scope` of `brief`/`work` once the follow-on records its own scope (the per-scope `review.integration` view still sees them). `brief` embeds only a bounded recent slice of `prior_contributions` (a total count plus the last few entries carrying comment_id, commit, relation, timestamp and that `integration` block); read `review TASK` for the complete list. `follows` and `supersedes` are mutually exclusive, and the field is optional so payloads and chains written before it existed keep validating; a first contribution sets both to null. Record the exact new branch/bundle path, commit, base and checksum in every case, even when only the bundle filename changed. Old delivery records remain in history. A new contribution does not resolve feedback automatically.
+
+## The reviewer's part in a capability proposal (kittrial-5bb.179)
+
+A contribution that adds or changes something a user or an agent can rely on carries a
+capability **proposal payload file** in its delivery, named in the contribution summary
+(conventionally `capability-proposals/<key>.json`, one file per record). The worker does
+**not** run `capability propose`: a record written from a lane is in every release's check
+set while its work is still in review, so it is checked against main, its pointers are
+missing, and it reads `drifted`. The reviewer reads the payload with the change, and the
+coordinator writes and accepts it at release, after integration, with the release as
+evidence. The reviewer's part is:
+
+1. **Read the named payload files with the diff.** A delivery that claims a new or changed
+   capability and names no payload file is incomplete; ask for it rather than approving.
+2. **Judge the claim, not the pointers.** The check proves **location only**: that the
+   `code`, `tests` and `anchors` pointers resolve at the commit the check runs at. It never
+   proves that the sentence is true. The reviewer judges the meaning — whether the summary
+   says what the change actually does, and whether the capability is worth claiming at all.
+3. **Check the pointers are the right ones.** They must exist at the delivered commit, never
+   on a branch still under review, and `tests` must include a test that fails when the
+   capability breaks. A regression fails that test; the check still passes, because the check
+   proves location only. Approval rests on the change plus
+   that test, not on a green check.
+4. **Check the payload's field set.** It is exactly `key`, `name`, `aliases`, `summary`,
+   `requirements`, `anchors`, `code`, `tests`, `owner`, `tags`, plus `schema_version`,
+   `operation_id` and (for a revision) `revision` and `expected_sha256`. Any other field is
+   refused, so a payload carrying a "check" or a commit is malformed: the check records the
+   commit it was run at, and the coordinator writes the record only after integration.
+5. **A removal or weakening is not a contributor's write.** Retiring is
+   `admin.py capability-retire`, operator-only, and it needs a successor key. The endpoint
+   accepts a contributor's `capability propose` or `capability revise` payload, but the process
+   does not use a live write from a lane: the worker carries the payload as a file in the
+   delivery, the reviewer judges it, and the coordinator writes it at release. This kit has no
+   demotion. The delivery must
+   therefore *state* that the entry is to be revised or retired and carry the revised
+   payload file or the successor key, for the coordinator to carry out. A delivery that
+   silently drops a capability is a change to the index's promise and belongs in the review.
+6. **A failing draft does not hold up a release; a failing accepted entry does.** When the
+   release is cut, the release is unfinished until `capability-verify` passes for every
+   accepted entry; a failing draft is listed in the release record with its key, the missing
+   pointers and an owner. Reviewers should not demand that a draft's pointers resolve before
+   its work is integrated, and should not accept a draft as if it settled the claim.
 
 ## Rollback compatibility of the approve snapshot
 

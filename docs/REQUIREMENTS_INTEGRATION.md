@@ -92,6 +92,11 @@ python requirement_records.py revise --config client.json --project example --ac
   be revised as `brd-section`, and a keyed record cannot change key.
 - `kind` is `requirement` (needs `key`) or `brd-section` (narrative, no key).
   Requirement keys are unique across the project.
+  If native issue metadata makes a row unreadable, native label-filtered ID
+  membership identifies requirement rows. A separate comments read validates the
+  immutable revision ledger to establish their bound keys. A potentially
+  conflicting unreadable requirement refuses the write; a proven different key
+  and an unreadable ordinary task do not. Titles never establish record kind or key.
 - Labels are controlled: they are derived from `kind` and `acceptance_state`. A
   caller-supplied `labels` field is refused, and unrelated labels are untouched.
   The contributor guard also refuses raw `update --add-label requirement...` and
