@@ -16,6 +16,7 @@ KIT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(KIT))
 sys.path.insert(0, str(KIT / 'tests'))
 import http_authority
+import test_http_proposals
 import test_own_party
 
 OWN_PARTY_AGENT = ('This contribution was delivered by this agent\'s own account (its owner, one of that account\'s '
@@ -150,6 +151,9 @@ class GrantTests(Grants):
     def test_what_ends_the_grant_at_the_next_request(self):
         self.assertEqual(200, self.grant().status)
         ways = (('the account is made a contributor', lambda: self.member('cora', 'contributor'), lambda: self.member('cora', 'coordinator')),
+                ('the account leaves the project',
+                 lambda: self.request('DELETE', '/v1/projects/%s/members/%s' % (self.project, self.ids['cora']), token=self.tokens['olive']),
+                 lambda: self.member('cora', 'coordinator')),
                 ('the agent is taken out of the project',
                  lambda: self.request('DELETE', '/v1/projects/%s/agents/%s' % (self.project, self.agent_id), token=self.tokens['olive']),
                  None))
@@ -170,6 +174,17 @@ class GrantTests(Grants):
         self.assertIsNone(self.listed()[self.agent_id]['coordinator'])
         task, contribution = self.deliver(self.tokens['carl'])
         self.assertEqual(403, self.approve(self.agent, task, contribution).status)
+
+    def test_a_disabled_agent_or_account_approves_nothing(self):
+        for label, path in (('the agent', '/v1/agents/%s/disable' % self.agent_id), ('its account', '/v1/accounts/%s/disable' % self.ids['cora'])):
+            with self.subTest(disabled=label):
+                agent, agent_id = self.agent_with_id('cora', 'Heron ' + label[:3]) if label == 'its account' else (self.agent, self.agent_id)
+                self.assertEqual(200, self.grant(agent_id).status)
+                task, contribution = self.deliver(self.tokens['carl'])
+                self.assertEqual(200, self.request('POST', path, {}, token=self.admin).status)
+                self.assertIn(self.approve(agent, task, contribution).status, (401, 403))
+                self.assertEqual(self.state_of(task), 'awaiting-review')
+                self.assertFalse(self.listed()[agent_id]['coordinator']['effective'])
 
     def test_who_may_grant_and_what_may_be_granted(self):
         for label, token, status in (('a coordinator', self.tokens['cora'], 403), ('a contributor', self.tokens['carl'], 403),
@@ -292,6 +307,34 @@ class NothingGrantedTests(Grants):
                          {'reviews.approve', 'coordinate'})
         self.assertEqual(http_authority.credential_capabilities(state, credential, dict(issuer, superuser=True), self.project) - caps,
                          {'reviews.approve', 'coordinate'})
+
+
+class ProposalTests(test_http_proposals.ProposalHarness):
+    """The grant is about contributions. Triage of requirement proposals stays what it was for a
+    credential: refused, and the reads do not tell a granted agent otherwise."""
+
+    def test_a_granted_agent_triages_no_proposal(self):
+        made = self.request('POST', '/v1/agents', {'name': 'Heron', 'working_directory': '/home/x/heron',
+                                                   'projects': [self.project]}, token=self.token('blair'))
+        self.assertEqual(201, made.status, made.data)
+        agent, agent_id = made.data['credential']['secret'], made.data['agent']['id']
+        key = self.submit().data['key']
+
+        def seen():
+            listed = self.request('GET', self.base(), token=agent)
+            one = self.request('GET', self.base() + '/' + key, token=agent)
+            refused = self.request('POST', self.base() + '/' + key + '/dispositions', {'to_state': 'triaged'},
+                                   token=agent, key='agent-triage-0001')
+            return (listed.status, listed.data['can_triage'], one.status, one.data['can_triage'], refused.status,
+                    (refused.data.get('error') or {}).get('message'))
+        self.assertEqual(seen(), (200, False, 200, False, 403, 'Credential scope does not permit this operation'))
+        granted = self.request('PUT', '/v1/projects/%s/agents/%s/coordinator' % (self.project, agent_id), {},
+                               token=self.token('dana'))
+        self.assertEqual((200, True), (granted.status, granted.data['coordinator']['effective']))
+        # The grant lifts the scope refusal and meets the rule of the route: no credential triages.
+        self.assertEqual(seen(), (200, False, 200, False, 403, 'A credential cannot record a proposal disposition'))
+        # Its owner, signed in, triages as before.
+        self.assertTrue(self.request('GET', self.base(), token=self.token('blair')).data['can_triage'])
 
 
 class PageTests(Grants):

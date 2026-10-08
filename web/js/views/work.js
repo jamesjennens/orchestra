@@ -78,7 +78,7 @@ export async function welcome(ctx) {
   const session = await ctx.api.current().catch(() => null);
   const mode = (session && session.project_create) || 'create';
   const start = {
-    create: ['Create a project for a piece of work. You become its owner and can invite colleagues and agents with a role: viewer, contributor or owner.', 'Create a project'],
+    create: ['Create a project for a piece of work. You become its owner and can invite colleagues and agents with a role: viewer, contributor, coordinator or owner.', 'Create a project'],
     register: ['On this server an operator creates a project on the coordination host (admin.py add-project NAME). You then register it here: you become its owner and add colleagues and agents with a role.', 'Register a project'],
     'operator-only': ['On this server an operator creates a project on the coordination host and a superuser registers it. Ask an operator or a superuser; they then add you as a member.', null],
   }[mode] || [];

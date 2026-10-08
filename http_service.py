@@ -5501,7 +5501,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             item['disposition'] = named(item['disposition'])
         if isinstance(item.get('timeline'), list):
             item['timeline'] = [named(entry) for entry in item['timeline']]
-        if mine or CAP_APPROVE in capabilities:
+        if mine or self._triages(ctx, capabilities):
             return item
 
         def withhold(disposition):
@@ -5592,9 +5592,16 @@ class ApiHandler(BaseHTTPRequestHandler):
         result['items'] = [self._proposal_view(ctx, capabilities, item) for item in result.get('items') or []]
         result['next_cursor'] = (make_cursor(ctx.principal, pid, ctx.query, result['next_offset'])
                                  if result.get('next_offset') is not None else None)
-        result['can_triage'] = CAP_APPROVE in capabilities
+        result['can_triage'] = self._triages(ctx, capabilities)
         result['can_propose'] = CAP_PROPOSALS in capabilities
         return 200, result
+
+    @staticmethod
+    def _triages(ctx, capabilities):
+        """Whether the caller triages proposals: a signed-in member with `reviews.approve`. Never
+        a credential, as the write below says; an agent's coordinator grant (kittrial-5bb.209)
+        gives it the approval of contributions and changes nothing here."""
+        return CAP_APPROVE in capabilities and ctx.principal.via != 'credential'
 
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/proposals/(?P<key>' + PROPOSAL_KEY + r')')
     def proposals_get(self, ctx):
@@ -5609,7 +5616,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             args += ['--history', caller_arg(ctx.query['history'], 'history')]
         capabilities = self.service.capabilities_for(ctx.principal, pid)
         result = self._proposal_view(ctx, capabilities, self.backend.proposal_read(pid, args, missing=True))
-        result['can_triage'] = CAP_APPROVE in capabilities
+        result['can_triage'] = self._triages(ctx, capabilities)
         return 200, result
 
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/proposals/(?P<key>' + PROPOSAL_KEY + r')/dispositions')
