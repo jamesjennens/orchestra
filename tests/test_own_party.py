@@ -554,7 +554,10 @@ class WiringTests(Party):
         import inspect
         source = inspect.getsource(http_service.main)
         self.assertIn("approval_by_another_party=args.approval_by_another_party", source)
-        self.assertIn("for line in settings_lines(service):\n        print(line, file=sys.stderr)", source)
+        said = "    for line in settings_lines(service):\n        print(line, file=sys.stderr, flush=True)\n"
+        self.assertIn(said, source)
+        # After the port is had: a start that fails for a taken port says its one line and nothing else.
+        self.assertLess(source.index('return EXIT_PORT_TAKEN'), source.index(said))
 
     def test_a_start_says_the_setting_and_a_change_is_in_the_audit(self):
         def entries():
