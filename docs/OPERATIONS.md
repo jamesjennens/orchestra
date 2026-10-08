@@ -90,6 +90,58 @@ self-declares its actor on every request, exactly as an unconfined one does; wha
 forced command protects is the operator-gated and reserved operations, which a contributor
 key could otherwise reach by running `admin.py` or `bd` directly.
 
+### Bind a key to its projects
+
+A confined key may name any project of the runtime. To bind it, print its line with the
+projects it may use (kittrial-5bb.193; rule 1 of
+[COORDINATORS_PER_PROJECT_DESIGN.md](COORDINATORS_PER_PROJECT_DESIGN.md)):
+
+```sh
+python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime \
+  authorized-keys --key-file ~/alex.pub --project alpha --project beta
+```
+
+The printed line carries `--project alpha --project beta` after `--endpoint`, and repeats
+the names in the key comment (`orchestra-projects=alpha,beta`) so the file can be read by
+eye; the binding is the arguments, never the comment. Only that line is printed: the
+operator line is a shell, and a shell is every project. Each name must be a project of
+this runtime. The client configuration does not change (`"forced_command": true`, as for
+any confined key), and the project stays in the request.
+
+What a bound key is answered: for one of its projects, exactly what any caller is
+answered. For any other project, whatever the action (raw `bd`, `session register`,
+reviews, the merge slot, lifecycle facts, views, everything the endpoint has), `ValueError:
+Unknown/uninitialized project`, the answer for a project that does not exist: the key
+cannot tell another project from none. Nothing of the other project is read first. The
+three actions that exist only for the web service answer that they are available only to
+the web service.
+
+What it does not do: the key still names its own actor, any actor, inside its projects
+(that is the next slice of the design); and it binds only a key whose ONLY line in
+`authorized_keys` is the bound one. A key that also has an unrestricted or an unbound line
+is not bound: replace that line. A line printed by an earlier release of the kit is served
+by that release's wrapper, which knows no `--project` and refuses the line outright (its
+own argument check), or, if the line names no project, binds nothing.
+
+Read what is installed, without changing anything:
+
+```sh
+python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime authorized-keys-list
+```
+
+It reads `~/.ssh/authorized_keys` of the account that runs it (`--file` for another file)
+and prints, for every line: its number, the key's type, fingerprint (as `ssh-keygen -l`
+prints it) and comment, and its `kind`: `unrestricted` (no `command=`: the account's
+shell, outside every rule of the kit), `confined` (the kit's forced command, any project),
+`bound` (with its `projects`), `other-command` (a `command=` that is not the kit's
+wrapper; said, not judged) or `unreadable`. For the kit's lines it also prints `other_kit`
+(the wrapper or the endpoint the line names is not the installed kit's file: after an
+upgrade of an office installation, a line that names `releases/<ID>` keeps running that
+release), `names_release` (it is the installed kit today but names its release folder, so
+it becomes `other_kit` at the next upgrade), `other_root`, `missing`, arguments the wrapper
+does not know and projects that are not projects. `attention` lists the line numbers to
+look at. `principal` is always null until the design's next slice.
+
 ### sshd settings the boundary needs
 
 The forced command closes what the key can run; two sshd settings decide what the client can

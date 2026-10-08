@@ -4524,7 +4524,26 @@ def _authorized_key_comment(comment):
         raise ValueError('--comment must be one line without control characters')
     return text.strip()
 
-def authorized_key_lines(root,kit,key_type,key_body,key_comment='',comment=None,python=None):
+#: What a bound line's comment carries, so that authorized_keys can be read by eye.
+KEY_PROJECTS_COMMENT='orchestra-projects='
+
+def key_projects(root,names):
+    """The projects a key is to be bound to, checked: names of this runtime's projects, none twice.
+
+    A name that is no project would bind the key to nothing, and a typo is the likely
+    reason, so it is refused here and not printed (kittrial-5bb.193).
+    """
+    projects=[]
+    for name in names or []:
+        validate_name(name)
+        if name in projects:raise ValueError('--project names %s twice'%name)
+        if not (project_dir(Path(root),name)/'.beads/metadata.json').is_file():
+            raise ValueError('--project %s: no such project in this runtime. A key bound to a name that is not '
+                             'a project reaches nothing; create the project first, or check the name'%name)
+        projects.append(name)
+    return projects
+
+def authorized_key_lines(root,kit,key_type,key_body,key_comment='',comment=None,python=None,projects=()):
     """The exact contributor (confined) and operator (unrestricted) authorized_keys lines.
 
     The contributor line runs `ssh_forced_command.py` - under an absolute interpreter with
@@ -4542,15 +4561,155 @@ def authorized_key_lines(root,kit,key_type,key_body,key_comment='',comment=None,
     if any(character in text for character in '\0\r\n'):
         raise ValueError('the key comment must be one line without control characters')
     key=' '.join(part for part in (key_type,key_body,text) if part)
+    bound=tuple(part for name in projects for part in ('--project',name))
     command=' '.join((python,)+AUTHORIZED_KEY_PYTHON_FLAGS+(wrapper,'--root',root,
-                                                           '--endpoint',endpoint))
-    contributor='command="%s",%s %s'%(command,','.join(CONTRIBUTOR_KEY_OPTIONS),key)
+                                                           '--endpoint',endpoint)+bound)
+    # The bound line says in its comment what it is bound to; the operator line stays the bare key.
+    bound_key=' '.join(part for part in (key_type,key_body,text,KEY_PROJECTS_COMMENT+','.join(projects)) if part) if projects else key
+    contributor='command="%s",%s %s'%(command,','.join(CONTRIBUTOR_KEY_OPTIONS),bound_key)
     return {'root':root,'kit':kit,'endpoint':endpoint,'wrapper':wrapper,'python':python,
             'python_flags':list(AUTHORIZED_KEY_PYTHON_FLAGS),
             'contributor_options':list(CONTRIBUTOR_KEY_OPTIONS),
             'contributor':contributor,'operator':key}
 
-def authorized_keys(root,key_file,role='both',python=None,comment=None):
+def _key_line_options(line):
+    """Split one authorized_keys line into (options text, the rest), as sshd reads it.
+
+    Options end at the first blank outside double quotes; inside quotes a backslash keeps
+    the next quote. A line that begins with a key type has no options.
+    """
+    first=line.split(None,1)[0]
+    if first in AUTHORIZED_KEY_TYPES:return '',line
+    quoted=False;index=0
+    while index<len(line):
+        character=line[index]
+        if character=='\\' and quoted and index+1<len(line) and line[index+1]=='"':index+=2;continue
+        if character=='"':quoted=not quoted
+        elif character in ' \t' and not quoted:break
+        index+=1
+    if quoted:raise ValueError('a quote is not closed')
+    return line[:index],line[index:].strip()
+
+def _key_line_command(options):
+    """The value of ``command=`` among a line's options, or None."""
+    parts=[];current='';quoted=False;index=0
+    while index<len(options):
+        character=options[index]
+        if character=='\\' and quoted and index+1<len(options) and options[index+1]=='"':
+            current+='"';index+=2;continue
+        if character=='"':quoted=not quoted
+        elif character==',' and not quoted:parts.append(current);current='';index+=1;continue
+        else:current+=character
+        index+=1
+    parts.append(current)
+    for part in parts:
+        name,equals,value=part.partition('=')
+        if equals and name.strip().lower()=='command':return value
+    return None
+
+def key_line(line,root,kit):
+    """What one line of authorized_keys is, for this runtime and this kit; None for a blank or # line.
+
+    Read only. ``kind`` is ``bound`` (this kit's forced command with projects), ``confined``
+    (the forced command with none: any project), ``unrestricted`` (no command: the account's
+    shell), ``other-command`` (a command that is not the kit's wrapper; said, not judged) or
+    ``unreadable``.
+    """
+    import shlex
+    text=line.strip()
+    if not text or text.startswith('#'):return None
+    try:
+        options,rest=_key_line_options(text)
+        parts=rest.split(None,2)
+        if len(parts)<2 or parts[0] not in AUTHORIZED_KEY_TYPES:raise ValueError('no public key after the options')
+        body=base64.b64decode(parts[1],validate=True)
+        if not body:raise ValueError('the key body is empty')
+    except Exception as error:
+        return {'kind':'unreadable','reason':str(error)[:120]}
+    entry={'key_type':parts[0],
+           'fingerprint':'SHA256:'+base64.b64encode(hashlib.sha256(body).digest()).decode('ascii').rstrip('='),
+           'comment':parts[2] if len(parts)>2 else ''}
+    command=_key_line_command(options)
+    if command is None:
+        entry['kind']='unrestricted'
+        return entry
+    try:tokens=shlex.split(command)
+    except ValueError:tokens=[]
+    at=next((index for index,token in enumerate(tokens) if token.rsplit('/',1)[-1]=='ssh_forced_command.py'),None)
+    if at is None:
+        entry['kind']='other-command'
+        return entry
+    wrapper=tokens[at];values={'--root':[],'--endpoint':[],'--python':[],'--project':[],'--principal':[]};unknown=[]
+    arguments=tokens[at+1:];index=0
+    while index<len(arguments):
+        flag,equals,joined=arguments[index].partition('=')
+        if flag in values and equals:values[flag].append(joined)
+        elif flag in values and index+1<len(arguments):index+=1;values[flag].append(arguments[index])
+        else:unknown.append(arguments[index])
+        index+=1
+    here=Path(os.path.realpath(str(kit)))
+    endpoints=values['--endpoint'] or [wrapper.rsplit('/',1)[0]+'/endpoint.py']
+    line_root=values['--root'][0] if values['--root'] else None
+    entry.update({
+        'kind':'bound' if values['--project'] else 'confined',
+        'projects':values['--project'],
+        # Slice 2 of the design adds --principal; the field is here so that the shape of the
+        # listing does not change with it.
+        'principal':values['--principal'][0] if values['--principal'] else None,
+        'root':line_root,'wrapper':wrapper,'endpoints':endpoints,
+        # A line names its wrapper and endpoint by path. One printed by an earlier release of an
+        # office installation still runs THAT release's kit, which knows none of the rules of
+        # this one, for as long as its folder is there (the design, Migration, step 6).
+        'other_kit':(Path(os.path.realpath(wrapper))!=here/'ssh_forced_command.py'
+                     or any(Path(os.path.realpath(endpoint))!=here/'endpoint.py' for endpoint in endpoints)),
+        'other_root':line_root is None or Path(os.path.realpath(line_root))!=Path(os.path.realpath(str(root))),
+        'missing':not Path(wrapper).is_file(),
+        'unknown_arguments':unknown})
+    # It is this kit today and names its release folder: after the next upgrade it is another kit.
+    link=install_current_link(here)
+    entry['names_release']=bool(link is not None and not entry['other_kit']
+                                and not all(str(path).startswith(str(link)+'/') for path in [wrapper,*endpoints]))
+    if not entry['other_root']:
+        entry['unknown_projects']=[name for name in values['--project']
+                                   if not re.fullmatch(r'[a-z][a-z0-9]{1,23}',name)
+                                   or not (Path(root)/'projects'/name/'.beads/metadata.json').is_file()]
+    return entry
+
+def authorized_keys_listing(root,file=None):
+    """Every line of an authorized_keys file and what it may do here. Reads; never writes.
+
+    The kit cannot audit sshd's file, only read it (kittrial-5bb.193): which keys have the
+    account's shell, which are confined to the endpoint, which are bound to projects, and
+    which point at a kit other than the installed one.
+    """
+    path=Path(file) if file else Path.home()/'.ssh'/'authorized_keys'
+    kit=Path(__file__).resolve().parent
+    try:text=path.read_text(encoding='utf-8',errors='replace')
+    except OSError as error:
+        raise ValueError('Cannot read %s: %s'%(path,error.strerror or error)) from None
+    lines=[];summary={}
+    for number,raw in enumerate(text.splitlines(),1):
+        entry=key_line(raw,root,kit)
+        if entry is None:continue
+        lines.append({'line':number,**entry})
+        summary[entry['kind']]=summary.get(entry['kind'],0)+1
+    attention=[entry['line'] for entry in lines
+               if entry.get('other_kit') or entry.get('missing') or entry.get('unknown_arguments')
+               or entry.get('unknown_projects') or entry.get('names_release') or entry['kind']=='unreadable']
+    return {'schema_version':1,'file':str(path),'root':str(root),'kit':str(kit),'lines':lines,'summary':summary,
+            'attention':attention,
+            'notes':['unrestricted: the key has this account\'s shell and is outside every rule of the kit, on every project.',
+                     'confined: the key runs only the endpoint and may name any project.',
+                     'bound: the key runs only the endpoint and only for its projects.',
+                     'other_kit: the line runs a wrapper or an endpoint that is not this kit\'s file. Such a line is '
+                     'served by that other kit, whatever its text says: a kit older than this one binds nothing. '
+                     'Print the line again with this kit (authorized-keys) and replace it.',
+                     'names_release: the line is this kit today but names its release folder, so after the next '
+                     'upgrade it is other_kit. Print it again; it then goes through install/current.',
+                     'other_root: the line serves another runtime than --root (or names none); its projects were not looked up here.',
+                     'This command reads the file and changes nothing.']}
+
+def authorized_keys(root,key_file,role='both',python=None,comment=None,projects=None):
     """Print the installable lines for one public key as JSON (see authorized_key_lines).
 
     The kit directory is taken through the installation's `install/current` link where it
@@ -4562,9 +4721,13 @@ def authorized_keys(root,key_file,role='both',python=None,comment=None):
     for name in ('ssh_forced_command.py','endpoint.py'):
         if not (kit/name).is_file():
             raise ValueError('This kit copy has no %s; run the helper from the installed kit directory'%name)
+    projects=key_projects(root,projects)
+    if projects and role=='operator':
+        raise ValueError('--project binds the confined contributor line; an unrestricted operator key has a '
+                         'shell and cannot be bound to projects')
     path=Path(key_file)
     lines=authorized_key_lines(root,kit,*public_key_line(path.read_text(encoding='utf-8-sig'),str(path)),
-                               comment=comment,python=python)
+                               comment=comment,python=python,projects=projects)
     payload={'schema_version':1,'root':lines['root'],'kit':lines['kit'],'endpoint':lines['endpoint'],
              'wrapper':lines['wrapper'],'python':lines['python'],
              'contributor_options':lines['contributor_options'],
@@ -4585,6 +4748,20 @@ def authorized_keys(root,key_file,role='both',python=None,comment=None):
                       'install/current link where it has one. Put that exact path in the contributor\'s '
                       'client config: the wrapper compares it as one token, and a releases/<ID> spelling '
                       'would keep that key on the release that printed it.']}
+    if projects:
+        # Rule 1 of docs/COORDINATORS_PER_PROJECT_DESIGN.md. Only the bound line is printed:
+        # the operator line is a shell, and a shell is every project.
+        role='contributor'
+        payload['projects']=projects
+        payload['notes'].extend([
+            'This line is bound to the projects above: the endpoint refuses every request of this key '
+            'that names another project, with the answer it gives for a project that does not exist. '
+            'The binding is the --project arguments of the line; the comment only repeats them.',
+            'The operator line is not printed with --project: an unrestricted key has the account\'s '
+            'shell and cannot be bound. A key that already has an unrestricted or an unbound line in '
+            'authorized_keys is not bound by adding this one: replace that line.',
+            'admin.py authorized-keys-list shows every line of authorized_keys, what it is bound to and '
+            'whether it still points at the installed kit.'])
     if role in ('contributor','both'):payload['contributor']=lines['contributor']
     if role in ('operator','both'):payload['operator']=lines['operator']
     print(json.dumps(payload,ensure_ascii=True,indent=2))
@@ -4799,6 +4976,12 @@ def main():
                    help='which line(s) to print (default: both, for different keys)')
     a.add_argument('--python',default=None,help='interpreter in the contributor forced command (default: this interpreter, or /usr/bin/python3)')
     a.add_argument('--comment',default=None,help='replace the key line comment')
+    a.add_argument('--project',action='append',default=None,metavar='NAME',
+                   help='bind the contributor line to this project (repeatable): the endpoint then refuses every '
+                        'request of that key for another project. Without it the key may name any project')
+    a=sub.add_parser('authorized-keys-list',help='read-only: every line of authorized_keys, what it may do here, the '
+                     'projects it is bound to, and whether it points at the installed kit')
+    a.add_argument('--file',default=None,help='the authorized_keys file to read (default: ~/.ssh/authorized_keys of this account)')
     a=sub.add_parser('backup');a.add_argument('projects',nargs='*',metavar='project')
     a.add_argument('--all',action='store_true',dest='all_projects',
                    help='back up every initialized project in this runtime in one run')
@@ -5359,7 +5542,9 @@ def main():
         for line in warnings:print(line,file=sys.stderr)
         print(json.dumps(result))
     elif args.command=='authorized-keys':
-        authorized_keys(root,args.key_file,args.role,args.python,args.comment)
+        authorized_keys(root,args.key_file,args.role,args.python,args.comment,args.project)
+    elif args.command=='authorized-keys-list':
+        print(json.dumps(authorized_keys_listing(root,args.file),ensure_ascii=True,indent=2))
     elif args.command=='backup':backup_projects(root,args.projects,args.all_projects)
     elif args.command=='backup-copy':backup_copy(root,args.destination,require_clean=args.require_clean)
     elif args.command=='backup-repoint':print(json.dumps(repoint_backup(root,args.project),sort_keys=True))
