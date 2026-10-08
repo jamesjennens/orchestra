@@ -833,6 +833,51 @@ to read it for editing. Owners and superusers, session only.
 - The write goes through the service-only endpoint action `set-onboarding`, which
   re-checks project administration under the authority lock.
 
+### The kit's documents for members: how work is found, and the prompts
+
+Every member of a project, a viewer included, has a page "How work is found"
+(`#/p/PROJECT/how`, in the project's navigation; kittrial-5bb.226). It says where a worker
+looks for work at each run and in what order, where it does not look, how whoever
+coordinates reaches a worker, and it offers the prompts a worker is started and woken
+with, each with a copy button.
+
+**The page retypes nothing.** Its texts are files of the installed kit, the same ones the
+client's `docs NAME` serves, read by the same reader:
+
+| `docs` name | File | What |
+|---|---|---|
+| `finding-work` | `docs/FINDING_WORK.md` | the order of a run, what a worker does not read, the three ways to reach a worker with what the web interface can do today and the command that works today |
+| `worker-prompt` | `templates/WORKER_PROMPT.md` | the first prompt for a new worker over SSH |
+| `poll-prompt` | `templates/WORKER_POLL_PROMPT.md` | the short recurring prompt for a worker over SSH |
+| `poll-prompt-agent` | `templates/AGENT_POLL_PROMPT.md` | the short recurring prompt for an agent with a web credential |
+
+- `GET /v1/docs` lists them (name, title, file, `served_as`, the named values a prompt
+  leaves to replace) and `GET /v1/docs/NAME` returns one: `text` (the whole file),
+  `prompt` (what is pasted: everything between the file's first line that is exactly
+  three backticks and the word text, and its last line that is exactly three backticks;
+  null for a document
+  that is no prompt), `placeholders`, and `server_url` (the address the service is
+  configured with, `--public-url`; never the request's Host header; null when none is
+  configured, and the page then uses the address it was loaded from).
+- Any signed-in member and any agent credential may read them: they hold nothing of a
+  project and no secret. Without a session: `401`. A name that is not one of the four,
+  the rest of the client's catalogue included: `404`. A file that cannot be read from
+  the installed kit: `503`, and the page says so and shows nothing in part.
+- The page fills in the values it knows: the server address, the project, and the names
+  of the reader's own agents that work in the project. It names the values that are left
+  ("Replace before use: ..."). A recurring prompt is at most 2,000 characters
+  (`onboarding.POLL_PROMPT_LIMIT`, pinned by a test): it carries no state and no rules.
+- An agent's `.orchestra/AGENT.md` (written by the Agents page) states the same order in
+  the agent's own words. `tests/test_finding_work.py` pins the order the texts state to
+  the order `GET /v1/agents/me/next` gives, on the in-process backend, on the endpoint
+  backend and through a real bd, so neither changes without the other.
+
+**What the text says is not there yet, and is not:** an agent with a web credential
+cannot read the coordinator's standing guidance, and a comment on a task or the
+assignment of a task to somebody else cannot be made over the web. The document names
+the command for each. A test fails when a route for one of them appears, so that the
+text is corrected with it.
+
 ### Requirement proposals
 
 A proposal says what the product should do. It is intake, not a task and not a

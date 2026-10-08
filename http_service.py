@@ -58,6 +58,8 @@ from http_auth import (AGENT_SECRET_ENV, agent_secret_file, CAP_ACCOUNTS_ADMIN, 
                        uncertain, unsupported)
 
 KIT_VERSION = '0.1.0'
+#: Where the installed kit is: the documents this service shows are read from it.
+KIT_DIRECTORY = Path(__file__).resolve().parent
 MAX_BODY_BYTES = 262144
 MAX_ATTACHMENTS = 8
 MAX_ATTACHMENT_BYTES = 65536
@@ -4322,6 +4324,34 @@ class ApiHandler(BaseHTTPRequestHandler):
                 if verdict[0] == 'no-canonical' else verdict[1]
             view['needs_confirmation'] = verdict[0] == 'unconfirmed'
         return view
+
+    # -- the kit's documents for members (kittrial-5bb.226) --------------------------------
+    #
+    # How a worker finds its work, how a coordinator reaches it, and the prompts a worker is
+    # started and woken with. The same files the client's ``docs`` serves, read by the same
+    # reader, so the page shows what the kit serves. For any signed-in member, a viewer
+    # included, and for an agent's credential; nothing of a project and no secret is in them.
+    @route('GET', r'/v1/docs')
+    def docs_list(self, ctx):
+        import onboarding
+        return 200, {'items': [{key: value for key, value in onboarding.member_document(KIT_DIRECTORY, name).items()
+                                if key != 'text' and key != 'prompt'} for name in onboarding.WEB_DOCUMENTS],
+                     'server_url': self.service.public_url or None}
+
+    @route('GET', r'/v1/docs/(?P<name>[a-z][a-z-]{0,40})')
+    def docs_get(self, ctx):
+        import onboarding
+        name = ctx.params['name']
+        if name not in onboarding.WEB_DOCUMENTS:
+            raise not_found('No such document. GET /v1/docs lists the documents this service serves.')
+        try:
+            document = onboarding.member_document(KIT_DIRECTORY, name)
+        except (OSError, ValueError) as failed:
+            raise HttpError(503, 'unavailable', 'The document %s could not be read from the installed kit (%s).'
+                            % (name, type(failed).__name__))
+        # The address this service is configured with, for the page to put into a prompt.
+        # Never the request's Host header, which a client controls.
+        return 200, dict(document, server_url=self.service.public_url or None)
 
     @route('GET', r'/v1/projects')
     def projects_list(self, ctx):
