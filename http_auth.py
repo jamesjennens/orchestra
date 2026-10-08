@@ -2305,7 +2305,10 @@ class Service:
     @staticmethod
     def _holds(namespace, name):
         """Whether a credential issued with ``namespace`` may write under ``name``."""
-        return isinstance(namespace, str) and bool(namespace) and (
+        # A credential issued with NO name has ``actor`` None and holds no name: it writes under its
+        # issuer's account id, which no other account can be issued (review of kittrial-5bb.199, round 2:
+        # a None here raised AttributeError and answered 500 to every other account's named credential).
+        return isinstance(namespace, str) and bool(namespace) and isinstance(name, str) and (
             name == namespace or name.startswith(namespace.rstrip('/') + '/'))
 
     def note_settings(self):

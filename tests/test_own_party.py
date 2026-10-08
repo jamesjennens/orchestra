@@ -227,6 +227,24 @@ class SettingOnTests(Party):
                 self.assertEqual(self.state_of(task), 'awaiting-review')
                 self.assertEqual(201, self.approve(other, task, contribution).status)
 
+    def test_a_named_credential_is_issued_beside_another_accounts_unnamed_one(self):
+        """Round 2 of the review: with one account holding a working credential issued with NO name (the
+        default), every other account asking for a NAMED one was answered 500 (the unnamed credential's
+        name is None), with the setting on or off. An unnamed credential holds no name."""
+        for setting in (True, False):
+            self.service.approval_by_another_party = setting
+            with self.subTest(setting=setting):
+                made = self.request('POST', '/v1/projects/%s/worker-credentials' % self.project, {'label': 'unnamed'}, token=self.tokens['olive'])
+                self.assertEqual((201, None), (made.status, made.data['credential']['actor']), made.data)
+                name = 'beside-unnamed-%s' % ('on' if setting else 'off')
+                for who, token in (('oscar', self.tokens['oscar']), ('admin', self.admin), ('olive', self.tokens['olive'])):
+                    with self.subTest(who=who):
+                        named = self.request('POST', '/v1/projects/%s/worker-credentials' % self.project,
+                                             {'label': 'named', 'actor': '%s-%s' % (name, who)}, token=token)
+                        self.assertEqual((201, '%s-%s' % (name, who)), (named.status, named.data.get('credential', {}).get('actor')), named.data)
+        self.assertFalse(self.service._holds('lane-a', None))
+        self.assertFalse(self.service._holds(None, 'lane-a'))
+
     def test_each_name_of_the_approver_is_compared(self):
         """The name a request acts under and the account behind it are both the approver. For a signed-in
         person they are one name; an agent's are two (slice 1b), so the rule is shown on the rule itself."""
