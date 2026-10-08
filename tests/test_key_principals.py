@@ -25,7 +25,7 @@ import sys
 import tempfile
 import unittest
 import uuid
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -85,8 +85,13 @@ def deployment(root, operators_list=('ops',)):
 
 
 def tree(folder):
+    # The deployment lock (.review-writes.lock) and the project coordination lock hold no
+    # state and are never backed up; taking a lock creates an empty file, so a "nothing was
+    # written" comparison ignores them (adopt-actor takes the deployment lock, kittrial-5bb.223
+    # finding 1; endpoint tests exclude .coordination.lock the same way).
     return {str(path.relative_to(folder)): (path.read_bytes() if path.is_file() else None)
-            for path in sorted(Path(folder).rglob('*'))}
+            for path in sorted(Path(folder).rglob('*'))
+            if path.name not in ('.review-writes.lock', '.coordination.lock')}
 
 
 def actions_of_the_endpoint():
@@ -199,6 +204,24 @@ class BoundPrincipalEndpointTests(unittest.TestCase):
                         mock.patch.object(endpoint.fcntl, 'flock', side_effect=reached):
                     with self.assertRaises(ValueError):
                         endpoint.execute(self.root, request, key_principal=MINE)
+
+    def test_a_bound_key_is_refused_the_web_only_actions_structurally(self):
+        # G1: for a key bound to a principal, the three web-only actions are refused above the
+        # gate, before the project or the action handler is reached. The handlers refuse a
+        # non-web caller too, so they are made to fail loudly here: only the structural lines
+        # can answer with this exact sentence.
+        reached = AssertionError('the request reached the action or its project')
+        import project_creation
+        with mock.patch.object(endpoint, 'project_dir', side_effect=reached), \
+                mock.patch.object(project_creation, 'create_action', side_effect=reached), \
+                mock.patch.object(project_creation, 'list_action', side_effect=reached), \
+                mock.patch.object(project_creation, 'standing_action', side_effect=reached):
+            for action in endpoint.SERVICE_ONLY_ACTIONS:
+                with self.subTest(action=action), self.assertRaises(ValueError) as refusal:
+                    endpoint.execute(self.root, {'project': 'alpha', 'actor': self.mine['actor'],
+                                                 'action': action}, key_principal=MINE)
+                self.assertEqual(str(refusal.exception),
+                                 '%s is available only to the web service' % action)
 
     def test_a_replayed_registration_leaves_the_owner_as_it_was(self):
         # S3: replaying somebody's registration under a bound key reconciles; it never takes
@@ -326,6 +349,19 @@ class LaunchedPrincipalEndpointTests(unittest.TestCase):
                 answer = self.ask(self.view(self.mine['actor']), *flags)
                 self.assertEqual((answer['returncode'], answer['stdout']), (2, ''))
                 self.assertIn(said, answer['stderr'])
+
+    def test_the_endpoint_refuses_a_repeated_or_abbreviated_key_principal(self):
+        # Finding 7: only the wrapper passes --key-principal, but the endpoint's own flag must
+        # not take the last of two, and must not accept an abbreviation.
+        repeated = self.ask(self.view(self.mine['actor']), '--key-principal', MINE, '--key-principal', OTHER)
+        self.assertEqual((repeated['returncode'], repeated['stdout']), (2, ''))
+        self.assertIn('--key-principal names', repeated['stderr'])
+        done = subprocess.run([sys.executable, str(KIT/'endpoint.py'), '--root', str(self.root),
+                               '--key-princ', MINE],
+                              input=json.dumps(self.view(self.mine['actor'])), capture_output=True, text=True,
+                              timeout=120)
+        self.assertEqual((done.returncode, done.stdout), (2, ''))
+        self.assertIn('unrecognized arguments', done.stderr)
 
     def test_lane_and_person_are_both_accepted_and_are_different_principals(self):
         # The coordinator decision: a lane is spelled lane:NAME as well as person:NAME, the two
@@ -513,6 +549,28 @@ class RegistryOwnerTests(unittest.TestCase):
         # A key need not be a registered session: adoption names legacy actors.
         sessions.validate({'schema_version': 1, 'records': {}, 'owners': {'legacy-name': MINE}})
 
+    def test_the_principal_prefixes_are_a_closed_set(self):
+        # L7: only lane:NAME and person:NAME are principals; any other prefix word is refused.
+        for good in ('lane:lane-one', 'person:lane-one', 'lane:a', 'person:' + 'a'*95):
+            with self.subTest(good=good):
+                self.assertEqual(sessions.valid_principal(good), good)
+        for bad in ('team:x', 'Lane:x', 'LANE:x', 'Person:x', 'lane:', 'person:', 'lane', 'person',
+                    ':x', 'lane:person:x', 'person:lane:x', 'lane:x:y', 'lane:-x', 'lane:two words',
+                    '', None, 7, 'lane:x\n'):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                sessions.valid_principal(bad)
+
+    def test_a_reconciled_registration_without_an_owners_map_omits_the_principal(self):
+        # P3: a registry with no owners map (an installation that configures nothing) answers a
+        # replay exactly as before rule 2, with no `principal` key.
+        made = self.register(principal=MINE)
+        write_registry(self.path, [made['session']])                  # no owners map at all
+        again = sessions.execute(self.path, 'example',
+                                 ['register', '--name', made['session']['name'],
+                                  '--request-id', made['session']['request_id']], self.export)
+        self.assertTrue(again['reconciled'])
+        self.assertNotIn('principal', again)
+
     def test_the_downgrade_limit_is_the_owners_key(self):
         """An older kit's validator refuses a registry that has the owners map."""
         def old_kit_reads(data):
@@ -586,6 +644,47 @@ class AdoptionTests(unittest.TestCase):
         self.assertEqual(len(admin.actor_adoptions(self.root)), 2)
         self.assertEqual(admin.actor_adoptions(self.root)[1]['previous'], MINE)
         self.assertTrue(admin.actor_adoptions(self.root)[1]['moved'])
+
+    def test_from_on_an_actor_with_no_owner_is_refused(self):
+        # F3: --from names the owner a move starts from; on an actor with no owner at all it
+        # must not be accepted as a first adoption.
+        untouched = tree(self.root)
+        with self.assertRaises(ValueError) as refusal:
+            self.adopt(from_principal=OTHER)
+        self.assertIn('does not give alex/s1 to it', str(refusal.exception))
+        self.assertEqual(tree(self.root), untouched)
+
+    def test_the_audit_entry_is_written_before_the_registry(self):
+        # F5: a kill between the two writes leaves the audit holding the adoption, never the
+        # registry holding an owner the audit does not name.
+        def killed(path, data):
+            raise OSError('killed before the registry write')
+        with mock.patch('coordination.atomic', side_effect=killed):
+            with self.assertRaises(OSError):
+                self.adopt()
+        self.assertEqual([entry['actor'] for entry in admin.actor_adoptions(self.root)], ['alex/s1'])
+        self.assertEqual(sessions.owners(self.root/'projects'/'alpha'), {})   # registry not written
+
+    def test_the_operator_name_rule_keeps_the_two_prefixes_apart(self):
+        # L5: lane:NAME and person:NAME are different principals in the operator-name rule too.
+        deployment(self.root, ('ops', 'coordinator'))
+        write_registry(self.root/'projects'/'beta', [], owners={'coordinator': PERSON})
+        before = tree(self.root)
+        with self.assertRaises(ValueError) as refusal:
+            self.adopt(actor='coordinator', principal=MINE)
+        self.assertIn('already gives it to %s' % PERSON, str(refusal.exception))
+        self.assertEqual(tree(self.root), before)
+
+    def test_moving_between_the_two_prefixes_is_a_move(self):
+        # L6: person:NAME to lane:NAME (the same suffix) is a move, not a no-op.
+        self.adopt(principal=PERSON)
+        before = tree(self.root)
+        with self.assertRaises(ValueError) as refusal:
+            self.adopt(principal=MINE)
+        self.assertIn('Refusing to move', str(refusal.exception))
+        self.assertEqual(tree(self.root), before)
+        moved = self.adopt(principal=MINE, from_principal=PERSON)
+        self.assertEqual((moved['changed'], moved['moved'], moved['previous']), (True, True, PERSON))
 
     def test_a_name_that_appears_nowhere_in_the_project_is_refused(self):
         before = tree(self.root)
@@ -677,6 +776,21 @@ class AdoptionTests(unittest.TestCase):
         body = source[source.index('\ndef adopt_actor('):source.index('\ndef credential_actors(')]
         self.assertIn('fcntl.flock(lock', body)
         self.assertIn(".coordination.lock", body)
+
+    def test_the_same_name_check_and_both_writes_are_under_the_deployment_lock(self):
+        # Finding 1: the operator-name check must run under the deployment lock the audit write
+        # takes, and the registry write must stay inside it, so two adopt-actor commands for one
+        # operator-listed name in two projects serialize instead of both exiting 0. Pinned at
+        # the source, as the coordination-lock test above is, because the race cannot be held
+        # without deadlocking the test.
+        source = (KIT/'admin.py').read_text(encoding='utf-8')
+        body = source[source.index('\ndef adopt_actor('):source.index('\ndef credential_actors(')]
+        lock = body.index('with deployment_config_lock(root):')
+        self.assertLess(lock, body.index('principal_conflicts(root,actor,principal,project)'))
+        self.assertLess(lock, body.index('actor_adoptions(root)'))
+        self.assertLess(lock, body.index("atomic(path/'.sessions.json',data)"))
+        self.assertLess(body.index('atomic_private_write(root/ACTOR_ADOPTIONS_AUDIT'),
+                        body.index("atomic(path/'.sessions.json',data)"))
 
     def test_a_non_project_is_refused(self):
         with self.assertRaises(ValueError) as refusal:
@@ -790,6 +904,73 @@ class PrintAndAdoptCommandTests(unittest.TestCase):
         self.assertEqual(listing['summary'].get('principal-bound'), 3)
         self.assertIn(2, listing['attention'])                        # the repeated principal
         self.assertIn(3, listing['attention'])                        # the ill-formed one
+
+    def test_the_listing_flags_bad_lines_that_are_otherwise_clean(self):
+        # R3, R4, finding 6: the same flags on lines that are otherwise in order, so they are
+        # under attention for the right reason (the older test's /srv/kit paths are under
+        # attention anyway and hid the mutant).
+        kit = Path(admin.__file__).resolve().parent
+
+        def line(**more):
+            return admin.authorized_key_lines(str(self.root), str(kit), 'ssh-ed25519', KEY_BODY,
+                                              'alex@laptop', python='/usr/bin/python3', **more)['contributor']
+
+        good = line(principal=MINE)
+        repeated_principal = line(principal=MINE).replace(
+            '--principal %s' % MINE, '--principal %s --principal %s' % (MINE, OTHER))
+        ill_principal = line(principal='lane-p')
+        repeated_project = line(projects=['alpha']).replace('--project alpha', '--project alpha --project alpha')
+        file = Path(self.tmp.name)/'authorized_keys'
+        file.write_text('\n'.join([good, repeated_principal, ill_principal, repeated_project])+'\n', encoding='utf-8')
+        listing = admin.authorized_keys_listing(self.root, str(file))
+        self.assertEqual([entry['kind'] for entry in listing['lines']], ['bound']*4)
+        self.assertEqual(listing['attention'], [2, 3, 4])
+        self.assertTrue(listing['lines'][1]['principal_repeated'])
+        self.assertFalse(listing['lines'][1]['principal_ill_formed'])
+        self.assertTrue(listing['lines'][2]['principal_ill_formed'])
+        self.assertTrue(listing['lines'][3]['project_repeated'])
+        # Every named principal is counted; a token that is a flag is not a principal at all.
+        self.assertEqual(listing['summary']['principal-bound'], 3)
+
+    def test_a_repeated_adopt_flag_is_refused_and_an_abbreviation_is_not_a_flag(self):
+        # Finding 4: argparse used to keep the last of a repeated --from/--principal/--actor/
+        # --reason and accepted an abbreviation; both are now refused.
+        cases = (
+            ['adopt-actor', 'alpha', 'alex/s1', '--principal', MINE, '--principal', OTHER,
+             '--actor', 'ops', '--reason', 'x'],
+            ['adopt-actor', 'alpha', 'alex/s1', '--principal', MINE,
+             '--from', MINE, '--from', OTHER, '--actor', 'ops', '--reason', 'x'],
+            ['adopt-actor', 'alpha', 'alex/s1', '--principal', MINE,
+             '--actor', 'ops', '--actor', 'ops2', '--reason', 'x'],
+            ['adopt-actor', 'alpha', 'alex/s1', '--principal', MINE,
+             '--actor', 'ops', '--reason', 'x', '--reason', 'y'],
+        )
+        for argv in cases:
+            with self.subTest(argv=argv), self.assertRaises(ValueError) as refusal:
+                self.run_admin(*argv)
+            self.assertIn('given more than once', str(refusal.exception))
+        said = io.StringIO()
+        with redirect_stderr(said), self.assertRaises(SystemExit):
+            self.run_admin('adopt-actor', 'alpha', 'alex/s1', '--princ', MINE, '--actor', 'ops', '--reason', 'x')
+        self.assertIn('--principal', said.getvalue())
+
+    def test_a_flag_swallowed_as_a_principal_value_is_not_counted(self):
+        # Finding 6: `--principal --project pa` used to make the listing report `--project` as
+        # the principal and count it as principal-bound; it is now unknown arguments only.
+        kit = Path(admin.__file__).resolve().parent
+        good = admin.authorized_key_lines(str(self.root), str(kit), 'ssh-ed25519', KEY_BODY, 'alex@laptop',
+                                          python='/usr/bin/python3', principal=MINE)['contributor']
+        line = good.replace(' --principal %s"' % MINE, ' --principal --project"')
+        entry = admin.key_line(line, self.root, kit)
+        self.assertIsNone(entry['principal'])
+        self.assertFalse(entry.get('principal_ill_formed'))
+        self.assertIn('--principal', entry['unknown_arguments'])
+        self.assertIn('--project', entry['unknown_arguments'])
+        file = Path(self.tmp.name)/'authorized_keys'
+        file.write_text(line+'\n', encoding='utf-8')
+        listing = admin.authorized_keys_listing(self.root, str(file))
+        self.assertEqual(listing['attention'], [1])
+        self.assertNotIn('principal-bound', listing['summary'])
 
     def test_the_adopt_command_writes_and_the_reader_prints_it(self):
         made = json.loads(self.run_admin('adopt-actor', 'alpha', 'alex/s1', '--principal', MINE,

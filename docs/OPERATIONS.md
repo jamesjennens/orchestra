@@ -188,7 +188,12 @@ python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime \
 ```
 
 The command refuses a name that appears nowhere in the project (no session registration, no
-owner entry and no tracker row names it), so the audit is not a place to invent an actor. It
+owner entry and no tracker row names it), so the audit is not a place to invent an actor. An
+ASSIGNEE on a tracker row counts as naming the actor, so a row assigned to a name makes that
+name adoptable exactly as a row's author does; the check is a guard against a mistyped name,
+not proof that the actor ever acted. A name on the deployment operator allowlist is not
+exempt: until a session registration, an owner entry or a tracker row in the project names
+it, a coordinator's listed name cannot be adopted there. It
 refuses a name on the deployment operator allowlist that another principal owns in another
 project: the one operator list must mean the same lane everywhere. It records in
 `<runtime>/actor-adoptions.audit.json` who gave which actor to which principal, when and why
@@ -204,7 +209,11 @@ refusal changes nothing, so one mistyped actor cannot take a lane's identity and
 **Nothing removes an owner**: there is no command that takes an actor back to "no principal",
 and a wrong owner is corrected with `adopt-actor ... --from`. The audit is a short history:
 it keeps the newest 200 entries and drops the oldest silently; it is a record of recent
-adoptions, not a complete ledger (the registry's owners map is the authority).
+adoptions, not a complete ledger (the registry's owners map is the authority). A kill between
+the command's two writes leaves an audit entry for a move that did not happen: the audit is
+written first, so the registry can still give the actor to the principal it had, and running
+the same command again appends a second identical entry. Read a `moved` entry against the
+registry.
 
 **What this section does not do.** Rule 2 binds only BOUND keys. A line with no
 `--principal`, a key bound only to projects, and a line printed by an older release all act
