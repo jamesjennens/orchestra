@@ -1455,6 +1455,110 @@ Two records can tell: the project's audit log has a `tasks.create` or
 carried an idempotency key, the project's operation journal has its row with both
 names (`principal` `user:usr_...` and an `actor` that is not that account).
 
+### Nobody approves work of their own party
+
+An installation setting, **off by default** (kittrial-5bb.199; slice 1a of
+[WEB_COORDINATOR_DESIGN.md](WEB_COORDINATOR_DESIGN.md)): `--approval-by-another-party` on
+`http_service.py` (the flag is taken whole: an abbreviation of it is refused), or
+`"approval_by_another_party": true` in the office service configuration. With it off,
+every review rule is what it was: an owner or a superuser approves any contribution, their
+own included, and a recommendation is judged by person (an account and its agents).
+
+**What changes on the day it is turned on.** One **party** is an account, every agent
+that account made, and every worker credential that account issued. From the next start:
+
+- An owner no longer approves their own contribution, their own agents' work, or work
+  delivered under a worker credential they issued, **to anybody**: the credential is of
+  their party whoever holds its secret.
+- A project with one owner who gave out its worker credentials can approve none of that
+  work. It needs somebody of another party who may approve: a second owner, or a
+  superuser who is not that owner. Where the only owner is also the only superuser (a
+  one-person installation), that second person does not exist until a second account is
+  made and named owner of the project (Accounts, then the project's Members panel). Do
+  that before turning the setting on.
+- A superuser is bound like anybody else for their own party's work, and approves
+  anybody else's as before.
+
+**The rule.**
+
+- `approve` is refused with `403`, and nothing is written, when the approver's party is
+  the party of the contribution's author or of the task's assignee. The sentence says
+  which is true:
+  - the author is of the approver's party: "This contribution was delivered by your own
+    party: you, one of your agents, or a name that a worker credential you issued holds
+    or has held.";
+  - the author's name has been held by worker credentials of more than one account, one
+    of them the approver's: "This contribution was delivered under NAME, a name that
+    worker credentials of more than one account have held. One of those accounts is
+    yours, and nothing on the record says which credential wrote it, so it counts as the
+    work of each of them.";
+  - only the assignee is of the approver's party: "This task is assigned to your own
+    party (...). Another account delivered the contribution, but nobody approves work on
+    a task their own party holds."
+
+  Each ends: "Somebody of another party who may approve here must approve it: another
+  owner of this project, or a superuser. If there is nobody else, a superuser makes a
+  second account an owner of this project (Members) and that person approves; where the
+  only owner is also the only superuser, that second account has to be made first." On
+  the task page the sentence stays in the review form until the page is left.
+- `recommend`, the review queue, My work and the brief count by the same parties, so the
+  agent of the account that issued a worker credential can no longer recommend work
+  delivered under it (with the setting off that work is nobody's, and it can). The
+  refusal of a recommendation names the worker credential as one of its reasons.
+
+**Whose party a name is.**
+
+- An account is itself; an agent is its owner.
+- A name whose first segment is an account or an agent (`ACCOUNT-ID/x`, `AGENT-ID/x`) is
+  that account's, before any credential is looked at. Only that account's own credentials
+  can write such a name: a worker credential issued with **no** name writes under its
+  issuer's account id and any label below it, and an agent's credential under the agent's.
+- Any other name written under a worker credential of the project: **every account that
+  has ever issued a credential whose name holds it** (the name, or `name/...`), working,
+  revoked or expired. No moment decides between them: the record does not say which
+  credential wrote it, and the tracker's time stamp can be a second later than this
+  service's clock, so "the credential alive at that moment" picked the wrong account
+  now and then. Counting each of them only ever refuses more.
+- So that two accounts do not come to share a name without anybody meaning it, **a name
+  has one issuer at a time**: issuing a worker credential whose name is held by a working
+  credential that another account issued in the same project (the same name, or one
+  holding the other) is `409`, "The name NAME is held by a working credential of this
+  project that another account issued (...). A name has one issuer at a time: have that
+  credential revoked first, or choose another name", whether or not anything was written
+  under it yet. The same account may issue a name it already holds: that is how it
+  replaces a credential without a gap.
+- **A writer that is no account, no agent and under no credential record is its own
+  party.** That is a name written over the host route (a lane with an SSH key): another
+  party than every web account, so whoever may approve here approves its work. This is
+  the rule, not an oversight; an installation that wants a host lane counted with a
+  person gives that person a worker credential or an agent instead.
+
+What would make this exact instead of careful: a **writer stamp on the record**, the id
+of the credential that wrote it, kept by the endpoint with the comment. It needs a field
+in the canonical contribution and claim records (a new record version, read by older
+kits as unknown), the web service handing the credential id to the endpoint with every
+write, and the endpoint refusing a stamp from a caller that is not the web service. Then
+a name would be traced to the one credential that wrote it and the "every issuer" rule
+could go. It is not in this slice.
+
+**It is a rule of the web route only.** An approval made on the host route (`endpoint.py`
+over SSH, or run on the server) is not bound by it, on or off: a party is made of web
+accounts, their agents and their worker credentials, and the host route knows none of
+them (a caller there names its own actor). For the same reason the setting is the web
+service's and not a host switch, and the endpoint's `setup-status` cannot report it.
+
+**Where it is said.** `GET /v1/projects/{id}/setup` carries
+`rules.approval_by_another_party`, and the set-up page says in one line whether the rule
+is on. The service writes one line to its log at every start, "approval by another party
+(--approval-by-another-party): on" or "off", and when that differs from the last start
+it says so and writes an audit entry `settings.approval_by_another_party` ("off -> on at
+service start"); the state file keeps what the last start had.
+
+**Going back to an older kit.** Remove `"approval_by_another_party"` from the office
+service configuration first: an office service older than this setting refuses to start
+with a key it does not know. The older web service ignores the state's record of the
+setting, and every rule is what it was.
+
 ### The merge slot is not a task
 
 Each project has one merge slot, `PROJECT-merge-slot`, an internal record. On the host it
