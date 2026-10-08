@@ -739,15 +739,15 @@ def get(rows, key, operators, current=None):
 
 def _list_item(entry, current=None):
     source = entry.get('candidate') or entry['record'] or entry['proposed'] or {}
-    item = {'key': entry['key'], 'title': (source.get('title') or '')[:TITLE_MAX], 'state': entry['state'],
+    item = {'key': entry['key'], 'title': (source.get('title') or entry.get('title') or '')[:TITLE_MAX], 'state': entry['state'],
             'owner': source.get('owner'), 'review_by': source.get('review_by') if entry['record'] else None,
             'proposed_review_by': (entry['proposed'] or {}).get('review_by'),
-            'due': 'conflicted' if entry['state'] == 'conflicted' else entry['due'], 'tags': source.get('tags') or [],
+            'due': 'conflicted' if entry['state'] == 'conflicted' else entry.get('due'), 'tags': source.get('tags') or [],
             'revision': source.get('revision'), 'native_id': entry['native_id'],
-            'acceptance_inert': entry['acceptance_inert'],
+            'acceptance_inert': entry.get('acceptance_inert', False),
             # What kind of authority the listed revision carries, and whether that revision
             # is the accepted record: a draft attestation is never shown unmarked.
-            'authority_kind': authority_kind(source), 'authority_accepted': entry['record'] is not None}
+            'authority_kind': authority_kind(source) if source else None, 'authority_accepted': entry['record'] is not None}
     note = authority_note(source or None, entry['record'] is not None, current)
     if note is not None:
         item['authority_note'] = note
@@ -758,22 +758,25 @@ def _list_item(entry, current=None):
 
 def list_entries(rows, options, operators, current=None):
     entries, incomplete = catalog(rows, operators, current)
-    good = [entry for entry in entries if entry['state'] not in ('malformed', 'unsupported')]
-    state = options.get('state') or 'all'
-    if state != 'all':
-        good = [entry for entry in good if entry['state'] == state]
+    state = options.get('state')
+    if state == 'all':
+        good = [entry for entry in entries if entry['state'] not in ('unsupported',)]
+    else:
+        good = [entry for entry in entries if entry['state'] not in ('malformed', 'unsupported')]
+        if state is not None:
+            good = [entry for entry in good if entry['state'] == state]
     if options.get('owner'):
         good = [entry for entry in good if (entry['record'] or entry['proposed'] or {}).get('owner')
                 == options['owner']]
     for tag in options.get('tags') or []:
         good = [entry for entry in good if tag in ((entry['record'] or entry['proposed'] or {}).get('tags') or [])]
     if options.get('due'):
-        good = [entry for entry in good if entry['due'] == options['due']]
+        good = [entry for entry in good if entry.get('due') == options['due']]
     if options.get('authority'):
         good = [entry for entry in good
                 if authority_kind(entry.get('candidate') or entry['record'] or entry['proposed'])
                 == options['authority']]
-    good.sort(key=lambda entry: (DUE_ORDER.get(entry['due'], 9), entry['key'] or ''))
+    good.sort(key=lambda entry: (DUE_ORDER.get(entry.get('due'), 9), entry['key'] or ''))
     offset, limit = options.get('offset', 0), options.get('limit', 20)
     page = good[offset:offset + limit]
     return {'schema_version': 1, 'total': len(good), 'items': [_list_item(entry, current) for entry in page],

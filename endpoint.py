@@ -74,7 +74,7 @@ def _native_labels(root,path,actor,task):
     p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','--actor',actor,'show',task,'--json'],env=environment(root),capture_output=True,text=True,encoding='utf-8',timeout=60)
     if p.returncode:raise ValueError('Could not read the current labels of %s before the label write, so the reserved-label guard cannot verify it: %s'%(task,(p.stderr or p.stdout).strip()))
     try:rows=json.loads(p.stdout)
-    except ValueError:raise ValueError('Could not parse the current labels of %s before the label write; refusing.'%(task,))
+    except (ValueError, RecursionError):raise ValueError('Could not parse the current labels of %s before the label write; refusing.'%(task,))
     if isinstance(rows,dict):rows=[rows]
     if not isinstance(rows,list):raise ValueError('Unexpected native read for %s; refusing the label write.'%(task,))
     matched={}
@@ -94,7 +94,7 @@ def _native_comments(root,path,actor,task):
     p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','--actor',actor,'comments',task,'--json'],env=environment(root),capture_output=True,text=True,encoding='utf-8',timeout=60)
     if p.returncode:raise ValueError('Could not read the comments of %s before the label write, so the record-anchor guard cannot verify it; refusing.'%(task,))
     try:rows=json.loads(p.stdout)
-    except ValueError:raise ValueError('Could not parse the comments of %s before the label write; refusing.'%(task,))
+    except (ValueError, RecursionError):raise ValueError('Could not parse the comments of %s before the label write; refusing.'%(task,))
     if not isinstance(rows,list):raise ValueError('Unexpected comment read for %s; refusing the label write.'%(task,))
     return rows
 
@@ -149,7 +149,7 @@ def _native_anchor_rows(root,path,actor,tokens):
                      capture_output=True,text=True,encoding='utf-8',timeout=60)
     if p.returncode:raise ValueError('Could not read %s before the status write, so the record-anchor guard cannot verify it: %s'%(', '.join(tokens),(p.stderr or p.stdout).strip()))
     try:rows=json.loads(p.stdout)
-    except ValueError:raise ValueError('Could not parse the current rows of %s before the status write; refusing.'%(', '.join(tokens),))
+    except (ValueError, RecursionError):raise ValueError('Could not parse the current rows of %s before the status write; refusing.'%(', '.join(tokens),))
     if isinstance(rows,dict):rows=[rows]
     if not isinstance(rows,list):raise ValueError('Unexpected native read for %s; refusing the status change.'%(', '.join(tokens),))
     resolved={}
@@ -648,6 +648,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
         # recorded reads as an ordinary row, exactly like one whose writer crashed.
         from reserved_comments import ANCHOR_READ_IDS_MAX, record_anchor_ids
         ids=request.get('args') or []
+        raw_rows=[]
         if (not isinstance(ids,list) or len(ids)>ANCHOR_READ_IDS_MAX or len(set(ids))!=len(ids)
                 or any(not isinstance(x,str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,160}',x) for x in ids)):
             raise ValueError('anchors takes no arguments, or at most %d distinct task ids'%ANCHOR_READ_IDS_MAX)
@@ -657,15 +658,32 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             except (ValueError,AttributeError):missing=False
             if missing:
                 # Every listed row was deleted after the list: none is an anchor.
-                rows,warnings=[],completed.stderr or ''
+                warnings=completed.stderr or ''
             else:
                 stdout,warnings=native.split(completed)
-                rows=json.loads(stdout or '[]')
-                rows=[r for r in (rows if isinstance(rows,list) else [rows]) if isinstance(r,dict) and r.get('id') in ids]
+                raw_rows=record_json.loads_array_rows(stdout or '[]')
+                unreadable=[r for r in raw_rows if isinstance(r,dict) and r.get('malformed')]
+                if unreadable:
+                    report='Unreadable issue row(s): %s' % ', '.join(
+                        '%s (%s)' % (r.get('id') or 'unknown', r.get('error') or 'malformed') for r in unreadable)
+                    warnings=(warnings + '\n' + report).strip() if warnings else report
         else:
             stdout,warnings=native.split(native.run(native.argv(root,path,actor,['export','--all']),environment(root)))
-            rows=[json.loads(line) for line in stdout.splitlines() if line.strip()]
-        return {'returncode':0,'stdout':json.dumps({'schema_version':1,'anchors':record_anchor_ids(rows)})+'\n','stderr':warnings}
+            raw_rows=record_json.loads_rows(stdout)
+            unreadable=[r for r in raw_rows if isinstance(r,dict) and r.get('malformed')]
+            if unreadable:
+                report='Unreadable issue row(s): %s' % ', '.join(
+                    '%s (%s)' % (r.get('id') or 'unknown', r.get('error') or 'malformed') for r in unreadable)
+                warnings=(warnings + '\n' + report).strip() if warnings else report
+        from reserved_comments import RECORD_ANCHOR_LABELS
+        def anchor_run(argv):
+            result,warning=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
+            if warning:anchor_warnings.append(warning)
+            return result
+        anchor_warnings=[]
+        classified=record_json.classify(raw_rows,anchor_run,sorted(RECORD_ANCHOR_LABELS)) if raw_rows else []
+        if anchor_warnings:warnings=(warnings+'\n'+'\n'.join(anchor_warnings)).strip()
+        return {'returncode':0,'stdout':json.dumps({'schema_version':1,'anchors':record_anchor_ids(classified)})+'\n','stderr':warnings}
     if action=='ref':
         # The reference catalog (.41 slice 1, kittrial-5bb.66). Reads (get, list, find, help)
         # read their own key, or the catalog in two native reads (reference_records), take no
@@ -865,8 +883,15 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             fcntl.flock(lock,fcntl.LOCK_EX)
             p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','export','--all'],env=environment(root),capture_output=True,text=True,encoding='utf-8',timeout=120)
             if p.returncode:return {'returncode':p.returncode,'stdout':p.stdout,'stderr':p.stderr}
-            rows=[json.loads(line) for line in p.stdout.splitlines() if line.strip()]
-            return {'returncode':0,'stdout':json.dumps(render(rows,path/'views',configured_operators(root),configured_verifiers(root)))+'\n','stderr':p.stderr}
+            rows=record_json.loads_rows(p.stdout)
+            from reserved_comments import RECORD_ANCHOR_LABELS
+            def refresh_run(argv):
+                stdout,warning=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
+                if warning:refresh_warnings.append(warning)
+                return stdout
+            refresh_warnings=[]
+            rows=record_json.classify(rows,refresh_run,sorted(RECORD_ANCHOR_LABELS)+['gt:slot'], ['event','gate'])
+            return {'returncode':0,'stdout':json.dumps(render(rows,path/'views',configured_operators(root),configured_verifiers(root)))+'\n','stderr':p.stderr+''.join(refresh_warnings)}
     if action!='bd':raise ValueError('Unknown action')
     args=request.get('args',[])
     if not isinstance(args,list) or not args or any(not isinstance(a,str) or '\0' in a for a in args):raise ValueError('Expected argument list')

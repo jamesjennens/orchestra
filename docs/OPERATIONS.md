@@ -1106,6 +1106,8 @@ disposition, contribution-settings and requirement-revision comments, and a life
 record stored as a state reason (which the listing command does not print, because it reads
 only comments), fail reads there too.
 
+Resetting issue metadata with `bd update ISSUE --metadata "{}"` merges into existing metadata (a no-op); clearing it requires `bd update ISSUE --unset-metadata KEY`, which removes the key and both kits recover.
+
 The kit refuses JSON nested more than 64 levels deep wherever it parses text that
 somebody else wrote: a record comment, a `--file` attachment, a payload argument, a
 request to the endpoint, an HTTP request body, a cursor. The deepest JSON the kit itself
