@@ -186,6 +186,12 @@ class InProcessSetupTests(test_http_agents.AgentHarness):
         for name in ('guidance', 'onboarding', 'backup'):
             self.assertEqual((steps[name]['state'], steps[name]['who']), ('not-applicable', 'operator'))
         self.assertEqual((answer.data['remaining'], answer.data['host']), (3, 'not-applicable'))
+        # Nobody said how this server's commands begin, so those words are named as words to replace too.
+        self.assertEqual([one['replace'] for one in steps['guidance']['commands']],
+                         [['PYTHON', 'KIT', 'RUNTIME_ROOT', 'OPERATOR', 'FILE']])
+        self.assertEqual([one['replace'] for one in steps['onboarding']['commands']], [['PYTHON', 'KIT', 'RUNTIME_ROOT', 'FILE']])
+        self.assertEqual([(one['kind'], one['text']) for one in steps['backup']['commands']],
+                         [('unit-line', 'ExecStart=PYTHON admin.py --root RUNTIME_ROOT backup --all')])
         self.assertEqual(answer.data['project'], {'id': self.project, 'name': 'Alpha', 'repository': None})
         self.assertTrue(answer.data['generated_at'])
 
