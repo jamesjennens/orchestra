@@ -6830,8 +6830,6 @@ def main(argv=None):
         trusted.append('localhost')
     service = Service(store, public_url=args.public_url, approval_by_another_party=args.approval_by_another_party)
     service.LOGINS_PER_ADDRESS = args.logins_per_address
-    for line in settings_lines(service):
-        print(line, file=sys.stderr)
     backend = build_backend(service, args)
     for line in operator_allowlist_warnings(args.root if args.backend == 'endpoint' else None):
         print(line, file=sys.stderr)
@@ -6852,6 +6850,10 @@ def main(argv=None):
               'not start. Stop that, or start this service on another port.' % (args.port, args.host),
               file=sys.stderr, flush=True)
         return EXIT_PORT_TAKEN
+    # Said once the service has its port: a start that failed says its one line and has
+    # started nothing, so it has changed no setting either.
+    for line in settings_lines(service):
+        print(line, file=sys.stderr, flush=True)
     if args.host not in LOOPBACK and not args.cert:
         print('WARNING: serving plain HTTP on %s:%d. Passwords and session cookies cross the network unencrypted. '
               'Use --cert and --key for HTTPS.' % (args.host, httpd.server_address[1]), file=sys.stderr, flush=True)
