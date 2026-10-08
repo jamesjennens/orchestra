@@ -1706,7 +1706,7 @@ class AgentSetupDialogCase(unittest.TestCase):
         # that sends a list (the page is run in tests/test_http_agents.py AgentsPageTests).
         self.assertIn('    compact ? null : scopesLine(raw),\n', self.function_body(code, 'agentCard'))
         self.assertNotIn('before this was fixed', code)
-        self.assertIn("if (agent.scopes === null) {", reissue)
+        self.assertIn('agent.scopes === null', reissue)
         self.assertIn("issueAgentCredential: (aid, scopes) => mutate('POST', `/v1/agents/${aid}/credentials`, "
                       "scopes ? { label: 'web: new secret', scopes } : { label: 'web: new secret' })",
                       (WEB / 'js' / 'api.js').read_text(encoding='utf-8'))

@@ -1873,6 +1873,7 @@ class AgentsPageTests(RenewalScopeTests):
                          {'read': False, 'tasks': False, 'checkpoints': True, 'reviews': True, 'feedback': True, 'proposals': True})
         self.assertEqual(seen['afterNarrow']['scopes'], 'read')
         self.assertEqual(seen['adminUnknown'], {'boxes': {}, 'ownerChoice': 1, 'save': False})
+        self.assertEqual(seen['adminInferredSetup'], {'needed': 1, 'issue': False})
         self.assertEqual(seen['adminUnconfirmed'], ['Dove', 'Wren'])
         self.assertFalse(seen['ownerFilter'])
         # 7. Set up folder.

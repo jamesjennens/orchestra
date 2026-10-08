@@ -122,6 +122,14 @@ async function open(ctx) { const page = await view.list(ctx); await settle(); re
   out.adminUnknown = { boxes: seen(page, 'Dove').boxes,
     ownerChoice: unknown.all((e) => e.attributes['data-owner-choice']).length,
     save: Boolean(button(unknown, 'Save and issue a new secret')) };
+  await button(block(page, 'Wren'), 'Set up folder').dispatch('click');
+  await settle();
+  const inferredDialog = dialogs().slice(-1)[0];
+  out.adminInferredSetup = {
+    needed: inferredDialog.all((e) => e.attributes['data-scopes-needed']).length,
+    issue: Boolean(button(inferredDialog, 'Issue a new secret')),
+  };
+  await closeDialogs();
   const filter = page.all((e) => e.attributes['data-filter'] === 'unconfirmed-scopes')[0];
   filter.checked = true;
   await filter.dispatch('change');
