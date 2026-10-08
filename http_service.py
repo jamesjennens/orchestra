@@ -3617,7 +3617,14 @@ class ApiHandler(BaseHTTPRequestHandler):
                  'credential you issued). Another owner of this project, or a superuser who did not deliver it, '
                  'must approve it.')
 
-    def _independent(self, actors, parties, project=None, at=None):
+    #: The same, said to an agent that holds the coordinator grant (kittrial-5bb.209): it is judged by
+    #: party whatever the installation's setting says.
+    OWN_PARTY_AGENT = ('This contribution was delivered by this agent\'s own account (its owner, one of that '
+                       'account\'s agents, or a worker credential it issued). An agent never approves work of its own '
+                       'account: another coordinator or owner of this project, or a superuser who did not deliver it, '
+                       'must approve it.')
+
+    def _independent(self, actors, parties, project=None, at=None, full=False):
         """The ``actors`` who are a different PERSON from every one of ``parties``.
 
         The canonical rule compares actor names, and a person and their agents are
@@ -3630,9 +3637,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         taken = set()
         for party in parties:
             if isinstance(party, str) and party:
-                taken |= self.service.actor_parties(party, project, at)
+                taken |= self.service.actor_parties(party, project, at, full)
         return [actor for actor in actors
-                if isinstance(actor, str) and not (self.service.actor_parties(actor, project) & taken)]
+                if isinstance(actor, str) and not (self.service.actor_parties(actor, project, None, full) & taken)]
 
     @staticmethod
     def _read_parties(assignee, author):
@@ -4833,6 +4840,28 @@ class ApiHandler(BaseHTTPRequestHandler):
         return 200, {'project': ctx.params['pid'], 'agent': agent,
                      'generated_at': now_iso(self.service._now())}
 
+    @route('PUT', r'/v1/projects/(?P<pid>' + ID + r')/agents/(?P<aid>' + ID + r')/coordinator')
+    def project_agent_coordinator_grant(self, ctx):
+        """Let this agent act as coordinator in this project (kittrial-5bb.209). An owner of the
+        project or a superuser; the body is empty. Answers the project's view of the agent."""
+        refuse_unknown_fields(dict(ctx.payload or {}), (), 'A coordinator grant')
+
+        def grant():
+            result = self.service.grant_coordinator(ctx.principal, ctx.params['pid'], ctx.params['aid'],
+                                                    request_id=ctx.request_id)
+            return result, result
+        return self._mutate(ctx, 'agents.coordinator.grant', ctx.params['pid'], grant,
+                            capability=CAP_PROJECT_ADMIN, reason='agent %s' % ctx.params['aid'])
+
+    @route('DELETE', r'/v1/projects/(?P<pid>' + ID + r')/agents/(?P<aid>' + ID + r')/coordinator')
+    def project_agent_coordinator_revoke(self, ctx):
+        def revoke():
+            result = self.service.revoke_coordinator(ctx.principal, ctx.params['pid'], ctx.params['aid'],
+                                                     request_id=ctx.request_id)
+            return result, result
+        return self._mutate(ctx, 'agents.coordinator.revoke', ctx.params['pid'], revoke,
+                            capability=CAP_PROJECT_ADMIN, reason='agent %s' % ctx.params['aid'])
+
     @route('DELETE', r'/v1/projects/(?P<pid>' + ID + r')/agents/(?P<aid>' + ID + r')')
     def project_agent_revoke(self, ctx):
         def revoke():
@@ -4917,7 +4946,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         agent_id = agent.get('id')
         actor = agent.get('actor') or agent_id
         may_review, owner_approves = self.service.agent_review_standing(agent_id, project_id)
-        if not may_review:
+        approves = self.service.agent_approves(agent_id, project_id)
+        if not may_review and not approves:
             return []
         actions = []
         for row in rows:
@@ -4926,7 +4956,17 @@ class ApiHandler(BaseHTTPRequestHandler):
             if not self._independent([actor], [row.get('assignee'), row.get('contribution_author')], project_id):
                 continue
             recommended_by = [name for name in row.get('recommended_by') or [] if isinstance(name, str)]
-            if recommended_by and owner_approves:
+            if approves:
+                # It holds the coordinator grant here (kittrial-5bb.209): the decision is its own. It is
+                # never shown its own party's work for it: that approval would be refused.
+                if not self._independent([actor], [row.get('assignee'), row.get('contribution_author')], project_id, None, True):
+                    continue
+                kind, count, who = 'to-review', 'to_review', 'agent'
+                reason = (('A reviewer recommends approving this contribution. ' if recommended_by else
+                           'A contribution by another account awaits review. ')
+                          + 'You hold the coordinator grant in this project: review it, then approve it or request '
+                            'changes.')
+            elif recommended_by and owner_approves:
                 kind, count, who = 'review-recommended', 'review_recommended', 'owner'
                 reason = ('A reviewer recommends approving this contribution. Tell your owner it is ready to '
                           'approve; an agent cannot approve.')
@@ -5845,15 +5885,17 @@ class ApiHandler(BaseHTTPRequestHandler):
     def reviews_add(self, ctx):
         payload = self._task_payload(ctx)
         payload.setdefault('schema_version', 1)
-        # Approval is an owner action; the contributor who delivered the work can
-        # contribute or request changes, never approve. A worker credential can never
-        # approve at all.
+        # Approval is an owner's or a coordinator's action; the contributor who delivered the
+        # work can contribute or request changes, never approve. A worker credential can never
+        # approve at all; a personal agent can where it holds the project's coordinator grant
+        # (kittrial-5bb.209), and is then judged by party below whatever the setting says.
         capability = CAP_APPROVE if payload.get('operation') == 'approve' else CAP_REVIEWS
         self._project(ctx, capability)
         recommending = payload.get('operation') == 'recommend'
         # With the installation's setting on, an approval is judged by whose work it is, which
         # needs the same read a recommendation makes (kittrial-5bb.199). Off: no read, no rule.
-        judged = payload.get('operation') == 'approve' and self.service.approval_by_another_party
+        by_agent = ctx.principal.via == 'credential'
+        judged = payload.get('operation') == 'approve' and (self.service.approval_by_another_party or by_agent)
         current = None
         if recommending or judged:
             # A field this kit does not know is refused, not dropped, by the one rule for
@@ -5907,9 +5949,9 @@ class ApiHandler(BaseHTTPRequestHandler):
                 # superuser is bound like anybody else for their own party's work.
                 parties = [(current.get('task') or {}).get('assignee'), delivered.get('author')]
                 actor = payload.get('actor') or ctx.principal.actor or ctx.principal.user_id
-                if not self._independent([actor], parties, pid, delivered.get('at')) or \
-                        not self._independent([ctx.principal.user_id], parties, pid, delivered.get('at')):
-                    raise forbidden(self.OWN_PARTY)
+                if not self._independent([actor], parties, pid, delivered.get('at'), by_agent) or \
+                        not self._independent([ctx.principal.user_id], parties, pid, delivered.get('at'), by_agent):
+                    raise forbidden(self.OWN_PARTY_AGENT if by_agent else self.OWN_PARTY)
             if recommending:
                 # Independence by PERSON, which only the web service can know; the
                 # canonical write then applies the name rule and every other rule.
