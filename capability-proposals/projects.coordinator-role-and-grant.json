@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "operation_id": "capnew-6a1f0c9d2b7e4f35a8c4d1e09b3f7a62",
+  "key": "projects.coordinator-role-and-grant",
+  "name": "A coordinator role, and a per-project grant that lets a personal agent approve",
+  "aliases": [
+    "coordinator role",
+    "coordinator grant",
+    "agent approves",
+    "make coordinator",
+    "agents.coordinator.grant",
+    "web coordinator slice 1b",
+    "coordinate capability"
+  ],
+  "summary": "A project role coordinator between contributor and owner: it approves contributions and triages proposals like an owner and holds the capability coordinate (no route asks for it yet); members, worker credentials, archive and the audit stay the owner's. And a grant kept with the project: PUT or DELETE /v1/projects/{id}/agents/{agent}/coordinator, by an owner of that project or a superuser, signed in. The agent must be a personal agent that works in the project and enabled, and its own account must be a coordinator or an owner there (else 409, nothing written). The grant adds reviews.approve and coordinate to the agent's credentials in that project only, while its account holds them; nothing else a credential is denied opens, proposal triage included. A granted agent never approves work of its own party (its account, that account's agents, the worker credentials it issued) whatever the approval_by_another_party setting says. Read from the present state on every request: removing the grant, lowering the account's role, taking the agent out of the project or disabling it ends it at the next request. The project's agent list carries coordinator, and the settings page gives and removes the grant.",
+  "requirements": [],
+  "anchors": [
+    "docs/HTTP_DEPLOYMENT.md#coordinators-a-role-and-a-grant-that-lets-an-agent-approve"
+  ],
+  "code": [
+    "http_authority.py::coordinator_grant",
+    "http_authority.py::coordinator_grant_capabilities",
+    "http_authority.py::credential_capabilities",
+    "http_auth.py::Service.grant_coordinator",
+    "http_auth.py::Service.revoke_coordinator",
+    "http_auth.py::Service.agent_approves",
+    "http_auth.py::Service.actor_parties",
+    "http_service.py::ApiHandler.project_agent_coordinator_grant",
+    "http_service.py::ApiHandler.project_agent_coordinator_revoke",
+    "http_service.py::ApiHandler.reviews_add"
+  ],
+  "tests": [
+    "tests/test_coordinator_grant.py",
+    "tests/test_coordinator_grant_real.py"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "reviews",
+    "http",
+    "identity"
+  ]
+}
