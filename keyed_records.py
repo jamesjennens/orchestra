@@ -36,6 +36,7 @@ import json
 import time
 from pathlib import Path
 
+import record_json
 from coordination import atomic, identifier
 from recovery import configured_operators
 from requirements import ACCEPTANCE_FIELDS, SHA256_TEXT, content_hash, load_json
@@ -225,7 +226,7 @@ def apply_controlled_labels(run, task, current, spec, desired):
 
 
 def read_rows(run):
-    return [json.loads(line) for line in run(['export', '--all']).splitlines() if line.strip()]
+    return record_json.loads_rows(run(['export', '--all']))
 
 
 def find(rows, task):
@@ -471,6 +472,9 @@ def apply_native(payload, actor, run, project, spec, operator=False, operators=N
             raise ValueError('Recorded native %s record %s is not visible; outcome uncertain. '
                              'Operator must reconcile this operation ID.' % (spec.noun, task))
         raise ValueError('Unknown %s record: %s' % (spec.noun, task))
+    if row.get('malformed'):
+        raise ValueError('%s record %s exists but cannot be read; operator repair required'
+                         % (spec.noun.capitalize(), task))
     existing = spec.existing_revisions(row)
     if not created:
         spec.require_selectable(row, payload, operator, existing)

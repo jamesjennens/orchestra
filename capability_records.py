@@ -53,6 +53,7 @@ import unicodedata
 import capability_verification as verification
 import keyed_entries
 import keyed_records as core
+import record_json
 from capabilities import normalized as normalize, safe_relpath, split_pointer, stems, words
 from coordination import atomic, identifier
 from export_requirements import parse_json
@@ -645,21 +646,22 @@ def read_catalog(run):
     `list` and `find` reach the same verdict as `get`, which reads lifecycle facts
     without this split (kittrial-5bb.69 re-review, P3).
     """
-    listed = json.loads(run(['list', '--label', TYPE_LABEL, '--all', '--limit', '0', '--json']) or '[]')
-    ids = [row['id'] for row in listed or [] if isinstance(row, dict) and isinstance(row.get('id'), str)]
+    listed = record_json.loads_array_rows(run(['list', '--label', TYPE_LABEL, '--all', '--limit', '0', '--json']) or '[]')
+    ids = record_json.ids_from_native(listed)
     if len(ids) <= keyed_entries.CATALOG_SHOW_MAX:
-        return KIND.shown(run, ids), None
+        return record_json.mark_selected(KIND.shown(run, ids), set(ids), [TYPE_LABEL]), None
     wanted = set(ids)
     rows, lifecycle = [], []
     for line in run(['export', '--all']).splitlines():
         if not line.strip():
             continue
-        row = json.loads(line)
+        row = record_json.loads_row(line)
         if isinstance(row, dict) and row.get('id') in wanted:
             rows.append(row)
-        if verification.is_lifecycle_row(row):
+        if row.get('malformed') or verification.is_lifecycle_row(row):
             lifecycle.append(row)
-    return rows, lifecycle
+    lifecycle=record_json.classify(lifecycle,run,types=['event'])
+    return record_json.mark_selected(rows, wanted, [TYPE_LABEL]), [r for r in lifecycle if verification.is_lifecycle_row(r)]
 
 
 class Trust:
@@ -738,12 +740,12 @@ def get(rows, key, operators, trust=None):
 
 def _list_item(entry, trust=None, pointers=False):
     source = entry.get('candidate') or entry['record'] or entry['proposed'] or {}
-    item = {'key': entry['key'], 'name': (source.get('name') or '')[:NAME_MAX], 'state': entry['state'],
+    item = {'key': entry['key'], 'name': (source.get('name') or entry.get('name') or '')[:NAME_MAX], 'state': entry['state'],
             'trust': 'conflicted' if entry['state'] == 'conflicted' else 'accepted' if entry['record'] else 'draft',
             'owner': source.get('owner'),
             'tags': source.get('tags') or [], 'revision': source.get('revision'), 'native_id': entry['native_id'],
-            'aliases_pending': len(entry['aliases_pending']), 'acceptance_inert': entry['acceptance_inert'],
-            'verification': 'conflicted' if entry['state'] == 'conflicted' else verification_of(entry, trust)['state']}
+            'aliases_pending': len(entry.get('aliases_pending') or ()), 'acceptance_inert': entry.get('acceptance_inert', False),
+            'verification': 'conflicted' if entry['state'] == 'conflicted' else verification_of(entry, trust)['state'] if entry['state'] != 'malformed' else None}
     if entry['state'] == 'conflicted':
         item['anchor_trust'] = entry['anchor_trust']
     if pointers:
@@ -756,10 +758,13 @@ def _list_item(entry, trust=None, pointers=False):
 
 def list_entries(rows, options, operators, trust=None):
     entries, incomplete = catalog(rows, operators)
-    good = [entry for entry in entries if entry['state'] not in ('malformed', 'unsupported')]
-    state = options.get('state') or 'all'
-    if state != 'all':
-        good = [entry for entry in good if entry['state'] == state]
+    state = options.get('state')
+    if state == 'all':
+        good = [entry for entry in entries if entry['state'] not in ('unsupported',)]
+    else:
+        good = [entry for entry in entries if entry['state'] not in ('malformed', 'unsupported')]
+        if state is not None:
+            good = [entry for entry in good if entry['state'] == state]
     if options.get('owner'):
         good = [entry for entry in good if (_newest(entry) or {}).get('owner') == options['owner']]
     for tag in options.get('tags') or []:
