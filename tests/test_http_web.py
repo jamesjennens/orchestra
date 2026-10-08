@@ -1695,9 +1695,23 @@ class AgentSetupDialogCase(unittest.TestCase):
         uses = [line.strip() for line in reissue.splitlines()
                 if re.search(r'\bsecret\b', self.unquoted(line))]
         self.assertEqual(['if (!credential.secret) {',
-                          "section.replaceChildren(secretSection(credential.secret, "
-                          "'New secret (shown once)', payload), olderCredentials(ctx, agent, credential.id));"],
+                          "section.replaceChildren(secretSection(credential.secret, 'New secret (shown once)', payload),"],
                          uses)
+        # What the new credential carries is shown with it, and the confirmation says what a renewal keeps
+        # (kittrial-5bb.208: the page sends no scope list, and the server used to answer the default four).
+        self.assertIn("'data-scopes': (credential.scopes || []).join(' ')", reissue)
+        self.assertIn("'This credential carries' + (scopeList(credential.scopes) || ': nothing beyond reading') + '.'", reissue)
+        self.assertIn('It carries what the agent has now${scopeList(agent.scopes)}.', reissue)
+        # What the agent may do is on its card, and "What it may do" on the Agents page is the one place
+        # that sends a list (the page is run in tests/test_http_agents.py AgentsPageTests).
+        self.assertIn('    compact ? null : scopesLine(raw),\n', self.function_body(code, 'agentCard'))
+        self.assertNotIn('before this was fixed', code)
+        self.assertIn("if (agent.scopes === null) {", reissue)
+        self.assertIn("issueAgentCredential: (aid, scopes) => mutate('POST', `/v1/agents/${aid}/credentials`, "
+                      "scopes ? { label: 'web: new secret', scopes } : { label: 'web: new secret' })",
+                      (WEB / 'js' / 'api.js').read_text(encoding='utf-8'))
+        self.assertEqual(code.count('ctx.api.issueAgentCredential('), 2)
+        self.assertIn('ctx.api.issueAgentCredential(agent.id, chosen)', code)
         # Without a fresh secret the steps show the placeholder line only.
         self.assertIn('secretSteps(payload, setupText.headerLine(), { withSecret: false })', reissue)
         older = self.function_body(code, 'olderCredentials')

@@ -96,6 +96,10 @@ AGENT_DIRECTORY_MAX = 512
 AGENT_PROJECTS_MAX = 64
 AGENT_MAX_PER_OWNER = 100
 AGENT_MAX_CREDENTIALS = 20
+#: How many credentials that no longer work (revoked or expired) are kept per agent, the newest
+#: ones, as the short history its card shows. Older ones are deleted from the state: the issue and
+#: the revocation of every credential stay in the audit log (kittrial-5bb.208).
+AGENT_DEAD_CREDENTIALS_KEPT = 5
 AGENT_DEFAULT_SCOPES = ('tasks', 'checkpoints', 'reviews', 'feedback')
 AGENT_CONFIG_PATH = '.orchestra/agent.json'
 AGENT_SECRET_ENV = 'ORCHESTRA_AGENT_SECRET'
@@ -2466,14 +2470,96 @@ class Service:
         return [c for c in self.state['credentials'].values()
                 if c.get('agent_id') == agent['id']]
 
+    def _credential_live(self, credential, moment=None):
+        """Whether a credential still works: not revoked, and not expired on either clock."""
+        moment = self._expiry_now() if moment is None else moment
+        return not credential.get('revoked') and not self._expired(
+            moment, expires_at=credential.get('expires_at'), issued_raw=credential.get('issued_raw'),
+            lifetime=self.credential_ttl)
+
+    def _scope_names(self, scopes):
+        """A caller's list of scopes as a tuple in the order given, or None when none was sent.
+
+        Anything that is not a list of known scope names is refused: a number or ``true`` used
+        to answer 500, an object was read as its keys. A name given twice counts once.
+        """
+        if scopes is None or (isinstance(scopes, (list, tuple)) and not scopes):
+            return None
+        if not isinstance(scopes, (list, tuple)):
+            raise invalid('scopes must be a list of scope names')
+        names = []
+        for scope in scopes:
+            if not isinstance(scope, str) or scope not in CREDENTIAL_SCOPES:
+                raise invalid('Unknown credential scope %r' % (scope,))
+            if scope not in names:
+                names.append(scope)
+        return tuple(names)
+
+    def agent_scopes(self, agent):
+        """What an agent may do, and where that is known from: ``(scopes, source)``.
+
+        ``set``: the list on the agent record, written when the agent is made and by a renewal
+        that sends a list. Once it is there no credential decides anything, working or dead
+        (kittrial-5bb.208 review: a revoked credential that was wider used to seed the next
+        renewal, so two requests got round the refusal to widen).
+
+        An agent made before the record kept them has none. ``inferred``: its working
+        credentials all carry the same list, and that is it; it is written to the record by
+        the first renewal, not by a read. ``unknown`` (scopes None): none of its credentials
+        works, or they do not carry the same, which is what an agent looks like that was
+        renewed from the page before this was fixed. Nothing is guessed then: never the
+        default four, never a credential that no longer works.
+        """
+        stored = agent.get('scopes')
+        if isinstance(stored, list):
+            return (tuple(scope for scope in stored if scope in CREDENTIAL_SCOPES),
+                    'inferred' if agent.get('scopes_source') == 'inferred' else 'set')
+        moment = self._expiry_now()
+        lists = {tuple(scope for scope in CREDENTIAL_SCOPES if scope in (credential.get('scopes') or ()))
+                 for credential in self._agent_credentials(agent) if self._credential_live(credential, moment)}
+        if len(lists) == 1:
+            return next(iter(lists)), 'inferred'
+        return None, 'unknown'
+
     def _revoke_agent_credentials(self, agent):
         for credential in self._agent_credentials(agent):
             credential['revoked'] = True
+        self._prune_agent_credentials(agent)
+
+    @staticmethod
+    def _credential_age(credential):
+        return (credential.get('issued_raw') or 0, credential.get('created_at') or '', credential.get('id') or '')
+
+    def _prune_agent_credentials(self, agent):
+        """Delete all but the newest few credentials of the agent that no longer work.
+
+        Caller holds ``store.lock`` and saves. Without it the state grew by a record for every
+        renewal for good, and every read of the agent carried them all (kittrial-5bb.208
+        review). What goes is the record (label, scopes, when made and last used); that it was
+        issued and revoked, by whom and when, stays in the audit log.
+        """
+        moment = self._expiry_now()
+        dead = sorted((c for c in self._agent_credentials(agent) if not self._credential_live(c, moment)),
+                      key=self._credential_age)
+        for credential in dead[:max(0, len(dead) - AGENT_DEAD_CREDENTIALS_KEPT)]:
+            self.state['credentials'].pop(credential['id'], None)
+            self.state['credential_tokens'].pop(credential.get('token_hash'), None)
+
+    def _agent_credentials_shown(self, agent):
+        """What an agent read carries: bounded whether or not anything was pruned yet (a
+        credential also stops working by expiry, with no write)."""
+        moment = self._expiry_now()
+        rows = sorted(self._agent_credentials(agent), key=self._credential_age)
+        live = [c for c in rows if self._credential_live(c, moment)]
+        dead = [c for c in rows if not self._credential_live(c, moment)][-AGENT_DEAD_CREDENTIALS_KEPT:]
+        shown = sorted(live + dead, key=self._credential_age)
+        return [dict(self.credential_view(c), working=self._credential_live(c, moment)) for c in shown]
 
     def agent_view(self, agent, principal):
         """The owner-visible agent record. The path never leaks to anyone else."""
         owner_sees_path = bool(principal.superuser or
                                principal.user_id == agent['owner'])
+        scopes, source = self.agent_scopes(agent)
         view = {
             'id': agent['id'], 'name': agent['name'], 'owner': agent['owner'],
             'owner_display_name': self._owner_name(agent['owner']),
@@ -2483,7 +2569,21 @@ class Service:
             'projects': list(agent.get('projects') or []),
             'created_at': agent.get('created_at'),
             'last_seen_at': agent.get('last_seen_at'),
-            'credentials': [self.credential_view(c) for c in self._agent_credentials(agent)],
+            # Every credential that works (at most AGENT_MAX_CREDENTIALS) and the newest few that
+            # do not; ``working`` says which is which (an expired one is not ``revoked``).
+            'credentials': self._agent_credentials_shown(agent),
+            # What the agent may do, which is what a new credential for it carries when no list
+            # is sent (kittrial-5bb.208); null when nothing says. ``scopes_source``: ``set`` (kept on
+            # the agent record: given when it was made or by a renewal that sent a list),
+            # ``inferred`` (an agent made before the record kept them: read from its working
+            # credentials, which all carry the same) or ``unknown``.
+            'scopes': None if scopes is None else list(scopes),
+            'scopes_source': source,
+            # The different scope lists its WORKING credentials carry, when they do not all carry
+            # the same; else []. A read for whoever reads the agent record: its account, a
+            # superuser, and the agent itself on /v1/agents/me. It says only that they differ:
+            # an account may have narrowed its agent on purpose and left the older credential.
+            'scopes_differ': self.agent_scope_differences(agent),
         }
         if owner_sees_path:
             view['working_directory'] = agent.get('working_directory')
@@ -2653,15 +2753,50 @@ class Service:
                         % (secret_file['windows'], secret_file['posix'], AGENT_SECRET_ENV),
         }
 
+    def agent_scope_differences(self, agent):
+        """The distinct scope lists of an agent's working credentials, when there is more than one."""
+        moment = self._expiry_now()
+        lists = {tuple(scope for scope in CREDENTIAL_SCOPES if scope in (credential.get('scopes') or ()))
+                 for credential in self._agent_credentials(agent) if self._credential_live(credential, moment)}
+        return [list(item) for item in sorted(lists)] if len(lists) > 1 else []
+
+    #: Said when nothing says what the agent may do. The page then asks its account to choose.
+    SCOPES_NEEDED = ('Nothing says what this agent may do: its record holds no scopes, and its credentials '
+                     'that still work do not say (there is none, or they do not all allow the same). Send the '
+                     'scopes it should have, for example "scopes": ["read"] for an agent that only reads')
+
     def _issue_agent_credential_locked(self, principal, agent, scopes=None, label=None):
-        """Create one agent credential. Caller holds ``store.lock`` and has authorized."""
-        requested = tuple(scopes or AGENT_DEFAULT_SCOPES)
-        for scope in requested:
-            if scope not in CREDENTIAL_SCOPES:
-                raise invalid('Unknown credential scope %r' % (scope,))
-        if len(self._agent_credentials(agent)) >= AGENT_MAX_CREDENTIALS:
-            raise conflict('An agent may hold at most %d credentials'
+        """Create one agent credential. Caller holds ``store.lock`` and has authorized.
+
+        With no list it carries exactly what the agent has (:meth:`agent_scopes`), and where
+        nothing says what that is, it is refused with a sentence that asks for the list. A
+        list sets what the agent has from now on: taken from anybody who may renew the agent
+        when it asks for nothing more, and from the agent's own account alone when it widens
+        (the one caller who could have made the agent with those scopes). Nothing is changed
+        by a request that is refused.
+        """
+        requested = self._scope_names(scopes)
+        has, _ = self.agent_scopes(agent)
+        if requested is None:
+            if has is None:
+                raise conflict(self.SCOPES_NEEDED, {'scopes_needed': True})
+        else:
+            more = [scope for scope in CREDENTIAL_SCOPES if scope in requested and scope not in (has or ())]
+            if more and principal.user_id != agent['owner']:
+                raise forbidden('This agent has %s. Only its own account may give it more (asked for beyond that: %s)'
+                                % (', '.join(has) if has else 'no scopes on record', ', '.join(more)))
+        # Twenty that still work. A revoked or expired credential is not counted: counted,
+        # the twentieth renewal of an agent was refused for good.
+        moment = self._expiry_now()
+        if sum(1 for credential in self._agent_credentials(agent)
+               if self._credential_live(credential, moment)) >= AGENT_MAX_CREDENTIALS:
+            raise conflict('An agent may hold at most %d credentials that still work; revoke one first'
                            % AGENT_MAX_CREDENTIALS)
+        if requested is not None:
+            agent['scopes'], agent['scopes_source'] = list(requested), 'set'
+        elif not isinstance(agent.get('scopes'), list):
+            agent['scopes'], agent['scopes_source'] = list(has), 'inferred'
+        requested = tuple(agent['scopes'])
         secret = new_token()
         moment = self._expiry_now()
         credential = {
@@ -2681,6 +2816,7 @@ class Service:
         }
         self.state['credentials'][credential['id']] = credential
         self.state['credential_tokens'][token_hash(secret)] = credential['id']
+        self._prune_agent_credentials(agent)
         return credential, secret
 
     def create_agent(self, principal, *, name, tool=None, working_directory=None,
@@ -2703,6 +2839,9 @@ class Service:
                 raise conflict('At most %d agents per account' % AGENT_MAX_PER_OWNER)
             self._check_agent_file_name(principal.user_id, clean_name)
             granted = self._agent_projects(principal, projects)
+            # What the agent may do is kept on its record from here on (kittrial-5bb.208): the
+            # list asked for, or the default. Judged before anything is written.
+            made_with = self._scope_names(scopes) or tuple(AGENT_DEFAULT_SCOPES)
             agent_id = 'agent_' + secrets.token_hex(8)
             agent = {
                 'id': agent_id, 'name': clean_name, 'owner': principal.user_id,
@@ -2710,10 +2849,10 @@ class Service:
                 'machine': machine, 'notes': notes, 'enabled': True,
                 'projects': granted, 'created_at': now_iso(self._now()),
                 'last_seen_at': None,
+                'scopes': list(made_with), 'scopes_source': 'set',
             }
             self.state['agents'][agent_id] = agent
-            credential, secret = self._issue_agent_credential_locked(principal, agent,
-                                                                     scopes=scopes)
+            credential, secret = self._issue_agent_credential_locked(principal, agent)
             self.store.save()
             # The one-time secret travels only in this response.
             public = {
@@ -2837,6 +2976,7 @@ class Service:
                     credential.get('agent_id') != agent['id']:
                 raise not_found('Credential not found')
             credential['revoked'] = True
+            self._prune_agent_credentials(agent)
             self.store.save()
         return {'id': credential_id, 'agent': agent['id'], 'revoked': True}
 
