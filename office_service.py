@@ -53,7 +53,8 @@ def service_config(path):
     if config.get('schema_version') != 1:
         raise ValueError('Office service configuration must have schema_version 1')
     allowed = {'schema_version', 'http_host', 'http_state', 'cert', 'key',
-               'trusted_proxies', 'public_url', 'endpoint_timeout', 'connections_per_address', 'logins_per_address', PLAINTEXT_SETTING}
+               'trusted_proxies', 'public_url', 'endpoint_timeout', 'connections_per_address', 'logins_per_address',
+               'approval_by_another_party', PLAINTEXT_SETTING}
     if set(config) - allowed:
         raise ValueError('Unknown office service setting: ' + ', '.join(sorted(set(config)-allowed)))
     if bool(config.get('cert')) != bool(config.get('key')):
@@ -61,6 +62,8 @@ def service_config(path):
     host = config.get('http_host', '127.0.0.1')
     if not isinstance(host, str) or not HOST.fullmatch(host):
         raise ValueError('http_host must be a host name or an address')
+    if not isinstance(config.get('approval_by_another_party', False), bool):
+        raise ValueError('approval_by_another_party must be true or false')
     plain = config.get(PLAINTEXT_SETTING, False)
     if not isinstance(plain, bool):
         raise ValueError(PLAINTEXT_SETTING + ' must be true or false')
@@ -332,6 +335,8 @@ def web_command(settings, root, port, release_python, release_script):
         command.extend(['--connections-per-address', settings['connections_per_address']])
     if 'logins_per_address' in settings:
         command.extend(['--logins-per-address', settings['logins_per_address']])
+    if settings.get('approval_by_another_party') is True:
+        command.append('--approval-by-another-party')
     return command
 
 

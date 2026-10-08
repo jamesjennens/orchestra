@@ -898,8 +898,13 @@ class Service:
                  idempotency_ttl=IDEMPOTENCY_TTL_SECONDS,
                  result_retention=RESULT_RETENTION_SECONDS,
                  login_max_attempts=LOGIN_MAX_ATTEMPTS, public_url=None,
-                 lookup_max=LOOKUP_MAX_PER_WINDOW, lookup_window=LOOKUP_WINDOW_SECONDS):
+                 lookup_max=LOOKUP_MAX_PER_WINDOW, lookup_window=LOOKUP_WINDOW_SECONDS,
+                 approval_by_another_party=False):
         self.store = store
+        #: The installation's setting "nobody approves work of their own party" (slice 1a of
+        #: docs/WEB_COORDINATOR_DESIGN.md, kittrial-5bb.199). OFF unless the operator turns it
+        #: on: with it off every review rule is exactly what it was.
+        self.approval_by_another_party = approval_by_another_party is True
         self.session_idle = session_idle
         self.session_absolute = session_absolute
         self.credential_ttl = credential_ttl
@@ -2237,6 +2242,56 @@ class Service:
             if isinstance(agent, dict) and agent.get('owner'):
                 return agent['owner']
         return actor
+
+    def actor_parties(self, actor, project_id=None, at=None):
+        """The accounts a task actor's work belongs to: its PARTY, as a set.
+
+        With the setting off this is ``{actor_person(actor)}`` and nothing else, so every rule
+        that asks it answers as before. With it on, one party is an account, every agent that
+        account made, and every worker credential that account issued (kittrial-5bb.199):
+
+        * an agent: its owner; an account: itself;
+        * a name written under a WORKER CREDENTIAL: the account that issued that credential.
+          It is traced by the credential, not by the name: the worker credentials (of
+          ``project_id`` when given) whose actor namespace holds the name. Where credentials of
+          more than one issuer have held the name, the one whose life covers ``at`` (the moment
+          the work was written) decides; when that cannot be decided, every such issuer is
+          the work's party, which only ever refuses more;
+        * anything else: the name itself.
+        """
+        person = self.actor_person(actor)
+        if not self.approval_by_another_party or not isinstance(actor, str) or not actor:
+            return {person}
+        with self.store.lock:
+            if actor in self.state['agents'] or actor in self.state['users']:
+                return {person}
+            held = []
+            for credential in self.state['credentials'].values():
+                if not isinstance(credential, dict) or credential.get('agent_id') or not credential.get('project_id'):
+                    continue
+                if project_id is not None and credential['project_id'] != project_id:
+                    continue
+                namespace = credential.get('actor')
+                if not isinstance(namespace, str) or not namespace:
+                    continue                      # it writes under its issuer's own account name
+                if actor == namespace or actor.startswith(namespace.rstrip('/') + '/'):
+                    held.append(credential)
+            if not held:
+                return {person}
+            issuers = {credential['user_id'] for credential in held}
+            if len(issuers) > 1 and isinstance(at, str) and at:
+                def ended(credential):
+                    if credential.get('revoked_at'):
+                        return str(credential['revoked_at'])
+                    try:
+                        return now_iso(credential['expires_at'])
+                    except (OSError, OverflowError, ValueError, TypeError):
+                        return '9999'             # a time this platform cannot write: it has not ended
+                living = {credential['user_id'] for credential in held
+                          if str(credential.get('created_at') or '') <= at <= ended(credential)}
+                if len(living) == 1:
+                    return living
+            return issuers
 
     def username_of(self, user_id):
         """The account's username, read under the store lock (``None`` if unknown)."""

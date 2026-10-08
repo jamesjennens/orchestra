@@ -1431,6 +1431,39 @@ Two records can tell: the project's audit log has a `tasks.create` or
 carried an idempotency key, the project's operation journal has its row with both
 names (`principal` `user:usr_...` and an `actor` that is not that account).
 
+### Nobody approves work of their own party
+
+An installation setting, **off by default** (kittrial-5bb.199; slice 1a of
+[WEB_COORDINATOR_DESIGN.md](WEB_COORDINATOR_DESIGN.md)): `--approval-by-another-party` on
+`http_service.py`, or `"approval_by_another_party": true` in the office service
+configuration. With it off, every review rule is what it was: an owner or a superuser
+approves any contribution, their own included, and a recommendation is judged by person
+(an account and its agents).
+
+With it on, one **party** is an account, every agent that account made, and every worker
+credential that account issued, and:
+
+- `approve` is refused with `403` when the approver's party is the party of the
+  contribution's author or of the task's assignee: "This contribution was delivered by
+  your own account (you, one of your agents, or a worker credential you issued). Another
+  owner of this project, or a superuser who did not deliver it, must approve it." Nothing
+  is written. A superuser is bound like anybody else for their own party's work, and
+  approves anybody else's as before.
+- `recommend`, the review queue, My work and the brief count by the same parties, so the
+  agent of the account that issued a worker credential can no longer recommend work
+  delivered under it (with the setting off that work is nobody's, and it can).
+- Work under a worker credential is traced by the credential, not by the name: the worker
+  credentials of the project whose actor namespace holds the name (the name, or
+  `name/...`); a credential issued with no name writes under its issuer's account
+  already. Where two issuers have held one name over time, the credential whose life
+  covers the moment the contribution was written decides; when that cannot be decided,
+  both issuers count as the work's party.
+
+`GET /v1/projects/{id}/setup` carries `rules.approval_by_another_party`, and the set-up
+page says in one line whether the rule is on. A project with one account that both
+delivers and approves needs a second owner, or a superuser who did not deliver, once it
+is on.
+
 ### The merge slot is not a task
 
 Each project has one merge slot, `PROJECT-merge-slot`, an internal record. On the host it

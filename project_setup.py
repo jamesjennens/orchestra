@@ -192,6 +192,9 @@ def steps(handler, principal, project_id):
             # "left to do" and they are not done, so the page says how many there are.
             'unchecked': sum(1 for item in result if item['state'] == 'unknown'),
             'host': 'available' if status is not None else reason,
+            # The installation's review rules an owner should know of (kittrial-5bb.199). A setting of
+            # the web service, so it is the service that says it; the host is not asked.
+            'rules': {'approval_by_another_party': bool(getattr(service, 'approval_by_another_party', False))},
             # How many project databases the server holds and its limit: for a superuser only,
             # because it counts other people's projects (kittrial-5bb.118 part 2 revision).
             'server': (status.get('project_databases') if isinstance(status, dict) and principal.superuser

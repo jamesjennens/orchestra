@@ -306,6 +306,13 @@ whose configuration or key line names a `releases/<ID>` path:
   A confined key's `--endpoint` is compared as one token against the `endpoint`
   in that contributor's client config, so those two change together.
 
+**Nobody approves work of their own account** is a setting of the web service, off by
+default: `"approval_by_another_party": true` in the office service configuration
+(`office_service.py run --config`), which starts the web service with
+`--approval-by-another-party`. See "Nobody approves work of their own party" in
+[HTTP_DEPLOYMENT.md](HTTP_DEPLOYMENT.md). It takes effect when the service is restarted,
+and the project set-up page says whether it is on.
+
 A configuration or key line that already names `<INSTALL_ROOT>/current/...`
 needs nothing: the link moves with the upgrade. A bare `python3` in an old
 client config is the other half of the same problem: on RHEL 8 it is
