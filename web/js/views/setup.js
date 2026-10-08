@@ -129,16 +129,28 @@ export async function page(ctx, { pid }) {
       return;
     }
     ctx.setupProject = data.project;
-    host.replaceChildren(
+    // replaceChildren writes the word "null" for a null: the note is left out when there is none.
+    host.replaceChildren(...[
       pageHead({
         crumbs: [{ label: 'Projects', href: ctx.href('/projects') }, { label: data.project.name, href: ctx.href('/p/' + pid) }, { label: 'Set up' }],
         title: 'Set up this project',
         lede: summary(data) + ' Each step says who can do it. Steps done on the server show the command for an operator; this page does not run anything there.',
       }),
-      h('ol', { class: 'stack setup-steps' }, data.steps.map((item) => stepItem(ctx, pid, item, draw))));
+      h('ol', { class: 'stack setup-steps' }, data.steps.map((item) => stepItem(ctx, pid, item, draw))),
+      rulesNote(data.rules)].filter(Boolean));
   }
   await draw();
   return host;
+}
+
+// The installation's review rule, said where an owner reads about the project (kittrial-5bb.199).
+// Nothing is shown when the service is older than the rule and sends none.
+export function rulesNote(rules) {
+  if (!rules || typeof rules.approval_by_another_party !== 'boolean') return null;
+  const on = rules.approval_by_another_party;
+  return h('p', { class: 'small muted', 'data-rule': 'approval_by_another_party', 'data-on': String(on) },
+    on ? 'On this server nobody approves or recommends work of their own account: not their own, not their agents’, not work under a worker credential they issued. Another owner, or a superuser who did not deliver it, approves.'
+      : 'On this server an owner may approve work of their own account (their own, their agents’, work under a worker credential they issued). An operator can turn that off for the whole server.');
 }
 
 // The line a project page shows its owners while steps are left. Null when nothing is

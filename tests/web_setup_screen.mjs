@@ -119,5 +119,14 @@ out.unchecked = [setup.summary({ remaining: 0, unchecked: 1 }), setup.summary({ 
   out.older = { kinds: older.kinds, texts: older.texts, buttons: older.buttons };
   const none = await shown({ command: null, commands: [] });
   out.none = { kinds: none.kinds, texts: none.texts, buttons: none.buttons };
+  // kittrial-5bb.199: the installation's review rule under the steps. A service older than the rule
+  // sends none: then nothing is added (a null handed to replaceChildren would be the word "null").
+  out.rule = [];
+  for (const rules of [undefined, null, { approval_by_another_party: true }, { approval_by_another_party: false }, { approval_by_another_party: 'yes' }]) {
+    const ctx = { api: { projectSetup: async () => ({ ...data({}), rules }) }, href: (path) => '#' + path, go() {} };
+    const page = await setup.page(ctx, { pid: 'p1' });
+    const notes = page.all((e) => e.attributes['data-rule'] === 'approval_by_another_party');
+    out.rule.push([notes.map((n) => n.attributes['data-on']), notes.map((n) => n.textContent.slice(0, 40)), page.childNodes.length]);
+  }
 }
 console.log(JSON.stringify(out));
