@@ -47,7 +47,7 @@ class ServedTextTests(unittest.TestCase):
                 self.assertEqual(served, (KIT / onboarding.DOCUMENTS[name]).read_text(encoding='utf-8'))
                 self.assertIn('  docs ' + name, onboarding.execute(KIT, KIT, 'example', 'worker', 'docs', []))
         with self.assertRaises(KeyError):
-            onboarding.web_document(KIT, 'cli-contract')                          # catalogued, and not for the web
+            onboarding.member_document(KIT, 'cli-contract')                          # catalogued, and not for the web
 
     def test_what_the_text_says_a_worker_does_and_in_what_order(self):
         text = (KIT / 'docs' / 'FINDING_WORK.md').read_text(encoding='utf-8')
@@ -101,7 +101,7 @@ class ServedTextTests(unittest.TestCase):
                   'poll-prompt-agent': ['REPLACE_AGENT_NAME', 'REPLACE_SERVER_URL', 'REPLACE_INTERVAL']}
         for name, placeholders in wanted.items():
             with self.subTest(prompt=name):
-                document = onboarding.web_document(KIT, name)
+                document = onboarding.member_document(KIT, name)
                 prompt = document['prompt']
                 self.assertLessEqual(len(prompt), onboarding.POLL_PROMPT_LIMIT, 'the recurring prompt has grown: %d' % len(prompt))
                 self.assertEqual(document['placeholders'], placeholders)
@@ -122,7 +122,7 @@ class ServedTextTests(unittest.TestCase):
                 self.assertIsNone(SECRET.search(document['text']))
 
     def test_every_command_in_the_ssh_prompt_is_one_the_client_takes(self):
-        prompt = onboarding.web_document(KIT, 'poll-prompt')['prompt']
+        prompt = onboarding.member_document(KIT, 'poll-prompt')['prompt']
         client = (KIT / 'client.py').read_text(encoding='utf-8')
         listed = re.search(r"elif args\[:1\] in \((.*?)\):action=args\.pop\(0\)", client)
         actions = set(re.findall(r"\['([a-z]+)'\]", listed.group(1)))
@@ -142,7 +142,7 @@ class ServedTextTests(unittest.TestCase):
         self.assertNotIn('worker-start', onboarding.DOCUMENTS)
 
     def test_the_first_prompt_is_served_as_it_is(self):
-        document = onboarding.web_document(KIT, 'worker-prompt')
+        document = onboarding.member_document(KIT, 'worker-prompt')
         self.assertTrue(document['prompt'].startswith('Work only in the dedicated working directory'))
         self.assertIn('REPLACE_PROJECT', document['placeholders'])
         self.assertIn('ready --json', document['prompt'])                       # past the commands it shows in a block of its own
@@ -261,7 +261,7 @@ class OrderTests(Members):
                 'progress. Act on the first.', '3. Only when none of your own tasks needs action: the tasks the same reply says you '
                 'could claim. Claim exactly one that nobody holds']
         self.assertLess(guide.index(said[0]), guide.index(said[1]))
-        agent = onboarding.web_document(KIT, 'poll-prompt-agent')['prompt']
+        agent = onboarding.member_document(KIT, 'poll-prompt-agent')['prompt']
         self.assertIn('Your own tasks come first in the reply: review feedback, then a task you left blocked, then one in '
                       'progress.', agent)
         # The words of the three texts for the three own kinds, in the order of the kinds the route gives.
@@ -402,7 +402,7 @@ class PageTests(Members):
         resume, poll = owner['agentBlocks']
         self.assertEqual((resume['prompt'], poll['prompt']), ('resume', 'agent'))
         self.assertIn('You are Kestrel, an Orchestra agent. Read .orchestra/AGENT.md', resume['text'])
-        prompt = onboarding.web_document(KIT, 'poll-prompt-agent')['prompt']
+        prompt = onboarding.member_document(KIT, 'poll-prompt-agent')['prompt']
         self.assertEqual(poll['text'], prompt.replace('REPLACE_AGENT_NAME', 'Kestrel').replace('REPLACE_SERVER_URL', 'https://office.example'))
         self.assertEqual((poll['left'], poll['served'], poll['buttons']), ('REPLACE_INTERVAL', ['docs poll-prompt-agent'], ['Copy']))
         # A viewer has no agent: the prompt is there, with the name left to replace.
@@ -414,8 +414,8 @@ class PageTests(Members):
         for reader in (owner, viewer):
             first, recurring = reader['workerBlocks']
             self.assertEqual((first['prompt'], recurring['prompt']), ('first', 'worker'))
-            self.assertEqual(first['text'], onboarding.web_document(KIT, 'worker-prompt')['prompt'].replace('REPLACE_PROJECT', self.project))
-            self.assertEqual(recurring['text'], onboarding.web_document(KIT, 'poll-prompt')['prompt'].replace('REPLACE_PROJECT', self.project))
+            self.assertEqual(first['text'], onboarding.member_document(KIT, 'worker-prompt')['prompt'].replace('REPLACE_PROJECT', self.project))
+            self.assertEqual(recurring['text'], onboarding.member_document(KIT, 'poll-prompt')['prompt'].replace('REPLACE_PROJECT', self.project))
             self.assertEqual(recurring['left'], 'REPLACE_WORKING_FOLDER REPLACE_ACTOR_FILE REPLACE_CLIENT_PREFIX REPLACE_INTERVAL')
             self.assertEqual((first['served'], recurring['served']), (['docs worker-prompt'], ['docs poll-prompt']))
             self.assertNotIn('REPLACE_PROJECT', first['text'] + recurring['text'])

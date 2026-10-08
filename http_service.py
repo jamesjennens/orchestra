@@ -4334,7 +4334,7 @@ class ApiHandler(BaseHTTPRequestHandler):
     @route('GET', r'/v1/docs')
     def docs_list(self, ctx):
         import onboarding
-        return 200, {'items': [{key: value for key, value in onboarding.web_document(KIT_DIRECTORY, name).items()
+        return 200, {'items': [{key: value for key, value in onboarding.member_document(KIT_DIRECTORY, name).items()
                                 if key != 'text' and key != 'prompt'} for name in onboarding.WEB_DOCUMENTS],
                      'server_url': self.service.public_url or None}
 
@@ -4345,7 +4345,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         if name not in onboarding.WEB_DOCUMENTS:
             raise not_found('No such document. GET /v1/docs lists the documents this service serves.')
         try:
-            document = onboarding.web_document(KIT_DIRECTORY, name)
+            document = onboarding.member_document(KIT_DIRECTORY, name)
         except (OSError, ValueError) as failed:
             raise HttpError(503, 'unavailable', 'The document %s could not be read from the installed kit (%s).'
                             % (name, type(failed).__name__))

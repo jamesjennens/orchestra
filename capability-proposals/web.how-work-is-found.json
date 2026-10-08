@@ -20,7 +20,7 @@
     "docs/HTTP_DEPLOYMENT.md#the-kits-documents-for-members-how-work-is-found-and-the-prompts"
   ],
   "code": [
-    "onboarding.py::web_document",
+    "onboarding.py::member_document",
     "onboarding.py::prompt_of",
     "onboarding.py::placeholders",
     "http_service.py::ApiHandler.docs_get",

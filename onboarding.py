@@ -260,7 +260,7 @@ def placeholders(text):
     return seen
 
 
-def web_document(kit, name):
+def member_document(kit, name):
     """One of ``WEB_DOCUMENTS`` for the web service: the text ``docs NAME`` serves, its
     title, and, when it is a prompt document, the prompt and the values to replace."""
     if name not in WEB_DOCUMENTS:
