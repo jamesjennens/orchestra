@@ -3,6 +3,11 @@
 **Status: design note for James to decide on (kittrial-5bb.178), second version
 after review. Nothing here is built, and this task changes no behaviour.**
 
+**For an installation where nobody but its owner is to have SSH (the office),
+see [WEB_COORDINATOR_DESIGN.md](WEB_COORDINATOR_DESIGN.md) (kittrial-5bb.201):
+the same rules on the web route. This note stays the design for lanes that
+already connect over SSH.**
+
 Everything under "What is true today" was read in the code on main `2d321be`;
 I ran nothing for this note. What was run is the coordinator's and the
 reviewer's: an office installation of release `ff83602` in a container (note of
