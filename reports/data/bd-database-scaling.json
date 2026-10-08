@@ -60,5 +60,5 @@
     "fixture": "Fresh stopped pinned seed copies,26tables/222columns; migrate target only for new version; actual existing DB count1/20/50 for each repetition. Other databases retain seed schema."
   },
   "aggregation": "Derived groups are not stored. Run summarize_bd_scaling.py; groups retain actual raw filename and avoid ambiguous post50 aliases. For the displayed filtered-columns50 debug control, pool six samples in native-curve-v2 and native-post-v1: median818.5ms.",
-  "trace_location": "Raw trace names are evidence identifiers, not repository paths. Preserved in owner-approved immutable .133 R2 evidence archive d93c7ae10c27fa1793bebc62b31096d8a7aaa2f241d95eea0aaaf820655ce9a0 on owned koopa scratch."
+  "trace_location": "Raw trace names are evidence identifiers, not repository paths. Preserved in private review evidence, archive sha256 d93c7ae10c27fa1793bebc62b31096d8a7aaa2f241d95eea0aaaf820655ce9a0."
 }

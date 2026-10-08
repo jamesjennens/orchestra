@@ -8,7 +8,7 @@ Keep the Beads 1.2.2 and Dolt 2.2.0 pins: the available evidence does not establ
 
 Each measured pinned-version native write and merge-slot command sends two filtered `INFORMATION_SCHEMA.COLUMNS` checks. Their logged duration grows with the number of databases while their count stays fixed. The equivalent filtered query grows on its own; an ordinary query and native list/show remain comparatively flat. Together with the pinned source path, this supports catalog enumeration as a major source of the observed write cost. Query durations are elapsed server times, not CPU profiles or proof that every component of latency has the same cause.
 
-Beads 1.3.1 replaces the two cursor-column probes, but each measured write retains one lease-column check and adds eleven `INFORMATION_SCHEMA.TABLES` probes; reads gain one TABLES probe. The COLUMNS-only count below omits that work. Our target-only migrated fixture favours 1.3.1: the other databases retain 26 tables/222 columns, while a migrated database has 30 tables/252 columns. The independent second review measured create at 30 fully migrated databases as 1.627 s, versus 1.364 s with 1.2.2, with non-overlapping observed ranges. On this evidence 1.3.1 does not reduce the cost. Our limited 50-database create/claim decreases remain observations of the biased fixture; add-project was about 1.6 times slower.
+Beads 1.3.1 replaces the two cursor-column probes, but each measured write gains one lease-column check (new in 1.3.1) and eleven `INFORMATION_SCHEMA.TABLES` probes; reads gain one TABLES probe. The COLUMNS-only count below omits that work. Our target-only migrated fixture favours 1.3.1: the other databases retain 26 tables/222 columns, while a migrated database has 30 tables/252 columns. The independent second review measured create at 30 fully migrated databases as 1.627 s, versus 1.364 s with 1.2.2, with non-overlapping observed ranges. On this evidence 1.3.1 does not reduce the cost. Our limited 50-database create/claim decreases remain observations of the biased fixture; add-project was about 1.6 times slower.
 
 ## Native commands
 
@@ -17,7 +17,7 @@ The pinned fixture has 26 tables and 222 columns per project database. The task 
 Warning-mode medians in seconds, three samples per cell. Native timers include process startup. Counts come from `SHOW DATABASES` after excluding system schemas. At 100 databases the native supplement uses the endpoint fixture after its staged measurements; schema count is matched but issue history and table contents differ from the earlier native fixture.
 
 | Operation | 1 DB | 5 DB | 10 DB | 20 DB | 35 DB | 50 DB | 100 DB |
-|---|---|---:|---:|---:|---:|---:|---:|---:|
+|---|---:|---:|---:|---:|---:|---:|---:|
 | create | 0.338 | 0.443 | 0.571 | 0.909 | 1.549 | 2.126 | 4.930 |
 | update | 0.333 | 0.405 | 0.513 | 0.910 | 1.416 | 2.235 | 5.069 |
 | comment | 0.320 | 0.398 | 0.565 | 0.852 | 1.341 | 2.031 | 5.069 |
@@ -38,7 +38,7 @@ The excess create cost per additional database is about 26 ms from 1 to 10 datab
 Warning-mode medians in seconds, three samples per cell. Timers include endpoint validation, locking and native calls, and exclude SSH and starting the measurement interpreter. New synthetic tasks keep each checkpoint/review history bounded. Prerequisite reads and fixture preparation are outside the write timer; reads performed by the endpoint itself stay inside it.
 
 | Operation | 1 DB | 5 DB | 10 DB | 20 DB | 35 DB | 50 DB | 100 DB |
-|---|---|---:|---:|---:|---:|---:|---:|---:|
+|---|---:|---:|---:|---:|---:|---:|---:|
 | endpoint-create | 0.343 | 0.439 | 0.635 | 0.851 | 1.369 | 2.041 | 4.838 |
 | endpoint-claim | 0.746 | 0.883 | 0.927 | 1.336 | 1.937 | 2.517 | 5.492 |
 | endpoint-checkpoint | 0.506 | 0.653 | 0.758 | 1.146 | 1.682 | 2.418 | 5.149 |
@@ -112,7 +112,7 @@ Propose an operator warning at 10 counted names for a default limit of 20, and a
 | Option | Expected benefit and cost | Required validation / risk |
 |---|---|---|
 | Add a schema WHERE clause | The captured migration query already has one; adding the same filter offers no measured improvement. | A fix must change catalog construction or avoid repeated checks without accepting an unvalidated migration. |
-| Beads 1.3.0 / 1.3.1 | The [released probe change](https://github.com/gastownhall/beads/commit/3594a3762) uses `SHOW COLUMNS FROM <cursor table> LIKE 'content_hash'`, avoiding the per-write `INFORMATION_SCHEMA.COLUMNS` probe. The replacement alone does not reduce the observed cost: additional TABLES probes, migration expansion and initialization work offset it. Keep the current pin; see the comparison and compatibility failures below. | Coordinate all clients, verify official and static builds, explicitly consent to shared-server migrations, and test authority, schema, backups and restore before changing any pin. |
+| Beads 1.3.0 / 1.3.1 | The [released probe change](https://github.com/gastownhall/beads/commit/3594a3762) uses `SHOW COLUMNS FROM <cursor table> LIKE 'content_hash'`, avoiding the two per-write cursor-table probes on `INFORMATION_SCHEMA.COLUMNS` (one other COLUMNS probe per write remains). The replacement alone does not reduce the observed cost: additional TABLES probes, migration expansion and initialization work offset it. Keep the current pin; see the comparison and compatibility failures below. | Coordinate all clients, verify official and static builds, explicitly consent to shared-server migrations, and test authority, schema, backups and restore before changing any pin. |
 | Newer Dolt | A server-side catalog optimization could reduce remaining probes, but no newer Dolt binary was measured here. | Compare an exact candidate against the same catalog and SQL before claiming improvement; do not infer it from a newer release number. |
 | Move retired databases off the server | Reduces the catalog only after the databases actually leave it; hiding/archiving project records alone does not. | Operator and owner design decision: verified native plus coordination backup, restore-new rehearsal, routes/dependencies/retention handling, and explicit drop authorization. No database move or drop was performed. |
 | Second Dolt server / installation | Bounds the catalog per server; comes with additional service, storage and operating cost. | Explicit routing, project authority, backup/restore ownership, cross-project dependencies and failure handling. No multi-server performance or failover was verified. |
@@ -183,7 +183,7 @@ Each fresh repetition uses copies of a stopped synthetic 26-table/222-column see
 
 The first harness attempt failed before sending SQL because a copied `.beads/dolt-server.port` still named the seed port despite updated metadata. It was excluded and retained in private investigation evidence; the corrected fresh comparison updates both port sources. No product source was changed, no existing fixture was modified, and every owned comparison server stopped.
 
-[Raw comparison samples](data/raw/bd-version-comparison.json) and [measurement metadata](data/bd-database-scaling.json) preserve all 126 timings and hashes. The six committed raw files are the measurements; the large redundant derived summary has been removed. Raw-row trace names identify captures in the immutable evidence archive `orchestra-sol1-133-r2-evidence-5963cb5-20261008.tgz` (SHA256 `d93c7ae10c27fa1793bebc62b31096d8a7aaa2f241d95eea0aaaf820655ce9a0`) under the owned .133 scratch folder on koopa, not files promised in this repository. The deterministic summarizer groups by actual raw filename, operation, database count, logging and version; it invents no post50 group names. Independent second-review findings are attributed to review `01a11b9a-76a2-732a-ad4f-25a0fed1b292` and its evidence at `koopa:/home/james/orchestra-review-evidence/1009-133/r2/README.md`; those originals were not changed or copied.
+[Raw comparison samples](data/raw/bd-version-comparison.json) and [measurement metadata](data/bd-database-scaling.json) preserve all 126 timings and hashes. The six committed raw files are the measurements; the large redundant derived summary has been removed. Raw-row trace names identify captures kept in private review evidence (an archive with SHA256 `d93c7ae10c27fa1793bebc62b31096d8a7aaa2f241d95eea0aaaf820655ce9a0`), not files promised in this repository. The deterministic summarizer groups by actual raw filename, operation, database count, logging and version; it invents no post50 group names. Independent second-review findings are attributed to review `01a11b9a-76a2-732a-ad4f-25a0fed1b292` on the task; its evidence is kept privately and was not changed or copied.
 
 ## Reproduction and limits
 
