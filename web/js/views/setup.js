@@ -129,14 +129,15 @@ export async function page(ctx, { pid }) {
       return;
     }
     ctx.setupProject = data.project;
-    host.replaceChildren(
+    // replaceChildren writes the word "null" for a null: the note is left out when there is none.
+    host.replaceChildren(...[
       pageHead({
         crumbs: [{ label: 'Projects', href: ctx.href('/projects') }, { label: data.project.name, href: ctx.href('/p/' + pid) }, { label: 'Set up' }],
         title: 'Set up this project',
         lede: summary(data) + ' Each step says who can do it. Steps done on the server show the command for an operator; this page does not run anything there.',
       }),
       h('ol', { class: 'stack setup-steps' }, data.steps.map((item) => stepItem(ctx, pid, item, draw))),
-      rulesNote(data.rules));
+      rulesNote(data.rules)].filter(Boolean));
   }
   await draw();
   return host;
