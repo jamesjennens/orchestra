@@ -14,17 +14,37 @@ one stderr sentence naming exactly what to add: it is never silent and never pre
 somebody was named. See the plan comment on kittrial-5bb.192 for the decision and why.
 
 Revision 2 (review 01a11b49-1b62-70f5-8e28-3ee0f971da2e) adds, and this file holds a test
-for each: a damaged audit never refuses a REMOVAL (it is set aside and a fresh history
-records that), an ADD on a damaged audit is refused naming the recovery, `restore-new`'s
+for each: a damaged audit never refuses a REMOVAL (it is set beside the runtime and a fresh
+history records that), an ADD on a damaged audit is refused naming the recovery, `restore-new`'s
 re-grants are recorded, the reader replays the trail against the current lists and marks the
 unattributed entries, a repeated `--actor`/`--reason` is refused, the audit's own temporary
 copies are cleaned up, and the entry is written BEFORE the list change (the mutant M03/M04
 order), with the check and the entry inside the deployment lock (M07).
+
+Revision 3 (review 01a11bd2-ff1a-7abf-9462-d05f3964336f) adds the four round-2 items:
+
+1. every NEW history begins with a `baseline` holding the lists as they stand, so the reader
+   replays from a known state and a listed-but-never-mentioned name really is a hand edit or an
+   older kit; the cap carries a fresh baseline forward instead of losing names, and at exactly
+   200 entries nothing is claimed to have been dropped. With no trail at all the reader says so,
+   prints the lists and warns about nothing (`replay.agrees` null).
+2. the damaged bytes are put at the `.damaged-*` name FIRST (hard link, or a copy) and the new
+   history replaces the audit path, so the path is never empty: a failed write at exactly that
+   point is tested, and the retry reuses the aside. `.damaged-*` files are never removed and the
+   reader lists them.
+3. `restore-new --actor/--reason` refuse a repeat, refuse an abbreviation, and print the one
+   stderr sentence when the re-grant is unattributed; the commands a refused restore prints carry
+   the flags.
+4. a no-op ADD on a damaged audit is NOT refused (the check before the lock knows whether
+   anything would change) and refuses nothing else either; the recovery sentence prints a real
+   `.damaged-<stamp>`; the grammar is fixed; the widened leftover cleanup, the verifiers
+   abbreviations and the capped trail are held by tests.
 """
 import contextlib
 import io
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -40,6 +60,7 @@ OPERATOR = 'ops'
 VERIFIER = 'ci-host'
 AUDIT = admin.AUTHORITY_CHANGES_AUDIT
 DEEP = '[' * 100000 + ']' * 100000
+STAMP = re.compile(r'\.damaged-\d{8}T\d{6}Z(\.\d+)?$')
 
 
 class AuthorityChangesCase(unittest.TestCase):
@@ -79,6 +100,11 @@ class AuthorityChangesCase(unittest.TestCase):
         document = self.audit()
         return [] if document is None else document['entries']
 
+    def baseline(self):
+        """The baseline the trail begins with, or None when it has none."""
+        document = self.audit()
+        return None if document is None else document.get('baseline')
+
     def entry(self, **fields):
         """One audit entry as the reader compares it, without the timestamp it carries."""
         entry = {'operator': None, 'list': 'operators', 'actor': 'someone', 'change': 'add', 'reason': None}
@@ -98,6 +124,12 @@ class AuthorityChangesCase(unittest.TestCase):
                  'actor': 'bob', 'change': 'add', 'reason': 'r'}
         entry.update(fields)
         return entry
+
+    def good_baseline(self, **fields):
+        baseline = {'at': '2026-10-01T00:00:00Z', 'operator': 'alice', 'reason': 'baseline: a test',
+                    'lists': {'operators': [OPERATOR], 'verifiers': [VERIFIER]}}
+        baseline.update(fields)
+        return baseline
 
 
 class RecordingTests(AuthorityChangesCase):
@@ -125,6 +157,32 @@ class RecordingTests(AuthorityChangesCase):
         # lives beside deployment.private.json, runtime-level, as the adoption audit does.
         self.assertEqual(set(self.entries()[0]), set(admin.AUTHORITY_CHANGES_FIELDS))
         self.assertTrue((self.root / AUDIT).is_file())
+        # The history BEGINS with a baseline of the lists as they stood (round-2 review item 1):
+        # this installation listed OPERATOR and VERIFIER before the first change.
+        self.assertEqual(set(self.baseline()), set(admin.AUTHORITY_CHANGES_BASELINE_FIELDS))
+        self.assertEqual(self.baseline()['lists'], {'operators': [OPERATOR], 'verifiers': [VERIFIER]})
+        self.assertEqual(self.baseline()['operator'], 'alice')
+        self.assertIn('baseline', self.baseline()['reason'])
+
+    def test_the_first_change_on_an_installation_from_before_this_kit_baselines_the_lists(self):
+        # The reviewer's finding 1: a runtime written by the release before, one operator listed
+        # and no audit at all. The first change starts a history from a KNOWN state, so the two
+        # names that were already there are in the trail and the reader does not cry wolf.
+        self.assertEqual(self.audit(), None)
+        self.cli('operators', 'add', 'bob', '--actor', 'alice', '--reason', 'pilot')
+        self.assertEqual(self.baseline()['lists'], {'operators': [OPERATOR], 'verifiers': [VERIFIER]})
+        report = json.loads(self.cli('authority-changes')[0])
+        self.assertTrue(report['replay']['agrees'])
+        self.assertEqual(report['replay']['lists']['operators']['listed_but_not_in_trail'], [])
+        self.assertEqual(report['replay']['lists']['operators']['trail_expects'], ['bob', OPERATOR])
+        self.assertEqual(report['unattributed_entries'], 0)
+        self.assertIn('leads to the current lists', report['replay']['note'])
+        self.assertNotIn('WARNING', report['replay']['note'])
+        # A no-op add of the name written by the release before writes no entry and no new history.
+        before = (self.root / AUDIT).read_bytes()
+        self.cli('operators', 'add', OPERATOR)
+        self.assertEqual((self.root / AUDIT).read_bytes(), before)
+        self.assertTrue(json.loads(self.cli('authority-changes')[0])['replay']['agrees'])
 
     def test_a_bare_call_keeps_working_and_says_what_to_add(self):
         # The office wrapper's exact call, and the same for verifiers.
@@ -260,17 +318,42 @@ class RecordingTests(AuthorityChangesCase):
         self.assertEqual(after.st_ino, before_stat.st_ino)
         self.assertEqual(after.st_mtime_ns, stamp * 10 ** 9)
 
-    def test_the_reader_answers_an_empty_history_when_nothing_was_recorded(self):
+    def test_the_reader_says_there_is_no_trail_yet_and_warns_about_nothing(self):
+        # Round-2 review item 1, the coordinator's decision: with no audit file at all, say there
+        # is no trail yet and print the lists - no warning. The exit code is 0 either way, which
+        # is why a script reads replay.agrees instead.
         out, err = self.cli('authority-changes')
         report = json.loads(out)
         self.assertEqual(report['schema_version'], admin.AUTHORITY_CHANGES_SCHEMA)
         self.assertEqual(report['entries'], [])
+        self.assertEqual(report['baseline'], None)
         self.assertEqual(report['unattributed_entries'], 0)
         self.assertEqual(report['current_lists'], {'operators': [OPERATOR], 'verifiers': [VERIFIER]})
-        self.assertFalse(report['replay']['agrees'])        # the trail mentions neither name
+        self.assertIsNone(report['replay']['agrees'])            # no trail: neither true nor false
+        self.assertEqual(report['replay']['state'], 'no-trail')
+        self.assertIn('No trail yet', report['replay']['note'])
+        self.assertNotIn('WARNING', report['replay']['note'])
+        self.assertNotIn('never mentions', err)
+        self.assertFalse((self.root / AUDIT).exists())          # reading never creates the file
+
+    def test_the_reader_reports_a_mismatch_once_the_baseline_is_wrong_too(self):
+        # A hand-started history with no baseline still replays, and says the trail is not known
+        # to be whole: the file may simply be older than the lists.
+        (self.root / AUDIT).write_text(
+            json.dumps({'schema_version': 1, 'entries': [self.good_entry(actor='legacy')]}), encoding='utf-8')
+        report = json.loads(self.cli('authority-changes')[0])
+        self.assertFalse(report['replay']['agrees'])
+        self.assertEqual(report['replay']['state'], 'mismatch')
+        self.assertEqual(report['baseline'], None)
+        self.assertIn('does not begin with a baseline', report['replay']['note'])
         self.assertEqual(report['replay']['lists']['operators']['listed_but_not_in_trail'], [OPERATOR])
-        self.assertIn('never mentions', err)
-        self.assertFalse((self.root / AUDIT).exists())      # reading never creates the file
+
+    def test_an_empty_history_file_reads_as_no_trail_too(self):
+        (self.root / AUDIT).write_text(json.dumps({'schema_version': 1, 'entries': []}), encoding='utf-8')
+        report = json.loads(self.cli('authority-changes')[0])
+        self.assertEqual(report['replay']['state'], 'no-trail')
+        self.assertIsNone(report['replay']['agrees'])
+        self.assertIn('No trail yet', report['replay']['note'])
 
     def test_the_reader_prints_the_lists_replays_the_trail_and_marks_the_unattributed(self):
         self.marker.write_text(json.dumps({'password': 'x', 'unit': 'none'}), encoding='utf-8')
@@ -297,10 +380,20 @@ class RecordingTests(AuthorityChangesCase):
         self.marker.write_text(json.dumps(config), encoding='utf-8')
         report = json.loads(self.cli('authority-changes')[0])
         self.assertFalse(report['replay']['agrees'])
+        self.assertEqual(report['replay']['state'], 'mismatch')
         self.assertEqual(report['replay']['lists']['operators']['listed_but_last_removed'], ['bob'])
-        self.assertEqual(report['replay']['lists']['operators']['listed_but_not_in_trail'], [OPERATOR])
+        # OPERATOR was listed before the trail began, so the BASELINE mentions it: a name the
+        # trail never mentions now really is one nobody recorded (round-2 review item 1).
+        self.assertEqual(report['replay']['lists']['operators']['listed_but_not_in_trail'], [])
         self.assertIn('last recorded change is a remove', report['replay']['note'])
         self.assertIn('hand edit', report['replay']['note'])
+        # A name added to the file by hand after the baseline IS the mismatch it should be.
+        config = self.stored()
+        config['operators'].append('sneaked')
+        self.marker.write_text(json.dumps(config), encoding='utf-8')
+        report = json.loads(self.cli('authority-changes')[0])
+        self.assertEqual(report['replay']['lists']['operators']['listed_but_not_in_trail'], ['sneaked'])
+        self.assertIn('sneaked', report['replay']['note'])
 
     def test_the_change_that_drops_entries_says_so_on_stderr(self):
         limit = admin.AUTHORITY_CHANGES_MAX
@@ -327,15 +420,21 @@ class RecordingTests(AuthorityChangesCase):
     @unittest.skipIf(os.name != 'posix', 'the cleanup runs only where fcntl exists')
     def test_the_audits_own_temporary_copies_are_removed(self):
         # A kill inside the audit's own write leaves .authority-changes.audit.json.XXXXXXXX; the
-        # next locked write removes it, as it already did for deployment.private.json.
-        leftover = self.root / ('.%s.abcd1234' % AUDIT)
-        leftover.write_text('{}', encoding='utf-8')
+        # next locked write removes it, as it already did for deployment.private.json. The
+        # adoption and review-writes audits are written the same way under the same lock, so
+        # their leftovers go too (round-2 review item 4 / mutant N16b).
+        leftovers = {}
+        for target in (AUDIT, admin.ACTOR_ADOPTIONS_AUDIT, admin.REVIEW_WRITES_AUDIT):
+            leftovers[target] = self.root / ('.%s.abcd1234' % target)
+            leftovers[target].write_text('{}', encoding='utf-8')
         kept = self.root / ('%s.bak' % AUDIT)
         kept.write_text('{}', encoding='utf-8')
         _, err = self.cli('operators', 'add', 'bob', '--actor', 'alice', '--reason', 'pilot')
-        self.assertFalse(leftover.exists())
+        for target, path in leftovers.items():
+            with self.subTest(target=target):
+                self.assertFalse(path.exists())
+                self.assertIn('temporary copy of %s' % target, err)
         self.assertTrue(kept.exists())
-        self.assertIn('temporary copy of %s' % AUDIT, err)
 
 
 class RefusalTests(AuthorityChangesCase):
@@ -355,11 +454,60 @@ class RefusalTests(AuthorityChangesCase):
                 with self.assertRaisesRegex(ValueError, 'not the history this kit writes') as refusal:
                     self.cli(*argv)
                 self.assertIn('Move the file aside by hand', str(refusal.exception))
-                self.assertIn('.damaged-STAMP', str(refusal.exception))
+                # A REAL stamp, not the literal word STAMP (round-2 review item 4): the command as
+                # printed can be followed, and following it twice cannot overwrite the first file.
+                self.assertNotIn('STAMP', str(refusal.exception))
+                self.assertRegex(str(refusal.exception), r'mv \S+ \S+\.damaged-\d{8}T\d{6}Z')
+        # The grammar the reviewer named: the path is followed by a verb, never by "it cannot be
+        # read" or by another subject (round-2 review item 4).
+        with self.assertRaises(ValueError) as refusal:
+            self.cli('authority-changes')
+        self.assertIn('The authority-changes audit %s is not the history' % (self.root / AUDIT),
+                      str(refusal.exception))
+        self.assertNotIn('audit %s it ' % (self.root / AUDIT), str(refusal.exception))
         self.assertEqual(self.marker.read_bytes(), before)
         self.assertEqual((self.root / AUDIT).read_text(encoding='utf-8'),
                          '{"schema_version": 1, "entries": [{"at": 1}]}')
         self.assertEqual(self.asides(), [])                 # an ADD was refused, nothing set aside
+
+    def test_a_no_op_add_on_a_damaged_audit_is_not_refused(self):
+        # Round-2 review item 4: the release before this audit exits 0 for a no-op `operators add`
+        # (the name is already listed), so a wrapper that re-runs its bare operators must not
+        # start failing. Only an add that WOULD change the list is refused - and that refusal
+        # happens BEFORE the lock, so it costs nothing at all: no lock file, nothing written.
+        (self.root / AUDIT).write_text('{nope', encoding='utf-8')
+        before_marker = self.marker.read_bytes()
+        self.assertFalse((self.root / admin.REVIEW_WRITES_LOCK).exists())
+        # An add that WOULD change either list is refused, and without taking the lock at all
+        # (M24/M25): the pre-lock check is what makes that refusal cost nothing.
+        for argv in (('operators', 'add', 'bob', '--actor', 'alice', '--reason', 'pilot'),
+                     ('verifiers', 'add', 'v2', '--actor', 'alice', '--reason', 'pilot')):
+            with self.subTest(argv=argv):
+                with self.assertRaisesRegex(ValueError, 'Move the file aside by hand') as refusal:
+                    self.cli(*argv)
+                self.assertIn('nothing was changed', str(refusal.exception))
+                self.assertFalse((self.root / admin.REVIEW_WRITES_LOCK).exists())
+                self.assertEqual(self.marker.read_bytes(), before_marker)
+                self.assertEqual(self.asides(), [])
+        # The requests that change nothing are not refused at all: rc 0, the list printed, no
+        # sentence, and the damaged file untouched.
+        for argv, noun in ((('operators', 'add', OPERATOR), 'operators'),
+                           (('verifiers', 'add', VERIFIER), 'verifiers'),
+                           (('operators', 'remove', 'nobody-here', '--confirm-revoke'), 'operators'),
+                           (('verifiers', 'remove', 'nobody-here', '--confirm-revoke'), 'verifiers')):
+            with self.subTest(argv=argv):
+                out, err = self.cli(*argv)
+                self.assertEqual(json.loads(out), {noun: self.stored()[noun]})
+                self.assertEqual(err, '')                   # nothing changed, so no notice either
+        self.assertEqual(self.marker.read_bytes(), before_marker)
+        self.assertEqual((self.root / AUDIT).read_text(encoding='utf-8'), '{nope')
+        self.assertEqual(self.asides(), [])
+        # The reader's own refusal has the fixed grammar too, and a read says nothing was READ.
+        with self.assertRaises(ValueError) as refusal:
+            self.cli('authority-changes')
+        self.assertIn('The authority-changes audit %s cannot be read:' % (self.root / AUDIT),
+                      str(refusal.exception))
+        self.assertIn('nothing was read', str(refusal.exception))
 
     def test_a_damaged_audit_never_refuses_a_removal(self):
         # The coordinator's decision (review item 1): every damage shape this reviewer used.
@@ -404,8 +552,19 @@ class RefusalTests(AuthorityChangesCase):
                 self.assertIn('kept beside the runtime', entry['reason'])
                 self.assertIn('key leaked', entry['reason'])
                 self.assertEqual(len(self.entries()), 1)
+                # The fresh history also CARRIES A BASELINE of the lists as they stood before the
+                # removal - the two names that remain are in the trail, so the reader does not call
+                # them a hand edit (round-2 review item 1) - and the FIRST record names the aside.
+                self.assertEqual(self.baseline()['lists'],
+                                 {'operators': sorted([OPERATOR, 'compromised']), 'verifiers': [VERIFIER]})
+                self.assertIn(aside.name, self.baseline()['reason'])
+                report = json.loads(self.cli('authority-changes')[0])
+                self.assertTrue(report['replay']['agrees'], label)
+                self.assertEqual(report['replay']['lists']['operators']['listed_but_not_in_trail'], [])
+                self.assertIn(aside.name, report['damaged_files'])
+                self.assertIn(aside.name, report['replay']['note'])
 
-    def test_a_damaged_verifiers_audit_never_refuses_a_verifiers_removal(self):
+    def test_a_damaged_audit_never_refuses_a_verifiers_removal(self):
         (self.root / AUDIT).write_text('{nope', encoding='utf-8')
         out, err = self.cli('verifiers', 'remove', VERIFIER, '--confirm-revoke',
                             '--actor', OPERATOR, '--reason', 'host retired')
@@ -413,6 +572,60 @@ class RefusalTests(AuthorityChangesCase):
         self.assertEqual(self.entries()[0]['list'], 'verifiers')
         self.assertIn('damaged', self.entries()[0]['reason'])
         self.assertEqual(len(self.asides()), 1)
+        self.assertEqual(self.baseline()['lists'], {'operators': [OPERATOR], 'verifiers': [VERIFIER]})
+        self.assertIn(self.asides()[0].name, self.baseline()['reason'])
+
+    def test_the_audit_path_is_never_empty_when_the_new_history_cannot_be_written(self):
+        # Round-2 review item 2: the bytes go to the aside name FIRST and the atomic write of the
+        # new history replaces the path. A failed write at exactly that point must leave the
+        # damaged file where it was - never an absent path that reads as an empty history.
+        path = self.root / AUDIT
+        path.write_text('{nope', encoding='utf-8')
+        real = admin.atomic_private_write
+
+        def fail_audit(target, text):
+            if Path(target).name == AUDIT:
+                raise OSError(28, 'No space left on device (injected)')
+            return real(target, text)
+
+        with patch.object(admin, 'atomic_private_write', side_effect=fail_audit):
+            with self.assertRaises(OSError):
+                self.cli('operators', 'remove', OPERATOR, '--confirm-revoke',
+                         '--actor', OPERATOR, '--reason', 'key leaked')
+        self.assertTrue(path.is_file())                       # the path is never absent
+        self.assertEqual(path.read_text(encoding='utf-8'), '{nope')
+        self.assertIn(OPERATOR, self.stored()['operators'])   # nothing was removed either
+        kept = self.asides()
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0].read_text(encoding='utf-8'), '{nope')
+        # The path still holds the damaged bytes, so the reader REFUSES rather than answering an
+        # empty history: an absent path is exactly what this fix removes.
+        with self.assertRaisesRegex(ValueError, 'cannot be read:'):
+            self.cli('authority-changes')
+        # The retry reuses that name - no pile of copies of the same bytes - and the fresh history
+        # names it in its first record.
+        out, err = self.cli('operators', 'remove', OPERATOR, '--confirm-revoke',
+                            '--actor', OPERATOR, '--reason', 'key leaked')
+        self.assertEqual(json.loads(out), {'operators': []})
+        self.assertEqual(self.asides(), kept)
+        self.assertIn(kept[0].name, self.baseline()['reason'])
+        self.assertEqual(kept[0].read_text(encoding='utf-8'), '{nope')
+
+    def test_the_bytes_are_copied_when_the_filesystem_has_no_hard_links(self):
+        # os.link is the first choice; a filesystem without it gets a plain copy, and the path is
+        # still never absent (the copy is made BEFORE the new history is written).
+        path = self.root / AUDIT
+        path.write_text('{nope', encoding='utf-8')
+        with patch.object(admin.os, 'link', side_effect=OSError(1, 'Operation not permitted (injected)')):
+            out, err = self.cli('operators', 'remove', OPERATOR, '--confirm-revoke',
+                                '--actor', OPERATOR, '--reason', 'key leaked')
+        self.assertEqual(json.loads(out), {'operators': []})
+        kept = self.asides()
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0].read_text(encoding='utf-8'), '{nope')
+        self.assertFalse(admin.os.path.samefile(path, kept[0]))     # a copy, not the same inode
+        self.assertIn(kept[0].name, self.baseline()['reason'])
+        self.assertTrue(json.loads(self.cli('authority-changes')[0])['replay']['agrees'])
 
     def test_an_audit_that_cannot_be_read_at_all_is_set_aside_too(self):
         cases = [('non-UTF-8 bytes', b'{"schema_version":1,"entries":[],"x":"\xe9\xff"}')]
@@ -485,8 +698,13 @@ class RefusalTests(AuthorityChangesCase):
         self.assertEqual(self.stored()['operators'], [OPERATOR])
 
     def test_abbreviations_are_off_and_the_pre_existing_ones_still_work(self):
+        # Both commands, both flags: the verifiers half was not held before (round-2 review item 4,
+        # mutant N19b).
         for argv in (('operators', 'add', 'bob', '--act', 'a', '--reason', 'r'),
-                     ('operators', 'add', 'bob', '--actor', 'a', '--reas', 'r')):
+                     ('operators', 'add', 'bob', '--actor', 'a', '--reas', 'r'),
+                     ('verifiers', 'add', 'v2', '--act', 'a', '--reason', 'r'),
+                     ('verifiers', 'add', 'v2', '--actor', 'a', '--reas', 'r'),
+                     ('verifiers', 'add', 'v2', '--acto', 'a', '--reaso', 'r')):
             with self.subTest(argv=argv):
                 with self.assertRaises(SystemExit) as refused:
                     self.cli(*argv)
@@ -529,20 +747,77 @@ class RefusalTests(AuthorityChangesCase):
 
 
 class HistoryTests(AuthorityChangesCase):
+    def capped(self, count, actor='old-%d'):
+        """A hand-written capped trail of ``count`` adds, with no baseline."""
+        return {'schema_version': admin.AUTHORITY_CHANGES_SCHEMA,
+                'entries': [dict(self.entry(actor=actor % index), at='2026-10-01T00:00:%02dZ' % (index % 60))
+                            for index in range(count)]}
+
     def test_the_history_is_capped_like_the_adoption_audit(self):
         limit = admin.AUTHORITY_CHANGES_MAX
-        (self.root / AUDIT).write_text(
-            json.dumps({'schema_version': admin.AUTHORITY_CHANGES_SCHEMA,
-                        'entries': [dict(self.entry(actor='old-%d' % index),
-                                         at='2026-10-01T00:00:%02dZ' % (index % 60))
-                                    for index in range(limit)]}),
-            encoding='utf-8')
+        (self.root / AUDIT).write_text(json.dumps(self.capped(limit)), encoding='utf-8')
         self.cli('operators', 'add', 'bob', '--actor', 'alice', '--reason', 'pilot')
         entries = self.entries()
         self.assertEqual(len(entries), limit)
         self.assertEqual(entries[0]['actor'], 'old-1')       # the oldest entry made room
         self.assertEqual(entries[-1]['actor'], 'bob')
         self.assertNotIn('old-0', [item['actor'] for item in entries])
+        # What the dropped entry recorded is CARRIED FORWARD in the baseline, not lost: old-0 is
+        # still a listed name the trail knows about (round-2 review item 1).
+        self.assertIn('old-0', self.baseline()['lists']['operators'])
+        self.assertIn('cut to its %d-entry cap' % limit, self.baseline()['reason'])
+        self.assertEqual(self.baseline()['operator'], 'alice')
+
+    def test_a_change_at_the_cap_does_not_make_the_reader_cry_mismatch(self):
+        # The reviewer's own 201-change case: the oldest entry is dropped by the cap, and the trail
+        # must still lead to the lists. It used to read `listed_but_not_in_trail: <the oldest>`.
+        limit = admin.AUTHORITY_CHANGES_MAX
+        names = ['n%03d' % index for index in range(limit - 1)]
+        self.marker.write_text(json.dumps({'password': 'x', 'unit': 'none', 'operators': names}),
+                               encoding='utf-8')
+        entries = [dict(self.entry(actor=name), at='2026-10-01T00:00:%02dZ' % (index % 60))
+                   for index, name in enumerate(names)]
+        (self.root / AUDIT).write_text(
+            json.dumps({'schema_version': admin.AUTHORITY_CHANGES_SCHEMA, 'entries': entries}),
+            encoding='utf-8')
+        # `u1` fills the trail to the cap exactly: nothing dropped yet, and the reader may not
+        # claim that anything was dropped (round-2 review item 1).
+        _, err = self.cli('operators', 'add', 'u1', '--actor', 'alice', '--reason', 'pilot')
+        self.assertEqual(err, '')
+        self.assertEqual(len(self.entries()), limit)
+        report = json.loads(self.cli('authority-changes')[0])
+        self.assertTrue(report['replay']['agrees'])
+        self.assertIn('cap of %d entries' % limit, report['replay']['note'])
+        self.assertNotIn('dropped', report['replay']['note'])
+        self.assertNotIn('WARNING', report['replay']['note'])
+        # The 201st change drops the oldest entry into the baseline: still no mismatch.
+        _, err = self.cli('operators', 'add', 'u2', '--actor', 'alice', '--reason', 'pilot')
+        self.assertIn('1 older entry was dropped', err)
+        self.assertIn('folded into the baseline', err)
+        self.assertEqual(len(self.entries()), limit)
+        self.assertIn(names[0], self.baseline()['lists']['operators'])
+        report = json.loads(self.cli('authority-changes')[0])
+        self.assertTrue(report['replay']['agrees'])
+        self.assertEqual(report['replay']['lists']['operators']['listed_but_not_in_trail'], [])
+        self.assertNotIn('WARNING', report['replay']['note'])
+        # This trail never had a baseline (it was hand-written): the reader says so plainly, and
+        # after the cap carried one forward it no longer needs to.
+        self.assertIn('cap of %d entries' % limit, report['replay']['note'])
+
+    def test_a_bad_baseline_is_not_this_history(self):
+        for label, baseline in (('a missing field', {k: v for k, v in self.good_baseline().items()
+                                                     if k != 'reason'}),
+                                ('an unknown field', dict(self.good_baseline(), extra=1)),
+                                ('an at that is not a stamp', dict(self.good_baseline(), at='yesterday')),
+                                ('a list that is not a list', dict(self.good_baseline(), lists={'operators': 'ops',
+                                                                                                'verifiers': []})),
+                                ('an unknown list', dict(self.good_baseline(), lists={'operators': [], 'x': []})),
+                                ('a blank name', dict(self.good_baseline(), lists={'operators': [''], 'verifiers': []}))):
+            with self.subTest(case=label):
+                (self.root / AUDIT).write_text(
+                    json.dumps({'schema_version': 1, 'baseline': baseline, 'entries': []}), encoding='utf-8')
+                with self.assertRaisesRegex(ValueError, 'baseline is not one this kit writes'):
+                    self.cli('authority-changes')
 
     def test_a_damaged_entry_shape_is_a_refusal_not_an_empty_history(self):
         entry = self.entry()
@@ -609,14 +884,31 @@ class RestoreRegrantTests(AuthorityChangesCase):
         self.assertIn('Re-granted operator allowlist entries', stream.getvalue())
 
     def test_a_regrant_without_actor_records_null_and_still_names_restore_new(self):
+        err = io.StringIO()
         with patch.object(admin, 'missing_operators', return_value=['op1']), \
                 patch.object(admin, 'missing_verifiers', return_value=[]), \
-                contextlib.redirect_stdout(io.StringIO()):
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
             admin.restore_authority(self.root, 'lm', restore_operators=True)
         self.assertEqual(self.entries()[0]['operator'], None)
         self.assertEqual(self.entries()[0]['reason'],
                          'restore-new lm re-granted this name from the backup '
                          '(--restore-operators/--restore-verifiers)')
+        # Round-2 review item 3: a bare re-grant prints the same one sentence the four list
+        # commands print, so it is never silently unattributed.
+        self.assertIn('WARNING', err.getvalue())
+        self.assertIn('--actor OPERATOR', err.getvalue())
+        self.assertIn('--reason TEXT', err.getvalue())
+        self.assertIn('unattributed', err.getvalue())
+
+    def test_a_regrant_that_names_who_and_why_prints_no_sentence(self):
+        err = io.StringIO()
+        with patch.object(admin, 'missing_operators', return_value=['op1']), \
+                patch.object(admin, 'missing_verifiers', return_value=[]), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            admin.restore_authority(self.root, 'lm', restore_operators=True,
+                                    actor='james', reason='after a rollback')
+        self.assertEqual(err.getvalue(), '')
+        self.assertEqual(self.entries()[0]['operator'], 'james')
 
     def test_a_damaged_audit_refuses_the_regrant_and_leaves_the_restore_complete(self):
         (self.root / AUDIT).write_text('{nope', encoding='utf-8')
@@ -629,11 +921,30 @@ class RestoreRegrantTests(AuthorityChangesCase):
         self.assertIn('was NOT re-granted', warning)
         self.assertIn('authority-changes audit', warning)
         self.assertIn('restore-new exits %d' % admin.RESTORE_AUTHORITY_NOT_REGRANTED, warning)
+        # The commands it prints carry the recording flags (round-2 review item 3), with what the
+        # restore was given where it had it.
+        self.assertIn('operators add op1 --actor james --reason ', warning)
         self.assertEqual(self.marker.read_bytes(), before)          # nothing was re-granted
         self.assertEqual((self.root / AUDIT).read_text(encoding='utf-8'), '{nope')
 
+    def test_the_regrant_commands_a_refused_restore_prints_are_never_bare(self):
+        # Round-2 review item 3: the bare form records a null operator and prints the warning, so
+        # the remedy would leave the audit less complete than the restore tried to.
+        self.cli('operators', 'add', 'bob', '--actor', 'alice', '--reason', 'pilot')
+        warning = admin.authority_not_regranted(self.root, 'lm', ['op1'], ['v1'])
+        self.assertIn('operators add op1 --actor OPERATOR --reason TEXT', warning)
+        self.assertIn('verifiers add v1 --actor OPERATOR --reason TEXT', warning)
+        with patch.object(admin, 'missing_operators', return_value=['op1']), \
+                patch.object(admin, 'missing_verifiers', return_value=[]), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            warning = admin.authority_not_regranted(self.root, 'lm', ['op1'], [], actor='james',
+                                                    reason='a rollback')
+        self.assertIn("operators add op1 --actor james --reason 'a rollback'", warning)
+
     def test_merge_operators_and_merge_verifiers_record_too(self):
-        # The kit's other two list writers, so the capability's name is true for every route.
+        # The kit's other two list writers, so the capability's name is true for every route. They
+        # have no caller in the kit (restore-new uses merge_authority for one lock wait); they stay
+        # because the lock matrix and the recovery tests hold them directly (round-2 review item 4).
         self.assertEqual(admin.merge_operators(self.root, ['op1']), ['op1'])
         self.assertEqual(admin.merge_verifiers(self.root, ['v1']), ['v1'])
         self.assertEqual([(item['list'], item['actor'], item['change']) for item in self.entries()],
@@ -646,6 +957,97 @@ class RestoreRegrantTests(AuthorityChangesCase):
             self.cli('restore-new', 'lm', 'lmr', '--actor', 'james', '--reason', 'r')
 
 
+class RestoreNewFlagTests(AuthorityChangesCase):
+    """Round-2 review item 3: the two flags on `restore-new`, held through the command line.
+
+    The flags used to reach the re-grant unchecked: no repeat refused, `--act`/`--reas` accepted,
+    the reason ceiling and the actor's form not held through the CLI (mutants N26, N27, N28), and
+    a bare re-grant silent. ``finish_restore`` is the step that passes them on, so it is called
+    here with the same command-line namespace ``main()`` builds.
+    """
+
+    def namespace(self, **fields):
+        import argparse
+        args = argparse.Namespace(project='lm', destination='lmr', restore_operators=True,
+                                  restore_verifiers=False, actor=None, reason=None, native_only=None)
+        for key, value in fields.items():
+            setattr(args, key, value)
+        return args
+
+    def finish(self, args):
+        """`finish_restore` with everything but the authority step stubbed; returns its calls."""
+        calls = []
+        (self.root / 'projects').mkdir(exist_ok=True)
+        (self.root / 'projects' / 'lmr').mkdir(exist_ok=True)
+        with patch.object(admin, 'run_bd', side_effect=lambda *a: 'ok'), \
+                patch.object(admin, 'restore_coordination', return_value=True), \
+                patch.object(admin, 'restore_journal', return_value='a journal'), \
+                patch.object(admin, 'restore_authority',
+                             side_effect=lambda root, source, **kwargs: calls.append((source, kwargs))):
+            admin.finish_restore(self.root, args, self.root / 'snapshot.sqlite3')
+        return calls
+
+    def test_the_flags_reach_the_regrant(self):
+        # N26: the CLI used to drop --actor/--reason on the way to the re-grant.
+        calls = self.finish(self.namespace(actor='james', reason='after a rollback'))
+        self.assertEqual(calls, [('lm', {'restore_operators': True, 'restore_verifiers': False,
+                                         'actor': 'james', 'reason': 'after a rollback'})])
+        calls = self.finish(self.namespace(restore_operators=False, restore_verifiers=True))
+        self.assertEqual(calls, [('lm', {'restore_operators': False, 'restore_verifiers': True,
+                                         'actor': None, 'reason': None})])
+
+    def test_the_reason_ceiling_and_the_actor_are_checked_before_anything_is_restored(self):
+        # N27 (the ceiling) and N28 (the actor's form): both refused before the restore starts,
+        # so a bad value is never discovered after the native restore.
+        limit = admin.AUTHORITY_CHANGES_REASON_MAX - len('restore-new lm: ')
+        with self.assertRaisesRegex(ValueError, 'at most %d characters here' % limit):
+            self.cli('restore-new', 'lm', 'lmr', '--restore-operators', '--reason', 'x' * (limit + 1))
+        with self.assertRaisesRegex(ValueError, 'Invalid operator identity'):
+            self.cli('restore-new', 'lm', 'lmr', '--restore-operators', '--actor', 'not a name!')
+        self.assertEqual((self.root / 'projects' / 'lmr').exists(), False)
+        with self.assertRaisesRegex(ValueError, 'not blank'):
+            self.cli('restore-new', 'lm', 'lmr', '--restore-operators', '--reason', '   ')
+        self.assertEqual((self.root / 'projects' / 'lmr').exists(), False)
+
+    def test_a_repeat_or_an_abbreviation_of_the_two_flags_is_refused(self):
+        for argv in (('lm', 'lmr', '--restore-operators', '--actor', 'a', '--actor', 'b'),
+                     ('lm', 'lmr', '--restore-operators', '--reason', 'one', '--reason', 'two')):
+            with self.subTest(argv=argv):
+                with self.assertRaisesRegex(ValueError, 'was given more than once'):
+                    self.cli('restore-new', *argv)
+        # Abbreviation is off for this subparser, exactly as for operators/verifiers: the two
+        # recording flags are refused, and so is every prefix of the older ones (nothing in this
+        # repository or its recipes spells one that way).
+        for argv in (('lm', 'lmr', '--restore-operators', '--act', 'a'),
+                     ('lm', 'lmr', '--restore-operators', '--reas', 'r'),
+                     ('lm', 'lmr', '--restore-operators', '--a', 'a'),
+                     ('lm', 'lmr', '--restore-operators', '--actor', 'a', '--reaso', 'r'),
+                     ('lm', 'lmr', '--restore-o', '--actor', 'a'),
+                     ('lm', 'lmr', '--without-c')):
+            with self.subTest(argv=argv):
+                with self.assertRaises(SystemExit) as refused:
+                    self.cli('restore-new', *argv)
+                self.assertEqual(refused.exception.code, 2)
+        # The spelled-out flags are unaffected: this reaches the restore itself.
+        with self.assertRaisesRegex(ValueError, 'Source backup missing'):
+            self.cli('restore-new', 'lm', 'lmr', '--restore-operators', '--without-coordination',
+                     '--actor', 'james', '--reason', 'a rollback')
+
+    def test_a_bare_regrant_prints_the_unattributed_sentence(self):
+        self.marker.write_text(json.dumps({'password': 'x', 'unit': 'none'}), encoding='utf-8')
+        err = io.StringIO()
+        with patch.object(admin, 'missing_operators', return_value=['op1']), \
+                patch.object(admin, 'missing_verifiers', return_value=[]), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            warning = admin.restore_authority(self.root, 'lm', restore_operators=True)
+        self.assertIsNone(warning)
+        self.assertIn('unattributed', err.getvalue())
+        self.assertIn('--actor OPERATOR', err.getvalue())
+        self.assertIn('--reason TEXT', err.getvalue())
+        self.assertEqual(self.entries()[0]['operator'], None)
+        self.assertEqual(self.entries()[0]['actor'], 'op1')
+
+
 class DocumentationTests(unittest.TestCase):
     def test_operations_documents_the_audit_the_reader_and_the_keep_working_rule(self):
         text = (KIT / 'docs' / 'OPERATIONS.md').read_text(encoding='utf-8')
@@ -654,6 +1056,24 @@ class DocumentationTests(unittest.TestCase):
                        'authority-changes.audit.json.damaged-<UTC date-time>',
                        'NEVER refused for it', 'restore-new SRC DST --restore-operators',
                        'not a regular file', 'What the audit cannot see'):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, text)
+
+    def test_operations_documents_the_round_two_answers(self):
+        # Round-2 review: the baseline, the never-empty path, the files never removed, the flagged
+        # re-grant commands, the no-op add, and that a script reads replay.agrees (the reader
+        # exits 0 on a mismatch and on an unreadable deployment file).
+        text = (KIT / 'docs' / 'OPERATIONS.md').read_text(encoding='utf-8')
+        for phrase in ('**The baseline: every new history starts from a known state.**',
+                       'is carried forward, never cut',
+                       'The `.damaged-*` files are never removed',
+                       'The path is therefore never absent',
+                       'a script reads `replay.agrees`',
+                       'exits 0 whether the',
+                       'no trail yet',
+                       'is not refused at all',
+                       'carry `--actor`/`--reason`',
+                       'lists them (in its JSON, under `damaged_files`'):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, text)
 

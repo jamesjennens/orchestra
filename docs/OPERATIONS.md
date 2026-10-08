@@ -412,12 +412,14 @@ changes a list appends one entry - time, operator, list, actor, change, reason -
 mode `0600`, the last `200` entries kept). The entry is written under the same deployment
 lock as the list and **before** it, so a crash between the two leaves an entry with no
 change rather than a change with no entry. When the cap makes room by dropping the oldest
-entry, the change says so on stderr. The read-only `authority-changes` command prints the
+entry, the change says so on stderr and what it recorded is carried in the baseline (below),
+so a name is never lost from the trail. The read-only `authority-changes` command prints the
 history; it counts and marks the entries that name no operator, prints the current operator
-and verifier lists beside the entries, and replays the trail against them, saying plainly (in
-the report's `replay.note` and on stderr) when the trail does not lead to the lists. The
-recorded `--actor` is a record, not a grant: these commands still check no allowlist, exactly
-as before (kittrial-5bb.192).
+and verifier lists beside the entries, prints the baseline the trail begins with and any
+damaged audit file kept beside the runtime, and replays the trail against the lists, saying
+plainly (in the report's `replay.note` and on stderr) when the trail does not lead to the
+lists. The recorded `--actor` is a record, not a grant: these commands still check no
+allowlist, exactly as before (kittrial-5bb.192).
 
 A call without the flags still works, because the office wrapper `coord.sh` runs the bare
 `admin.py --root RT operators add ACTOR`. Such a call still records the change, with
@@ -425,29 +427,67 @@ A call without the flags still works, because the office wrapper `coord.sh` runs
 add: the change is never silent, and the audit never pretends somebody was named. With one of
 the two flags given, the sentence names the operator (or the reason) it does have and asks
 only for the flag that is missing - a change by a named operator is not called unattributed.
+A call that changes nothing (the name is already listed, or a remove of a name that is not
+listed) records nothing, prints nothing and exits 0, exactly as the release before this audit.
+
+**The baseline: every new history starts from a known state.** The first change that finds no
+baseline in the file writes one beside the entries: a compact record - `at`, `operator`,
+`reason` and `lists` - holding the operator and verifier lists exactly as they stood then, read
+under the lock and before that change. So a history begins with a baseline when it is started
+on an installation from before this kit, and again when a removal starts a fresh history after
+a damaged audit. It is carried forward, never cut: when a change needs room in the 200-entry
+cap, the entries dropped for room are folded into a fresh baseline first, so a name they
+mentioned is still in the trail. (One compact record, not one entry per name: a baseline that
+cost an entry for every name it holds could not fit inside a 200-*entry* cap on an installation
+that lists many names, and the trail would stop being replayable exactly when it is needed.) The
+baseline is what makes the reader's answer usable: a name the list holds that the trail never
+mentions is then really a hand edit or a change made by a kit older than the baseline. A
+history with no baseline at all - a file written by hand, or by a kit older than this one - is
+still read, and the note says the trail may simply be older than the lists.
+
+**Reading the answer: a script reads `replay.agrees`.** `authority-changes` exits 0 whether the
+trail leads to the lists or not, and also when `deployment.private.json` cannot be read (then
+`current_lists` and `replay` are `null` and the warning is on stderr). The JSON says it in
+`replay.agrees`: `true` when the trail leads to the lists, `false` when it does not, and `null`
+when there is no trail yet (no audit file at all: the reader then says there is no trail yet,
+prints the lists and warns about nothing). `replay.state` carries the same answer as
+`agrees`, `mismatch`, `no-trail`, and `replay.note` is the sentence printed on stderr. Never a
+non-zero exit on a mismatch: every existing installation would fail otherwise.
 
 **What the audit cannot see.** An entry holds no before/after of the list itself, so
-`authority-changes` can only replay the trail: a name the list holds whose last recorded
-change is a remove, a name the trail adds that the list does not hold, and a listed name the
-trail never mentions (a hand edit of `deployment.private.json`, or a list change made by an
-older kit) are all reported as a trail that does not lead to the lists, never silently. The
-trail keeps only the last 200 entries, so a change older than the oldest entry shown cannot be
-replayed either. Nothing else in the kit detects a hand edit.
+`authority-changes` can only replay the trail from its baseline: a name the list holds whose
+last recorded change is a remove, a name the trail adds that the list does not hold, and - with
+a baseline - a listed name the trail never mentions (a hand edit of `deployment.private.json`,
+or a list change made by a kit older than the baseline) are all reported as a trail that does
+not lead to the lists, never silently. Nothing else in the kit detects a hand edit.
 
 **A damaged audit, and the two kinds of change.** An `authority-changes.audit.json` this kit
 cannot read - not JSON, empty, a list, `null`, another `schema_version` (including JSON `true`
-or `1.0`), an unknown top-level key, an entry with an unknown or missing field or an `at` that
-is not a UTC stamp, nested past the guard, a BOM, non-UTF-8 bytes, `NaN`, or mode `000` - is
-treated differently by the two. A **removal** (`operators remove NAME --confirm-revoke`,
-`verifiers remove NAME --confirm-revoke`) is NEVER refused for it: the damaged file is renamed
-to `authority-changes.audit.json.damaged-<UTC date-time>` (`review-writes.audit.json` behaves
-the same way for its own audit), one sentence on stderr says so, and a fresh history starts
-whose first entry records the set-aside in its reason and then the removal. An **add**
+or `1.0`), an unknown top-level key, an entry or a baseline with an unknown or missing field or
+an `at` that is not a UTC stamp, nested past the guard, a BOM, non-UTF-8 bytes, `NaN`, or mode
+`000` - is treated differently by the two. A **removal** (`operators remove NAME
+--confirm-revoke`, `verifiers remove NAME --confirm-revoke`) is NEVER refused for it: the
+damaged bytes are put beside the runtime FIRST, as a hard link or a copy, under the name
+`authority-changes.audit.json.damaged-<UTC date-time>` (`.N` if that name is taken), and the
+atomic write of the fresh history then replaces the audit path. The path is therefore never absent,
+not even for an instant: a kill, or a write that fails, between the two leaves the
+damaged file exactly where it was plus one extra name, and running the command again sets the
+same bytes aside again (the name already holding them is reused). One sentence on stderr says
+so, and the fresh history's first record - its baseline, or the removal when the lists are empty
+- names the file kept. An **add**
 (`operators add`, `verifiers add`, and a `restore-new --restore-operators`/`--restore-verifiers`
 re-grant, which is an add) IS refused, with a sentence that names the file and the recovery:
-move the damaged file aside by hand, then run the command again. A path that is not a regular
-file at all - a directory, a fifo or a symlink - is refused for every command, because the kit
-only sets a damaged regular FILE aside by itself.
+move the damaged file aside by hand, then run the command again. That refusal is checked before
+the lock is taken, so it costs nothing at all (no lock file, nothing written), and an add that
+would change nothing is not refused at all. The `mv` command every refusal prints carries a real,
+current stamp, not a placeholder, so following it twice cannot overwrite the first kept file. A
+path that is not a regular file at all - a directory, a fifo or a symlink - is refused for every
+command, because the kit only keeps a damaged regular FILE beside the runtime by itself.
+
+**The `.damaged-*` files are never removed.** Nothing in the kit deletes one, ever: they
+accumulate beside the runtime as the record of what the trail could no longer read, and the
+reader lists them (in its JSON, under `damaged_files`, and in the note when there are any). Move
+one away, or archive it, yourself once you have read it.
 
 `--actor` and `--reason` may be given at most once; a repeat is refused instead of recording the
 last value silently. Abbreviations are OFF for these two commands, so `--act` and `--reas` are
@@ -465,11 +505,21 @@ gets one entry in the same audit, written under the same deployment lock and bef
 configuration. `operator` is `restore-new`'s `--actor` (null when it was not given) and the
 recorded reason names `restore-new` and the source project, then the `--reason` sentence.
 `restore-new` itself takes `--actor OPERATOR` and `--reason TEXT` for these two flags, checked
-before the restore starts; they are refused when neither flag is given. A damaged audit refuses
-the re-grant the same way it refuses an add: the restore is still complete, and it exits 3 with
-the warning and the commands to re-grant by hand. What is NOT covered: a hand edit of
-`deployment.private.json`, and a list change made by an older kit running on the same runtime -
-both change the lists with no entry, and only the reader's replay reports the gap.
+before the restore starts (the reason must leave room for the `restore-new SRC: ` prefix inside
+the 400-character ceiling); they are refused when neither flag is given, and a repeat of either
+is refused. Like `operators` and `verifiers`, `restore-new` does not abbreviate ANY of its flags:
+`--act`, `--reas`, `--restore-op` and `--without-c` are refused by the parser with exit status 2.
+The spelled-out names are unaffected, and every use in this document and in the kit's own calls
+is spelled out (`--restore-operators`, `--restore-verifiers`, `--without-coordination`). A
+re-grant nobody was named for
+records a null operator and prints the same one stderr sentence the four list commands print, so
+it is never silently unattributed. A damaged audit refuses the re-grant the same way it refuses
+an add: the restore is still complete, and it exits 3 with the warning and the commands to
+re-grant by hand - those commands now carry `--actor`/`--reason` (with what the restore was
+given where it had it), so following them does not leave the unattributed entry the warning says
+to avoid. What is NOT covered: a hand edit of `deployment.private.json`, and a list change made
+by an older kit running on the same runtime - both change the lists with no entry, and only the
+reader's replay reports the gap.
 
 ### Standing guidance
 
@@ -1648,13 +1698,13 @@ python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime ope
 Or re-run the whole restore with `--restore-operators` when the entire allowlist recorded in the backup is intended to be in force again, for example on a replacement host:
 
 ```
-python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime restore-new example examplerestore --restore-operators
+python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime restore-new example examplerestore --restore-operators --actor OPERATOR --reason "replacement host, re-granting the recorded allowlist"
 ```
 
-`--restore-operators` is additive only (it never removes an entry) and prints exactly which entries it re-granted. `--restore-operators` and `--restore-verifiers` are the last step of `restore-new`, after the coordination files and the operation-journal snapshot are restored (kittrial-5bb.142). They are the only step that takes the deployment lock, and both lists are re-granted under one wait for it (kittrial-5bb.144). When another change holds the lock past its 10-second wait, the restore still completes, but nothing is re-granted:
+The `--actor`/`--reason` on `restore-new` are recorded on every re-grant the restore makes in the authority-changes audit, exactly as on `operators add`/`verifiers add`; a re-grant without them records a null operator and prints the sentence saying so (kittrial-5bb.192). `--restore-operators` is additive only (it never removes an entry) and prints exactly which entries it re-granted. `--restore-operators` and `--restore-verifiers` are the last step of `restore-new`, after the coordination files and the operation-journal snapshot are restored (kittrial-5bb.142). They are the only step that takes the deployment lock, and both lists are re-granted under one wait for it (kittrial-5bb.144). The restore still completes, but nothing is re-granted, in two cases: another change holds the lock past its 10-second wait, or `authority-changes.audit.json` is damaged (a re-grant is an add, and an add is refused while the audit is damaged; move the file aside first, then run the printed commands):
 
 - **Exit status 3** means the restore is complete, but the authority asked for was not re-granted (kittrial-5bb.144; kittrial-5bb.142 exited 0). Status 0 means restored, including every re-grant asked for; 1 means failed. A script running `restore-new ... --restore-operators && next-step` therefore stops at status 3. `restore-new --help` states the codes.
-- **The warning is the last thing the restore prints**, on stderr, after `Restored only into the newly created project` and anything else on stdout. It names both lists (`WARNING: the restore is complete, but deployment authority the backup records was NOT re-granted: operators (--restore-operators): ...; verifiers (--restore-verifiers): ...`). It then gives one exact, shell-quoted `admin.py --root ROOT operators add ACTOR` (or `verifiers add`) command per entry and the `backup-authority` command below, and ends with `restore-new exits 3: ...`.
+- **The warning is the last thing the restore prints**, on stderr, after `Restored only into the newly created project` and anything else on stdout. It names both lists (`WARNING: the restore is complete, but deployment authority the backup records was NOT re-granted: operators (--restore-operators): ...; verifiers (--restore-verifiers): ...`) and the cause (the lock, or the damaged audit and how to move it aside). It then gives one exact, shell-quoted `admin.py --root ROOT operators add ACTOR --actor OPERATOR --reason TEXT` (or `verifiers add`) command per entry - with the operator and reason the restore was given where it had them, so following them does not leave the unattributed entry the audit warns about - and the `backup-authority` command below, and ends with `restore-new exits 3: ...`.
 
 Run the printed commands; do not repeat the restore, which is refused because the destination now exists. Before kittrial-5bb.142 such a refusal ended `restore-new` with exit status 1 and a half-restored destination: the operation journal and the other list were not restored either.
 

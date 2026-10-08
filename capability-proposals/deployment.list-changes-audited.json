@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "operation_id": "capnew-5bb192-list-changes-0002",
+  "operation_id": "capnew-5bb192-list-changes-0003",
   "key": "deployment.list-changes-audited",
   "name": "Every operator and verifier list change is audited",
   "aliases": [
@@ -12,7 +12,7 @@
     "damaged authority-changes audit",
     "coordinators per project slice 5"
   ],
-  "summary": "operators add|remove and verifiers add|remove take --actor OPERATOR and --reason TEXT (at most 400 characters; blank refused); restore-new takes both for its --restore-operators/--restore-verifiers re-grants. A real list change appends one entry - at, operator, list, actor, change, reason - to the runtime-level authority-changes.audit.json beside deployment.private.json (schema_version 1, mode 0600, newest 200 kept; drops said on stderr), under the lock and BEFORE the configuration. A re-grant records one entry per name, operator from restore-new --actor or null, reason naming restore-new and the source. The read-only authority-changes prints the entries (operator-null ones marked and counted), the current lists, and a replay saying when the trail does not lead to them. A damaged audit never refuses a REMOVAL: the file is set aside as .damaged-STAMP and a fresh history records that; an ADD is refused with the recovery named; a directory, fifo or symlink is refused. Unknown entry fields, a schema_version that is true or 1.0, and repeated --actor/--reason are refused. NOT covered, with nothing detecting it: a hand edit of deployment.private.json; a list change by an older kit.",
+  "summary": "operators add|remove and verifiers add|remove take --actor OPERATOR and --reason TEXT (at most 400 characters); restore-new takes both for its --restore-operators/--restore-verifiers re-grants. A real change appends one entry - at, operator, list, actor, change, reason - to the runtime-level authority-changes.audit.json beside deployment.private.json (schema_version 1, mode 0600, 200 entries kept), under the lock and BEFORE the configuration. Every NEW history begins with a compact baseline holding the lists as they stood, and entries the cap drops are folded into a fresh one, so a listed-but-never-mentioned name really is a hand edit or an older kit. The read-only authority-changes prints the entries, the lists, the baseline, the .damaged-* files and the replay; replay.agrees is true, false, or null (no trail yet); the exit code is 0 either way. A damaged audit never refuses a REMOVAL: the bytes are kept beside it first and the new history replaces the path, never leaving it absent; an add that would change something is refused before the lock (a no-op add is not), naming a real .damaged-<stamp>. NOT covered: a hand edit of deployment.private.json; a list change by an older kit.",
   "requirements": [],
   "anchors": [
     "docs/OPERATIONS.md#the-operator-and-verifier-list-changes-are-audited"
@@ -22,11 +22,16 @@
     "admin.py::authority_changes_document",
     "admin.py::read_authority_changes",
     "admin.py::authority_changes",
+    "admin.py::authority_change_baseline",
+    "admin.py::authority_change_damaged_files",
+    "admin.py::set_aside_damaged_authority_changes",
     "admin.py::authority_change_replay",
     "admin.py::authority_changes_report",
+    "admin.py::authority_change_precheck",
     "admin.py::record_authority_change",
     "admin.py::authority_change_notice",
     "admin.py::authority_change_arguments",
+    "admin.py::authority_regrant_commands",
     "admin.py::merge_authority",
     "admin.py::restore_authority"
   ],
