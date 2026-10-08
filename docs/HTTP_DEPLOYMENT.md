@@ -541,7 +541,9 @@ creation lock.
 
 **When a creation stops half way.** The host keeps one record per creation in
 `<root>/project-creations/NAME.json`: the intent is written before the first write and
-the result after the last.
+the result after the last. `admin.py add-project` keeps the same record, so a creation it
+stopped half way through is finished or removed with the same two commands
+(kittrial-5bb.176).
 - **Nothing was made yet** (no directory, or an empty one): the request answers 409
   "The project could not be created and nothing was made. Try again; if it fails again,
   ask an operator of the server." The same request can be sent again. The cause is not

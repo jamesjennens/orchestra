@@ -128,7 +128,10 @@ class RuntimeCase(unittest.TestCase):
         (self.root / 'deployment.private.json').write_text(json.dumps(
             {'port': 13317, 'unit': 'beads-example.service', 'password': 'test-only-password',
              'schema': 1}), encoding='utf-8')
-        fake = types.SimpleNamespace(flock=Mock(), LOCK_EX=2)
+        # ``restore-new`` runs ``add-project``, which takes the creation lock too
+        # (kittrial-5bb.176), so the stand-in needs the whole fcntl surface
+        # ``http_authority.file_lock`` uses.
+        fake = types.SimpleNamespace(flock=Mock(), LOCK_EX=2, LOCK_NB=4, LOCK_UN=8)
         self.fcntl = fake
         patcher = patch.dict(sys.modules, {'fcntl': fake})
         patcher.start()
