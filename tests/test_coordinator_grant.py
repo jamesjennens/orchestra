@@ -193,8 +193,9 @@ class GrantTests(Grants):
                 self.assertEqual(status, self.grant(token=token).status)
         self.assertIsNone(self.listed()[self.agent_id]['coordinator'])
         self.assertEqual(200, self.grant(token=self.admin).status)                # a superuser
-        self.assertEqual(self.listed()[self.agent_id]['coordinator']['granted_by'], self.admin_user['id']
-                         if isinstance(self.admin_user, dict) else self.listed()[self.agent_id]['coordinator']['granted_by'])
+        first = self.listed()[self.agent_id]['coordinator']
+        self.assertNotIn(first['granted_by'], self.ids.values())                  # the superuser, none of the members
+        self.assertTrue(first['granted_at'])
         # An agent whose account is only a contributor: the grant would have no effect and is not written.
         worker, worker_id = self.agent_with_id('carl', 'Wren')
         refused = self.grant(worker_id)
@@ -212,8 +213,13 @@ class GrantTests(Grants):
                                            {'scopes': ['reviews']}, token=self.tokens['olive']).status)
         # Removing a grant that is not there says so; giving one twice changes nothing.
         self.assertEqual(404, self.grant(worker_id, method='DELETE').status)
-        again = self.grant()
-        self.assertEqual((again.status, again.data['coordinator']['granted_by']), (200, self.listed()[self.agent_id]['coordinator']['granted_by']))
+        again = self.grant()                                                      # by olive this time
+        self.assertEqual((again.status, again.data['coordinator']), (200, first))
+        # Taking it away is the owner's too: not a coordinator's, a contributor's or the agent's own.
+        for label, token in (('a coordinator', self.tokens['cora']), ('a contributor', self.tokens['carl']), ('the agent itself', self.agent)):
+            with self.subTest(removed_by=label):
+                self.assertEqual(403, self.grant(token=token, method='DELETE').status)
+        self.assertEqual(self.listed()[self.agent_id]['coordinator'], first)
 
     def test_an_owners_own_agent_is_granted_by_that_owner(self):
         """The agent's own account may grant only where that account is an owner of the project."""
@@ -276,6 +282,17 @@ class GrantTests(Grants):
         self.assertEqual(after[task]['kind'], 'to-review')
         self.assertIn('You hold the coordinator grant in this project: review it, then approve it or request changes.', after[task]['reason'])
         self.assertNotIn(own, after)                                              # never its own party's
+        # Work under a worker credential its account issued is nobody's by person (the setting is off), so
+        # only the party rule keeps it from the agent that would be refused the approval.
+        swift, swift_id = self.agent_with_id('olive', 'Swift')
+        self.assertEqual(200, self.grant(swift_id).status)
+        worker, _ = self.worker_of('olive', 'lane-a')
+        under, _ = self.deliver(worker)
+        shown = {item['task']: item for item in self.request('GET', '/v1/agents/me/next', token=swift).data['next_actions']
+                 if item.get('kind') in ('to-review', 'review-recommended')}
+        self.assertIn(task, shown)
+        self.assertIn('You hold the coordinator grant', shown[task]['reason'])
+        self.assertNotIn(under, shown)
 
 
 class NothingGrantedTests(Grants):
