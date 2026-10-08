@@ -96,11 +96,17 @@ function stepItem(ctx, pid, item, redraw) {
   if (item.id === 'repository') body.push(repositoryForm(ctx, pid, (ctx.setupProject || {}).repository, redraw));
   else if (route && item.state !== 'done') body.push(h('p', null, h('a', { class: 'btn', href: ctx.href(route) }, 'Go there')));
   else if (route) body.push(h('p', { class: 'small' }, h('a', { href: ctx.href(route) }, 'Open')));
-  if (item.command) {
-    // The command is text to copy. Nothing on this page runs it.
-    body.push(h('div', { class: 'stack' },
-      h('pre', { class: 'json' }, item.command),
-      h('div', null, copyButton('Copy command', item.command, { what: 'Command' }))));
+  // Text to copy; nothing on this page runs it. Each entry says what it is: a shell command, a shell
+  // command with words to replace, or a line of a unit file, which is not a command (kittrial-5bb.200).
+  const entries = Array.isArray(item.commands) && item.commands.length ? item.commands
+    : (item.command ? [{ kind: 'shell', label: 'Command', text: item.command, note: null }] : []);
+  for (const one of entries) {
+    const line = one.kind === 'unit-line';
+    body.push(h('div', { class: 'stack', 'data-command': one.kind },
+      h('p', { class: 'small' }, h('strong', null, one.label)),
+      h('pre', { class: 'json' }, one.text),
+      h('div', null, copyButton(line ? 'Copy line' : 'Copy command', one.text, { what: line ? 'Line' : 'Command' })),
+      one.note ? h('p', { class: 'small muted' }, one.note) : null));
   }
   if (item.note) body.push(h('p', { class: 'small muted' }, item.note));
   return h('li', { class: 'panel', 'data-step': item.id, 'data-state': item.state },

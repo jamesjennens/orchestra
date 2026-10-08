@@ -116,9 +116,9 @@ cannot tell another project from none. Nothing of the other project is read firs
 three actions that exist only for the web service answer that they are available only to
 the web service.
 
-What it does not do: the key still names its own actor, any actor, inside its projects
-(that is the next slice of the design); and it binds only a key whose ONLY line in
-`authorized_keys` is the bound one. A key that also has an unrestricted or an unbound line
+What it does not do: the key still names its own actor, any actor, inside its projects. Name
+a principal as well (below) to confine the actor too. And it binds only a key whose ONLY line
+in `authorized_keys` is the bound one. A key that also has an unrestricted or an unbound line
 is not bound: replace that line. A line printed by an earlier release of the kit is served
 by that release's wrapper, which knows no `--project` and refuses the line outright (its
 own argument check), or, if the line names no project, binds nothing.
@@ -140,7 +140,107 @@ upgrade of an office installation, a line that names `releases/<ID>` keeps runni
 release), `names_release` (it is the installed kit today but names its release folder, so
 it becomes `other_kit` at the next upgrade), `other_root`, `missing`, arguments the wrapper
 does not know and projects that are not projects. `attention` lists the line numbers to
-look at. `principal` is always null until the design's next slice.
+look at. `principal` is the principal named on the line (`lane:NAME` or `person:NAME`), or
+null. The summary counts both kinds of binding: `bound` for every bound line and
+`principal-bound` for the lines that name a principal; a line bound only to a principal is
+`bound`, not `confined`. A repeated principal (`--principal` twice) and an ill-formed one
+are under attention, because the wrapper refuses such a key.
+
+### Bind a key to its principal
+
+A confined key may name any actor. To bind it to a principal - a lane, in the
+`lane:NAME` form (`person:NAME` is accepted too, and is a different principal) - name
+the principal when the line is printed (kittrial-5bb.194; rule 2 of
+[COORDINATORS_PER_PROJECT_DESIGN.md](COORDINATORS_PER_PROJECT_DESIGN.md)):
+
+```sh
+python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime \
+  authorized-keys --key-file ~/alex.pub --principal lane:orc-coord --project alpha
+```
+
+`--principal` and `--project` are independent: a key may be bound to projects, to a
+principal, or to both. The printed line carries `--principal lane:orc-coord` after the
+projects and repeats it in the key comment (`orchestra-principal=lane:orc-coord`); the
+binding is the argument, never the comment. Only the confined contributor line is printed,
+as with `--project`: an operator line has a shell and cannot be bound. A line that names a
+principal twice is refused, as a project named twice is.
+
+What a key bound to a principal is answered: a request whose actor the project's session
+registry (`projects/PROJECT/.sessions.json`) gives to that principal is served exactly as
+any caller is; every other action is refused before anything runs, whichever actor the
+request names, with a sentence naming the principal and the actor. An actor that has no
+entry has no principal and is not this key's. **The exception is a session registration**:
+`session register` under a bound key is allowed and records the new actor under the key's
+principal, so the new session can then act through that key. It is the only exception, and
+only when the first argument is exactly `register`; a `session resume`, `session run` or
+`session show` as another actor is refused like any other action. `session show` prints the
+principal the actor belongs to (`principal`); on an installation that has never written an
+owners map the key is omitted, so the answer is the one this kit gave before rule 2.
+
+An actor that existed before the key was bound (an older coordinator, a legacy name with no
+registration) keeps its name and its history if it is given to the principal once by the
+writing host command:
+
+```sh
+python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime \
+  adopt-actor alpha alex/session1 --principal lane:orc-coord --actor OPERATOR \
+  --reason "the lane he coordinates in"
+```
+
+The command refuses a name that appears nowhere in the project (no session registration, no
+owner entry and no tracker row names it), so the audit is not a place to invent an actor. It
+refuses a name on the deployment operator allowlist that another principal owns in another
+project: the one operator list must mean the same lane everywhere. It records in
+`<runtime>/actor-adoptions.audit.json` who gave which actor to which principal, when and why
+(`admin.py actor-adoptions [PROJECT]` prints it), and reports `previous` when it moved an
+actor this project already gave to a different principal. It writes nothing when the project
+already gives the actor to this principal.
+
+**Moving an actor that another principal already owns is not the same plain command.** Once
+a project's registry gives an actor to a principal, `adopt-actor` refuses to give it to
+another unless the command names the owner it has now with `--from PRINCIPAL`; the audit
+entry for such a change carries `"moved": true` beside `previous`. Without `--from` the
+refusal changes nothing, so one mistyped actor cannot take a lane's identity and record away.
+**Nothing removes an owner**: there is no command that takes an actor back to "no principal",
+and a wrong owner is corrected with `adopt-actor ... --from`. The audit is a short history:
+it keeps the newest 200 entries and drops the oldest silently; it is a record of recent
+adoptions, not a complete ledger (the registry's owners map is the authority).
+
+**What this section does not do.** Rule 2 binds only BOUND keys. A line with no
+`--principal`, a key bound only to projects, and a line printed by an older release all act
+as every actor until slice 4 (bound keys only), and a line of an older release stays outside
+even then. A lane still passes its own work until rule 3 (slice 6): its actor may approve its
+own contribution and take its own merge slot. A principal named with no `--project` reaches
+every project of the installation by registering there first; `--principal` alone limits the
+names a key may use, not the projects it can reach. And `operators add` does not look at the
+owners maps: an actor adopted by two principals and listed afterwards belongs to both, in its
+own project each. Adopt or move an actor before putting its name on the operator list.
+
+`session register` under a bound key is unbounded, and every bound request parses the whole
+registry: one lane can slow the others by registering in a loop (the registry was 16.6 kB
+with 53 entries in the review's run, and 40 registrations took 35 s). Nothing here caps that;
+slice 4's bound-keys-only rule and the operator list are what bound who may register.
+
+Removing a coordinator whose lane is simply replaced: remove its `authorized_keys` line (its
+principal binding goes with the key), and do not start with `operators remove
+--confirm-revoke`, which makes every void, integration revert, retraction and proposal record
+it authored stop counting. Take a name off the operator list only when that effect is what is
+wanted.
+
+**Downgrade limit.** The registry gains one key, `owners` (actor to principal). This kit
+writes that key only when it is non-empty: an installation that configures nothing still
+writes the registry exactly as before, and an older kit reads it. Once an actor is adopted,
+or a session is registered under a bound key, the registry carries `owners`, and an older
+kit's validator refuses a registry with the unknown key. That older kit then refuses
+`session show`, `session resume`, `session register`, `session run start` and
+`actor-standing` for the project, **and `admin.py backup PROJECT` fails for it with status
+incomplete**; every key bound with `--principal` is refused (its wrapper does not know the
+argument), while `bd` itself, `work` and `review` keep working. Before rolling back to a kit
+without rule 2, remove that map from `projects/PROJECT/.sessions.json` first (and the binding
+from the keys), or the older kit cannot read the registry, cannot back the project up, and
+refuses every such key. The same applies to a coordination-sidecar backup taken after an
+adoption. [OFFICE_SERVICE.md](OFFICE_SERVICE.md) repeats this beside "Binary pins on
+rollback".
 
 ### sshd settings the boundary needs
 
@@ -282,6 +382,8 @@ history](#malformed-structured-history) (`void-record`).
 | `guidance-status PROJECT --actor OPERATOR` | print who has acknowledged which guidance version, with the current text, the previous text, the history, `up_to_date`, `behind` and `stale`, and who cleared the guidance, when and which version (`clear_record`, `clears`) (the authoritative read; the endpoint's `guidance status` shows no guidance text) | the deployment operator allowlist |
 | `clear-guidance PROJECT --actor OPERATOR` | remove `GUIDANCE.md` and `.guidance.json` and write the local `.guidance-clear.json` record (who, when, cleared version; shown by `guidance-status`); guidance then reads `present: false`. A record already there that is not valid is kept as `.guidance-clear.json.invalid.<UTC time>`, and the command says so. A symlinked `GUIDANCE.md` is refused and needs a manual delete | the deployment operator allowlist |
 | `compact-guidance-acks PROJECT --actor OPERATOR` | drop acknowledgements for versions other than the current and previous one; the record keeps `acks_compacted_by`/`acks_compacted_at` (also kept across later sets) as the audit trail | the deployment operator allowlist |
+| `adopt-actor PROJECT ACTOR --principal lane:NAME --actor OPERATOR --reason TEXT [--from lane:OWNER]` | give an existing actor to a principal (a lane) in one project's session registry, so a key bound to that principal may act as it. It refuses a name that appears nowhere in the project, and it refuses to move an actor another principal already owns unless `--from` names that owner. It refuses a name on the operator allowlist that another principal owns in another project, records the change in `<runtime>/actor-adoptions.audit.json` (with `moved` on a move), and writes nothing when the actor already belongs to this principal. See [Bind a key to its principal](#bind-a-key-to-its-principal) | the deployment operator allowlist (the `--actor`), checked before any write |
+| `actor-adoptions [PROJECT]` | read the adoption audit: who gave which actor to which principal, when and why | none: read-only |
 
 All five are shell-trusted: access to the service account's shell is the boundary.
 `requirement-apply`, `requirement-backfill`, `void-record` and `anchor-release` also
@@ -1513,7 +1615,7 @@ timer below applies to deployments that use a user systemd manager.
 
 Edit `templates/beads-backup.service` for the installation paths, then copy it and `templates/beads-backup.timer` into the service account's `~/.config/systemd/user/`. Its `ExecStart` uses `backup --all`, so the one timer covers every project initialized in that runtime, including projects added later, and every run writes the `backup-status.json` record described above. Enable with `systemctl --user daemon-reload` and `systemctl --user enable --now beads-backup.timer`. Check `systemctl --user list-timers`, the service journal, and `backup-status --require-complete`; lingering must already be enabled for unattended operation. The timer performs same-host backup only. Configure off-machine copying, its completeness gate and retention separately; the timer does not copy anything off the host. These templates do not replace an existing team's backup schedule, and an existing installation that already runs a long-sync wrapper for this runtime keeps it. Once this kit's native step is deployed, that wrapper's monkeypatched `run_bd` and its `--timeout` ceiling are dead code: `admin.py backup` performs the native step itself through the Dolt SQL client (bounded by the 30-minute ceiling), and the wrapper's `dolt-backup-state.json` marker is no longer written or read by the kit.
 
-`add-project` reads every installed `~/.config/systemd/user/beads-*backup*.service` unit for the account — `beads-backup.service` is only one of the names a deployment may use — and reports factually which units it read. It states that a `backup --all` unit covers every project; a recognised long-sync wrapper for this runtime is reported as covering only the projects its `--project` arguments name (a wrapper that names no project is not coverage of anything), because a project added later needs another wrapper line. It prints the exact `ExecStart` to add when a unit that names projects individually does not cover every project (a project list is replaced with the durable form; named projects and `--all` are never combined in one command) and never steers an operator off an existing wrapper. An absent or unreadable unit is reported as no coverage rather than assumed fine, and a unit that runs the backup through `sh -c` is deliberately still reported as not backing up the runtime: only a recognised `admin.py` or wrapper `ExecStart` can be attributed to this runtime with certainty, and a wrong "already covered" answer could leave a project silently off the schedule, so the conservative direction is the safe one (it can prompt a double-check, never hide a gap). It reads the unit files only — it never edits, installs or enables a unit — and systemd drop-ins (`*.service.d/*.conf`) are not inspected, so the report is about the unit files themselves and not about a drop-in override.
+`add-project` reads every installed `~/.config/systemd/user/beads-*backup*.service` unit for the account — `beads-backup.service` is only one of the names a deployment may use — and reports factually which units it read. It states that a `backup --all` unit covers every project; a recognised long-sync wrapper for this runtime is reported as covering only the projects its `--project` arguments name (a wrapper that names no project is not coverage of anything), because a project added later needs another wrapper line. Where no unit covers the project it prints, each under its own label, the shell command that runs a backup of every project now (`PYTHON KIT/admin.py --root ROOT backup --all`, as the service account pastes it), the `ExecStart` line for a schedule (a line of the unit file, not a shell command, with the unit directory it goes in) and the check to run afterwards (kittrial-5bb.200: it used to print the `ExecStart` line alone, which pasted into a shell answers `Permission denied`). It prints the exact `ExecStart` to add when a unit that names projects individually does not cover every project (a project list is replaced with the durable form; named projects and `--all` are never combined in one command) and never steers an operator off an existing wrapper. An absent or unreadable unit is reported as no coverage rather than assumed fine, and a unit that runs the backup through `sh -c` is deliberately still reported as not backing up the runtime: only a recognised `admin.py` or wrapper `ExecStart` can be attributed to this runtime with certainty, and a wrong "already covered" answer could leave a project silently off the schedule, so the conservative direction is the safe one (it can prompt a double-check, never hide a gap). It reads the unit files only — it never edits, installs or enables a unit — and systemd drop-ins (`*.service.d/*.conf`) are not inspected, so the report is about the unit files themselves and not about a drop-in override.
 
 ### Local and Windows clients
 

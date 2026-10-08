@@ -331,14 +331,36 @@ the exact command for the server. `remaining` counts the `todo` ones.
 | Repository location recorded | the project's `repository` field | an owner, on the setup page |
 | A first task defined | the task list (the project's merge slot row is not a task) | any member who may write tasks |
 | A personal agent granted the project | the enabled agents granted this project | each member, for their own agent |
-| Guidance set | the host | an operator: `admin.py set-guidance NAME --actor OPERATOR --file FILE` |
-| Onboarding set | the host | an operator: `admin.py set-onboarding NAME --file FILE` |
-| Covered by a scheduled backup | the host | an operator, with the `ExecStart` line shown |
+| Guidance set | the host | an operator: `PYTHON KIT/admin.py --root ROOT set-guidance NAME --actor OPERATOR --file FILE` |
+| Onboarding set | the host | an operator: `PYTHON KIT/admin.py --root ROOT set-onboarding NAME --file FILE` |
+| Covered by a scheduled backup | the host | an operator: a command that runs a backup now, and the `ExecStart` line for a schedule |
 
 - **Who can do it holds for one person and for three.** Each step names a role, not a
   person. On an installation where one person is operator, superuser and owner, they do
   every step; where those are three people, the page tells the owner which steps are
   theirs and gives them the command to send to the operator for the rest.
+- **What a host step gives to copy says what it is** (kittrial-5bb.200). A step carries
+  `commands`, a list; each entry has a `label`, the `text`, a `note` and a `kind`:
+  `shell` can be pasted into a shell on the server as it stands; `shell-fill` is a shell
+  command with words to replace first, named in `replace` (`OPERATOR`, `FILE`);
+  `unit-line` is a line of a systemd unit file and **not a command**. Every shell
+  command begins as the host says its commands begin: the interpreter the kit runs
+  under, `admin.py` of the installed kit, `--root` and the runtime, each through
+  `install/current` where the installation has one. (`admin.py ...` alone is not on
+  `PATH` and, in a release, deliberately not executable; the backup step used to show
+  the unit-file line `ExecStart=...` as "the command", which a shell answers with
+  `Permission denied`.) The backup step gives three entries: run a backup now, the line
+  for a schedule with where it goes and how to check, and the check
+  (`backup-status --require-complete`). `command` is still sent, with the first entry's
+  text, for a page older than the service. An endpoint older than this answer cannot say
+  how its commands begin: the entries then name `PYTHON`, `KIT` and `RUNTIME_ROOT` as
+  words to replace.
+- **The backup step says which of two things is missing**: a backup that has been run,
+  and a schedule that will run the next. A project that was backed up once and is on no
+  schedule reads `todo` with "What is missing is the schedule"; one with neither says
+  both are missing. The step looks for a systemd unit of the service account
+  (`beads-*backup*.service`) that backs up this runtime, and says so: a schedule kept
+  anywhere else is not seen.
 - **The page runs nothing on the server.** The host steps show a command to copy; the
   web interface does not run it. One host step can also be done on the page: an owner
   may write the project's onboarding text there (see "Onboarding text from the setup
