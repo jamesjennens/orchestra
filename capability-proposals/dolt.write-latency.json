@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "operation_id": "dolt-write-latency-investigation-20261008",
+  "key": "dolt.write-latency",
+  "name": "Database-count cost in the pinned Beads and Dolt write path",
+  "aliases": [
+    "Dolt write latency",
+    "database count write cost",
+    "information_schema columns scaling",
+    "project cap performance"
+  ],
+  "summary": "Historical synthetic measurements for Beads 1.2.2 and Dolt 2.2.0 at source f615440: native and endpoint write/claim/checkpoint/review/merge costs at 1, 5, 10, 20, 35, 50 and 100 databases, captured SQL counts and catalog durations, and single release25/backup-all samples at 50 and 100. Two filtered migration-column checks recur on measured native writes; their duration grows with the catalog while ordinary-query and list/show controls remain comparatively flat. The report recommends retaining the 20-database default and route-specific estimates, and evaluates settings/versions, retired-database movement, multiple servers and operator-only count/latency warnings. This is measured investigation documentation, not an implemented speedup, a universal performance guarantee, a dependency upgrade, or a live-deployment/restore claim.",
+  "requirements": [],
+  "anchors": [
+    "reports/BD_DATABASE_SCALING.md#finding",
+    "reports/BD_DATABASE_SCALING.md#recommended-bound-and-operator-warning",
+    "reports/BD_DATABASE_SCALING.md#options-and-risks",
+    "reports/BD_DATABASE_SCALING.md#reproduction-and-limits"
+  ],
+  "code": [],
+  "tests": [],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "dolt",
+    "beads",
+    "performance",
+    "operations"
+  ]
+}
