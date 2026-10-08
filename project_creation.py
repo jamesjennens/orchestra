@@ -73,6 +73,9 @@ ERROR_LIMIT = 300
 #: One sentence for a name that cannot be used, whatever the reason (taken by a project,
 #: held by another creation, or retired), so the answer does not say which.
 NOT_AVAILABLE = 'Project name %s is not available: choose another name'
+#: The ``by`` of a creation an operator made with ``admin.py add-project``. No web account
+#: made it, so it is never counted toward an account's limit (kittrial-5bb.176).
+HOST = 'host'
 
 
 class NothingMade(ValueError):
@@ -410,6 +413,10 @@ def work(root, name, initialize=None):
         with contextlib.redirect_stdout(output):
             initialize(root, name, stage)
     except BaseException as error:
+        if not _record_is_ours(root, name, record):
+            # Not this run's record any more: a late or interrupted run must not overwrite or
+            # delete what another run wrote (kittrial-5bb.176 item 2).
+            raise
         if made(root, name) == 'nothing':
             path = admin.project_dir(root, name)
             if path.is_dir():
@@ -418,6 +425,15 @@ def work(root, name, initialize=None):
             delete_record(root, name)
             if isinstance(error, Exception):
                 note_failure(root, name, record.get('by'), error)
+                try:
+                    missing = admin.missing_bd_init_tools(root)
+                except Exception:                                    # noqa: BLE001
+                    missing = []
+                if missing:
+                    # The program's name is not host-private detail, and naming it is what lets the
+                    # person who asked tell an operator what to look at, instead of the reason
+                    # living only in project-creations/last-failure.txt (kittrial-5bb.176 item 3).
+                    raise NothingMade(missing_tools_message(missing)) from None
                 raise NothingMade(COULD_NOT) from None
             raise
         # The detail (which may name host paths and commands) stays in the record, for the operator.
@@ -457,6 +473,127 @@ def incomplete_message(name):
             'remove it (admin.py remove-creation %s --actor OPERATOR --reason REASON).' % (name, name, name))
 
 
+def _record_is_ours(root, name, record):
+    """Whether the record on disk is still the one this run last wrote.
+
+    A run that failed or was interrupted must not overwrite or delete a record another run
+    wrote in the meantime (kittrial-5bb.176 item 2). The creation lock makes that all but
+    impossible now; this check makes it impossible.
+    """
+    try:
+        current = read_record(root, name)
+    except (ValueError, OSError):
+        return False
+    return current == record
+
+
+def host_busy_message(root, name):
+    """What ``add-project`` is told when another creation holds the creation lock.
+
+    The same name: the sentence ``admin.add_project`` has always used for a name it cannot
+    use, so it appends :func:`unfinished_sentence` and the operator is told the creation is
+    RUNNING. Another name: name the project that is being created (kittrial-5bb.176 item 1).
+    """
+    running = running_name(root)
+    if running == name:
+        return 'Project already exists; use it rather than initializing again'
+    if running:
+        return ('Another project is being created on this server right now (%s); wait for it to finish, then run '
+                'this command again.' % running)
+    return BUSY
+
+
+def host_create(root, name, initialize, guards):
+    """``admin.py add-project``'s path: the operator's route keeps the web route's record.
+
+    ``guards`` refuses a name that cannot be used before anything is written, so a refusal
+    still leaves no directory, no database and no record. A record already there in state
+    ``started`` - an earlier ``add-project`` that stopped, or a web request that stalled -
+    is reused rather than overwritten, so the run that finishes is the record that was
+    begun, with the account that began it.
+
+    It holds the SAME per-host creation lock the web route holds (``create``) for its whole
+    run, and writes the same ``.running`` marker, so one creation runs at a time on the host
+    whichever route started it (kittrial-5bb.176 items 1 and 2). A second creation is
+    refused and told the name is RUNNING; ``remove-creation`` and ``retire-project`` refuse
+    to touch the directory of a creation in flight; and the record this run writes is the
+    one it owns, so a failure never downgrades or deletes a record another run wrote.
+
+    A failure that made nothing deletes the record this call wrote, so a refusal still
+    leaves nothing behind. A failure after something was made leaves the record
+    ``incomplete``, which ``finish-project`` and ``remove-creation`` act on
+    (kittrial-5bb.176). The directory is never removed here: ``admin.initialize_project``
+    explains why (kittrial-5bb.162: a failure must not delete another creation's work).
+
+    Returns the finished record. Raises what ``guards`` or the work raised, with the record
+    left to match what is on the host.
+    """
+    root = Path(root)
+    try:
+        with creation_lock(root, wait=0, name=name):
+            return _host_create_locked(root, name, initialize, guards)
+    except Busy:
+        raise ValueError(host_busy_message(root, name)) from None
+
+
+def _host_create_locked(root, name, initialize, guards):
+    guards(root, name)
+    record = read_record(root, name)
+    if record is None or record['state'] != 'started':
+        record = {'project': name, 'by': HOST, 'state': 'started', 'stage': None, 'started_at': _stamp()}
+
+    def stage(label):
+        record['stage'] = label
+        write_record(root, name, record)
+
+    record['stage'] = None
+    write_record(root, name, record)
+    try:
+        initialize(root, name, stage)
+    except BaseException as error:
+        if not _record_is_ours(root, name, record):
+            # The record on disk is not the one this run wrote: another run owns it now, and
+            # a late or interrupted run must never overwrite or delete it.
+            raise
+        if made(root, name) == 'nothing':
+            delete_record(root, name)
+        else:
+            record.update(state='incomplete', stopped_at=_stamp(), error=_bounded(error))
+            write_record(root, name, record)
+        raise
+    record.update(state='created', stage=None, completed_at=_stamp())
+    write_record(root, name, record)
+    return record
+
+
+def unfinished_sentence(root, name):
+    """What ``add-project`` adds when the name is held by a creation that did not finish.
+
+    ``''`` when there is no readable unfinished record, or when the creation finished or
+    was removed. ``add-project`` appends this to "Project already exists" so a re-run names
+    the commands that act on the leftover instead of being a dead end (kittrial-5bb.176).
+    Never raises: a record it cannot read is not its business.
+    """
+    try:
+        record = read_record(root, name)
+        running = running_name(root)
+        if record is None:
+            # The marker written beside the lock names the creation in flight, and it is
+            # written before the record: a creation that has just taken the lock holds its
+            # name (kittrial-5bb.176 item 1).
+            effective = RUNNING if running == name else None
+        else:
+            effective = effective_state(root, record, running)
+    except (ValueError, OSError):
+        return ''
+    if effective in (None, 'created', 'removed', 'damaged', NOT_A_RECORD):
+        return ''
+    if effective == RUNNING:
+        return ('A project creation for %s is running on this server right now; wait for it to finish and run '
+                'this command again.' % name)
+    return incomplete_message(name)
+
+
 def _coverage(root, name):
     import admin
     try:
@@ -486,6 +623,10 @@ def finish(root, name, finish_steps=None):
             raise ValueError('The creation of %s was removed' % name)
         state = made(root, name)
         if state == 'nothing':
+            if record.get('by') == HOST:
+                raise ValueError('Nothing was made for %s: run the command again (admin.py add-project %s), or '
+                                 'remove the record: admin.py remove-creation %s --actor OPERATOR --reason REASON'
+                                 % (name, name, name))
             raise ValueError('Nothing was made for %s: the same web request creates it, or remove the record: '
                              'admin.py remove-creation %s --actor OPERATOR --reason REASON' % (name, name))
         if state != 'initialized':
@@ -603,6 +744,12 @@ COMMANDS = {
     NOT_A_RECORD: 'this file is not a creation record, because no project can have that name. It holds no name and '
                   'is not counted. Move project-creations/FILE out of that directory',
 }
+#: For a creation the operator's own ``add-project`` began (``by`` is :data:`HOST`) the same
+#: command resumes it, not a web request (kittrial-5bb.176 item 4).
+HOST_COMMANDS = {
+    STALLED: 'run this command again (admin.py add-project NAME), which resumes it; or remove the record '
+             '(admin.py remove-creation NAME --actor OPERATOR --reason REASON), which frees the name',
+}
 #: Put before the command of a damaged record whose project is initialized, and so is served.
 SERVED_DAMAGED = ('projects/NAME is initialized and is SERVED WITH A DAMAGED CREATION RECORD: the kit cannot tell '
                   'whether its creation finished. The project itself is used as before; only its name is held. ')
@@ -619,6 +766,8 @@ def attention(root):
         if record['effective'] not in COMMANDS:
             continue
         command = COMMANDS[record['effective']]
+        if record.get('by') == HOST:
+            command = HOST_COMMANDS.get(record['effective'], command)
         served = record['effective'] == 'damaged' and _initialized(root, record['project'])
         if served:
             command = SERVED_DAMAGED + command
@@ -782,6 +931,16 @@ def note_failure(root, name, account, error, step=None):
 
 COULD_NOT = ('The project could not be created and nothing was made. Try again; if it fails again, ask an '
              'operator of the server.')
+#: One sentence for a program ``bd init`` needs and this host has not got. The program's name is not
+#: host-private detail, and the person who asked can pass it to an operator (kittrial-5bb.176 item 3).
+MISSING_TOOLS = ('The server has no %s, which bd init needs to create a project; nothing was made. Ask an operator '
+                 'of the server to install it and try again.')
+
+
+def missing_tools_message(missing):
+    """One sentence naming the programs a creation needs and this host has not got."""
+    return MISSING_TOOLS % ' and '.join(missing)
+
 MADE_NOT_REGISTERED = ('Project %s was made on the server, but it could not be registered in the web interface. Ask '
                        'an operator of the server to look at it. When that is repaired, create it again with the '
                        'same name: nothing is made twice, it is only registered. Do not create it under another name.')
@@ -800,7 +959,13 @@ def _sentence_patterns():
                      'are not finished)'),
              escaped(AT_SERVER_LIMIT), escaped(AT_SERVER_LIMIT + ' Project %s was made on the server and is not registered.'),
              escaped(COULD_NOT), escaped(MADE_NOT_REGISTERED), escaped(NAME_RULE), incomplete]
-    return [re.compile(text) for text in texts]
+    patterns = [re.compile(text) for text in texts]
+    # The missing-tools sentence (item 3) names one or more programs joined by ' and '. Each is a
+    # plain program name, never a path, so the recognised sentence stays free of host detail.
+    tool = r'[a-z][a-z0-9+-]{0,23}'
+    patterns.append(re.compile(re.escape(MISSING_TOOLS).replace(
+        '%s', '(?:%s)(?: and (?:%s))*' % (tool, tool))))
+    return patterns
 
 
 def creation_sentence(line):
