@@ -3529,6 +3529,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                            'projects', 'scopes')
     AGENT_UPDATE_FIELDS = ('name', 'tool', 'working_directory', 'machine', 'notes',
                            'projects', 'enabled')
+    AGENT_CREDENTIAL_FIELDS = ('label', 'scopes')
     ACCOUNT_CREATE_FIELDS = ('username', 'display_name')
 
     #: What a task change may change, and what else its body may carry: ``version`` is the
@@ -4791,6 +4792,11 @@ class ApiHandler(BaseHTTPRequestHandler):
                 # sentence (kittrial-5bb.90 review item 3.2).
                 for project_id in agent.get('projects') or ():
                     self._require_usable(project_id)
+            # A field this route does not take is refused, not dropped, as when an agent is
+            # made (kittrial-5bb.208 review). After the checks above: who may not see the
+            # agent keeps the service's 404.
+            self.service.get_agent(ctx.principal, ctx.params['aid'])
+            refuse_unknown_fields(payload, self.AGENT_CREDENTIAL_FIELDS, 'A new agent credential')
             result = self.service.issue_agent_credential(
                 ctx.principal, ctx.params['aid'], scopes=payload.get('scopes'),
                 label=payload.get('label'), request_id=ctx.request_id)

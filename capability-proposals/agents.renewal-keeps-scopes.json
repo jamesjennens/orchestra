@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "operation_id": "capnew-352a090f9a004575ade24162260f7f24",
+  "key": "agents.renewal-keeps-scopes",
+  "name": "An agent's scopes are kept on the agent; a new credential carries exactly them",
+  "aliases": [
+    "agent credential renewal",
+    "new secret scopes",
+    "read-only agent",
+    "issue agent credential",
+    "agent scopes",
+    "scopes_source",
+    "scopes_needed",
+    "at most 20 credentials",
+    "dead credentials pruned",
+    "What it may do"
+  ],
+  "summary": "What an agent may do is kept on the agent record (scopes): written when the agent is made and changed only by a renewal that sends a scopes list. A new credential (POST /v1/agents/{id}/credentials) with no list carries exactly those; no credential, working or dead, decides anything. A list that asks for nothing more is taken from the agent's account or a superuser; one that widens only from its own account, else 403. scopes must be a list of known names and the body takes only label and scopes (422). An agent made before the record kept its scopes: while its working credentials all allow the same, that is inferred (scopes_source inferred, stored by its first renewal); when none works or they differ, nothing is guessed: scopes is null and a renewal with no list is refused 409 with detail.scopes_needed, never the default four. The record carries scopes, scopes_source, scopes_differ and per credential scopes and working. The agents page shows what an agent may do, lists each credential with a Revoke button, and lets its account set the scopes under What it may do. At most 20 that work; of the dead ones the newest 5 are kept, older ones deleted (the audit log keeps the events).",
+  "requirements": [],
+  "anchors": [
+    "docs/HTTP_DEPLOYMENT.md#personal-agents"
+  ],
+  "code": [
+    "http_auth.py::Service.agent_scopes",
+    "http_auth.py::Service._scope_names",
+    "http_auth.py::Service._issue_agent_credential_locked",
+    "http_auth.py::Service._prune_agent_credentials",
+    "http_auth.py::Service._agent_credentials_shown",
+    "http_auth.py::Service._credential_live",
+    "http_auth.py::Service.issue_agent_credential",
+    "http_auth.py::Service.agent_scope_differences",
+    "http_service.py::ApiHandler.agents_credential_issue"
+  ],
+  "tests": [
+    "tests/test_http_agents.py",
+    "tests/web_agents_screen.mjs"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "agents",
+    "http",
+    "identity"
+  ]
+}
