@@ -64,7 +64,7 @@ def load_export(source):
     for number,line in enumerate(text.splitlines(),1):
         if not line.strip():continue
         try:row=json.loads(line)
-        except json.JSONDecodeError as e:raise ValueError(f'{path}: line {number} is not valid JSON ({e.msg})') from None
+        except (json.JSONDecodeError, RecursionError, ValueError) as e:raise ValueError(f'{path}: line {number} is not valid JSON ({getattr(e, "msg", str(e))})') from None
         if not isinstance(row,dict):raise ValueError(f'{path}: line {number} is not a JSON issue object')
         if not isinstance(row.get('id'),str) or not row['id']:raise ValueError(f'{path}: line {number} has no string issue id')
         if row.get('comments') is not None and not isinstance(row['comments'],list):raise ValueError(f'{path}: line {number} has a non-list comments field')
@@ -161,7 +161,7 @@ def load_cursor(source,scope):
     try:text=path.read_text(encoding='utf-8-sig')
     except OSError as e:raise ValueError(f'cannot read cursor {path}: {e}') from None
     try:payload=json.loads(text)
-    except json.JSONDecodeError as e:raise ValueError(f'cursor {path} is not valid JSON ({e.msg})') from None
+    except (json.JSONDecodeError, RecursionError, ValueError) as e:raise ValueError(f'cursor {path} is not valid JSON ({getattr(e, "msg", str(e))})') from None
     if not isinstance(payload,dict):raise ValueError(f'cursor {path} is not a JSON object')
     if payload.get('version')!=CURSOR_VERSION:raise ValueError(f'cursor {path} has unsupported version {payload.get("version")!r}')
     stored=payload.get('scope')

@@ -104,7 +104,7 @@ def issue_confirmation(issue_id, run):
     """
     try:
         rows=json.loads(run(['show',issue_id,'--json']))
-    except (TypeError,ValueError) as exc:
+    except (TypeError,ValueError,RecursionError) as exc:
         raise ValueError('Could not read native issue %s to confirm its parent, creator and title: %s' % (issue_id,exc))
     if isinstance(rows,dict):rows=[rows]
     if (not isinstance(rows,list) or len(rows)!=1 or not isinstance(rows[0],dict)
@@ -324,9 +324,11 @@ def apply_native(p, actor, run, project):
         reusable=resubmittable(prior,actor)
         if prior and prior['sha256']!=digest and not reusable:raise ValueError('Request ID already reserved for different content or actor')
         label='request:'+identity
-        found=json.loads(run(['list','--all','--limit','0','--label',label,'--json'])) or []
+        found=record_json.loads_array_rows(run(['list','--all','--limit','0','--label',label,'--json'])) or []
         if len(found)>1:raise ValueError('Duplicate native request records; operator reconciliation required')
         if found:
+            if found[0].get('malformed'):
+                raise ValueError('Cannot verify native request: child %s could not be parsed' % (found[0].get('id') or ''))
             if 'request-content:'+digest not in (found[0].get('labels') or []):
                 # A receipt completed by the operator from the native issue has no
                 # recoverable original content; accept its recorded id.
@@ -363,7 +365,7 @@ def apply_native(p, actor, run, project):
                              +' The native create did not confirm an issue; the outcome is uncertain, so the request stays pending. Inspect native state and reconcile this request ID (admin.py reconcile-request) before retrying.')
         try:
             issue=json.loads(raw)
-        except (TypeError,ValueError):
+        except (TypeError,ValueError,RecursionError):
             issue=None
         if not isinstance(issue,dict) or not issue.get('id'):raise ValueError('Create response uncertain; reconcile same request ID')
         atomic(receipt,receipt_record(pending,digest,'complete',id=issue['id'],actor=actor))
@@ -413,7 +415,10 @@ def apply_native(p, actor, run, project):
             return {'acquired':True,'reconciled':True,'context':context}
         return {'acquired':False,'holder':state.get('holder')}
     # Validate task exists before reserving; check native state on retry.
-    run(['show',p['task'],'--json'])
+    task_raw=run(['show',p['task'],'--json'])
+    task_rows=record_json.loads_array_rows(task_raw)
+    if task_rows and task_rows[0].get('malformed'):
+        raise ValueError('Task %s is malformed: %s' % (p['task'], task_rows[0].get('error') or 'cannot parse row'))
     atomic(context_path,desired)
     result=json.loads(run(['merge-slot','acquire','--holder',actor,'--json']))
     result['context']=desired if result.get('acquired') else None

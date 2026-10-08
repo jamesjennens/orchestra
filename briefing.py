@@ -1156,8 +1156,9 @@ def help_notes(action):
             'Every unresolved item must be carried forward unchanged or explicitly resolved with reason and evidence.']
 
 def exported_rows(run):
-    """Use the bounded JSON decoder for every briefing export read."""
-    return record_json.loads_rows(run(['export','--all']))
+    """Bound rows and classify native events before briefing lifecycle facts."""
+    from lifecycle import read_event_rows
+    return read_event_rows(run)
 
 def checkpoint_writes_enabled(root):
     """Reader-first rollout: only an installation operator enables new writes."""

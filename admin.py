@@ -1127,7 +1127,7 @@ def revoked_verifications(root,actor,limit=5):
     for name in initialized_projects(root):
         path=project_dir(root,name)
         try:
-            rows=[json.loads(line) for line in run_bd(root,name,['export','--all']).splitlines() if line.strip()]
+            rows=record_json.loads_rows(run_bd(root,name,['export','--all']))
             entries,_=capability_records.catalog(rows,authority)
             before=capability_records.Trust(None,authority,listed,path,export_rows=rows)
             after=capability_records.Trust(None,authority,remaining,path,export_rows=rows)
@@ -1557,7 +1557,7 @@ def restore_destination_state(root,destination):
     if metadata!='server':return 'partial'
     try:
         rows=json.loads(run_bd(root,destination,['list','--all','--limit','0','--json']) or '[]')
-    except (subprocess.CalledProcessError,subprocess.TimeoutExpired,OSError,ValueError,TypeError):
+    except (subprocess.CalledProcessError,subprocess.TimeoutExpired,OSError,ValueError,TypeError,RecursionError):
         return 'partial'
     if not isinstance(rows,list):return 'partial'
     slot=destination+'-merge-slot'
@@ -1617,7 +1617,7 @@ def provision_merge_slot(root,name):
     from coordination import merge_slot_missing
     try:
         state=json.loads(run_bd(root,name,['merge-slot','check','--json']))
-    except (TypeError,ValueError):
+    except (TypeError,ValueError,RecursionError):
         state=None
     if not merge_slot_missing(state):return
     try:
@@ -2268,7 +2268,7 @@ def retire_findings(root,name):
             rows=json.loads(run_bd(root,name,['list','--all','--limit','0','--json']) or '[]')
             if not isinstance(rows,list):raise ValueError('unexpected list output')
             bd='reads';issues=sum(1 for row in rows if not (isinstance(row,dict) and row.get('id')==name+'-merge-slot'))
-        except (subprocess.CalledProcessError,ValueError,TypeError):
+        except (subprocess.CalledProcessError,ValueError,TypeError,RecursionError):
             bd='rejects';slot='not-applicable'
         except (subprocess.TimeoutExpired,OSError):
             bd='unreachable'
@@ -2278,7 +2278,7 @@ def retire_findings(root,name):
             if isinstance(state,dict) and 'available' in state and not state.get('error'):
                 holder=state.get('holder');slot='held' if holder else 'free'
             elif isinstance(state,dict):slot='missing'
-        except (subprocess.CalledProcessError,subprocess.TimeoutExpired,OSError,ValueError,TypeError):pass
+        except (subprocess.CalledProcessError,subprocess.TimeoutExpired,OSError,ValueError,TypeError,RecursionError):pass
     pending={};unreadable={}
     for journal in RESERVATION_JOURNALS:
         directory=path/journal
@@ -3300,7 +3300,7 @@ def revoked_proposal_records(root,actor,limit=5):
     for name in initialized_projects(root):
         path=project_dir(root,name)
         try:
-            rows=[json.loads(line) for line in run_bd(root,name,['export','--all']).splitlines() if line.strip()]
+            rows=record_json.loads_rows(run_bd(root,name,['export','--all']))
             moved,setting=proposal_records.revocation_effects(rows,authority,actor,path)
             changed+=['%s/%s'%(name,item) for item in moved]
             if setting:settings.append('%s: %s'%(name,setting))
@@ -3331,7 +3331,7 @@ def revoked_keyed_voids(root,actor,limit=5):
     count=0;changed=[];unreadable=0
     for name in initialized_projects(root):
         try:
-            rows=[json.loads(line) for line in run_bd(root,name,['export','--all']).splitlines() if line.strip()]
+            rows=record_json.loads_rows(run_bd(root,name,['export','--all']))
         except (OSError,ValueError,TypeError,KeyError,subprocess.CalledProcessError):
             unreadable+=1
             continue
@@ -3384,7 +3384,7 @@ def revoked_revert_records(root,actor,limit=5):
     for name in initialized_projects(root):
         path=project_dir(root,name)
         try:
-            rows=[json.loads(line) for line in run_bd(root,name,['export','--all']).splitlines() if line.strip()]
+            rows=record_json.loads_rows(run_bd(root,name,['export','--all']))
         except (OSError,ValueError,TypeError,KeyError):
             unreadable+=1
             continue
@@ -5701,7 +5701,7 @@ def main():
                 if kind is None:raise ValueError('Unsupported operator void target kind')
                 print(json.dumps(kind.apply_void(payload,args.actor,run,authority)))
                 return
-            rows=[json.loads(line) for line in run_bd(root,args.project,['export','--all']).splitlines() if line.strip()]
+            rows=record_json.loads_rows(run_bd(root,args.project,['export','--all']))
             print(json.dumps(apply_void(rows,payload['task'],args.actor,payload,run,operator=True,
                                         operators=authority,journal=path)))
     elif args.command=='revert-record':
@@ -5714,7 +5714,7 @@ def main():
         def run(argv):return run_bd(root,args.project,['--actor',args.actor,*argv])
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
-            rows=[json.loads(line) for line in run_bd(root,args.project,['export','--all']).splitlines() if line.strip()]
+            rows=record_json.loads_rows(run_bd(root,args.project,['export','--all']))
             print(json.dumps(apply_revert(rows,payload['task'],args.actor,payload,run,operator=True,
                                           operators=authority,journal=path)))
     elif args.command=='operators':

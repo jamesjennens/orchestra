@@ -1607,6 +1607,7 @@ it by failing.
 | Command | Option | Range |
 | --- | --- | --- |
 | every command | JSON nesting in a request, a `--file` attachment or a payload argument | at most 64 levels; deeper is refused with `JSON nested too deeply (more than 64 levels)`, exit 2, nothing written |
+| tracker export / bd rows | JSON nesting in an issue row (`bd export --all`, `bd list`, `bd show`) | at most 750 levels (ROW_NESTING_MAX); rows of 751 to about 980 levels, which earlier kits read normally, are now malformed (a catalog anchor at 751 levels reads accepted before and malformed now) |
 | `work` | `--limit`, `--handoff-limit` | 1..100 |
 | `work` | `--offset`, `--handoff-offset` | >= 0 |
 | `work` | `--state` | one of the documented review states |
@@ -1811,6 +1812,23 @@ and content hashes are durable, so an uncertain create is reconciled with the sa
 request ID instead of creating a duplicate.
 
 ## Backward compatibility
+
+Unreadable native reference, capability and proposal rows are classified by their
+ID's membership in native label-filtered reads. Contributor-controlled titles and
+labels inside unreadable JSON are not classification evidence. Reference and
+capability catalogs name unreadable anchors as malformed (their exact key may be
+unknown); get reports that the selected key exists but cannot be read. These
+anchors stay out of work and remain in the anchors read. Healthy rows retain the
+existing label-plus-record rule and healthy reads need no extra membership reads.
+
+Unreadable lifecycle events use the complete native `list --type event --all
+--limit 0 --json` ID set, through the same helper. A failed event selection or an
+unreadable selected event refuses lifecycle writes with the operator repair
+sentence. Since its parent and dimension cannot be trusted, lifecycle reads of
+that snapshot report unknown instead of an older passed fact. The contributor
+endpoint currently permits creating an event and changing native type to/from
+event; a retyped ordinary row joins event membership, and a retyped event leaves
+it. Type membership alone never makes readable event content a trusted fact.
 
 Consumers should key on documented fields, tolerate additional fields, and treat any
 nonzero exit code as failure. The envelope, `work` top-level shape, `brief`
