@@ -449,7 +449,8 @@ class SettingOffTests(Party):
     def test_the_person_rule_for_a_recommendation_is_as_it_was(self):
         first, second = self.agent_of('carl', 'Kestrel'), self.agent_of('carl', 'Merlin')
         task, contribution = self.deliver(first)
-        self.assertEqual(403, self.recommend(second, task, contribution).status)
+        refused = self.recommend(second, task, contribution)
+        self.assertEqual((403, API.NOT_INDEPENDENT), (refused.status, refused.data['error']['message']))   # the sentence it was
         self.assertEqual(403, self.recommend(self.tokens['carl'], task, contribution).status)
         self.assertEqual(201, self.recommend(self.agent_of('olive', 'Osprey'), task, contribution).status)
 
