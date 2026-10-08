@@ -1529,25 +1529,74 @@ literal `export` would persist in shell history and the process list, and curl r
 header from it with `-K`, so no shell expansion ever puts the secret in the
 process list either. A lost secret is replaced, never re-shown: `POST
 /v1/agents/{id}/credentials` issues a new one (the old credential works until revoked
-with `POST /v1/agents/{id}/credentials/{credential}/revoke`). **A new credential
-carries what the agent has** (kittrial-5bb.208): with no `scopes` in the body, which is
-what the agents page sends, it carries the scopes of the agent's newest credential that
-still works (with none that works, of its newest credential). Before that fix it carried
-the default four whatever the agent had, so a read-only agent became a writing one when
-its owner clicked "new secret" and an agent with all six lost `proposals`. A `scopes`
-list is taken when it asks for nothing the agent has not got, from the agent's account or
-a superuser; a list that asks for more is taken only from the agent's own account, the one
-caller who could have made the agent with those scopes, and is refused with 403 from a
-superuser renewing somebody else's agent ("This agent has read. Only its own account may
-give it more ..."). `GET /v1/agents/{id}` carries `scopes`, what the next credential will
-carry, and the page shows what a new credential carries beside its secret.
-`scopes_differ` on the same record lists the different scope lists the agent's working
-credentials carry when they are not all the same (else `[]`), and the agent's card says
-so: it is how an agent renewed from the page before the fix is found. It says only that
-they differ, not which was meant, and an agent whose one working credential is the
-renewed one cannot be found this way. An agent may
-hold at most 20 credentials **that still work**; revoked and expired ones are kept as
-records and not counted (counted, an agent could not be renewed a twentieth time). The
+with `POST /v1/agents/{id}/credentials/{credential}/revoke`).
+
+**What an agent may do is kept on the agent, and a new credential carries exactly that**
+(kittrial-5bb.208). The agent record holds its `scopes`: written when the agent is made
+(the list asked for, or the default four) and changed only by a renewal that sends a
+`scopes` list. With no list in the body, which is what "Issue a new secret" on the agents
+page sends, the new credential carries the record's scopes, in the order they were given.
+Before this a renewal with no list carried the default four whatever the agent had, so a
+read-only agent became a writing one when its owner clicked "new secret", and an agent
+with all six lost `proposals`. **No credential decides anything**: not the newest that
+works, and not a revoked or expired one (an earlier fix read the newest credential, and a
+revoked one that was wider then seeded the next renewal once nothing worked).
+
+- A `scopes` list sets what the agent has from then on. One that asks for nothing the
+  agent has not got is taken from the agent's account or from a superuser (who may so
+  narrow somebody else's agent); one that asks for more is taken only from the agent's
+  own account, the one caller who could have made the agent with those scopes, and is
+  refused with `403` from anybody else ("This agent has read. Only its own account may
+  give it more (asked for beyond that: reviews, tasks)"). Scopes that were widened and
+  the credential revoked afterwards stay widened: revoking a credential does not change
+  what the agent has; a list does.
+- `scopes` must be a list of scope names: anything else, and a name that does not exist,
+  is `422` before any other answer (a number or `true` used to answer `500`, and an object
+  was read as its keys). A name given twice counts once; an empty list is no list. A body
+  field the route does not take (it takes `label` and `scopes`) is `422`, as when an agent
+  is made.
+- **An agent made before the record kept its scopes** has none. While its working
+  credentials all allow the same, that is what it has (`scopes_source: "inferred"` on the
+  record; written to the record by its first renewal, never by a read). When none of its
+  credentials works, or they do not all allow the same (which is what an agent looks like
+  that was renewed from the page before the fix: the credential it was made with, and a
+  newer one with the default four), **nothing is guessed**: `scopes` is `null`,
+  `scopes_source` is `"unknown"`, and a renewal with no list is refused with `409` and
+  `detail.scopes_needed: true` ("Nothing says what this agent may do ... Send the scopes
+  it should have"). Never the default four, never a credential that no longer works. A
+  list then counts as a widening of nothing: it is taken from the agent's own account
+  only. On the agents page the card says so, and "What it may do" offers the choice with
+  reading ticked alone.
+- `GET /v1/agents/{id}`, the list, and the agent's own `GET /v1/agents/me` carry `scopes`,
+  `scopes_source` (`set`, `inferred` or `unknown`) and `scopes_differ`: the different
+  scope lists of the agent's working credentials when they are not all the same, else
+  `[]`. Each entry of `credentials` carries its `scopes` and `working` (an expired
+  credential is not `revoked` and does not work).
+- **The agents page**: the card says what the agent may do and where that is known from
+  when it was inferred, and how many working credentials allow something else. Under
+  "What it may do" each credential is listed with what it allows and can be revoked
+  there, and the agent's account sets the scopes with tick boxes; saving issues a new
+  secret that carries them (a superuser can untick, and cannot tick what the agent has
+  not got). A credential the agent already holds keeps what it allows until it is
+  revoked.
+- An agent may hold at most 20 credentials **that still work**; revoked and expired ones
+  are not counted (counted, an agent could not be renewed a twentieth time). Of those
+  that no longer work **the newest 5 are kept** per agent, as the short history the card
+  shows, and older ones are deleted from the state whenever a credential of the agent is
+  issued or revoked or the agent is disabled; an agent read never carries more than the
+  working ones and those 5. What is lost is the record of an old credential (its label,
+  scopes, when it was made and last used). That it was issued and revoked, by whom and
+  when, stays in the audit log (`agents.credentials.issue`, `agents.credentials.revoke`,
+  `agents.disable`). "Newest" is by the host clock at issue, so after a backward clock
+  step a newer dead record can be deleted before an older one; nothing but that short
+  history depends on the order.
+- **Rolling back** to a kit before this one: the older kit ignores `scopes` on the agent
+  record and counts every credential record, working or not, toward its limit of 20. An
+  agent that holds 20 or more records (possible here: up to 20 that work and 5 that do
+  not) cannot be renewed under the older kit until records are revoked and removed by
+  hand; and the older kit gives the default four to every renewal from the page again.
+
+The
 agent then calls `GET /v1/agents/me` and `GET /v1/agents/me/next` with its credential as a
 bearer token (`Authorization: Bearer <agent-secret>`); every other project route works as
 before, capped at the owner's live role and the agent's granted projects. A grant may

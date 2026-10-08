@@ -1702,14 +1702,16 @@ class AgentSetupDialogCase(unittest.TestCase):
         self.assertIn("'data-scopes': (credential.scopes || []).join(' ')", reissue)
         self.assertIn("'This credential carries' + (scopeList(credential.scopes) || ': nothing beyond reading') + '.'", reissue)
         self.assertIn('It carries what the agent has now${scopeList(agent.scopes)}.', reissue)
-        # An agent whose working credentials differ is said on its card, for whoever may see the card.
-        self.assertIn('    scopesDiffer(raw),\n', self.function_body(code, 'agentCard'))
-        differ = self.function_body(code, 'scopesDiffer')
-        self.assertIn('if (lists.length < 2) return null;', differ)
-        self.assertIn("'data-scopes-differ': String(lists.length)", differ)
-        self.assertIn('Revoke the credential the agent should not have', differ)
-        self.assertIn("issueAgentCredential: (aid) => mutate('POST', `/v1/agents/${aid}/credentials`, { label: 'web: new secret' })",
+        # What the agent may do is on its card, and "What it may do" on the Agents page is the one place
+        # that sends a list (the page is run in tests/test_http_agents.py AgentsPageTests).
+        self.assertIn('    compact ? null : scopesLine(raw),\n', self.function_body(code, 'agentCard'))
+        self.assertNotIn('before this was fixed', code)
+        self.assertIn("if (agent.scopes === null) {", reissue)
+        self.assertIn("issueAgentCredential: (aid, scopes) => mutate('POST', `/v1/agents/${aid}/credentials`, "
+                      "scopes ? { label: 'web: new secret', scopes } : { label: 'web: new secret' })",
                       (WEB / 'js' / 'api.js').read_text(encoding='utf-8'))
+        self.assertEqual(code.count('ctx.api.issueAgentCredential('), 2)
+        self.assertIn('ctx.api.issueAgentCredential(agent.id, chosen)', code)
         # Without a fresh secret the steps show the placeholder line only.
         self.assertIn('secretSteps(payload, setupText.headerLine(), { withSecret: false })', reissue)
         older = self.function_body(code, 'olderCredentials')

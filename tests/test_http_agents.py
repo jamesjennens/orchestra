@@ -15,12 +15,14 @@ import secrets
 import shutil
 import sys
 import threading
+import time
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+import http_auth
 import http_service
 from http_auth import AGENT_SECRET_ENV, Service, Store
 from http_service import MAX_BODY_BYTES, InProcessBackend, create_server
@@ -1249,8 +1251,39 @@ class RenewalScopeTests(AgentHarness):
     def writes(self, secret):
         return self.request('POST', '/v1/projects/%s/tasks' % self.project, {'title': 'a task'}, token=secret).status
 
+    def read(self, agent_id, token=None):
+        return self.request('GET', '/v1/agents/%s' % agent_id, token=token or self.alex).data
+
     def has(self, agent_id):
-        return self.request('GET', '/v1/agents/%s' % agent_id, token=self.alex).data['scopes']
+        return self.read(agent_id)['scopes']
+
+    def revoke(self, agent_id, credential_id, token=None):
+        return self.request('POST', '/v1/agents/%s/credentials/%s/revoke' % (agent_id, credential_id), {},
+                            token=token or self.alex)
+
+    def working(self, agent_id):
+        return [credential for credential in self.read(agent_id)['credentials'] if credential['working']]
+
+    def made_before(self, agent_id):
+        """An agent as an earlier kit left it: its record holds no scopes."""
+        with self.service.store.lock:
+            agent = self.service.state['agents'][agent_id]
+            agent.pop('scopes', None)
+            agent.pop('scopes_source', None)
+            self.service.store.save()
+
+    def stored(self, agent_id):
+        with self.service.store.lock:
+            agent = self.service.state['agents'][agent_id]
+            return agent.get('scopes'), agent.get('scopes_source')
+
+    def later(self, seconds):
+        """The host clock moves on; everybody signs in again (their sessions are over too)."""
+        self.ahead = getattr(self, 'ahead', 0) + seconds
+        ahead = self.ahead
+        self.service.store.clock = lambda: time.time() + ahead
+        self.admin = self.admin_token()
+        self.alex = self.login('alex', 'alex-password-1')[0]
 
     def test_a_read_only_agent_renewed_from_the_page_stays_read_only(self):
         agent_id, first, made = self.agent(['read'])
@@ -1274,33 +1307,140 @@ class RenewalScopeTests(AgentHarness):
     def test_an_agent_made_with_the_default_keeps_the_default(self):
         agent_id, _, made = self.agent()
         self.assertEqual(made['credential']['scopes'], ['tasks', 'checkpoints', 'reviews', 'feedback'])
-        self.assertEqual(sorted(self.renew(agent_id).data['credential']['scopes']), ['checkpoints', 'feedback', 'reviews', 'tasks'])
+        self.assertEqual(self.renew(agent_id).data['credential']['scopes'], ['tasks', 'checkpoints', 'reviews', 'feedback'])
+        self.assertEqual((self.has(agent_id), self.read(agent_id)['scopes_source']),
+                         (['tasks', 'checkpoints', 'reviews', 'feedback'], 'set'))
 
     def test_a_list_that_asks_for_no_more_is_taken_and_decides_what_the_agent_has_next(self):
         agent_id, _, _ = self.agent(self.ALL)
         narrower = self.renew(agent_id, {'scopes': ['read', 'tasks']})
         self.assertEqual(201, narrower.status, narrower.data)
         self.assertEqual(narrower.data['credential']['scopes'], ['read', 'tasks'])
-        self.assertEqual(self.has(agent_id), ['read', 'tasks'])                    # the newest credential that works
+        self.assertEqual(self.has(agent_id), ['read', 'tasks'])                    # the list is the agent's now
         self.assertEqual(self.renew(agent_id).data['credential']['scopes'], ['read', 'tasks'])
-        # The same list again, and a part of it: neither asks for more.
-        self.assertEqual(201, self.renew(agent_id, {'scopes': ['tasks', 'read']}).status)
+        # The same names in another order and one of them twice: neither asks for more. The order
+        # given is the order kept, and a plain renewal issues exactly that.
+        again = self.renew(agent_id, {'scopes': ['tasks', 'read', 'tasks']})
+        self.assertEqual((201, ['tasks', 'read']), (again.status, again.data['credential']['scopes']))
+        self.assertEqual((self.has(agent_id), self.stored(agent_id)), (['tasks', 'read'], (['tasks', 'read'], 'set')))
+        self.assertEqual(self.renew(agent_id).data['credential']['scopes'], ['tasks', 'read'])
         self.assertEqual(201, self.renew(agent_id, {'scopes': ['read']}).status)
-
-    def test_the_newest_credential_that_still_works_decides(self):
-        agent_id, _, made = self.agent(self.ALL)
-        narrow = self.renew(agent_id, {'scopes': ['read']}).data['credential']
         self.assertEqual(self.has(agent_id), ['read'])
-        self.assertEqual(204, self.request('POST', '/v1/agents/%s/credentials/%s/revoke' % (agent_id, narrow['id']),
-                                           {}, token=self.alex).status)
-        self.assertEqual(sorted(self.has(agent_id)), self.ALL)                     # the first one works again alone
-        self.assertEqual(sorted(self.renew(agent_id).data['credential']['scopes']), self.ALL)
-        # With none that works, the newest of the dead ones.
-        for credential in self.request('GET', '/v1/agents/%s' % agent_id, token=self.alex).data['credentials']:
-            if not credential['revoked']:
-                self.request('POST', '/v1/agents/%s/credentials/%s/revoke' % (agent_id, credential['id']), {}, token=self.alex)
-        self.assertEqual(sorted(self.has(agent_id)), self.ALL)
-        self.assertEqual(sorted(self.renew(agent_id).data['credential']['scopes']), self.ALL)
+
+    def test_no_credential_decides_anything_once_the_record_has_the_scopes(self):
+        """The review's finding: with no working credential a revoked or expired one seeded the plain
+        renewal and the widening check, so a superuser got round the 403 in two requests."""
+        agent_id, _, _ = self.agent(['read'])
+        # Its account widens it and narrows it again; the wide credential is revoked and stays on record.
+        wide = self.renew(agent_id, {'scopes': self.ALL}).data['credential']
+        narrow = self.renew(agent_id, {'scopes': ['read']}).data['credential']
+        self.assertEqual(204, self.revoke(agent_id, wide['id']).status)
+        self.assertEqual(self.has(agent_id), ['read'])
+        refused = self.renew(agent_id, {'scopes': self.ALL}, token=self.admin)
+        self.assertEqual(403, refused.status, refused.data)
+        # The superuser revokes every credential that works and sends the page's plain body.
+        for credential in self.working(agent_id):
+            self.assertEqual(204, self.revoke(agent_id, credential['id'], token=self.admin).status)
+        self.assertEqual(self.working(agent_id), [])
+        self.assertEqual(self.has(agent_id), ['read'])                             # it was all six: the newest dead one
+        again = self.renew(agent_id, token=self.admin)
+        self.assertEqual((201, ['read']), (again.status, again.data['credential']['scopes']), again.data)
+        self.assertEqual(self.writes(again.data['credential']['secret']), 403)
+        refused = self.renew(agent_id, {'scopes': ['read', 'tasks']}, token=self.admin)
+        self.assertEqual(403, refused.status, refused.data)
+        # The same after the agent was disabled and enabled, which revokes them all.
+        for action in ('disable', 'enable'):
+            self.assertEqual(200, self.request('POST', '/v1/agents/%s/%s' % (agent_id, action), {}, token=self.alex).status)
+        self.assertEqual(self.renew(agent_id).data['credential']['scopes'], ['read'])
+        self.assertEqual(narrow['scopes'], ['read'])
+
+    def test_the_same_when_they_stopped_working_by_time(self):
+        agent_id, _, _ = self.agent(['read'])
+        self.renew(agent_id, {'scopes': self.ALL})
+        self.renew(agent_id, {'scopes': ['read']})
+        self.later(self.service.credential_ttl + 60)                               # a month and more away
+        self.assertEqual((self.working(agent_id), self.has(agent_id)), ([], ['read']))
+        refused = self.renew(agent_id, {'scopes': self.ALL}, token=self.admin)
+        self.assertEqual(403, refused.status, refused.data)
+        again = self.renew(agent_id, token=self.admin)
+        self.assertEqual((201, ['read']), (again.status, again.data['credential']['scopes']), again.data)
+
+    def test_an_agent_made_before_the_record_kept_its_scopes(self):
+        """One working credential, or several that allow the same: that is what the agent has. It is
+        written to the record by the first renewal, not by a read."""
+        agent_id, _, _ = self.agent(['read', 'tasks'])
+        self.assertEqual(201, self.renew(agent_id).status)
+        self.made_before(agent_id)
+        seen = self.read(agent_id)
+        self.assertEqual((seen['scopes'], seen['scopes_source']), (['read', 'tasks'], 'inferred'))
+        self.assertEqual(self.stored(agent_id), (None, None))                      # a read writes nothing
+        renewed = self.renew(agent_id)
+        self.assertEqual((201, ['read', 'tasks']), (renewed.status, renewed.data['credential']['scopes']), renewed.data)
+        self.assertEqual(self.stored(agent_id), (['read', 'tasks'], 'inferred'))
+        self.assertEqual(self.read(agent_id)['scopes_source'], 'inferred')
+        # From here on the record decides, as for any agent.
+        for credential in self.working(agent_id):
+            self.revoke(agent_id, credential['id'])
+        self.assertEqual(self.renew(agent_id, token=self.admin).data['credential']['scopes'], ['read', 'tasks'])
+        # A list from its account makes them set, not inferred.
+        self.assertEqual(201, self.renew(agent_id, {'scopes': ['read']}).status)
+        self.assertEqual(self.stored(agent_id), (['read'], 'set'))
+
+    def test_nothing_is_guessed_for_one_with_no_working_credential(self):
+        agent_id, _, made = self.agent(['read'])
+        wide = self.renew(agent_id, {'scopes': self.ALL}).data['credential']       # the newest, and the widest
+        for credential in self.working(agent_id):
+            self.revoke(agent_id, credential['id'])
+        self.made_before(agent_id)
+        seen = self.read(agent_id)
+        self.assertEqual((seen['scopes'], seen['scopes_source'], seen['scopes_differ']), (None, 'unknown', []))
+        before = len(seen['credentials'])
+        for token in (self.alex, self.admin):
+            refused = self.renew(agent_id, token=token)
+            self.assertEqual(409, refused.status, refused.data)
+            self.assertEqual(refused.data['error']['message'], http_auth.Service.SCOPES_NEEDED)
+            self.assertEqual(refused.data['error']['detail'], {'scopes_needed': True})
+        # A superuser's list is a widening of nothing; the narrowest one too.
+        refused = self.renew(agent_id, {'scopes': ['read']}, token=self.admin)
+        self.assertEqual(403, refused.status, refused.data)
+        self.assertEqual(refused.data['error']['message'],
+                         'This agent has no scopes on record. Only its own account may give it more (asked for beyond that: read)')
+        self.assertEqual((len(self.read(agent_id)['credentials']), self.stored(agent_id)), (before, (None, None)))
+        # Its own account says what it may do.
+        chosen = self.renew(agent_id, {'scopes': ['read']})
+        self.assertEqual((201, ['read']), (chosen.status, chosen.data['credential']['scopes']), chosen.data)
+        self.assertEqual(self.stored(agent_id), (['read'], 'set'))
+        self.assertEqual(self.renew(agent_id, token=self.admin).data['credential']['scopes'], ['read'])
+        self.assertEqual(wide['scopes'], self.ALL)
+
+    def test_nothing_is_guessed_for_one_whose_working_credentials_differ(self):
+        """What an agent looks like that was renewed from the page before the fix: the credential it was
+        made with, and a newer one with the four writing scopes."""
+        agent_id, _, made = self.agent(['read'])
+        harmed = self.renew(agent_id, {'scopes': ['tasks', 'checkpoints', 'reviews', 'feedback']}).data['credential']
+        self.made_before(agent_id)
+        seen = self.read(agent_id)
+        self.assertEqual((seen['scopes'], seen['scopes_source'], len(seen['scopes_differ'])), (None, 'unknown', 2))
+        refused = self.renew(agent_id)
+        self.assertEqual((409, {'scopes_needed': True}), (refused.status, refused.data['error']['detail']), refused.data)
+        # Its owner revokes the credential it should not have and clicks "new secret": read-only again.
+        self.assertEqual(204, self.revoke(agent_id, harmed['id']).status)
+        self.assertEqual(self.read(agent_id)['scopes_source'], 'inferred')
+        for action in ('disable', 'enable'):
+            self.assertEqual(200, self.request('POST', '/v1/agents/%s/%s' % (agent_id, action), {}, token=self.alex).status)
+        # Disabled and enabled, none works: nothing is guessed, and the dead ones do not decide.
+        refused = self.renew(agent_id)
+        self.assertEqual(409, refused.status, refused.data)
+        chosen = self.renew(agent_id, {'scopes': ['read']})
+        self.assertEqual((201, 403), (chosen.status, self.writes(chosen.data['credential']['secret'])))
+
+    def test_a_superuser_may_narrow_and_not_widen_back(self):
+        agent_id, _, _ = self.agent(['read', 'tasks'])
+        narrowed = self.renew(agent_id, {'scopes': ['read']}, token=self.admin)
+        self.assertEqual((201, ['read']), (narrowed.status, narrowed.data['credential']['scopes']), narrowed.data)
+        self.assertEqual(self.stored(agent_id), (['read'], 'set'))
+        self.assertEqual(403, self.renew(agent_id, {'scopes': ['read', 'tasks']}, token=self.admin).status)
+        self.assertEqual(201, self.renew(agent_id, {'scopes': ['read', 'tasks']}).status)
 
     def test_only_the_agents_own_account_may_give_it_more(self):
         agent_id, _, _ = self.agent(['read'])
@@ -1322,9 +1462,31 @@ class RenewalScopeTests(AgentHarness):
     def test_a_scope_that_does_not_exist_is_refused_before_anything_else(self):
         agent_id, _, _ = self.agent(['read'])
         for token in (self.alex, self.admin):
-            refused = self.renew(agent_id, {'scopes': ['read', 'everything']}, token=token)
-            self.assertEqual(422, refused.status, refused.data)
+            # For the superuser the list also widens (tasks): the name that does not exist answers first.
+            refused = self.renew(agent_id, {'scopes': ['read', 'tasks', 'everything']}, token=token)
+            self.assertEqual((422, "Unknown credential scope 'everything'"), (refused.status, refused.data['error']['message']))
         self.assertEqual(len(self.request('GET', '/v1/agents/%s' % agent_id, token=self.alex).data['credentials']), 1)
+
+    def test_scopes_that_are_not_a_list_of_names_and_a_field_the_route_does_not_take(self):
+        agent_id, _, _ = self.agent(['read'])
+        agents = len(self.request('GET', '/v1/agents', token=self.alex).data['items'])
+        for number, bad in enumerate((5, True, 'read', {'read': 1, 'tasks': 1}, [5], [['read']], [None])):
+            with self.subTest(scopes=bad):
+                renewed = self.renew(agent_id, {'scopes': bad})
+                self.assertEqual(422, renewed.status, renewed.data)
+                made = self.create_agent(self.alex, name='Bad %d' % number, scopes=bad)
+                self.assertEqual(422, made.status, made.data)
+        # Nothing was made and nothing was issued; an empty list is no list.
+        self.assertEqual(len(self.request('GET', '/v1/agents', token=self.alex).data['items']), agents)
+        self.assertEqual(len(self.read(agent_id)['credentials']), 1)
+        self.assertEqual(self.renew(agent_id, {'scopes': []}).data['credential']['scopes'], ['read'])
+        refused = self.renew(agent_id, {'label': 'x', 'scope': ['read', 'tasks']})
+        self.assertEqual(422, refused.status, refused.data)
+        self.assertIn('scope', refused.data['error']['message'])
+        # Somebody who may not see the agent learns nothing from the field check.
+        self.create_account(self.admin, 'blake', 'blake-password-1')
+        blake = self.login('blake', 'blake-password-1')[0]
+        self.assertEqual(404, self.renew(agent_id, {'scope': ['read']}, token=blake).status)
 
     def test_a_replay_returns_the_same_credential_and_changes_nothing(self):
         agent_id, _, _ = self.agent(['read'])
@@ -1360,7 +1522,55 @@ class RenewalScopeTests(AgentHarness):
             self.service.store.save()
         late = self.renew(agent_id)
         self.assertEqual((late.status, late.data['credential']['scopes']), (201, ['read']))
-        self.assertEqual(len(self.request('GET', '/v1/agents/%s' % agent_id, token=self.alex).data['credentials']), 22)
+        # The one that works and the newest few that do not: the others are gone from the state.
+        shown = self.read(agent_id)['credentials']
+        self.assertEqual([c['working'] for c in shown], [False] * http_auth.AGENT_DEAD_CREDENTIALS_KEPT + [True])
+        self.assertEqual(shown[-1]['id'], late.data['credential']['id'])
+
+    def held(self, agent_id):
+        with self.service.store.lock:
+            ids = {key for key, credential in self.service.state['credentials'].items() if credential.get('agent_id') == agent_id}
+            tokens = [value for value in self.service.state['credential_tokens'].values() if value in ids]
+            return len(ids), len(tokens)
+
+    def test_credentials_that_no_longer_work_are_kept_to_a_few(self):
+        """The state grew by a record for every renewal, and every read of the agent carried them all."""
+        kept = http_auth.AGENT_DEAD_CREDENTIALS_KEPT
+        agent_id, first, made = self.agent(['read'])
+        issued = [made['credential']['id']]
+        secrets_seen = [first]
+        for _ in range(kept + 7):
+            renewed = self.renew(agent_id).data['credential']
+            self.assertEqual(204, self.revoke(agent_id, issued[-1]).status)
+            issued.append(renewed['id'])
+            secrets_seen.append(renewed['secret'])
+        self.assertEqual(self.held(agent_id), (kept + 1, kept + 1))                # the state, and its index of secrets
+        shown = self.read(agent_id)['credentials']
+        self.assertEqual([c['id'] for c in shown], issued[-(kept + 1):])           # the newest ones, oldest first
+        self.assertEqual([c['working'] for c in shown], [False] * kept + [True])
+        # A secret whose record is gone is refused like any other that does not work.
+        self.assertEqual(401, self.request('GET', '/v1/agents/me', token=secrets_seen[0]).status)
+        self.assertEqual(401, self.request('GET', '/v1/agents/me', token=secrets_seen[-2]).status)
+        self.assertEqual(200, self.request('GET', '/v1/agents/me', token=secrets_seen[-1]).status)
+        # Twelve that work, all revoked at once by disabling the agent: the same few remain.
+        for _ in range(11):
+            self.assertEqual(201, self.renew(agent_id).status)
+        self.assertEqual(200, self.request('POST', '/v1/agents/%s/disable' % agent_id, {}, token=self.alex).status)
+        self.assertEqual(self.held(agent_id), (kept, kept))
+        # Stopped working by time, with no write since: the read is bounded all the same.
+        self.assertEqual(200, self.request('POST', '/v1/agents/%s/enable' % agent_id, {}, token=self.alex).status)
+        for _ in range(kept + 3):
+            self.assertEqual(201, self.renew(agent_id).status)
+        self.later(self.service.credential_ttl + 60)
+        self.assertEqual(self.held(agent_id)[0], 2 * kept + 3)
+        self.assertEqual([c['working'] for c in self.read(agent_id)['credentials']], [False] * kept)
+        self.assertEqual(201, self.renew(agent_id).status)
+        self.assertEqual(self.held(agent_id), (kept + 1, kept + 1))
+        # Another agent's credentials are not touched by any of it.
+        other, _, _ = self.agent(['read'], name='Other')
+        self.assertEqual(self.held(other), (1, 1))
+        self.assertEqual(204, self.revoke(agent_id, self.working(agent_id)[0]['id']).status)
+        self.assertEqual(self.held(other), (1, 1))
 
     def test_working_credentials_that_differ_are_said_and_dead_ones_are_not(self):
         """A read for the agent's account and a superuser: what main left behind. It says that they differ, not
@@ -1394,8 +1604,111 @@ class RenewalScopeTests(AgentHarness):
 
     def test_making_an_agent_is_as_it_was(self):
         self.assertEqual(self.agent(name='One')[2]['credential']['scopes'], ['tasks', 'checkpoints', 'reviews', 'feedback'])
-        self.assertEqual(self.agent(['read'], name='Two')[2]['credential']['scopes'], ['read'])
+        two_id, _, two = self.agent(['read'], name='Two')
+        self.assertEqual(two['credential']['scopes'], ['read'])
+        self.assertEqual((two['agent']['scopes'], two['agent']['scopes_source'], self.stored(two_id)),
+                         (['read'], 'set', (['read'], 'set')))
         self.assertEqual(422, self.create_agent(self.alex, name='Three', scopes=['nothing']).status)
+        # The agent reads the same about itself.
+        mine = self.request('GET', '/v1/agents/me', token=two['credential']['secret']).data['agent']
+        self.assertEqual((mine['scopes'], mine['scopes_source'], mine['scopes_differ']), (['read'], 'set', []))
+
+
+
+class AgentsPageTests(RenewalScopeTests):
+    """web/js/views/agents.js run under Node, with a small DOM, against this real service: what the card
+    says about an agent's scopes, and that its account can put them right from the page."""
+
+    def test_the_agents_page_under_node_against_the_real_service(self):
+        from test_http_web import run_node_module
+        node = shutil.which('node')
+        if not node:
+            print('NOTE: AgentsPageTests.test_the_agents_page_under_node_against_the_real_service was SKIPPED: node is not '
+                  'installed, so web/js/views/agents.js was not run on this platform.', file=sys.stderr)
+            self.skipTest('node is not installed; the agents page is not run here')
+        four = ['tasks', 'checkpoints', 'reviews', 'feedback']
+        kestrel, _, _ = self.agent(['read'], name='Kestrel')
+        wren, _, _ = self.agent(['read'], name='Wren')
+        self.assertEqual(201, self.renew(wren, {'scopes': four}).status)
+        self.made_before(wren)                                                     # harmed by a renewal of an earlier kit
+        nothing = {}
+        for name in ('Lone', 'Dove'):                                              # nothing on record, nothing that works
+            nothing[name], _, _ = self.agent(self.ALL, name=name)
+            for credential in self.working(nothing[name]):
+                self.revoke(nothing[name], credential['id'])
+            self.made_before(nothing[name])
+        web = ROOT / 'web' / 'js'
+        done = run_node_module(self, node, 'await import(process.argv[1])',
+                               (ROOT / 'tests' / 'web_agents_screen.mjs').as_uri(),
+                               (ROOT / 'tests' / 'web_dom_shim.mjs').as_uri(), (web / 'api.js').as_uri(),
+                               (web / 'views' / 'agents.js').as_uri(), 'http://127.0.0.1:%d' % self.port, self.project,
+                               'alex=%s=%s' % (self.alex_id, self.alex), 'admin=none=%s' % self.admin)
+        self.assertEqual(0, done.returncode, done.stderr[-3000:])
+        seen = json.loads(done.stdout.strip().splitlines()[-1])
+        first = seen['first']
+        # 1. What the card says, and what "What it may do" shows.
+        self.assertEqual((first['Kestrel']['scopes'], first['Kestrel']['source'], first['Kestrel']['differ']), ('read', 'set', None))
+        self.assertEqual(first['Kestrel']['line'], 'May: read.')
+        self.assertEqual(first['Kestrel']['boxes'], {'read': [True, False], 'tasks': [False, False], 'checkpoints': [False, False],
+                                                     'reviews': [False, False], 'feedback': [False, False], 'proposals': [False, False]})
+        self.assertEqual([(row['working'], row['differs'], row['buttons']) for row in first['Kestrel']['rows']],
+                         [('true', 'false', ['Revoke'])])
+        self.assertEqual((first['Wren']['scopes'], first['Wren']['source'], first['Wren']['differ'], first['Wren']['summary']),
+                         ('unknown', 'unknown', '2', 'What it may do (choose)'))
+        self.assertIn('Nothing says what this agent may do.', first['Wren']['line'])
+        self.assertIn('Its working credentials do not all allow the same.', first['Wren']['line'])
+        self.assertNotIn('fixed', first['Wren']['line'])                           # nobody is blamed
+        self.assertEqual(sorted((row['differs'], row['buttons'], 'allows read' in row['text']) for row in first['Wren']['rows']),
+                         [('true', ['Revoke'], False), ('true', ['Revoke'], True)])
+        self.assertEqual((first['Lone']['scopes'], first['Lone']['differ']), ('unknown', None))
+        self.assertEqual({row['working'] for row in first['Lone']['rows']}, {'false'})
+        self.assertEqual({tuple(row['buttons']) for row in first['Lone']['rows']}, {()})
+        self.assertEqual({name for name, (ticked, _) in first['Lone']['boxes'].items() if ticked}, {'read'})
+        # 2. The credential that allowed the four is revoked from the card; what is left says what Wren has.
+        self.assertIn('Revoke this credential?', seen['revokeAsked'])
+        after = seen['afterRevoke']
+        self.assertEqual((after['scopes'], after['source'], after['differ']), ('read', 'inferred', None))
+        self.assertIn('read from its working credentials', after['line'])
+        self.assertEqual(self.read(wren)['scopes'], ['read'])
+        self.assertEqual([c['scopes'] for c in self.working(wren)], [['read']])
+        # 3. and 4. Nothing ticked sends nothing; the choice (reading alone, as offered) issues a secret.
+        self.assertEqual(seen['noneTicked'], {'said': 'Tick at least one.', 'sent': 0, 'dialogs': 0})
+        self.assertIn('Lone will have: read.', seen['loneAsked'])
+        self.assertEqual(seen['loneDialog'], 1)
+        self.assertEqual((seen['afterChoice']['scopes'], seen['afterChoice']['source']), ('read', 'set'))
+        self.assertEqual(self.stored(nothing['Lone']), (['read'], 'set'))
+        # 5. Its own account gives more; a cancelled confirmation sends nothing.
+        self.assertEqual(seen['cancelSent'], 0)
+        self.assertIn('Kestrel will have: read, tasks.', seen['widenAsked'])
+        self.assertEqual((seen['afterWiden']['scopes'], seen['afterWiden']['differ']), ('read tasks', '1'))
+        self.assertIn('1 working credential allows something else than that.', seen['afterWiden']['line'])
+        # 6. A superuser: what the agent does not have cannot be ticked, and is not sent when it is.
+        self.assertEqual({name: disabled for name, (_, disabled) in seen['admin']['boxes'].items()},
+                         {'read': False, 'tasks': False, 'checkpoints': True, 'reviews': True, 'feedback': True, 'proposals': True})
+        self.assertEqual(seen['afterNarrow']['scopes'], 'read')
+        # 7. Set up folder.
+        self.assertEqual((seen['setupKestrel']['needed'], seen['setupKestrel']['issue']), (0, True))
+        self.assertIn('It carries what the agent has now: read.', seen['setupKestrel']['asked'])
+        self.assertEqual(seen['setupKestrel']['carries'], [['read', 'This credential carries: read.']])
+        self.assertGreaterEqual(seen['setupKestrel']['older'], 1)
+        self.assertEqual(seen['setupDove'], {'needed': 1, 'issue': False})
+        # 8. Nothing threw.
+        self.assertEqual(seen['odd'], [[0, None], [0, 'unknown'], [0, 'read'], [2, 'read'], [2, 'unknown'], [0, 'unknown']])
+        # What the page sent, in order: a list only from "What it may do".
+        credentials = '/v1/agents/AGENT/credentials'
+        self.assertEqual(seen['sent'], [
+            ['alex', 'POST', credentials + '/CRED/revoke', {}],
+            ['alex', 'POST', credentials, {'label': 'web: new secret', 'scopes': ['read']}],
+            ['alex', 'POST', credentials, {'label': 'web: new secret', 'scopes': ['read', 'tasks']}],
+            ['admin', 'POST', credentials, {'label': 'web: new secret', 'scopes': ['read']}],
+            ['alex', 'POST', credentials, {'label': 'web: new secret'}]])
+        self.assertEqual(self.stored(kestrel), (['read'], 'set'))
+        self.assertEqual(self.stored(nothing['Dove']), (None, None))
+
+
+for _name in dir(RenewalScopeTests):
+    if _name.startswith('test_') and _name not in AgentsPageTests.__dict__:
+        setattr(AgentsPageTests, _name, None)
 
 
 if __name__ == '__main__':

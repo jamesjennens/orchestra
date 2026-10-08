@@ -60,16 +60,35 @@ function manages(ctx, raw) {
   return Boolean(ctx.me && (ctx.me.superuser || owner === ctx.me.id));
 }
 
-// The agent's working credentials do not all carry the same scopes (kittrial-5bb.208: a renewal from
-// this page used to give the default four whatever the agent had). The page can say that they differ,
-// not which is the one meant: the owner revokes what the agent should not have, under Set up folder.
-function scopesDiffer(raw) {
-  const lists = Array.isArray(raw.scopes_differ) ? raw.scopes_differ : [];
-  if (lists.length < 2) return null;
-  return h('div', { class: 'banner', role: 'status', 'data-scopes-differ': String(lists.length) },
-    'This agent’s working credentials do not all allow the same: ',
-    lists.map((list) => (list.length ? list.join(', ') : 'nothing')).join(' | '),
-    '. A new secret issued here before this was fixed may allow more than the agent was made with. Revoke the credential the agent should not have (Set up folder shows them).');
+// What an agent may do (kittrial-5bb.208). The server keeps it on the agent record: `scopes`, and in
+// `scopes_source` where that is known from (`set`, `inferred` from its working credentials for an agent
+// made before the record kept it, or `unknown`: scopes is null and a new secret needs a choice).
+export const SCOPES = [['read', 'Read'], ['tasks', 'Claim and change tasks'], ['checkpoints', 'Write checkpoints'],
+  ['reviews', 'Deliver and review'], ['feedback', 'Send feedback'], ['proposals', 'Propose requirements']];
+const scopeNames = (scopes) => (Array.isArray(scopes) && scopes.length ? scopes.join(', ') : 'nothing beyond reading');
+const sameScopes = (a, b) => Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((s) => b.includes(s));
+const credentialsOf = (raw) => (Array.isArray(raw.credentials) ? raw.credentials.filter((c) => c && typeof c === 'object') : []);
+// An older service sends no `working`: then a credential that is not revoked counts.
+const works = (c) => (c.working === undefined ? !c.revoked : Boolean(c.working));
+// The working credentials that allow something else than the agent's scopes. With scopes unknown: every
+// working credential when they do not all allow the same.
+export function otherCredentials(raw) {
+  const working = credentialsOf(raw).filter(works);
+  if (Array.isArray(raw.scopes)) return working.filter((c) => !sameScopes(c.scopes, raw.scopes));
+  return working.some((c) => !sameScopes(c.scopes, working[0].scopes)) ? working : [];
+}
+// The card's line. It says what is so and blames nobody: an account may have narrowed its agent on
+// purpose and left the older credential working.
+export function scopesLine(raw) {
+  if (raw.scopes === undefined && raw.scopes_source === undefined) return null;         // a service that does not say
+  const known = Array.isArray(raw.scopes);
+  const other = otherCredentials(raw).length;
+  return h('div', { class: 'small', 'data-scopes': known ? raw.scopes.join(' ') : 'unknown', 'data-scopes-source': raw.scopes_source || '' },
+    known ? ['May: ', scopeNames(raw.scopes), raw.scopes_source === 'inferred' ? ' (read from its working credentials: nothing recorded what it was made with)' : null, '.'] :
+      'Nothing says what this agent may do. Choose under “What it may do” on the Agents page before it gets a new secret.',
+    other ? h('div', { class: 'banner', role: 'status', 'data-scopes-differ': String(other) },
+      known ? `${other} working ${other === 1 ? 'credential allows' : 'credentials allow'} something else than that.` : 'Its working credentials do not all allow the same.',
+      ' “What it may do” on the Agents page shows each one and can revoke it.') : null);
 }
 
 // One agent's card: status, what is waiting, and exactly where to go to resume it.
@@ -94,7 +113,7 @@ export function agentCard(ctx, raw, { compact = false } = {}) {
         h('span', { class: 'small prompt' }, resumePrompt(agent)),
         h('button', { type: 'button', class: 'ghost', 'aria-label': 'Copy the resume prompt', onclick: () => copy(resumePrompt(agent), 'Resume prompt') }, 'Copy')),
       compact ? null : h('p', { class: 'small muted resume-hint' }, 'Needs .orchestra/agent.json in the folder; use Set up folder first.')),
-    scopesDiffer(raw),
+    compact ? null : scopesLine(raw),
     manages(ctx, raw) ? h('div', { class: 'copy-row' },
       h('button', { type: 'button', 'aria-label': 'Set up the folder for ' + agent.display_name, onclick: (event) => reopenSetup(ctx, raw.id, event.currentTarget) }, 'Set up folder')) : null,
     compact ? null : h('div', { class: 'small muted' }, 'Projects: ', agent.projects.map((p) => `${p.name} (${p.role})`).join(', ') || 'none'));
@@ -105,7 +124,7 @@ export async function list(ctx) {
   async function load() {
     let data;
     try { data = await ctx.api.agents(); } catch (error) { host.replaceChildren(errorState(error, load)); return; }
-    host.replaceChildren(data.items.length ? h('div', { class: 'agent-grid' }, data.items.map((a) => h('div', { class: 'stack' }, agentCard(ctx, a), editFolder(a), manages(ctx, a) ? editProjects(a) : null))) :
+    host.replaceChildren(data.items.length ? h('div', { class: 'agent-grid' }, data.items.map((a) => h('div', { class: 'stack', 'data-agent': a.id }, agentCard(ctx, a), editFolder(a), manages(ctx, a) ? editProjects(a) : null, manages(ctx, a) ? editScopes(a) : null))) :
       h('div', { class: 'panel' }, empty('No agents yet', 'Add an agent for each assistant you run — for example a GitHub Copilot chat working in its own folder.')));
   }
   function editFolder(agent) {
@@ -145,6 +164,59 @@ export async function list(ctx) {
       if (saved) load();
     });
     details.append(h('summary', null, granted.size ? 'Change projects' : 'Grant a project (none yet)'), form);
+    return details;
+  }
+  // What the agent may do, each of its credentials with what it allows, and the way to change either.
+  // Setting the scopes issues a new secret that carries them (the server keeps the list on the agent);
+  // a credential the agent already has keeps what it allows until it is revoked here.
+  function editScopes(agent) {
+    const own = Boolean(ctx.me && agent.owner === ctx.me.id);
+    const known = Array.isArray(agent.scopes);
+    const has = known ? agent.scopes : [];
+    const other = otherCredentials(agent);
+    const details = h('details', { class: 'deliver', 'data-panel': 'agent-scopes', open: !known || other.length ? true : null });
+    const rows = credentialsOf(agent).slice().reverse().map((c) => {
+      const working = works(c);
+      const row = h('li', { class: 'copy-row', 'data-credential': c.id, 'data-working': String(working), 'data-differs': String(other.includes(c)) },
+        h('span', null, c.label || c.id, ' ', h('span', { class: 'small muted' }, 'issued ', time(c.created_at), ' · allows ', scopeNames(c.scopes))),
+        working ? (other.includes(c) ? h('span', { class: 'chip warn' }, known ? 'Allows something else' : 'Differs') : h('span', { class: 'chip ok' }, 'Works')) :
+          h('span', { class: 'chip plain' }, c.revoked ? 'Revoked' : 'Expired'));
+      if (working && agent.enabled !== false) row.append(h('button', { type: 'button', class: 'danger', 'aria-label': 'Revoke credential ' + (c.label || c.id), onclick: async (event) => {
+        if (!(await confirmDialog({ title: 'Revoke this credential?', body: 'Anything still using its secret stops working immediately.', confirmLabel: 'Revoke', danger: true }))) return;
+        try { await act(event.currentTarget, () => ctx.api.revokeAgentCredential(agent.id, c.id), { success: 'Credential revoked' }); } catch { return; }
+        load();
+      } }, 'Revoke'));
+      return row;
+    });
+    // Ticked: what it has; with nothing known, reading alone. Only its own account may give it more.
+    const ticked = new Set(known ? has : ['read']);
+    const form = h('form', { class: 'form', novalidate: true },
+      h('fieldset', { class: 'checks' }, h('legend', null, 'What it may do'),
+        SCOPES.map(([scope, label]) => h('label', { class: 'check', for: `sc-${agent.id}-${scope}` },
+          h('input', { type: 'checkbox', id: `sc-${agent.id}-${scope}`, name: 'scope', value: scope, checked: ticked.has(scope) ? true : null,
+            disabled: !own && !has.includes(scope) ? true : null }), label)),
+        h('p', { class: 'small muted' }, own ? 'Saving issues a new secret that carries exactly these, and a later new secret carries them too. A credential it already has keeps what it allows until you revoke it above.' :
+          'Only the agent’s own account may give it more than it has; you may take something away. Saving issues a new secret.')),
+      h('p', { class: 'error', role: 'alert', hidden: true }),
+      h('div', null, h('button', { type: 'submit' }, 'Save and issue a new secret')));
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const problem = form.querySelector('p[role=alert]');
+      const chosen = [...form.querySelectorAll('input')].filter((i) => i.getAttribute('name') === 'scope' && i.checked && !i.disabled).map((i) => i.value);
+      problem.hidden = chosen.length > 0;
+      problem.textContent = chosen.length ? '' : 'Tick at least one.';
+      if (!chosen.length) return;
+      if (!(await confirmDialog({ title: 'Set what it may do and issue a new secret?',
+        body: `${agent.name} will have: ${chosen.join(', ')}. A new credential with exactly these is created and its secret is shown once.`, confirmLabel: 'Issue new secret' }))) return;
+      let result;
+      try { result = await act(form.querySelector('button'), () => ctx.api.issueAgentCredential(agent.id, chosen), { success: 'New secret issued' }); } catch { return; }
+      const fresh = await ctx.api.agent(agent.id).catch(() => agent);
+      setupDialog(ctx, { agent: fresh, setup: result && result.setup }, { secret: result && result.credential && result.credential.secret });
+      load();
+    });
+    details.append(h('summary', null, known ? 'What it may do' : 'What it may do (choose)'),
+      rows.length ? h('ul', { class: 'open-items' }, rows) : h('p', { class: 'small muted' }, 'It has no credential on record.'),
+      agent.enabled === false ? h('p', { class: 'small muted' }, 'This agent is disabled: enable it before it gets a new secret.') : form);
     return details;
   }
   load();
@@ -317,6 +389,12 @@ function scopeList(scopes) {
 }
 function reissueSection(ctx, agent, payload) {
   const section = h('div', { class: 'setup-block' });
+  if (agent.scopes === null) {
+    // Nothing says what the agent may do, so the server refuses a plain renewal: the choice is on its card.
+    section.append(h('p', { class: 'small', role: 'status', 'data-scopes-needed': 'true' },
+      'The secret was shown once and cannot be shown again. A new one cannot be issued from here: nothing says what this agent may do. Close this and choose under “What it may do” on its card, which issues the new secret.'));
+    return section;
+  }
   const issue = h('button', { type: 'button', onclick: async () => {
     const ok = await confirmDialog({
       title: 'Issue a new secret?',
@@ -345,12 +423,12 @@ function reissueSection(ctx, agent, payload) {
 // The agent's other live credentials after a new one is issued: they still work
 // until revoked, so offer the revoke (POST /v1/agents/{id}/credentials/{cid}/revoke).
 function olderCredentials(ctx, agent, newId) {
-  const live = (agent.credentials || []).filter((c) => c && c.id !== newId && !c.revoked);
+  const live = credentialsOf(agent).filter((c) => c.id !== newId && works(c));
   if (!live.length) return h('p', { class: 'small muted' }, 'Any earlier credential for this agent keeps working until it is revoked.');
   return h('div', { class: 'setup-block' },
     h('p', { class: 'small' }, `The agent’s earlier ${live.length === 1 ? 'credential still works' : 'credentials still work'} until revoked. Revoke once the agent uses the new secret.`),
     h('ul', { class: 'open-items' }, live.map((c) => {
-      const row = h('li', { class: 'copy-row' }, h('span', null, c.label || c.id, ' ', h('span', { class: 'small muted' }, 'issued ', time(c.created_at))));
+      const row = h('li', { class: 'copy-row' }, h('span', null, c.label || c.id, ' ', h('span', { class: 'small muted' }, 'issued ', time(c.created_at), ' · allows ', scopeNames(c.scopes))));
       row.append(h('button', { type: 'button', class: 'danger', 'aria-label': 'Revoke credential ' + (c.label || c.id), onclick: async (event) => {
         const button = event.currentTarget;
         if (!(await confirmDialog({ title: 'Revoke this credential?', body: 'Anything still using its secret stops working immediately.', confirmLabel: 'Revoke', danger: true }))) return;
