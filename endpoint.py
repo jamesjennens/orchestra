@@ -1018,7 +1018,9 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                                require_authority=require_authority,runner=runner)
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--root',required=True)
+    # No prefix matching: the wrapper passes these flags exactly, and an abbreviation must
+    # not silently select a different option (kittrial-5bb.223, finding 7).
+    p=argparse.ArgumentParser(allow_abbrev=False);p.add_argument('--root',required=True)
     p.add_argument('--authority-store',help='server-side live-authority document (HTTP service only)')
     p.add_argument('--authority-lock',help='server-side authority lock (defaults to STORE.lock)')
     p.add_argument('--require-authority',action='store_true',
@@ -1030,11 +1032,12 @@ def main():
                    help='a project the calling SSH key is bound to (repeatable; passed only by '
                         'ssh_forced_command.py from the authorized_keys line): every request for '
                         'another project is refused (kittrial-5bb.193)')
-    p.add_argument('--key-principal',metavar='NAME',
+    p.add_argument('--key-principal',action='append',default=None,metavar='NAME',
                    help='the principal the calling SSH key belongs to (passed only by '
                         'ssh_forced_command.py from the authorized_keys line): every request whose '
                         'actor that principal does not own in the project is refused, except a '
-                        'session registration, which makes the new actor its own (kittrial-5bb.194)')
+                        'session registration, which makes the new actor its own (kittrial-5bb.194; '
+                        'given twice, refused)')
     a=p.parse_args()
     authority_config=None
     if a.authority_store:
@@ -1047,8 +1050,13 @@ def main():
             raise ValueError('--key-principal is for an SSH key line and cannot be combined with --authority-store')
         from admin import validate_name
         key_projects=None if a.key_project is None else frozenset(validate_name(name) for name in a.key_project)
+        if a.key_principal is not None and len(a.key_principal)>1:
+            # The flag may be named at most once: argparse would otherwise keep the last and a
+            # line that names two principals would be served as one of them (finding 7).
+            raise ValueError('--key-principal names %s twice; a key may name at most one principal'
+                             %', '.join(str(value) for value in a.key_principal))
         from sessions import valid_principal
-        key_principal=None if a.key_principal is None else valid_principal(a.key_principal,'--key-principal')
+        key_principal=None if a.key_principal is None else valid_principal(a.key_principal[0],'--key-principal')
         text=sys.stdin.read(2_000_001)
         if len(text)>2_000_000:raise ValueError('Request exceeds 2 MB')
         answer=execute(root_path(a.root),record_json.loads(text),authority_config=authority_config,
