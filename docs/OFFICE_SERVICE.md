@@ -205,6 +205,20 @@ otherwise untouched; a new deployment root is the documented way forward. That
 release's installer is readable as `git show 87a356c^1:bootstrap.py`. A rollback
 that stays within releases that know both pins has no such step.
 
+Rules 1 and 2 on rollback (kittrial-5bb.194). A rollback to a kit built before
+kittrial-5bb.194 also rolls back the session registry's `owners` map and the
+`--principal` key binding. The older kit's session validator refuses a registry that
+carries `owners`, so for a project where an actor was adopted or a session was registered
+under a bound key it refuses `session show`, `session resume`, `session register`,
+`session run start` and `actor-standing`, and **`admin.py backup PROJECT` fails for that
+project with status incomplete**. A key whose line carries `--principal` is refused on
+every request (the older wrapper does not know the argument), while `bd` itself, `work`
+and `review` keep working. The way forward is the one OPERATIONS.md ("Bind a key to its
+principal", Downgrade limit) documents: remove the `owners` key from
+`projects/PROJECT/.sessions.json` by hand and reprint the keys without `--principal`
+before the rollback, or restore with a kit that knows rule 2. Decide this before rolling
+back an installation that has used rule 2, exactly as for the binary pins above.
+
 ## Prepare a private runtime
 
 Use the bundled interpreter, with `<PYTHON>` denoting
@@ -286,7 +300,14 @@ are printed through it, so an upgrade needs no change to a configuration printed
 by this release or later. An installation with no `current` link (the live kits
 keep `<BASE>/kit -> <BASE>/releases/<ID>`) prints the release spelling instead,
 and says so: print that configuration again after an upgrade or it keeps running
-the release that printed it. A
+the release that printed it. In that
+configuration `python` names the interpreter that runs the endpoint on this
+server when a worker on another machine reaches it over SSH (and the same
+interpreter for the local transport): the bundled one. `host` is the worker's
+to fill in and must be a name or address the worker's machine can reach; this
+server's own host name may not resolve from the worker's network. (The
+service's `public_url` is where the web interface is published, which need not
+be where SSH lands, so the kit does not guess the host from it.) A
 project made on the host is not on the web yet: nothing of it appears in the web
 interface until a superuser registers it there (New project, with this name, or
 `POST /v1/projects` without `create`).
@@ -318,7 +339,23 @@ A configuration or key line that already names `<INSTALL_ROOT>/current/...`
 needs nothing: the link moves with the upgrade. A bare `python3` in an old
 client config is the other half of the same problem: on RHEL 8 it is
 platform-python 3.6, which cannot run the endpoint, and a host with no `python3`
-on PATH fails outright, so name the bundled interpreter instead.
+on PATH fails outright, so name the bundled interpreter instead. Since
+kittrial-5bb.191 an interpreter older than 3.10 is told so before anything is
+imported: every program of the kit that needs 3.10 prints one line
+(`endpoint.py needs Python 3.10 or newer and was started with Python 3.6.8
+(/usr/bin/python3). Nothing was carried out. ...` and what to do) and exits 2,
+where the endpoint used to die in a regular-expression traceback: `endpoint.py`,
+`client.py`, `admin.py`, `office_service.py`, `http_service.py`,
+`http_client.py`, `lifecycle.py`, `coordination.py`, `capabilities.py`,
+`requirement_records.py`, `setup_assistant.py`, `worker.py`, `worker_gate.py`
+and `tools/office_verify.py`. That includes `office_service.py health`, which
+happened to run under 3.6. `tools/office_release.py` and
+`ssh_forced_command.py` have no such check: they run under the host's
+Python 3.6 on purpose. The client shows the endpoint's line as it is, without
+its usual "outcome may be uncertain"; with a confined key (`"forced_command":
+true`) the interpreter is the one in the `authorized_keys` line, so the client
+says that the line must be printed again (`admin.py authorized-keys`) instead
+of pointing at its own configuration.
 
 The client half of those lines is a change in this kit's `client.py`: it runs the
 interpreter the config names, where older clients ran a literal `python3` on the

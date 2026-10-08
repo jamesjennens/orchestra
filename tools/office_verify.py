@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
 """Read-only UAT verification record for an installed office service."""
+import sys
+if sys.version_info < (3, 10):
+    # Before every other import, and in syntax Python 3.6 reads: an older interpreter failed in
+    # an import further down, with a traceback that hid the cause (kittrial-5bb.191).
+    sys.stderr.write('office_verify.py needs Python 3.10 or newer and was started with Python %d.%d.%d (%s). '
+                     'Nothing was carried out. Run it with Python 3.10 or newer; on an office installation that is the bundled interpreter, INSTALL_ROOT/current/python-runtime/....\n'
+                     % (sys.version_info[0], sys.version_info[1], sys.version_info[2], sys.executable))
+    sys.exit(2)
 import argparse
 import json
 import platform
