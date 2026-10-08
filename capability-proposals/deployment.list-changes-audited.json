@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "operation_id": "capnew-5bb192-list-changes-0003",
+  "operation_id": "capnew-6d1f0a37c9b84e2f9a5c1d70e4b8236f",
   "key": "deployment.list-changes-audited",
   "name": "Every operator and verifier list change is audited",
   "aliases": [
@@ -12,7 +12,7 @@
     "damaged authority-changes audit",
     "coordinators per project slice 5"
   ],
-  "summary": "operators add|remove and verifiers add|remove take --actor OPERATOR and --reason TEXT (at most 400 characters); restore-new takes both for its --restore-operators/--restore-verifiers re-grants. A real change appends one entry - at, operator, list, actor, change, reason - to the runtime-level authority-changes.audit.json beside deployment.private.json (schema_version 1, mode 0600, 200 entries kept), under the lock and BEFORE the configuration. Every NEW history begins with a compact baseline holding the lists as they stood, and entries the cap drops are folded into a fresh one, so a listed-but-never-mentioned name really is a hand edit or an older kit. The read-only authority-changes prints the entries, the lists, the baseline, the .damaged-* files and the replay; replay.agrees is true, false, or null (no trail yet); the exit code is 0 either way. A damaged audit never refuses a REMOVAL: the bytes are kept beside it first and the new history replaces the path, never leaving it absent; an add that would change something is refused before the lock (a no-op add is not), naming a real .damaged-<stamp>. NOT covered: a hand edit of deployment.private.json; a list change by an older kit.",
+  "summary": "operators add|remove and verifiers add|remove take --actor OPERATOR and --reason TEXT; restore-new takes both for its re-grants. A real change appends one entry to the runtime-level authority-changes.audit.json beside deployment.private.json (schema_version 1, 0600, 200 entries kept), under the lock and BEFORE the configuration. Every NEW history begins with a compact baseline of the lists as they stood; a list that cannot be read is recorded there as null (UNKNOWN), never as an empty list, and the trail is incomplete for it. An ADD that would start a history while a list cannot be read is refused; a REMOVAL is never refused for the audit or an unreadable list - it records the unknown list as null and goes on. authority-changes prints the trail and the replay; replay.agrees is true, false, or null (no trail yet, or incomplete: one list unreadable now, or null in the baseline); the exit code is 0 either way. A damaged audit never refuses a REMOVAL: the bytes are kept beside it first. The printed placeholders are refused on an ADD and dropped on a REMOVAL (recorded unattributed). NOT covered: a hand edit of deployment.private.json; a list change by an older kit.",
   "requirements": [],
   "anchors": [
     "docs/OPERATIONS.md#the-operator-and-verifier-list-changes-are-audited"
@@ -23,17 +23,24 @@
     "admin.py::read_authority_changes",
     "admin.py::authority_changes",
     "admin.py::authority_change_baseline",
+    "admin.py::authority_change_baseline_reason",
+    "admin.py::authority_change_fold",
     "admin.py::authority_change_damaged_files",
     "admin.py::set_aside_damaged_authority_changes",
+    "admin.py::authority_change_keep_bytes",
+    "admin.py::authority_change_copy_bytes",
     "admin.py::authority_change_replay",
+    "admin.py::authority_changes_incomplete_sentence",
     "admin.py::authority_changes_report",
     "admin.py::authority_change_precheck",
     "admin.py::record_authority_change",
     "admin.py::authority_change_notice",
+    "admin.py::authority_change_placeholder_notice",
     "admin.py::authority_change_arguments",
     "admin.py::authority_regrant_commands",
     "admin.py::merge_authority",
-    "admin.py::restore_authority"
+    "admin.py::restore_authority",
+    "admin.py::remove_private_write_leftovers"
   ],
   "tests": [
     "tests/test_authority_changes.py"
