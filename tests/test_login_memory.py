@@ -410,6 +410,23 @@ class WaitTests(Held):
         self.service.LOGIN_WAIT_SECONDS = http_auth.Service.LOGIN_WAIT_SECONDS
         self.assertEqual(self.service.LOGINS_PER_ADDRESS, 4)
         barrier, results, waits, most = threading.Barrier(10), [], [], []
+        # What is asserted is the wait of the service, its real two seconds, and the share. The
+        # password check is given a fixed length, a quarter of a second each, in place of a hash
+        # whose length is the machine's: on a starved machine ten real hashes, four at a time,
+        # outlasted the two seconds and the tenth person was sent away (seen once on Windows
+        # beside other suites, kittrial-5bb.191). The same answer as the real check gives.
+        real = http_auth.verify_password
+        known = {}
+
+        def a_quarter_of_a_second(verifier, password):
+            if (verifier, password) not in known:
+                known[(verifier, password)] = real(verifier, password)
+            time.sleep(0.25)
+            return known[(verifier, password)]
+        self.assertIs(a_quarter_of_a_second(self.service.state['users'][self.admin_user['id']]['password'], PASSWORD), True)
+        patched = mock.patch.object(http_auth, 'verify_password', a_quarter_of_a_second)
+        patched.start()
+        self.addCleanup(patched.stop)
 
         def person():
             barrier.wait(30)
