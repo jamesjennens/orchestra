@@ -18,7 +18,11 @@ KIT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(KIT))
 sys.path.insert(0, str(KIT / 'tests'))
 import onboarding
+import test_agent_attention
+import test_bd_label_aliases as rb
+import test_claim_held as held_stack
 import test_http_agents
+import test_http_review_fixes as fixes
 from test_http_agents import BASE, BUNDLE, COMMIT
 
 NAMES = ('finding-work', 'worker-prompt', 'poll-prompt', 'poll-prompt-agent')
@@ -289,6 +293,155 @@ class OrderTests(Members):
         self.assertTrue(numbered[3][1].startswith('A task assigned to somebody else is held'), numbered[3])
         self.assertIn('GET https://office.example/v1/docs/finding-work', guide)
         self.assertIsNone(SECRET.search(guide))
+
+
+
+def only_its_own_tests(*bases):
+    """Borrows a harness that is a TestCase with tests of its own and runs none of them again."""
+    def decorate(cls):
+        for base in bases:
+            for name in dir(base):
+                if name.startswith('test_') and name not in cls.__dict__:
+                    setattr(cls, name, None)
+        return cls
+    return decorate
+
+
+@only_its_own_tests(test_agent_attention.EndpointAttentionTests)
+class EndpointOrderTests(test_agent_attention.EndpointAttentionTests):
+    """The same order on the ENDPOINT backend (the strict canonical stand-in): item 4 of the task.
+    kittrial-5bb.114 was that this read knew no review state there, so an agent with changes
+    requested was offered free work. tests/test_agent_attention.py covers every own state; this is
+    the one statement the page makes, on the backend an installation runs."""
+
+    def test_own_feedback_then_blocked_then_in_progress_and_only_then_free_work(self):
+        feedback, blocked, working, free = self.tasks
+        held = self.create_task(self.people['blair'], self.project, 'held').data['id']
+        self.assertEqual(200, self.request('POST', self.base(held) + '/claim', {}, token=self.people['blair']).status)
+        for own in (feedback, blocked, working):
+            self.claim(own)
+        contribution = self.contribute(feedback)
+        self.review(self.people['blair'], feedback, 'request-changes', previous=contribution, contribution=contribution,
+                    items=[{'id': 'item-1', 'text': 'please revise'}])
+        self.checkpoint(blocked, [{'id': 'size', 'kind': 'blocker', 'source': 'task', 'text': 'which page size?'}])
+        data = self.next()
+        self.assertEqual(test_agent_attention.kinds(data),
+                         [('changes-requested', feedback), ('blocked', blocked), ('in-progress', working), ('claimable-task', free)])
+        self.assertEqual(data['next_action']['task'], feedback)
+        self.assertNotIn(held, [task for _, task in test_agent_attention.kinds(data)])
+
+
+@unittest.skipIf(rb.endpoint is None, 'endpoint imports fcntl (POSIX-only)')
+@unittest.skipIf(rb.BD is None, 'no real bd binary (set ORCHESTRA_BD_BIN or put bd on PATH)')
+@only_its_own_tests(rb.RealBdLabelAliasTests, held_stack.RealStackTests)
+class RealStackOrderTests(held_stack.RealStackTests):
+    """And through the real stack: the web service, the real endpoint.py, a real bd."""
+
+    def test_own_feedback_comes_before_free_work_and_a_held_task_is_not_offered(self):
+        made = self.request('POST', '/v1/agents', {'name': 'Kestrel', 'working_directory': '/home/x/kestrel', 'projects': ['pp']},
+                            token=self.tokens['casey'])
+        self.assertEqual(201, made.status, made.data)
+        agent = made.data['credential']['secret']
+        feedback, working, free, held = (self.new(title) for title in ('feedback', 'working', 'free', 'held'))
+        for own in (feedback, working):
+            self.assertEqual(200, self.claim('casey', own, token=agent).status)
+        self.assertEqual(200, self.claim('drew', held).status)
+        reviews = '%s/%s/reviews' % (self.tasks, feedback)
+        delivered = self.request('POST', reviews, dict(fixes.CONTRIBUTION, operation='contribute', schema_version=1,
+                                                       operation_id='op-order-1', previous=None), token=agent)
+        self.assertEqual(201, delivered.status, delivered.data)
+        contribution = self.request('GET', '%s/%s/brief' % (self.tasks, feedback), token=self.tokens['alex']).data['review']['contribution']['id']
+        asked = self.request('POST', reviews, dict(operation='request-changes', schema_version=1, operation_id='op-order-2',
+                                                   previous=contribution, contribution=contribution,
+                                                   items=[{'id': 'item-1', 'text': 'please revise'}]),
+                             token=self.tokens['alex'])
+        self.assertEqual(201, asked.status, asked.data)
+        answer = self.request('GET', '/v1/agents/me/next', token=agent)
+        self.assertEqual(200, answer.status, answer.data)
+        kinds = [(action['kind'], action['task']) for action in answer.data['next_actions']]
+        self.assertEqual(kinds, [('changes-requested', feedback), ('in-progress', working), ('claimable-task', free)])
+        self.assertEqual(answer.data['next_action']['task'], feedback)
+        self.assertNotIn(held, [task for _, task in kinds])
+
+
+class PageTests(Members):
+    """web/js/views/how.js run under Node, with a small DOM, against this real service."""
+
+    def test_the_page_shows_what_the_kit_serves_to_an_owner_and_to_a_viewer(self):
+        from test_http_web import run_node_module
+        node = shutil.which('node')
+        if not node:
+            print('NOTE: PageTests.test_the_page_shows_what_the_kit_serves_to_an_owner_and_to_a_viewer was SKIPPED: node '
+                  'is not installed, so web/js/views/how.js was not run on this platform.', file=sys.stderr)
+            self.skipTest('node is not installed; the page is not run here')
+        self.service.public_url = 'https://office.example'
+        web = KIT / 'web' / 'js'
+        done = run_node_module(self, node, 'await import(process.argv[1])',
+                               (KIT / 'tests' / 'web_how_screen.mjs').as_uri(),
+                               (KIT / 'tests' / 'web_dom_shim.mjs').as_uri(), (web / 'api.js').as_uri(),
+                               (web / 'views' / 'how.js').as_uri(), 'http://127.0.0.1:%d' % self.port, self.project,
+                               'alex=%s=%s' % (self.alex_id, self.alex), 'vera=%s=%s' % (self.ids['vera'], self.tokens['vera']))
+        self.assertEqual(0, done.returncode, done.stderr[-3000:])
+        seen = json.loads(done.stdout.strip().splitlines()[-1])
+        text = (KIT / 'docs' / 'FINDING_WORK.md').read_text(encoding='utf-8')
+        owner, viewer = seen['owner'], seen['viewer']
+        # The text is the kit's, for both readers alike: every heading of the document, in order.
+        wanted = [('H%d ' % (len(marks) + 1)) + head.replace('**', '').replace('`', '')
+                  for marks, head in re.findall(r'^(#{2,4}) (.+)$', text, re.M)]
+        self.assertEqual(owner['title'], 'How work is found')
+        self.assertEqual(owner['headings'], wanted)
+        self.assertEqual(viewer['headings'], wanted)
+        self.assertEqual(viewer['howText'], owner['howText'])
+        for said in ('1. The coordinator\'s standing guidance', '3. Only when none of its own tasks needs action: the ready list',
+                     'In the web interface today: no.', 'comments add TASK --file note.md --json', 'Served by the kit as docs finding-work.'):
+            with self.subTest(said=said):
+                self.assertIn(said, owner['howText'])
+        self.assertNotIn('**', owner['howText'])                                 # rendered, not shown as marks
+        # The owner's agent: its resume prompt and its recurring prompt, with its name and the address in them.
+        self.assertEqual((owner['agents'], owner['noAgents']), (1, 0))
+        resume, poll = owner['agentBlocks']
+        self.assertEqual((resume['prompt'], poll['prompt']), ('resume', 'agent'))
+        self.assertIn('You are Kestrel, an Orchestra agent. Read .orchestra/AGENT.md', resume['text'])
+        prompt = onboarding.web_document(KIT, 'poll-prompt-agent')['prompt']
+        self.assertEqual(poll['text'], prompt.replace('REPLACE_AGENT_NAME', 'Kestrel').replace('REPLACE_SERVER_URL', 'https://office.example'))
+        self.assertEqual((poll['left'], poll['served'], poll['buttons']), ('REPLACE_INTERVAL', ['docs poll-prompt-agent'], ['Copy']))
+        # A viewer has no agent: the prompt is there, with the name left to replace.
+        self.assertEqual((viewer['agents'], viewer['noAgents']), (0, 1))
+        self.assertEqual([block['prompt'] for block in viewer['agentBlocks']], ['agent'])
+        self.assertEqual(viewer['agentBlocks'][0]['left'], 'REPLACE_AGENT_NAME REPLACE_INTERVAL')
+        self.assertIn('https://office.example/v1/agents/me/next', viewer['agentBlocks'][0]['text'])
+        # A worker over SSH: the first prompt and the recurring one, as served, with the project in them.
+        for reader in (owner, viewer):
+            first, recurring = reader['workerBlocks']
+            self.assertEqual((first['prompt'], recurring['prompt']), ('first', 'worker'))
+            self.assertEqual(first['text'], onboarding.web_document(KIT, 'worker-prompt')['prompt'].replace('REPLACE_PROJECT', self.project))
+            self.assertEqual(recurring['text'], onboarding.web_document(KIT, 'poll-prompt')['prompt'].replace('REPLACE_PROJECT', self.project))
+            self.assertEqual(recurring['left'], 'REPLACE_WORKING_FOLDER REPLACE_ACTOR_FILE REPLACE_CLIENT_PREFIX REPLACE_INTERVAL')
+            self.assertEqual((first['served'], recurring['served']), (['docs worker-prompt'], ['docs poll-prompt']))
+            self.assertNotIn('REPLACE_PROJECT', first['text'] + recurring['text'])
+        # No prompt on the page holds a secret: not the agent's, not anybody's session.
+        everything = json.dumps(seen)
+        for secret in (self.secret, self.alex, self.tokens['vera']):
+            self.assertNotIn(secret, everything)
+        self.assertIsNone(SECRET.search(everything))
+        # A document that cannot be read: said, and no panel is shown half.
+        self.assertEqual(seen['unreadable']['panels'], 0)
+        self.assertIn('How work is found', seen['unreadable']['text'])
+        # What the page fills in and what it leaves.
+        self.assertEqual(seen['fill'], [{'text': 'A x b REPLACE_TWO c x', 'left': ['REPLACE_TWO']},
+                                        {'text': 'A REPLACE_ONE', 'left': ['REPLACE_ONE']},
+                                        {'text': 'nothing here', 'left': []}, {'text': '', 'left': []}])
+        self.assertEqual(seen['body'], 'First paragraph.\n\n## Next\n')
+
+    def test_the_page_is_reached_from_the_projects_navigation_by_every_member(self):
+        app = (KIT / 'web' / 'js' / 'app.js').read_text(encoding='utf-8')
+        routes = (KIT / 'web' / 'js' / 'routes.js').read_text(encoding='utf-8')
+        self.assertIn("  ['how', '/p/{pid}/how'],\n", routes)
+        self.assertIn('how: how.page,', app)
+        line = "            link('/p/' + pid + '/how', 'How work is found'),\n"
+        self.assertIn(line, app)
+        # Not behind a role: the line before it is the owners' one, and this one has no condition.
+        self.assertNotIn('?', line)
 
 
 if __name__ == '__main__':

@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "operation_id": "capnew-3c7d1f0a5b9e4e62a4d8f6b1c0e9a735",
+  "key": "web.how-work-is-found",
+  "name": "How a worker finds its work and how a coordinator reaches it: one served text, a page for every member, served prompts",
+  "aliases": [
+    "how work is found",
+    "where does a worker look for work",
+    "how to reach a worker",
+    "poll prompt",
+    "recurring prompt",
+    "worker prompt served",
+    "docs finding-work",
+    "GET /v1/docs"
+  ],
+  "summary": "The kit serves one text that says where a worker looks for work at each run and in what order (the standing guidance; its own tasks with review feedback and newer comments; only then the ready list, exactly one task nobody holds; a task assigned to somebody else is held), what it does not read (a parent or coordination task is not an inbox), and the three ways to reach a worker (guidance, assignment, a comment on its task) with what the web interface can do today and the command that works today: docs/FINDING_WORK.md, served as docs finding-work. It serves the prompts too: docs worker-prompt (first prompt over SSH), docs poll-prompt and docs poll-prompt-agent (the short recurring prompts, at most 2000 characters, no state). The web service hands the same files to any signed-in member or agent: GET /v1/docs and GET /v1/docs/NAME (text, prompt, placeholders, server_url). The page How work is found (#/p/PROJECT/how) shows them to every member, a viewer included, with copy buttons and the known values filled in, and no secret. An agent's .orchestra/AGENT.md states the same order; a test pins it to the order GET /v1/agents/me/next gives.",
+  "requirements": [],
+  "anchors": [
+    "docs/FINDING_WORK.md#how-work-is-found",
+    "docs/HTTP_DEPLOYMENT.md#the-kits-documents-for-members-how-work-is-found-and-the-prompts"
+  ],
+  "code": [
+    "onboarding.py::web_document",
+    "onboarding.py::prompt_of",
+    "onboarding.py::placeholders",
+    "http_service.py::ApiHandler.docs_get",
+    "http_service.py::ApiHandler.docs_list"
+  ],
+  "tests": [
+    "tests/test_finding_work.py"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "web",
+    "onboarding",
+    "agents"
+  ]
+}
