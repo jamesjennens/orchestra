@@ -4706,7 +4706,8 @@ def key_line(line,root,kit):
     while index<len(arguments):
         flag,equals,joined=arguments[index].partition('=')
         if flag in values and equals:values[flag].append(joined)
-        elif flag in values and index+1<len(arguments):index+=1;values[flag].append(arguments[index])
+        elif flag in values and index+1<len(arguments) and not arguments[index+1].startswith('-'):
+            index+=1;values[flag].append(arguments[index])
         else:unknown.append(arguments[index])
         index+=1
     here=Path(os.path.realpath(str(kit)))
@@ -4745,6 +4746,10 @@ def key_line(line,root,kit):
         entry['principal_repeated']=len(principals)>1
         entry['principal_ill_formed']=any(not isinstance(item,str) or not PRINCIPAL_FORM.fullmatch(item)
                                           for item in principals)
+    if values['--project'] and len(values['--project'])!=len(set(values['--project'])):
+        # A project named twice (``--project pa --project pa``) is refused by the wrapper, as
+        # a repeated principal is; the listing must say so too (kittrial-5bb.223, finding 6).
+        entry['project_repeated']=True
     return entry
 
 def authorized_keys_listing(root,file=None):
@@ -4768,12 +4773,13 @@ def authorized_keys_listing(root,file=None):
         # Both kinds of binding are counted and named (kittrial-5bb.194 review, finding 3):
         # `bound` counts every bound line, and `principal-bound` names the principal binding
         # on its own. The key appears only when such a line exists.
-        if entry.get('principal'):
+        if entry.get('principal') and not str(entry['principal']).startswith('-'):
             summary['principal-bound']=summary.get('principal-bound',0)+1
     attention=[entry['line'] for entry in lines
                if entry.get('other_kit') or entry.get('missing') or entry.get('unknown_arguments')
                or entry.get('unknown_projects') or entry.get('names_release') or entry['kind']=='unreadable'
-               or entry.get('principal_repeated') or entry.get('principal_ill_formed')]
+               or entry.get('principal_repeated') or entry.get('principal_ill_formed')
+               or entry.get('project_repeated')]
     return {'schema_version':1,'file':str(path),'root':str(root),'kit':str(kit),'lines':lines,'summary':summary,
             'attention':attention,
             'notes':['unrestricted: the key has this account\'s shell and is outside every rule of the kit, on every project.',
@@ -4785,6 +4791,8 @@ def authorized_keys_listing(root,file=None):
                      'principal_ill_formed: the line names a principal that is not `lane:NAME` or `person:NAME`; the '
                      'wrapper refuses every request of that key. principal_repeated: the line names more than one '
                      'principal (the wrapper refuses it). Both are under attention and must be reprinted.',
+                     'project_repeated: the line names the same project twice (`--project pa --project pa`); the '
+                     'wrapper refuses the line. It is under attention and must be reprinted.',
                      'other_kit: the line runs a wrapper or an endpoint that is not this kit\'s file. Such a line is '
                      'served by that other kit, whatever its text says: a kit older than this one binds nothing. '
                      'Print the line again with this kit (authorized-keys) and replace it.',
@@ -4964,10 +4972,14 @@ def adopt_actor(root,project,actor,principal,operator,reason,from_principal=None
     command: ``from_principal`` (``--from``) must name the owner it has now, and the audit
     entry is marked ``moved``. Writing nothing when it already gives it to this one.
 
-    The registry is written under the project's coordination lock and the audit entry under
-    the deployment lock. A damaged audit refuses the whole command before the registry is
-    touched. The audit is appended BEFORE the registry mutation, so a host crash between the
-    two leaves an audit entry with no adoption - the safer mistake (review, item 6).
+    The same-operator-name check, the existence check and both writes run under the
+    deployment lock (kittrial-5bb.223, finding 1): two ``adopt-actor`` commands for one
+    operator-listed name in two projects serialize there, so the second reads the first's
+    owner entry and refuses instead of both exiting 0. Within that lock the registry is
+    written under the project's coordination lock. A damaged audit refuses the whole command
+    before the registry is touched. The audit is appended BEFORE the registry mutation, so a
+    host crash between the two leaves an audit entry with no adoption - the safer mistake
+    (review, item 6).
     """
     path=project_dir(root,project)
     if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
@@ -4982,55 +4994,55 @@ def adopt_actor(root,project,actor,principal,operator,reason,from_principal=None
     if not isinstance(reason,str) or not reason.strip():raise ValueError('A reason is required (--reason)')
     reason=reason.strip()
     if len(reason)>400:raise ValueError('--reason must be at most 400 characters')
-    if actor in operators(root):
-        conflicts=principal_conflicts(root,actor,principal,project)
-        if conflicts:
-            raise ValueError('Refusing to adopt %s for %s: it is on the operator allowlist and project %s '
-                             'already gives it to %s. One operator name must mean one principal on this '
-                             'installation; adopt it there first, or take it off the operator list.'
-                             %(actor,principal,conflicts[0][0],conflicts[0][1]))
-    actor_adoptions(root)                       # a damaged audit refuses before anything is written
-    if actor not in project_actor_names(root,project,path):
-        raise ValueError('Refusing to adopt %s: no session registration, owner entry or tracker row in project %s '
-                         'names that actor, so this project holds nothing to give to %s. Check the name '
-                         '(session show ACTOR, or the project rows); nothing was changed.'%(actor,project,principal))
-    try:
-        import fcntl
-    except ImportError:                         # a platform without flock: the atomic write still stands
-        fcntl=None
-    with (path/'.coordination.lock').open('a') as lock:
-        if fcntl is not None:fcntl.flock(lock,fcntl.LOCK_EX)
-        from coordination import atomic
-        data=read_registry(path)
-        current=dict(owner_map(data))
-        previous=current.get(actor)
-        if previous is not None and previous!=principal:
-            # An actor belongs to one principal: moving it out of another's hands is not the
-            # same plain command that gives a legacy actor its first owner (review, item 2).
-            if from_principal is None:
-                raise ValueError('Refusing to move %s: project %s already gives it to %s. One actor belongs to one '
-                                 'principal; to move it, name the owner it has now with --from %s. Nothing was changed.'
-                                 %(actor,project,previous,previous))
-            if from_principal!=previous:
-                raise ValueError('--from names %s, but project %s gives %s to %s; nothing was changed.'
-                                 %(from_principal,project,actor,previous))
-        elif from_principal is not None and from_principal!=previous:
-            raise ValueError('--from names %s, but project %s does not give %s to it; nothing was changed.'
-                             %(from_principal,project,actor))
-        changed=previous!=principal
-        if changed:
-            entry={'at':utc_stamp(),'operator':operator,'project':project,'actor':actor,'principal':principal,
-                   'previous':previous,'reason':reason,'moved':previous is not None}
-            with deployment_config_lock(root):
+    with deployment_config_lock(root):
+        if actor in operators(root):
+            conflicts=principal_conflicts(root,actor,principal,project)
+            if conflicts:
+                raise ValueError('Refusing to adopt %s for %s: it is on the operator allowlist and project %s '
+                                 'already gives it to %s. One operator name must mean one principal on this '
+                                 'installation; adopt it there first, or take it off the operator list.'
+                                 %(actor,principal,conflicts[0][0],conflicts[0][1]))
+        actor_adoptions(root)                   # a damaged audit refuses before anything is written
+        if actor not in project_actor_names(root,project,path):
+            raise ValueError('Refusing to adopt %s: no session registration, owner entry or tracker row in project %s '
+                             'names that actor, so this project holds nothing to give to %s. Check the name '
+                             '(session show ACTOR, or the project rows); nothing was changed.'%(actor,project,principal))
+        try:
+            import fcntl
+        except ImportError:                     # a platform without flock: the atomic write still stands
+            fcntl=None
+        with (path/'.coordination.lock').open('a') as lock:
+            if fcntl is not None:fcntl.flock(lock,fcntl.LOCK_EX)
+            from coordination import atomic
+            data=read_registry(path)
+            current=dict(owner_map(data))
+            previous=current.get(actor)
+            if previous is not None and previous!=principal:
+                # An actor belongs to one principal: moving it out of another's hands is not the
+                # same plain command that gives a legacy actor its first owner (review, item 2).
+                if from_principal is None:
+                    raise ValueError('Refusing to move %s: project %s already gives it to %s. One actor belongs to one '
+                                     'principal; to move it, name the owner it has now with --from %s. Nothing was changed.'
+                                     %(actor,project,previous,previous))
+                if from_principal!=previous:
+                    raise ValueError('--from names %s, but project %s gives %s to %s; nothing was changed.'
+                                     %(from_principal,project,actor,previous))
+            elif from_principal is not None and from_principal!=previous:
+                raise ValueError('--from names %s, but project %s does not give %s to it; nothing was changed.'
+                                 %(from_principal,project,actor))
+            changed=previous!=principal
+            if changed:
+                entry={'at':utc_stamp(),'operator':operator,'project':project,'actor':actor,'principal':principal,
+                       'previous':previous,'reason':reason,'moved':previous is not None}
                 history=actor_adoptions(root)
                 history.append(entry)
                 atomic_private_write(root/ACTOR_ADOPTIONS_AUDIT,
                                      json.dumps({'schema_version':ACTOR_ADOPTIONS_SCHEMA,
                                                  'entries':history[-ACTOR_ADOPTIONS_MAX:]}))
-            current[actor]=principal
-            data['owners']=current
-            validate_sessions(data)
-            atomic(path/'.sessions.json',data)
+                current[actor]=principal
+                data['owners']=current
+                validate_sessions(data)
+                atomic(path/'.sessions.json',data)
     if not changed:
         return {'schema_version':1,'project':project,'actor':actor,'principal':principal,
                 'previous':previous,'changed':False,'moved':False,'audit_records':len(actor_adoptions(root))}
@@ -5146,6 +5158,20 @@ def credential_actors(root,state_path,service_namespace=None):
     return {'schema_version':1,'state':str(source),'worker_credentials_with_a_name':len(out),
             'colliding_and_not_revoked':len(colliding),'credentials':out}
 
+def one_flag_value(values,label):
+    """The one value of a CLI flag that may be named at most once.
+
+    ``adopt-actor``'s ``--principal``, ``--from``, ``--actor`` and ``--reason`` are ``append``
+    arguments, so a flag named twice is refused here rather than silently taking the last
+    (kittrial-5bb.223, finding 4); the parser stores one or more values in a list.
+    """
+    if isinstance(values,list):
+        if len(values)>1:
+            raise ValueError('%s given more than once; name it once (got %s)'
+                             %(label,', '.join(str(value) for value in values)))
+        return values[0] if values else None
+    return values
+
 def main():
     p=argparse.ArgumentParser();p.add_argument('--root',required=True)
     sub=p.add_subparsers(dest='command',required=True)
@@ -5257,18 +5283,19 @@ def main():
     a.add_argument('--file',default=None,help='the authorized_keys file to read (default: ~/.ssh/authorized_keys of this account)')
     a=sub.add_parser('adopt-actor',help='give an existing actor to a principal (a lane) in one project, so a key '
                                         'bound to that principal may act as it; recorded in the adoption audit '
-                                        '(operator allowlist)')
+                                        '(operator allowlist)',allow_abbrev=False)
     a.add_argument('project',help='the project whose registry records the actor')
     a.add_argument('actor',metavar='ACTOR',help='the actor name to give to the principal, as it already appears in '
                                                 'the project (a session actor, or an older name with tracker rows)')
-    a.add_argument('--principal',required=True,metavar='NAME',help='the principal (a lane, lane:NAME or person:NAME) '
-                                                                   'that actor is to belong to')
-    a.add_argument('--from',dest='from_principal',default=None,metavar='NAME',
+    a.add_argument('--principal',required=True,action='append',default=None,metavar='NAME',
+                   help='the principal (a lane, lane:NAME or person:NAME) that actor is to belong to (given twice, refused)')
+    a.add_argument('--from',dest='from_principal',action='append',default=None,metavar='NAME',
                    help='the principal that currently owns the actor, required to MOVE an actor another principal '
-                        'already owns: without it the move is refused')
-    a.add_argument('--actor',required=True,dest='operator',metavar='OPERATOR',
-                   help='the actor performing the adoption, on the deployment operator allowlist')
-    a.add_argument('--reason',required=True,help='why this actor is being adopted (recorded in the audit)')
+                        'already owns: without it the move is refused (given twice, refused)')
+    a.add_argument('--actor',required=True,dest='operator',action='append',default=None,metavar='OPERATOR',
+                   help='the actor performing the adoption, on the deployment operator allowlist (given twice, refused)')
+    a.add_argument('--reason',required=True,action='append',default=None,
+                   help='why this actor is being adopted (recorded in the audit; given twice, refused)')
     a=sub.add_parser('actor-adoptions',help='read-only: the recorded actor adoptions (who gave which actor to which '
                                             'principal, when and why)')
     a.add_argument('project',nargs='?',help='only the adoptions of this project')
@@ -5836,8 +5863,11 @@ def main():
     elif args.command=='authorized-keys-list':
         print(json.dumps(authorized_keys_listing(root,args.file),ensure_ascii=True,indent=2))
     elif args.command=='adopt-actor':
-        print(json.dumps(adopt_actor(root,args.project,args.actor,args.principal,args.operator,args.reason,
-                                     from_principal=args.from_principal),
+        print(json.dumps(adopt_actor(root,args.project,args.actor,
+                                     one_flag_value(args.principal,'--principal'),
+                                     one_flag_value(args.operator,'--actor'),
+                                     one_flag_value(args.reason,'--reason'),
+                                     from_principal=one_flag_value(args.from_principal,'--from')),
                          ensure_ascii=True,sort_keys=True))
     elif args.command=='actor-adoptions':
         print(json.dumps({'schema_version':ACTOR_ADOPTIONS_SCHEMA,'entries':actor_adoptions(root,args.project)},
