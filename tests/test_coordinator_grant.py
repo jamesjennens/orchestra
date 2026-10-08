@@ -16,12 +16,11 @@ KIT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(KIT))
 sys.path.insert(0, str(KIT / 'tests'))
 import http_authority
+import http_service
 import test_http_proposals
 import test_own_party
 
-OWN_PARTY_AGENT = ('This contribution was delivered by this agent\'s own account (its owner, one of that account\'s '
-                   'agents, or a worker credential it issued). An agent never approves work of its own account: another '
-                   'coordinator or owner of this project, or a superuser who did not deliver it, must approve it.')
+OWN_PARTY_AGENT = http_service.ApiHandler.OWN_PARTY_AGENT[0] + http_service.ApiHandler.OWN_PARTY_AGENT[3]
 
 
 class Grants(test_own_party.Party):

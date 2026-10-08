@@ -14,13 +14,12 @@ from pathlib import Path
 KIT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(KIT))
 sys.path.insert(0, str(KIT / 'tests'))
+import http_service
 import test_bd_label_aliases as rb
 import test_claim_held as held
 import test_http_review_fixes as fixes
 
-OWN_PARTY_AGENT = ('This contribution was delivered by this agent\'s own account (its owner, one of that account\'s '
-                   'agents, or a worker credential it issued). An agent never approves work of its own account: another '
-                   'coordinator or owner of this project, or a superuser who did not deliver it, must approve it.')
+OWN_PARTY_AGENT = http_service.ApiHandler.OWN_PARTY_AGENT[0] + http_service.ApiHandler.OWN_PARTY_AGENT[3]
 
 
 def only_its_own_tests(cls):
