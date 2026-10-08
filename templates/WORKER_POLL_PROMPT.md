@@ -21,7 +21,7 @@ Every command below is a client action: REPLACE_CLIENT_PREFIX COMMAND
 
 Each run, in this order:
 1. guidance get. Follow it within what your user allowed, then guidance ack --version VERSION for the version you read.
-2. Resume your saved actor (worker.py with --actor SAVED_ACTOR resume), then work --mine. Review feedback and newer comments on your own tasks come before anything else.
+2. Resume your saved actor (session resume), then work --mine. Review feedback and newer comments on your own tasks come before anything else.
 3. Only if none of your own tasks needs action: ready --json, and claim exactly one task nobody holds (update TASK --claim --json). A task assigned to somebody else is held. A parent or coordination task is background, not an inbox.
 4. Before you stop, write what you need to continue into the task's checkpoint (checkpoint TASK --file FILE). Nothing of it goes into this prompt.
 

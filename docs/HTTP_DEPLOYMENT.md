@@ -862,7 +862,8 @@ client's `docs NAME` serves, read by the same reader:
 - Any signed-in member and any agent credential may read them: they hold nothing of a
   project and no secret. Without a session: `401`. A name that is not one of the four,
   the rest of the client's catalogue included: `404`. A file that cannot be read from
-  the installed kit: `503`, and the page says so and shows nothing in part.
+  the installed kit: `503`; the page then shows nothing in part, under the application's
+  general words for a failed load (they are not specific to this page yet).
 - The page fills in the values it knows: the server address, the project, and the names
   of the reader's own agents that work in the project. It names the values that are left
   ("Replace before use: ..."). A recurring prompt is at most 2,000 characters

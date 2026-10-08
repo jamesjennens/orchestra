@@ -37,6 +37,10 @@ its last checkpoint.
 
 **Agent:** `GET /v1/agents/me/next`. The reply lists its own tasks first: changes
 requested, then a task blocked by its last checkpoint, then a task in progress.
+Not there yet for an agent: a comment written on a task it has **in progress** is not
+flagged in that reply, and the task's brief over the web carries no comments (a comment
+on a task it left **blocked** is flagged). Until it is, an agent that expects word from
+its coordinator reads the task's history: `GET /v1/projects/PROJECT/tasks/TASK/history`.
 
 ### 3. Only when none of its own tasks needs action: the ready list
 
@@ -100,7 +104,11 @@ task page. Giving a task to somebody else is not there yet (planned: kittrial-5b
 
 ### A task already in a lane's hands: a comment on that task
 
-It shows as newer activity when the worker next reads its own tasks.
+For a worker over SSH it shows as newer activity when the worker next reads its own
+tasks (`work --mine`, `brief TASK --json`). For an agent with a web credential it is
+flagged only on a task the agent left blocked; on a task in progress the agent must
+read the task's history to see it (see step 2 above). So do not rely on a comment alone
+to reach a web agent that is busy: assign, or request changes on what it delivered.
 
 **In the web interface today: no.** The task page shows the task's history. Writing a
 comment over the web is not there yet (planned: kittrial-5bb.211). A review that
