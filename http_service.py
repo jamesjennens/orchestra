@@ -4799,10 +4799,10 @@ class ApiHandler(BaseHTTPRequestHandler):
             refuse_unknown_fields(payload, self.AGENT_CREDENTIAL_FIELDS, 'A new agent credential')
             result = self.service.issue_agent_credential(
                 ctx.principal, ctx.params['aid'], scopes=payload.get('scopes'),
-                label=payload.get('label'), request_id=ctx.request_id)
+                label=payload.get('label'), request_id=ctx.request_id, persist=False)
             return result, _redact_agent_secret(result)
-        return self._mutate(ctx, 'agents.credentials.issue', None, issue, status=201,
-                            capability=CAP_AGENTS, replay_status=200)
+        return self._mutate_agent_credential(ctx, 'agents.credentials.issue', issue, status=201,
+                                             replay_status=200)
 
     @route('POST', r'/v1/agents/(?P<aid>' + ID + r')/credentials/'
                   r'(?P<cid>' + ID + r')/revoke')
@@ -4810,10 +4810,33 @@ class ApiHandler(BaseHTTPRequestHandler):
         def revoke():
             result = self.service.revoke_agent_credential(
                 ctx.principal, ctx.params['aid'], ctx.params['cid'],
-                request_id=ctx.request_id)
+                request_id=ctx.request_id, persist=False)
             return result, result
-        return self._mutate(ctx, 'agents.credentials.revoke', None, revoke, status=204,
-                            capability=CAP_AGENTS)
+        return self._mutate_agent_credential(ctx, 'agents.credentials.revoke', revoke, status=204)
+
+    def _mutate_agent_credential(self, ctx, operation, fn, **options):
+        """Save the credential and its route audit in one atomic JSON replacement.
+
+        The service defers its inner save on these two routes only. A failed final save
+        rolls back the mutation and removes its idempotency receipt, so a retry can issue
+        one fresh secret rather than replay an issuance that never persisted. Existing
+        authorization, target checks and one-time-secret replay stay in _mutate.
+        """
+        with self.service.store.lock:
+            agent = self.service.state['agents'].get(ctx.params['aid'])
+            if not isinstance(agent, dict):
+                return self._mutate(ctx, operation, None, fn, capability=CAP_AGENTS, **options)
+            with self.service._agent_credential_transaction(agent, persist=False):
+                try:
+                    return self._mutate(ctx, operation, None, fn, capability=CAP_AGENTS, **options)
+                except HttpError:
+                    raise  # _mutate already releases a refused reservation and audits it
+                except Exception:
+                    if ctx.idempotency_key is not None:
+                        digest = self.service._idempotency_key(ctx.principal, None,
+                            '%s %s' % (operation, ctx.route_target), ctx.idempotency_key)
+                        self.service.idempotency_release(digest)
+                    raise
 
     # -- project-scoped agent routes (owner decision 4) ------------------------
     #

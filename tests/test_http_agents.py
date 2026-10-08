@@ -17,10 +17,12 @@ import sys
 import threading
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import http_auth
 import http_service
@@ -1228,6 +1230,181 @@ class RenewalScopeTests(AgentHarness):
     PAGE = {'label': 'web: new secret'}
     ALL = ['checkpoints', 'feedback', 'proposals', 'read', 'reviews', 'tasks']
 
+    def test_only_its_account_confirms_inferred_scopes_by_plain_renewal(self):
+        agent_id, _, _ = self.agent(['read'])
+        self.made_before(agent_id)
+        before = self.working(agent_id)
+        refused = self.renew(agent_id, token=self.admin)
+        self.assertEqual(409, refused.status, refused.data)
+        self.assertEqual({'scopes_needed': True}, refused.data['error']['detail'])
+        self.assertEqual((None, None), self.stored(agent_id))
+        self.assertEqual(before, self.working(agent_id))
+        renewed = self.renew(agent_id)
+        self.assertEqual(201, renewed.status, renewed.data)
+        self.assertEqual((['read'], 'set'), self.stored(agent_id))
+        self.assertEqual(201, self.renew(agent_id, token=self.admin).status)
+
+    def test_revocation_or_expiry_of_the_narrow_credential_never_lets_admin_confirm_the_remainder(self):
+        for mode in ('revoke', 'expire'):
+            with self.subTest(mode=mode):
+                agent_id, _, made = self.agent(['read'], name='Legacy ' + mode)
+                four = ['tasks', 'checkpoints', 'reviews', 'feedback']
+                self.assertEqual(201, self.renew(agent_id, {'scopes': four}).status)
+                self.made_before(agent_id)
+                if mode == 'revoke':
+                    self.assertEqual(204, self.revoke(agent_id, made['credential']['id']).status)
+                else:
+                    with self.service.store.lock:
+                        self.service.state['credentials'][made['credential']['id']]['expires_at'] = 0
+                        self.service.store.save()
+                self.assertEqual(set(four), set(self.has(agent_id)))
+                self.assertEqual('inferred', self.read(agent_id)['scopes_source'])
+                self.assertEqual(409, self.renew(agent_id, token=self.admin).status)
+                self.assertEqual((None, None), self.stored(agent_id))
+                self.assertEqual(201, self.renew(agent_id, {'scopes': ['read']}).status)
+
+    def test_pruning_cannot_erase_the_scope_change_or_credential_audit(self):
+        agent_id, _, made = self.agent(['read'])
+        credential_id = made['credential']['id']
+        original_hash = self.service.state['credentials'][credential_id]['token_hash']
+        renewed = self.renew(agent_id, {'scopes': ['read', 'tasks']})
+        self.assertEqual(201, renewed.status, renewed.data)
+        self.assertEqual(204, self.revoke(agent_id, credential_id).status)
+        for _ in range(http_auth.AGENT_DEAD_CREDENTIALS_KEPT + 1):
+            cred = self.renew(agent_id).data['credential']
+            self.revoke(agent_id, cred['id'])
+        self.assertNotIn(credential_id, self.service.state['credentials'])
+        self.assertNotIn(original_hash, self.service.state['credential_tokens'])
+        events = [e for e in self.service.state['audit'] if e.get('agent_id') == agent_id]
+        self.assertTrue(any(e['action'] == 'agents.scopes' for e in events), events)
+        changed = next(e for e in events if e['action'] == 'agents.scopes')
+        self.assertEqual((['read'], ['read', 'tasks']), (changed['scopes_before'], changed['scopes_after']))
+        self.assertEqual(self.alex_id, changed['user_id'])
+        self.assertTrue(changed['time'])
+        self.assertTrue(changed['request_id'])
+        issued = next(e for e in events if e['action'] == 'agents.credentials.issued'
+                      and e['target_credential_id'] == renewed.data['credential']['id'])
+        self.assertEqual(renewed.data['credential']['id'], issued['target_credential_id'])
+        revoked = next(e for e in events if e['action'] == 'agents.credentials.revoked')
+        self.assertEqual(credential_id, revoked['target_credential_id'])
+        self.assertEqual(['read'], revoked['credential_scopes'])
+        self.assertNotIn(renewed.data['credential']['secret'], json.dumps(events))
+        self.assertNotIn('token_hash', json.dumps(events))
+
+    def test_failed_save_rolls_back_scope_credential_index_pruning_and_audit(self):
+        agent_id, first, _ = self.agent(['read'])
+        for _ in range(http_auth.AGENT_DEAD_CREDENTIALS_KEPT):
+            cred = self.renew(agent_id).data['credential']
+            self.revoke(agent_id, cred['id'])
+        with self.service.store.lock:
+            oldest = self.service._agent_credentials(self.service.state['agents'][agent_id])[0]
+            oldest['expires_at'] = 0  # issuance would prune this extra dead record
+            self.service.store.save()
+        # Authentication may save a last-use stamp first. Fail the actual renewal write.
+        before = json.loads(json.dumps(self.service.state))
+        write = self.service.store._write
+        def fail_renewal():
+            if self.stored(agent_id)[0] != ['read']:
+                raise OSError('synthetic renewal save failure')
+            return write()
+        with mock.patch.object(self.service.store, '_write', side_effect=fail_renewal):
+            failed = self.renew(agent_id, {'scopes': ['read', 'tasks']}, key='failed-renewal')
+        self.assertEqual(500, failed.status, failed.data)
+        self.assertNotIn('secret', failed.body.decode())
+        self.assertEqual(before['agents'][agent_id], self.service.state['agents'][agent_id])
+        self.assertEqual(before['credentials'], self.service.state['credentials'])
+        self.assertEqual(before['credential_tokens'], self.service.state['credential_tokens'])
+        self.assertFalse(any(e.get('agent_id') == agent_id and e['action'] == 'agents.scopes'
+                             for e in self.service.state['audit']))
+        self.service.store.save()  # an unrelated write must not publish the failed renewal
+        disk = json.loads(self.service.store.path.read_text())
+        self.assertEqual(before['credentials'], disk['credentials'])
+        retry = self.renew(agent_id, {'scopes': ['read', 'tasks']}, key='failed-renewal')
+        self.assertEqual(201, retry.status, retry.data)
+
+    def test_route_audit_save_failure_does_not_publish_or_replay_a_failed_renewal(self):
+        agent_id, _, _ = self.agent(['read'])
+        before = json.loads(json.dumps(self.service.state))
+        write = self.service.store._write
+        def fail_route_save():
+            if any(e['action'] == 'agents.credentials.issue' and e['outcome'] == 'committed'
+                   for e in self.service.state['audit']):
+                raise OSError('synthetic route audit save failure')
+            return write()
+        with mock.patch.object(self.service.store, '_write', side_effect=fail_route_save):
+            failed = self.renew(agent_id, {'scopes': ['read', 'tasks']}, key='late-failed-renewal')
+        self.assertEqual(500, failed.status, failed.data)
+        self.assertNotIn('secret', failed.body.decode())
+        self.assertEqual(before['agents'][agent_id], self.service.state['agents'][agent_id])
+        self.assertEqual(before['credentials'], self.service.state['credentials'])
+        self.service.store.save()
+        disk = json.loads(self.service.store.path.read_text())
+        self.assertEqual(before['agents'][agent_id], disk['agents'][agent_id])
+        self.assertEqual(before['credentials'], disk['credentials'])
+        retry = self.renew(agent_id, {'scopes': ['read', 'tasks']}, key='late-failed-renewal')
+        self.assertEqual(201, retry.status, retry.data)
+        self.assertTrue(retry.data['credential']['secret'])
+        replay = self.renew(agent_id, {'scopes': ['read', 'tasks']}, key='late-failed-renewal')
+        self.assertEqual(200, replay.status, replay.data)
+        self.assertNotIn('secret', replay.data['credential'])
+
+    def test_failed_revocation_restores_the_credential_and_its_token_index(self):
+        agent_id, secret, made = self.agent(['read'])
+        cid = made['credential']['id']
+        write = self.service.store._write
+        before = json.loads(json.dumps(self.service.state))
+        def fail_revocation():
+            if self.service.state['credentials'][cid]['revoked']:
+                raise OSError('synthetic revocation save failure')
+            return write()
+        with mock.patch.object(self.service.store, '_write', side_effect=fail_revocation):
+            failed = self.revoke(agent_id, cid)
+        self.assertEqual(500, failed.status, failed.data)
+        self.assertEqual(before['credentials'], self.service.state['credentials'])
+        self.assertEqual(before['credential_tokens'], self.service.state['credential_tokens'])
+        self.assertEqual(200, self.request('GET', '/v1/projects/%s/tasks' % self.project, token=secret).status)
+
+    def test_malformed_stored_scopes_are_unknown_and_never_inferred(self):
+        agent_id, _, _ = self.agent(['read'])
+        for malformed in ('read', True, {'read': True}, ['read', 'unknown'], ['read', 'read'], [None]):
+            with self.subTest(stored=malformed):
+                with self.service.store.lock:
+                    self.service.state['agents'][agent_id]['scopes'] = malformed
+                    self.service.store.save()
+                self.assertEqual((None, 'unknown'), (self.read(agent_id)['scopes'], self.read(agent_id)['scopes_source']))
+                self.assertEqual(409, self.renew(agent_id).status)
+                self.assertEqual(403, self.renew(agent_id, {'scopes': ['read']}, token=self.admin).status)
+                self.assertEqual(201, self.renew(agent_id, {'scopes': ['read']}).status)
+
+    def test_both_credential_routes_refuse_non_list_scopes_and_bad_labels(self):
+        agent_id, _, _ = self.agent(['read'])
+        worker = '/v1/projects/%s/worker-credentials' % self.project
+        agent = '/v1/agents/%s/credentials' % agent_id
+        for path, token in ((worker, self.admin), (agent, self.alex)):
+            for field, values in (('scopes', (5, True, {'read': True}, 'read')),
+                                  ('label', (5, True, {}, 'x' * 5000, 'line\nbreak', 'delete\x7f'))):
+                for value in values:
+                    with self.subTest(path=path, field=field, value=value):
+                        ids = set(self.service.state['credentials'])
+                        response = self.request('POST', path, {field: value}, token=token)
+                        self.assertEqual(422, response.status, response.data)
+                        self.assertEqual(ids, set(self.service.state['credentials']))
+            response = self.request('POST', path, {'scopes': ['read', 'read'], 'label': 'x' * 64}, token=token)
+            self.assertEqual(201, response.status, response.data)
+            credential = response.data.get('credential', response.data)
+            self.assertEqual(['read'], credential['scopes'])
+
+    def test_expiry_at_zero_does_not_turn_a_dead_credential_into_inference(self):
+        agent_id, _, made = self.agent(['read'])
+        self.made_before(agent_id)
+        with self.service.store.lock:
+            self.service.state['credentials'][made['credential']['id']]['expires_at'] = 0
+            self.service.store.save()
+        with mock.patch.object(self.service, '_expiry_now', return_value=-1):
+            self.assertFalse(self.service._credential_live(self.service.state['credentials'][made['credential']['id']], 0))
+        with mock.patch.object(self.service, '_expiry_now', return_value=0):
+            self.assertEqual((None, 'unknown'), self.service.agent_scopes(self.service.state['agents'][agent_id]))
+
     def setUp(self):
         super().setUp()
         self.admin = self.admin_token()
@@ -1376,8 +1553,8 @@ class RenewalScopeTests(AgentHarness):
         self.assertEqual(self.stored(agent_id), (None, None))                      # a read writes nothing
         renewed = self.renew(agent_id)
         self.assertEqual((201, ['read', 'tasks']), (renewed.status, renewed.data['credential']['scopes']), renewed.data)
-        self.assertEqual(self.stored(agent_id), (['read', 'tasks'], 'inferred'))
-        self.assertEqual(self.read(agent_id)['scopes_source'], 'inferred')
+        self.assertEqual(self.stored(agent_id), (['read', 'tasks'], 'set'))
+        self.assertEqual(self.read(agent_id)['scopes_source'], 'set')
         # From here on the record decides, as for any agent.
         for credential in self.working(agent_id):
             self.revoke(agent_id, credential['id'])
@@ -1676,7 +1853,8 @@ class AgentsPageTests(RenewalScopeTests):
         self.assertIn('Revoke this credential?', seen['revokeAsked'])
         after = seen['afterRevoke']
         self.assertEqual((after['scopes'], after['source'], after['differ']), ('read', 'inferred', None))
-        self.assertIn('read from its working credentials', after['line'])
+        self.assertIn('inferred from working credentials, not confirmed', after['line'])
+        self.assertIn('revocation or expiry', after['line'])
         self.assertEqual(self.read(wren)['scopes'], ['read'])
         self.assertEqual([c['scopes'] for c in self.working(wren)], [['read']])
         # 3. and 4. Nothing ticked sends nothing; the choice (reading alone, as offered) issues a secret.
@@ -1694,12 +1872,17 @@ class AgentsPageTests(RenewalScopeTests):
         self.assertEqual({name: disabled for name, (_, disabled) in seen['admin']['boxes'].items()},
                          {'read': False, 'tasks': False, 'checkpoints': True, 'reviews': True, 'feedback': True, 'proposals': True})
         self.assertEqual(seen['afterNarrow']['scopes'], 'read')
+        self.assertEqual(seen['adminUnknown'], {'boxes': {}, 'ownerChoice': 1, 'save': False})
+        self.assertEqual(seen['adminUnconfirmed'], ['Dove', 'Wren'])
+        self.assertFalse(seen['ownerFilter'])
         # 7. Set up folder.
         self.assertEqual((seen['setupKestrel']['needed'], seen['setupKestrel']['issue']), (0, True))
         self.assertIn('It carries what the agent has now: read.', seen['setupKestrel']['asked'])
         self.assertEqual(seen['setupKestrel']['carries'], [['read', 'This credential carries: read.']])
         self.assertGreaterEqual(seen['setupKestrel']['older'], 1)
         self.assertEqual(seen['setupDove'], {'needed': 1, 'issue': False})
+        self.assertIn('older service does not report', seen['olderAsked'])
+        self.assertNotIn('It carries what the agent has now', seen['olderAsked'])
         # 8. Nothing threw.
         self.assertEqual(seen['odd'], [[0, None], [0, 'unknown'], [0, 'read'], [2, 'read'], [2, 'unknown'], [0, 'unknown']])
         # What the page sent, in order: a list only from "What it may do".

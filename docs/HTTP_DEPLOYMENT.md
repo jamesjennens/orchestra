@@ -1557,9 +1557,19 @@ revoked one that was wider then seeded the next renewal once nothing worked).
   was read as its keys). A name given twice counts once; an empty list is no list. A body
   field the route does not take (it takes `label` and `scopes`) is `422`, as when an agent
   is made.
+- Both agent and project worker credentials validate scopes this way. `label` is optional
+  text of at most 64 printable characters; numbers, objects, control characters and longer
+  labels are `422`. A malformed **stored** agent scope value (non-list, unknown name or
+  duplicate) is unknown, never inferred from credentials. Its account can repair it by
+  choosing a valid explicit list; a superuser cannot widen unknown scopes.
 - **An agent made before the record kept its scopes** has none. While its working
-  credentials all allow the same, that is what it has (`scopes_source: "inferred"` on the
-  record; written to the record by its first renewal, never by a read). When none of its
+  credentials all allow the same, that list is **inferred, not confirmed**
+  (`scopes_source: "inferred"`). Expiry or revocation may have left only an unintended
+  credential working: check the list before confirming it. Only the agent's own account
+  may confirm it by plain renewal, storing the list as `set`; a read writes nothing.
+  A superuser's plain renewal is `409` with `detail.scopes_needed: true` and asks for an
+  explicit list, which remains subject to the widening rule above. An older record
+  already carrying `scopes_source: "inferred"` has the same confirmation rule. When none of its
   credentials works, or they do not all allow the same (which is what an agent looks like
   that was renewed from the page before the fix: the credential it was made with, and a
   newer one with the default four), **nothing is guessed**: `scopes` is `null`,
@@ -1580,7 +1590,11 @@ revoked one that was wider then seeded the next renewal once nothing worked).
   there, and the agent's account sets the scopes with tick boxes; saving issues a new
   secret that carries them (a superuser can untick, and cannot tick what the agent has
   not got). A credential the agent already holds keeps what it allows until it is
-  revoked.
+  revoked. For unknown scopes a superuser sees a sentence asking the owning account to
+  choose, rather than an unusable Save form. Superusers can filter their already-authorized
+  list to agents with inferred or unknown scopes. A new page used with an older service
+  that omits scope metadata says so and asks the user to check the new credential's scopes;
+  it does not promise that a plain renewal preserves scopes the page cannot know.
 - An agent may hold at most 20 credentials **that still work**; revoked and expired ones
   are not counted (counted, an agent could not be renewed a twentieth time). Of those
   that no longer work **the newest 5 are kept** per agent, as the short history the card
@@ -1588,10 +1602,20 @@ revoked one that was wider then seeded the next renewal once nothing worked).
   issued or revoked or the agent is disabled; an agent read never carries more than the
   working ones and those 5. What is lost is the record of an old credential (its label,
   scopes, when it was made and last used). That it was issued and revoked, by whom and
-  when, stays in the audit log (`agents.credentials.issue`, `agents.credentials.revoke`,
-  `agents.disable`). "Newest" is by the host clock at issue, so after a backward clock
+  when, stays in the audit log within its configured retention. Committed metadata events
+  `agents.credentials.issued` and `agents.credentials.revoked` name `agent_id`,
+  `target_credential_id`, `credential_scopes`, `scopes_before`/`scopes_after` and their
+  sources, alongside the acting account, request ID and time. A changed scope list or
+  source also records `agents.scopes`. These contain no labels, secrets or token hashes;
+  pruning a credential does not remove its audit entries. Route outcome events
+  (`agents.credentials.issue`, `agents.credentials.revoke`, `agents.disable`) remain.
+  "Newest" is by the host clock at issue, so after a backward clock
   step a newer dead record can be deleted before an older one; nothing but that short
   history depends on the order.
+- If the renewal or revocation state-file save fails, its in-memory agent scope changes,
+  credential records, token index, pruning and metadata audit are restored before returning
+  an error. A failed renewal returns no secret, and a later unrelated save cannot publish
+  those failed changes. Existing unrelated pending state is preserved.
 - **Rolling back** to a kit before this one: the older kit ignores `scopes` on the agent
   record and counts every credential record, working or not, toward its limit of 20. An
   agent that holds 20 or more records (possible here: up to 20 that work and 5 that do

@@ -30,6 +30,8 @@ service is a single process with a per-process lock, and the deployment runbook 
 that.
 """
 import hashlib
+import copy
+from contextlib import contextmanager
 import hmac
 import ipaddress
 import json
@@ -1995,10 +1997,8 @@ class Service:
         with self.store.lock:
             self._refresh_authority(principal)
             project, role = self.require_project(principal, project_id, 'owner')
-            requested = tuple(scopes or ('tasks', 'checkpoints', 'reviews', 'feedback'))
-            for scope in requested:
-                if scope not in CREDENTIAL_SCOPES:
-                    raise invalid('Unknown credential scope %r' % (scope,))
+            requested = self._scope_names(scopes) or ('tasks', 'checkpoints', 'reviews', 'feedback')
+            label = self._credential_label(label)
             if actor is not None and (not isinstance(actor, str) or not re.fullmatch(
                     r'[A-Za-z0-9][A-Za-z0-9_.@/-]{0,63}', actor)):
                 raise invalid('Invalid credential actor namespace')
@@ -2443,16 +2443,22 @@ class Service:
         renewal, so two requests got round the refusal to widen).
 
         An agent made before the record kept them has none. ``inferred``: its working
-        credentials all carry the same list, and that is it; it is written to the record by
-        the first renewal, not by a read. ``unknown`` (scopes None): none of its credentials
+        credentials all carry the same list. This is an inference, not proof of its intended
+        scopes: revocation or expiry may have left only an unintended credential working.
+        Only its own account confirms it through plain renewal; a read writes nothing.
+        ``unknown`` (scopes None): none of its credentials
         works, or they do not carry the same, which is what an agent looks like that was
         renewed from the page before this was fixed. Nothing is guessed then: never the
         default four, never a credential that no longer works.
         """
-        stored = agent.get('scopes')
-        if isinstance(stored, list):
-            return (tuple(scope for scope in stored if scope in CREDENTIAL_SCOPES),
-                    'inferred' if agent.get('scopes_source') == 'inferred' else 'set')
+        if 'scopes' in agent:
+            stored = agent['scopes']
+            # Corruption is not a legacy record. Never infer authority from credentials
+            # when a stored value is malformed, including duplicate names.
+            if not isinstance(stored, list) or any(not isinstance(scope, str) or scope not in CREDENTIAL_SCOPES
+                                                  for scope in stored) or len(stored) != len(set(stored)):
+                return None, 'unknown'
+            return tuple(stored), 'inferred' if agent.get('scopes_source') == 'inferred' else 'set'
         moment = self._expiry_now()
         lists = {tuple(scope for scope in CREDENTIAL_SCOPES if scope in (credential.get('scopes') or ()))
                  for credential in self._agent_credentials(agent) if self._credential_live(credential, moment)}
@@ -2704,6 +2710,64 @@ class Service:
                      'that still work do not say (there is none, or they do not all allow the same). Send the '
                      'scopes it should have, for example "scopes": ["read"] for an agent that only reads')
 
+    @staticmethod
+    def _credential_label(label):
+        """Optional display text, never an arbitrary JSON value or unbounded payload."""
+        if label is None:
+            return None
+        if not isinstance(label, str) or len(label) > 64 or any(not c.isprintable() for c in label):
+            raise invalid('Credential label must be at most 64 printable characters')
+        return label.strip() or None
+
+    @contextmanager
+    def _agent_credential_transaction(self, agent, *, persist=True):
+        """Roll back the agent mutation if its atomic state-file save fails.
+
+        Caller holds store.lock. Preserve unrelated pending writes and object identity;
+        restore pruning, token indexes and audit retention as well as the agent record.
+        """
+        previous_agent = copy.deepcopy(agent)
+        credentials = copy.deepcopy({key: value for key, value in self.state['credentials'].items()
+                                     if value.get('agent_id') == agent['id']})
+        tokens = dict(self.state['credential_tokens'])
+        audit = copy.deepcopy(self.state['audit'])
+        unsaved = self.store.unsaved_since
+        try:
+            yield
+            if persist:
+                self.store.save()
+        except BaseException:
+            # The HTTP boundary may also have recorded a refusal; retain that audit
+            # outcome while removing rolled-back committed mutation events.
+            refusals = [event for event in self.state['audit']
+                        if event not in audit and event.get('outcome') in ('denied', 'rejected')]
+            for key, value in list(self.state['credentials'].items()):
+                if value.get('agent_id') == agent['id']:
+                    del self.state['credentials'][key]
+            self.state['credentials'].update(credentials)
+            self.state['credential_tokens'].clear()
+            self.state['credential_tokens'].update(tokens)
+            self.state['audit'][:] = (audit + refusals)[-AUDIT_LIMIT:]
+            agent.clear()
+            agent.update(previous_agent)
+            self.store.unsaved_since = unsaved
+            raise
+
+    def _audit_agent_credential(self, principal, agent, credential, action, before, request_id):
+        """Durable metadata that survives credential pruning. No labels, secrets or hashes."""
+        after = self.agent_scopes(agent)
+        event = self.audit(request_id, principal, action, 'committed', actor=self.agent_actor(agent))
+        event.update(agent_id=agent['id'], target_credential_id=credential['id'],
+                     credential_scopes=list(credential['scopes']),
+                     scopes_before=None if before[0] is None else list(before[0]),
+                     scopes_after=None if after[0] is None else list(after[0]),
+                     scopes_source_before=before[1], scopes_source_after=after[1])
+        if before != after:
+            change = self.audit(request_id, principal, 'agents.scopes', 'committed', actor=self.agent_actor(agent))
+            change.update({key: value for key, value in event.items()
+                           if key in ('agent_id', 'target_credential_id', 'scopes_before', 'scopes_after',
+                                      'scopes_source_before', 'scopes_source_after')})
+
     def _issue_agent_credential_locked(self, principal, agent, scopes=None, label=None):
         """Create one agent credential. Caller holds ``store.lock`` and has authorized.
 
@@ -2712,13 +2776,20 @@ class Service:
         list sets what the agent has from now on: taken from anybody who may renew the agent
         when it asks for nothing more, and from the agent's own account alone when it widens
         (the one caller who could have made the agent with those scopes). Nothing is changed
-        by a request that is refused.
+        by a request that is refused. Only its own account may confirm inferred scopes
+        without choosing a list. That confirmation stores them as set.
         """
         requested = self._scope_names(scopes)
-        has, _ = self.agent_scopes(agent)
+        label = self._credential_label(label)
+        has, source = self.agent_scopes(agent)
         if requested is None:
             if has is None:
                 raise conflict(self.SCOPES_NEEDED, {'scopes_needed': True})
+            if source == 'inferred' and principal.user_id != agent['owner']:
+                raise conflict('These scopes are inferred from working credentials, not confirmed. '
+                               'Only the agent\'s own account may confirm them by plain renewal. '
+                               'Send an explicit scopes list, for example "scopes": ["read"].',
+                               {'scopes_needed': True})
         else:
             more = [scope for scope in CREDENTIAL_SCOPES if scope in requested and scope not in (has or ())]
             if more and principal.user_id != agent['owner']:
@@ -2733,8 +2804,8 @@ class Service:
                            % AGENT_MAX_CREDENTIALS)
         if requested is not None:
             agent['scopes'], agent['scopes_source'] = list(requested), 'set'
-        elif not isinstance(agent.get('scopes'), list):
-            agent['scopes'], agent['scopes_source'] = list(has), 'inferred'
+        elif source == 'inferred':
+            agent['scopes'], agent['scopes_source'] = list(has), 'set'
         requested = tuple(agent['scopes'])
         secret = new_token()
         moment = self._expiry_now()
@@ -2792,6 +2863,8 @@ class Service:
             }
             self.state['agents'][agent_id] = agent
             credential, secret = self._issue_agent_credential_locked(principal, agent)
+            self._audit_agent_credential(principal, agent, credential, 'agents.credentials.issued',
+                                         self.agent_scopes(agent), request_id)
             self.store.save()
             # The one-time secret travels only in this response.
             public = {
@@ -2883,7 +2956,7 @@ class Service:
             return self.agent_view(agent, principal)
 
     def issue_agent_credential(self, principal, agent_id, *, scopes=None, label=None,
-                               request_id=None):
+                               request_id=None, persist=True):
         if principal is None or principal.via == 'credential':
             raise forbidden('Session authority required to issue an agent credential')
         with self.store.lock:
@@ -2891,9 +2964,12 @@ class Service:
             agent = self._agent_owned(principal, agent_id)
             if not agent.get('enabled'):
                 raise conflict('A disabled agent cannot receive a credential')
-            credential, secret = self._issue_agent_credential_locked(
-                principal, agent, scopes=scopes, label=label)
-            self.store.save()
+            before = self.agent_scopes(agent)
+            with self._agent_credential_transaction(agent, persist=persist):
+                credential, secret = self._issue_agent_credential_locked(
+                    principal, agent, scopes=scopes, label=label)
+                self._audit_agent_credential(principal, agent, credential, 'agents.credentials.issued',
+                                             before, request_id)
             return {
                 'operation': 'agents.credentials.issue',
                 'agent': agent['id'],
@@ -2904,7 +2980,7 @@ class Service:
             }
 
     def revoke_agent_credential(self, principal, agent_id, credential_id,
-                                request_id=None):
+                                request_id=None, *, persist=True):
         if principal is None or principal.via == 'credential':
             raise forbidden('Session authority required to revoke an agent credential')
         with self.store.lock:
@@ -2914,9 +2990,12 @@ class Service:
             if not isinstance(credential, dict) or \
                     credential.get('agent_id') != agent['id']:
                 raise not_found('Credential not found')
-            credential['revoked'] = True
-            self._prune_agent_credentials(agent)
-            self.store.save()
+            before = self.agent_scopes(agent)
+            with self._agent_credential_transaction(agent, persist=persist):
+                credential['revoked'] = True
+                self._prune_agent_credentials(agent)
+                self._audit_agent_credential(principal, agent, credential, 'agents.credentials.revoked',
+                                             before, request_id)
         return {'id': credential_id, 'agent': agent['id'], 'revoked': True}
 
     # -- idempotency -----------------------------------------------------------
