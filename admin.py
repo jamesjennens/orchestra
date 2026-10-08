@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
 """Operator commands for an isolated, user-systemd Beads/Dolt deployment."""
+import sys
+if sys.version_info < (3, 10):
+    # Before every other import, and in syntax Python 3.6 reads: an older interpreter failed in
+    # an import further down, with a traceback that hid the cause (kittrial-5bb.191).
+    sys.stderr.write('admin.py needs Python 3.10 or newer and was started with Python %d.%d.%d (%s). '
+                     'Nothing was carried out. Run it with Python 3.10 or newer; on an office installation that is the bundled interpreter, INSTALL_ROOT/current/python-runtime/....\n'
+                     % (sys.version_info[0], sys.version_info[1], sys.version_info[2], sys.executable))
+    sys.exit(2)
 import argparse
 import base64
 import contextlib
@@ -1794,9 +1802,14 @@ def worker_client_setup(root,name):
                        'interpreter below name the release that printed them and must be printed '
                        'again after an upgrade')
         local_note=('the same paths, which name this release, so print them again after an upgrade')
+    # The server's own host name is what an operator types first, and it need not resolve from
+    # the worker's network (kittrial-5bb.191: the first use of this route from another machine).
+    host_note=('WORKER_SSH_HOST must lead to a name or address the worker\'s machine can reach; this\n'
+               'server\'s own host name may not resolve from the worker\'s network.')
     return (f'Worker client configuration for {name} (save as client.local.json in the worker\'s own\n'
             f'directory and replace WORKER_SSH_HOST with that worker\'s SSH alias; this kit endpoint serves\n'
             f'every project, so do not point it at a project-specific wrapper). {endpoint_note}:\n{config}\n'
+            f'{host_note}\n'
             f'Bootstrap command (replace ACTOR with the actor returned by worker.py start or session\n'
             f'register):\n  python client.py --config client.local.json --project {name} --actor ACTOR -- onboard\n'
             f'An agent that runs on the server itself uses the local transport instead (no SSH and no\n'
@@ -1855,6 +1868,35 @@ def scheduled_backup_execstart(root):
     module=install_current_path(Path(__file__).resolve())
     return (f'ExecStart={python} {module} '
             f'--root {root} backup --all')
+
+def host_command(root,*words):
+    """A host command as the service user pastes it into a shell: interpreter, this module,
+    ``--root``, then ``words``; every word quoted for a shell.
+
+    ``admin.py`` alone is not a command: it is not on PATH and, in a release, not executable,
+    and a set-up step that showed ``admin.py set-guidance ...`` or the unit-file line
+    ``ExecStart=...`` could not be pasted (kittrial-5bb.200: "Permission denied"). The
+    interpreter and the module go through ``install/current`` where there is one, as the
+    schedule line does.
+    """
+    import shlex
+    python=install_current_path(sys.executable)
+    module=install_current_path(Path(__file__).resolve())
+    return ' '.join(shlex.quote(str(word)) for word in (python,module,'--root',root,*words))
+
+def backup_now_command(root):
+    """The command that backs up every project of this runtime now."""
+    return host_command(root,'backup','--all')
+
+def schedule_text(root):
+    """The two things an operator needs for backups, each under its own label: the command
+    that runs one now, and the line a schedule's unit file carries (which is NOT a command)."""
+    return (f'To run a backup of every project now, as this account (a shell command):\n  {backup_now_command(root)}\n'
+            f'The line for a schedule (a line of a systemd unit file, not a shell command; it goes in the '
+            f'[Service] section of a beads-*backup*.service unit in {scheduled_backup_unit_dir()}, run by its '
+            f'timer):\n  {scheduled_backup_execstart(root)}\n'
+            f'To check afterwards: `systemctl --user list-timers`, and\n  '
+            f'{host_command(root,"backup-status","--require-complete")}')
 
 def _execstart_values(text):
     """The command of each ``ExecStart=`` line in a unit file, systemd prefix stripped.
@@ -1992,7 +2034,18 @@ def project_setup_status(root,name,path=None):
     except OSError:
         covers=None
     backup={'scheduled':'covered' if covers else 'unknown' if covers is None else 'not-covered',
-            'line':scheduled_backup_execstart(root),'last_run':None}
+            'line':scheduled_backup_execstart(root),'last_run':None,
+            # What can be pasted into a shell, beside the unit-file line that cannot (kittrial-5bb.200).
+            'run_now':backup_now_command(root),
+            'check':host_command(root,'backup-status','--require-complete')}
+    try:
+        directory=account_unit_dir(root)
+        backup['unit_directory']=None if directory is None else str(directory)
+    except OSError:
+        backup['unit_directory']=None
+    # The words every host command of this runtime begins with, for the steps an operator
+    # does on the server.
+    result['admin']=host_command(root)
     # Why the schedule could not be checked, when it could not: this process runs under
     # the runtime's scoped home and was not told the account's own home (the service was
     # started without a usable HOME), or a unit file could not be read.
@@ -2045,13 +2098,14 @@ def scheduled_backup_coverage(root,name):
     """
     directory=scheduled_backup_unit_dir()
     line=scheduled_backup_execstart(root)
+    both=schedule_text(root)
     dropins=(f'Systemd drop-ins ({directory}/*.service.d/*.conf) are not inspected, so this reports the unit '
              f'files themselves.')
     paths=scheduled_backup_unit_paths()
     if not paths:
         return False,(f'No installed scheduled backup unit matching beads-*backup*.service was found in '
                       f'{directory}, so no project of this runtime is on a schedule. A schedule that covers '
-                      f'every project, including {name}, is:\n  {line}')
+                      f'every project, including {name}, needs the line below.\n{both}')
     read=[];unreadable=[];durable=[];wrappers=[];named={};wrapper_projects={};foreign=[]
     for path in paths:
         try:text=path.read_text(encoding='utf-8')
@@ -2091,7 +2145,7 @@ def scheduled_backup_coverage(root,name):
                           f'named projects with --all in one command.')
             else:
                 message+=(f' Replace that project list with the durable form (do not combine named projects with '
-                          f'--all in one command):\n  {line}')
+                          f'--all in one command); it is a line of the unit file, not a shell command:\n  {line}')
             return False,message+note+' '+dropins
         message=(f'The installed scheduled backup unit(s) read for this runtime cover only '
                  f'{", ".join(covered) if covered else "no project"}, so they do not include {name}.')
@@ -2106,7 +2160,7 @@ def scheduled_backup_coverage(root,name):
                           f'projects with --all in one command.')
         else:
             message+=(f' Add {name} there, or replace the project list with the durable form (do not combine named '
-                      f'projects with --all in one command):\n  {line}')
+                      f'projects with --all in one command); it is a line of the unit file, not a shell command:\n  {line}')
         return False,message+note+' '+dropins
     details=[]
     if foreign:details.append('these units do not back up this runtime: '+', '.join(foreign))
@@ -2114,10 +2168,10 @@ def scheduled_backup_coverage(root,name):
     if not read:
         return False,(f'The installed scheduled backup unit(s) found in {directory} could not be read ('
                       +'; '.join(unreadable)+f'), so schedule coverage of {name} cannot be confirmed. Use a '
-                      f'schedule that covers every project:\n  {line}')
+                      f'schedule that covers every project.\n{both}')
     return False,(f'The installed scheduled backup unit(s) read ('+', '.join(read)+f') do not cover {name}'
                   +(' ('+'; '.join(details)+')' if details else '')
-                  +f'. A schedule that covers every project is:\n  {line} '+dropins)
+                  +f'. A schedule that covers every project needs the line below. '+dropins+f'\n{both}')
 
 #: Where ``retire-project`` moves a project directory, and its append-only journal.
 RETIRED_DIR='retired'

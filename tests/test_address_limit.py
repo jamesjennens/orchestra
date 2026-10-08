@@ -386,10 +386,17 @@ class ProxyTests(AddressCase):
                 raise ConnectionAbortedError('the client went away')
             return real(handler, method)
         with mock.patch.object(http_service.ApiHandler, '_dispatch', watched):
+            # A place is given back when its handler returns, a moment after the client has its
+            # answer: each next request waits for that, or it finds the one before still counted
+            # (seen in CI on Linux: {FAR: 1, the /64: 1} for {the /64: 1}; the same race the helper
+            # was written for in kittrial-5bb.185).
             self.assertEqual(self.forwarded(FAR)[0], 200)
+            self.requests_being_served({})
             self.assertEqual(self.forwarded('2001:db8:1:2::5')[0], 200)
+            self.requests_being_served({})
             with self.assertRaises((ConnectionError, http.client.HTTPException, OSError)):
                 self.forwarded(FAR, path='/boom')
+            self.requests_being_served({})
             self.assertEqual(self.get(B)[0], 200)                                # not through the proxy: not counted
         self.assertEqual(seen, [{FAR: 1}, {'2001:db8:1:2::/64': 1}, {FAR: 1}, {}])
         self.settled()
