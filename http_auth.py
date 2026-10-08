@@ -2450,6 +2450,13 @@ class Service:
             'credentials': [self.credential_view(c) for c in self._agent_credentials(agent)],
             # What a new credential for this agent carries when no list is sent (kittrial-5bb.208).
             'scopes': list(self.agent_scopes(agent)),
+            # The different scope lists its WORKING credentials carry, when they do not all carry
+            # the same; else []. A read, for the agent's account and a superuser: before
+            # kittrial-5bb.208 a renewal from the page gave the default four whatever the agent
+            # had, so a read-only agent may hold a second credential that writes. It says only
+            # that they differ, not which is right; and an agent whose one working credential is
+            # the renewed one cannot be told from an agent that was made that way.
+            'scopes_differ': self.agent_scope_differences(agent),
         }
         if owner_sees_path:
             view['working_directory'] = agent.get('working_directory')
@@ -2618,6 +2625,13 @@ class Service:
                         'secondary fallback. The secret is shown only once.'
                         % (secret_file['windows'], secret_file['posix'], AGENT_SECRET_ENV),
         }
+
+    def agent_scope_differences(self, agent):
+        """The distinct scope lists of an agent's working credentials, when there is more than one."""
+        moment = self._expiry_now()
+        lists = {tuple(scope for scope in CREDENTIAL_SCOPES if scope in (credential.get('scopes') or ()))
+                 for credential in self._agent_credentials(agent) if self._credential_live(credential, moment)}
+        return [list(item) for item in sorted(lists)] if len(lists) > 1 else []
 
     def _issue_agent_credential_locked(self, principal, agent, scopes=None, label=None, first=False):
         """Create one agent credential. Caller holds ``store.lock`` and has authorized.

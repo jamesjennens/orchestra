@@ -60,6 +60,18 @@ function manages(ctx, raw) {
   return Boolean(ctx.me && (ctx.me.superuser || owner === ctx.me.id));
 }
 
+// The agent's working credentials do not all carry the same scopes (kittrial-5bb.208: a renewal from
+// this page used to give the default four whatever the agent had). The page can say that they differ,
+// not which is the one meant: the owner revokes what the agent should not have, under Set up folder.
+function scopesDiffer(raw) {
+  const lists = Array.isArray(raw.scopes_differ) ? raw.scopes_differ : [];
+  if (lists.length < 2) return null;
+  return h('div', { class: 'banner', role: 'status', 'data-scopes-differ': String(lists.length) },
+    'This agent’s working credentials do not all allow the same: ',
+    lists.map((list) => (list.length ? list.join(', ') : 'nothing')).join(' | '),
+    '. A new secret issued here before this was fixed may allow more than the agent was made with. Revoke the credential the agent should not have (Set up folder shows them).');
+}
+
 // One agent's card: status, what is waiting, and exactly where to go to resume it.
 export function agentCard(ctx, raw, { compact = false } = {}) {
   const agent = normalize(ctx, raw);
@@ -82,6 +94,7 @@ export function agentCard(ctx, raw, { compact = false } = {}) {
         h('span', { class: 'small prompt' }, resumePrompt(agent)),
         h('button', { type: 'button', class: 'ghost', 'aria-label': 'Copy the resume prompt', onclick: () => copy(resumePrompt(agent), 'Resume prompt') }, 'Copy')),
       compact ? null : h('p', { class: 'small muted resume-hint' }, 'Needs .orchestra/agent.json in the folder; use Set up folder first.')),
+    scopesDiffer(raw),
     manages(ctx, raw) ? h('div', { class: 'copy-row' },
       h('button', { type: 'button', 'aria-label': 'Set up the folder for ' + agent.display_name, onclick: (event) => reopenSetup(ctx, raw.id, event.currentTarget) }, 'Set up folder')) : null,
     compact ? null : h('div', { class: 'small muted' }, 'Projects: ', agent.projects.map((p) => `${p.name} (${p.role})`).join(', ') || 'none'));

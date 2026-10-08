@@ -1518,7 +1518,12 @@ a superuser; a list that asks for more is taken only from the agent's own accoun
 caller who could have made the agent with those scopes, and is refused with 403 from a
 superuser renewing somebody else's agent ("This agent has read. Only its own account may
 give it more ..."). `GET /v1/agents/{id}` carries `scopes`, what the next credential will
-carry, and the page shows what a new credential carries beside its secret. An agent may
+carry, and the page shows what a new credential carries beside its secret.
+`scopes_differ` on the same record lists the different scope lists the agent's working
+credentials carry when they are not all the same (else `[]`), and the agent's card says
+so: it is how an agent renewed from the page before the fix is found. It says only that
+they differ, not which was meant, and an agent whose one working credential is the
+renewed one cannot be found this way. An agent may
 hold at most 20 credentials **that still work**; revoked and expired ones are kept as
 records and not counted (counted, an agent could not be renewed a twentieth time). The
 agent then calls `GET /v1/agents/me` and `GET /v1/agents/me/next` with its credential as a

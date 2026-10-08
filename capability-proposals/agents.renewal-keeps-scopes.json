@@ -11,7 +11,7 @@
     "agent scopes",
     "at most 20 credentials"
   ],
-  "summary": "A new credential for an existing agent (POST /v1/agents/{id}/credentials) carries what the agent has: with no scopes in the body, the scopes of the agent's newest credential that still works (not revoked, not expired); with none that works, of its newest credential. A list that asks for nothing more is taken from the agent's account or a superuser; a list that widens is taken only from the agent's own account and refused with 403 from anybody else. An unknown scope is 422. The credential an agent is made with takes the scopes asked for, or the default four. GET /v1/agents/{id} carries scopes (what the next credential will carry) and the agents page shows what a new credential carries beside its secret. An agent may hold at most 20 credentials that still work; revoked and expired ones are not counted. Before kittrial-5bb.208 a renewal with no list gave the default four, so a read-only agent became a writing one.",
+  "summary": "A new credential for an existing agent (POST /v1/agents/{id}/credentials) carries what the agent has: with no scopes in the body, the scopes of the agent's newest credential that still works (not revoked, not expired); with none that works, of its newest credential. A list that asks for nothing more is taken from the agent's account or a superuser; a list that widens is taken only from the agent's own account and refused with 403 from anybody else. An unknown scope is 422. The credential an agent is made with takes the scopes asked for, or the default four. GET /v1/agents/{id} carries scopes (what the next credential will carry) and the agents page shows what a new credential carries beside its secret. An agent may hold at most 20 credentials that still work; revoked and expired ones are not counted. The record also carries scopes_differ: the different scope lists of its working credentials when they are not all the same, shown on the agent's card. Before kittrial-5bb.208 a renewal with no list gave the default four, so a read-only agent became a writing one.",
   "requirements": [],
   "anchors": [
     "docs/HTTP_DEPLOYMENT.md#personal-agents"
@@ -21,7 +21,8 @@
     "http_auth.py::Service._issue_agent_credential_locked",
     "http_auth.py::Service._credential_live",
     "http_auth.py::Service.issue_agent_credential",
-    "http_service.py::ApiHandler.agents_credential_issue"
+    "http_service.py::ApiHandler.agents_credential_issue",
+    "http_auth.py::Service.agent_scope_differences"
   ],
   "tests": [
     "tests/test_http_agents.py"

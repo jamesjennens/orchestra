@@ -1702,6 +1702,12 @@ class AgentSetupDialogCase(unittest.TestCase):
         self.assertIn("'data-scopes': (credential.scopes || []).join(' ')", reissue)
         self.assertIn("'This credential carries' + (scopeList(credential.scopes) || ': nothing beyond reading') + '.'", reissue)
         self.assertIn('It carries what the agent has now${scopeList(agent.scopes)}.', reissue)
+        # An agent whose working credentials differ is said on its card, for whoever may see the card.
+        self.assertIn('    scopesDiffer(raw),\n', self.function_body(code, 'agentCard'))
+        differ = self.function_body(code, 'scopesDiffer')
+        self.assertIn('if (lists.length < 2) return null;', differ)
+        self.assertIn("'data-scopes-differ': String(lists.length)", differ)
+        self.assertIn('Revoke the credential the agent should not have', differ)
         self.assertIn("issueAgentCredential: (aid) => mutate('POST', `/v1/agents/${aid}/credentials`, { label: 'web: new secret' })",
                       (WEB / 'js' / 'api.js').read_text(encoding='utf-8'))
         # Without a fresh secret the steps show the placeholder line only.

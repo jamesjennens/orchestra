@@ -1362,6 +1362,36 @@ class RenewalScopeTests(AgentHarness):
         self.assertEqual((late.status, late.data['credential']['scopes']), (201, ['read']))
         self.assertEqual(len(self.request('GET', '/v1/agents/%s' % agent_id, token=self.alex).data['credentials']), 22)
 
+    def test_working_credentials_that_differ_are_said_and_dead_ones_are_not(self):
+        """A read for the agent's account and a superuser: what main left behind. It says that they differ, not
+        which is right, and an agent whose only working credential is a renewed one cannot be told at all."""
+        agent_id, _, _ = self.agent(self.ALL)
+
+        def differ(token=None):
+            return self.request('GET', '/v1/agents/%s' % agent_id, token=token or self.alex).data['scopes_differ']
+        self.assertEqual(differ(), [])
+        self.assertEqual(201, self.renew(agent_id).status)                         # the same scopes: nothing to say
+        self.assertEqual(differ(), [])
+        narrow = self.renew(agent_id, {'scopes': ['read', 'tasks']}).data['credential']
+        expected = [['checkpoints', 'feedback', 'proposals', 'read', 'reviews', 'tasks'], ['read', 'tasks']]
+        self.assertEqual([sorted(item) for item in differ()], expected)
+        self.assertEqual([sorted(item) for item in differ(self.admin)], expected)  # a superuser sees it too
+        listed = {item['id']: item for item in self.request('GET', '/v1/agents', token=self.admin).data['items']}
+        self.assertEqual([sorted(item) for item in listed[agent_id]['scopes_differ']], expected)
+        # Revoked, or expired: a credential that no longer works is not what the agent may do.
+        self.assertEqual(204, self.request('POST', '/v1/agents/%s/credentials/%s/revoke' % (agent_id, narrow['id']),
+                                           {}, token=self.alex).status)
+        self.assertEqual(differ(), [])
+        again = self.renew(agent_id, {'scopes': ['read']}).data['credential']
+        self.assertEqual(len(differ()), 2)
+        with self.service.store.lock:
+            self.service.state['credentials'][again['id']]['expires_at'] = 0
+            self.service.store.save()
+        self.assertEqual(differ(), [])
+        # What it cannot see: one working credential, whatever it carries.
+        other, _, _ = self.agent(['read'], name='Lone')
+        self.assertEqual(self.request('GET', '/v1/agents/%s' % other, token=self.alex).data['scopes_differ'], [])
+
     def test_making_an_agent_is_as_it_was(self):
         self.assertEqual(self.agent(name='One')[2]['credential']['scopes'], ['tasks', 'checkpoints', 'reviews', 'feedback'])
         self.assertEqual(self.agent(['read'], name='Two')[2]['credential']['scopes'], ['read'])
