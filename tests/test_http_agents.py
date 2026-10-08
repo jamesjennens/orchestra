@@ -1506,6 +1506,9 @@ class RenewalScopeTests(AgentHarness):
         full = self.renew(agent_id)
         self.assertEqual(409, full.status, full.data)
         self.assertEqual(full.data['error']['message'], 'An agent may hold at most 20 credentials that still work; revoke one first')
+        # Refused with a list too, and a refused request has changed nothing of what the agent has.
+        self.assertEqual(409, self.renew(agent_id, {'scopes': ['read', 'tasks']}).status)
+        self.assertEqual((self.has(agent_id), self.stored(agent_id)), (['read'], (['read'], 'set')))
         credentials = self.request('GET', '/v1/agents/%s' % agent_id, token=self.alex).data['credentials']
         self.assertEqual(len(credentials), 20)
         # One revoked: one more may be issued, and then it is full again.
