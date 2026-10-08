@@ -177,7 +177,7 @@ export function createMock(options = {}) {
   const me = () => db.session && db.users[db.session];
   const role = (pid) => (db.memberships[pid] || {})[db.session];
   const visible = (pid) => db.projects[pid] && (me().superuser || role(pid));
-  const canWrite = (pid) => me().superuser || ['owner', 'contributor'].includes(role(pid));
+  const canWrite = (pid) => me().superuser || ['owner', 'coordinator', 'contributor'].includes(role(pid));
   const isOwner = (pid) => me().superuser || role(pid) === 'owner';
   const name = (uid) => (db.users[uid] ? db.users[uid].display_name : uid);
   const log = (pid, action, tid, detail) => {
@@ -320,7 +320,7 @@ export function createMock(options = {}) {
   on('PUT', '/v1/projects/(?<pid>[\\w-]+)/members/(?<uid>[\\w-]+)', (b, p) => {
     const g = guardProject(p.pid); if (g) return g;
     if (!isOwner(p.pid)) return err(403, 'forbidden', 'Only a project owner can change membership');
-    if (!['viewer', 'contributor', 'owner'].includes(b.role)) return err(422, 'invalid_payload', 'Role must be viewer, contributor or owner');
+    if (!['viewer', 'contributor', 'coordinator', 'owner'].includes(b.role)) return err(422, 'invalid_payload', 'Role must be viewer, contributor, coordinator or owner');
     if (!db.users[p.uid]) return err(404, 'not_found', 'Account not found');
     const owners = Object.entries(db.memberships[p.pid]).filter(([, r]) => r === 'owner');
     if (owners.length === 1 && owners[0][0] === p.uid && b.role !== 'owner') return err(409, 'conflict', 'A project needs at least one owner');

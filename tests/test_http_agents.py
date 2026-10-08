@@ -659,7 +659,7 @@ class ProjectOwnerAgentTests(AgentHarness):
 
     #: The only fields a project owner may receive about an agent in their project.
     SAFE_FIELDS = {'id', 'name', 'owner', 'owner_display_name', 'actor', 'enabled',
-                   'last_seen_at'}
+                   'last_seen_at', 'coordinator'}
 
     def setUp(self):
         super().setUp()

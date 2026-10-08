@@ -222,7 +222,7 @@ export async function list(ctx) {
   load();
 
   function grantable() {
-    return ctx.projects.filter((p) => !p.archived && ['owner', 'contributor', 'superuser'].includes(p.role));
+    return ctx.projects.filter((p) => !p.archived && ['owner', 'coordinator', 'contributor', 'superuser'].includes(p.role));
   }
   const projects = grantable();
   const form = h('form', { class: 'form', novalidate: true },

@@ -3621,17 +3621,34 @@ class ApiHandler(BaseHTTPRequestHandler):
                        'task\'s assignee, the person who owns the agent that delivered it, and that person\'s '
                        'other agents cannot recommend it')
 
-    def _independent(self, actors, parties):
+    #: Said to an approver whose own party delivered the work (the setting of kittrial-5bb.199).
+    OWN_PARTY = ('This contribution was delivered by your own account (you, one of your agents, or a worker '
+                 'credential you issued). Another owner of this project, or a superuser who did not deliver it, '
+                 'must approve it.')
+
+    #: The same, said to an agent that holds the coordinator grant (kittrial-5bb.209): it is judged by
+    #: party whatever the installation's setting says.
+    OWN_PARTY_AGENT = ('This contribution was delivered by this agent\'s own account (its owner, one of that '
+                       'account\'s agents, or a worker credential it issued). An agent never approves work of its own '
+                       'account: another coordinator or owner of this project, or a superuser who did not deliver it, '
+                       'must approve it.')
+
+    def _independent(self, actors, parties, project=None, at=None, full=False):
         """The ``actors`` who are a different PERSON from every one of ``parties``.
 
         The canonical rule compares actor names, and a person and their agents are
         different names. The web service knows who owns each agent, so here a person,
         their agent, and two agents of one person are all the same party
-        (kittrial-5bb.115).
+        (kittrial-5bb.115). With the installation's setting on, work under a worker
+        credential belongs to the account that issued it as well (``Service.actor_parties``;
+        ``project`` and ``at`` say where and when the work of ``parties`` was written).
         """
-        persons = {self.service.actor_person(party) for party in parties if isinstance(party, str) and party}
+        taken = set()
+        for party in parties:
+            if isinstance(party, str) and party:
+                taken |= self.service.actor_parties(party, project, at, full)
         return [actor for actor in actors
-                if isinstance(actor, str) and self.service.actor_person(actor) not in persons]
+                if isinstance(actor, str) and not (self.service.actor_parties(actor, project, None, full) & taken)]
 
     @staticmethod
     def _read_parties(assignee, author):
@@ -3648,7 +3665,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             return [author]
         return [assignee] if isinstance(assignee, str) and assignee else []
 
-    def _independent_queue(self, read):
+    def _independent_queue(self, read, project=None):
         """Drop from each row's ``recommended_by`` anyone who is the contribution author's person.
 
         The same party as the brief compares with (kittrial-5bb.115 review): a
@@ -3677,7 +3694,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             if names and not (isinstance(author, str) and author):
                 kept, item['recommended_unchecked'] = [], list(names)
             elif names:
-                kept = self._independent(names, [author])
+                kept = self._independent(names, [author], project)
             else:
                 kept = names
             if len(kept) != len(names):
@@ -3692,7 +3709,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         return [name for name in (row.get('recommended_by') or []) + (row.get('recommended_unchecked') or [])
                 if isinstance(name, str)]
 
-    def _own_party_recommended(self, row, actor):
+    def _own_party_recommended(self, row, actor, project=None):
         """Whether ``actor``'s own PERSON has already recommended the row's delivery (kittrial-5bb.154).
 
         The one answer to "already recommended?" for an agent's actions and for My work: the
@@ -3701,7 +3718,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         person adds no independent reading. Read from every name on the row, counted or not.
         """
         names = self._every_recommender(row)
-        return len(self._independent(names, [actor])) != len(names)
+        return len(self._independent(names, [actor], project)) != len(names)
 
     def _review_queue(self, project_id, shared=False):
         """One review-queue read of a project per request (and, when ``shared`` and the
@@ -3710,7 +3727,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         Authorization is never cached: callers re-check live authority first.
         """
         return self._cached_read('queue', project_id,
-                                 lambda: self._independent_queue(self.backend.review_queue(project_id)), shared)
+                                 lambda: self._independent_queue(self.backend.review_queue(project_id), project_id), shared)
 
     def _cached_read(self, kind, project_id, load, shared=False):
         """One canonical read per request, optionally reused across requests.
@@ -4837,6 +4854,28 @@ class ApiHandler(BaseHTTPRequestHandler):
         return 200, {'project': ctx.params['pid'], 'agent': agent,
                      'generated_at': now_iso(self.service._now())}
 
+    @route('PUT', r'/v1/projects/(?P<pid>' + ID + r')/agents/(?P<aid>' + ID + r')/coordinator')
+    def project_agent_coordinator_grant(self, ctx):
+        """Let this agent act as coordinator in this project (kittrial-5bb.209). An owner of the
+        project or a superuser; the body is empty. Answers the project's view of the agent."""
+        refuse_unknown_fields(dict(ctx.payload or {}), (), 'A coordinator grant')
+
+        def grant():
+            result = self.service.grant_coordinator(ctx.principal, ctx.params['pid'], ctx.params['aid'],
+                                                    request_id=ctx.request_id)
+            return result, result
+        return self._mutate(ctx, 'agents.coordinator.grant', ctx.params['pid'], grant,
+                            capability=CAP_PROJECT_ADMIN, reason='agent %s' % ctx.params['aid'])
+
+    @route('DELETE', r'/v1/projects/(?P<pid>' + ID + r')/agents/(?P<aid>' + ID + r')/coordinator')
+    def project_agent_coordinator_revoke(self, ctx):
+        def revoke():
+            result = self.service.revoke_coordinator(ctx.principal, ctx.params['pid'], ctx.params['aid'],
+                                                     request_id=ctx.request_id)
+            return result, result
+        return self._mutate(ctx, 'agents.coordinator.revoke', ctx.params['pid'], revoke,
+                            capability=CAP_PROJECT_ADMIN, reason='agent %s' % ctx.params['aid'])
+
     @route('DELETE', r'/v1/projects/(?P<pid>' + ID + r')/agents/(?P<aid>' + ID + r')')
     def project_agent_revoke(self, ctx):
         def revoke():
@@ -4921,20 +4960,31 @@ class ApiHandler(BaseHTTPRequestHandler):
         agent_id = agent.get('id')
         actor = agent.get('actor') or agent_id
         may_review, owner_approves = self.service.agent_review_standing(agent_id, project_id)
-        if not may_review:
+        approves = self.service.agent_approves(agent_id, project_id)
+        if not may_review and not approves:
             return []
         actions = []
         for row in rows:
             if row.get('review_state') != 'awaiting-review' or row.get('status') == 'closed':
                 continue
-            if not self._independent([actor], [row.get('assignee'), row.get('contribution_author')]):
+            if not self._independent([actor], [row.get('assignee'), row.get('contribution_author')], project_id):
                 continue
             recommended_by = [name for name in row.get('recommended_by') or [] if isinstance(name, str)]
-            if recommended_by and owner_approves:
+            if approves:
+                # It holds the coordinator grant here (kittrial-5bb.209): the decision is its own. It is
+                # never shown its own party's work for it: that approval would be refused.
+                if not self._independent([actor], [row.get('assignee'), row.get('contribution_author')], project_id, None, True):
+                    continue
+                kind, count, who = 'to-review', 'to_review', 'agent'
+                reason = (('A reviewer recommends approving this contribution. ' if recommended_by else
+                           'A contribution by another account awaits review. ')
+                          + 'You hold the coordinator grant in this project: review it, then approve it or request '
+                            'changes.')
+            elif recommended_by and owner_approves:
                 kind, count, who = 'review-recommended', 'review_recommended', 'owner'
                 reason = ('A reviewer recommends approving this contribution. Tell your owner it is ready to '
                           'approve; an agent cannot approve.')
-            elif not self._own_party_recommended(row, actor):
+            elif not self._own_party_recommended(row, actor, project_id):
                 kind, count, who = 'to-review', 'to_review', 'agent'
                 reason = ('A contribution by someone else awaits review. Review it, then record a recommendation '
                           'or request changes.')
@@ -5465,7 +5515,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             item['disposition'] = named(item['disposition'])
         if isinstance(item.get('timeline'), list):
             item['timeline'] = [named(entry) for entry in item['timeline']]
-        if mine or CAP_APPROVE in capabilities:
+        if mine or self._triages(ctx, capabilities):
             return item
 
         def withhold(disposition):
@@ -5556,9 +5606,16 @@ class ApiHandler(BaseHTTPRequestHandler):
         result['items'] = [self._proposal_view(ctx, capabilities, item) for item in result.get('items') or []]
         result['next_cursor'] = (make_cursor(ctx.principal, pid, ctx.query, result['next_offset'])
                                  if result.get('next_offset') is not None else None)
-        result['can_triage'] = CAP_APPROVE in capabilities
+        result['can_triage'] = self._triages(ctx, capabilities)
         result['can_propose'] = CAP_PROPOSALS in capabilities
         return 200, result
+
+    @staticmethod
+    def _triages(ctx, capabilities):
+        """Whether the caller triages proposals: a signed-in member with `reviews.approve`. Never
+        a credential, as the write below says; an agent's coordinator grant (kittrial-5bb.209)
+        gives it the approval of contributions and changes nothing here."""
+        return CAP_APPROVE in capabilities and ctx.principal.via != 'credential'
 
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/proposals/(?P<key>' + PROPOSAL_KEY + r')')
     def proposals_get(self, ctx):
@@ -5573,7 +5630,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             args += ['--history', caller_arg(ctx.query['history'], 'history')]
         capabilities = self.service.capabilities_for(ctx.principal, pid)
         result = self._proposal_view(ctx, capabilities, self.backend.proposal_read(pid, args, missing=True))
-        result['can_triage'] = CAP_APPROVE in capabilities
+        result['can_triage'] = self._triages(ctx, capabilities)
         return 200, result
 
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/proposals/(?P<key>' + PROPOSAL_KEY + r')/dispositions')
@@ -5694,7 +5751,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         # (kittrial-5bb.115 review). Past those, one is still named and has no text here.
         parties = self._read_parties(brief['task'].get('assignee'), (contribution or {}).get('author'))
         standing = [entry for entry in review.get('recommendations') or [] if isinstance(entry, dict)]
-        kept = set(self._independent([entry.get('author') for entry in standing], parties)) if parties else set()
+        kept = set(self._independent([entry.get('author') for entry in standing], parties, pid,
+                                     (contribution or {}).get('at'))) if parties else set()
         shown = [entry for entry in standing if entry.get('author') in kept]
         newest = review.get('recommendation')
         if not (newest and newest.get('author') in kept):
@@ -5848,14 +5906,19 @@ class ApiHandler(BaseHTTPRequestHandler):
     def reviews_add(self, ctx):
         payload = self._task_payload(ctx)
         payload.setdefault('schema_version', 1)
-        # Approval is an owner action; the contributor who delivered the work can
-        # contribute or request changes, never approve. A worker credential can never
-        # approve at all.
+        # Approval is an owner's or a coordinator's action; the contributor who delivered the
+        # work can contribute or request changes, never approve. A worker credential can never
+        # approve at all; a personal agent can where it holds the project's coordinator grant
+        # (kittrial-5bb.209), and is then judged by party below whatever the setting says.
         capability = CAP_APPROVE if payload.get('operation') == 'approve' else CAP_REVIEWS
         self._project(ctx, capability)
         recommending = payload.get('operation') == 'recommend'
+        # With the installation's setting on, an approval is judged by whose work it is, which
+        # needs the same read a recommendation makes (kittrial-5bb.199). Off: no read, no rule.
+        by_agent = ctx.principal.via == 'credential'
+        judged = payload.get('operation') == 'approve' and (self.service.approval_by_another_party or by_agent)
         current = None
-        if recommending:
+        if recommending or judged:
             # A field this kit does not know is refused, not dropped, by the one rule for
             # every review operation below (kittrial-5bb.110): at most five plain names.
             # One read serves the record-anchor check and the person rule below.
@@ -5899,14 +5962,24 @@ class ApiHandler(BaseHTTPRequestHandler):
                               % (operation, unsupported_fields_text(unknown)))
 
         def add():
+            delivered = (current.get('review') or {}).get('contribution') or {} if current else {}
+            pid = ctx.params['pid']
+            if judged:
+                # Nobody approves work of their own party: the account that approves, against the
+                # account behind the contribution's author and behind the task's assignee. A
+                # superuser is bound like anybody else for their own party's work.
+                parties = [(current.get('task') or {}).get('assignee'), delivered.get('author')]
+                actor = payload.get('actor') or ctx.principal.actor or ctx.principal.user_id
+                if not self._independent([actor], parties, pid, delivered.get('at'), by_agent) or \
+                        not self._independent([ctx.principal.user_id], parties, pid, delivered.get('at'), by_agent):
+                    raise forbidden(self.OWN_PARTY_AGENT if by_agent else self.OWN_PARTY)
             if recommending:
                 # Independence by PERSON, which only the web service can know; the
                 # canonical write then applies the name rule and every other rule.
-                parties = [(current.get('task') or {}).get('assignee'),
-                           ((current.get('review') or {}).get('contribution') or {}).get('author')]
+                parties = [(current.get('task') or {}).get('assignee'), delivered.get('author')]
                 actor = payload.get('actor') or ctx.principal.actor or ctx.principal.user_id
-                if not self._independent([actor], parties) or \
-                        not self._independent([ctx.principal.user_id], parties):
+                if not self._independent([actor], parties, pid, delivered.get('at')) or \
+                        not self._independent([ctx.principal.user_id], parties, pid, delivered.get('at')):
                     raise forbidden(self.NOT_INDEPENDENT)
                 # One standing recommendation for a contribution from each PERSON
                 # (kittrial-5bb.154): a second one, by the same actor or by another agent of
@@ -5914,7 +5987,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 # it is every standing one, whether or not this service counts it.
                 standing = [entry.get('author') for entry in (current.get('review') or {}).get('recommendations') or []
                             if isinstance(entry, dict) and isinstance(entry.get('author'), str)]
-                own = [name for name in standing if not self._independent([name], [actor, ctx.principal.user_id])]
+                own = [name for name in standing if not self._independent([name], [actor, ctx.principal.user_id], pid)]
                 if own:
                     shown = self.service.actor_names(own[:1]).get(own[0]) or own[0]
                     raise conflict(self.ALREADY_RECOMMENDED % shown, {'recommended_by': own[0]})
@@ -6048,8 +6121,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             # nobody of theirs has recommended yet (the rule of _agent_review_actions). "Yet" is
             # read from every name on the row, counted or not (kittrial-5bb.147).
             reviewable = {i.get('id') for i in items if CAP_REVIEWS in capabilities
-                          and self._independent([actor], [i.get('assignee'), i.get('contribution_author')])
-                          and not self._own_party_recommended(i, actor)}
+                          and self._independent([actor], [i.get('assignee'), i.get('contribution_author')], project['id'])
+                          and not self._own_party_recommended(i, actor, project['id'])}
             classified.append(agent_prompts.classify(project, capabilities, items,
                                                      actor, blocked, now, names, reviewable))
             for item in items:
@@ -6672,6 +6745,9 @@ def main(argv=None):
                         help='log-ins one client address may have in flight at once, of the %d in all '
                              '(default %d; 1 to %d)' % (Service.LOGINS_AT_ONCE, Service.LOGINS_PER_ADDRESS,
                                                         Service.LOGINS_AT_ONCE))
+    parser.add_argument('--approval-by-another-party', action='store_true',
+                        help='nobody approves (or recommends) work of their own party: an account, its agents '
+                             'and the worker credentials it issued. Off unless given')
     parser.add_argument('--public-url',
                         help='canonical base URL of this service, used only to render '
                              'copyable agent setup/resume snippets (e.g. https://host)')
@@ -6757,7 +6833,7 @@ def main(argv=None):
     trusted = list(args.trusted_proxy)
     if args.trust_proxy and 'localhost' not in trusted:
         trusted.append('localhost')
-    service = Service(store, public_url=args.public_url)
+    service = Service(store, public_url=args.public_url, approval_by_another_party=args.approval_by_another_party)
     service.LOGINS_PER_ADDRESS = args.logins_per_address
     backend = build_backend(service, args)
     for line in operator_allowlist_warnings(args.root if args.backend == 'endpoint' else None):

@@ -323,6 +323,9 @@ CAP_APPROVE = 'reviews.approve'
 #: member or an agent can propose. Triage and decisions need CAP_APPROVE, which no
 #: credential ever holds.
 CAP_PROPOSALS = 'proposals.write'
+#: What a project's coordinator may do beyond approving (slice 1b of docs/WEB_COORDINATOR_DESIGN.md,
+#: kittrial-5bb.209). No route asks for it yet: the merge slot and the lifecycle facts will.
+CAP_COORDINATE = 'coordinate'
 CAP_PROJECT_ADMIN = 'project.admin'
 CAP_PROJECT_CREATE = 'project.create'
 CAP_ACCOUNTS_ADMIN = 'accounts.admin'
@@ -338,8 +341,8 @@ GRANT_LIMIT_DEFAULT = 5
 #: credential ever holds it (an agent cannot create or widen another identity).
 CAP_AGENTS = 'agents.manage'
 
-ROLES = ('viewer', 'contributor', 'owner')
-RANK = {'viewer': 0, 'contributor': 1, 'owner': 2}
+ROLES = ('viewer', 'contributor', 'coordinator', 'owner')
+RANK = {'viewer': 0, 'contributor': 1, 'coordinator': 2, 'owner': 3}
 
 SCOPE_CAPABILITIES = {
     'read': frozenset({CAP_READ}),
@@ -357,9 +360,15 @@ ROLE_CAPABILITIES = {
     'viewer': frozenset({CAP_READ}),
     'contributor': frozenset({CAP_READ, CAP_TASKS, CAP_CHECKPOINTS, CAP_REVIEWS, CAP_FEEDBACK,
                               CAP_PROPOSALS}),
+    # Between contributor and owner: approves and coordinates; does not administer the
+    # project (members, worker credentials, archive and the audit stay the owner's).
+    'coordinator': frozenset({CAP_READ, CAP_TASKS, CAP_CHECKPOINTS, CAP_REVIEWS, CAP_FEEDBACK,
+                              CAP_PROPOSALS, CAP_APPROVE, CAP_COORDINATE}),
     'owner': frozenset({CAP_READ, CAP_TASKS, CAP_CHECKPOINTS, CAP_REVIEWS, CAP_FEEDBACK,
-                        CAP_PROPOSALS, CAP_APPROVE, CAP_PROJECT_ADMIN}),
+                        CAP_PROPOSALS, CAP_APPROVE, CAP_COORDINATE, CAP_PROJECT_ADMIN}),
 }
+#: What the coordinator grant adds to an agent's credential in the project of the grant.
+GRANT_CAPABILITIES = frozenset({CAP_APPROVE, CAP_COORDINATE})
 CREDENTIAL_FORBIDDEN_CAPABILITIES = frozenset({CAP_APPROVE, CAP_PROJECT_ADMIN,
                                                CAP_PROJECT_CREATE, CAP_ACCOUNTS_ADMIN,
                                                CAP_AGENTS})
@@ -404,12 +413,46 @@ def credential_capabilities(state, credential, issuer, project_id):
         caps |= SCOPE_CAPABILITIES.get(scope, frozenset())
     caps -= CREDENTIAL_FORBIDDEN_CAPABILITIES
     if issuer.get('superuser'):
-        return frozenset(caps)
+        return frozenset(caps | coordinator_grant_capabilities(state, credential, project_id, ROLE_CAPABILITIES['owner']))
     role = state.get('memberships', {}).get(project_id, {}).get(issuer['id'])
     if role is None:
         raise deny(403, 'forbidden',
                    'The credential issuer is no longer a member of this project')
-    return frozenset(cap for cap in caps if cap in ROLE_CAPABILITIES.get(role, frozenset()))
+    held = ROLE_CAPABILITIES.get(role, frozenset())
+    return frozenset({cap for cap in caps if cap in held}
+                     | coordinator_grant_capabilities(state, credential, project_id, held))
+
+
+def coordinator_grant(state, project_id, agent_id):
+    """The coordinator grant of one agent in one project, or None.
+
+    Kept with the PROJECT, not on any credential (an agent's scopes sit on its credential,
+    one list for all its projects, set by its own account): ``coordinator_grants[project]
+    [agent] = {'granted_by', 'granted_at'}``, written by an owner of that project or a
+    superuser. A record of any other shape is no grant: the check fails closed.
+    """
+    grants = state.get('coordinator_grants')
+    grant = (grants.get(project_id) or {}).get(agent_id) if isinstance(grants, dict) and \
+        isinstance(grants.get(project_id), dict) else None
+    if not isinstance(grant, dict) or not isinstance(grant.get('granted_by'), str):
+        return None
+    return grant
+
+
+def coordinator_grant_capabilities(state, credential, project_id, held):
+    """What the grant adds to this credential here: approving and coordinating, or nothing.
+
+    Only for an agent's credential, only in the project of the grant, and only while the
+    agent's account itself holds them there (``held``: it is a coordinator or an owner of
+    the project, or a superuser). It is the one place where "a credential never approves"
+    is lifted. Read from the present state on every decision, by the web service and again
+    by the endpoint before it writes: removing the grant, lowering the account's role or
+    taking the agent out of the project ends it at the next request.
+    """
+    agent_id = credential.get('agent_id')
+    if not agent_id or coordinator_grant(state, project_id, agent_id) is None:
+        return frozenset()
+    return frozenset(cap for cap in GRANT_CAPABILITIES if cap in held)
 
 
 def project_grant(user):

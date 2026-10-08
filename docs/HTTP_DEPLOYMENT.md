@@ -15,7 +15,7 @@ the operator path.
 
 It is an authenticated adapter to canonical coordination data: browser sessions
 and project-scoped worker credentials gate every route, and organization is by
-project membership (`owner`, `contributor`, `viewer`) with a global superuser.
+project membership (`owner`, `coordinator`, `contributor`, `viewer`) with a global superuser.
 
 It is **not** a replacement for repository permissions, TLS termination, host
 isolation, or the canonical database's own access controls. It never grants Git
@@ -1455,6 +1455,117 @@ Two records can tell: the project's audit log has a `tasks.create` or
 carried an idempotency key, the project's operation journal has its row with both
 names (`principal` `user:usr_...` and an `actor` that is not that account).
 
+### Nobody approves work of their own party
+
+An installation setting, **off by default** (kittrial-5bb.199; slice 1a of
+[WEB_COORDINATOR_DESIGN.md](WEB_COORDINATOR_DESIGN.md)): `--approval-by-another-party` on
+`http_service.py`, or `"approval_by_another_party": true` in the office service
+configuration. With it off, every review rule is what it was: an owner or a superuser
+approves any contribution, their own included, and a recommendation is judged by person
+(an account and its agents).
+
+With it on, one **party** is an account, every agent that account made, and every worker
+credential that account issued, and:
+
+- `approve` is refused with `403` when the approver's party is the party of the
+  contribution's author or of the task's assignee: "This contribution was delivered by
+  your own account (you, one of your agents, or a worker credential you issued). Another
+  owner of this project, or a superuser who did not deliver it, must approve it." Nothing
+  is written. A superuser is bound like anybody else for their own party's work, and
+  approves anybody else's as before.
+- `recommend`, the review queue, My work and the brief count by the same parties, so the
+  agent of the account that issued a worker credential can no longer recommend work
+  delivered under it (with the setting off that work is nobody's, and it can).
+- Work under a worker credential is traced by the credential, not by the name: the worker
+  credentials of the project whose actor namespace holds the name (the name, or
+  `name/...`); a credential issued with no name writes under its issuer's account
+  already. A label an agent writes under its own name (`AGENT/night`) is traced the same
+  way to the agent's account. Where two issuers have held one name over time, the credential whose life
+  covers the moment the contribution was written decides; when that cannot be decided,
+  both issuers count as the work's party.
+
+**It is a rule of the web route only.** An approval made on the host route (`endpoint.py`
+over SSH, or run on the server) is not bound by it, on or off: a party is made of web
+accounts, their agents and their worker credentials, and the host route knows none of
+them (a caller there names its own actor). For the same reason the setting is the web
+service's and not a host switch, and the endpoint's `setup-status` cannot report it.
+What an owner can see is the service's own answer:
+
+`GET /v1/projects/{id}/setup` carries `rules.approval_by_another_party`, and the set-up
+page says in one line whether the rule is on. A project with one account that both
+delivers and approves needs a second owner, or a superuser who did not deliver, once it
+is on.
+
+### Coordinators: a role, and a grant that lets an agent approve
+
+Slice 1b of [WEB_COORDINATOR_DESIGN.md](WEB_COORDINATOR_DESIGN.md) (kittrial-5bb.209). Two
+things, and an installation that uses neither behaves as before.
+
+**The role `coordinator`** sits between `contributor` and `owner`:
+
+| | viewer | contributor | coordinator | owner |
+|---|---|---|---|---|
+| Read | yes | yes | yes | yes |
+| Claim, deliver, checkpoint, review, recommend, propose | no | yes | yes | yes |
+| Approve a contribution, triage a proposal (`reviews.approve`) | no | no | yes | yes |
+| `coordinate` (no route asks for it yet; the merge slot and the lifecycle facts will) | no | no | yes | yes |
+| Members, worker credentials, archive, the audit, this grant (`project.admin`) | no | no | no | yes |
+
+An owner gives and takes the role on the Members panel (`PUT
+/v1/projects/{id}/members/{user}` with `"role": "coordinator"`); making an owner stays a
+superuser's. A coordinator who is signed in approves as an owner does, and the setting of
+the section above binds them alike.
+
+**The coordinator grant** lets one personal agent approve in one project. Until now no
+credential approved anything; this is the one place where that is lifted.
+
+- `PUT /v1/projects/{id}/agents/{agent}/coordinator` (empty body) gives it, `DELETE` on
+  the same path takes it away. An owner of that project or a superuser, signed in; never
+  a credential, a granted agent included (`403`). Both answer the project's view of the
+  agent, and both write an audit record (`agents.coordinator.grant`,
+  `agents.coordinator.revoke`) that names the project, the agent and who did it.
+- The agent must be a personal agent that works in the project (anything else answers
+  `404 Agent not found`, as the other routes of this list do; a worker credential is not
+  an agent and cannot be named), enabled (`409`), and **its own account must be a
+  coordinator or an owner of the project, or a superuser**: otherwise `409` "This agent's
+  account is not a coordinator or an owner of this project, so the grant would have no
+  effect. Make the account a coordinator first (Members), then grant the agent." Nothing
+  is written.
+- The grant is kept with the project, not on a credential: a new or renewed credential of
+  the agent has it, and the agent's scopes (one list for all its projects, set by its own
+  account) do not carry it. In another project of the same agent it gives nothing.
+- What it adds to the agent's credentials there is `reviews.approve` and `coordinate`,
+  each only while the agent's account holds it. Nothing else a credential is denied
+  opens: members, worker credentials, the audit, archiving, creating a project and the
+  grant itself stay refused, and so does the triage of requirement proposals (no
+  credential records a disposition; the proposal reads keep answering `can_triage:
+  false` to a granted agent).
+- **A granted agent never approves work of its own party, whatever the setting of the
+  section above says.** The party is the full one of that section: its account, that
+  account's other agents, and the worker credentials that account issued. `403`: "This
+  contribution was delivered by this agent's own account (its owner, one of that
+  account's agents, or a worker credential it issued). An agent never approves work of
+  its own account: another coordinator or owner of this project, or a superuser who did
+  not deliver it, must approve it." A person's approval follows the setting as before.
+- It is read from the present state on every request, by the web service and again when
+  the endpoint authorizes the write. Each of these ends it at the agent's next request:
+  the grant is removed; the account is made a contributor or a viewer, or leaves the
+  project; the agent is taken out of the project (which also deletes the grant, so it
+  does not wait there for the account to add the project back); the agent or its account
+  is disabled. A grant whose account was lowered stays on record and shows as "Granted,
+  no effect" until the account is raised again or the grant is removed.
+
+`GET /v1/projects/{id}/agents` and `.../agents/{agent}` carry `coordinator` for each
+agent: `null`, or `{granted_by, granted_by_display_name, granted_at, effective}`. The
+project's settings page lists "Agents in this project" for an owner with a "Make
+coordinator" or "Remove grant" button on each row, and shows the server's sentence when a
+grant is refused. `GET /v1/agents/me/next` tells a granted agent of a contribution by
+another account "You hold the coordinator grant in this project: review it, then approve
+it or request changes", and never lists its own party's work for approval.
+
+Like the setting above, this is the web route's: an approval on the host route
+(`endpoint.py` over SSH, or run on the server) knows no accounts and no grants.
+
 ### The merge slot is not a task
 
 Each project has one merge slot, `PROJECT-merge-slot`, an internal record. On the host it
@@ -1626,7 +1737,9 @@ private. `GET /v1/projects/{id}/agents` lists the agents whose grant names the p
 (id, name, owner, `last_seen_at`, `enabled` only, never `working_directory` or
 `working_directory_hidden`), `GET /v1/projects/{id}/agents/{agent}` returns one of
 them, and `DELETE /v1/projects/{id}/agents/{agent}` removes the project from that
-agent's grant with an audit record naming the project and the acting user. An agent that
+agent's grant with an audit record naming the project and the acting user. Which of
+them coordinates the project, and the routes that give and take that, are in
+"Coordinators: a role, and a grant that lets an agent approve" above. An agent that
 is not granted the project is reported exactly like a nonexistent id: both routes answer
 `404` with the same `Agent not found` message, so a project owner cannot probe the wider
 registry. Removal

@@ -45,6 +45,7 @@ from pathlib import Path
 from http_authority import (ALL_CAPABILITIES, CAP_ACCOUNTS_ADMIN, CAP_AGENTS, CAP_APPROVE,
                             CAP_CHECKPOINTS, CAP_FEEDBACK, CAP_PROJECT_ADMIN, CAP_PROPOSALS,
                             CAP_PROJECT_CREATE, CAP_PROJECT_HOST_CREATE, CAP_READ, CAP_REVIEWS, CAP_TASKS,
+                            CAP_COORDINATE, coordinator_grant,
                             GRANT_LIMIT_DEFAULT, GRANT_LIMIT_MAX, created_projects, project_grant,
                             CREDENTIAL_FORBIDDEN_CAPABILITIES, CREDENTIAL_SCOPES, RANK,
                             ROLE_CAPABILITIES, ROLES, SCOPE_CAPABILITIES, SCHEMA_VERSION,
@@ -902,8 +903,13 @@ class Service:
                  idempotency_ttl=IDEMPOTENCY_TTL_SECONDS,
                  result_retention=RESULT_RETENTION_SECONDS,
                  login_max_attempts=LOGIN_MAX_ATTEMPTS, public_url=None,
-                 lookup_max=LOOKUP_MAX_PER_WINDOW, lookup_window=LOOKUP_WINDOW_SECONDS):
+                 lookup_max=LOOKUP_MAX_PER_WINDOW, lookup_window=LOOKUP_WINDOW_SECONDS,
+                 approval_by_another_party=False):
         self.store = store
+        #: The installation's setting "nobody approves work of their own party" (slice 1a of
+        #: docs/WEB_COORDINATOR_DESIGN.md, kittrial-5bb.199). OFF unless the operator turns it
+        #: on: with it off every review rule is exactly what it was.
+        self.approval_by_another_party = approval_by_another_party is True
         self.session_idle = session_idle
         self.session_absolute = session_absolute
         self.credential_ttl = credential_ttl
@@ -2242,6 +2248,64 @@ class Service:
                 return agent['owner']
         return actor
 
+    def actor_parties(self, actor, project_id=None, at=None, full=False):
+        """The accounts a task actor's work belongs to: its PARTY, as a set.
+
+        With the setting off this is ``{actor_person(actor)}`` and nothing else, so every rule
+        that asks it answers as before. With it on, one party is an account, every agent that
+        account made, and every worker credential that account issued (kittrial-5bb.199):
+
+        * an agent: its owner; an account: itself;
+        * a name written under a CREDENTIAL: the account behind that credential. It is
+          traced by the credential, not by the name: the credentials whose actor namespace
+          holds the name (the name itself, or ``name/...``): a worker credential of
+          ``project_id``, whose account is the one that issued it; or an agent's credential,
+          for a label written under the agent's name (``AGENT/night``), whose account is the
+          agent's owner. Where credentials of more than one account have held the name, the
+          one whose life covers ``at`` (the moment the work was written) decides; when that
+          cannot be decided, every such account is the work's party, which only ever refuses
+          more;
+        * anything else: the name itself.
+        """
+        person = self.actor_person(actor)
+        # ``full``: an agent that approves is judged by party whatever the setting says
+        # (kittrial-5bb.209); a person's approval follows the setting.
+        if not (self.approval_by_another_party or full) or not isinstance(actor, str) or not actor:
+            return {person}
+        with self.store.lock:
+            if actor in self.state['agents'] or actor in self.state['users']:
+                return {person}
+            held = []
+            for credential in self.state['credentials'].values():
+                if not isinstance(credential, dict):
+                    continue
+                # A worker credential holds its name in ITS project; an agent's credential has no
+                # project of its own and holds the agent's name wherever the agent works.
+                if not credential.get('agent_id') and (not credential.get('project_id') or (
+                        project_id is not None and credential['project_id'] != project_id)):
+                    continue
+                namespace = credential.get('actor')
+                if not isinstance(namespace, str) or not namespace:
+                    continue                      # it writes under its issuer's own account name
+                if actor == namespace or actor.startswith(namespace.rstrip('/') + '/'):
+                    held.append(credential)
+            if not held:
+                return {person}
+            issuers = {credential['user_id'] for credential in held}
+            if len(issuers) > 1 and isinstance(at, str) and at:
+                def ended(credential):
+                    if credential.get('revoked_at'):
+                        return str(credential['revoked_at'])
+                    try:
+                        return now_iso(credential['expires_at'])
+                    except (OSError, OverflowError, ValueError, TypeError):
+                        return '9999'             # a time this platform cannot write: it has not ended
+                living = {credential['user_id'] for credential in held
+                          if str(credential.get('created_at') or '') <= at <= ended(credential)}
+                if len(living) == 1:
+                    return living
+            return issuers
+
     def username_of(self, user_id):
         """The account's username, read under the store lock (``None`` if unknown)."""
         with self.store.lock:
@@ -2258,6 +2322,31 @@ class Service:
     # agent on its next request. ``working_directory`` is a free-text hint for the
     # owner's own machine; the server stores it and never reads it, and only the owner
     # (or a superuser) ever receives it in a response.
+    def agent_approves(self, agent_id, project_id):
+        """Whether a live credential of the agent may approve in the project now: it holds the
+        coordinator grant there and its account is a coordinator or an owner (kittrial-5bb.209).
+        Used to word what the agent is shown; it grants nothing."""
+        from http_authority import credential_capabilities
+        with self.store.lock:
+            agent = self.state['agents'].get(agent_id)
+            if not isinstance(agent, dict) or not agent.get('enabled') or \
+                    project_id not in (agent.get('projects') or []):
+                return False
+            owner = self.state['users'].get(agent.get('owner'))
+            if not isinstance(owner, dict) or owner.get('disabled'):
+                return False
+            moment = self._expiry_now()
+            for credential in self.state.get('credentials', {}).values():
+                if not isinstance(credential, dict) or credential.get('agent_id') != agent_id or \
+                        credential.get('revoked') or credential.get('expires_at', 0) <= moment:
+                    continue
+                try:
+                    if CAP_APPROVE in credential_capabilities(self.state, credential, owner, project_id):
+                        return True
+                except AuthorityDenied:
+                    continue
+            return False
+
     def agent_review_standing(self, agent_id, project_id):
         """``(may_review, owner_approves)`` for one agent in one project, from live state.
 
@@ -2531,7 +2620,7 @@ class Service:
             view['working_directory_hidden'] = True
         return view
 
-    def project_agent_view(self, agent):
+    def project_agent_view(self, agent, project_id=None):
         """The *project-owner* view of an agent active in their project.
 
         Deliberately narrower than :meth:`agent_view`. A project owner governs
@@ -2541,7 +2630,7 @@ class Service:
         ``working_directory_hidden``, which would still disclose that a path exists -
         nor do the agent's other project grants, its machine/notes or its credentials.
         """
-        return {
+        view = {
             'id': agent['id'],
             'name': agent['name'],
             'owner': agent['owner'],
@@ -2550,6 +2639,74 @@ class Service:
             'enabled': bool(agent.get('enabled')),
             'last_seen_at': agent.get('last_seen_at'),
         }
+        if project_id is not None:
+            # Whether this agent coordinates THIS project (kittrial-5bb.209): who granted it and
+            # when, and whether the grant has effect now (its account must itself be a
+            # coordinator or an owner here); null when it holds none.
+            view['coordinator'] = self.coordinator_view(project_id, agent)
+        return view
+
+    def coordinator_view(self, project_id, agent):
+        grant = coordinator_grant(self.state, project_id, agent['id'])
+        if grant is None:
+            return None
+        return {'granted_by': grant['granted_by'], 'granted_by_display_name': self._owner_name(grant['granted_by']),
+                'granted_at': grant.get('granted_at'), 'effective': self._may_coordinate(project_id, agent)}
+
+    def _may_coordinate(self, project_id, agent):
+        """Whether the agent's account holds the coordinator's capabilities in the project now."""
+        owner = self.state['users'].get(agent.get('owner')) or {}
+        if owner.get('disabled') or not agent.get('enabled'):
+            return False
+        role = self.state.get('memberships', {}).get(project_id, {}).get(agent.get('owner'))
+        return bool(owner.get('superuser')) or CAP_COORDINATE in ROLE_CAPABILITIES.get(role, frozenset())
+
+    NOT_A_COORDINATOR = ('This agent\'s account is not a coordinator or an owner of this project, so the grant would '
+                         'have no effect. Make the account a coordinator first (Members), then grant the agent.')
+
+    def grant_coordinator(self, principal, project_id, agent_id, request_id=None):
+        """Let one agent act as coordinator in one project (slice 1b, kittrial-5bb.209).
+
+        The route holds the ``CAP_PROJECT_ADMIN`` boundary: an owner of the project or a
+        superuser, never a credential. The agent must be a personal agent granted this
+        project (anything else answers like a missing agent, as the other routes here do),
+        and its account must itself be a coordinator or an owner of the project: a grant
+        that could not take effect is not written.
+        """
+        if principal is None or principal.via == 'credential':
+            raise forbidden('Session authority required to change a coordinator grant')
+        with self.store.lock:
+            self._refresh_authority(principal)
+            agent = self._agent(agent_id)
+            if project_id not in (agent.get('projects') or []):
+                raise not_found('Agent not found')
+            if not agent.get('enabled'):
+                raise conflict('A disabled agent cannot be granted')
+            if not self._may_coordinate(project_id, agent):
+                raise conflict(self.NOT_A_COORDINATOR)
+            grants = self.state.setdefault('coordinator_grants', {}).setdefault(project_id, {})
+            if coordinator_grant(self.state, project_id, agent_id) is None:
+                grants[agent_id] = {'granted_by': principal.user_id, 'granted_at': now_iso(self._now())}
+                self.store.save()
+            return self.project_agent_view(agent, project_id)
+
+    def revoke_coordinator(self, principal, project_id, agent_id, request_id=None):
+        """Take the coordinator grant away. From the next request the agent approves nothing here."""
+        if principal is None or principal.via == 'credential':
+            raise forbidden('Session authority required to change a coordinator grant')
+        with self.store.lock:
+            self._refresh_authority(principal)
+            agent = self._agent(agent_id)
+            grants = self.state.get('coordinator_grants')
+            held = grants.get(project_id) if isinstance(grants, dict) else None
+            if not isinstance(held, dict) or agent_id not in held:
+                raise not_found('Agent not found' if project_id not in (agent.get('projects') or [])
+                                else 'This agent holds no coordinator grant in this project')
+            del held[agent_id]
+            if not held:
+                del grants[project_id]
+            self.store.save()
+            return self.project_agent_view(agent, project_id)
 
     def list_project_agents(self, principal, project_id):
         """Agents whose live grant names ``project_id`` (owner decision 4).
@@ -2563,7 +2720,7 @@ class Service:
             agents = [a for a in self.state['agents'].values()
                       if project_id in (a.get('projects') or [])]
             agents.sort(key=lambda a: a['id'])
-            return [self.project_agent_view(a) for a in agents]
+            return [self.project_agent_view(a, project_id) for a in agents]
 
     def get_project_agent(self, principal, project_id, agent_id):
         """One agent as its project's owner/admin sees it.
@@ -2581,7 +2738,7 @@ class Service:
                 # One message for every agent 404 on this route: "exists but is not
                 # granted here" must be indistinguishable from "no such id".
                 raise not_found('Agent not found')
-            return self.project_agent_view(agent)
+            return self.project_agent_view(agent, project_id)
 
     def revoke_agent_project(self, principal, project_id, agent_id, request_id=None):
         """Remove one project from an agent's grant (owner decision 4).
@@ -2615,8 +2772,15 @@ class Service:
                 # learns nothing and a project owner cannot probe for the id.
                 raise not_found('Agent not found')
             agent['projects'] = [pid for pid in projects if pid != project_id]
+            # Out of the project, out of its coordinators: a grant must not wait there for the
+            # agent's own account to add the project back (kittrial-5bb.209).
+            grants = self.state.get('coordinator_grants')
+            if isinstance(grants, dict) and isinstance(grants.get(project_id), dict):
+                grants[project_id].pop(agent_id, None)
+                if not grants[project_id]:
+                    del grants[project_id]
             self.store.save()
-            view = self.project_agent_view(agent)
+            view = self.project_agent_view(agent, project_id)
         return {'operation': 'agents.project.revoke', 'project': project_id, 'agent': view}
 
     def agent_setup(self, agent, secret, projects=None):

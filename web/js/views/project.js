@@ -4,8 +4,11 @@ import { queuePanel, detailPanel, proposeForm, myStrip } from './proposals.js';
 import { setupHint } from './setup.js';
 
 const PAGE = 10;
-export const canWrite = (p) => ['owner', 'contributor', 'superuser'].includes(p.role);
+export const canWrite = (p) => ['owner', 'coordinator', 'contributor', 'superuser'].includes(p.role);
 export const isOwner = (p) => ['owner', 'superuser'].includes(p.role);
+// Who decides on a contribution: an owner, or a coordinator (kittrial-5bb.209). Not who administers the project.
+export const canApprove = (p) => ['owner', 'coordinator', 'superuser'].includes(p.role);
+export const ROLE_NAMES = [['viewer', 'Viewer'], ['contributor', 'Contributor'], ['coordinator', 'Coordinator'], ['owner', 'Owner']];
 
 async function load(ctx, pid) {
   const project = await ctx.api.project(pid);
@@ -210,6 +213,7 @@ export async function settings(ctx, { pid }) {
   const project = await load(ctx, pid);
   const owner = isOwner(project);
   const membersHost = h('div', { class: 'panel' });
+  const agentsHost = h('div');
   const credsHost = h('div');
   const auditHost = h('div');
 
@@ -218,12 +222,12 @@ export async function settings(ctx, { pid }) {
     try { data = await ctx.api.members(pid); } catch (error) { membersHost.replaceChildren(errorState(error, drawMembers)); return; }
     const rows = data.items.slice().sort((a, b) => a.display_name.localeCompare(b.display_name));
     membersHost.replaceChildren(
-      h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Members ', h('span', { class: 'nav-count' }, rows.length)), h('span', { class: 'small muted hide-narrow' }, 'Viewers read · contributors claim and deliver · owners review and manage')),
+      h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Members ', h('span', { class: 'nav-count' }, rows.length)), h('span', { class: 'small muted hide-narrow' }, 'Viewers read · contributors claim and deliver · coordinators also approve · owners also manage')),
       h('div', { class: 'table-wrap' }, h('table', null,
         h('thead', null, h('tr', null, h('th', { scope: 'col' }, 'Person'), h('th', { scope: 'col' }, 'Role'), owner ? h('th', { scope: 'col' }, h('span', { class: 'visually-hidden' }, 'Actions')) : null)),
         h('tbody', null, rows.map((m) => {
           const select = h('select', { 'aria-label': 'Role for ' + m.display_name, disabled: !owner || project.archived },
-            ['viewer', 'contributor', 'owner'].map((r) => h('option', { value: r, selected: r === m.role }, r[0].toUpperCase() + r.slice(1))));
+            ROLE_NAMES.map(([r, label]) => h('option', { value: r, selected: r === m.role }, label)));
           select.addEventListener('change', async () => {
             try { await act(select, () => ctx.api.setMember(pid, m.user_id, select.value), { success: `${m.display_name} is now ${select.value}` }); }
             catch { select.value = m.role; }
@@ -239,14 +243,16 @@ export async function settings(ctx, { pid }) {
               drawMembers();
             } }, 'Remove')) : null);
         })))),
-      owner && !project.archived ? addMemberForm() : null);
+      // Not `null`: replaceChildren writes a null argument out as the word "null", which is what a member
+      // who is not an owner saw under this table.
+      ...(owner && !project.archived ? [addMemberForm()] : []));
   }
 
   function addMemberForm() {
     const form = h('form', { class: 'panel-body', novalidate: true },
       h('div', { class: 'form-row' },
         field({ id: 'm-username', label: 'Add by username', placeholder: 'e.g. lena', required: true }),
-        field({ id: 'm-role', label: 'Role', type: 'select', value: 'contributor', options: [['viewer', 'Viewer'], ['contributor', 'Contributor'], ['owner', 'Owner']] })),
+        field({ id: 'm-role', label: 'Role', type: 'select', value: 'contributor', options: ROLE_NAMES })),
       h('div', null, h('button', { type: 'submit', class: 'primary' }, 'Add member')));
     form.addEventListener('submit', async (event) => {
       event.preventDefault();
@@ -262,6 +268,39 @@ export async function settings(ctx, { pid }) {
       drawMembers();
     });
     return form;
+  }
+
+  // The agents that work in this project, and which of them coordinate it (kittrial-5bb.209). An owner
+  // gives and removes the grant here; the server says why when a grant cannot be given.
+  async function drawAgents() {
+    if (!owner) { agentsHost.replaceChildren(); return; }
+    let data;
+    try { data = await ctx.api.projectAgents(pid); } catch (error) { agentsHost.replaceChildren(errorState(error, drawAgents)); return; }
+    const rows = (data.items || []).slice().sort((a, b) => a.name.localeCompare(b.name));
+    agentsHost.replaceChildren(h('section', { class: 'panel', 'data-panel': 'project-agents' },
+      h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Agents in this project ', h('span', { class: 'nav-count' }, rows.length)),
+        h('span', { class: 'small muted hide-narrow' }, 'A coordinating agent may approve other accounts’ work here; never its own account’s')),
+      rows.length ? h('div', { class: 'table-wrap' }, h('table', null,
+        h('thead', null, h('tr', null, h('th', { scope: 'col' }, 'Agent'), h('th', { scope: 'col' }, 'Account'), h('th', { scope: 'col' }, 'Coordinator'), h('th', { scope: 'col' }, h('span', { class: 'visually-hidden' }, 'Actions')))),
+        h('tbody', null, rows.map((a) => {
+          const grant = a.coordinator;
+          const change = async (e, call, done) => {
+            try { await act(e.currentTarget, call, { success: done }); } catch { /* the refusal is shown */ }
+            drawAgents();
+          };
+          return h('tr', { 'data-agent': a.id, 'data-coordinator': grant ? String(grant.effective) : 'none' },
+            h('td', null, a.name, a.enabled ? null : h('div', { class: 'sub' }, 'Disabled')),
+            h('td', null, a.owner_display_name || a.owner),
+            h('td', null, !grant ? h('span', { class: 'muted' }, 'No') :
+              [h('span', { class: 'chip ' + (grant.effective ? 'ok' : 'plain') }, grant.effective ? 'Coordinates' : 'Granted, no effect'),
+                h('div', { class: 'sub' }, 'by ', grant.granted_by_display_name || grant.granted_by, ' ', time(grant.granted_at),
+                  grant.effective ? null : ' — its account is no longer a coordinator or owner here')]),
+            h('td', null, project.archived ? null : grant ?
+              h('button', { type: 'button', class: 'danger', 'aria-label': 'Remove the coordinator grant from ' + a.name,
+                onclick: (e) => change(e, () => ctx.api.revokeCoordinator(pid, a.id), `${a.name} no longer coordinates`) }, 'Remove grant') :
+              h('button', { type: 'button', 'aria-label': 'Let ' + a.name + ' coordinate this project',
+                onclick: (e) => change(e, () => ctx.api.grantCoordinator(pid, a.id), `${a.name} coordinates this project`) }, 'Make coordinator')));
+        })))) : h('div', { class: 'panel-body' }, empty('No agents here yet', 'A member grants their own agent this project on the Agents page.'))));
   }
 
   async function drawCreds() {
@@ -303,7 +342,7 @@ export async function settings(ctx, { pid }) {
         empty('No administrative activity yet', null)));
   }
 
-  drawMembers(); drawCreds(); drawAudit();
+  drawMembers(); drawAgents(); drawCreds(); drawAudit();
 
   const danger = owner && !project.archived ? h('section', { class: 'panel' },
     h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Archive project')),
@@ -319,5 +358,5 @@ export async function settings(ctx, { pid }) {
     pageHead({ crumbs: crumbs(ctx, project, 'Members & settings'), title: 'Members & settings', lede: owner ? 'Manage who can see and change this project.' : 'Only project owners can change membership.' }),
     archivedBanner(project),
     unusableBanner(project),
-    membersHost, credsHost, auditHost, danger);
+    membersHost, agentsHost, credsHost, auditHost, danger);
 }
