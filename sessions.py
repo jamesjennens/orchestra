@@ -5,6 +5,7 @@ import re
 import uuid
 from datetime import datetime, timezone
 from coordination import atomic
+import record_json
 from requirements import content_hash
 
 UUID = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
@@ -252,7 +253,7 @@ def execute(path, project, args, export, *, actor=None, principal=None):
         if not owner_map(data):
             return dict(project=project,session=old,reconciled=True)
         return dict(project=project,session=old,reconciled=True,principal=owner_map(data).get(old['actor']))
-    rows=[json.loads(line) for line in export().splitlines() if line.strip()]
+    rows=record_json.loads_rows(export())
     occupied=used_actors(rows)|{r['actor'] for r in data['records'].values()}
     for _ in range(20):
         actor='session-'+str(uuid.uuid4())

@@ -909,6 +909,9 @@ def is_record_anchor(row):
     """
     if not isinstance(row, dict):
         return False
+    if row.get('malformed'):
+        import record_json
+        return record_json.selected(row, RECORD_ANCHOR_LABELS)
     labels = row.get('labels')
     comments = row.get('comments')
     if not isinstance(labels, (list, tuple)) or not isinstance(comments, list):
