@@ -324,7 +324,7 @@ class SaidOnTheSetUpPageTests(Party):
 
     def test_the_page_has_a_line_for_it(self):
         page = (KIT / 'web' / 'js' / 'views' / 'setup.js').read_text(encoding='utf-8')
-        self.assertIn("      rulesNote(data.rules));\n", page)
+        self.assertIn("      rulesNote(data.rules)].filter(Boolean));\n", page)
         self.assertIn("if (!rules || typeof rules.approval_by_another_party !== 'boolean') return null;", page)
         self.assertIn('On this server nobody approves or recommends work of their own account', page)
         self.assertIn('On this server an owner may approve work of their own account', page)
