@@ -141,10 +141,16 @@ class RefusedAuthorityMergeTests(RuntimeCase):
             ['admin.py', '--root', str(self.root), 'operators', 'add', 'ops-recorded'] + flags,
             ['admin.py', '--root', str(self.root), 'operators', 'add', 'ops-second'] + flags,
             ['admin.py', '--root', str(self.root), 'verifiers', 'add', 'verifier-recorded'] + flags])
-        # The printed commands are the whole remedy once the holder is gone, and they carry the
-        # recording flags, so following them gives attributed entries (kittrial-5bb.192 rev3).
+        self.assertIn('Replace OPERATOR in --actor and TEXT in --reason', stderr)
         self.release(holder)
-        for command in commands:
+        # kittrial-5bb.229 finding 3: a command copied as printed is REFUSED - the placeholders
+        # must be replaced, so the audit never records an operator named OPERATOR with the entry
+        # counted as attributed.
+        with self.assertRaisesRegex(ValueError, 'placeholder'):
+            self.run_admin(*commands[0][3:])
+        replaced = [command[:6] + ['--actor', 'james', '--reason', 'after a rollback']
+                    for command in commands]
+        for command in replaced:
             _, err, rc = self.run_admin(*command[3:])
             self.assertEqual(rc, 0, err)
         self.assertEqual(admin.operators(self.root), frozenset({'ops-recorded', 'ops-second'}))

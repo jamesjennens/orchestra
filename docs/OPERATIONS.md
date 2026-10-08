@@ -443,7 +443,10 @@ that lists many names, and the trail would stop being replayable exactly when it
 baseline is what makes the reader's answer usable: a name the list holds that the trail never
 mentions is then really a hand edit or a change made by a kit older than the baseline. A
 history with no baseline at all - a file written by hand, or by a kit older than this one - is
-still read, and the note says the trail may simply be older than the lists.
+still read, and the note says the trail is incomplete for these lists and may simply be older
+than the lists. When a later change takes a baseline on such a history it says so: it holds the
+lists as they stand at that change, not "as they stood when this history began"
+(kittrial-5bb.229 finding 6).
 
 **Reading the answer: a script reads `replay.agrees`.** `authority-changes` exits 0 whether the
 trail leads to the lists or not, and also when `deployment.private.json` cannot be read (then
@@ -453,6 +456,12 @@ when there is no trail yet (no audit file at all: the reader then says there is 
 prints the lists and warns about nothing). `replay.state` carries the same answer as
 `agrees`, `mismatch`, `no-trail`, and `replay.note` is the sentence printed on stderr. Never a
 non-zero exit on a mismatch: every existing installation would fail otherwise.
+When one list ALONE cannot be read, `current_lists` holds `null` for it,
+`replay.state` is `incomplete` and `replay.agrees` is `null`: the note says the trail is
+incomplete for that list, and the comparison this read cannot make is not made
+(kittrial-5bb.229 finding 2). A change that would START a new history while a list cannot be
+read is refused with the same reason, because a baseline must never hold an empty list for an
+unreadable one.
 
 **What the audit cannot see.** An entry holds no before/after of the list itself, so
 `authority-changes` can only replay the trail from its baseline: a name the list holds whose
@@ -469,10 +478,16 @@ an `at` that is not a UTC stamp, nested past the guard, a BOM, non-UTF-8 bytes, 
 --confirm-revoke`, `verifiers remove NAME --confirm-revoke`) is NEVER refused for it: the
 damaged bytes are put beside the runtime FIRST, as a hard link or a copy, under the name
 `authority-changes.audit.json.damaged-<UTC date-time>` (`.N` if that name is taken), and the
-atomic write of the fresh history then replaces the audit path. The path is therefore never absent,
+atomic write of the fresh history then replaces the audit path. Only a regular, non-symlink file
+is a candidate or is listed: a symlink at a `.damaged-*` name, even a dangling one, is never
+followed, never overwritten and never read as bytes the kit kept inside the runtime
+(kittrial-5bb.229 finding 1). Where the filesystem has no hard links the copy is written to a
+temporary name first and renamed into place, opened `O_CREAT|O_EXCL|O_NOFOLLOW`, so a kill
+inside the copy never leaves a partial file under a `.damaged-*` name (finding 4). The path is therefore never absent,
 not even for an instant: a kill, or a write that fails, between the two leaves the
 damaged file exactly where it was plus one extra name, and running the command again sets the
-same bytes aside again (the name already holding them is reused). One sentence on stderr says
+same bytes aside again - the name already holding them is reused, found by `samefile` or by
+comparing the bytes, so even without hard links the attempts do not pile up copies. One sentence on stderr says
 so, and the fresh history's first record - its baseline, or the removal when the lists are empty
 - names the file kept. An **add**
 (`operators add`, `verifiers add`, and a `restore-new --restore-operators`/`--restore-verifiers`
@@ -517,7 +532,10 @@ it is never silently unattributed. A damaged audit refuses the re-grant the same
 an add: the restore is still complete, and it exits 3 with the warning and the commands to
 re-grant by hand - those commands now carry `--actor`/`--reason` (with what the restore was
 given where it had it), so following them does not leave the unattributed entry the warning says
-to avoid. What is NOT covered: a hand edit of `deployment.private.json`, and a list change made
+to avoid. Where the restore was given no `--actor`/`--reason`, the commands carry the literal
+placeholders `OPERATOR` and `TEXT` and the warning says to replace them: running one unchanged is
+refused, so the audit never records an operator named OPERATOR
+(kittrial-5bb.229 finding 3). What is NOT covered: a hand edit of `deployment.private.json`, and a list change made
 by an older kit running on the same runtime - both change the lists with no entry, and only the
 reader's replay reports the gap.
 

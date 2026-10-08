@@ -365,7 +365,7 @@ class RecordingTests(AuthorityChangesCase):
         self.assertEqual(report['replay']['lists']['operators'],
                          {'agrees': True, 'current': ['bob'], 'trail_expects': ['bob'],
                           'listed_but_last_removed': [], 'listed_but_not_in_trail': [],
-                          'trail_added_but_not_listed': []})
+                          'trail_added_but_not_listed': [], 'listed_more_than_once': []})
         self.assertEqual(report['unattributed_entries'], 1)
         self.assertNotIn('unattributed', report['entries'][0])       # the attributed entry stands out
         self.assertEqual(report['entries'][1]['unattributed'], True)  # this one does not
@@ -1046,6 +1046,203 @@ class RestoreNewFlagTests(AuthorityChangesCase):
         self.assertIn('--reason TEXT', err.getvalue())
         self.assertEqual(self.entries()[0]['operator'], None)
         self.assertEqual(self.entries()[0]['actor'], 'op1')
+
+
+class SymlinkSetAsideTests(AuthorityChangesCase):
+    """kittrial-5bb.229 finding 1: the set-aside and the reader never follow a symlink.
+
+    A ``.damaged-*`` symlink to an outside file used to be listed as a file the kit kept, and a
+    symlink at the aside name pointing at the audit path used to make ``samefile`` true so nothing
+    was linked or copied and the damaged bytes were lost when the history was replaced. A dangling
+    symlink at the aside name made ``exists`` false, ``os.link`` fail with ``EEXIST`` and the
+    fallback copy follow the link, writing the damaged bytes OUTSIDE the runtime.
+    """
+
+    def outside(self, tag):
+        path = self.root.parent / ('outside-229-%s-%d.json' % (tag, os.getpid()))
+        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+        return path
+
+    @unittest.skipIf(os.name != 'posix', 'symlinks are POSIX-only')
+    def test_a_damaged_symlink_to_an_outside_file_is_not_listed(self):
+        outside = self.outside('list')
+        outside.write_text('OUTSIDE', encoding='utf-8')
+        link = self.root / (AUDIT + admin.AUTHORITY_CHANGES_DAMAGED + 'outside')
+        os.symlink(outside, link)
+        report = json.loads(self.cli('authority-changes')[0])
+        self.assertNotIn(link.name, report['damaged_files'])
+
+    @unittest.skipIf(os.name != 'posix', 'symlinks are POSIX-only')
+    def test_a_damaged_symlink_to_the_audit_path_is_never_reused_and_the_bytes_are_kept(self):
+        path = self.root / AUDIT
+        path.write_text('{nope', encoding='utf-8')
+        link = self.root / (AUDIT + admin.AUTHORITY_CHANGES_DAMAGED + 'keep')
+        os.symlink(path, link)                      # samefile(path, link) was true before the fix
+        out, err = self.cli('operators', 'remove', OPERATOR, '--confirm-revoke',
+                            '--actor', OPERATOR, '--reason', 'key leaked')
+        self.assertEqual(json.loads(out), {'operators': []})
+        kept = [item for item in self.asides() if not item.is_symlink()]
+        self.assertEqual(len(kept), 1)              # a real regular file holds the damaged bytes
+        self.assertEqual(kept[0].read_text(encoding='utf-8'), '{nope')
+        self.assertNotIn(link.name, json.loads(self.cli('authority-changes')[0])['damaged_files'])
+
+    @unittest.skipIf(os.name != 'posix', 'symlinks are POSIX-only')
+    def test_a_dangling_symlink_at_the_aside_name_is_never_copied_through(self):
+        from datetime import datetime, timezone
+        path = self.root / AUDIT
+        path.write_text('{nope', encoding='utf-8')
+        outside = self.outside('dangling')
+        fixed = datetime(2026, 10, 8, 12, 0, 0, tzinfo=timezone.utc)
+        with patch('datetime.datetime') as clock:
+            clock.now.return_value = fixed
+            name = admin.authority_change_aside_name(self.root)
+            os.symlink(outside, name)               # dangling: the target does not exist
+            out, err = self.cli('operators', 'remove', OPERATOR, '--confirm-revoke',
+                                '--actor', OPERATOR, '--reason', 'key leaked')
+        self.assertEqual(json.loads(out), {'operators': []})
+        self.assertFalse(os.path.exists(outside))   # the bytes never reached the link's target
+        self.assertTrue(os.path.islink(name))       # the dangling link is left alone
+        kept = [item for item in self.asides() if not item.is_symlink()]
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0].read_text(encoding='utf-8'), '{nope')
+
+    @unittest.skipIf(os.name != 'posix', 'symlinks are POSIX-only')
+    def test_the_copy_fallback_does_not_follow_a_symlink_at_the_aside_name(self):
+        from datetime import datetime, timezone
+        path = self.root / AUDIT
+        path.write_text('{nope', encoding='utf-8')
+        outside = self.outside('copy')
+        fixed = datetime(2026, 10, 8, 12, 0, 0, tzinfo=timezone.utc)
+        with patch('datetime.datetime') as clock:
+            clock.now.return_value = fixed
+            name = admin.authority_change_aside_name(self.root)
+            os.symlink(outside, name)
+            with patch.object(admin.os, 'link', side_effect=OSError(1, 'no hard links (injected)')):
+                out, err = self.cli('operators', 'remove', OPERATOR, '--confirm-revoke',
+                                    '--actor', OPERATOR, '--reason', 'key leaked')
+        self.assertEqual(json.loads(out), {'operators': []})
+        self.assertFalse(os.path.exists(outside))
+        kept = [item for item in self.asides() if not item.is_symlink()]
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0].read_text(encoding='utf-8'), '{nope')
+
+    def test_the_copy_fallback_compares_bytes_before_copying_again(self):
+        # Finding 4: without hard links a retry reuses the copy already holding these bytes.
+        path = self.root / AUDIT
+        path.write_text('{nope', encoding='utf-8')
+        with patch.object(admin.os, 'link', side_effect=OSError(1, 'no hard links (injected)')):
+            first = admin.set_aside_damaged_authority_changes(self.root, ('unreadable', 'cannot be read'))
+            second = admin.set_aside_damaged_authority_changes(self.root, ('unreadable', 'cannot be read'))
+        self.assertEqual(first, second)
+        kept = [item for item in self.asides() if not item.is_symlink()]
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0].read_text(encoding='utf-8'), '{nope')
+
+
+class UnreadableListTests(AuthorityChangesCase):
+    """kittrial-5bb.229 finding 2: never an empty list for a list that could not be read."""
+
+    def test_an_unreadable_verifiers_list_is_refused_and_never_baselined_empty(self):
+        self.marker.write_text(json.dumps({'password': 'x', 'unit': 'none',
+                                           'operators': ['o1', 'o2'], 'verifiers': 5}), encoding='utf-8')
+        before = self.marker.read_bytes()
+        with self.assertRaisesRegex(ValueError, 'cannot both be read') as refusal:
+            self.cli('operators', 'add', 'o3', '--actor', 'alice', '--reason', 'pilot')
+        self.assertIn('verifiers', str(refusal.exception))
+        self.assertEqual(self.audit(), None)                 # no history with an empty baseline
+        self.assertEqual(self.marker.read_bytes(), before)    # nothing changed
+        report = json.loads(self.cli('authority-changes')[0])
+        self.assertEqual(report['current_lists']['operators'], ['o1', 'o2'])
+        self.assertIsNone(report['current_lists']['verifiers'])
+        self.assertEqual(report['replay']['state'], 'no-trail')
+        self.assertIsNone(report['replay']['agrees'])
+        self.assertIsNone(report['replay']['lists']['verifiers'])
+        self.assertIn('No trail yet', report['replay']['note'])
+        self.assertIn('incomplete', report['replay']['note'])
+        self.assertIn('verifiers', report['replay']['note'])
+
+    def test_an_unreadable_operators_list_is_refused_and_read_incomplete(self):
+        self.marker.write_text(json.dumps({'password': 'x', 'unit': 'none', 'operators': 7,
+                                           'verifiers': ['v1']}), encoding='utf-8')
+        with self.assertRaisesRegex(ValueError, 'operators'):
+            self.cli('verifiers', 'add', 'v2', '--actor', 'alice', '--reason', 'pilot')
+        self.assertEqual(self.audit(), None)
+        report = json.loads(self.cli('authority-changes')[0])
+        self.assertIsNone(report['current_lists']['operators'])
+        self.assertEqual(report['current_lists']['verifiers'], ['v1'])
+        self.assertEqual(report['replay']['state'], 'no-trail')
+        self.assertIn('incomplete', report['replay']['note'])
+
+    def test_a_trail_with_an_unreadable_list_reads_incomplete(self):
+        self.marker.write_text(json.dumps({'password': 'x', 'unit': 'none',
+                                           'operators': ['o1'], 'verifiers': 5}), encoding='utf-8')
+        (self.root / AUDIT).write_text(
+            json.dumps({'schema_version': 1, 'entries': [self.good_entry(actor='o1')]}), encoding='utf-8')
+        report = json.loads(self.cli('authority-changes')[0])
+        self.assertEqual(report['replay']['state'], 'incomplete')
+        self.assertIsNone(report['replay']['agrees'])
+        self.assertIsNone(report['replay']['lists']['verifiers'])
+        self.assertIsNotNone(report['replay']['lists']['operators'])
+        self.assertIn('The trail is incomplete for verifiers', report['replay']['note'])
+
+    def test_a_repaired_file_lets_the_history_start_from_the_real_lists(self):
+        self.marker.write_text(json.dumps({'password': 'x', 'unit': 'none',
+                                           'operators': ['o1', 'o2'], 'verifiers': 5}), encoding='utf-8')
+        with self.assertRaises(ValueError):
+            self.cli('operators', 'add', 'o3', '--actor', 'alice', '--reason', 'pilot')
+        self.marker.write_text(json.dumps({'password': 'x', 'unit': 'none',
+                                           'operators': ['o1', 'o2'], 'verifiers': ['v1']}), encoding='utf-8')
+        self.cli('operators', 'add', 'o3', '--actor', 'alice', '--reason', 'pilot')
+        self.assertEqual(self.baseline()['lists'], {'operators': ['o1', 'o2'], 'verifiers': ['v1']})
+        report = json.loads(self.cli('authority-changes')[0])
+        self.assertTrue(report['replay']['agrees'])
+        self.assertEqual(report['replay']['lists']['operators']['listed_but_not_in_trail'], [])
+
+
+class PlaceholderTests(AuthorityChangesCase):
+    """kittrial-5bb.229 finding 3: the literal re-grant placeholders are refused."""
+
+    def test_the_literal_placeholders_are_refused_and_nothing_is_recorded(self):
+        for argv in (('operators', 'add', 'op1', '--actor', 'OPERATOR', '--reason', 'pilot'),
+                     ('operators', 'add', 'op1', '--actor', 'alice', '--reason', 'TEXT'),
+                     ('verifiers', 'add', 'v1', '--actor', 'OPERATOR', '--reason', 'TEXT')):
+            with self.subTest(argv=argv):
+                with self.assertRaisesRegex(ValueError, 'placeholder'):
+                    self.cli(*argv)
+        self.assertIsNone(self.audit())
+        self.assertEqual(self.stored()['operators'], [OPERATOR])
+        self.assertEqual(self.stored()['verifiers'], [VERIFIER])
+
+    def test_the_replaced_placeholders_record_an_attributed_entry(self):
+        self.cli('operators', 'add', 'op1', '--actor', 'james', '--reason', 'after a rollback')
+        entry = self.entries()[0]
+        self.assertEqual((entry['operator'], entry['actor']), ('james', 'op1'))
+        self.assertEqual(json.loads(self.cli('authority-changes')[0])['unattributed_entries'], 0)
+
+    def test_the_regrant_warning_says_the_placeholders_must_be_replaced(self):
+        warning = admin.authority_not_regranted(self.root, 'lm', ['op1'], ['v1'])
+        self.assertIn('operators add op1 --actor OPERATOR --reason TEXT', warning)
+        self.assertIn('Replace OPERATOR in --actor and TEXT in --reason', warning)
+
+
+class LateBaselineTests(AuthorityChangesCase):
+    """kittrial-5bb.229 finding 6: a baseline taken late is worded truthfully."""
+
+    def test_a_history_without_a_baseline_reads_incomplete(self):
+        (self.root / AUDIT).write_text(
+            json.dumps({'schema_version': 1, 'entries': [self.good_entry(actor='legacy')]}), encoding='utf-8')
+        report = json.loads(self.cli('authority-changes')[0])
+        self.assertIn('does not begin with a baseline', report['replay']['note'])
+        self.assertIn('incomplete', report['replay']['note'])
+
+    def test_a_late_baseline_does_not_claim_to_hold_the_original_lists(self):
+        (self.root / AUDIT).write_text(
+            json.dumps({'schema_version': 1, 'entries': [self.good_entry(actor='legacy')]}), encoding='utf-8')
+        self.cli('operators', 'add', 'bob', '--actor', 'alice', '--reason', 'pilot')
+        reason = self.baseline()['reason']
+        self.assertIn('as they stand at this change', reason)
+        self.assertIn('incomplete', reason)
+        self.assertNotIn('as they stood when this history began', reason)
 
 
 class DocumentationTests(unittest.TestCase):
