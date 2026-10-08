@@ -210,7 +210,9 @@ class NativeMembershipTests(unittest.TestCase):
         for kind, action, key in [('reference','ref','deep.ref'), ('capability','capability','deep.cap')]:
             self.entry(kind, key)
             task=self.read(action, ['get', key])['native_id']
-            self.ep('bd', ['update', task, '--title', 'A contributor changed this title', '--json'])
+            # Host fixture setup: the contributor endpoint correctly protects
+            # an existing record anchor's title on current main.
+            self.run_bd(['update', task, '--title', 'A host changed this title', '--json'])
             self.deep(task)
             with self.assertRaisesRegex(ValueError, 'exists .* cannot be read'):
                 self.read(action, ['get', key])

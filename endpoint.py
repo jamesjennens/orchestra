@@ -664,17 +664,17 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                 raw_rows=record_json.loads_array_rows(stdout or '[]')
                 unreadable=[r for r in raw_rows if isinstance(r,dict) and r.get('malformed')]
                 if unreadable:
-                    report='Unreadable issue row(s): %s' % ', '.join(
+                    unreadable_report='Unreadable issue row(s): %s' % ', '.join(
                         '%s (%s)' % (r.get('id') or 'unknown', r.get('error') or 'malformed') for r in unreadable)
-                    warnings=(warnings + '\n' + report).strip() if warnings else report
+                    warnings=(warnings + '\n' + unreadable_report).strip() if warnings else unreadable_report
         else:
             stdout,warnings=native.split(native.run(native.argv(root,path,actor,['export','--all']),environment(root)))
             raw_rows=record_json.loads_rows(stdout)
             unreadable=[r for r in raw_rows if isinstance(r,dict) and r.get('malformed')]
             if unreadable:
-                report='Unreadable issue row(s): %s' % ', '.join(
+                unreadable_report='Unreadable issue row(s): %s' % ', '.join(
                     '%s (%s)' % (r.get('id') or 'unknown', r.get('error') or 'malformed') for r in unreadable)
-                warnings=(warnings + '\n' + report).strip() if warnings else report
+                warnings=(warnings + '\n' + unreadable_report).strip() if warnings else unreadable_report
         from reserved_comments import RECORD_ANCHOR_LABELS
         def anchor_run(argv):
             result,warning=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
