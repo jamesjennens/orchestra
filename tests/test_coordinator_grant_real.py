@@ -79,9 +79,8 @@ class RealStackTests(held.RealStackTests):
             contribution=contribution, summary='Accepted'), token=token)
 
     def comments(self, task):
-        found = json.loads(self.bd('show', task, '--json').stdout)
-        found = found[0] if isinstance(found, list) else found
-        return [(entry.get('author'), entry.get('text') or '') for entry in found.get('comments') or []]
+        found = json.loads(self.bd('comments', task, '--json').stdout)
+        return [(entry.get('author'), entry.get('text') or '') for entry in found or []]
 
     def test_a_granted_agent_approves_another_accounts_work_and_bd_holds_it_under_its_name(self):
         task, contribution = self.deliver('casey')
