@@ -8,28 +8,66 @@ from coordination import atomic
 from requirements import content_hash
 
 UUID = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
+#: An actor name as the endpoint accepts one (endpoint.execute's own rule), so every name a
+#: request may carry can be an entry of the registry's owners map.
+ACTOR = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.@/-]{0,95}')
+#: A principal (kittrial-5bb.194, rule 2): the ``person:NAME`` form the proposal settings
+#: already use, but one token with no space or control character, because the value is an
+#: argument of the ``authorized_keys`` command line and that line is split on spaces.
+PRINCIPAL = re.compile(r"person:[A-Za-z0-9][A-Za-z0-9_.-]{0,94}")
 
-def registered_actors(path):
-    """The session actors registered in the project at ``path``. Reads the registry; writes nothing.
+def valid_principal(value, label='--principal'):
+    """Return ``value`` if it is a principal name, else raise naming the form."""
+    if not isinstance(value, str) or not PRINCIPAL.fullmatch(value):
+        raise ValueError('%s must be a principal name of the form person:NAME (one token: letters, '
+                         'digits, dot, underscore, dash; no space). Refused %r' % (label, value))
+    return value
 
-    A registry that cannot be read as one raises ``ValueError``: whoever asks which names
-    are taken must not be told "none" by a damaged file (kittrial-5bb.184).
+
+def valid_actor(value, label='--actor'):
+    """Return ``value`` if it is an actor name the endpoint may carry, else raise."""
+    if not isinstance(value, str) or not ACTOR.fullmatch(value):
+        raise ValueError('%s must be a short actor name (letters, digits, dot, underscore, at, slash, '
+                         'dash, up to 96 characters). Refused %r' % (label, value))
+    return value
+
+
+def read_registry(path):
+    """The project's session registry, validated; an empty one when no file exists.
+
+    A registry that exists but cannot be read as one raises ``ValueError``: whoever asks a
+    question of it must not be told "none" by a damaged file (kittrial-5bb.184).
     """
     from pathlib import Path
     file = Path(path) / '.sessions.json'
     if file.is_symlink():
         raise ValueError('Session registry paths must not be symlinks')
     if not file.exists():
-        return []
+        return {'schema_version': 1, 'records': {}}
     try:
-        data = validate(json.loads(file.read_text(encoding='utf-8')))
+        return validate(json.loads(file.read_text(encoding='utf-8')))
     except (OSError, UnicodeDecodeError, RecursionError) as error:
         raise ValueError('The session registry cannot be read: %s' % type(error).__name__) from None
-    return sorted(record['actor'] for record in data['records'].values())
+
+
+def registered_actors(path):
+    """The session actors registered in the project at ``path``. Reads the registry; writes nothing."""
+    return sorted(record['actor'] for record in read_registry(path)['records'].values())
+
+
+def owner_map(data):
+    """The registry's actor -> principal map; ``{}`` when it has none."""
+    value = data.get('owners', {}) if isinstance(data, dict) else {}
+    return value if isinstance(value, dict) else {}
+
+
+def owners(path):
+    """The project's actor -> principal map; ``{}`` when the registry or the map is absent."""
+    return dict(owner_map(read_registry(path)))
 
 
 def validate(data):
-    if not isinstance(data,dict) or not {'schema_version','records'}.issubset(data) or set(data)-{'schema_version','records','resumes','runs'} or type(data['schema_version']) is not int or data['schema_version']!=1 or not isinstance(data['records'],dict):
+    if not isinstance(data,dict) or not {'schema_version','records'}.issubset(data) or set(data)-{'schema_version','records','resumes','runs','owners'} or type(data['schema_version']) is not int or data['schema_version']!=1 or not isinstance(data['records'],dict):
         raise ValueError('Invalid session registry')
     actors=set()
     for key,r in data['records'].items():
@@ -42,6 +80,17 @@ def validate(data):
         moment=datetime.fromisoformat(r['created_at'].replace('Z','+00:00'))
         if moment.tzinfo is None:raise ValueError('Session timestamp needs timezone')
         actors.add(r['actor'])
+    # The owners map (kittrial-5bb.194, rule 2 of the coordinators design). An actor with an
+    # entry belongs to that principal; an actor with none has no principal and is its own
+    # party, compared by name (the coordinator note of 2026-10-07 on kittrial-5bb.178). A key
+    # must be a name the endpoint may carry, not necessarily a registered session: the whole
+    # point of the adoption command is to name actors that already exist (legacy actors).
+    owner_records=data.get('owners',{})
+    if not isinstance(owner_records,dict):raise ValueError('Invalid session owner map')
+    for actor,principal in owner_records.items():
+        if (not isinstance(actor,str) or not ACTOR.fullmatch(actor)
+                or not isinstance(principal,str) or not PRINCIPAL.fullmatch(principal)):
+            raise ValueError('Invalid session owner map entry')
     resumes=data.get('resumes',{})
     if not isinstance(resumes,dict):raise ValueError('Invalid session resume records')
     for key,event in resumes.items():
@@ -94,8 +143,13 @@ def used_actors(value):
 class Parser(argparse.ArgumentParser):
     def error(self,message):raise ValueError(message)
 
-def execute(path, project, args, export, *, actor=None):
-    """Caller holds .coordination.lock, including native writes and backup."""
+def execute(path, project, args, export, *, actor=None, principal=None):
+    """Caller holds .coordination.lock, including native writes and backup.
+
+    ``principal`` is the principal of the key that made the request, or None for a caller
+    with no bound key (kittrial-5bb.194). It is used in one place only: registering a new
+    session records the new actor under it. Nothing else about an operation changes.
+    """
     parser=Parser(add_help=False)
     sub=parser.add_subparsers(dest='operation',required=True)
     p=sub.add_parser('register',add_help=False);p.add_argument('--name',required=True);p.add_argument('--request-id',required=True)
@@ -113,7 +167,8 @@ def execute(path, project, args, export, *, actor=None):
     if a.operation=='show':
         found=[r for r in data['records'].values() if r['actor']==a.actor]
         if not found:raise ValueError('Actor not registered in this project; legacy actors have no registration record')
-        return dict(project=project,session=found[0])
+        # The principal the actor belongs to, or None when it has none (rule 2).
+        return dict(project=project,session=found[0],principal=owner_map(data).get(a.actor))
     if a.operation=='resume':
         if not UUID.fullmatch(a.request_id):raise ValueError('request-id must be a lowercase UUID')
         found=[r for r in data['records'].values() if r['actor']==actor]
@@ -187,7 +242,7 @@ def execute(path, project, args, export, *, actor=None):
     old=data['records'].get(a.request_id)
     if old:
         if old['name']!=a.name:raise ValueError('Registration request-id already used with a different name')
-        return dict(project=project,session=old,reconciled=True)
+        return dict(project=project,session=old,reconciled=True,principal=owner_map(data).get(old['actor']))
     rows=[json.loads(line) for line in export().splitlines() if line.strip()]
     occupied=used_actors(rows)|{r['actor'] for r in data['records'].values()}
     for _ in range(20):
@@ -195,5 +250,13 @@ def execute(path, project, args, export, *, actor=None):
         if actor not in occupied:break
     else:raise ValueError('Could not allocate an unused actor; no registration written')
     record=dict(request_id=a.request_id,actor=actor,name=a.name,created_at=datetime.now(timezone.utc).isoformat())
-    data['records'][a.request_id]=record;validate(data);atomic(file,data)
-    return dict(project=project,session=record,reconciled=False)
+    data['records'][a.request_id]=record
+    # Rule 2: registering a new session under a bound key makes the new actor that
+    # principal's. Without a principal (an unbound key, or a local caller) no owners map is
+    # written at all, so an installation that configures nothing writes the registry exactly
+    # as before and an older kit can still read it (the downgrade limit).
+    if principal is not None:
+        assigned=dict(owner_map(data));assigned[actor]=valid_principal(principal)
+        data['owners']=assigned
+    validate(data);atomic(file,data)
+    return dict(project=project,session=record,reconciled=False,principal=owner_map(data).get(actor))

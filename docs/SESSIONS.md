@@ -80,3 +80,12 @@ Explicit recurring-run resume is now available: `worker.py ... --actor SAVED_ACT
 This is attribution and accidental-collision prevention, not authentication, an access role, a lease, or a detector of two processes deliberately sharing one ID. Existing explicitly named actors continue working; they do not acquire registry records automatically. A trusted participant can still reuse another actor string. Never use registration to take over existing claims.
 
 Registration is project-scoped. UUIDs make accidental cross-project collisions extremely unlikely, but there is no global identity service. `.sessions.json` is operator-owned runtime state, included in the existing coordination backup sidecar; do not edit or delete it to free names. Restore with this kit version or newer. As with other coordination data, never operate a restored copy as a second live authority. Shared backups do not include a worker's local saved actor/request ID; keep those in the private session handoff.
+
+The registry also carries an `owners` map (actor to principal) where a key is bound to a
+principal (kittrial-5bb.194): `session register` under such a key records the new actor under
+the key's principal, `session show` returns it as `principal`, and `admin.py adopt-actor`
+gives an existing actor to a principal once (see
+[bind a key to its principal](OPERATIONS.md#bind-a-key-to-its-principal)). The map is
+written only when non-empty, so an installation that configures nothing writes the registry
+exactly as before. Once it is present, a kit that predates it refuses the registry as an
+unknown key: remove `owners` before a downgrade, or restore with this kit or newer.

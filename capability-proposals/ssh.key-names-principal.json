@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "operation_id": "capnew-5bb194-principal-0001",
+  "key": "ssh.key-names-principal",
+  "name": "An SSH key bound to a principal acts only as that principal's actors",
+  "aliases": [
+    "key owns principal",
+    "--key-principal",
+    "--principal",
+    "adopt-actor",
+    "actor-adoptions",
+    "session owners",
+    "an actor belongs to a principal",
+    "coordinators per project slice 2"
+  ],
+  "summary": "An SSH key can be bound to a principal (a lane, person:NAME). ssh_forced_command.py takes --principal NAME from its own arguments (the authorized_keys line, never the connection) and starts the endpoint with --key-principal NAME. The project's session registry gains an owners map, actor to principal, written only when non-empty so an unconfigured installation keeps today's bytes. On a bound key, endpoint.execute refuses every request whose actor that map does not give to the key's principal, before any action; session register is the exception and records the new actor under the key's principal; session show returns the principal. A key with no --principal reads no owner and behaves as before. admin.py authorized-keys --principal prints the bound contributor line (comment orchestra-principal=person:NAME); adopt-actor PROJECT ACTOR --principal person:NAME --actor OPERATOR --reason TEXT gives an existing actor to a principal once, refuses a name on the operator allowlist that another principal owns in another project, and records it in actor-adoptions.audit.json, which admin.py actor-adoptions prints. Downgrade: a kit that predates this refuses a registry whose owners map is present.",
+  "requirements": [],
+  "anchors": [
+    "docs/OPERATIONS.md#bind-a-key-to-its-principal"
+  ],
+  "code": [
+    "endpoint.py::key_principal_refusal",
+    "endpoint.py::execute",
+    "sessions.py::owners",
+    "sessions.py::valid_principal",
+    "sessions.py::validate",
+    "sessions.py::execute",
+    "admin.py::key_principal",
+    "admin.py::authorized_key_lines",
+    "admin.py::adopt_actor",
+    "admin.py::actor_adoptions",
+    "ssh_forced_command.py::endpoint_argv",
+    "ssh_forced_command.py::_principal"
+  ],
+  "tests": [
+    "tests/test_key_principals.py"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "ssh",
+    "identity",
+    "operations"
+  ]
+}

@@ -3,7 +3,9 @@
 **Status: design note (kittrial-5bb.178), second version after review; James
 decided the seven questions on 2026-10-07 ("recommended for all"). Built so far:
 slice 1, a key names its projects (kittrial-5bb.193; see "Bind a key to its
-projects" in [OPERATIONS.md](OPERATIONS.md)). The rest of this note describes
+projects" in [OPERATIONS.md](OPERATIONS.md)), and slice 2, a key names its
+principal and actors belong to principals (kittrial-5bb.194; see "Bind a key to
+its principal" in [OPERATIONS.md](OPERATIONS.md)). The rest of this note describes
 the design and the state of main when it was written, not what is built.**
 
 Everything under "What is true today" was read in the code on main `2d321be`;

@@ -4485,6 +4485,8 @@ def _authorized_key_comment(comment):
 
 #: What a bound line's comment carries, so that authorized_keys can be read by eye.
 KEY_PROJECTS_COMMENT='orchestra-projects='
+#: The principal a bound line names, in the same comment (kittrial-5bb.194).
+KEY_PRINCIPAL_COMMENT='orchestra-principal='
 
 def key_projects(root,names):
     """The projects a key is to be bound to, checked: names of this runtime's projects, none twice.
@@ -4502,7 +4504,17 @@ def key_projects(root,names):
         projects.append(name)
     return projects
 
-def authorized_key_lines(root,kit,key_type,key_body,key_comment='',comment=None,python=None,projects=()):
+def key_principal(value):
+    """The principal a key is to name, checked (kittrial-5bb.194, rule 2).
+
+    The same `person:NAME` form the proposal settings use, one token with no space because
+    the value is an argument of the authorized_keys command line.
+    """
+    if value is None:return None
+    from sessions import valid_principal
+    return valid_principal(value,'--principal')
+
+def authorized_key_lines(root,kit,key_type,key_body,key_comment='',comment=None,python=None,projects=(),principal=None):
     """The exact contributor (confined) and operator (unrestricted) authorized_keys lines.
 
     The contributor line runs `ssh_forced_command.py` - under an absolute interpreter with
@@ -4521,10 +4533,15 @@ def authorized_key_lines(root,kit,key_type,key_body,key_comment='',comment=None,
         raise ValueError('the key comment must be one line without control characters')
     key=' '.join(part for part in (key_type,key_body,text) if part)
     bound=tuple(part for name in projects for part in ('--project',name))
+    if principal is not None:
+        bound=bound+('--principal',principal)
     command=' '.join((python,)+AUTHORIZED_KEY_PYTHON_FLAGS+(wrapper,'--root',root,
                                                            '--endpoint',endpoint)+bound)
     # The bound line says in its comment what it is bound to; the operator line stays the bare key.
-    bound_key=' '.join(part for part in (key_type,key_body,text,KEY_PROJECTS_COMMENT+','.join(projects)) if part) if projects else key
+    marks=[]
+    if projects:marks.append(KEY_PROJECTS_COMMENT+','.join(projects))
+    if principal is not None:marks.append(KEY_PRINCIPAL_COMMENT+principal)
+    bound_key=' '.join(part for part in (key_type,key_body,text,*marks) if part) if marks else key
     contributor='command="%s",%s %s'%(command,','.join(CONTRIBUTOR_KEY_OPTIONS),bound_key)
     return {'root':root,'kit':kit,'endpoint':endpoint,'wrapper':wrapper,'python':python,
             'python_flags':list(AUTHORIZED_KEY_PYTHON_FLAGS),
@@ -4668,7 +4685,7 @@ def authorized_keys_listing(root,file=None):
                      'other_root: the line serves another runtime than --root (or names none); its projects were not looked up here.',
                      'This command reads the file and changes nothing.']}
 
-def authorized_keys(root,key_file,role='both',python=None,comment=None,projects=None):
+def authorized_keys(root,key_file,role='both',python=None,comment=None,projects=None,principal=None):
     """Print the installable lines for one public key as JSON (see authorized_key_lines).
 
     The kit directory is taken through the installation's `install/current` link where it
@@ -4681,12 +4698,13 @@ def authorized_keys(root,key_file,role='both',python=None,comment=None,projects=
         if not (kit/name).is_file():
             raise ValueError('This kit copy has no %s; run the helper from the installed kit directory'%name)
     projects=key_projects(root,projects)
-    if projects and role=='operator':
-        raise ValueError('--project binds the confined contributor line; an unrestricted operator key has a '
-                         'shell and cannot be bound to projects')
+    principal=key_principal(principal)
+    if (projects or principal is not None) and role=='operator':
+        raise ValueError('--project and --principal bind the confined contributor line; an unrestricted operator '
+                         'key has a shell and cannot be bound to projects or to a principal')
     path=Path(key_file)
     lines=authorized_key_lines(root,kit,*public_key_line(path.read_text(encoding='utf-8-sig'),str(path)),
-                               comment=comment,python=python,projects=projects)
+                               comment=comment,python=python,projects=projects,principal=principal)
     payload={'schema_version':1,'root':lines['root'],'kit':lines['kit'],'endpoint':lines['endpoint'],
              'wrapper':lines['wrapper'],'python':lines['python'],
              'contributor_options':lines['contributor_options'],
@@ -4707,18 +4725,28 @@ def authorized_keys(root,key_file,role='both',python=None,comment=None,projects=
                       'install/current link where it has one. Put that exact path in the contributor\'s '
                       'client config: the wrapper compares it as one token, and a releases/<ID> spelling '
                       'would keep that key on the release that printed it.']}
-    if projects:
-        # Rule 1 of docs/COORDINATORS_PER_PROJECT_DESIGN.md. Only the bound line is printed:
-        # the operator line is a shell, and a shell is every project.
+    if projects or principal is not None:
+        # Rules 1 and 2 of docs/COORDINATORS_PER_PROJECT_DESIGN.md. Only the bound line is
+        # printed: the operator line is a shell, and a shell is every project.
         role='contributor'
-        payload['projects']=projects
+        if projects:
+            payload['projects']=projects
+            payload['notes'].append(
+                'This line is bound to the projects above: the endpoint refuses every request of this key '
+                'that names another project, with the answer it gives for a project that does not exist. '
+                'The binding is the --project arguments of the line; the comment only repeats them.')
+        if principal is not None:
+            payload['principal']=principal
+            payload['notes'].append(
+                'This line is bound to the principal above (a lane): the endpoint refuses every request of '
+                'this key whose actor the project\'s registry does not give to that principal. Registering '
+                'a new session under this key makes the new actor that principal\'s. The binding is the '
+                '--principal argument of the line; the comment only repeats it.')
+        bound_note='--project or --principal' if principal is not None else '--project'
         payload['notes'].extend([
-            'This line is bound to the projects above: the endpoint refuses every request of this key '
-            'that names another project, with the answer it gives for a project that does not exist. '
-            'The binding is the --project arguments of the line; the comment only repeats them.',
-            'The operator line is not printed with --project: an unrestricted key has the account\'s '
-            'shell and cannot be bound. A key that already has an unrestricted or an unbound line in '
-            'authorized_keys is not bound by adding this one: replace that line.',
+            'The operator line is not printed with %s: an unrestricted key has the account\'s shell and '
+            'cannot be bound. A key that already has an unrestricted or an unbound line in authorized_keys '
+            'is not bound by adding this one: replace that line.'%bound_note,
             'admin.py authorized-keys-list shows every line of authorized_keys, what it is bound to and '
             'whether it still points at the installed kit.'])
     if role in ('contributor','both'):payload['contributor']=lines['contributor']
@@ -4727,6 +4755,128 @@ def authorized_keys(root,key_file,role='both',python=None,comment=None,projects=
     if role in ('operator','both'):
         print('warning: the operator line is unrestricted service-account shell access; '+OPERATOR_KEY_NOTE,
               file=sys.stderr)
+
+#: The adoption audit (kittrial-5bb.194, rule 2): every give-an-actor-to-a-principal a host
+#: command made. The registry's owners map is written by the server (session register under a
+#: bound key) and by this host command; this audit says who ran the host command, when and
+#: why. Runtime-level, beside deployment.private.json, and never part of a project's
+#: coordination backup.
+ACTOR_ADOPTIONS_AUDIT='actor-adoptions.audit.json'
+ACTOR_ADOPTIONS_SCHEMA=1
+#: A short history, like review-writes.audit.json: the audit answers "who adopted whom, when,
+#: and why", not "every adoption since the installation was made".
+ACTOR_ADOPTIONS_MAX=200
+ACTOR_ADOPTIONS_FIELDS=frozenset({'at','operator','project','actor','principal','previous','reason'})
+
+def adoption_entry(item):
+    """Whether one entry has exactly the shape ``adopt-actor`` writes."""
+    return (isinstance(item,dict) and set(item)==ACTOR_ADOPTIONS_FIELDS
+            and all(isinstance(item[field],str) and item[field] for field in
+                    ('at','operator','project','actor','principal','reason'))
+            and (item['previous'] is None or isinstance(item['previous'],str)))
+
+def actor_adoptions(root,project=None):
+    """The recorded adoptions, oldest first, for one project or all of them. Reads only.
+
+    An absent file is an empty history. A file this kit cannot read as its own history is a
+    refusal, not an empty history: a caller must not be told "nobody was adopted" by a
+    damaged audit.
+    """
+    path=root/ACTOR_ADOPTIONS_AUDIT
+    if not path.is_file():return []
+    try:record=record_json.loads(path.read_text(encoding='utf-8'))
+    except (OSError,UnicodeError,ValueError) as error:
+        raise ValueError('The actor-adoptions audit %s cannot be read: %s'%(path,error)) from None
+    entries=record.get('entries') if isinstance(record,dict) and record.get('schema_version')==ACTOR_ADOPTIONS_SCHEMA else None
+    if not isinstance(entries,list) or any(not adoption_entry(item) for item in entries):
+        raise ValueError('The actor-adoptions audit %s is not the history this kit writes; nothing was changed'%path)
+    return [item for item in entries if project is None or item['project']==project]
+
+def principal_conflicts(root,actor,principal,exclude):
+    """Other projects' owners maps that give ``actor`` to a principal other than ``principal``.
+
+    Read before an adoption. The design (rule 2) keeps one operator list for the whole
+    installation, so a name on that list must mean the same principal everywhere; a name not
+    on the list may differ from project to project. A registry that cannot be read is a whole
+    refusal, never "no conflict".
+    """
+    from sessions import owners
+    found=[]
+    projects=root/'projects'
+    if not projects.is_dir():return found
+    for entry in sorted(projects.iterdir()):
+        if not entry.is_dir() or entry.name==exclude or not (entry/'.sessions.json').is_file():continue
+        try:other=owners(entry).get(actor)
+        except ValueError as error:
+            raise ValueError('Cannot read the session registry of project %s while adopting %s: %s'
+                             %(entry.name,actor,error)) from None
+        if other is not None and other!=principal:found.append((entry.name,other))
+    return found
+
+def adopt_actor(root,project,actor,principal,operator,reason):
+    """Give an existing actor to a principal in one project, and record it in the audit.
+
+    Rule 2 of docs/COORDINATORS_PER_PROJECT_DESIGN.md: actors that existed before a key was
+    bound are given to a principal once, by a host command, so they keep their names and
+    their history. It refuses a name on the operator allowlist that another principal owns in
+    another project: the one operator list must mean one lane everywhere. It records
+    ``previous`` when this project already gave the actor to a different principal, and
+    writes nothing at all when it already gives it to this one.
+
+    The registry is written under the project's coordination lock and the audit entry under
+    the deployment lock. A damaged audit refuses the whole command before the registry is
+    touched; the audit is appended after the registry, so a host crash between the two leaves
+    an adoption the registry still shows but the audit does not.
+    """
+    path=project_dir(root,project)
+    if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
+    from sessions import validate as validate_sessions, read_registry, owner_map, valid_actor, valid_principal
+    from recovery import identity
+    actor=valid_actor(actor,'actor')
+    principal=valid_principal(principal,'--principal')
+    operator=identity(operator,'Invalid operator identity')
+    from keyed_records import require_configured_operator
+    require_configured_operator(operator,operators(root,strict=True),'adopt an actor')
+    if not isinstance(reason,str) or not reason.strip():raise ValueError('A reason is required (--reason)')
+    reason=reason.strip()
+    if len(reason)>400:raise ValueError('--reason must be at most 400 characters')
+    if actor in operators(root):
+        conflicts=principal_conflicts(root,actor,principal,project)
+        if conflicts:
+            raise ValueError('Refusing to adopt %s for %s: it is on the operator allowlist and project %s '
+                             'already gives it to %s. One operator name must mean one principal on this '
+                             'installation; adopt it there first, or take it off the operator list.'
+                             %(actor,principal,conflicts[0][0],conflicts[0][1]))
+    actor_adoptions(root)                       # a damaged audit refuses before anything is written
+    try:
+        import fcntl
+    except ImportError:                         # a platform without flock: the atomic write still stands
+        fcntl=None
+    with (path/'.coordination.lock').open('a') as lock:
+        if fcntl is not None:fcntl.flock(lock,fcntl.LOCK_EX)
+        from coordination import atomic
+        data=read_registry(path)
+        current=dict(owner_map(data))
+        previous=current.get(actor)
+        changed=previous!=principal
+        if changed:
+            current[actor]=principal
+            data['owners']=current
+            validate_sessions(data)
+            atomic(path/'.sessions.json',data)
+    if not changed:
+        return {'schema_version':1,'project':project,'actor':actor,'principal':principal,
+                'previous':previous,'changed':False,'audit_records':len(actor_adoptions(root))}
+    entry={'at':utc_stamp(),'operator':operator,'project':project,'actor':actor,'principal':principal,
+           'previous':previous,'reason':reason}
+    with deployment_config_lock(root):
+        history=actor_adoptions(root)
+        history.append(entry)
+        atomic_private_write(root/ACTOR_ADOPTIONS_AUDIT,
+                             json.dumps({'schema_version':ACTOR_ADOPTIONS_SCHEMA,
+                                         'entries':history[-ACTOR_ADOPTIONS_MAX:]}))
+    return {'schema_version':1,'project':project,'actor':actor,'principal':principal,
+            'previous':previous,'changed':True,'audit_records':len(actor_adoptions(root))}
 
 def credential_actors(root,state_path,service_namespace=None):
     """Every worker credential of the web service with the name it writes under, and whether
@@ -4938,9 +5088,27 @@ def main():
     a.add_argument('--project',action='append',default=None,metavar='NAME',
                    help='bind the contributor line to this project (repeatable): the endpoint then refuses every '
                         'request of that key for another project. Without it the key may name any project')
+    a.add_argument('--principal',default=None,metavar='NAME',
+                   help='bind the contributor line to this principal (a lane, person:NAME): the endpoint then '
+                        'refuses every request of that key whose actor that principal does not own in the '
+                        'project. Without it the key acts as any actor')
     a=sub.add_parser('authorized-keys-list',help='read-only: every line of authorized_keys, what it may do here, the '
                      'projects it is bound to, and whether it points at the installed kit')
     a.add_argument('--file',default=None,help='the authorized_keys file to read (default: ~/.ssh/authorized_keys of this account)')
+    a=sub.add_parser('adopt-actor',help='give an existing actor to a principal (a lane) in one project, so a key '
+                                        'bound to that principal may act as it; recorded in the adoption audit '
+                                        '(operator allowlist)')
+    a.add_argument('project',help='the project whose registry records the actor')
+    a.add_argument('actor',metavar='ACTOR',help='the actor name to give to the principal, as it already appears in '
+                                                'the project (a session actor or an older name)')
+    a.add_argument('--principal',required=True,metavar='NAME',help='the principal (a lane, person:NAME) that actor '
+                                                                   'is to belong to')
+    a.add_argument('--actor',required=True,dest='operator',metavar='OPERATOR',
+                   help='the actor performing the adoption, on the deployment operator allowlist')
+    a.add_argument('--reason',required=True,help='why this actor is being adopted (recorded in the audit)')
+    a=sub.add_parser('actor-adoptions',help='read-only: the recorded actor adoptions (who gave which actor to which '
+                                            'principal, when and why)')
+    a.add_argument('project',nargs='?',help='only the adoptions of this project')
     a=sub.add_parser('backup');a.add_argument('projects',nargs='*',metavar='project')
     a.add_argument('--all',action='store_true',dest='all_projects',
                    help='back up every initialized project in this runtime in one run')
@@ -5501,9 +5669,15 @@ def main():
         for line in warnings:print(line,file=sys.stderr)
         print(json.dumps(result))
     elif args.command=='authorized-keys':
-        authorized_keys(root,args.key_file,args.role,args.python,args.comment,args.project)
+        authorized_keys(root,args.key_file,args.role,args.python,args.comment,args.project,args.principal)
     elif args.command=='authorized-keys-list':
         print(json.dumps(authorized_keys_listing(root,args.file),ensure_ascii=True,indent=2))
+    elif args.command=='adopt-actor':
+        print(json.dumps(adopt_actor(root,args.project,args.actor,args.principal,args.operator,args.reason),
+                         ensure_ascii=True,sort_keys=True))
+    elif args.command=='actor-adoptions':
+        print(json.dumps({'schema_version':ACTOR_ADOPTIONS_SCHEMA,'entries':actor_adoptions(root,args.project)},
+                         ensure_ascii=True,indent=2))
     elif args.command=='backup':backup_projects(root,args.projects,args.all_projects)
     elif args.command=='backup-copy':backup_copy(root,args.destination,require_clean=args.require_clean)
     elif args.command=='backup-repoint':print(json.dumps(repoint_backup(root,args.project),sort_keys=True))

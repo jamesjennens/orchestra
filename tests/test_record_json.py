@@ -259,7 +259,10 @@ class NoUnguardedParseTests(unittest.TestCase):
             # The third (kittrial-5bb.182) reads an office release's manifest.json for the
             # bundled interpreter: a manifest that is unreadable or nested too deeply must
             # fall back to the default interpreter, not traceback out of add-project.
-            'admin.py': 3,
+            # The fourth (kittrial-5bb.194) reads the actor-adoptions audit, which an
+            # operator command appends to and an operator reads: a nested or unreadable file
+            # must be a refusal naming it, not a traceback.
+            'admin.py': 4,
             'briefing.py': 3, 'coordination.py': 3, 'endpoint.py': 4, 'export_requirements.py': 1, 'feedback.py': 3, 'guidance.py': 3,
             'handoff.py': 1, 'http_service.py': 2, 'lifecycle.py': 1, 'recovery.py': 1, 'requirements.py': 1, 'reserved_comments.py': 1,
             'review_recommendations.py': 2, 'review_workflow.py': 4, 'work.py': 1, 'worker_gate.py': 1})
