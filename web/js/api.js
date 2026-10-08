@@ -146,7 +146,9 @@ export function createApi(transport) {
     updateAgent: (aid, body) => mutate('PATCH', `/v1/agents/${aid}`, body),
     agent: (aid) => call('GET', `/v1/agents/${aid}`),
     // A NEW credential for the agent; its secret is in this one response only.
-    issueAgentCredential: (aid) => mutate('POST', `/v1/agents/${aid}/credentials`, { label: 'web: new secret' }),
+    // With no list the new credential carries what the agent has; a list sets what it has from now on
+    // (kittrial-5bb.208). The page sends a list only from "What it may do" on the agent's card.
+    issueAgentCredential: (aid, scopes) => mutate('POST', `/v1/agents/${aid}/credentials`, scopes ? { label: 'web: new secret', scopes } : { label: 'web: new secret' }),
     revokeAgentCredential: (aid, cid) => mutate('POST', `/v1/agents/${aid}/credentials/${cid}/revoke`, {}),
     // requirement proposals (identity is the session's; the submitter is never sent)
     proposals: (pid, params) => call('GET', `/v1/projects/${pid}/proposals`, { params }),
