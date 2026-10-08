@@ -2251,12 +2251,15 @@ class Service:
         account made, and every worker credential that account issued (kittrial-5bb.199):
 
         * an agent: its owner; an account: itself;
-        * a name written under a WORKER CREDENTIAL: the account that issued that credential.
-          It is traced by the credential, not by the name: the worker credentials (of
-          ``project_id`` when given) whose actor namespace holds the name. Where credentials of
-          more than one issuer have held the name, the one whose life covers ``at`` (the moment
-          the work was written) decides; when that cannot be decided, every such issuer is
-          the work's party, which only ever refuses more;
+        * a name written under a CREDENTIAL: the account behind that credential. It is
+          traced by the credential, not by the name: the credentials whose actor namespace
+          holds the name (the name itself, or ``name/...``): a worker credential of
+          ``project_id``, whose account is the one that issued it; or an agent's credential,
+          for a label written under the agent's name (``AGENT/night``), whose account is the
+          agent's owner. Where credentials of more than one account have held the name, the
+          one whose life covers ``at`` (the moment the work was written) decides; when that
+          cannot be decided, every such account is the work's party, which only ever refuses
+          more;
         * anything else: the name itself.
         """
         person = self.actor_person(actor)
@@ -2267,9 +2270,12 @@ class Service:
                 return {person}
             held = []
             for credential in self.state['credentials'].values():
-                if not isinstance(credential, dict) or credential.get('agent_id') or not credential.get('project_id'):
+                if not isinstance(credential, dict):
                     continue
-                if project_id is not None and credential['project_id'] != project_id:
+                # A worker credential holds its name in ITS project; an agent's credential has no
+                # project of its own and holds the agent's name wherever the agent works.
+                if not credential.get('agent_id') and (not credential.get('project_id') or (
+                        project_id is not None and credential['project_id'] != project_id)):
                     continue
                 namespace = credential.get('actor')
                 if not isinstance(namespace, str) or not namespace:

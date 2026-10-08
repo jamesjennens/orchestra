@@ -311,7 +311,8 @@ default: `"approval_by_another_party": true` in the office service configuration
 (`office_service.py run --config`), which starts the web service with
 `--approval-by-another-party`. See "Nobody approves work of their own party" in
 [HTTP_DEPLOYMENT.md](HTTP_DEPLOYMENT.md). It takes effect when the service is restarted,
-and the project set-up page says whether it is on.
+and the project set-up page says whether it is on. It binds approvals made over the web
+only: one made on the host route (over SSH or on this server) is not bound by it.
 
 A configuration or key line that already names `<INSTALL_ROOT>/current/...`
 needs nothing: the link moves with the upgrade. A bare `python3` in an old

@@ -159,15 +159,33 @@ class SettingOnTests(Party):
         self.assertEqual(self.service.actor_parties('lane-b', self.project), {self.ids['oscar']})
 
     def test_the_assignee_counts_as_well_as_the_author(self):
-        """The task is olive's (she holds it); carl's agent delivered on it. She does not approve it."""
-        task = self.request('POST', '/v1/projects/%s/tasks' % self.project, {'title': 'held'}, token=self.admin).data['id']
-        self.assertEqual(200, self.request('POST', self.base(task) + '/claim', {}, token=self.tokens['olive']).status)
+        """Carl delivered; the task was then given to olive's agent (a reassignment, which the host route can
+        make). The author is another party and the assignee is hers: she does not approve it."""
+        task, contribution = self.deliver(self.tokens['carl'])
+        agent = self.agent_of('olive', 'Kestrel')
+        agent_id = self.request('GET', '/v1/agents/me', token=agent).data['agent']['id']
+        self.backend._task(self.project, task)['assignee'] = agent_id
+        brief = self.request('GET', self.base(task) + '/brief', token=self.admin).data
+        self.assertEqual((brief['task']['assignee'], brief['review']['contribution']['author']), (agent_id, self.ids['carl']))
+        self.refused(self.approve(self.tokens['olive'], task, contribution))
+        self.assertEqual(201, self.approve(self.tokens['oscar'], task, contribution).status)
+
+    def test_a_label_under_an_agents_name_is_the_agents_account(self):
+        """An agent may write under AGENT/label. That is a different name and the same party."""
+        agent = self.agent_of('carl', 'Kestrel')
+        agent_id = self.request('GET', '/v1/agents/me', token=agent).data['agent']['id']
+        label = agent_id + '/night'
+        self.assertEqual(self.service.actor_parties(label, self.project), {self.ids['carl']})
+        self.assertEqual(self.service.actor_parties(agent_id + 'x', self.project), {agent_id + 'x'})     # not inside the name
+        task = self.request('POST', '/v1/projects/%s/tasks' % self.project, {'title': 'labelled'}, token=self.admin).data['id']
+        self.assertEqual(200, self.request('POST', self.base(task) + '/claim', {'actor': label}, token=agent).status)
         made = self.request('POST', self.base(task) + '/reviews', {
             'operation': 'contribute', 'commit': test_http_agents.COMMIT, 'base_commit': test_http_agents.BASE,
-            'bundle_sha256': test_http_agents.BUNDLE, 'summary': 'delivered'}, token=self.tokens['olive'])
+            'bundle_sha256': test_http_agents.BUNDLE, 'summary': 'delivered', 'actor': label}, token=agent)
         self.assertEqual(201, made.status, made.data)
-        self.refused(self.approve(self.tokens['olive'], task, made.data['contribution']['id']))
-        self.assertEqual(201, self.approve(self.tokens['oscar'], task, made.data['contribution']['id']).status)
+        other = self.agent_of('carl', 'Merlin')
+        self.assertEqual(403, self.recommend(other, task, made.data['contribution']['id']).status)
+        self.assertEqual(201, self.recommend(self.agent_of('olive', 'Osprey'), task, made.data['contribution']['id']).status)
 
     def test_a_name_two_issuers_have_held_is_decided_by_the_moment_or_counts_for_both(self):
         """kittrial-5bb.188 lets a superuser waive a name's reuse: the same name under two issuers, one after the other."""

@@ -1455,9 +1455,17 @@ credential that account issued, and:
 - Work under a worker credential is traced by the credential, not by the name: the worker
   credentials of the project whose actor namespace holds the name (the name, or
   `name/...`); a credential issued with no name writes under its issuer's account
-  already. Where two issuers have held one name over time, the credential whose life
+  already. A label an agent writes under its own name (`AGENT/night`) is traced the same
+  way to the agent's account. Where two issuers have held one name over time, the credential whose life
   covers the moment the contribution was written decides; when that cannot be decided,
   both issuers count as the work's party.
+
+**It is a rule of the web route only.** An approval made on the host route (`endpoint.py`
+over SSH, or run on the server) is not bound by it, on or off: a party is made of web
+accounts, their agents and their worker credentials, and the host route knows none of
+them (a caller there names its own actor). For the same reason the setting is the web
+service's and not a host switch, and the endpoint's `setup-status` cannot report it.
+What an owner can see is the service's own answer:
 
 `GET /v1/projects/{id}/setup` carries `rules.approval_by_another_party`, and the set-up
 page says in one line whether the rule is on. A project with one account that both
