@@ -1605,11 +1605,14 @@ credential approved anything; this is the one place where that is lifted.
   false` to a granted agent).
 - **A granted agent never approves work of its own party, whatever the setting of the
   section above says.** The party is the full one of that section: its account, that
-  account's other agents, and the worker credentials that account issued. `403`: "This
-  contribution was delivered by this agent's own account (its owner, one of that
-  account's agents, or a worker credential it issued). An agent never approves work of
-  its own account: another coordinator or owner of this project, or a superuser who did
-  not deliver it, must approve it." A person's approval follows the setting as before.
+  account's other agents, and every name a worker credential of that account holds or has
+  held. `403`, with the sentences of that section said of the agent: "This contribution
+  was delivered by this agent's own party: its account, one of that account's agents, or
+  a name that a worker credential of that account holds or has held. An agent never
+  approves work of its own party, whatever this server's setting for people says:
+  somebody of another party who may approve here must approve it (another coordinator or
+  owner of this project, or a superuser)." A person's approval follows the setting as
+  before.
 - It is read from the present state on every request, by the web service and again when
   the endpoint authorizes the write. Each of these ends it at the agent's next request:
   the grant is removed; the account is made a contributor or a viewer, or leaves the
