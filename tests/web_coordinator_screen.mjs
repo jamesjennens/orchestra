@@ -8,11 +8,16 @@ await import(shimUrl);
 const { createApi } = await import(apiUrl);
 const view = await import(projectUrl);
 
+let inFlight = 0;
 function person(spec) {
   const [name, token] = spec.split('=');
   const transport = async (method, path, headers, body) => {
-    const response = await fetch(base + path, { method, headers: { ...headers, Authorization: 'Bearer ' + token }, body });
-    const text = await response.text();
+    inFlight += 1;
+    let response, text;
+    try {
+      response = await fetch(base + path, { method, headers: { ...headers, Authorization: 'Bearer ' + token }, body });
+      text = await response.text();
+    } finally { inFlight -= 1; }
     let data = null;
     try { data = text ? JSON.parse(text) : null; } catch { data = null; }
     return { status: response.status, data };
@@ -21,7 +26,12 @@ function person(spec) {
 }
 const who = Object.fromEntries(people.map(person));
 const out = {};
-const settle = () => new Promise((resolve) => setTimeout(resolve, 400));
+// Until the page has had no request in flight for a moment (at most 30 seconds): it redraws when its
+// reads answer, and a fixed wait is too short on a slow machine.
+async function settle() {
+  let quiet = 0;
+  for (let i = 0; i < 1200 && quiet < 6; i += 1) { await new Promise((resolve) => setTimeout(resolve, 25)); quiet = inFlight === 0 ? quiet + 1 : 0; }
+}
 const panel = (page) => page.all((e) => e.tagName === 'SECTION' && e.attributes['data-panel'] === 'project-agents')[0];
 const rows = (page) => panel(page).all((e) => e.tagName === 'TR' && e.attributes['data-agent']).map((tr) => ({
   agent: tr.attributes['data-agent'], coordinator: tr.attributes['data-coordinator'], text: tr.textContent,
