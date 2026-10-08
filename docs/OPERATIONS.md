@@ -455,22 +455,35 @@ history with no baseline at all - a file written by hand, or by a kit older than
 still read, and the note says the trail is incomplete for these lists and may simply be older
 than the lists. When a later change takes a baseline on such a history it says so: it holds the
 lists as they stand at that change, not "as they stood when this history began"
-(kittrial-5bb.229 finding 6).
+(kittrial-5bb.229 finding 6). A list that cannot be read is recorded in the baseline as `null`,
+labelled `UNKNOWN` (kittrial-5bb.229 rev-2 item 1): never as an empty list. An empty list there
+would read every name the list really holds as one the trail never mentions, for good, and the
+baseline's own `reason` says which list it is and that the trail is incomplete for it.
 
 **Reading the answer: a script reads `replay.agrees`.** `authority-changes` exits 0 whether the
 trail leads to the lists or not, and also when `deployment.private.json` cannot be read (then
 `current_lists` and `replay` are `null` and the warning is on stderr). The JSON says it in
 `replay.agrees`: `true` when the trail leads to the lists, `false` when it does not, and `null`
 when there is no trail yet (no audit file at all: the reader then says there is no trail yet,
-prints the lists and warns about nothing). `replay.state` carries the same answer as
-`agrees`, `mismatch`, `no-trail`, and `replay.note` is the sentence printed on stderr. Never a
-non-zero exit on a mismatch: every existing installation would fail otherwise.
+prints the lists and warns about nothing) or when the trail is INCOMPLETE for a list. `replay.state`
+carries the same answer as `agrees`, `mismatch`, `no-trail`, or `incomplete`, and `replay.note` is
+the sentence printed on stderr. Never a non-zero exit on a mismatch: every existing installation
+would fail otherwise.
 When one list ALONE cannot be read, `current_lists` holds `null` for it,
 `replay.state` is `incomplete` and `replay.agrees` is `null`: the note says the trail is
-incomplete for that list, and the comparison this read cannot make is not made
-(kittrial-5bb.229 finding 2). A change that would START a new history while a list cannot be
-read is refused with the same reason, because a baseline must never hold an empty list for an
-unreadable one.
+incomplete for that list - and names it FIRST, before anything about the lists it could compare -
+and the comparison this read cannot make is not made (kittrial-5bb.229 findings 2 and rev-2 item
+2). The same state is reported when the BASELINE holds a list as `null` (UNKNOWN), which is what a
+baseline records for a list that could not be read when that history began (rev-2 item 1): the
+trail has no known state to replay that list from, even after the value is repaired. One rule
+covers the audit and the lists both, and it is the same rule as for a damaged audit: a **removal**
+is never refused for it, and only an **add** is. A removal that would start a new history while a
+list cannot be read proceeds, and the baseline it writes records that list as `null` (UNKNOWN); an
+add that would start one is refused, because a baseline must never hold an empty list for a list
+that could not be read (rev-2 item 1). The placeholder flags are covered by the same rule: a
+removal carrying the literal `--actor OPERATOR`/`--reason TEXT` the printed re-grant commands carry
+is not refused - the placeholder is dropped, the entry is recorded without it, and one stderr
+sentence says so - while an add carrying them is refused (rev-2 item 3).
 
 **What the audit cannot see.** An entry holds no before/after of the list itself, so
 `authority-changes` can only replay the trail from its baseline: a name the list holds whose
@@ -487,23 +500,29 @@ an `at` that is not a UTC stamp, nested past the guard, a BOM, non-UTF-8 bytes, 
 --confirm-revoke`, `verifiers remove NAME --confirm-revoke`) is NEVER refused for it: the
 damaged bytes are put beside the runtime FIRST, as a hard link or a copy, under the name
 `authority-changes.audit.json.damaged-<UTC date-time>` (`.N` if that name is taken), and the
-atomic write of the fresh history then replaces the audit path. Only a regular, non-symlink file
-is a candidate or is listed: a symlink at a `.damaged-*` name, even a dangling one, is never
-followed, never overwritten and never read as bytes the kit kept inside the runtime
-(kittrial-5bb.229 finding 1). Where the filesystem has no hard links the copy is written to a
-temporary name first and renamed into place, opened `O_CREAT|O_EXCL|O_NOFOLLOW`, so a kill
-inside the copy never leaves a partial file under a `.damaged-*` name (finding 4). The path is therefore never absent,
-not even for an instant: a kill, or a write that fails, between the two leaves the
-damaged file exactly where it was plus one extra name, and running the command again sets the
-same bytes aside again - the name already holding them is reused, found by `samefile` or by
-comparing the bytes, so even without hard links the attempts do not pile up copies. One sentence on stderr says
-so, and the fresh history's first record - its baseline, or the removal when the lists are empty
-- names the file kept. An **add**
+atomic write of the fresh history then replaces the audit path. The ONE rule for both the audit
+and the lists: a removal is never refused for either, and only an add is - here, an **add**
 (`operators add`, `verifiers add`, and a `restore-new --restore-operators`/`--restore-verifiers`
 re-grant, which is an add) IS refused, with a sentence that names the file and the recovery:
 move the damaged file aside by hand, then run the command again. That refusal is checked before
 the lock is taken, so it costs nothing at all (no lock file, nothing written), and an add that
-would change nothing is not refused at all. The `mv` command every refusal prints carries a real,
+would change nothing is not refused at all. The sentence saying a fresh history starts is printed
+only once that history has actually been written, so the kit never says it and then refuses
+(kittrial-5bb.229 rev-2 item 1). Only a regular, non-symlink file
+is a candidate or is listed: a symlink at a `.damaged-*` name, even a dangling one, is never
+followed, never overwritten and never read as bytes the kit kept inside the runtime
+(kittrial-5bb.229 finding 1). Where the filesystem has no hard links the copy is written to a
+temporary name first and renamed into place, opened `O_CREAT|O_EXCL|O_NOFOLLOW`, so a kill
+inside the copy never leaves a partial file under a `.damaged-*` name (finding 4); `O_EXCL` is the
+flag that does the work - it already refuses a taken name, a symlink included - and `O_NOFOLLOW` is
+kept beside it only because it says the intent and costs nothing (rev-2 item 4). The path is therefore never absent,
+not even for an instant: a kill, or a write that fails, between the two leaves the
+damaged file exactly where it was plus one extra name, and running the command again sets the
+same bytes aside again - the name already holding them is reused, found by `samefile` or by
+comparing the BYTES (not the size: a same-size file holding something else is not the kept copy,
+rev-2 item 4) - so even without hard links the attempts do not pile up copies. One sentence on stderr says
+so, and the fresh history's first record - its baseline, or the removal when the lists are empty
+- names the file kept. The `mv` command every refusal prints carries a real,
 current stamp, not a placeholder, so following it twice cannot overwrite the first kept file. A
 path that is not a regular file at all - a directory, a fifo or a symlink - is refused for every
 command, because the kit only keeps a damaged regular FILE beside the runtime by itself.
@@ -511,7 +530,12 @@ command, because the kit only keeps a damaged regular FILE beside the runtime by
 **The `.damaged-*` files are never removed.** Nothing in the kit deletes one, ever: they
 accumulate beside the runtime as the record of what the trail could no longer read, and the
 reader lists them (in its JSON, under `damaged_files`, and in the note when there are any). Move
-one away, or archive it, yourself once you have read it.
+one away, or archive it, yourself once you have read it. Two things beside them ARE cleaned up,
+because they are interrupted writes rather than kept records: `.authority-changes.audit.json.XXXXXXXX`,
+the copy `atomic_private_write` leaves if it is killed before its rename, and
+`.authority-changes.audit.json.damaged-<stamp>.tmp-<16 hex>`, the copy of a damaged audit's bytes
+left if the process is killed inside that copy. The next write under the deployment lock removes
+both and says so on stderr (kittrial-5bb.229 rev-2 item 4).
 
 `--actor` and `--reason` may be given at most once; a repeat is refused instead of recording the
 last value silently. Abbreviations are OFF for these two commands, so `--act` and `--reas` are
@@ -542,9 +566,12 @@ an add: the restore is still complete, and it exits 3 with the warning and the c
 re-grant by hand - those commands now carry `--actor`/`--reason` (with what the restore was
 given where it had it), so following them does not leave the unattributed entry the warning says
 to avoid. Where the restore was given no `--actor`/`--reason`, the commands carry the literal
-placeholders `OPERATOR` and `TEXT` and the warning says to replace them: running one unchanged is
-refused, so the audit never records an operator named OPERATOR
-(kittrial-5bb.229 finding 3). What is NOT covered: a hand edit of `deployment.private.json`, and a list change made
+placeholders `OPERATOR` and `TEXT` and the warning says to replace them: the re-grant is an ADD,
+and running one unchanged is refused, so the audit never records an operator named OPERATOR
+(kittrial-5bb.229 finding 3). A REMOVAL carrying the same literal placeholders is not refused -
+a removal is never harder with the flags than without (rev-2 item 3): the placeholder is dropped,
+the entry is recorded without it, and one stderr sentence says exactly what was recorded. What is
+NOT covered: a hand edit of `deployment.private.json`, and a list change made
 by an older kit running on the same runtime - both change the lists with no entry, and only the
 reader's replay reports the gap.
 
