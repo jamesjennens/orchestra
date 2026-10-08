@@ -1631,6 +1631,10 @@ class AgentsPageTests(RenewalScopeTests):
             self.skipTest('node is not installed; the agents page is not run here')
         four = ['tasks', 'checkpoints', 'reviews', 'feedback']
         kestrel, _, _ = self.agent(['read'], name='Kestrel')
+        late = self.renew(kestrel).data['credential']                              # one that stopped working by time
+        with self.service.store.lock:
+            self.service.state['credentials'][late['id']]['expires_at'] = 0
+            self.service.store.save()
         wren, _, _ = self.agent(['read'], name='Wren')
         self.assertEqual(201, self.renew(wren, {'scopes': four}).status)
         self.made_before(wren)                                                     # harmed by a renewal of an earlier kit
@@ -1654,8 +1658,8 @@ class AgentsPageTests(RenewalScopeTests):
         self.assertEqual(first['Kestrel']['line'], 'May: read.')
         self.assertEqual(first['Kestrel']['boxes'], {'read': [True, False], 'tasks': [False, False], 'checkpoints': [False, False],
                                                      'reviews': [False, False], 'feedback': [False, False], 'proposals': [False, False]})
-        self.assertEqual([(row['working'], row['differs'], row['buttons']) for row in first['Kestrel']['rows']],
-                         [('true', 'false', ['Revoke'])])
+        self.assertEqual([(row['working'], row['differs'], row['buttons'], 'Expired' in row['text']) for row in first['Kestrel']['rows']],
+                         [('false', 'false', [], True), ('true', 'false', ['Revoke'], False)])
         self.assertEqual((first['Wren']['scopes'], first['Wren']['source'], first['Wren']['differ'], first['Wren']['summary']),
                          ('unknown', 'unknown', '2', 'What it may do (choose)'))
         self.assertIn('Nothing says what this agent may do.', first['Wren']['line'])
@@ -1668,6 +1672,7 @@ class AgentsPageTests(RenewalScopeTests):
         self.assertEqual({tuple(row['buttons']) for row in first['Lone']['rows']}, {()})
         self.assertEqual({name for name, (ticked, _) in first['Lone']['boxes'].items() if ticked}, {'read'})
         # 2. The credential that allowed the four is revoked from the card; what is left says what Wren has.
+        self.assertEqual(seen['cancelRevokeSent'], 0)
         self.assertIn('Revoke this credential?', seen['revokeAsked'])
         after = seen['afterRevoke']
         self.assertEqual((after['scopes'], after['source'], after['differ']), ('read', 'inferred', None))

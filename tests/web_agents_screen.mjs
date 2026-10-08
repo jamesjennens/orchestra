@@ -75,6 +75,10 @@ async function open(ctx) { const page = await view.list(ctx); await settle(); re
   out.first = { Kestrel: seen(page, 'Kestrel'), Wren: seen(page, 'Wren'), Lone: seen(page, 'Lone') };
 
   // 2. The harmed one: the credential that allows the four is revoked there, without a new secret first.
+  //    Answered "Cancel" first: nothing is sent.
+  const anyRow = () => block(page, 'Wren').all((e) => e.tagName === 'LI' && e.attributes['data-credential']).find((li) => li.textContent.includes('tasks'));
+  await pressAndConfirm(button(anyRow(), 'Revoke'), 'click', 'Cancel');
+  out.cancelRevokeSent = sent.length;
   const wrong = block(page, 'Wren').all((e) => e.tagName === 'LI' && e.attributes['data-credential']).find((li) => li.textContent.includes('tasks'));
   out.revokeAsked = await pressAndConfirm(button(wrong, 'Revoke'), 'click', 'Revoke');
   out.afterRevoke = seen(page, 'Wren');
