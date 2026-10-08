@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "operation_id": "capnew-5bb192-list-changes-0001",
+  "operation_id": "capnew-5bb192-list-changes-0002",
   "key": "deployment.list-changes-audited",
   "name": "Every operator and verifier list change is audited",
   "aliases": [
@@ -9,19 +9,26 @@
     "operators add audited",
     "verifiers add audited",
     "unattributed list change",
+    "damaged authority-changes audit",
     "coordinators per project slice 5"
   ],
-  "summary": "admin.py operators add|remove and verifiers add|remove take --actor OPERATOR (who makes the change) and --reason TEXT (at most 400 characters; blank refused). A change that really changes a list appends one entry - at, operator, list, actor, change (add or remove), reason - to the runtime-level authority-changes.audit.json beside deployment.private.json: schema_version 1, mode 0600, newest 200 kept, written under the deployment lock and BEFORE the configuration, so a crash leaves an entry with no change rather than a change with no entry. The read-only admin.py authority-changes command prints it, writes nothing and never creates the file. A call without the flags keeps working (the office wrapper coord.sh runs the bare form): it still records the change, with operator and/or reason null, and prints one stderr sentence naming what to add. The recorded --actor is a record, not a grant: the four commands check no allowlist. A hand-damaged audit is refused by all five commands before anything is written, never read as an empty history. Downgrade: an older kit neither reads nor writes the file, so it loses no function and records no new entries.",
+  "summary": "operators add|remove and verifiers add|remove take --actor OPERATOR and --reason TEXT (at most 400 characters; blank refused); restore-new takes both for its --restore-operators/--restore-verifiers re-grants. A real list change appends one entry - at, operator, list, actor, change, reason - to the runtime-level authority-changes.audit.json beside deployment.private.json (schema_version 1, mode 0600, newest 200 kept; drops said on stderr), under the lock and BEFORE the configuration. A re-grant records one entry per name, operator from restore-new --actor or null, reason naming restore-new and the source. The read-only authority-changes prints the entries (operator-null ones marked and counted), the current lists, and a replay saying when the trail does not lead to them. A damaged audit never refuses a REMOVAL: the file is set aside as .damaged-STAMP and a fresh history records that; an ADD is refused with the recovery named; a directory, fifo or symlink is refused. Unknown entry fields, a schema_version that is true or 1.0, and repeated --actor/--reason are refused. NOT covered, with nothing detecting it: a hand edit of deployment.private.json; a list change by an older kit.",
   "requirements": [],
   "anchors": [
     "docs/OPERATIONS.md#the-operator-and-verifier-list-changes-are-audited"
   ],
   "code": [
     "admin.py::authority_change_entry",
+    "admin.py::authority_changes_document",
+    "admin.py::read_authority_changes",
     "admin.py::authority_changes",
+    "admin.py::authority_change_replay",
+    "admin.py::authority_changes_report",
     "admin.py::record_authority_change",
     "admin.py::authority_change_notice",
-    "admin.py::authority_change_arguments"
+    "admin.py::authority_change_arguments",
+    "admin.py::merge_authority",
+    "admin.py::restore_authority"
   ],
   "tests": [
     "tests/test_authority_changes.py"

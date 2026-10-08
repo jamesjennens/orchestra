@@ -960,29 +960,36 @@ def deployment_config_lock(root):
         handle.close()
 
 def remove_private_write_leftovers(root):
-    """Remove temporary copies of deployment.private.json left by an interrupted write.
+    """Remove temporary copies the private files' interrupted writes left behind.
 
-    ``atomic_private_write`` writes a sibling ``.deployment.private.json.XXXXXXXX`` (the
-    ``mkstemp`` name) and renames it over the file; a writer killed between the two
-    leaves that copy behind, and it holds the full configuration with the Dolt password
-    (kittrial-5bb.142). The next locked write removes it. Returns the names removed.
+    ``atomic_private_write`` writes a sibling ``.NAME.XXXXXXXX`` (the ``mkstemp`` name) and
+    renames it over the file; a writer killed between the two leaves that copy behind. For
+    ``deployment.private.json`` that copy holds the full configuration with the Dolt password
+    (kittrial-5bb.142). The audits this kit appends to are written exactly the same way, under
+    the same deployment lock, so their leftovers are removed too (kittrial-5bb.192 review item
+    4): a kill inside the audit's own write used to leave
+    ``.authority-changes.audit.json.XXXXXXXX`` for good. The next locked write removes them,
+    which is the only moment no writer of this kit can be mid-write. Returns the names removed.
     """
     removed=[]
-    pattern=re.compile(r'\.deployment\.private\.json\.[A-Za-z0-9_]{8}')
     try:
         names=os.listdir(root)
     except OSError:
         return removed
-    for name in sorted(names):
-        if not pattern.fullmatch(name):continue
-        try:
-            os.unlink(os.path.join(str(root),name))
-        except OSError:
-            continue
-        removed.append(name)
-    if removed:
-        print('Removed %d temporary cop%s of deployment.private.json left by an interrupted write: %s'
-              %(len(removed),'y' if len(removed)==1 else 'ies',', '.join(removed)),file=sys.stderr)
+    for target in ('deployment.private.json',AUTHORITY_CHANGES_AUDIT,ACTOR_ADOPTIONS_AUDIT,REVIEW_WRITES_AUDIT):
+        pattern=re.compile(r'\.'+re.escape(target)+r'\.[A-Za-z0-9_]{8}')
+        found=[]
+        for name in sorted(names):
+            if not pattern.fullmatch(name):continue
+            try:
+                os.unlink(os.path.join(str(root),name))
+            except OSError:
+                continue
+            found.append(name)
+        if not found:continue
+        removed.extend(found)
+        print('Removed %d temporary cop%s of %s left by an interrupted write: %s'
+              %(len(found),'y' if len(found)==1 else 'ies',target,', '.join(found)),file=sys.stderr)
     return removed
 
 #: The name the switch code and kittrial-5bb.110's tests use.
@@ -4087,12 +4094,46 @@ def coordination_verifiers(root,source):
     if data is None:return []
     return validate_coordination_operators(data.get('verifiers'),'verifiers')
 
-def merge_authority(root,operators=(),verifiers=()):
+def authority_change_restore_reason(source,reason):
+    """The reason recorded for a name ``restore-new`` re-grants (kittrial-5bb.192 review item 2).
+
+    It always names ``restore-new`` and the source project, so a reader of the trail can tell a
+    re-grant from a listing done with ``operators add``; the operator's own sentence follows it.
+    The 400-character ceiling is on ``--reason``; the recorded reason also carries this prefix.
+    """
+    base='restore-new %s'%source
+    return ('%s: %s'%(base,reason) if reason else
+            '%s re-granted this name from the backup (--restore-operators/--restore-verifiers)'%base)
+
+def _restore_authority_reason(source,reason):
+    """Validate ``restore-new --reason`` before anything is restored; ``None`` when it was not given.
+
+    The audit holds the COMPOSED reason (``authority_change_restore_reason``), so the 400-character
+    ceiling is checked on that, before the destination exists: the re-grant runs last, and a value
+    refused there would fail a restore that had already happened.
+    """
+    if reason is None:return None
+    reason=reason.strip()
+    if not reason:raise ValueError('--reason must be a sentence, not blank')
+    room=AUTHORITY_CHANGES_REASON_MAX-len('restore-new %s: '%source)
+    if len(reason)>room:
+        raise ValueError('--reason must be at most %d characters here: the recorded reason also carries '
+                         '"restore-new %s: ", so a reader of the authority-changes audit can tell a re-grant '
+                         'from an `operators add`'%(room,source))
+    return reason
+
+def merge_authority(root,operators=(),verifiers=(),actor=None,reason=None,source=None):
     """Add missing operators and verifiers under ONE wait for the deployment lock.
 
     Returns ``(added_operators, added_verifiers)``. Additive only; ``restore_authority``
     calls it with exactly the lists the explicit restore flags asked for, so a busy lock
-    refuses both at once with nothing changed (kittrial-5bb.144).
+    refuses both at once with nothing changed (kittrial-5bb.144). Every name it re-grants is
+    RECORDED in the authority-changes audit, one entry per name, under the same lock and before
+    the configuration (kittrial-5bb.192 review item 2): this is the one route in the kit that
+    undoes a revocation, so the trail must carry its last word on the name. ``actor`` is the
+    ``--actor`` the restore was given (null when it was not) and the reason names ``restore-new``
+    and the source. A damaged audit refuses the re-grant because it is an ADD; nothing is changed
+    and the caller reports what was not re-granted.
     """
     marker=root/'deployment.private.json'
     if not marker.is_file():raise ValueError('Deployment is not installed; run install first')
@@ -4108,18 +4149,24 @@ def merge_authority(root,operators=(),verifiers=()):
         added_operators=[item for item in wanted_operators if item not in current_operators]
         added_verifiers=[item for item in wanted_verifiers if item not in current_verifiers]
         if not added_operators and not added_verifiers:return [],[]
+        for noun,added in (('operators',added_operators),('verifiers',added_verifiers)):
+            for name in added:
+                record_authority_change(root,noun,'add',name,actor,
+                                        authority_change_restore_reason(source,reason))
         if added_operators:cfg['operators']=current_operators+added_operators
         if added_verifiers:cfg['verifiers']=current_verifiers+added_verifiers
         atomic_private_write(marker,json.dumps(cfg))
     return added_operators,added_verifiers
 
-def merge_verifiers(root,actors):
+def merge_verifiers(root,actors,actor=None,reason=None):
     """Add missing verifiers to the deployment list; return the added names.
 
     Additive only, and only ever called by `restore_coordination` when the operator
     explicitly passed `--restore-verifiers`: the list is deployment-wide authority, so
     a backup taken before `verifiers remove ACTOR --confirm-revoke` must not silently
-    undo that revocation.
+    undo that revocation. Every name it adds is recorded in the authority-changes audit,
+    one entry per name, under the same lock and before the configuration, so no route in
+    this kit changes a list without an entry (kittrial-5bb.192 review item 2).
     """
     marker=root/'deployment.private.json'
     if not marker.is_file():raise ValueError('Deployment is not installed; run install first')
@@ -4130,6 +4177,10 @@ def merge_verifiers(root,actors):
         current=stored_verifiers(cfg)
         added=[item for item in wanted if item not in current]
         if not added:return []
+        for name in added:
+            record_authority_change(root,'verifiers','add',name,actor,
+                                    reason or 'admin.py merge_verifiers added this name to the capability '
+                                              'verifiers list')
         cfg['verifiers']=current+added
         atomic_private_write(marker,json.dumps(cfg))
     return added
@@ -4139,7 +4190,7 @@ def missing_verifiers(root,source):
     listed=verifiers(root)
     return [item for item in coordination_verifiers(root,source) if item not in listed]
 
-def merge_operators(root,actors):
+def merge_operators(root,actors,actor=None,reason=None):
     """Add missing operators to the deployment allowlist; return the added names.
 
     Additive only, and only ever called by `restore_coordination` when the
@@ -4147,7 +4198,9 @@ def merge_operators(root,actors):
     authority for EVERY project, so re-adding an entry from a backup is a
     deployment-wide grant: a backup taken before `operators remove ACTOR
     --confirm-revoke` must not silently undo that revocation. The added names are
-    returned so the caller can report exactly what was re-granted.
+    returned so the caller can report exactly what was re-granted, and every one of
+    them is recorded in the authority-changes audit, one entry per name, under the
+    same lock and before the configuration (kittrial-5bb.192 review item 2).
     """
     marker=root/'deployment.private.json'
     if not marker.is_file():raise ValueError('Deployment is not installed; run install first')
@@ -4159,6 +4212,9 @@ def merge_operators(root,actors):
         current=stored_operators(cfg)
         added=[item for item in wanted if item not in current]
         if not added:return []
+        for name in added:
+            record_authority_change(root,'operators','add',name,actor,
+                                    reason or 'admin.py merge_operators added this name to the operator allowlist')
         cfg['operators']=current+added
         atomic_private_write(marker,json.dumps(cfg))
     return added
@@ -4183,7 +4239,8 @@ def using_last_complete_sidecar(root,source):
     fallback=last_complete_sidecar_path(root,source)
     return complete_sidecar(bundle) is None and complete_sidecar(fallback) is not None
 
-def restore_coordination(root,source,destination,restore_operators=False,restore_verifiers=False,authority=True):
+def restore_coordination(root,source,destination,restore_operators=False,restore_verifiers=False,authority=True,
+                         actor=None,reason=None):
     from coordination import atomic
     path=project_dir(root,destination)
     files=coordination_backup(root,source)
@@ -4265,7 +4322,7 @@ def restore_coordination(root,source,destination,restore_operators=False,restore
             _atomic_write_bytes(target,validate_quarantine_record(name,record))
         else:atomic(target,record)
     if authority:
-        warning=restore_authority(root,source,restore_operators,restore_verifiers)
+        warning=restore_authority(root,source,restore_operators,restore_verifiers,actor,reason)
         if warning:print(warning,file=sys.stderr)
     return True
 
@@ -4273,16 +4330,18 @@ def restore_coordination(root,source,destination,restore_operators=False,restore
 #: ``--restore-verifiers`` could not re-grant what the backup records (kittrial-5bb.144).
 RESTORE_AUTHORITY_NOT_REGRANTED=3
 
-def restore_authority(root,source,restore_operators=False,restore_verifiers=False):
+def restore_authority(root,source,restore_operators=False,restore_verifiers=False,actor=None,reason=None):
     """Report, and with the explicit flags re-grant, the deployment authority a backup records.
 
     ``restore-new`` runs this LAST, after the coordination files and the operation journal
     are in place (kittrial-5bb.142). Both requested lists are merged under ONE wait for the
-    deployment lock (kittrial-5bb.144), so a busy lock costs one wait, not one per list.
-    A merge refused because another change still holds the lock leaves a completed restore:
-    the warning naming what was not re-granted, with the exact commands to re-grant it, is
-    RETURNED (``None`` when there is nothing to say) so the caller prints it last and exits
-    ``RESTORE_AUTHORITY_NOT_REGRANTED``.
+    deployment lock (kittrial-5bb.144), so a busy lock costs one wait, not one per list, and
+    every name the merge re-grants is recorded in the authority-changes audit (kittrial-5bb.192
+    review item 2), with ``actor``/``reason`` from the new ``restore-new --actor``/``--reason``.
+    A merge refused because another change still holds the lock, or because the audit is damaged
+    and a re-grant is an ADD, leaves a completed restore: the warning naming what was not
+    re-granted, with the exact commands to re-grant it, is RETURNED (``None`` when there is
+    nothing to say) so the caller prints it last and exits ``RESTORE_AUTHORITY_NOT_REGRANTED``.
     """
     # The native and coordination records (original comment plus its void
     # disposition) are restored by the writes above. Operator AUTHORITY is not:
@@ -4310,14 +4369,40 @@ def restore_authority(root,source,restore_operators=False,restore_verifiers=Fals
     wanted_verifiers=unlisted if restore_verifiers else []
     if not wanted_operators and not wanted_verifiers:return None
     try:
-        added_operators,added_verifiers=merge_authority(root,wanted_operators,wanted_verifiers)
+        added_operators,added_verifiers=merge_authority(root,wanted_operators,wanted_verifiers,actor,reason,source)
     except DeploymentLockBusy:
         return authority_not_regranted(root,source,wanted_operators,wanted_verifiers)
+    except AuthorityAuditDamaged as error:
+        # The re-grant is an ADD, and an ADD is refused on a damaged audit. The restore itself
+        # is complete, so this is the same shape as a busy lock: report what was not re-granted
+        # and exit 3 rather than fail the whole restore at its last step.
+        return authority_not_regranted_damaged_audit(root,source,wanted_operators,wanted_verifiers,error)
     if added_operators:
         print('Re-granted operator allowlist entries from the backup (--restore-operators): ' + ', '.join(added_operators))
     if added_verifiers:
         print('Re-granted capability verifiers from the backup (--restore-verifiers): ' + ', '.join(added_verifiers))
     return None
+
+def authority_not_regranted_damaged_audit(root,source,operators,verifiers,error):
+    """The warning for a restore whose re-grant a DAMAGED authority-changes audit refused.
+
+    The restore is complete; nothing was re-granted and nothing was written to the audit. The
+    recovery is the one the audit's own refusal names (move the file aside, then re-grant), so
+    this says that instead of the busy-lock remedy of retrying the command.
+    """
+    import shlex
+    named=[]
+    if operators:named.append('operators (--restore-operators): '+', '.join(operators))
+    if verifiers:named.append('verifiers (--restore-verifiers): '+', '.join(verifiers))
+    commands=['admin.py --root %s %s add %s'%(shlex.quote(str(root)),kind,shlex.quote(actor))
+              for kind,actors in (('operators',operators),('verifiers',verifiers)) for actor in actors]
+    return ('WARNING: the restore is complete, but deployment authority the backup records was NOT re-granted: '
+            '%s. The authority-changes audit refuses an ADD while it is damaged: %s Do not repeat the restore; '
+            'move the damaged file aside, then re-grant them with:\n  %s\nCompare what the backup records with '
+            'this installation:\n  admin.py --root %s backup-authority %s\nrestore-new exits %d: the restore is '
+            'complete, but the authority above was NOT re-granted.'
+            %('; '.join(named),error,'\n  '.join(commands),shlex.quote(str(root)),shlex.quote(source),
+              RESTORE_AUTHORITY_NOT_REGRANTED))
 
 def authority_not_regranted(root,source,operators,verifiers):
     """The warning for a restore whose authority merge was refused by a busy lock.
@@ -5054,6 +5139,12 @@ AUTHORITY_CHANGES_LISTS=('operators','verifiers')
 AUTHORITY_CHANGES_ACTIONS=('add','remove')
 #: The ceiling on a recorded ``--reason``, the same one ``adopt-actor`` uses.
 AUTHORITY_CHANGES_REASON_MAX=400
+#: What a damaged audit file is renamed to before a fresh history starts beside it, the shape
+#: ``review-writes.audit.json`` already uses (kittrial-5bb.192 review item 1).
+AUTHORITY_CHANGES_DAMAGED='.damaged-'
+
+class AuthorityAuditDamaged(ValueError):
+    """A list change or a read was refused because the authority-changes audit is unusable."""
 
 def authority_change_entry(item):
     """Whether one entry has the shape ``operators``/``verifiers`` add|remove writes.
@@ -5062,15 +5153,85 @@ def authority_change_entry(item):
     the new flags keeps working - the office wrapper ``coord.sh`` runs the bare
     ``admin.py --root RT operators add ACTOR`` - and the entry then says plainly that the
     change was not attributed instead of pretending somebody was named. The other fields
-    are always present, so the reader can always show what changed.
+    are always present, so the reader can always show what changed. ``at`` must be the exact
+    UTC stamp ``utc_stamp`` writes: a hand-written entry whose ``at`` is any other text is not
+    this kit's history, and neither is one that carries a field this kit does not write
+    (kittrial-5bb.192 review item 4).
     """
     return (isinstance(item,dict) and set(item)==AUTHORITY_CHANGES_FIELDS
-            and isinstance(item['at'],str) and bool(item['at'])
+            and utc_timestamp(item['at'])
             and isinstance(item['actor'],str) and bool(item['actor'])
             and item['list'] in AUTHORITY_CHANGES_LISTS
             and item['change'] in AUTHORITY_CHANGES_ACTIONS
             and all(item[field] is None or (isinstance(item[field],str) and bool(item[field]))
                     for field in ('operator','reason')))
+
+def authority_changes_document(record):
+    """``(entries, damage)`` for a parsed audit document; ``([], (kind, phrase))`` when it is not ours.
+
+    The ONE place the document's shape is judged, so the reader, the set-aside and the four
+    commands cannot disagree. ``schema_version`` is compared strictly: JSON ``true`` equals 1 in
+    Python and a hand-set ``1.0`` reads as 1, and neither is this kit's history (kittrial-5bb.192
+    review item 4). An unknown top-level key is a refusal, not something quietly dropped at the
+    next write, and every entry must carry exactly ``AUTHORITY_CHANGES_FIELDS``.
+    """
+    if not isinstance(record,dict) or set(record)!={'schema_version','entries'}:
+        return [],('not-this-history','it is not the history this kit writes')
+    if type(record['schema_version']) is not int or record['schema_version']!=AUTHORITY_CHANGES_SCHEMA:
+        return [],('not-this-history','it is not the history this kit writes: its schema_version is %r, not %d'
+                   %(record['schema_version'],AUTHORITY_CHANGES_SCHEMA))
+    entries=record['entries']
+    if not isinstance(entries,list) or any(not authority_change_entry(item) for item in entries):
+        return [],('not-this-history','it is not the history this kit writes')
+    return entries,None
+
+def read_authority_changes(root):
+    """``(entries, damage)`` for the audit file; ``damage`` is None when it is absent or readable.
+
+    ``damage`` is ``(kind, phrase)``. ``not-a-regular-file``: the path is a directory, a fifo or a
+    symlink - a dangling symlink is not a file at all, so it used to read as an empty history and
+    then be replaced by a regular file. ``unreadable``: the bytes cannot be read as this kit's
+    JSON (not JSON, empty, a BOM, non-UTF-8, a bare list or ``null``, nested past the guard, a
+    ``NaN``, unreadable mode ``000``). ``not-this-history``: the document is JSON but is not the
+    history this kit writes (another schema, an unknown top-level key, an entry with an unknown or
+    missing field, an ``at`` that is not this kit's stamp). An absent file is an empty history,
+    never damage.
+    """
+    path=root/AUTHORITY_CHANGES_AUDIT
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        return [],('not-a-regular-file','the path is not a regular file (a directory, a fifo or a symlink)')
+    if not path.exists():return [],None
+    try:record=record_json.loads(path.read_text(encoding='utf-8'))
+    except (OSError,UnicodeError,ValueError) as error:
+        return [],('unreadable','it cannot be read: %s'%error)
+    return authority_changes_document(record)
+
+def authority_change_aside_hint(root):
+    """The ``mv`` command that gets a damaged audit out of the way, as the refusals print it."""
+    path=root/AUTHORITY_CHANGES_AUDIT
+    return 'mv %s %s%sSTAMP'%(path,path,AUTHORITY_CHANGES_DAMAGED)
+
+def authority_audit_refusal(root,damage,mode):
+    """The sentence for an unusable audit; ``mode`` is ``read``, ``add`` or ``remove``.
+
+    Every refusal names the path, what is wrong with it and the recovery, so an operator is never
+    told only that the command was refused (kittrial-5bb.192 review items 1 and 4).
+    """
+    kind,phrase=damage
+    path=root/AUTHORITY_CHANGES_AUDIT
+    hint=authority_change_aside_hint(root)
+    head='The authority-changes audit %s %s; nothing was changed'%(path,phrase)
+    if kind=='not-a-regular-file':
+        return (head+'. The kit only sets a damaged regular FILE aside by itself. Move it aside by hand (%s) '
+                'and run the command again.'%hint)
+    if mode=='add':
+        return (head+'. This command ADDS to the deployment authority, and the kit does not start a fresh history '
+                'for a grant. Move the file aside by hand (%s) and run the command again: the change is then '
+                'recorded in a fresh history.'%hint)
+    if mode=='read':
+        return (head+'. Move the file aside by hand (%s) and read it again; a REMOVAL made with this kit sets a '
+                'damaged file aside by itself and starts a fresh history.'%hint)
+    return head+'. Move it aside by hand (%s) and run the command again.'%hint
 
 def authority_changes(root):
     """The recorded operator/verifier list changes, oldest first. Reads only.
@@ -5079,28 +5240,83 @@ def authority_changes(root):
     refusal, not an empty history, exactly as ``actor_adoptions``: a caller must not be told
     "nobody changed the lists" by a damaged audit.
     """
-    path=root/AUTHORITY_CHANGES_AUDIT
-    if not path.is_file():return []
-    try:record=record_json.loads(path.read_text(encoding='utf-8'))
-    except (OSError,UnicodeError,ValueError) as error:
-        raise ValueError('The authority-changes audit %s cannot be read: %s'%(path,error)) from None
-    entries=record.get('entries') if isinstance(record,dict) and record.get('schema_version')==AUTHORITY_CHANGES_SCHEMA else None
-    if not isinstance(entries,list) or any(not authority_change_entry(item) for item in entries):
-        raise ValueError('The authority-changes audit %s is not the history this kit writes; nothing was changed'%path)
+    entries,damage=read_authority_changes(root)
+    if damage is not None:raise AuthorityAuditDamaged(authority_audit_refusal(root,damage,'read'))
     return entries
+
+def set_aside_damaged_authority_changes(root,damage):
+    """Keep a DAMAGED audit file beside the runtime under a dated name; return the path kept.
+
+    A REMOVAL is never refused for the audit (kittrial-5bb.192 review item 1, the coordinator's
+    decision): the bytes this kit cannot read are renamed to
+    ``authority-changes.audit.json.damaged-<UTC date-time>`` (``.N`` on collision), the same shape
+    ``review-writes.audit.json`` already uses, one sentence is printed on stderr, and the caller
+    starts a fresh history whose first entry says so.
+    """
+    from datetime import datetime,timezone
+    path=root/AUTHORITY_CHANGES_AUDIT
+    stamp=datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+    aside=root/('%s%s%s'%(AUTHORITY_CHANGES_AUDIT,AUTHORITY_CHANGES_DAMAGED,stamp))
+    number=1
+    while aside.exists():
+        aside=root/('%s%s%s.%d'%(AUTHORITY_CHANGES_AUDIT,AUTHORITY_CHANGES_DAMAGED,stamp,number));number+=1
+    os.replace(path,aside)
+    print('The authority-changes audit %s is damaged (%s); it was kept beside the runtime as %s, and a fresh '
+          'history starts with the change that follows.'%(path,damage[1],aside),file=sys.stderr)
+    return aside
+
+def authority_change_set_aside_reason(aside,reason):
+    """The reason on the first entry of a fresh history started after a damaged audit.
+
+    The entry field set is closed, so the one place a removal can record the set-aside is the
+    entry's reason; it is written BEFORE the operator's own sentence so the fact cannot be lost.
+    """
+    note='the previous audit was damaged and was kept beside the runtime as %s'%aside.name
+    return '%s; %s'%(note,reason) if reason else note
+
+def authority_change_precheck(root,action):
+    """Refuse an ADD on a damaged audit, and any command on a path that is not a regular file.
+
+    A REMOVAL is NOT refused for a damaged file: ``record_authority_change`` keeps it aside under
+    a dated name and starts a fresh history with the removal in it (kittrial-5bb.192 review item
+    1). Called before the lock, so the refusal costs nothing and nothing is written.
+    """
+    _,damage=read_authority_changes(root)
+    if damage is None:return
+    if damage[0]=='not-a-regular-file':
+        raise AuthorityAuditDamaged(authority_audit_refusal(root,damage,'remove' if action=='remove' else 'add'))
+    if action=='add':
+        raise AuthorityAuditDamaged(authority_audit_refusal(root,damage,'add'))
 
 def record_authority_change(root,noun,action,actor,operator,reason):
     """Append one recorded list change and return the entry written.
 
     Called only when the list really changes, from inside ``deployment_config_lock`` and
     BEFORE the configuration is written: a host crash between the two leaves an audit entry
-    with no change - the safer mistake, the same ordering ``adopt_actor`` uses. The caller
-    has already read the history once, so a damaged audit refuses the whole command before
-    anything is written.
+    with no change - the safer mistake, the same ordering ``adopt_actor`` uses.
+
+    A damaged FILE is handled here (kittrial-5bb.192 review item 1, the coordinator's decision):
+    a REMOVAL keeps the file aside under a dated name and starts a fresh history whose first
+    entry records the set-aside in its reason, then removes; an ADD is refused, and a path that
+    is not a regular file is refused for every command. When the history is at its cap, the
+    entries that make room are named on stderr, so a dropped entry is never silent (review
+    item 3e).
     """
+    entries,damage=read_authority_changes(root)
+    if damage is not None:
+        if damage[0]=='not-a-regular-file' or action!='remove':
+            raise AuthorityAuditDamaged(authority_audit_refusal(root,damage,'add' if action!='remove' else 'remove'))
+        reason=authority_change_set_aside_reason(set_aside_damaged_authority_changes(root,damage),reason)
+        entries=[]
     entry={'at':utc_stamp(),'operator':operator,'list':noun,'actor':actor,'change':action,'reason':reason}
-    history=authority_changes(root)
+    history=list(entries)
     history.append(entry)
+    dropped=len(history)-AUTHORITY_CHANGES_MAX
+    if dropped>0:
+        print('WARNING: %d older entr%s dropped from %s: it keeps the last %d entries, so a change older than '
+              'the oldest entry here can no longer be replayed by the reader.'
+              %(dropped,'y was' if dropped==1 else 'ies were',root/AUTHORITY_CHANGES_AUDIT,AUTHORITY_CHANGES_MAX),
+              file=sys.stderr)
     atomic_private_write(root/AUTHORITY_CHANGES_AUDIT,
                          json.dumps({'schema_version':AUTHORITY_CHANGES_SCHEMA,
                                      'entries':history[-AUTHORITY_CHANGES_MAX:]}))
@@ -5109,13 +5325,22 @@ def record_authority_change(root,noun,action,actor,operator,reason):
 def authority_change_notice(noun,action,operator,reason):
     """The one sentence a list change without the new flags prints on stderr.
 
-    It names exactly what to add, so the bare form the office wrapper uses keeps working and
-    is never silently unattributed.
+    It names exactly what to add, so the bare form the office wrapper uses keeps working and is
+    never silently unattributed. With one flag given it names that flag's holder and asks for the
+    other alone: a change made by a named operator is not called unattributed (kittrial-5bb.192
+    review item 3c).
     """
-    missing=[flag for flag,value in (('--actor OPERATOR',operator),('--reason TEXT',reason)) if value is None]
-    return ('WARNING: this %s %s was recorded in %s without %s, so the audit reads it as '
-            'unattributed. Add %s to say who changed the deployment authority and why.'
-            %(noun,action,AUTHORITY_CHANGES_AUDIT,' and '.join(missing),' and '.join(missing)))
+    if operator is None and reason is None:
+        return ('WARNING: this %s %s was recorded in %s without --actor OPERATOR and --reason TEXT, so the audit '
+                'reads it as unattributed. Add --actor OPERATOR and --reason TEXT to say who changed the '
+                'deployment authority and why.'%(noun,action,AUTHORITY_CHANGES_AUDIT))
+    if reason is None:
+        return ('WARNING: this %s %s by %s was recorded in %s without --reason TEXT, so the audit names %s but '
+                'does not say WHY the change was made. Add --reason TEXT to say why the deployment authority was '
+                'changed.'%(noun,action,operator,AUTHORITY_CHANGES_AUDIT,operator))
+    return ('WARNING: this %s %s was recorded in %s without --actor OPERATOR, so the audit does not say WHO made '
+            'the change (the reason you gave is recorded). Add --actor OPERATOR to name the operator who changed '
+            'the deployment authority.'%(noun,action,AUTHORITY_CHANGES_AUDIT))
 
 def authority_change_arguments(args,noun):
     """Validate ``--actor``/``--reason`` for one list change; returns ``(operator,reason,notice)``.
@@ -5124,6 +5349,8 @@ def authority_change_arguments(args,noun):
     office wrapper ``coord.sh``) must keep working. A value that IS given is normalised and
     checked here like ``adopt-actor``'s, and ``notice`` is the one sentence to print on
     stderr when one or both were not given, so the bare form is never silently unattributed.
+    ``--actor``/``--reason`` may be given at most once: the parser refuses a repeat instead of
+    recording the last value silently (kittrial-5bb.192 review item 4).
     """
     from recovery import identity
     operator=args.operator
@@ -5137,6 +5364,108 @@ def authority_change_arguments(args,noun):
     notice=(authority_change_notice(noun,args.action,operator,reason)
             if operator is None or reason is None else None)
     return operator,reason,notice
+
+def authority_change_list_arguments(args,noun):
+    """Refuse the recording flags on ``list``: they were accepted and ignored (review item 4)."""
+    given=[flag for flag,value in (('--actor',args.operator),('--reason',args.reason)) if value is not None]
+    if given:
+        raise ValueError('%s list takes no %s: it changes nothing, so the flag would be accepted and ignored. '
+                         'The recording flags are for %s add and %s remove.'
+                         %(noun,' or '.join(given),noun,noun))
+
+def authority_changes_current_lists(root):
+    """``(lists, problem)``: the operator and verifier lists as the deployment holds them now.
+
+    Reads only, and never raises: the reader must still show the trail when
+    ``deployment.private.json`` cannot be read, saying beside it that it could not.
+    """
+    try:
+        cfg=config(root)
+        return {'operators':list(stored_operators(cfg)),'verifiers':list(stored_verifiers(cfg))},None
+    except (OSError,UnicodeError,ValueError,TypeError) as error:
+        return None,'%s'%error
+
+def authority_change_replay(entries,listed,noun):
+    """Replay one list's trail against that list as it is now (kittrial-5bb.192 review item 3a).
+
+    An entry holds no before/after of the list itself, so the trail can only be replayed: the last
+    entry the trail holds for a name is the trail's last word on it. The trail is capped, so a name
+    it no longer mentions may simply have aged out.
+    """
+    last={}
+    for item in entries:
+        if item['list']==noun:last[item['actor']]=item['change']
+    current=sorted(listed.get(noun,[]))
+    expected=sorted(name for name,change in last.items() if change=='add')
+    return {'agrees':current==expected,
+            'current':current,
+            'trail_expects':expected,
+            'listed_but_last_removed':sorted(name for name in current if last.get(name)=='remove'),
+            'listed_but_not_in_trail':sorted(name for name in current if name not in last),
+            'trail_added_but_not_listed':sorted(set(expected)-set(current))}
+
+def authority_changes_replay_note(replay,entries,capped,problem):
+    """The plain sentence beside the entries: does the trail lead to the lists as they are now?"""
+    if problem is not None:
+        return ('WARNING: the trail cannot be compared with the current lists: %s. The audit records only the '
+                'changes the four list commands made here, so this read cannot say whether the trail leads to '
+                'the lists.'%problem)
+    parts=[]
+    for noun in AUTHORITY_CHANGES_LISTS:
+        item=replay[noun]
+        if item['agrees']:continue
+        detail=[]
+        if item['listed_but_last_removed']:
+            detail.append('the list holds %s, whose last recorded change is a remove'
+                          %', '.join(item['listed_but_last_removed']))
+        if item['trail_added_but_not_listed']:
+            detail.append('the trail adds %s but the list does not hold it'
+                          %', '.join(item['trail_added_but_not_listed']))
+        if item['listed_but_not_in_trail']:
+            detail.append('the list holds %s, which the trail never mentions'
+                          %', '.join(item['listed_but_not_in_trail']))
+        parts.append('%s: %s'%(noun,'; '.join(detail)))
+    note=[]
+    if parts:
+        note.append('WARNING: the trail does not lead to the current lists - '+' | '.join(parts)+'.')
+        note.append('A hand edit of deployment.private.json or a list change made by an older kit leaves no entry '
+                    'here, and neither this reader nor anything else detects it.')
+    elif capped:
+        note.append('The trail leads to the current lists, but it holds its cap of %d entries: entries older than '
+                    'the oldest shown were dropped, so a name listed before them cannot be replayed.'
+                    %AUTHORITY_CHANGES_MAX)
+    else:
+        note.append('The trail leads to the current lists: every name listed now was last added by an entry, and '
+                    'every name the trail adds is listed.')
+    if capped and parts:
+        note.append('The trail also holds its cap of %d entries, so entries older than the oldest shown were '
+                    'dropped.'%AUTHORITY_CHANGES_MAX)
+    return ' '.join(note)
+
+def authority_changes_report(root):
+    """``(report, note)`` for the ``authority-changes`` reader: the trail, the lists and the replay.
+
+    The report prints the current lists beside the entries, counts and marks the entries that name
+    nobody, and replays the trail against the lists (kittrial-5bb.192 review items 3a and 3b).
+    """
+    entries,damage=read_authority_changes(root)
+    if damage is not None:raise AuthorityAuditDamaged(authority_audit_refusal(root,damage,'read'))
+    listed,problem=authority_changes_current_lists(root)
+    capped=len(entries)>=AUTHORITY_CHANGES_MAX
+    report={'schema_version':AUTHORITY_CHANGES_SCHEMA,
+            'entries':[dict(item,unattributed=True) if item['operator'] is None else item for item in entries],
+            'unattributed_entries':sum(1 for item in entries if item['operator'] is None),
+            'current_lists':listed,
+            'current_lists_problem':problem}
+    if listed is None:
+        report['replay']=None
+        note=authority_changes_replay_note(None,entries,capped,problem)
+        return report,note
+    replay={noun:authority_change_replay(entries,listed,noun) for noun in AUTHORITY_CHANGES_LISTS}
+    note=authority_changes_replay_note(replay,entries,capped,problem)
+    report['replay']={'agrees':all(replay[noun]['agrees'] for noun in AUTHORITY_CHANGES_LISTS),
+                      'lists':replay,'note':note}
+    return report,note
 
 def credential_actors(root,state_path,service_namespace=None):
     """Every worker credential of the web service with the name it writes under, and whether
@@ -5246,6 +5575,19 @@ def credential_actors(root,state_path,service_namespace=None):
     return {'schema_version':1,'state':str(source),'worker_credentials_with_a_name':len(out),
             'colliding_and_not_revoked':len(colliding),'credentials':out}
 
+class _OnceFlag(argparse.Action):
+    """A flag that may be given at most once.
+
+    argparse's default ``store`` keeps the LAST value silently, so ``--actor a --actor b``
+    recorded ``b`` with nothing said (kittrial-5bb.192 review item 4). The second occurrence is
+    refused instead: whose change it was must never depend on the order of the arguments.
+    """
+    def __call__(self,parser,namespace,values,option_string=None):
+        if getattr(namespace,self.dest,None) is not None:
+            raise ValueError('%s was given more than once; give it once. The value recorded would otherwise be the '
+                             'last one, silently.'%(option_string or self.dest))
+        setattr(namespace,self.dest,values)
+
 def main():
     p=argparse.ArgumentParser();p.add_argument('--root',required=True)
     sub=p.add_subparsers(dest='command',required=True)
@@ -5322,26 +5664,34 @@ def main():
     a.add_argument('--set-aside-evidence',action='store_true',dest='set_aside_evidence',
                    help='with --duplicate: release an anchor that carries acceptance evidence; with live evidence, a remaining anchor must have live evidence too')
     a=sub.add_parser('revert-record');a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
-    a=sub.add_parser('operators',help='the installation operator allowlist: who may run the operator-gated host '
-                                      'commands; add and remove are recorded in the authority-changes audit')
+    a=sub.add_parser('operators',allow_abbrev=False,
+                     help='the installation operator allowlist: who may run the operator-gated host '
+                          'commands; add and remove are recorded in the authority-changes audit')
     a.add_argument('action',choices=['list','add','remove']);a.add_argument('actor',nargs='?')
-    a.add_argument('--actor',dest='operator',default=None,metavar='OPERATOR',
+    a.add_argument('--actor',dest='operator',default=None,metavar='OPERATOR',action=_OnceFlag,
                    help='with add/remove: the operator making this change, recorded in the authority-changes '
-                        'audit (the change still applies without it, and the entry records null)')
-    a.add_argument('--reason',default=None,help='with add/remove: why the list is changed, recorded in the '
-                                                'authority-changes audit (at most %d characters)'%AUTHORITY_CHANGES_REASON_MAX)
-    a.add_argument('--confirm-revoke',action='store_true',dest='confirm_revoke',
+                        'audit (the change still applies without it, and the entry records null). Given twice, '
+                        'refused')
+    a.add_argument('--reason',default=None,action=_OnceFlag,
+                   help='with add/remove: why the list is changed, recorded in the '
+                        'authority-changes audit (at most %d characters). Given twice, refused'
+                        %AUTHORITY_CHANGES_REASON_MAX)
+    a.add_argument('--confirm','--confirm-revoke',action='store_true',dest='confirm_revoke',
                    help='with remove: acknowledge that this operator\'s earlier operator voids stop applying')
-    a.add_argument('--all-revoked',action='store_true',dest='all_revoked',
+    a.add_argument('--a','--all','--all-revoked',action='store_true',dest='all_revoked',
                    help='with remove: name every affected entry instead of the first 5 (the warning truncates otherwise)')
-    a=sub.add_parser('verifiers',help='the capability verifiers list: actors whose capability-verify records read verified')
+    a=sub.add_parser('verifiers',allow_abbrev=False,
+                     help='the capability verifiers list: actors whose capability-verify records read verified')
     a.add_argument('action',choices=['list','add','remove']);a.add_argument('actor',nargs='?')
-    a.add_argument('--actor',dest='operator',default=None,metavar='OPERATOR',
+    a.add_argument('--actor',dest='operator',default=None,metavar='OPERATOR',action=_OnceFlag,
                    help='with add/remove: the operator making this change, recorded in the authority-changes '
-                        'audit (the change still applies without it, and the entry records null)')
-    a.add_argument('--reason',default=None,help='with add/remove: why the list is changed, recorded in the '
-                                                'authority-changes audit (at most %d characters)'%AUTHORITY_CHANGES_REASON_MAX)
-    a.add_argument('--confirm-revoke',action='store_true',dest='confirm_revoke',
+                        'audit (the change still applies without it, and the entry records null). Given twice, '
+                        'refused')
+    a.add_argument('--reason',default=None,action=_OnceFlag,
+                   help='with add/remove: why the list is changed, recorded in the '
+                        'authority-changes audit (at most %d characters). Given twice, refused'
+                        %AUTHORITY_CHANGES_REASON_MAX)
+    a.add_argument('--confirm','--confirm-revoke',action='store_true',dest='confirm_revoke',
                    help='with remove: acknowledge that this verifier\'s capability verifications stop reading verified')
     a=sub.add_parser('review-writes',help='read or set the per-installation switch that allows WRITING the new review-workflow record shapes (readers understand them either way; OFF by default)')
     a.add_argument('action',choices=['status','on','off'])
@@ -5422,13 +5772,21 @@ def main():
     a.add_argument('--restore-verifiers',action='store_true',dest='restore_verifiers',
                    help='explicitly re-grant the capability verifiers the backup records that this host no '
                         'longer lists; off by default for the same reason as --restore-operators')
+    a.add_argument('--actor',default=None,metavar='OPERATOR',
+                   help='with --restore-operators/--restore-verifiers: the operator making the re-grant, recorded '
+                        'in the authority-changes audit (the re-grant still applies without it, and the entry '
+                        'records null)')
+    a.add_argument('--reason',default=None,
+                   help='with --restore-operators/--restore-verifiers: why the re-grant is made; the recorded '
+                        'reason names restore-new and the source project and then this sentence')
     a.add_argument('--without-coordination',action='store_true',dest='without_coordination',
                    help='restore only the native tracker data of a backup whose coordination sidecar exists but '
                         'cannot be used (restore-new refuses such a backup without this flag); its sessions, '
                         'handoffs, requests, merge context and recorded operators and verifiers are not restored')
     a.epilog=('Exit status: 0 restored; 3 restored, but --restore-operators/--restore-verifiers could not '
-              're-grant (another change held the deployment lock): the last lines say what, with the commands '
-              'to re-grant it; 1 failed. Compare a backup with this installation: backup-authority PROJECT.')
+              're-grant (another change held the deployment lock, or the authority-changes audit is damaged): '
+              'the last lines say what, with the commands to re-grant it; 1 failed. Compare a backup with this '
+              'installation: backup-authority PROJECT.')
     a=sub.add_parser('reconcile-request');a.add_argument('project');a.add_argument('--request-id',required=True)
     a.add_argument('--actor',required=True);a.add_argument('--reason',required=True)
     a.add_argument('--disposition',choices=['failed','released','complete'],default='released')
@@ -5863,6 +6221,7 @@ def main():
         cfg=config(root)
         current=stored_operators(cfg)
         if args.action=='list':
+            authority_change_list_arguments(args,'operators')
             print(json.dumps({'operators':current}))
             # An allowlist that already holds an HTTP account or agent id (added by hand, or
             # by an older kit following its own advice) makes that id an operator.
@@ -5899,7 +6258,7 @@ def main():
                                  ' (re-add restores them).' + revoked_keyed_voids(root,actor,limit) +
                                  revoked_proposal_records(root,actor,limit) +
                                  ' Re-run with --confirm-revoke to acknowledge this.')
-        authority_changes(root)          # a damaged audit refuses before anything is written
+        authority_change_precheck(root,args.action)   # a damaged audit refuses an ADD before anything is written
         # The change is applied to a fresh read under the deployment lock, so an add or
         # remove made at the same instant by another command is not lost (kittrial-5bb.136).
         changed=False
@@ -5922,7 +6281,9 @@ def main():
         from recovery import identity
         cfg=config(root)
         current=stored_verifiers(cfg)
-        if args.action=='list':print(json.dumps({'verifiers':current}));return
+        if args.action=='list':
+            authority_change_list_arguments(args,'verifiers')
+            print(json.dumps({'verifiers':current}));return
         # Config is the single authority source, exactly as for `operators`.
         verifiers(root, strict=True)
         if not args.actor:raise ValueError('verifiers '+args.action+' requires an actor identity')
@@ -5936,7 +6297,7 @@ def main():
                                  'recorded reads `reported` instead of `verified`, and drift that only their '
                                  'passes had cleared reappears' + revoked_verifications(root,actor) +
                                  ' (re-add restores them). Re-run with --confirm-revoke to acknowledge this.')
-        authority_changes(root)          # a damaged audit refuses before anything is written
+        authority_change_precheck(root,args.action)   # a damaged audit refuses an ADD before anything is written
         changed=False
         with deployment_config_lock(root):
             cfg=config(root)
@@ -5969,8 +6330,9 @@ def main():
         print(json.dumps({'schema_version':ACTOR_ADOPTIONS_SCHEMA,'entries':actor_adoptions(root,args.project)},
                          ensure_ascii=True,indent=2))
     elif args.command=='authority-changes':
-        print(json.dumps({'schema_version':AUTHORITY_CHANGES_SCHEMA,'entries':authority_changes(root)},
-                         ensure_ascii=True,indent=2))
+        report,note=authority_changes_report(root)
+        print(json.dumps(report,ensure_ascii=True,indent=2))
+        if note:print(note,file=sys.stderr)
     elif args.command=='backup':backup_projects(root,args.projects,args.all_projects)
     elif args.command=='backup-copy':backup_copy(root,args.destination,require_clean=args.require_clean)
     elif args.command=='backup-repoint':print(json.dumps(repoint_backup(root,args.project),sort_keys=True))
@@ -6044,6 +6406,17 @@ def main():
                   file=__import__('sys').stderr)
     elif args.command=='restore-new':
         validate_name(args.project);validate_name(args.destination)
+        # --actor/--reason record the re-grant the two restore flags make (kittrial-5bb.192 review
+        # item 2). Everything about them is checked HERE, before the destination exists: a bad
+        # value must not be discovered after the native restore, when the re-grant step runs last.
+        args.reason=_restore_authority_reason(args.project,args.reason)
+        if args.actor is not None:
+            from recovery import identity
+            args.actor=identity(args.actor,'Invalid operator identity')
+        if (args.actor is not None or args.reason is not None) and not (args.restore_operators or args.restore_verifiers):
+            raise ValueError('--actor/--reason on restore-new record the re-grant that --restore-operators or '
+                             '--restore-verifiers makes in the authority-changes audit; without one of those '
+                             'flags nothing is re-granted, so they would record nothing')
         refuse_retired_name(root,args.destination)
         backup=root/'backups'/args.project
         if not backup.is_dir():raise ValueError('Source backup missing')
@@ -6178,7 +6551,7 @@ def finish_restore(root,args,snapshot):
                   '--restore-operators/--restore-verifiers re-granted nothing.')
         return None
     return restore_authority(root,args.project,restore_operators=args.restore_operators,
-                             restore_verifiers=args.restore_verifiers)
+                             restore_verifiers=args.restore_verifiers,actor=args.actor,reason=args.reason)
 
 def kit_refusal(error):
     """Whether a ``ValueError`` is one of the kit's own refusals: exactly ``ValueError``

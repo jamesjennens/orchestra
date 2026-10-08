@@ -411,19 +411,65 @@ changes a list appends one entry - time, operator, list, actor, change, reason -
 `<runtime>/authority-changes.audit.json` beside `deployment.private.json` (schema version 1,
 mode `0600`, the last `200` entries kept). The entry is written under the same deployment
 lock as the list and **before** it, so a crash between the two leaves an entry with no
-change rather than a change with no entry. The read-only `authority-changes` command prints
-the history. The recorded `--actor` is a record, not a grant: these commands still check no
-allowlist, exactly as before (kittrial-5bb.192).
+change rather than a change with no entry. When the cap makes room by dropping the oldest
+entry, the change says so on stderr. The read-only `authority-changes` command prints the
+history; it counts and marks the entries that name no operator, prints the current operator
+and verifier lists beside the entries, and replays the trail against them, saying plainly (in
+the report's `replay.note` and on stderr) when the trail does not lead to the lists. The
+recorded `--actor` is a record, not a grant: these commands still check no allowlist, exactly
+as before (kittrial-5bb.192).
 
 A call without the flags still works, because the office wrapper `coord.sh` runs the bare
 `admin.py --root RT operators add ACTOR`. Such a call still records the change, with
 `operator` and/or `reason` `null`, and prints one sentence on stderr naming exactly what to
-add: the change is never silent, and the audit never pretends somebody was named. A
-hand-damaged `authority-changes.audit.json` is refused by every one of these commands and by
-the reader before anything is written; it is never read as an empty history. The audit is
-runtime-level and, like `actor-adoptions.audit.json`, is never part of a project's
-coordination backup. `restore-new`'s `--restore-operators`/`--restore-verifiers` re-grants
-still write the lists directly and are not recorded here.
+add: the change is never silent, and the audit never pretends somebody was named. With one of
+the two flags given, the sentence names the operator (or the reason) it does have and asks
+only for the flag that is missing - a change by a named operator is not called unattributed.
+
+**What the audit cannot see.** An entry holds no before/after of the list itself, so
+`authority-changes` can only replay the trail: a name the list holds whose last recorded
+change is a remove, a name the trail adds that the list does not hold, and a listed name the
+trail never mentions (a hand edit of `deployment.private.json`, or a list change made by an
+older kit) are all reported as a trail that does not lead to the lists, never silently. The
+trail keeps only the last 200 entries, so a change older than the oldest entry shown cannot be
+replayed either. Nothing else in the kit detects a hand edit.
+
+**A damaged audit, and the two kinds of change.** An `authority-changes.audit.json` this kit
+cannot read - not JSON, empty, a list, `null`, another `schema_version` (including JSON `true`
+or `1.0`), an unknown top-level key, an entry with an unknown or missing field or an `at` that
+is not a UTC stamp, nested past the guard, a BOM, non-UTF-8 bytes, `NaN`, or mode `000` - is
+treated differently by the two. A **removal** (`operators remove NAME --confirm-revoke`,
+`verifiers remove NAME --confirm-revoke`) is NEVER refused for it: the damaged file is renamed
+to `authority-changes.audit.json.damaged-<UTC date-time>` (`review-writes.audit.json` behaves
+the same way for its own audit), one sentence on stderr says so, and a fresh history starts
+whose first entry records the set-aside in its reason and then the removal. An **add**
+(`operators add`, `verifiers add`, and a `restore-new --restore-operators`/`--restore-verifiers`
+re-grant, which is an add) IS refused, with a sentence that names the file and the recovery:
+move the damaged file aside by hand, then run the command again. A path that is not a regular
+file at all - a directory, a fifo or a symlink - is refused for every command, because the kit
+only sets a damaged regular FILE aside by itself.
+
+`--actor` and `--reason` may be given at most once; a repeat is refused instead of recording the
+last value silently. Abbreviations are OFF for these two commands, so `--act` and `--reas` are
+refused; the abbreviations that existed before these commands took `--actor` are kept as
+explicit aliases: `--a` and `--all` mean `--all-revoked`, and `--confirm` means
+`--confirm-revoke`. Neither command takes the recording flags on `list`: they would change
+nothing and be ignored.
+
+The audit is runtime-level and, like `actor-adoptions.audit.json`, is never part of a project's
+coordination backup.
+
+**Re-grants are recorded too.** `restore-new SRC DST --restore-operators`/`--restore-verifiers`
+re-adds the names the backup records that this host no longer lists, and every name it re-grants
+gets one entry in the same audit, written under the same deployment lock and before the
+configuration. `operator` is `restore-new`'s `--actor` (null when it was not given) and the
+recorded reason names `restore-new` and the source project, then the `--reason` sentence.
+`restore-new` itself takes `--actor OPERATOR` and `--reason TEXT` for these two flags, checked
+before the restore starts; they are refused when neither flag is given. A damaged audit refuses
+the re-grant the same way it refuses an add: the restore is still complete, and it exits 3 with
+the warning and the commands to re-grant by hand. What is NOT covered: a hand edit of
+`deployment.private.json`, and a list change made by an older kit running on the same runtime -
+both change the lists with no entry, and only the reader's replay reports the gap.
 
 ### Standing guidance
 
@@ -1054,7 +1100,7 @@ Afterwards:
 **Upgrade note: reconcile commands and an empty allowlist.** `requirement-reconcile`, `reference-reconcile`, `capability-reconcile`, `record-reconcile` and `reconcile-request` now refuse an actor that is not on the deployment operator allowlist. A deployment that has never configured operators must add the acting operator first, or every one of these commands refuses with "No operator allowlist is configured":
 
 ```bash
-python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime operators add OPERATOR
+python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime operators add OPERATOR --actor OPERATOR --reason "why this operator is listed"
 ```
 
 ### The capability lookup-miss log
@@ -1297,7 +1343,7 @@ A comment that claims a reserved machine format (`Kind: contribution-review-v1`,
 Read the incident first: `brief PROJECT-TASK` fails naming the offending comment id, and `history PROJECT-TASK` returns its exact bytes. Configure the operator allowlist once per deployment, then build a void payload and submit it with the host command:
 
 ```sh
-python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime operators add OPERATOR
+python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime operators add OPERATOR --actor OPERATOR --reason "why this operator is listed"
 python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime operators list
 ```
 
@@ -1595,7 +1641,7 @@ The allowlist is deployment configuration rather than a native Beads object, so 
 To re-establish the recorded authority, re-grant it explicitly, one actor at a time:
 
 ```
-python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime operators add OPERATOR
+python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime operators add OPERATOR --actor OPERATOR --reason "why this operator is re-granted"
 python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime operators list
 ```
 
