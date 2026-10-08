@@ -294,5 +294,42 @@ class NothingGrantedTests(Grants):
                          {'reviews.approve', 'coordinate'})
 
 
+class PageTests(Grants):
+    """The settings page under Node, with a small DOM, against this real service."""
+
+    def test_the_settings_page_gives_and_removes_the_grant(self):
+        import json
+        import shutil
+        from test_http_web import run_node_module
+        node = shutil.which('node')
+        if not node:
+            print('NOTE: PageTests.test_the_settings_page_gives_and_removes_the_grant was SKIPPED: node is not installed, '
+                  'so the settings page of web/js/views/project.js was not run on this platform.', file=sys.stderr)
+            self.skipTest('node is not installed; the coordinator panel is not run here')
+        _, worker_id = self.agent_with_id('carl', 'Wren')
+        web = KIT / 'web' / 'js'
+        done = run_node_module(self, node, 'await import(process.argv[1])',
+                               (KIT / 'tests' / 'web_coordinator_screen.mjs').as_uri(),
+                               (KIT / 'tests' / 'web_dom_shim.mjs').as_uri(), (web / 'api.js').as_uri(),
+                               (web / 'views' / 'project.js').as_uri(), 'http://127.0.0.1:%d' % self.port, self.project,
+                               'owner=' + self.tokens['olive'], 'coordinator=' + self.tokens['cora'])
+        self.assertEqual(0, done.returncode, done.stderr[-3000:])
+        seen = json.loads(done.stdout.strip().splitlines()[-1])
+        self.assertEqual(seen['roles'], ['Viewer', 'Contributor', 'Coordinator', 'Owner'])
+        self.assertIn('Agents in this project 2', seen['head'])
+        self.assertEqual(sorted((row['coordinator'], row['buttons']) for row in seen['before']),
+                         [('none', ['Make coordinator']), ('none', ['Make coordinator'])])
+        self.assertEqual((seen['granted']['agent'], seen['granted']['coordinator'], seen['granted']['buttons']),
+                         (self.agent_id, 'true', ['Remove grant']))
+        self.assertIn('Coordinates', seen['granted']['text'])
+        self.assertEqual((seen['refused']['agent'], seen['refused']['coordinator']), (worker_id, 'none'))
+        self.assertEqual((seen['removed']['coordinator'], seen['removed']['buttons']), ('none', ['Make coordinator']))
+        self.assertIs(seen['coordinatorSeesPanel'], False)
+        self.assertEqual(seen['can'], {'approveOwner': True, 'approveCoordinator': True, 'approveContributor': False,
+                                       'ownerCoordinator': False, 'writeCoordinator': True})
+        # What the page did is what the server holds: given and removed, so none now.
+        self.assertIsNone(self.listed()[self.agent_id]['coordinator'])
+
+
 if __name__ == '__main__':
     unittest.main()

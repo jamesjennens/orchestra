@@ -1,6 +1,6 @@
 import { h, time, confirmDialog, shortSha, toast } from '../dom.js';
 import { pageHead, reviewChip, statusChip, priority, empty, field, setFieldError, formValues, act, lifecycleStrip, describe, errorState } from '../ui.js';
-import { canWrite, isOwner } from './project.js';
+import { canWrite, canApprove, isOwner } from './project.js';
 
 const ACTIONS = {
   'task-created': ['Created the task', ''], 'task-claimed': ['Claimed the task', 'accent'], 'task-updated': ['Edited the task', ''],
@@ -38,7 +38,8 @@ export async function detail(ctx, { pid, tid }) {
   const [project, brief] = await Promise.all([ctx.api.project(pid), ctx.api.brief(pid, tid)]);
   const t = brief.task;
   const review = { requests: [], ...brief.review };
-  const owner = isOwner(project);
+  // Who decides on a contribution here: an owner or a coordinator (kittrial-5bb.209).
+  const owner = canApprove(project);
   const writer = canWrite(project) && !project.archived;
   const mine = t.assignee === ctx.me.id;
   const reload = () => ctx.render();
@@ -56,7 +57,7 @@ export async function detail(ctx, { pid, tid }) {
   const next = t.next_action;
   const nextBanner = next ? h('div', { class: 'banner info' },
     h('strong', null, 'Next: '), next.text,
-    next.who === 'owner' ? h('span', { class: 'muted' }, owner ? ' — that’s you (project owner).' : ' — waiting on a project owner.') :
+    next.who === 'owner' ? h('span', { class: 'muted' }, owner ? (isOwner(project) ? ' — that’s you (project owner).' : ' — that’s you (coordinator).') : ' — waiting on a project owner or coordinator.') :
     next.who === 'assignee' ? h('span', { class: 'muted' }, mine ? ' — that’s you.' : ` — waiting on ${t.assignee_name || 'the assignee'}.`) :
     h('span', { class: 'muted' }, writer ? ' — any contributor can claim it.' : '')) : null;
 

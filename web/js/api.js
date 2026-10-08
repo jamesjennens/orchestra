@@ -121,6 +121,10 @@ export function createApi(transport) {
     confirmProject: (pid) => mutate('POST', `/v1/projects/${pid}/confirm`, {}),
     members: (pid) => call('GET', `/v1/projects/${pid}/members`, { params: { limit: 100 } }),
     setMember: (pid, uid, role) => mutate('PUT', `/v1/projects/${pid}/members/${uid}`, { role }),
+    // The agents that work in a project, as its owner sees them, and the coordinator grant (kittrial-5bb.209).
+    projectAgents: (pid) => call('GET', `/v1/projects/${pid}/agents`),
+    grantCoordinator: (pid, aid) => mutate('PUT', `/v1/projects/${pid}/agents/${aid}/coordinator`, {}),
+    revokeCoordinator: (pid, aid) => mutate('DELETE', `/v1/projects/${pid}/agents/${aid}/coordinator`),
     removeMember: (pid, uid) => mutate('DELETE', `/v1/projects/${pid}/members/${uid}`),
     credentials: (pid) => call('GET', `/v1/projects/${pid}/worker-credentials`, { params: { limit: 100 } }),
     issueCredential: (pid, scopes, label) => mutate('POST', `/v1/projects/${pid}/worker-credentials`, { scopes, label }),
