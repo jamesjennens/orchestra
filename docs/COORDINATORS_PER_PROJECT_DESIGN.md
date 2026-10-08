@@ -1,7 +1,10 @@
 # Several projects on one installation, each with its own coordinator
 
-**Status: design note for James to decide on (kittrial-5bb.178), second version
-after review. Nothing here is built, and this task changes no behaviour.**
+**Status: design note (kittrial-5bb.178), second version after review; James
+decided the seven questions on 2026-10-07 ("recommended for all"). Built so far:
+slice 1, a key names its projects (kittrial-5bb.193; see "Bind a key to its
+projects" in [OPERATIONS.md](OPERATIONS.md)). The rest of this note describes
+the design and the state of main when it was written, not what is built.**
 
 **For an installation where nobody but its owner is to have SSH (the office),
 see [WEB_COORDINATOR_DESIGN.md](WEB_COORDINATOR_DESIGN.md) (kittrial-5bb.201):

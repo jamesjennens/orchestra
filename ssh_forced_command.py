@@ -25,8 +25,9 @@ boundary that makes those rules real: the key can run the endpoint and nothing e
 
 The contract, deliberately narrow:
 
-* The wrapper's *own* argv (``--root``, one or more ``--endpoint``, ``--python``) is the
-  only trusted input. It comes from the sshd configuration, not from the connection.
+* The wrapper's *own* argv (``--root``, one or more ``--endpoint``, ``--python``, and the
+  ``--project`` names a key is bound to) is the only trusted input. It comes from the sshd
+  configuration, not from the connection.
 * ``SSH_ORIGINAL_COMMAND`` is never executed and never becomes part of a command line.
   It is read only to *select* the endpoint: after ``shlex.split`` it must be exactly one
   token equal to one of the configured ``--endpoint`` paths. Every other value - another
@@ -37,6 +38,12 @@ The contract, deliberately narrow:
   ``[python, endpoint, '--root', <the fixed root>]``, so ``--root`` is fixed by the
   deployment and no authority flag can be passed. stdin, stdout and stderr (the JSON
   request/response envelope) pass through unchanged.
+* A key may be BOUND to projects (kittrial-5bb.193, rule 1 of
+  ``docs/COORDINATORS_PER_PROJECT_DESIGN.md``): each ``--project NAME`` of the line is
+  handed to the endpoint as ``--key-project NAME`` after the root, and the endpoint then
+  refuses every request that names another project. The project stays in the request; the
+  caller cannot add a name or drop one, because nothing of the connection reaches this
+  command line. A line with no ``--project`` starts the endpoint exactly as before.
 * The endpoint is exec'd with a minimal, explicit environment: ``PATH``, ``HOME``, the
   locale variables (``LANG``, ``LC_*``), and the variables this kit sets for the endpoint
   itself (none today). Everything else the session carried - ``PYTHONPATH``, ``BASH_ENV``,
@@ -70,6 +77,9 @@ PYTHON_NAME = re.compile(r'(?:[A-Za-z0-9_][A-Za-z0-9_.-]*|/[A-Za-z0-9_./-]+)')
 # none. A future kit component that needs one adds it here deliberately, so nothing a
 # caller can forward (via AcceptEnv) reaches the endpoint by inheritance.
 KIT_ENVIRONMENT = {}
+# A project name as the kit makes them (admin.validate_name; not imported here, so that this
+# wrapper stays one file that starts on any interpreter the account has).
+PROJECT_NAME = re.compile(r'[a-z][a-z0-9]{1,23}')
 # Forwarded from the session because the kit needs them: PATH to find the interpreter,
 # HOME for the account's own files, and the locale so text handling matches the terminal.
 LOCALE_NAMES = ('LANG',)
@@ -108,6 +118,9 @@ def parse_args(argv):
                              'endpoint.py beside this wrapper)')
     parser.add_argument('--python', default=None,
                         help='interpreter used for the endpoint (default: this wrapper\'s own)')
+    parser.add_argument('--project', action='append', default=[], metavar='NAME',
+                        help='a project this key is bound to (repeatable); with none the key may '
+                             'name any project, as before')
     return parser.parse_args(argv)
 
 
@@ -123,6 +136,19 @@ def _python(value):
         raise ValueError('--python must be one interpreter name or absolute path using only '
                          'letters, digits, dot, underscore, dash and slash')
     return value
+
+
+def _projects(values):
+    """The projects of a bound line, in the order written; an empty list for an unbound one."""
+    projects = []
+    for value in values or []:
+        if not isinstance(value, str) or not PROJECT_NAME.fullmatch(value):
+            raise ValueError('--project must be a project name (2-24 lowercase letters and digits, '
+                             'beginning with a letter); refused %s' % _echo(value))
+        if value in projects:
+            raise ValueError('--project names %s twice' % value)
+        projects.append(value)
+    return projects
 
 
 def configured(args):
@@ -174,9 +200,13 @@ def select_endpoint(tokens, endpoints):
     return chosen, None
 
 
-def endpoint_argv(python, endpoint, root):
-    """The exact command line the endpoint is launched with: fixed root, no other flag."""
-    return [python, endpoint, '--root', root]
+def endpoint_argv(python, endpoint, root, projects=()):
+    """The exact command line the endpoint is launched with: the fixed root and, for a bound
+    key, the projects of its line. No other flag, and none of it from the connection."""
+    command = [python, endpoint, '--root', root]
+    for project in projects:
+        command.extend(['--key-project', project])
+    return command
 
 
 def refuse(reason):
@@ -188,6 +218,7 @@ def main(argv=None):
     try:
         args = parse_args(sys.argv[1:] if argv is None else list(argv))
         root, endpoints, python = configured(args)
+        projects = _projects(args.project)
         try:
             tokens = shlex.split(os.environ.get('SSH_ORIGINAL_COMMAND', ''))
         except ValueError as error:
@@ -195,7 +226,7 @@ def main(argv=None):
         chosen, reason = select_endpoint(tokens, endpoints)
         if chosen is None:
             return refuse(reason)
-        command = endpoint_argv(python, chosen, root)
+        command = endpoint_argv(python, chosen, root, projects)
         # Replace this process: the endpoint inherits the caller's stdio byte for byte, but
         # not the caller-influenced environment (see child_environment).
         os.execvpe(command[0], command, child_environment())

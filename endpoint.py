@@ -455,7 +455,29 @@ def reserved_actors(root,path,rows=False,own=()):
         names['authors']=sorted(tracker_actors(root,path,None if rows is True else rows,own))
     return names
 
-def execute(root,request,authority_config=None,require_authority=False):
+#: The actions that exist only for the web service: they name no existing project.
+SERVICE_ONLY_ACTIONS=('create-project','project-creations','creation-standing')
+
+def key_project_refusal(request,key_projects):
+    """Refuse, for a key bound to projects, a request that is not for one of them.
+
+    Rule 1 of docs/COORDINATORS_PER_PROJECT_DESIGN.md (kittrial-5bb.193). ``key_projects``
+    comes from the endpoint's own launch flags (``--key-project``, which only the forced
+    command of an authorized_keys line passes) and is None for every other caller, who is
+    not looked at. It is asked before anything else in ``execute``: nothing of another
+    project is read, and the answer for another project is the answer for a project that
+    does not exist, so a bound key cannot tell the two apart.
+    """
+    if key_projects is None:return
+    action=request.get('action') if isinstance(request,dict) else None
+    if action in SERVICE_ONLY_ACTIONS:
+        raise ValueError('%s is available only to the web service'%action)
+    project=request.get('project') if isinstance(request,dict) else None
+    if not isinstance(project,str) or project not in key_projects:
+        raise ValueError('Unknown/uninitialized project')
+
+def execute(root,request,authority_config=None,require_authority=False,key_projects=None):
+    key_project_refusal(request,key_projects)
     # Two actions exist only for the web service and name no existing project
     # (kittrial-5bb.118 part 2); project_creation holds them, with what stops other callers.
     if request.get('action')=='create-project':
@@ -936,15 +958,24 @@ def main():
     p.add_argument('--service-namespace',
                    help="the web service's own actor namespace (default http): a name the "
                         'service was started under is refused at use too (kittrial-5bb.188 item 3)')
+    p.add_argument('--key-project',action='append',metavar='NAME',
+                   help='a project the calling SSH key is bound to (repeatable; passed only by '
+                        'ssh_forced_command.py from the authorized_keys line): every request for '
+                        'another project is refused (kittrial-5bb.193)')
     a=p.parse_args()
     authority_config=None
     if a.authority_store:
         authority_config=AuthorityConfig(a.authority_store,a.authority_lock,a.service_namespace)
     try:
+        if a.key_project is not None and a.authority_store:
+            # A key line is not the web service, and the service passes no such flag.
+            raise ValueError('--key-project is for an SSH key line and cannot be combined with --authority-store')
+        from admin import validate_name
+        key_projects=None if a.key_project is None else frozenset(validate_name(name) for name in a.key_project)
         text=sys.stdin.read(2_000_001)
         if len(text)>2_000_000:raise ValueError('Request exceeds 2 MB')
         answer=execute(root_path(a.root),record_json.loads(text),authority_config=authority_config,
-                       require_authority=a.require_authority)
+                       require_authority=a.require_authority,key_projects=key_projects)
     except subprocess.TimeoutExpired:
         answer={'returncode':124,'stdout':'','stderr':'Command timed out; mutation outcome may be uncertain. Inspect state before retrying.\n'}
     except TimeoutError as waited:
