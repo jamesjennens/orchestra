@@ -225,6 +225,51 @@ class SettingOnTests(Party):
                if item['id'] == task][0]
         self.assertEqual(row.get('recommended_by') or [], [])
 
+    def test_a_recommendation_under_a_worker_credential_is_its_issuers(self):
+        """The other side of the comparison: the name that RECOMMENDED is traced too. olive's agent delivered;
+        a worker credential olive issued recommended it (allowed while the rule was off). It does not count."""
+        task, contribution = self.deliver(self.agent_of('olive', 'Kestrel'))
+        worker, _ = self.worker_of('olive', 'lane-a')
+        # Written under the credential's name as over the host route, where only names are compared: the web
+        # route refuses it already, by the account behind the request.
+        records = self.backend.state['contributions'][task]
+        self.backend.state.setdefault('recommendations', {}).setdefault(task, []).append({
+            'id': 'rec_planted', 'task_id': task, 'kind': 'recommendation', 'contribution_id': contribution,
+            'commit': test_http_agents.COMMIT, 'verdict': 'approve', 'summary': 'planted', 'items': [], 'actor': 'lane-a',
+            'created_at': '2099-01-01T00:00:00Z', 'after': len(records)})
+        self.service.approval_by_another_party = False
+        brief = self.request('GET', self.base(task) + '/brief', token=self.tokens['oscar']).data['review']
+        self.assertEqual([entry['author'] for entry in brief['recommendations']], ['lane-a'])        # off: it counts, as today
+        self.service.approval_by_another_party = True
+        brief = self.request('GET', self.base(task) + '/brief', token=self.tokens['oscar']).data['review']
+        self.assertEqual((brief['recommendations'], brief['recommendation']), ([], None))
+        row = [item for item in self.request('GET', '/v1/projects/%s/queue' % self.project, token=self.tokens['oscar']).data['items']
+               if item['id'] == task][0]
+        self.assertEqual(row.get('recommended_by') or [], [])
+
+    def test_a_name_is_traced_in_the_project_of_the_work(self):
+        """`lane-a` is olive's in Alpha and oscar's in Beta. Work under it in Alpha is olive's alone: oscar's agent
+        recommends it and its recommendation is shown, and oscar approves it."""
+        beta = self.create_project(self.admin, 'Beta')
+        self.assertEqual(200, self.request('PUT', '/v1/projects/%s/members/%s' % (beta, self.ids['oscar']), {'role': 'owner'},
+                                           token=self.admin).status)
+        made = self.request('POST', '/v1/projects/%s/worker-credentials' % beta, {'label': 'worker', 'actor': 'lane-a'},
+                            token=self.tokens['oscar'])
+        self.assertEqual(201, made.status, made.data)
+        worker, _ = self.worker_of('olive', 'lane-a')
+        task, contribution = self.deliver(worker)
+        self.assertEqual(self.service.actor_parties('lane-a', self.project), {self.ids['olive']})
+        self.assertEqual(self.service.actor_parties('lane-a', beta), {self.ids['oscar']})
+        agent = self.agent_of('oscar', 'Osprey')
+        agent_id = self.request('GET', '/v1/agents/me', token=agent).data['agent']['id']
+        self.assertEqual(201, self.recommend(agent, task, contribution).status)
+        brief = self.request('GET', self.base(task) + '/brief', token=self.tokens['carl']).data['review']
+        self.assertEqual([entry['author'] for entry in brief['recommendations']], [agent_id])
+        row = [item for item in self.request('GET', '/v1/projects/%s/queue' % self.project, token=self.tokens['carl']).data['items']
+               if item['id'] == task][0]
+        self.assertEqual(row.get('recommended_by'), [agent_id])
+        self.assertEqual(201, self.approve(self.tokens['oscar'], task, contribution).status)
+
 
 class SettingOffTests(Party):
     """An installation that configures nothing: every answer is today's."""
