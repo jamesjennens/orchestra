@@ -187,8 +187,10 @@ class NoUnguardedParseTests(unittest.TestCase):
 
     ALLOWED = {
         'activity.py': (2, "the tracker export, and a cursor file on the caller's own machine"),
-        'admin.py': (30, 'bd output and files on the coordination host, in operator commands; credential-actors '
-                         '(kittrial-5bb.184) reads the web state and an export and catches RecursionError itself'),
+        'admin.py': (31, 'bd output and files on the coordination host, in operator commands; credential-actors '
+                         '(kittrial-5bb.184) reads the web state and an export and catches RecursionError itself; '
+                         'adopt-actor (kittrial-5bb.194 revision 2) reads one export to check that the actor '
+                         'appears in the project and catches RecursionError itself'),
         'artifacts.py': (1, 'the artifact index the kit writes'),
         'bootstrap.py': (2, 'bd output on the host'),
         'bd_refusals.py': (1, "bd's own answer to one command; it catches RecursionError itself"),
@@ -219,7 +221,9 @@ class NoUnguardedParseTests(unittest.TestCase):
         'project_creation.py': (2, 'the creation record and the failure note the kit writes on the coordination host; a note that cannot be parsed, however deep, is ignored'),
         'review_recommendations.py': (1, 'bd output (the answer of comments add)'),
         'review_workflow.py': (4, 'bd output and the revert journal the kit writes'),
-        'sessions.py': (3, 'bd output, and the session registry the kit writes (registered_actors catches RecursionError)'),
+        'sessions.py': (2, 'bd output, and the session registry the kit writes in read_registry (which turns a '
+                           'damaged or nested file into one plain sentence; kittrial-5bb.194 revision 2 made '
+                           'execute read through it)'),
         'version.py': (1, "the kit's own version file"),
         'work.py': (4, 'bd output and the request files the kit writes'),
         'worker.py': (2, "the endpoint's answer, on the caller's machine"),
@@ -259,7 +263,10 @@ class NoUnguardedParseTests(unittest.TestCase):
             # The third (kittrial-5bb.182) reads an office release's manifest.json for the
             # bundled interpreter: a manifest that is unreadable or nested too deeply must
             # fall back to the default interpreter, not traceback out of add-project.
-            'admin.py': 3,
+            # The fourth (kittrial-5bb.194) reads the actor-adoptions audit, which an
+            # operator command appends to and an operator reads: a nested or unreadable file
+            # must be a refusal naming it, not a traceback.
+            'admin.py': 4,
             'briefing.py': 3, 'coordination.py': 3, 'endpoint.py': 4, 'export_requirements.py': 1, 'feedback.py': 3, 'guidance.py': 3,
             'handoff.py': 1, 'http_service.py': 2, 'lifecycle.py': 1, 'recovery.py': 1, 'requirements.py': 1, 'reserved_comments.py': 1,
             'review_recommendations.py': 2, 'review_workflow.py': 4, 'work.py': 1, 'worker_gate.py': 1})

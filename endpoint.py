@@ -10,6 +10,14 @@ no HTTP principal at all. ``--service-namespace`` is the web service's own actor
 namespace (``http`` unless it was started with another): at use the endpoint refuses a
 credential named under it, and only its launcher knows it (kittrial-5bb.188 item 3).
 """
+import sys
+if sys.version_info < (3, 10):
+    # Before every other import, and in syntax Python 3.6 reads: an older interpreter failed in
+    # an import further down, with a traceback that hid the cause (kittrial-5bb.191).
+    sys.stderr.write('endpoint.py needs Python 3.10 or newer and was started with Python %d.%d.%d (%s). '
+                     'Nothing was carried out. Set "python" in the client configuration to an interpreter of 3.10 or newer on the server; on an office installation that is the bundled one, INSTALL_ROOT/current/python-runtime/..., as add-project prints it.\n'
+                     % (sys.version_info[0], sys.version_info[1], sys.version_info[2], sys.executable))
+    sys.exit(2)
 import argparse
 import fcntl
 import json
@@ -455,7 +463,61 @@ def reserved_actors(root,path,rows=False,own=()):
         names['authors']=sorted(tracker_actors(root,path,None if rows is True else rows,own))
     return names
 
-def execute(root,request,authority_config=None,require_authority=False):
+#: The actions that exist only for the web service: they name no existing project.
+SERVICE_ONLY_ACTIONS=('create-project','project-creations','creation-standing')
+
+def key_project_refusal(request,key_projects):
+    """Refuse, for a key bound to projects, a request that is not for one of them.
+
+    Rule 1 of docs/COORDINATORS_PER_PROJECT_DESIGN.md (kittrial-5bb.193). ``key_projects``
+    comes from the endpoint's own launch flags (``--key-project``, which only the forced
+    command of an authorized_keys line passes) and is None for every other caller, who is
+    not looked at. It is asked before anything else in ``execute``: nothing of another
+    project is read, and the answer for another project is the answer for a project that
+    does not exist, so a bound key cannot tell the two apart.
+    """
+    if key_projects is None:return
+    action=request.get('action') if isinstance(request,dict) else None
+    if action in SERVICE_ONLY_ACTIONS:
+        raise ValueError('%s is available only to the web service'%action)
+    project=request.get('project') if isinstance(request,dict) else None
+    if not isinstance(project,str) or project not in key_projects:
+        raise ValueError('Unknown/uninitialized project')
+
+def key_principal_refusal(request,path,key_principal):
+    """Refuse, for a key bound to a principal, a request whose actor that principal does not own.
+
+    Rule 2 of docs/COORDINATORS_PER_PROJECT_DESIGN.md (kittrial-5bb.194). ``key_principal``
+    comes from the endpoint's own launch flags (``--key-principal``, which only the forced
+    command of an authorized_keys line passes) and is None for every other caller, who is
+    not looked at. A session registration is the one exception: it makes the new actor the
+    key's principal's, so it is answered before that actor exists (sessions.execute writes
+    the entry). Every other action must name an actor the project's registry gives to this
+    principal; an actor with no entry has no principal, so a bound key cannot act as it.
+    """
+    if key_principal is None:return
+    action=request.get('action') if isinstance(request,dict) else None
+    args=request.get('args') if isinstance(request,dict) else None
+    if action=='session' and isinstance(args,list) and args[:1]==['register']:return
+    actor=request.get('actor') if isinstance(request,dict) else None
+    from sessions import owners
+    owned=owners(path)
+    if not isinstance(actor,str) or owned.get(actor)!=key_principal:
+        raise ValueError('This key is bound to principal %s and may act only as actors that principal '
+                         'registered in this project; %s is not one of them'
+                         % (key_principal,actor if isinstance(actor,str) and actor else repr(actor)))
+
+def execute(root,request,authority_config=None,require_authority=False,key_projects=None,key_principal=None):
+    key_project_refusal(request,key_projects)
+    # Rule 2: a key bound to a principal is refused the web-only actions here, before their
+    # name is looked at. The gate proper needs the project's registry and is asked below,
+    # after the project is known; this structural refusal means no action at all is answered
+    # before the gate, so an action added above it later cannot slip past (kittrial-5bb.194
+    # review, mutant N1; slice 1 does the same for a key bound to projects).
+    if key_principal is not None:
+        answered=request.get('action') if isinstance(request,dict) else None
+        if answered in SERVICE_ONLY_ACTIONS:
+            raise ValueError('%s is available only to the web service'%answered)
     # Two actions exist only for the web service and name no existing project
     # (kittrial-5bb.118 part 2); project_creation holds them, with what stops other callers.
     if request.get('action')=='create-project':
@@ -478,6 +540,9 @@ def execute(root,request,authority_config=None,require_authority=False):
     if unfinished:raise ValueError('Unknown/uninitialized project: '+unfinished)
     actor=request.get('actor','')
     refuse_http_actor(actor,authority_config is not None)
+    # Rule 2 (kittrial-5bb.194): a key bound to a principal acts only as that principal's
+    # actors in this project. Asked before any action runs; the registry is the only source.
+    key_principal_refusal(request,path,key_principal)
     # Launched by the HTTP service, an HTTP-shaped actor still needs the verified
     # descriptor on every action, with or without --require-authority (review 01a10262).
     denied=http_actor_denial(request,authority_config)
@@ -498,7 +563,7 @@ def execute(root,request,authority_config=None,require_authority=False):
             return stdout
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
-            result=session_execute(path,name,args,export,actor=actor)
+            result=session_execute(path,name,args,export,actor=actor,principal=key_principal)
         result['provenance'] = {'kit': report(Path(__file__).resolve().parent, 'kit')}
         answer={'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(session_warnings)}
         # The session writes are not guarded writes; they carry the server's time all the same
@@ -936,15 +1001,33 @@ def main():
     p.add_argument('--service-namespace',
                    help="the web service's own actor namespace (default http): a name the "
                         'service was started under is refused at use too (kittrial-5bb.188 item 3)')
+    p.add_argument('--key-project',action='append',metavar='NAME',
+                   help='a project the calling SSH key is bound to (repeatable; passed only by '
+                        'ssh_forced_command.py from the authorized_keys line): every request for '
+                        'another project is refused (kittrial-5bb.193)')
+    p.add_argument('--key-principal',metavar='NAME',
+                   help='the principal the calling SSH key belongs to (passed only by '
+                        'ssh_forced_command.py from the authorized_keys line): every request whose '
+                        'actor that principal does not own in the project is refused, except a '
+                        'session registration, which makes the new actor its own (kittrial-5bb.194)')
     a=p.parse_args()
     authority_config=None
     if a.authority_store:
         authority_config=AuthorityConfig(a.authority_store,a.authority_lock,a.service_namespace)
     try:
+        if a.key_project is not None and a.authority_store:
+            # A key line is not the web service, and the service passes no such flag.
+            raise ValueError('--key-project is for an SSH key line and cannot be combined with --authority-store')
+        if a.key_principal is not None and a.authority_store:
+            raise ValueError('--key-principal is for an SSH key line and cannot be combined with --authority-store')
+        from admin import validate_name
+        key_projects=None if a.key_project is None else frozenset(validate_name(name) for name in a.key_project)
+        from sessions import valid_principal
+        key_principal=None if a.key_principal is None else valid_principal(a.key_principal,'--key-principal')
         text=sys.stdin.read(2_000_001)
         if len(text)>2_000_000:raise ValueError('Request exceeds 2 MB')
         answer=execute(root_path(a.root),record_json.loads(text),authority_config=authority_config,
-                       require_authority=a.require_authority)
+                       require_authority=a.require_authority,key_projects=key_projects,key_principal=key_principal)
     except subprocess.TimeoutExpired:
         answer={'returncode':124,'stdout':'','stderr':'Command timed out; mutation outcome may be uncertain. Inspect state before retrying.\n'}
     except TimeoutError as waited:

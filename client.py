@@ -7,6 +7,14 @@ explicit opt-in (config "transport": "local") for a Linux endpoint on this machi
 it runs the same endpoint as an argv list with shell=False. Both transports send the
 byte-identical JSON envelope, so attachments and actor semantics do not vary.
 """
+import sys
+if sys.version_info < (3, 10):
+    # Before every other import, and in syntax Python 3.6 reads: an older interpreter failed in
+    # an import further down, with a traceback that hid the cause (kittrial-5bb.191).
+    sys.stderr.write('client.py needs Python 3.10 or newer and was started with Python %d.%d.%d (%s). '
+                     'Nothing was carried out. Run the client with Python 3.10 or newer; the beads.cmd and beads.sh wrappers take the interpreter from BEADS_PYTHON.\n'
+                     % (sys.version_info[0], sys.version_info[1], sys.version_info[2], sys.executable))
+    sys.exit(2)
 import argparse
 import hashlib
 import json
@@ -158,6 +166,26 @@ def _wire(project,actor,args,action,path):
     if len(wire) > MAX_WIRE:raise ValueError('Request exceeds 2 MB')
     return wire
 
+#: What endpoint.py answers, and only that, when it was started by an interpreter too old for
+#: it: exit 2, nothing on stdout, this one line (kittrial-5bb.191).
+TOO_OLD=re.compile(r'(endpoint\.py needs Python 3\.10 or newer and was started with Python \d+\.\d+\.\d+ \([^\n]{0,400}\)\. '
+                   r'Nothing was carried out\.) [^\n]{0,600}\n?')
+
+def _interpreter_refusal(returncode,stdout,stderr,config):
+    """The endpoint's own sentence when it refused to start under an old interpreter, else None.
+
+    That answer says nothing was carried out, so the client does not put "outcome may be
+    uncertain" in front of it. With a confined key the interpreter is the one in the server's
+    authorized_keys line, not this configuration's ``python``, and the advice says so.
+    """
+    found=TOO_OLD.fullmatch(stderr or '') if returncode==2 and not stdout else None
+    if not found:return None
+    if config.get('transport','ssh')=='ssh' and config.get('forced_command') is True:
+        return (found.group(1)+' This key runs a forced command, so the interpreter is the one in its '
+                'authorized_keys line on the server, not "python" in this configuration: ask the operator to '
+                'print that line again (admin.py authorized-keys) with an interpreter of 3.10 or newer.')
+    return stderr.strip()
+
 def request(config,project,actor,args,action='bd',path=None):
     argv,label = _argv(config)
     wire = _wire(project,actor,args,action,path)
@@ -168,7 +196,10 @@ def request(config,project,actor,args,action='bd',path=None):
                            creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
     except subprocess.TimeoutExpired:
         raise RuntimeError(f'{label} timed out; outcome may be uncertain. Inspect state; do not blindly retry mutations.') from None
-    if p.returncode:raise RuntimeError(f'{label} failed ({p.returncode}); outcome may be uncertain. {p.stderr[:1000]}')
+    if p.returncode:
+        too_old=_interpreter_refusal(p.returncode,p.stdout,p.stderr,config)
+        if too_old:raise RuntimeError(f'{label}: {too_old}')
+        raise RuntimeError(f'{label} failed ({p.returncode}); outcome may be uncertain. {p.stderr[:1000]}')
     try:return json.loads(p.stdout)
     except json.JSONDecodeError:raise RuntimeError('Invalid endpoint response; inspect state before retrying.') from None
 
