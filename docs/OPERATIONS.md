@@ -357,7 +357,9 @@ history](#malformed-structured-history) (`void-record`).
 | `capability-alias-reject PROJECT --actor OPERATOR --file reject.json` | reject a pending alias (`{schema_version, key, alias, reason}`); lookup then ignores it | the deployment operator allowlist |
 | `capability-alias-propose PROJECT --actor OPERATOR --file alias.json` | propose an alias as a verified operator (`{schema_version, key, alias, evidence?}`). This is the only route that writes `identity: verified`; `capability propose-alias` through the endpoint always writes `unverified`, even for an operator's actor name | the deployment operator allowlist |
 | `capability-verify PROJECT --actor ACTOR --file payloads.json` | record capability checks as **verified**. The file is what `capability check --repo . --payloads payloads.json` wrote at the commit being verified (one payload, or `{schema_version, items}` of up to 500). Each item is one capability and takes the coordination lock on its own; the result is `recorded`, `already-recorded` or `refused` per item, and re-running the file is safe. This is the only route that writes a verified check: `capability check --record` through the endpoint always writes an unverified report | the deployment operator allowlist or the `verifiers` list, both checked before any read |
-| `verifiers list\|add\|remove [ACTOR] [--confirm-revoke]` | manage the deployment `verifiers` list: actors, other than operators, whose `capability-verify` records readers count as verified. The list is empty by default and grants nothing else. `remove` needs `--confirm-revoke`; the refusal names the capabilities whose verification would change | shell access to the coordination host; `deployment.private.json` is the only authority source |
+| `operators list\|add\|remove [ACTOR] [--actor OPERATOR] [--reason TEXT] [--confirm-revoke] [--all-revoked]` | manage the deployment operator allowlist: who may run the operator-gated host commands. `add` refuses an HTTP account or agent id. `remove` needs `--confirm-revoke` and first names the voids, proposal dispositions and settings that change (capped at 5; `--all-revoked` names all). Every real change is recorded in `<runtime>/authority-changes.audit.json`, with `--actor`/`--reason` when they are given (see [the audited list changes](#the-operator-and-verifier-list-changes-are-audited)) | shell access to the coordination host; `deployment.private.json` is the only authority source |
+| `verifiers list\|add\|remove [ACTOR] [--actor OPERATOR] [--reason TEXT] [--confirm-revoke]` | manage the deployment `verifiers` list: actors, other than operators, whose `capability-verify` records readers count as verified. The list is empty by default and grants nothing else. `remove` needs `--confirm-revoke`; the refusal names the capabilities whose verification would change. Every real change is recorded like `operators` (see [the audited list changes](#the-operator-and-verifier-list-changes-are-audited)) | shell access to the coordination host; `deployment.private.json` is the only authority source |
+| `authority-changes` | read-only: the recorded changes of the operator and verifier lists - which list, the actor added or removed, the change, when, and the recorded `--actor`/`--reason` (`null` when the caller gave neither) | none: read-only |
 | `review-writes status\|on\|off --actor OPERATOR` | read or set the per-installation switch that allows **writing** the new review-workflow record shapes (`withdraw`, `request-review`, `resolve-item`, `decline-review`, an item `severity`, a request-changes `summary`). Readers in this kit understand those shapes either way; with the switch off (the default) a write of one is refused before any native write. See [Review-workflow write switch](#review-workflow-write-switch) | the deployment operator allowlist, checked before any write; `deployment.private.json` is the only source (there is no environment fallback) |
 | `checkpoint-provenance-writes status\|on\|off --actor OPERATOR` | read or set the per-installation switch that allows **writing** checkpoint provenance and direction dispositions (acknowledge, resolve, supersede). Readers in this kit understand them either way; with the switch off (the default) a checkpoint that asks for them is refused before any native write. See [Checkpoint provenance write switch](#checkpoint-provenance-write-switch) | the deployment operator allowlist, checked before any write; `deployment.private.json` is the only source |
 | `proposal-review PROJECT --actor OPERATOR --file review.json` | record a coordinator disposition on a requirement proposal. The payload is `{schema_version, operation_id, key, previous, proposal_sha256, to_state, ...}`: `previous` is the `disposition_comment_id` and `proposal_sha256` the `sha256` that `proposal get` returned, so a stale read is refused before any write. `to_state` is `under-review` (the claim), `rejected` (with `reason`), `duplicate-of` (with `duplicate_of`), `needs-info` (with `question`), `escalated-to-owner` (with `escalation: {question, owner_identity, due_by}`) or `incorporated` (with `incorporation`, checked against the requirement record) | the deployment operator allowlist, checked before any read; the actor must be mapped to a person and must not be the submitter |
@@ -400,6 +402,28 @@ and confirm with `operators list`; an empty or short list is a deploy blocker,
 not a warning. Use the identity of the person actually running the command as
 `--actor`; the owner decision is named in the payload, never by reusing the
 owner's actor.
+
+### The operator and verifier list changes are audited
+
+`operators add|remove` and `verifiers add|remove` take `--actor OPERATOR` (the operator
+making the change) and `--reason TEXT` (at most 400 characters). Every change that really
+changes a list appends one entry - time, operator, list, actor, change, reason - to
+`<runtime>/authority-changes.audit.json` beside `deployment.private.json` (schema version 1,
+mode `0600`, the last `200` entries kept). The entry is written under the same deployment
+lock as the list and **before** it, so a crash between the two leaves an entry with no
+change rather than a change with no entry. The read-only `authority-changes` command prints
+the history. The recorded `--actor` is a record, not a grant: these commands still check no
+allowlist, exactly as before (kittrial-5bb.192).
+
+A call without the flags still works, because the office wrapper `coord.sh` runs the bare
+`admin.py --root RT operators add ACTOR`. Such a call still records the change, with
+`operator` and/or `reason` `null`, and prints one sentence on stderr naming exactly what to
+add: the change is never silent, and the audit never pretends somebody was named. A
+hand-damaged `authority-changes.audit.json` is refused by every one of these commands and by
+the reader before anything is written; it is never read as an empty history. The audit is
+runtime-level and, like `actor-adoptions.audit.json`, is never part of a project's
+coordination backup. `restore-new`'s `--restore-operators`/`--restore-verifiers` re-grants
+still write the lists directly and are not recorded here.
 
 ### Standing guidance
 

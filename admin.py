@@ -5013,6 +5013,106 @@ def adopt_actor(root,project,actor,principal,operator,reason,from_principal=None
             'previous':previous,'changed':True,'moved':entry['moved'],
             'audit_records':len(actor_adoptions(root))}
 
+#: The deployment-authority audit (kittrial-5bb.192, slice 5 of
+#: docs/COORDINATORS_PER_PROJECT_DESIGN.md): every change of the operator and verifier lists
+#: made by ``operators add|remove`` and ``verifiers add|remove``. Where the adoption audit
+#: above records who gave an actor to a principal, this one records who changed the
+#: installation's authority and why. It is runtime-level, beside ``deployment.private.json``
+#: and ``actor-adoptions.audit.json``, and never part of a project's coordination backup.
+AUTHORITY_CHANGES_AUDIT='authority-changes.audit.json'
+AUTHORITY_CHANGES_SCHEMA=1
+#: A short history, like actor-adoptions.audit.json: the audit answers "who changed the
+#: lists, when and why", not "every change since the installation was made".
+AUTHORITY_CHANGES_MAX=200
+AUTHORITY_CHANGES_FIELDS=frozenset({'at','operator','list','actor','change','reason'})
+AUTHORITY_CHANGES_LISTS=('operators','verifiers')
+AUTHORITY_CHANGES_ACTIONS=('add','remove')
+#: The ceiling on a recorded ``--reason``, the same one ``adopt-actor`` uses.
+AUTHORITY_CHANGES_REASON_MAX=400
+
+def authority_change_entry(item):
+    """Whether one entry has the shape ``operators``/``verifiers`` add|remove writes.
+
+    ``operator`` and ``reason`` are null when the caller did not say them. A call without
+    the new flags keeps working - the office wrapper ``coord.sh`` runs the bare
+    ``admin.py --root RT operators add ACTOR`` - and the entry then says plainly that the
+    change was not attributed instead of pretending somebody was named. The other fields
+    are always present, so the reader can always show what changed.
+    """
+    return (isinstance(item,dict) and set(item)==AUTHORITY_CHANGES_FIELDS
+            and isinstance(item['at'],str) and bool(item['at'])
+            and isinstance(item['actor'],str) and bool(item['actor'])
+            and item['list'] in AUTHORITY_CHANGES_LISTS
+            and item['change'] in AUTHORITY_CHANGES_ACTIONS
+            and all(item[field] is None or (isinstance(item[field],str) and bool(item[field]))
+                    for field in ('operator','reason')))
+
+def authority_changes(root):
+    """The recorded operator/verifier list changes, oldest first. Reads only.
+
+    An absent file is an empty history. A file this kit cannot read as its own history is a
+    refusal, not an empty history, exactly as ``actor_adoptions``: a caller must not be told
+    "nobody changed the lists" by a damaged audit.
+    """
+    path=root/AUTHORITY_CHANGES_AUDIT
+    if not path.is_file():return []
+    try:record=record_json.loads(path.read_text(encoding='utf-8'))
+    except (OSError,UnicodeError,ValueError) as error:
+        raise ValueError('The authority-changes audit %s cannot be read: %s'%(path,error)) from None
+    entries=record.get('entries') if isinstance(record,dict) and record.get('schema_version')==AUTHORITY_CHANGES_SCHEMA else None
+    if not isinstance(entries,list) or any(not authority_change_entry(item) for item in entries):
+        raise ValueError('The authority-changes audit %s is not the history this kit writes; nothing was changed'%path)
+    return entries
+
+def record_authority_change(root,noun,action,actor,operator,reason):
+    """Append one recorded list change and return the entry written.
+
+    Called only when the list really changes, from inside ``deployment_config_lock`` and
+    BEFORE the configuration is written: a host crash between the two leaves an audit entry
+    with no change - the safer mistake, the same ordering ``adopt_actor`` uses. The caller
+    has already read the history once, so a damaged audit refuses the whole command before
+    anything is written.
+    """
+    entry={'at':utc_stamp(),'operator':operator,'list':noun,'actor':actor,'change':action,'reason':reason}
+    history=authority_changes(root)
+    history.append(entry)
+    atomic_private_write(root/AUTHORITY_CHANGES_AUDIT,
+                         json.dumps({'schema_version':AUTHORITY_CHANGES_SCHEMA,
+                                     'entries':history[-AUTHORITY_CHANGES_MAX:]}))
+    return entry
+
+def authority_change_notice(noun,action,operator,reason):
+    """The one sentence a list change without the new flags prints on stderr.
+
+    It names exactly what to add, so the bare form the office wrapper uses keeps working and
+    is never silently unattributed.
+    """
+    missing=[flag for flag,value in (('--actor OPERATOR',operator),('--reason TEXT',reason)) if value is None]
+    return ('WARNING: this %s %s was recorded in %s without %s, so the audit reads it as '
+            'unattributed. Add %s to say who changed the deployment authority and why.'
+            %(noun,action,AUTHORITY_CHANGES_AUDIT,' and '.join(missing),' and '.join(missing)))
+
+def authority_change_arguments(args,noun):
+    """Validate ``--actor``/``--reason`` for one list change; returns ``(operator,reason,notice)``.
+
+    Both are optional, because the bare form ``admin.py --root RT operators add ACTOR`` (the
+    office wrapper ``coord.sh``) must keep working. A value that IS given is normalised and
+    checked here like ``adopt-actor``'s, and ``notice`` is the one sentence to print on
+    stderr when one or both were not given, so the bare form is never silently unattributed.
+    """
+    from recovery import identity
+    operator=args.operator
+    if operator is not None:operator=identity(operator,'Invalid operator identity')
+    reason=args.reason
+    if reason is not None:
+        reason=reason.strip()
+        if not reason:raise ValueError('--reason must be a sentence, not blank')
+        if len(reason)>AUTHORITY_CHANGES_REASON_MAX:
+            raise ValueError('--reason must be at most %d characters'%AUTHORITY_CHANGES_REASON_MAX)
+    notice=(authority_change_notice(noun,args.action,operator,reason)
+            if operator is None or reason is None else None)
+    return operator,reason,notice
+
 def credential_actors(root,state_path,service_namespace=None):
     """Every worker credential of the web service with the name it writes under, and whether
     that name is somebody else's on this host (kittrial-5bb.184). Reads; changes nothing.
@@ -5197,13 +5297,25 @@ def main():
     a.add_argument('--set-aside-evidence',action='store_true',dest='set_aside_evidence',
                    help='with --duplicate: release an anchor that carries acceptance evidence; with live evidence, a remaining anchor must have live evidence too')
     a=sub.add_parser('revert-record');a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
-    a=sub.add_parser('operators');a.add_argument('action',choices=['list','add','remove']);a.add_argument('actor',nargs='?')
+    a=sub.add_parser('operators',help='the installation operator allowlist: who may run the operator-gated host '
+                                      'commands; add and remove are recorded in the authority-changes audit')
+    a.add_argument('action',choices=['list','add','remove']);a.add_argument('actor',nargs='?')
+    a.add_argument('--actor',dest='operator',default=None,metavar='OPERATOR',
+                   help='with add/remove: the operator making this change, recorded in the authority-changes '
+                        'audit (the change still applies without it, and the entry records null)')
+    a.add_argument('--reason',default=None,help='with add/remove: why the list is changed, recorded in the '
+                                                'authority-changes audit (at most %d characters)'%AUTHORITY_CHANGES_REASON_MAX)
     a.add_argument('--confirm-revoke',action='store_true',dest='confirm_revoke',
                    help='with remove: acknowledge that this operator\'s earlier operator voids stop applying')
     a.add_argument('--all-revoked',action='store_true',dest='all_revoked',
                    help='with remove: name every affected entry instead of the first 5 (the warning truncates otherwise)')
     a=sub.add_parser('verifiers',help='the capability verifiers list: actors whose capability-verify records read verified')
     a.add_argument('action',choices=['list','add','remove']);a.add_argument('actor',nargs='?')
+    a.add_argument('--actor',dest='operator',default=None,metavar='OPERATOR',
+                   help='with add/remove: the operator making this change, recorded in the authority-changes '
+                        'audit (the change still applies without it, and the entry records null)')
+    a.add_argument('--reason',default=None,help='with add/remove: why the list is changed, recorded in the '
+                                                'authority-changes audit (at most %d characters)'%AUTHORITY_CHANGES_REASON_MAX)
     a.add_argument('--confirm-revoke',action='store_true',dest='confirm_revoke',
                    help='with remove: acknowledge that this verifier\'s capability verifications stop reading verified')
     a=sub.add_parser('review-writes',help='read or set the per-installation switch that allows WRITING the new review-workflow record shapes (readers understand them either way; OFF by default)')
@@ -5247,6 +5359,8 @@ def main():
     a=sub.add_parser('actor-adoptions',help='read-only: the recorded actor adoptions (who gave which actor to which '
                                             'principal, when and why)')
     a.add_argument('project',nargs='?',help='only the adoptions of this project')
+    a=sub.add_parser('authority-changes',help='read-only: the recorded changes of the installation operator and '
+                                              'verifier lists (which list changed, who changed it, when and why)')
     a=sub.add_parser('backup');a.add_argument('projects',nargs='*',metavar='project')
     a.add_argument('--all',action='store_true',dest='all_projects',
                    help='back up every initialized project in this runtime in one run')
@@ -5740,6 +5854,7 @@ def main():
         operators(root, strict=True)
         if not args.actor:raise ValueError('operators '+args.action+' requires an actor identity')
         actor=identity(args.actor,'Invalid operator identity')
+        operator,reason,notice=authority_change_arguments(args,'operators')
         if args.action=='add':
             # An HTTP account or agent id is never an operator (kittrial-5bb.70 review
             # 01a10308): the web service acts under those ids, and an older kit's advice
@@ -5759,17 +5874,22 @@ def main():
                                  ' (re-add restores them).' + revoked_keyed_voids(root,actor,limit) +
                                  revoked_proposal_records(root,actor,limit) +
                                  ' Re-run with --confirm-revoke to acknowledge this.')
+        authority_changes(root)          # a damaged audit refuses before anything is written
         # The change is applied to a fresh read under the deployment lock, so an add or
         # remove made at the same instant by another command is not lost (kittrial-5bb.136).
+        changed=False
         with deployment_config_lock(root):
             cfg=config(root)
             current=stored_operators(cfg)
+            changed=(actor not in current) if args.action=='add' else (actor in current)
+            if changed:record_authority_change(root,'operators',args.action,actor,operator,reason)
             if args.action=='add':
                 if actor not in current:current.append(actor)
             elif actor in current:current.remove(actor)
             if current:cfg['operators']=current
             else:cfg.pop('operators',None)
             atomic_private_write(marker,json.dumps(cfg))
+        if changed and notice:print(notice,file=sys.stderr)
         print(json.dumps({'operators':current}))
     elif args.command=='verifiers':
         marker=root/'deployment.private.json'
@@ -5782,6 +5902,7 @@ def main():
         verifiers(root, strict=True)
         if not args.actor:raise ValueError('verifiers '+args.action+' requires an actor identity')
         actor=identity(args.actor,'Invalid verifier identity')
+        operator,reason,notice=authority_change_arguments(args,'verifiers')
         if args.action=='add':
             if actor not in current:current.append(actor)
         else:
@@ -5790,15 +5911,20 @@ def main():
                                  'recorded reads `reported` instead of `verified`, and drift that only their '
                                  'passes had cleared reappears' + revoked_verifications(root,actor) +
                                  ' (re-add restores them). Re-run with --confirm-revoke to acknowledge this.')
+        authority_changes(root)          # a damaged audit refuses before anything is written
+        changed=False
         with deployment_config_lock(root):
             cfg=config(root)
             current=stored_verifiers(cfg)
+            changed=(actor not in current) if args.action=='add' else (actor in current)
+            if changed:record_authority_change(root,'verifiers',args.action,actor,operator,reason)
             if args.action=='add':
                 if actor not in current:current.append(actor)
             elif actor in current:current.remove(actor)
             if current:cfg['verifiers']=current
             else:cfg.pop('verifiers',None)
             atomic_private_write(marker,json.dumps(cfg))
+        if changed and notice:print(notice,file=sys.stderr)
         print(json.dumps({'verifiers':current}))
     elif args.command=='checkpoint-provenance-writes':
         print(json.dumps(checkpoint_provenance_switch(root,args.action,args.actor)))
@@ -5816,6 +5942,9 @@ def main():
                          ensure_ascii=True,sort_keys=True))
     elif args.command=='actor-adoptions':
         print(json.dumps({'schema_version':ACTOR_ADOPTIONS_SCHEMA,'entries':actor_adoptions(root,args.project)},
+                         ensure_ascii=True,indent=2))
+    elif args.command=='authority-changes':
+        print(json.dumps({'schema_version':AUTHORITY_CHANGES_SCHEMA,'entries':authority_changes(root)},
                          ensure_ascii=True,indent=2))
     elif args.command=='backup':backup_projects(root,args.projects,args.all_projects)
     elif args.command=='backup-copy':backup_copy(root,args.destination,require_clean=args.require_clean)
