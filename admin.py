@@ -4507,9 +4507,16 @@ def key_projects(root,names):
 def key_principal(value):
     """The principal a key is to name, checked (kittrial-5bb.194, rule 2).
 
-    The same `person:NAME` form the proposal settings use, one token with no space because
-    the value is an argument of the authorized_keys command line.
+    A lane, spelled `lane:NAME` or `person:NAME` (the coordinator decision of 2026-10-08:
+    the two prefixes are different principals). One token with no space because the value is
+    an argument of the authorized_keys command line. ``--principal`` is an append argument,
+    so a value given twice is refused rather than silently taking the last.
     """
+    if isinstance(value,list):
+        if len(value)>1:
+            raise ValueError('--principal names %s twice; a key may name at most one principal'
+                             %', '.join(str(item) for item in value))
+        value=value[0] if value else None
     if value is None:return None
     from sessions import valid_principal
     return valid_principal(value,'--principal')
@@ -4626,12 +4633,15 @@ def key_line(line,root,kit):
     here=Path(os.path.realpath(str(kit)))
     endpoints=values['--endpoint'] or [wrapper.rsplit('/',1)[0]+'/endpoint.py']
     line_root=values['--root'][0] if values['--root'] else None
+    principals=values['--principal']
     entry.update({
-        'kind':'bound' if values['--project'] else 'confined',
+        # A line bound to a principal is bound, not merely confined (kittrial-5bb.194 review,
+        # finding 3): the summary counts the binding and the notes name both kinds.
+        'kind':'bound' if (values['--project'] or principals) else 'confined',
         'projects':values['--project'],
         # Slice 2 of the design adds --principal; the field is here so that the shape of the
         # listing does not change with it.
-        'principal':values['--principal'][0] if values['--principal'] else None,
+        'principal':principals[0] if principals else None,
         'root':line_root,'wrapper':wrapper,'endpoints':endpoints,
         # A line names its wrapper and endpoint by path. One printed by an earlier release of an
         # office installation still runs THAT release's kit, which knows none of the rules of
@@ -4649,6 +4659,13 @@ def key_line(line,root,kit):
         entry['unknown_projects']=[name for name in values['--project']
                                    if not re.fullmatch(r'[a-z][a-z0-9]{1,23}',name)
                                    or not (Path(root)/'projects'/name/'.beads/metadata.json').is_file()]
+    if principals:
+        # A repeated principal would be served as the last one while the listing showed the
+        # first; an ill-formed one refuses every request of that key. Both go under attention.
+        from sessions import PRINCIPAL as PRINCIPAL_FORM
+        entry['principal_repeated']=len(principals)>1
+        entry['principal_ill_formed']=any(not isinstance(item,str) or not PRINCIPAL_FORM.fullmatch(item)
+                                          for item in principals)
     return entry
 
 def authorized_keys_listing(root,file=None):
@@ -4669,14 +4686,26 @@ def authorized_keys_listing(root,file=None):
         if entry is None:continue
         lines.append({'line':number,**entry})
         summary[entry['kind']]=summary.get(entry['kind'],0)+1
+        # Both kinds of binding are counted and named (kittrial-5bb.194 review, finding 3):
+        # `bound` counts every bound line, and `principal-bound` names the principal binding
+        # on its own. The key appears only when such a line exists.
+        if entry.get('principal'):
+            summary['principal-bound']=summary.get('principal-bound',0)+1
     attention=[entry['line'] for entry in lines
                if entry.get('other_kit') or entry.get('missing') or entry.get('unknown_arguments')
-               or entry.get('unknown_projects') or entry.get('names_release') or entry['kind']=='unreadable']
+               or entry.get('unknown_projects') or entry.get('names_release') or entry['kind']=='unreadable'
+               or entry.get('principal_repeated') or entry.get('principal_ill_formed')]
     return {'schema_version':1,'file':str(path),'root':str(root),'kit':str(kit),'lines':lines,'summary':summary,
             'attention':attention,
             'notes':['unrestricted: the key has this account\'s shell and is outside every rule of the kit, on every project.',
-                     'confined: the key runs only the endpoint and may name any project.',
-                     'bound: the key runs only the endpoint and only for its projects.',
+                     'confined: the key runs only the endpoint and may name any project and any actor.',
+                     'bound: the key runs only the endpoint and only for its projects and/or its principal - the '
+                     '`projects` and `principal` fields say which. A principal-bound line is `bound`, not `confined`.',
+                     'principal-bound: counted separately for the lines that name a principal, so a line bound only to '
+                     'a principal is not read as merely confined.',
+                     'principal_ill_formed: the line names a principal that is not `lane:NAME` or `person:NAME`; the '
+                     'wrapper refuses every request of that key. principal_repeated: the line names more than one '
+                     'principal (the wrapper refuses it). Both are under attention and must be reprinted.',
                      'other_kit: the line runs a wrapper or an endpoint that is not this kit\'s file. Such a line is '
                      'served by that other kit, whatever its text says: a kit older than this one binds nothing. '
                      'Print the line again with this kit (authorized-keys) and replace it.',
@@ -4741,7 +4770,8 @@ def authorized_keys(root,key_file,role='both',python=None,comment=None,projects=
                 'This line is bound to the principal above (a lane): the endpoint refuses every request of '
                 'this key whose actor the project\'s registry does not give to that principal. Registering '
                 'a new session under this key makes the new actor that principal\'s. The binding is the '
-                '--principal argument of the line; the comment only repeats it.')
+                '--principal argument of the line; the comment only repeats it. A lane is spelled lane:NAME '
+                '(or person:NAME, which is a different principal).')
         bound_note='--project or --principal' if principal is not None else '--project'
         payload['notes'].extend([
             'The operator line is not printed with %s: an unrestricted key has the account\'s shell and '
@@ -4767,13 +4797,19 @@ ACTOR_ADOPTIONS_SCHEMA=1
 #: and why", not "every adoption since the installation was made".
 ACTOR_ADOPTIONS_MAX=200
 ACTOR_ADOPTIONS_FIELDS=frozenset({'at','operator','project','actor','principal','previous','reason'})
+#: A MOVE (the actor already belonged to another principal, named with --from) is marked in
+#: the entry. Entries written before the marker existed are still read, so the audit stays
+#: forward-compatible with this kit's own history.
+ACTOR_ADOPTIONS_MOVE='moved'
+ACTOR_ADOPTIONS_FIELDS_WITH_MOVE=ACTOR_ADOPTIONS_FIELDS|{ACTOR_ADOPTIONS_MOVE}
 
 def adoption_entry(item):
-    """Whether one entry has exactly the shape ``adopt-actor`` writes."""
-    return (isinstance(item,dict) and set(item)==ACTOR_ADOPTIONS_FIELDS
+    """Whether one entry has the shape ``adopt-actor`` writes (with or without the move marker)."""
+    return (isinstance(item,dict) and set(item) in (ACTOR_ADOPTIONS_FIELDS,ACTOR_ADOPTIONS_FIELDS_WITH_MOVE)
             and all(isinstance(item[field],str) and item[field] for field in
                     ('at','operator','project','actor','principal','reason'))
-            and (item['previous'] is None or isinstance(item['previous'],str)))
+            and (item['previous'] is None or isinstance(item['previous'],str))
+            and (ACTOR_ADOPTIONS_MOVE not in item or isinstance(item[ACTOR_ADOPTIONS_MOVE],bool)))
 
 def actor_adoptions(root,project=None):
     """The recorded adoptions, oldest first, for one project or all of them. Reads only.
@@ -4813,20 +4849,46 @@ def principal_conflicts(root,actor,principal,exclude):
         if other is not None and other!=principal:found.append((entry.name,other))
     return found
 
-def adopt_actor(root,project,actor,principal,operator,reason):
+def project_actor_names(root,project,path):
+    """The actor names the project already holds: session registrations, owners-map keys and
+    the names its tracker rows use.
+
+    Read before an adoption so that a name that appears nowhere in the project is refused
+    rather than adopted into a fictitious owner (kittrial-5bb.194 review, finding 10). The
+    tracker is read because the actors this command exists for are the legacy ones: they
+    predate the registry and are visible only in the rows they wrote. A tracker that cannot
+    be read is a refusal, never "the name is unknown".
+    """
+    from sessions import read_registry, owner_map, used_actors
+    data=read_registry(path)
+    names={record['actor'] for record in data['records'].values()}|set(owner_map(data))
+    try:
+        text=run_bd(root,project,['export','--all'])
+        rows=[json.loads(line) for line in text.splitlines() if line.strip()]
+    except (subprocess.SubprocessError,OSError,ValueError,RecursionError):
+        raise ValueError('Cannot read the tracker of project %s to check whether that actor exists there; '
+                         'nothing was changed'%project) from None
+    names|=used_actors(rows)
+    return names
+
+def adopt_actor(root,project,actor,principal,operator,reason,from_principal=None):
     """Give an existing actor to a principal in one project, and record it in the audit.
 
     Rule 2 of docs/COORDINATORS_PER_PROJECT_DESIGN.md: actors that existed before a key was
     bound are given to a principal once, by a host command, so they keep their names and
-    their history. It refuses a name on the operator allowlist that another principal owns in
-    another project: the one operator list must mean one lane everywhere. It records
-    ``previous`` when this project already gave the actor to a different principal, and
-    writes nothing at all when it already gives it to this one.
+    their history. The name must appear somewhere in the project the kit can read (a session
+    registration, an owner entry or a tracker row): a name that appears nowhere is refused.
+    It refuses a name on the operator allowlist that another principal owns in another
+    project: the one operator list must mean one lane everywhere.
+
+    An actor this project already gives to ANOTHER principal is not moved by the same plain
+    command: ``from_principal`` (``--from``) must name the owner it has now, and the audit
+    entry is marked ``moved``. Writing nothing when it already gives it to this one.
 
     The registry is written under the project's coordination lock and the audit entry under
     the deployment lock. A damaged audit refuses the whole command before the registry is
-    touched; the audit is appended after the registry, so a host crash between the two leaves
-    an adoption the registry still shows but the audit does not.
+    touched. The audit is appended BEFORE the registry mutation, so a host crash between the
+    two leaves an audit entry with no adoption - the safer mistake (review, item 6).
     """
     path=project_dir(root,project)
     if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
@@ -4834,6 +4896,7 @@ def adopt_actor(root,project,actor,principal,operator,reason):
     from recovery import identity
     actor=valid_actor(actor,'actor')
     principal=valid_principal(principal,'--principal')
+    if from_principal is not None:from_principal=valid_principal(from_principal,'--from')
     operator=identity(operator,'Invalid operator identity')
     from keyed_records import require_configured_operator
     require_configured_operator(operator,operators(root,strict=True),'adopt an actor')
@@ -4848,6 +4911,10 @@ def adopt_actor(root,project,actor,principal,operator,reason):
                              'installation; adopt it there first, or take it off the operator list.'
                              %(actor,principal,conflicts[0][0],conflicts[0][1]))
     actor_adoptions(root)                       # a damaged audit refuses before anything is written
+    if actor not in project_actor_names(root,project,path):
+        raise ValueError('Refusing to adopt %s: no session registration, owner entry or tracker row in project %s '
+                         'names that actor, so this project holds nothing to give to %s. Check the name '
+                         '(session show ACTOR, or the project rows); nothing was changed.'%(actor,project,principal))
     try:
         import fcntl
     except ImportError:                         # a platform without flock: the atomic write still stands
@@ -4858,25 +4925,39 @@ def adopt_actor(root,project,actor,principal,operator,reason):
         data=read_registry(path)
         current=dict(owner_map(data))
         previous=current.get(actor)
+        if previous is not None and previous!=principal:
+            # An actor belongs to one principal: moving it out of another's hands is not the
+            # same plain command that gives a legacy actor its first owner (review, item 2).
+            if from_principal is None:
+                raise ValueError('Refusing to move %s: project %s already gives it to %s. One actor belongs to one '
+                                 'principal; to move it, name the owner it has now with --from %s. Nothing was changed.'
+                                 %(actor,project,previous,previous))
+            if from_principal!=previous:
+                raise ValueError('--from names %s, but project %s gives %s to %s; nothing was changed.'
+                                 %(from_principal,project,actor,previous))
+        elif from_principal is not None and from_principal!=previous:
+            raise ValueError('--from names %s, but project %s does not give %s to it; nothing was changed.'
+                             %(from_principal,project,actor))
         changed=previous!=principal
         if changed:
+            entry={'at':utc_stamp(),'operator':operator,'project':project,'actor':actor,'principal':principal,
+                   'previous':previous,'reason':reason,'moved':previous is not None}
+            with deployment_config_lock(root):
+                history=actor_adoptions(root)
+                history.append(entry)
+                atomic_private_write(root/ACTOR_ADOPTIONS_AUDIT,
+                                     json.dumps({'schema_version':ACTOR_ADOPTIONS_SCHEMA,
+                                                 'entries':history[-ACTOR_ADOPTIONS_MAX:]}))
             current[actor]=principal
             data['owners']=current
             validate_sessions(data)
             atomic(path/'.sessions.json',data)
     if not changed:
         return {'schema_version':1,'project':project,'actor':actor,'principal':principal,
-                'previous':previous,'changed':False,'audit_records':len(actor_adoptions(root))}
-    entry={'at':utc_stamp(),'operator':operator,'project':project,'actor':actor,'principal':principal,
-           'previous':previous,'reason':reason}
-    with deployment_config_lock(root):
-        history=actor_adoptions(root)
-        history.append(entry)
-        atomic_private_write(root/ACTOR_ADOPTIONS_AUDIT,
-                             json.dumps({'schema_version':ACTOR_ADOPTIONS_SCHEMA,
-                                         'entries':history[-ACTOR_ADOPTIONS_MAX:]}))
+                'previous':previous,'changed':False,'moved':False,'audit_records':len(actor_adoptions(root))}
     return {'schema_version':1,'project':project,'actor':actor,'principal':principal,
-            'previous':previous,'changed':True,'audit_records':len(actor_adoptions(root))}
+            'previous':previous,'changed':True,'moved':entry['moved'],
+            'audit_records':len(actor_adoptions(root))}
 
 def credential_actors(root,state_path,service_namespace=None):
     """Every worker credential of the web service with the name it writes under, and whether
@@ -5088,21 +5169,24 @@ def main():
     a.add_argument('--project',action='append',default=None,metavar='NAME',
                    help='bind the contributor line to this project (repeatable): the endpoint then refuses every '
                         'request of that key for another project. Without it the key may name any project')
-    a.add_argument('--principal',default=None,metavar='NAME',
-                   help='bind the contributor line to this principal (a lane, person:NAME): the endpoint then '
-                        'refuses every request of that key whose actor that principal does not own in the '
-                        'project. Without it the key acts as any actor')
+    a.add_argument('--principal',action='append',default=None,metavar='NAME',
+                   help='bind the contributor line to this principal (a lane, lane:NAME or person:NAME): the '
+                        'endpoint then refuses every request of that key whose actor that principal does not own '
+                        'in the project. Without it the key acts as any actor. Given twice, refused')
     a=sub.add_parser('authorized-keys-list',help='read-only: every line of authorized_keys, what it may do here, the '
-                     'projects it is bound to, and whether it points at the installed kit')
+                     'projects and the principal it is bound to, and whether it points at the installed kit')
     a.add_argument('--file',default=None,help='the authorized_keys file to read (default: ~/.ssh/authorized_keys of this account)')
     a=sub.add_parser('adopt-actor',help='give an existing actor to a principal (a lane) in one project, so a key '
                                         'bound to that principal may act as it; recorded in the adoption audit '
                                         '(operator allowlist)')
     a.add_argument('project',help='the project whose registry records the actor')
     a.add_argument('actor',metavar='ACTOR',help='the actor name to give to the principal, as it already appears in '
-                                                'the project (a session actor or an older name)')
-    a.add_argument('--principal',required=True,metavar='NAME',help='the principal (a lane, person:NAME) that actor '
-                                                                   'is to belong to')
+                                                'the project (a session actor, or an older name with tracker rows)')
+    a.add_argument('--principal',required=True,metavar='NAME',help='the principal (a lane, lane:NAME or person:NAME) '
+                                                                   'that actor is to belong to')
+    a.add_argument('--from',dest='from_principal',default=None,metavar='NAME',
+                   help='the principal that currently owns the actor, required to MOVE an actor another principal '
+                        'already owns: without it the move is refused')
     a.add_argument('--actor',required=True,dest='operator',metavar='OPERATOR',
                    help='the actor performing the adoption, on the deployment operator allowlist')
     a.add_argument('--reason',required=True,help='why this actor is being adopted (recorded in the audit)')
@@ -5673,7 +5757,8 @@ def main():
     elif args.command=='authorized-keys-list':
         print(json.dumps(authorized_keys_listing(root,args.file),ensure_ascii=True,indent=2))
     elif args.command=='adopt-actor':
-        print(json.dumps(adopt_actor(root,args.project,args.actor,args.principal,args.operator,args.reason),
+        print(json.dumps(adopt_actor(root,args.project,args.actor,args.principal,args.operator,args.reason,
+                                     from_principal=args.from_principal),
                          ensure_ascii=True,sort_keys=True))
     elif args.command=='actor-adoptions':
         print(json.dumps({'schema_version':ACTOR_ADOPTIONS_SCHEMA,'entries':actor_adoptions(root,args.project)},

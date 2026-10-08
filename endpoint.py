@@ -501,6 +501,15 @@ def key_principal_refusal(request,path,key_principal):
 
 def execute(root,request,authority_config=None,require_authority=False,key_projects=None,key_principal=None):
     key_project_refusal(request,key_projects)
+    # Rule 2: a key bound to a principal is refused the web-only actions here, before their
+    # name is looked at. The gate proper needs the project's registry and is asked below,
+    # after the project is known; this structural refusal means no action at all is answered
+    # before the gate, so an action added above it later cannot slip past (kittrial-5bb.194
+    # review, mutant N1; slice 1 does the same for a key bound to projects).
+    if key_principal is not None:
+        answered=request.get('action') if isinstance(request,dict) else None
+        if answered in SERVICE_ONLY_ACTIONS:
+            raise ValueError('%s is available only to the web service'%answered)
     # Two actions exist only for the web service and name no existing project
     # (kittrial-5bb.118 part 2); project_creation holds them, with what stops other callers.
     if request.get('action')=='create-project':

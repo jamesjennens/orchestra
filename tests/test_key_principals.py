@@ -19,6 +19,7 @@ import base64
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -41,8 +42,9 @@ except ImportError:                                   # fcntl: the endpoint is P
 
 POSIX = unittest.skipIf(endpoint is None, 'endpoint imports fcntl (POSIX-only)')
 KEY_BODY = base64.b64encode(b'orchestra-principal-synthetic-key').decode()
-MINE = 'person:lane-one'
-OTHER = 'person:lane-two'
+MINE = 'lane:lane-one'
+OTHER = 'lane:lane-two'
+PERSON = 'person:lane-one'                            # a different principal from MINE, same name
 UNKNOWN = 'Unknown/uninitialized project'
 
 
@@ -87,6 +89,19 @@ def tree(folder):
             for path in sorted(Path(folder).rglob('*'))}
 
 
+def actions_of_the_endpoint():
+    """Every action name ``endpoint.execute`` compares the request's action with, read from its
+    source, exactly as tests/test_key_projects.py does for rule 1. An action added to
+    ``execute`` above the principal gate is then exercised by the test below by itself
+    (kittrial-5bb.194 review, mutant N1)."""
+    source = (KIT/'endpoint.py').read_text(encoding='utf-8')
+    body = source[source.index('\ndef execute('):source.index('\ndef main(')]
+    names = set(re.findall(r"action'?\)?\s*[!=]=\s*'([a-z-]+)'", body))
+    for group in re.findall(r"action in \(([^)]*)\)", body):
+        names.update(re.findall(r"'([a-z-]+)'", group))
+    return names
+
+
 @POSIX
 class BoundPrincipalEndpointTests(unittest.TestCase):
     """endpoint.execute, with a key bound to a principal."""
@@ -112,6 +127,11 @@ class BoundPrincipalEndpointTests(unittest.TestCase):
     def view(self, project='alpha', actor=None):
         return {'project': project, 'actor': self.mine['actor'] if actor is None else actor, 'action': 'view'}
 
+    def sentence(self, actor):
+        return ('This key is bound to principal %s and may act only as actors that principal '
+                'registered in this project; %s is not one of them'
+                % (MINE, actor if isinstance(actor, str) and actor else repr(actor)))
+
     def test_a_bound_key_acts_only_as_its_principals_actors(self):
         # Its own actor is served, exactly as an unbound caller.
         self.assertEqual(endpoint.execute(self.root, self.view(), key_principal=MINE),
@@ -120,9 +140,99 @@ class BoundPrincipalEndpointTests(unittest.TestCase):
         # anything is read or run.
         for actor in (self.other['actor'], 'session-'+str(uuid.uuid4()), 'legacy-name', ''):
             with self.subTest(actor=actor):
-                self.refused(self.view(actor=actor),
-                             'This key is bound to principal %s and may act only as actors that principal '
-                             'registered in this project; %s is not one of them' % (MINE, actor or "''"))
+                self.refused(self.view(actor=actor), self.sentence(actor))
+
+    def test_a_non_text_actor_is_refused(self):
+        # E5: the gate itself refuses an actor that is not text, before any later shape check.
+        for actor in (None, 7, True, ['session-'+str(uuid.uuid4())], {'actor': 'x'}):
+            with self.subTest(actor=actor):
+                self.refused({'project': 'alpha', 'actor': actor, 'action': 'view'}, self.sentence(actor))
+
+    def test_an_actor_whose_case_differs_is_a_different_actor(self):
+        # E11: names are compared exactly; 'Session-...' is nobody's.
+        upper = self.mine['actor'][0].upper()+self.mine['actor'][1:]
+        self.assertEqual(upper, 'S'+self.mine['actor'][1:])
+        self.refused(self.view(actor=upper), self.sentence(upper))
+
+    def test_every_session_operation_is_gated_not_only_register(self):
+        # E3 and E13: resume, run and show are served only for the key's own actor; nothing is
+        # written for another actor and the registry bytes are unchanged.
+        registry = self.root/'projects'/'alpha'/'.sessions.json'
+        before = registry.read_bytes()
+        cases = [['resume', '--request-id', str(uuid.uuid4())],
+                 ['run', 'start', '--run-id', str(uuid.uuid4()), '--event-id', str(uuid.uuid4()), '--task', 'x'],
+                 ['run', 'status', '--run-id', str(uuid.uuid4())],
+                 ['run', 'heartbeat', '--run-id', str(uuid.uuid4()), '--event-id', str(uuid.uuid4())],
+                 ['show', 'legacy-name']]
+        for actor in (self.other['actor'], 'legacy-name'):
+            for args in cases:
+                with self.subTest(actor=actor, args=args[:2]):
+                    self.refused({'project': 'alpha', 'actor': actor, 'action': 'session', 'args': args},
+                                 self.sentence(actor))
+        self.assertEqual(registry.read_bytes(), before)
+
+    def test_only_the_first_argument_register_is_exempt(self):
+        # E4: 'register' anywhere but the first argument is not the exemption.
+        for args in (['run', 'start', '--run-id', str(uuid.uuid4()), '--event-id', str(uuid.uuid4()),
+                      '--task', 'register'],
+                     ['show', 'register'],
+                     ['register-extra', '--name', 'x']):
+            with self.subTest(args=args[:2]):
+                actor = self.other['actor']
+                self.refused({'project': 'alpha', 'actor': actor, 'action': 'session', 'args': args},
+                             self.sentence(actor))
+
+    def test_every_action_the_endpoint_answers_is_gated(self):
+        # N1: every action name read out of ``execute``'s own source is refused for an actor
+        # this key does not own, before it is answered; an action added above the gate fails
+        # here. The web-only actions name no project, so the gate refuses them structurally.
+        actions = actions_of_the_endpoint()
+        self.assertIn('session', actions)
+        self.assertIn('view', actions)
+        reached = AssertionError('the request reached a program or a lock')
+        for action in sorted(actions)+['no-such-action']:
+            with self.subTest(action=action):
+                request = {'project': 'alpha', 'actor': 'legacy-name', 'action': action,
+                           'args': ['list'], 'payload': {}, 'attachments': {}, 'path': 'CURRENT.md'}
+                with mock.patch.object(subprocess, 'run', side_effect=reached), \
+                        mock.patch.object(endpoint.native, 'run', side_effect=reached), \
+                        mock.patch.object(endpoint.fcntl, 'flock', side_effect=reached):
+                    with self.assertRaises(ValueError):
+                        endpoint.execute(self.root, request, key_principal=MINE)
+
+    def test_a_replayed_registration_leaves_the_owner_as_it_was(self):
+        # S3: replaying somebody's registration under a bound key reconciles; it never takes
+        # the actor over and never writes the registry.
+        registry = self.root/'projects'/'alpha'/'.sessions.json'
+        before = registry.read_bytes()
+        request = {'project': 'alpha', 'actor': '', 'action': 'session',
+                   'args': ['register', '--name', self.other['name'], '--request-id', self.other['request_id']]}
+        with mock.patch.object(endpoint.fcntl, 'flock'):
+            answer = endpoint.execute(self.root, request, key_principal=MINE)
+        result = json.loads(answer['stdout'])
+        self.assertTrue(result['reconciled'])
+        self.assertEqual(result['principal'], OTHER)
+        self.assertEqual(sessions.owners(self.root/'projects'/'alpha')[self.other['actor']], OTHER)
+        self.assertEqual(registry.read_bytes(), before)
+
+    def test_a_registration_under_a_bound_key_takes_the_allocated_actor(self):
+        # S6: the new actor is recorded under the key's principal even if its name already
+        # carried a stale owner. The public path cannot collide, so the uuid is pinned.
+        fixed = uuid.uuid4()
+        actor = 'session-'+str(fixed)
+        write_registry(self.root/'projects'/'alpha', [self.mine],
+                       owners={self.mine['actor']: MINE, actor: OTHER})
+        empty = subprocess.CompletedProcess([], 0, '', '')
+        request = {'project': 'alpha', 'actor': '', 'action': 'session',
+                   'args': ['register', '--name', 'new-worker', '--request-id', str(uuid.uuid4())]}
+        with mock.patch.object(sessions.uuid, 'uuid4', return_value=fixed), \
+                mock.patch.object(endpoint.native, 'run', return_value=empty), \
+                mock.patch.object(endpoint.fcntl, 'flock'), \
+                mock.patch.object(endpoint, 'environment', return_value={}):
+            answer = endpoint.execute(self.root, request, key_principal=MINE)
+        result = json.loads(answer['stdout'])
+        self.assertEqual(result['session']['actor'], actor)
+        self.assertEqual(sessions.owners(self.root/'projects'/'alpha')[actor], MINE)
 
     def test_an_unbound_caller_is_not_looked_at_even_with_an_owners_map(self):
         # No principal named: the owners map exists but is not consulted (today's behaviour).
@@ -156,13 +266,22 @@ class BoundPrincipalEndpointTests(unittest.TestCase):
         with self.assertRaises(ValueError) as refusal:
             endpoint.execute(self.root, self.view(), key_principal=MINE)
         self.assertEqual(str(refusal.exception), 'Invalid session registry')
+        # A registry that is not JSON at all (or is unreadable) is one plain sentence, never
+        # a bare JSONDecodeError or a PermissionError with a path (review, item 6).
+        write_registry(self.root/'projects'/'alpha', damaged='{not json')
+        with self.assertRaises(ValueError) as refusal:
+            endpoint.execute(self.root, self.view(), key_principal=MINE)
+        self.assertEqual(str(refusal.exception),
+                         'The session registry cannot be read: it is damaged, unreadable or not JSON; '
+                         'nothing was changed')
+        self.assertNotIn('JSONDecodeError', str(refusal.exception))
+        self.assertNotIn('.sessions.json', str(refusal.exception))
 
     def test_a_principal_without_projects_may_name_another_project_but_only_its_actors(self):
         # A principal without --project is not rule 1: another project is not refused as
         # unknown. But it still acts only as this principal's actors, and beta has none.
         self.refused({'project': 'beta', 'actor': self.mine['actor'], 'action': 'view'},
-                     'This key is bound to principal %s and may act only as actors that principal '
-                     'registered in this project; %s is not one of them' % (MINE, self.mine['actor']))
+                     self.sentence(self.mine['actor']))
         write_registry(self.root/'projects'/'beta', [], owners={self.mine['actor']: MINE})
         self.assertEqual(endpoint.execute(self.root, {'project': 'beta', 'actor': self.mine['actor'],
                                                       'action': 'view'}, key_principal=MINE)['stdout'],
@@ -197,15 +316,29 @@ class LaunchedPrincipalEndpointTests(unittest.TestCase):
         self.assertIn('may act only as actors that principal registered', refused['stderr'])
 
     def test_the_principal_flags_are_refused_with_the_service_or_out_of_shape(self):
-        for flags, said in ((('--key-principal', 'lane-one'), 'must be a principal name of the form person:NAME'),
+        for flags, said in ((('--key-principal', 'lane-one'), 'must be a principal name of the form lane:NAME or person:NAME'),
                             (('--key-principal', 'person:' + 'a'*100), 'must be a principal name'),
                             (('--key-principal', 'person:two words'), 'must be a principal name'),
+                            (('--key-principal', 'lane:two words'), 'must be a principal name'),
                             (('--key-principal', MINE, '--authority-store', str(self.root/'store.json')),
                              '--key-principal is for an SSH key line and cannot be combined with --authority-store')):
             with self.subTest(flags=flags):
                 answer = self.ask(self.view(self.mine['actor']), *flags)
                 self.assertEqual((answer['returncode'], answer['stdout']), (2, ''))
                 self.assertIn(said, answer['stderr'])
+
+    def test_lane_and_person_are_both_accepted_and_are_different_principals(self):
+        # The coordinator decision: a lane is spelled lane:NAME as well as person:NAME, the two
+        # prefixes are different principals, and nothing reads the proposal settings' person: map.
+        self.assertEqual(sessions.valid_principal('lane:lane-one'), 'lane:lane-one')
+        self.assertEqual(sessions.valid_principal('person:lane-one'), 'person:lane-one')
+        self.assertNotEqual(PERSON, MINE)
+        write_registry(self.root/'projects'/'alpha', [self.mine], owners={self.mine['actor']: PERSON})
+        refused = self.ask(self.view(self.mine['actor']), '--key-principal', MINE)
+        self.assertEqual((refused['returncode'], refused['stdout']), (2, ''))
+        self.assertIn('may act only as actors that principal registered', refused['stderr'])
+        self.assertEqual(self.ask(self.view(self.mine['actor']), '--key-principal', PERSON)['stdout'],
+                         'the view of alpha\n')
 
     def through_the_wrapper(self, request, *args, command=None):
         target = str(KIT/'endpoint.py')
@@ -267,22 +400,59 @@ class WrapperPrincipalTests(unittest.TestCase):
                                 '--key-principal', MINE])
 
     def test_a_principal_that_is_not_a_name_stops_the_line_and_nothing_is_run(self):
-        for value in ('lane-one', 'person:', 'person:two words', 'person:' + 'a'*100, 'Person:lane', 'person:lane\n'):
+        for value in ('lane-one', 'person:', 'person:two words', 'person:'+'a'*100, 'Person:lane', 'person:lane\n',
+                      'lane:', 'lane:two words', 'lane:'+'a'*100):
             with self.subTest(value=value):
                 argv, status, said = self.launched('--principal', value)
                 self.assertEqual((argv, status), (None, 2))
                 self.assertIn('--principal must be a principal name', said)
 
+    def test_the_wrapper_refuses_a_repeated_principal(self):
+        # Finding 3: a line with --principal twice is served as the last one and listed as the
+        # first; the wrapper refuses it, as it refuses a project named twice.
+        argv, status, said = self.launched('--principal', MINE, '--principal', OTHER)
+        self.assertEqual((argv, status), (None, 2))
+        self.assertIn('--principal names', said)
+        self.assertIn('twice', said)
+        self.assertIn(MINE, said)
+        self.assertIn(OTHER, said)
+        args = forced.parse_args(['--root', '/srv/state', '--principal', MINE, '--principal', OTHER])
+        with self.assertRaises(ValueError) as refusal:
+            forced._principal(args.principal)
+        self.assertIn('twice', str(refusal.exception))
+
+    def test_the_wrapper_binds_nothing_from_the_environment(self):
+        # W4: a principal in the environment (ORCHESTRA_PRINCIPAL or any other name) with no
+        # --principal on the line binds nothing: the line's own arguments are the only input.
+        for name in ('ORCHESTRA_PRINCIPAL', 'ORCHESTRA_KEY_PRINCIPAL', 'KEY_PRINCIPAL', 'LC_PRINCIPAL'):
+            with self.subTest(name=name):
+                said = io.StringIO()
+                with mock.patch.dict(os.environ, {'SSH_ORIGINAL_COMMAND': '/srv/kit/endpoint.py', name: OTHER}), \
+                        mock.patch.object(forced.os, 'execvpe', side_effect=OSError('not run in a test')) as executed, \
+                        mock.patch.object(sys, 'stderr', said):
+                    status = forced.main(['--root', '/srv/state', '--endpoint', '/srv/kit/endpoint.py',
+                                          '--python', '/usr/bin/python3'])
+                argv = executed.call_args.args[1] if executed.called else None
+                self.assertEqual(argv, ['/usr/bin/python3', '/srv/kit/endpoint.py', '--root', '/srv/state'])
+                self.assertNotIn('--key-principal', argv)
+                self.assertEqual(status, 2)                 # execvpe refused in the test, not the wrapper
+
     def test_the_name_rule_is_the_kits(self):
-        for name in ('person:a', MINE, 'person:lane.one', 'person:lane-one', 'person:lane_one',
-                     'person:' + 'a'*95, 'lane', 'person:', 'person:two words', 'person:' + 'a'*96,
-                     'Person:lane', 'person:lane/one'):
+        for name in ('person:a', 'person:lane.one', 'person:lane-one', 'person:lane_one',
+                     'person:' + 'a'*95, 'lane:a', 'lane:lane.one', 'lane:lane-one', 'lane:lane_one',
+                     'lane:' + 'a'*95, 'person:lane/one', 'lane:lane/one',
+                     'lane', 'person:', 'lane:', 'person:two words', 'lane:two words',
+                     'person:' + 'a'*96, 'lane:' + 'a'*96, 'Person:lane', 'Lane:lane', 'person:Lane-P'):
             kit = True
             try:
                 sessions.valid_principal(name)
             except ValueError:
                 kit = False
             self.assertEqual(bool(forced.PRINCIPAL_NAME.fullmatch(name)), kit, name)
+        # The two prefixes are different principals even under the same name.
+        self.assertNotEqual(MINE, PERSON)
+        sessions.valid_principal(MINE)
+        sessions.valid_principal(PERSON)
 
 
 class RegistryOwnerTests(unittest.TestCase):
@@ -300,7 +470,9 @@ class RegistryOwnerTests(unittest.TestCase):
 
     def test_an_unconfigured_installation_writes_no_owners_map(self):
         made = self.register()
-        self.assertIsNone(made['principal'])
+        # No owners map at all: the answer is exactly the one this kit gave before rule 2,
+        # with no `principal` key (review item 5c).
+        self.assertNotIn('principal', made)
         data = json.loads((self.path/'.sessions.json').read_text())
         self.assertNotIn('owners', data)
         # The keys an older kit's validator allows are exactly these, so it still reads it.
@@ -322,6 +494,15 @@ class RegistryOwnerTests(unittest.TestCase):
         shown = sessions.execute(self.path, 'example', ['show', owned['actor']], self.export)
         self.assertEqual(shown['principal'], MINE)
         self.assertEqual(shown['session'], owned)
+        # A registry with an owners map but no entry for this actor: `principal` is null. A
+        # registry with no map at all omits the key (item 5c).
+        other = record('other')['actor']
+        write_registry(self.path, [{'request_id': str(uuid.uuid4()), 'actor': other, 'name': 'other',
+                                    'created_at': '2026-01-01T00:00:00+00:00'}], owners={owned['actor']: MINE})
+        self.assertIsNone(sessions.execute(self.path, 'example', ['show', other], self.export)['principal'])
+        write_registry(self.path, [{'request_id': str(uuid.uuid4()), 'actor': other, 'name': 'other',
+                                    'created_at': '2026-01-01T00:00:00+00:00'}])
+        self.assertNotIn('principal', sessions.execute(self.path, 'example', ['show', other], self.export))
 
     def test_the_owner_map_is_validated(self):
         actor = record()['actor']
@@ -351,16 +532,26 @@ class AdoptionTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.root = runtime(self.tmp.name, 'alpha', 'beta')
         deployment(self.root)
+        # The tracker names the legacy actors these tests adopt; `adopt-actor` reads it to
+        # refuse a name that appears nowhere in the project (review, finding 10).
+        rows = [{'id': 't-%d' % index, 'actor': name}
+                for index, name in enumerate(('alex/s1', 'coordinator'))]
+        self.tracker = mock.patch.object(admin, 'run_bd',
+                                         return_value='\n'.join(json.dumps(row) for row in rows) + '\n')
+        self.tracker.start()
+        self.addCleanup(self.tracker.stop)
 
     def adopt(self, **more):
-        args = dict(project='alpha', actor='alex/s1', principal=MINE, operator='ops', reason='the lane he works in')
+        args = dict(project='alpha', actor='alex/s1', principal=MINE, operator='ops', reason='the lane he works in',
+                    from_principal=None)
         args.update(more)
         return admin.adopt_actor(self.root, args['project'], args['actor'], args['principal'],
-                                 args['operator'], args['reason'])
+                                 args['operator'], args['reason'], from_principal=args['from_principal'])
 
     def test_an_existing_actor_is_given_to_a_principal_and_audited(self):
         result = self.adopt()
-        self.assertEqual((result['changed'], result['previous'], result['principal']), (True, None, MINE))
+        self.assertEqual((result['changed'], result['previous'], result['principal'], result['moved']),
+                         (True, None, MINE, False))
         self.assertEqual(sessions.owners(self.root/'projects'/'alpha'), {'alex/s1': MINE})
         audit = admin.actor_adoptions(self.root)
         self.assertEqual(len(audit), 1)
@@ -368,18 +559,50 @@ class AdoptionTests(unittest.TestCase):
                          {'operator': 'ops', 'project': 'alpha', 'actor': 'alex/s1', 'principal': MINE,
                           'previous': None})
         self.assertEqual(audit[0]['reason'], 'the lane he works in')
+        self.assertFalse(audit[0]['moved'])                           # the first owner is not a move
         self.assertEqual(admin.actor_adoptions(self.root, 'beta'), [])
 
-    def test_the_same_principal_again_writes_nothing_and_a_change_records_previous(self):
+    def test_the_same_principal_again_writes_nothing_and_a_move_needs_from(self):
         self.adopt()
         before = (self.root/'actor-adoptions.audit.json').read_bytes()
         again = self.adopt(reason='said twice')
         self.assertFalse(again['changed'])
         self.assertEqual((self.root/'actor-adoptions.audit.json').read_bytes(), before)
-        moved = self.adopt(principal=OTHER, reason='moved lane')
-        self.assertEqual((moved['changed'], moved['previous']), (True, MINE))
+        # Moving another principal's actor with the plain command is refused (item 2).
+        untouched = tree(self.root)
+        with self.assertRaises(ValueError) as refusal:
+            self.adopt(principal=OTHER, reason='moved lane')
+        self.assertIn('Refusing to move', str(refusal.exception))
+        self.assertIn('--from %s' % MINE, str(refusal.exception))
+        self.assertEqual(tree(self.root), untouched)                  # nothing written
+        # --from naming the wrong owner is refused too.
+        with self.assertRaises(ValueError) as refusal:
+            self.adopt(principal=OTHER, reason='moved lane', from_principal=OTHER)
+        self.assertIn('--from names %s' % OTHER, str(refusal.exception))
+        self.assertEqual(tree(self.root), untouched)
+        # --from naming the owner it has now moves it, and the audit records the move.
+        moved = self.adopt(principal=OTHER, reason='moved lane', from_principal=MINE)
+        self.assertEqual((moved['changed'], moved['previous'], moved['moved']), (True, MINE, True))
         self.assertEqual(len(admin.actor_adoptions(self.root)), 2)
         self.assertEqual(admin.actor_adoptions(self.root)[1]['previous'], MINE)
+        self.assertTrue(admin.actor_adoptions(self.root)[1]['moved'])
+
+    def test_a_name_that_appears_nowhere_in_the_project_is_refused(self):
+        before = tree(self.root)
+        with self.assertRaises(ValueError) as refusal:
+            self.adopt(actor='ghost-actor')
+        self.assertIn('no session registration, owner entry or tracker row', str(refusal.exception))
+        self.assertEqual(tree(self.root), before)
+        # A registered session actor is enough, with no tracker row.
+        known = record('known')
+        write_registry(self.root/'projects'/'alpha', [known])
+        self.assertTrue(self.adopt(actor=known['actor'])['changed'])
+        # A tracker that cannot be read is a refusal, never "the name is unknown".
+        write_registry(self.root/'projects'/'alpha')                  # clear the owner entry
+        with mock.patch.object(admin, 'run_bd', side_effect=OSError('no bd')):
+            with self.assertRaises(ValueError) as refusal:
+                self.adopt(actor='ghost-actor')
+            self.assertIn('Cannot read the tracker', str(refusal.exception))
 
     def test_an_operator_listed_name_owned_elsewhere_by_another_principal_is_refused(self):
         # An operator identity cannot contain a slash (recovery.identity), so the name that
@@ -404,7 +627,7 @@ class AdoptionTests(unittest.TestCase):
         for more, said in ((dict(operator='nobody'), 'not a server-side configured operator'),
                            (dict(reason='   '), 'A reason is required'),
                            (dict(reason='x'*401), 'at most 400 characters'),
-                           (dict(principal='lane-one'), 'principal name of the form person:NAME'),
+                           (dict(principal='lane-one'), 'principal name of the form lane:NAME or person:NAME'),
                            (dict(actor='bad name'), 'must be a short actor name')):
             with self.subTest(more=more), self.assertRaises(ValueError) as refusal:
                 self.adopt(**more)
@@ -417,6 +640,43 @@ class AdoptionTests(unittest.TestCase):
             self.adopt()
         self.assertIn('actor-adoptions audit', str(refusal.exception))
         self.assertFalse((self.root/'projects'/'alpha'/'.sessions.json').exists())
+
+    def test_an_audit_of_the_wrong_shape_is_a_refusal_not_an_empty_history(self):
+        # A8: not merely invalid JSON but a JSON document of the wrong shape must refuse.
+        for record in ({'schema_version': 1, 'entries': [{'bogus': 1}]},
+                       {'schema_version': 2, 'entries': []},
+                       {'schema_version': 1, 'entries': 'nope'},
+                       {'schema_version': 1}):
+            with self.subTest(record=record):
+                (self.root/'actor-adoptions.audit.json').write_text(json.dumps(record), encoding='utf-8')
+                with self.assertRaises(ValueError) as refusal:
+                    admin.actor_adoptions(self.root)
+                self.assertIn('not the history this kit writes', str(refusal.exception))
+                with self.assertRaises(ValueError):
+                    self.adopt()
+
+    def test_the_audit_keeps_the_documented_newest_entries(self):
+        # A10: the limit is a documented 200 and the oldest entries are dropped.
+        self.assertEqual(admin.ACTOR_ADOPTIONS_MAX, 200)
+        entries = [{'at': '2026-01-01T00:00:00Z', 'operator': 'ops', 'project': 'alpha',
+                    'actor': 'actor-%03d' % index, 'principal': MINE, 'previous': None, 'reason': 'x'}
+                   for index in range(admin.ACTOR_ADOPTIONS_MAX)]
+        (self.root/'actor-adoptions.audit.json').write_text(
+            json.dumps({'schema_version': admin.ACTOR_ADOPTIONS_SCHEMA, 'entries': entries}), encoding='utf-8')
+        self.assertTrue(self.adopt()['changed'])
+        kept = admin.actor_adoptions(self.root)
+        self.assertEqual(len(kept), admin.ACTOR_ADOPTIONS_MAX)
+        self.assertEqual(kept[0]['actor'], 'actor-001')               # the oldest was dropped
+        self.assertEqual(kept[-1]['actor'], 'alex/s1')
+
+    def test_adopt_actor_takes_the_project_lock(self):
+        # A9: the registry write is under the project's coordination lock. Pinned at the
+        # source, as slice 1 pins the action walk, because a source-level assertion is the
+        # honest way to hold a lock that a test cannot take without deadlocking.
+        source = (KIT/'admin.py').read_text(encoding='utf-8')
+        body = source[source.index('\ndef adopt_actor('):source.index('\ndef credential_actors(')]
+        self.assertIn('fcntl.flock(lock', body)
+        self.assertIn(".coordination.lock", body)
 
     def test_a_non_project_is_refused(self):
         with self.assertRaises(ValueError) as refusal:
@@ -471,6 +731,10 @@ class PrintAndAdoptCommandTests(unittest.TestCase):
         deployment(self.root)
         self.key = Path(self.tmp.name)/'key.pub'
         self.key.write_text('ssh-ed25519 %s alex@laptop\n' % KEY_BODY, encoding='utf-8')
+        tracker = mock.patch.object(admin, 'run_bd',
+                                    return_value=json.dumps({'id': 't-1', 'actor': 'alex/s1'})+'\n')
+        tracker.start()
+        self.addCleanup(tracker.stop)
 
     def run_admin(self, *args):
         said = io.StringIO()
@@ -487,16 +751,62 @@ class PrintAndAdoptCommandTests(unittest.TestCase):
         self.assertEqual(bound['principal'], MINE)
         self.assertIn(' --principal %s",restrict,' % MINE, bound['contributor'])
         self.assertNotIn('operator', bound)
+        # A lane spelled lane:NAME is accepted exactly like person:NAME.
+        lane = json.loads(self.run_admin('authorized-keys', '--key-file', str(self.key),
+                                         '--python', '/usr/bin/python3', '--principal', 'lane:orc-coord'))
+        self.assertEqual(lane['principal'], 'lane:orc-coord')
+
+    def test_a_repeated_principal_is_refused(self):
+        # Finding 3: `authorized-keys --principal A --principal B` used to print B silently.
+        self.assertEqual(admin.key_principal(MINE), MINE)
+        with self.assertRaises(ValueError) as refusal:
+            admin.key_principal([MINE, OTHER])
+        self.assertIn('--principal names %s' % MINE, str(refusal.exception))
+        self.assertIn(OTHER, str(refusal.exception))
+        with self.assertRaises(ValueError):
+            admin.authorized_keys(self.root, str(self.key), 'contributor', '/usr/bin/python3', None, None,
+                                  [MINE, OTHER])
+
+    def test_the_listing_names_both_bindings_and_flags_a_bad_principal(self):
+        good = admin.authorized_key_lines('/srv/state', '/srv/kit', 'ssh-ed25519', KEY_BODY, 'alex@laptop',
+                                          python='/usr/bin/python3', principal=MINE)['contributor']
+        entry = admin.key_line(good, self.root, Path('/srv/kit'))
+        self.assertEqual((entry['kind'], entry['principal']), ('bound', MINE))
+        self.assertFalse(entry['principal_repeated'])
+        self.assertFalse(entry['principal_ill_formed'])
+        repeated_line = good.replace('--principal %s' % MINE, '--principal %s --principal %s' % (MINE, OTHER))
+        repeated = admin.key_line(repeated_line, self.root, Path('/srv/kit'))
+        self.assertTrue(repeated['principal_repeated'])
+        self.assertFalse(repeated['principal_ill_formed'])
+        ill_line = good.replace('--principal %s' % MINE, '--principal lane-p')
+        ill = admin.key_line(ill_line, self.root, Path('/srv/kit'))
+        self.assertTrue(ill['principal_ill_formed'])
+        self.assertEqual(ill['principal'], 'lane-p')
+        file = Path(self.tmp.name)/'authorized_keys'
+        file.write_text('\n'.join([good, repeated_line, ill_line])+'\n', encoding='utf-8')
+        listing = admin.authorized_keys_listing(self.root, str(file))
+        # Both kinds of binding are counted: `bound` for all three, `principal-bound` named.
+        self.assertEqual(listing['summary'].get('bound'), 3)
+        self.assertEqual(listing['summary'].get('principal-bound'), 3)
+        self.assertIn(2, listing['attention'])                        # the repeated principal
+        self.assertIn(3, listing['attention'])                        # the ill-formed one
 
     def test_the_adopt_command_writes_and_the_reader_prints_it(self):
         made = json.loads(self.run_admin('adopt-actor', 'alpha', 'alex/s1', '--principal', MINE,
                                          '--actor', 'ops', '--reason', 'the lane he works in'))
-        self.assertEqual((made['changed'], made['principal']), (True, MINE))
+        self.assertEqual((made['changed'], made['principal'], made['moved']), (True, MINE, False))
         listing = json.loads(self.run_admin('actor-adoptions'))
         self.assertEqual([entry['actor'] for entry in listing['entries']], ['alex/s1'])
         self.assertEqual(json.loads(self.run_admin('actor-adoptions', 'alpha'))['entries'],
                          listing['entries'])
         self.assertEqual(json.loads(self.run_admin('actor-adoptions', 'beta'))['entries'], [])
+        # A move needs --from; with it the entry is marked a move.
+        with self.assertRaises(ValueError):
+            self.run_admin('adopt-actor', 'alpha', 'alex/s1', '--principal', OTHER,
+                           '--actor', 'ops', '--reason', 'moved')
+        moved = json.loads(self.run_admin('adopt-actor', 'alpha', 'alex/s1', '--principal', OTHER,
+                                          '--from', MINE, '--actor', 'ops', '--reason', 'moved'))
+        self.assertEqual((moved['changed'], moved['previous'], moved['moved']), (True, MINE, True))
 
 
 if __name__ == '__main__':

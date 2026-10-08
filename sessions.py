@@ -11,16 +11,18 @@ UUID = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}
 #: An actor name as the endpoint accepts one (endpoint.execute's own rule), so every name a
 #: request may carry can be an entry of the registry's owners map.
 ACTOR = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.@/-]{0,95}')
-#: A principal (kittrial-5bb.194, rule 2): the ``person:NAME`` form the proposal settings
-#: already use, but one token with no space or control character, because the value is an
-#: argument of the ``authorized_keys`` command line and that line is split on spaces.
-PRINCIPAL = re.compile(r"person:[A-Za-z0-9][A-Za-z0-9_.-]{0,94}")
+#: A principal (kittrial-5bb.194, rule 2): a lane, spelled ``lane:NAME`` or ``person:NAME``
+#: (the coordinator decision of 2026-10-08; ``person:NAME`` stays for compatibility and the
+#: two prefixes are different principals). One token with no space or control character,
+#: because the value is an argument of the ``authorized_keys`` command line and that line is
+#: split on spaces. The name rules are the same under both prefixes and case is kept.
+PRINCIPAL = re.compile(r"(?:lane|person):[A-Za-z0-9][A-Za-z0-9_.-]{0,94}")
 
 def valid_principal(value, label='--principal'):
     """Return ``value`` if it is a principal name, else raise naming the form."""
     if not isinstance(value, str) or not PRINCIPAL.fullmatch(value):
-        raise ValueError('%s must be a principal name of the form person:NAME (one token: letters, '
-                         'digits, dot, underscore, dash; no space). Refused %r' % (label, value))
+        raise ValueError('%s must be a principal name of the form lane:NAME or person:NAME (one token: '
+                         'letters, digits, dot, underscore, dash; no space). Refused %r' % (label, value))
     return value
 
 
@@ -46,8 +48,9 @@ def read_registry(path):
         return {'schema_version': 1, 'records': {}}
     try:
         return validate(json.loads(file.read_text(encoding='utf-8')))
-    except (OSError, UnicodeDecodeError, RecursionError) as error:
-        raise ValueError('The session registry cannot be read: %s' % type(error).__name__) from None
+    except (OSError, UnicodeDecodeError, RecursionError, json.JSONDecodeError) as error:
+        raise ValueError('The session registry cannot be read: it is damaged, unreadable or not JSON; '
+                         'nothing was changed') from None
 
 
 def registered_actors(path):
@@ -163,12 +166,16 @@ def execute(path, project, args, export, *, actor=None, principal=None):
     a=parser.parse_args(args)
     file=path/'.sessions.json'
     if file.is_symlink() or file.with_suffix('.tmp').is_symlink():raise ValueError('Session registry paths must not be symlinks')
-    data=validate(json.loads(file.read_text(encoding='utf-8'))) if file.exists() else {'schema_version':1,'records':{}}
+    data=read_registry(path)
     if a.operation=='show':
         found=[r for r in data['records'].values() if r['actor']==a.actor]
         if not found:raise ValueError('Actor not registered in this project; legacy actors have no registration record')
-        # The principal the actor belongs to, or None when it has none (rule 2).
-        return dict(project=project,session=found[0],principal=owner_map(data).get(a.actor))
+        # The principal the actor belongs to. The key is omitted when the registry has no
+        # owners map at all (an installation that configures nothing): that answer is what
+        # this kit gave before rule 2, so "unchanged without configuration" is literally true.
+        answer=dict(project=project,session=found[0])
+        if owner_map(data):answer['principal']=owner_map(data).get(a.actor)
+        return answer
     if a.operation=='resume':
         if not UUID.fullmatch(a.request_id):raise ValueError('request-id must be a lowercase UUID')
         found=[r for r in data['records'].values() if r['actor']==actor]
@@ -242,6 +249,8 @@ def execute(path, project, args, export, *, actor=None, principal=None):
     old=data['records'].get(a.request_id)
     if old:
         if old['name']!=a.name:raise ValueError('Registration request-id already used with a different name')
+        if not owner_map(data):
+            return dict(project=project,session=old,reconciled=True)
         return dict(project=project,session=old,reconciled=True,principal=owner_map(data).get(old['actor']))
     rows=[json.loads(line) for line in export().splitlines() if line.strip()]
     occupied=used_actors(rows)|{r['actor'] for r in data['records'].values()}
@@ -259,4 +268,6 @@ def execute(path, project, args, export, *, actor=None, principal=None):
         assigned=dict(owner_map(data));assigned[actor]=valid_principal(principal)
         data['owners']=assigned
     validate(data);atomic(file,data)
-    return dict(project=project,session=record,reconciled=False,principal=owner_map(data).get(actor))
+    answer=dict(project=project,session=record,reconciled=False)
+    if owner_map(data):answer['principal']=owner_map(data).get(actor)
+    return answer

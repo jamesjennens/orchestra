@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "operation_id": "capnew-5bb194-principal-0001",
+  "operation_id": "capnew-5bb194-principal-0002",
   "key": "ssh.key-names-principal",
   "name": "An SSH key bound to a principal acts only as that principal's actors",
   "aliases": [
@@ -13,7 +13,7 @@
     "an actor belongs to a principal",
     "coordinators per project slice 2"
   ],
-  "summary": "An SSH key can be bound to a principal (a lane, person:NAME). ssh_forced_command.py takes --principal NAME from its own arguments (the authorized_keys line, never the connection) and starts the endpoint with --key-principal NAME. The project's session registry gains an owners map, actor to principal, written only when non-empty so an unconfigured installation keeps today's bytes. On a bound key, endpoint.execute refuses every request whose actor that map does not give to the key's principal, before any action; session register is the exception and records the new actor under the key's principal; session show returns the principal. A key with no --principal reads no owner and behaves as before. admin.py authorized-keys --principal prints the bound contributor line (comment orchestra-principal=person:NAME); adopt-actor PROJECT ACTOR --principal person:NAME --actor OPERATOR --reason TEXT gives an existing actor to a principal once, refuses a name on the operator allowlist that another principal owns in another project, and records it in actor-adoptions.audit.json, which admin.py actor-adoptions prints. Downgrade: a kit that predates this refuses a registry whose owners map is present.",
+  "summary": "An SSH key can be bound to a principal (a LANE, lane:NAME; person:NAME is accepted too and is a different principal). ssh_forced_command.py takes --principal NAME from the authorized_keys line, never the connection, and starts the endpoint with --key-principal NAME; a line naming one twice is refused. The session registry gains an owners map, actor to principal, written only when non-empty, so an unconfigured installation keeps today's bytes and omits the principal key. On a bound key, endpoint.execute refuses every request whose actor that map does not give to the key's principal, before any action; session register with first argument register is the only exception and records the new actor under that principal; session show returns the principal when a map exists. admin.py authorized-keys --principal prints the bound line and refuses a repeated principal; authorized-keys-list marks a repeated or ill-formed principal and counts both bindings. adopt-actor gives an EXISTING actor to a principal ONCE; moving another principal's actor needs --from OWNER and is audited moved; the audit keeps the newest 200. Downgrade: an older kit refuses a registry with owners, backup included.",
   "requirements": [],
   "anchors": [
     "docs/OPERATIONS.md#bind-a-key-to-its-principal"
@@ -27,6 +27,9 @@
     "sessions.py::execute",
     "admin.py::key_principal",
     "admin.py::authorized_key_lines",
+    "admin.py::key_line",
+    "admin.py::authorized_keys_listing",
+    "admin.py::project_actor_names",
     "admin.py::adopt_actor",
     "admin.py::actor_adoptions",
     "ssh_forced_command.py::endpoint_argv",
