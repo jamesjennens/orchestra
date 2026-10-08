@@ -2633,20 +2633,21 @@ class Service:
                  for credential in self._agent_credentials(agent) if self._credential_live(credential, moment)}
         return [list(item) for item in sorted(lists)] if len(lists) > 1 else []
 
-    def _issue_agent_credential_locked(self, principal, agent, scopes=None, label=None, first=False):
+    def _issue_agent_credential_locked(self, principal, agent, scopes=None, label=None):
         """Create one agent credential. Caller holds ``store.lock`` and has authorized.
 
-        ``first`` is the credential an agent is made with: its scopes are the ones asked for,
-        or the default. Every later one is a renewal (kittrial-5bb.208): with no list it
-        carries what the agent has; a list is taken when it asks for nothing more; and a list
-        that widens is taken only from the agent's own account, the one caller who could have
-        made the agent with those scopes.
+        With no list it carries what the agent has (kittrial-5bb.208); a list is taken when
+        it asks for nothing more; and a list that widens is taken only from the agent's own
+        account, the one caller who could have made the agent with those scopes. The
+        credential an agent is MADE with goes through the same rule and comes out as it
+        always did: an agent with no credential yet has the default, and it is its own
+        account that makes it.
         """
-        requested = tuple(scopes or (AGENT_DEFAULT_SCOPES if first else self.agent_scopes(agent)))
+        requested = tuple(scopes or self.agent_scopes(agent))
         for scope in requested:
             if scope not in CREDENTIAL_SCOPES:
                 raise invalid('Unknown credential scope %r' % (scope,))
-        if not first and scopes:
+        if scopes:
             has = self.agent_scopes(agent)
             more = [scope for scope in CREDENTIAL_SCOPES if scope in requested and scope not in has]
             if more and principal.user_id != agent['owner']:
@@ -2710,7 +2711,7 @@ class Service:
             }
             self.state['agents'][agent_id] = agent
             credential, secret = self._issue_agent_credential_locked(principal, agent,
-                                                                     scopes=scopes, first=True)
+                                                                     scopes=scopes)
             self.store.save()
             # The one-time secret travels only in this response.
             public = {
