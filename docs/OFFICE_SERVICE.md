@@ -337,6 +337,11 @@ default: `"approval_by_another_party": true` in the office service configuration
 [HTTP_DEPLOYMENT.md](HTTP_DEPLOYMENT.md). It takes effect when the service is restarted,
 and the project set-up page says whether it is on. It binds approvals made over the web
 only: one made on the host route (over SSH or on this server) is not bound by it.
+The value is `true` or `false` and nothing else (`"true"`, `1` and the like are refused
+when the configuration is read). The web service says in its log at every start whether
+it is on, and a change since the last start is an audit entry. **Before going back to an
+older kit, remove the key**: an office service that does not know it refuses to start
+("Unknown office service setting").
 
 A configuration or key line that already names `<INSTALL_ROOT>/current/...`
 needs nothing: the link moves with the upgrade. A bare `python3` in an old

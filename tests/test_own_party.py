@@ -6,6 +6,8 @@ setting that is OFF by default: with it off, every answer here is what it was.
 
 Through the real routes of the web service (the in-process backend).
 """
+import json
+import os
 import secrets
 import sys
 import unittest
@@ -18,8 +20,8 @@ import http_service
 import test_http_agents
 from http_auth import Service, Store
 
-OWN_PARTY = ('This contribution was delivered by your own account (you, one of your agents, or a worker credential '
-             'you issued). Another owner of this project, or a superuser who did not deliver it, must approve it.')
+API = http_service.ApiHandler
+OWN_PARTY = API.OWN_PARTY + API.OWN_PARTY_NEXT
 
 
 class Party(test_http_agents.AgentHarness):
@@ -78,9 +80,28 @@ class Party(test_http_agents.AgentHarness):
             'contribution': contribution, 'commit': test_http_agents.COMMIT, 'verdict': 'approve',
             'summary': 'Read the diff and ran the tests.', 'items': []}, token=token)
 
-    def refused(self, answer):
+    def refused(self, answer, sentence=OWN_PARTY):
         self.assertEqual(403, answer.status, answer.data)
-        self.assertEqual(answer.data['error']['message'], OWN_PARTY)
+        self.assertEqual(answer.data['error']['message'], sentence)
+
+    def issue(self, name, actor, project=None):
+        return self.request('POST', '/v1/projects/%s/worker-credentials' % (project or self.project),
+                            {'label': 'worker', 'actor': actor}, token=self.tokens[name])
+
+    def revoke(self, name, credential_id):
+        return self.request('POST', '/v1/projects/%s/worker-credentials/%s/revoke' % (self.project, credential_id), {},
+                            token=self.tokens[name])
+
+    def deliver_as(self, token, actor):
+        """A task claimed and delivered with ``token`` under the name ``actor``."""
+        task = self.request('POST', '/v1/projects/%s/tasks' % self.project, {'title': secrets.token_hex(4)},
+                            token=self.admin).data['id']
+        self.assertEqual(200, self.request('POST', self.base(task) + '/claim', {'actor': actor}, token=token).status)
+        made = self.request('POST', self.base(task) + '/reviews', {
+            'operation': 'contribute', 'commit': test_http_agents.COMMIT, 'base_commit': test_http_agents.BASE,
+            'bundle_sha256': test_http_agents.BUNDLE, 'summary': 'delivered', 'actor': actor}, token=token)
+        self.assertEqual(201, made.status, made.data)
+        return task, made.data['contribution']['id']
 
     def state_of(self, task):
         return self.request('GET', self.base(task) + '/brief', token=self.admin).data['review']['state']
@@ -113,7 +134,8 @@ class SettingOnTests(Party):
                 own_agent = self.agent_of('olive', 'Merlin-' + str(actor))
                 answer = self.recommend(own_agent, task, contribution)
                 self.assertEqual(403, answer.status, answer.data)
-                self.assertIn('must be independent of the author', answer.data['error']['message'])
+                self.assertEqual(answer.data['error']['message'], API.NOT_INDEPENDENT_PARTY)
+                self.assertIn('the account that issued the worker credential it was delivered under', API.NOT_INDEPENDENT_PARTY)
                 # Another account's agent recommends it and another owner approves it.
                 self.assertEqual(201, self.recommend(self.agent_of('carl', 'Osprey-' + str(actor)), task, contribution).status)
                 self.assertEqual(201, self.approve(self.tokens['oscar'], task, contribution).status)
@@ -167,8 +189,57 @@ class SettingOnTests(Party):
         self.backend._task(self.project, task)['assignee'] = agent_id
         brief = self.request('GET', self.base(task) + '/brief', token=self.admin).data
         self.assertEqual((brief['task']['assignee'], brief['review']['contribution']['author']), (agent_id, self.ids['carl']))
-        self.refused(self.approve(self.tokens['olive'], task, contribution))
+        self.refused(self.approve(self.tokens['olive'], task, contribution), API.OWN_PARTY_ASSIGNEE + API.OWN_PARTY_NEXT)
+        self.assertIn('Another account delivered the contribution', API.OWN_PARTY_ASSIGNEE)
         self.assertEqual(201, self.approve(self.tokens['oscar'], task, contribution).status)
+
+    def test_the_author_counts_when_the_task_is_another_partys(self):
+        """The other way round: olive delivered and the task was then given to carl. The assignee is
+        another party and the author is hers."""
+        task, contribution = self.deliver(self.tokens['olive'])
+        self.backend._task(self.project, task)['assignee'] = self.ids['carl']
+        brief = self.request('GET', self.base(task) + '/brief', token=self.admin).data
+        self.assertEqual((brief['task']['assignee'], brief['review']['contribution']['author']), (self.ids['carl'], self.ids['olive']))
+        self.refused(self.approve(self.tokens['olive'], task, contribution))
+        self.assertEqual(self.state_of(task), 'awaiting-review')
+        self.assertEqual(201, self.approve(self.tokens['oscar'], task, contribution).status)
+
+    def test_a_label_under_an_account_id_is_that_account(self):
+        """The review's first finding: a worker credential issued with NO name writes under its issuer's
+        account id and under any label below it. ACCOUNT/x was no account and under no credential's
+        name, so it was nobody's party and its issuer approved it every time."""
+        accounts = self.request('GET', '/v1/accounts', token=self.admin).data['items']
+        self.ids['admin'] = [account['id'] for account in accounts if account.get('superuser')][0]
+        for name, token, other in (('olive', self.tokens['olive'], self.tokens['oscar']), ('admin', self.admin, self.tokens['olive'])):
+            with self.subTest(issuer=name):
+                made = self.request('POST', '/v1/projects/%s/worker-credentials' % self.project, {'label': 'unnamed'}, token=token)
+                self.assertEqual((201, None), (made.status, made.data['credential']['actor']), made.data)
+                account = self.ids[name]
+                label = account + '/x'
+                self.assertEqual(self.service.actor_parties(label, self.project), {account})
+                self.assertEqual(self.service.actor_parties(label, None), {account})          # an account is one everywhere
+                task, contribution = self.deliver_as(made.data['credential']['secret'], label)
+                brief = self.request('GET', self.base(task) + '/brief', token=self.admin).data
+                self.assertEqual(brief['review']['contribution']['author'], label)
+                if name == 'olive':
+                    self.assertEqual(403, self.recommend(self.agent_of('olive', 'Merlin'), task, contribution).status)
+                self.refused(self.approve(token, task, contribution))
+                self.assertEqual(self.state_of(task), 'awaiting-review')
+                self.assertEqual(201, self.approve(other, task, contribution).status)
+
+    def test_each_name_of_the_approver_is_compared(self):
+        """The name a request acts under and the account behind it are both the approver. For a signed-in
+        person they are one name; an agent's are two (slice 1b), so the rule is shown on the rule itself."""
+        handler = API.__new__(API)
+        handler.service = self.service
+        olive, oscar, carl = self.ids['olive'], self.ids['oscar'], self.ids['carl']
+        said = handler._own_party_refusal
+        self.assertIsNone(said(['somebody-else', oscar], carl, carl, self.project))
+        self.assertEqual(said(['somebody-else', olive], carl, olive, self.project), OWN_PARTY)        # the account behind it
+        self.assertEqual(said([olive, 'somebody-else'], carl, olive, self.project), OWN_PARTY)        # the name it acts under
+        self.assertEqual(said(['somebody-else', olive], olive, carl, self.project), API.OWN_PARTY_ASSIGNEE + API.OWN_PARTY_NEXT)
+        self.assertEqual(said([olive, None], None, olive, self.project), OWN_PARTY)                   # no assignee, no second name
+        self.assertIsNone(said([olive, olive], None, None, self.project))                             # nobody to compare with
 
     def test_a_label_under_an_agents_name_is_the_agents_account(self):
         """An agent may write under AGENT/label. That is a different name and the same party."""
@@ -187,25 +258,65 @@ class SettingOnTests(Party):
         self.assertEqual(403, self.recommend(other, task, made.data['contribution']['id']).status)
         self.assertEqual(201, self.recommend(self.agent_of('olive', 'Osprey'), task, made.data['contribution']['id']).status)
 
-    def test_a_name_two_issuers_have_held_is_decided_by_the_moment_or_counts_for_both(self):
-        """kittrial-5bb.188 lets a superuser waive a name's reuse: the same name under two issuers, one after the other."""
-        with self.service.store.lock:
-            credentials = self.service.state['credentials']
-            credentials['cred_old'] = {'id': 'cred_old', 'user_id': self.ids['olive'], 'project_id': self.project,
-                                       'agent_id': None, 'label': 'old', 'scopes': ['tasks'], 'actor': 'lane-x',
-                                       'token_hash': 'x', 'created_at': '2026-01-01T00:00:00Z', 'issued_raw': 0,
-                                       'last_used': None, 'expires_at': 1, 'revoked': True,
-                                       'revoked_at': '2026-02-01T00:00:00Z'}
-            credentials['cred_new'] = dict(credentials['cred_old'], id='cred_new', user_id=self.ids['oscar'], token_hash='y',
-                                           created_at='2026-03-01T00:00:00Z', revoked=False, expires_at=2 * 10 ** 9)
-            credentials['cred_new'].pop('revoked_at')
-        parties = self.service.actor_parties
+    def test_a_name_has_one_issuer_at_a_time(self):
+        """The review's second finding, first half: while oscar's credential was unused, olive was issued the
+        same name. A name another account's WORKING credential holds is refused, used or not, in both
+        directions of holding; the same account may issue it again (that is how it replaces a credential)."""
+        held = self.issue('oscar', 'squat')
+        self.assertEqual(201, held.status, held.data)
+        for name in ('squat', 'squat/night'):
+            with self.subTest(asked=name):
+                refused = self.issue('olive', name)
+                self.assertEqual(409, refused.status, refused.data)
+                self.assertEqual(refused.data['error']['message'],
+                                 'The name %s is held by a working credential of this project that another account issued '
+                                 '(squat, issued by oscar). A name has one issuer at a time: have that credential revoked '
+                                 'first, or choose another name' % name)
+                self.assertEqual(refused.data['error']['detail'], {'held_by_credential': held.data['credential']['id']})
+        self.assertEqual(201, self.issue('oscar', 'deep/lane/one').status)
+        self.assertEqual(409, self.issue('olive', 'deep').status)                 # it would hold oscar's name
+        self.assertEqual(409, self.issue('olive', 'deep/lane').status)
+        self.assertEqual(201, self.issue('olive', 'deep-other').status)           # only looks like it
+        self.assertEqual(201, self.issue('olive', 'deeper/lane').status)
+        self.assertEqual(201, self.issue('oscar', 'squat').status)                # the same account, again
+        self.assertEqual(self.service.actor_parties('squat', self.project), {self.ids['oscar']})
+        # In another project the name is free: a name is held in a project.
+        beta = self.create_project(self.admin, 'Beta')
+        self.assertEqual(200, self.request('PUT', '/v1/projects/%s/members/%s' % (beta, self.ids['olive']), {'role': 'owner'},
+                                           token=self.admin).status)
+        self.assertEqual(201, self.issue('olive', 'squat', beta).status)
+
+    def test_every_issuer_a_name_has_had_is_of_the_works_party(self):
+        """Second half: nothing on a record says which credential wrote it, and the moment cannot say it either
+        (the tracker's stamp is later than this service's clock). So no moment decides: where two accounts
+        have held a name, one after the other, work under it is of both, whenever it was written."""
+        first = self.issue('oscar', 'lane-x')
+        self.assertEqual(204, self.revoke('oscar', first.data['credential']['id']).status)
+        second = self.issue('olive', 'lane-x')                                    # free again once revoked
+        self.assertEqual(201, second.status, second.data)
         both = {self.ids['olive'], self.ids['oscar']}
-        self.assertEqual(parties('lane-x', self.project, '2026-01-15T00:00:00Z'), {self.ids['olive']})
-        self.assertEqual(parties('lane-x', self.project, '2026-03-15T00:00:00Z'), {self.ids['oscar']})
-        self.assertEqual(parties('lane-x', self.project), both)                   # no moment: both, which only refuses more
-        self.assertEqual(parties('lane-x', self.project, '2026-02-15T00:00:00Z'), both)      # between the two lives: both
-        self.assertEqual(parties('lane-x', 'another-project'), {'lane-x'})        # a name is held in a project
+        self.assertEqual(self.service.actor_parties('lane-x', self.project), both)
+        self.assertEqual(self.service.actor_parties('lane-x/night', self.project), both)
+        self.assertEqual(self.service.actor_parties('lane-x', 'another-project'), {'lane-x'})
+        self.assertEqual(self.service.actor_parties('lane-x', None), {'lane-x'})
+        task, contribution = self.deliver(second.data['credential']['secret'])
+        shared = API.OWN_PARTY_SHARED % 'lane-x' + API.OWN_PARTY_NEXT
+        self.assertIn('nothing on the record says which credential wrote it', shared)
+        # olive's credential wrote it; oscar's never wrote anything. Both are refused, and told why.
+        self.refused(self.approve(self.tokens['olive'], task, contribution), shared)
+        self.refused(self.approve(self.tokens['oscar'], task, contribution), shared)
+        self.assertEqual(self.state_of(task), 'awaiting-review')
+        # Revoked too, the name stays theirs: a credential that no longer works still says whose the work was.
+        self.assertEqual(204, self.revoke('olive', second.data['credential']['id']).status)
+        self.refused(self.approve(self.tokens['olive'], task, contribution), shared)
+        self.assertEqual(201, self.approve(self.admin, task, contribution).status)
+
+    def test_a_writer_nobody_knows_is_its_own_party(self):
+        """A name that is no account, no agent and under no credential record (a lane of the host route):
+        its own party, so whoever may approve here approves it. Accepted as the rule, and said."""
+        task = self.request('POST', '/v1/projects/%s/tasks' % self.project, {'title': 'host'}, token=self.admin).data['id']
+        self.assertEqual(self.service.actor_parties('host-lane', self.project), {'host-lane'})
+        self.assertEqual(self.service.actor_parties('usr_0000000000000000/x', self.project), {'usr_0000000000000000/x'})
 
     def test_the_queue_and_the_brief_count_by_the_same_parties(self):
         """A recommendation from the issuer's own agent on work under the issuer's worker credential is not shown as one."""
@@ -270,6 +381,47 @@ class SettingOnTests(Party):
         self.assertEqual(row.get('recommended_by'), [agent_id])
         self.assertEqual(201, self.approve(self.tokens['oscar'], task, contribution).status)
 
+    def planted(self, task, contribution, name):
+        """A recommendation standing under ``name``, as written over the host route."""
+        records = self.backend.state['contributions'][task]
+        self.backend.state.setdefault('recommendations', {}).setdefault(task, []).append({
+            'id': 'rec_' + secrets.token_hex(4), 'task_id': task, 'kind': 'recommendation', 'contribution_id': contribution,
+            'commit': test_http_agents.COMMIT, 'verdict': 'approve', 'summary': 'planted', 'items': [], 'actor': name,
+            'created_at': '2099-01-01T00:00:00Z', 'after': len(records)})
+
+    def test_every_read_traces_a_name_in_the_project_of_the_work(self):
+        """`lane-c` is cora's here and nobody's anywhere else. Three places asked without the project and so
+        took the name for nobody's: whether my party has recommended already, an agent's next actions, and
+        what My work offers a person's agents to recommend. cora issued the credential as an owner and is a
+        contributor now, so she recommends and does not approve."""
+        self.ids['cora'] = self.create_account(self.admin, 'cora', 'cora-password-1')
+        self.tokens['cora'] = self.login('cora', 'cora-password-1')[0]
+        members = '/v1/projects/%s/members/%s' % (self.project, self.ids['cora'])
+        self.assertEqual(200, self.request('PUT', members, {'role': 'owner'}, token=self.admin).status)
+        worker, _ = self.worker_of('cora', 'lane-c')
+        under, delivered = self.deliver(worker)                                   # cora's party's work
+        self.assertEqual(200, self.request('PUT', members, {'role': 'contributor'}, token=self.admin).status)
+        other, contribution = self.deliver(self.tokens['carl'])                   # another party's
+        agent = self.agent_of('cora', 'Merlin')
+
+        def offered():
+            return {item['task'] for item in self.request('GET', '/v1/agents/me/next', token=agent).data['next_actions']
+                    if item.get('kind') in ('to-review', 'review-recommended')}
+
+        def prompt():
+            return self.request('GET', '/v1/me/work', token=self.tokens['cora']).data['agent_prompts'][0]['text']
+        self.assertEqual(offered() & {under, other}, {other})                     # not its own party's work
+        self.assertIn(other, prompt())
+        self.assertNotIn(under, prompt())
+        self.assertEqual(403, self.recommend(agent, under, delivered).status)
+        # A recommendation by cora's worker credential stands on carl's work: cora's party has recommended.
+        self.planted(other, contribution, 'lane-c')
+        again = self.recommend(agent, other, contribution)
+        self.assertEqual(409, again.status, again.data)
+        self.assertEqual(again.data['error']['detail'], {'recommended_by': 'lane-c'})
+        self.assertNotIn(other, offered())
+        self.assertNotIn(other, prompt())
+
 
 class SettingOffTests(Party):
     """An installation that configures nothing: every answer is today's."""
@@ -330,17 +482,100 @@ class SaidOnTheSetUpPageTests(Party):
         self.assertIn('On this server an owner may approve work of their own account', page)
 
 
-class WiringTests(unittest.TestCase):
+class TaskPageTests(unittest.TestCase):
+    """The review form of web/js/views/task.js run under Node: a refusal that says who must approve
+    instead stays on the page. As a toast it was gone after seven seconds."""
 
-    def test_the_service_is_started_with_the_setting_only_when_the_office_configuration_says_true(self):
+    def test_the_refusal_stays_on_the_page(self):
+        import shutil
+        from test_http_web import run_node_module
+        node = shutil.which('node')
+        if not node:
+            print('NOTE: TaskPageTests.test_the_refusal_stays_on_the_page was SKIPPED: node is not installed, so the '
+                  'review form of web/js/views/task.js was not run on this platform.', file=sys.stderr)
+            self.skipTest('node is not installed; the review form is not run here')
+        done = run_node_module(self, node, 'await import(process.argv[1])',
+                               (KIT / 'tests' / 'web_task_review_screen.mjs').as_uri(),
+                               (KIT / 'tests' / 'web_dom_shim.mjs').as_uri(),
+                               (KIT / 'web' / 'js' / 'views' / 'task.js').as_uri())
+        self.assertEqual(0, done.returncode, done.stderr[-3000:])
+        seen = json.loads(done.stdout.strip().splitlines()[-1])
+        refused = seen['refused']
+        self.assertEqual((refused['sent'], refused['renders']), (['approve'], 0))             # the page is not redrawn
+        self.assertEqual(refused['banner']['hidden'], False)
+        self.assertEqual(refused['banner']['refused'], '403')
+        self.assertTrue(refused['banner']['text'].startswith('This contribution was delivered by your own party'))
+        self.assertIn('must approve it.', refused['banner']['text'])
+        # A stale page keeps its own sentence, and an approval that is taken redraws the page.
+        self.assertEqual((seen['stale']['banner']['hidden'], seen['stale']['banner']['refused'], seen['stale']['renders']),
+                         (False, None, 0))
+        self.assertIn('A newer revision arrived', seen['stale']['banner']['text'])
+        self.assertEqual((seen['approved']['banner']['hidden'], seen['approved']['renders']), (True, 1))
+
+
+class WiringTests(Party):
+    """How the setting reaches the service, loaded and run rather than read."""
+
+    @unittest.skipUnless(os.name == 'posix', 'office_service.py imports fcntl; POSIX only')
+    def test_the_office_configuration_takes_true_or_false_and_nothing_else(self):
+        import office_service
+        import tempfile
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'office.json'
+
+            def loaded(value):
+                path.write_text(json.dumps(dict({'schema_version': 1}, **({} if value is None else
+                                                                          {'approval_by_another_party': value}))),
+                                encoding='utf-8')
+                return office_service.service_config(path)
+            for bad in ('true', 1, 0, 'on', [], None.__class__.__name__):
+                with self.subTest(value=bad):
+                    with self.assertRaisesRegex(ValueError, 'approval_by_another_party must be true or false'):
+                        loaded(bad)
+            commands = {}
+            for value in (True, False, None):
+                settings = loaded(value)
+                commands[value] = office_service.web_command(settings, Path(folder), 8443, 'python3', Path(folder) / 'office_service.py')
+            self.assertIn('--approval-by-another-party', commands[True])
+            self.assertNotIn('--approval-by-another-party', commands[False])
+            self.assertNotIn('--approval-by-another-party', commands[None])
+
+    def test_the_flag_is_taken_whole_or_not_at_all(self):
+        import contextlib
+        import io
+        for prefix in ('--approval-by-another', '--approval', '--approval-by-another-part'):
+            with self.subTest(flag=prefix):
+                said = io.StringIO()
+                with contextlib.redirect_stderr(said), self.assertRaises(SystemExit) as stopped:
+                    http_service.main(['--state', str(Path(self.service.store.path).with_name('none.json')), prefix])
+                self.assertEqual(stopped.exception.code, 2)
+                self.assertIn('unrecognized arguments: ' + prefix, said.getvalue())
         import inspect
         source = inspect.getsource(http_service.main)
         self.assertIn("approval_by_another_party=args.approval_by_another_party", source)
-        self.assertIn("'--approval-by-another-party', action='store_true'", source)
-        office = (KIT / 'office_service.py').read_text(encoding='utf-8')
-        self.assertIn("if settings.get('approval_by_another_party') is True:\n        command.append('--approval-by-another-party')", office)
-        self.assertIn("raise ValueError('approval_by_another_party must be true or false')", office)
+        self.assertIn("for line in settings_lines(service):\n        print(line, file=sys.stderr)", source)
 
+    def test_a_start_says_the_setting_and_a_change_is_in_the_audit(self):
+        def entries():
+            with self.service.store.lock:
+                return [(event['action'], event['outcome'], event['reason'], event['user_id'])
+                        for event in self.service.state['audit'] if event['action'].startswith('settings.')]
+        self.service.approval_by_another_party = False
+        self.assertEqual(http_service.settings_lines(self.service),
+                         ['approval by another party (--approval-by-another-party): off'])
+        self.assertEqual(entries(), [])                                           # never recorded counts as off
+        self.service.approval_by_another_party = True
+        self.assertEqual(http_service.settings_lines(self.service),
+                         ['approval by another party (--approval-by-another-party): on '
+                          '(it was off at the last start; recorded in the audit)'])
+        self.assertEqual(entries(), [('settings.approval_by_another_party', 'committed', 'off -> on at service start', None)])
+        self.assertEqual(http_service.settings_lines(self.service), ['approval by another party (--approval-by-another-party): on'])
+        self.assertEqual(len(entries()), 1)                                       # the same again: no second entry
+        # It is in the state file, so the next process knows what the last start had.
+        again = Service(Store(self.service.store.path), approval_by_another_party=False)
+        self.assertEqual(again.note_settings(), (True, False))
+        self.assertEqual([event['reason'] for event in again.state['audit'] if event['action'].startswith('settings.')],
+                         ['off -> on at service start', 'on -> off at service start'])
 
 if __name__ == '__main__':
     unittest.main()

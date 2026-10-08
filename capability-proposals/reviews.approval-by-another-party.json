@@ -12,7 +12,7 @@
     "web coordinator slice 1a",
     "lane is an account"
   ],
-  "summary": "An installation setting of the web service, off by default: --approval-by-another-party on http_service.py, or approval_by_another_party: true in the office service configuration. Off, every review rule is what it was. On, one party is an account, every agent that account made and every worker credential it issued (Service.actor_parties): approve is refused with 403 and a sentence that says what to do when the approver's party is that of the contribution's author or the task's assignee, a superuser included for their own party's work; recommend, the review queue, My work and the brief count by the same parties. Work under a worker credential is traced by the credential whose actor namespace holds the name, in that project; where two issuers held one name, the credential alive when the contribution was written decides, else both count. GET /v1/projects/{id}/setup carries rules.approval_by_another_party and the set-up page says whether it is on.",
+  "summary": "An installation setting of the web service, off by default: --approval-by-another-party on http_service.py (taken whole, no abbreviation), or approval_by_another_party: true in the office service configuration. Off, every review rule is what it was. On, one party is an account, every agent that account made and every worker credential it issued (Service.actor_parties): approve is refused with 403 and a sentence that says what is true and what to do when the approver's party is that of the contribution's author or the task's assignee, a superuser included; recommend, the review queue, My work and the brief count by the same parties. A name whose first segment is an account or agent is that account's. Any other name under a worker credential is of every account that ever issued a credential holding it, in that project; no moment decides. A name has one issuer at a time: a name a working credential of another account holds is refused with 409. A writer under no account, agent or credential is its own party. The service logs the setting at start and audits a change (settings.approval_by_another_party); GET /v1/projects/{id}/setup carries rules.approval_by_another_party.",
   "requirements": [],
   "anchors": [
     "docs/HTTP_DEPLOYMENT.md#nobody-approves-work-of-their-own-party"
@@ -20,8 +20,12 @@
   "code": [
     "http_auth.py::Service.actor_parties",
     "http_auth.py::Service.actor_person",
+    "http_auth.py::Service.note_settings",
+    "http_auth.py::Service.issue_credential",
     "http_service.py::ApiHandler._independent",
+    "http_service.py::ApiHandler._own_party_refusal",
     "http_service.py::ApiHandler.reviews_add",
+    "http_service.py::settings_lines",
     "project_setup.py::steps",
     "office_service.py::service_config"
   ],

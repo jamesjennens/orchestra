@@ -2015,6 +2015,24 @@ class Service:
                     and claimed != principal.user_id:
                 raise invalid('A credential actor namespace cannot have the shape of an account or agent id '
                               'other than your own account id')
+            if actor is not None:
+                # One name has one issuer at a time (kittrial-5bb.199 review): with the party
+                # rule on, work under a name is of every account that ever issued it, so a
+                # second account must not be able to take a name that is in use, written
+                # under yet or not. The same account may: that is how it replaces a lane's
+                # credential without a gap, and both are its own party.
+                moment = self._expiry_now()
+                for other in self.state['credentials'].values():
+                    if not isinstance(other, dict) or other.get('agent_id') or other.get('project_id') != project_id \
+                            or other.get('user_id') == principal.user_id or not self._credential_live(other, moment):
+                        continue
+                    theirs = other.get('actor')
+                    if self._holds(theirs, actor) or self._holds(actor, theirs):
+                        raise conflict('The name %s is held by a working credential of this project that another account '
+                                       'issued (%s, issued by %s). A name has one issuer at a time: have that credential '
+                                       'revoked first, or choose another name'
+                                       % (actor, theirs, self._owner_name(other.get('user_id'))),
+                                       {'held_by_credential': other.get('id')})
             secret = new_token()
             # ``created_at`` is informational and stays on the raw clock; the credential's
             # expiry is stamped on the monotone clock, so a credential issued during a
@@ -2247,7 +2265,7 @@ class Service:
                 return agent['owner']
         return actor
 
-    def actor_parties(self, actor, project_id=None, at=None):
+    def actor_parties(self, actor, project_id=None):
         """The accounts a task actor's work belongs to: its PARTY, as a set.
 
         With the setting off this is ``{actor_person(actor)}`` and nothing else, so every rule
@@ -2255,53 +2273,60 @@ class Service:
         account made, and every worker credential that account issued (kittrial-5bb.199):
 
         * an agent: its owner; an account: itself;
-        * a name written under a CREDENTIAL: the account behind that credential. It is
-          traced by the credential, not by the name: the credentials whose actor namespace
-          holds the name (the name itself, or ``name/...``): a worker credential of
-          ``project_id``, whose account is the one that issued it; or an agent's credential,
-          for a label written under the agent's name (``AGENT/night``), whose account is the
-          agent's owner. Where credentials of more than one account have held the name, the
-          one whose life covers ``at`` (the moment the work was written) decides; when that
-          cannot be decided, every such account is the work's party, which only ever refuses
-          more;
-        * anything else: the name itself.
+        * a name whose FIRST SEGMENT is an account or an agent (``ACCOUNT/x``, ``AGENT/x``):
+          that account, before any credential is looked at. Only that account's own
+          credentials can write such a name: one issued with no name writes under its
+          issuer's account id and any label below it, and an agent's under the agent's;
+        * any other name written under a WORKER CREDENTIAL of ``project_id``: every account
+          that has ever issued a credential whose actor namespace holds the name (the name
+          itself, or ``name/...``), working, revoked or expired. Nothing on a record says
+          which credential wrote it, and a moment cannot say it either (the tracker's stamp
+          is up to a second later than this service's clock), so where more than one account
+          has held a name, the work is of each of them: that only ever refuses more;
+        * anything else: the name itself. A writer that is no account, no agent and under no
+          credential record (a name of the host route) is its own party.
         """
         person = self.actor_person(actor)
         if not self.approval_by_another_party or not isinstance(actor, str) or not actor:
             return {person}
         with self.store.lock:
-            if actor in self.state['agents'] or actor in self.state['users']:
-                return {person}
-            held = []
-            for credential in self.state['credentials'].values():
-                if not isinstance(credential, dict):
-                    continue
-                # A worker credential holds its name in ITS project; an agent's credential has no
-                # project of its own and holds the agent's name wherever the agent works.
-                if not credential.get('agent_id') and (not credential.get('project_id') or (
-                        project_id is not None and credential['project_id'] != project_id)):
-                    continue
-                namespace = credential.get('actor')
-                if not isinstance(namespace, str) or not namespace:
-                    continue                      # it writes under its issuer's own account name
-                if actor == namespace or actor.startswith(namespace.rstrip('/') + '/'):
-                    held.append(credential)
-            if not held:
-                return {person}
-            issuers = {credential['user_id'] for credential in held}
-            if len(issuers) > 1 and isinstance(at, str) and at:
-                def ended(credential):
-                    if credential.get('revoked_at'):
-                        return str(credential['revoked_at'])
-                    try:
-                        return now_iso(credential['expires_at'])
-                    except (OSError, OverflowError, ValueError, TypeError):
-                        return '9999'             # a time this platform cannot write: it has not ended
-                living = {credential['user_id'] for credential in held
-                          if str(credential.get('created_at') or '') <= at <= ended(credential)}
-                if len(living) == 1:
-                    return living
-            return issuers
+            head = actor.split('/', 1)[0]
+            agent = self.state['agents'].get(head)
+            if isinstance(agent, dict) and agent.get('owner'):
+                return {agent['owner']}
+            if head in self.state['users']:
+                return {head}
+            issuers = {credential['user_id'] for credential in self.state['credentials'].values()
+                       if isinstance(credential, dict) and not credential.get('agent_id')
+                       and project_id is not None and credential.get('project_id') == project_id
+                       and self._holds(credential.get('actor'), actor)}
+            return issuers or {person}
+
+    @staticmethod
+    def _holds(namespace, name):
+        """Whether a credential issued with ``namespace`` may write under ``name``."""
+        return isinstance(namespace, str) and bool(namespace) and (
+            name == namespace or name.startswith(namespace.rstrip('/') + '/'))
+
+    def note_settings(self):
+        """Record what the installation's settings are at this start; answers ``(was, is)``.
+
+        Turning ``approval_by_another_party`` on or off is done outside the service (a flag,
+        or the office configuration) and used to leave no trace. The state keeps what the
+        last start had, and a start that differs writes one audit entry. A state that has
+        never recorded it counts as off, which is what every earlier kit was.
+        """
+        with self.store.lock:
+            seen = self.state.get('settings_seen')
+            was = bool(seen.get('approval_by_another_party')) if isinstance(seen, dict) else False
+            now = bool(self.approval_by_another_party)
+            if was != now:
+                self.audit(None, None, 'settings.approval_by_another_party', 'committed',
+                           reason='%s -> %s at service start' % ('on' if was else 'off', 'on' if now else 'off'))
+            if not isinstance(seen, dict) or was != now or 'approval_by_another_party' not in seen:
+                self.state['settings_seen'] = {'approval_by_another_party': now}
+                self.store.save()
+            return was, now
 
     def username_of(self, user_id):
         """The account's username, read under the store lock (``None`` if unknown)."""

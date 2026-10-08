@@ -3621,12 +3621,44 @@ class ApiHandler(BaseHTTPRequestHandler):
                        'task\'s assignee, the person who owns the agent that delivered it, and that person\'s '
                        'other agents cannot recommend it')
 
-    #: Said to an approver whose own party delivered the work (the setting of kittrial-5bb.199).
-    OWN_PARTY = ('This contribution was delivered by your own account (you, one of your agents, or a worker '
-                 'credential you issued). Another owner of this project, or a superuser who did not deliver it, '
-                 'must approve it.')
+    #: The same with the installation's setting on (kittrial-5bb.199): a worker credential is a reason too.
+    NOT_INDEPENDENT_PARTY = (NOT_INDEPENDENT + '; and on this server neither can the account that issued the worker '
+                             'credential it was delivered under, nor that account\'s agents')
 
-    def _independent(self, actors, parties, project=None, at=None):
+    #: Said to an approver of the party the work belongs to (the setting of kittrial-5bb.199). Which of
+    #: the three is said depends on what is true; each ends with OWN_PARTY_NEXT.
+    OWN_PARTY = ('This contribution was delivered by your own party: you, one of your agents, or a name that a '
+                 'worker credential you issued holds or has held.')
+    OWN_PARTY_SHARED = ('This contribution was delivered under %s, a name that worker credentials of more than one '
+                        'account have held. One of those accounts is yours, and nothing on the record says which '
+                        'credential wrote it, so it counts as the work of each of them.')
+    OWN_PARTY_ASSIGNEE = ('This task is assigned to your own party (you, one of your agents, or a name of a worker '
+                          'credential you issued). Another account delivered the contribution, but nobody approves '
+                          'work on a task their own party holds.')
+    OWN_PARTY_NEXT = (' Somebody of another party who may approve here must approve it: another owner of this '
+                      'project, or a superuser. If there is nobody else, a superuser makes a second account an owner '
+                      'of this project (Members) and that person approves; where the only owner is also the only '
+                      'superuser, that second account has to be made first.')
+
+    def _own_party_refusal(self, names, assignee, author, project):
+        """The sentence for an approver whose party the work is, or None when it is not.
+
+        ``names`` are the approver: the name it acts under and the account behind the request.
+        The author is looked at first; the assignee only when the author is another party.
+        """
+        if not self._independent_all(names, [author], project):
+            shared = len(self.service.actor_parties(author, project)) > 1 if isinstance(author, str) else False
+            return (self.OWN_PARTY_SHARED % author if shared else self.OWN_PARTY) + self.OWN_PARTY_NEXT
+        if not self._independent_all(names, [assignee], project):
+            return self.OWN_PARTY_ASSIGNEE + self.OWN_PARTY_NEXT
+        return None
+
+    def _independent_all(self, names, parties, project=None):
+        """Whether EVERY one of ``names`` is of another party than all of ``parties``."""
+        names = [name for name in names if isinstance(name, str) and name]
+        return len(self._independent(names, parties, project)) == len(names)
+
+    def _independent(self, actors, parties, project=None):
         """The ``actors`` who are a different PERSON from every one of ``parties``.
 
         The canonical rule compares actor names, and a person and their agents are
@@ -3634,12 +3666,12 @@ class ApiHandler(BaseHTTPRequestHandler):
         their agent, and two agents of one person are all the same party
         (kittrial-5bb.115). With the installation's setting on, work under a worker
         credential belongs to the account that issued it as well (``Service.actor_parties``;
-        ``project`` and ``at`` say where and when the work of ``parties`` was written).
+        ``project`` says where the work of ``parties`` was written).
         """
         taken = set()
         for party in parties:
             if isinstance(party, str) and party:
-                taken |= self.service.actor_parties(party, project, at)
+                taken |= self.service.actor_parties(party, project)
         return [actor for actor in actors
                 if isinstance(actor, str) and not (self.service.actor_parties(actor, project) & taken)]
 
@@ -5704,8 +5736,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         # (kittrial-5bb.115 review). Past those, one is still named and has no text here.
         parties = self._read_parties(brief['task'].get('assignee'), (contribution or {}).get('author'))
         standing = [entry for entry in review.get('recommendations') or [] if isinstance(entry, dict)]
-        kept = set(self._independent([entry.get('author') for entry in standing], parties, pid,
-                                     (contribution or {}).get('at'))) if parties else set()
+        kept = set(self._independent([entry.get('author') for entry in standing], parties, pid)) if parties else set()
         shown = [entry for entry in standing if entry.get('author') in kept]
         newest = review.get('recommendation')
         if not (newest and newest.get('author') in kept):
@@ -5919,19 +5950,19 @@ class ApiHandler(BaseHTTPRequestHandler):
                 # Nobody approves work of their own party: the account that approves, against the
                 # account behind the contribution's author and behind the task's assignee. A
                 # superuser is bound like anybody else for their own party's work.
-                parties = [(current.get('task') or {}).get('assignee'), delivered.get('author')]
                 actor = payload.get('actor') or ctx.principal.actor or ctx.principal.user_id
-                if not self._independent([actor], parties, pid, delivered.get('at')) or \
-                        not self._independent([ctx.principal.user_id], parties, pid, delivered.get('at')):
-                    raise forbidden(self.OWN_PARTY)
+                refusal = self._own_party_refusal([actor, ctx.principal.user_id], (current.get('task') or {}).get('assignee'),
+                                                  delivered.get('author'), pid)
+                if refusal:
+                    raise forbidden(refusal)
             if recommending:
                 # Independence by PERSON, which only the web service can know; the
                 # canonical write then applies the name rule and every other rule.
                 parties = [(current.get('task') or {}).get('assignee'), delivered.get('author')]
                 actor = payload.get('actor') or ctx.principal.actor or ctx.principal.user_id
-                if not self._independent([actor], parties, pid, delivered.get('at')) or \
-                        not self._independent([ctx.principal.user_id], parties, pid, delivered.get('at')):
-                    raise forbidden(self.NOT_INDEPENDENT)
+                if not self._independent_all([actor, ctx.principal.user_id], parties, pid):
+                    raise forbidden(self.NOT_INDEPENDENT_PARTY if self.service.approval_by_another_party
+                                    else self.NOT_INDEPENDENT)
                 # One standing recommendation for a contribution from each PERSON
                 # (kittrial-5bb.154): a second one, by the same actor or by another agent of
                 # the same person, is refused and nothing is stored. Read from the brief, so
@@ -6661,8 +6692,21 @@ def build_backend(service, args):
     return InProcessBackend(service, getattr(args, 'actor_namespace', None))
 
 
+def settings_lines(service):
+    """What the service says about its rule settings when it starts: one line each, and the
+    change is in the audit when it differs from the last start (``Service.note_settings``)."""
+    was, now = service.note_settings()
+    word = {True: 'on', False: 'off'}
+    line = 'approval by another party (--approval-by-another-party): %s' % word[now]
+    if was != now:
+        line += ' (it was %s at the last start; recorded in the audit)' % word[was]
+    return [line]
+
+
 def main(argv=None):
-    parser = argparse.ArgumentParser(description='Orchestra authenticated HTTP service')
+    # No abbreviations: a prefix of a flag that changes a rule of the installation
+    # (--approval-by-another) must not turn the rule on (kittrial-5bb.199 review).
+    parser = argparse.ArgumentParser(description='Orchestra authenticated HTTP service', allow_abbrev=False)
     parser.add_argument('--state', required=True, help='private service state path (outside source)')
     parser.add_argument('--host', default='127.0.0.1')
     parser.add_argument('--port', type=int, default=8443)
@@ -6786,6 +6830,8 @@ def main(argv=None):
         trusted.append('localhost')
     service = Service(store, public_url=args.public_url, approval_by_another_party=args.approval_by_another_party)
     service.LOGINS_PER_ADDRESS = args.logins_per_address
+    for line in settings_lines(service):
+        print(line, file=sys.stderr)
     backend = build_backend(service, args)
     for line in operator_allowlist_warnings(args.root if args.backend == 'endpoint' else None):
         print(line, file=sys.stderr)
