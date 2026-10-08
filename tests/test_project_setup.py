@@ -932,6 +932,13 @@ class SetupScreenTests(test_http_agents.AgentHarness):
         self.assertEqual(len(seen['warning']), 1)
         self.assertIn('looks like an access token', seen['warning'][0])
         self.assertEqual(seen['noWarning'], 0)
+        # The review rule of the installation (kittrial-5bb.199): said when the service says it, and
+        # nothing at all is added to the page when it does not.
+        self.assertEqual(seen['rule'], [
+            [[], [], 2], [[], [], 2],
+            [['true'], ['On this server nobody approves or recomm'], 3],
+            [['false'], ['On this server an owner may approve work'], 3],
+            [[], [], 2]])
 
 
 if __name__ == '__main__':
