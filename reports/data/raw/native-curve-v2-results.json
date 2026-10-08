@@ -1,0 +1,8061 @@
+[
+  {
+    "operation": "create",
+    "databases": 1,
+    "rep": 1,
+    "seconds": 0.32762089208699763,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.36181640625,
+      6.31884765625,
+      6.50048828125
+    ],
+    "available_GiB": 116.36062240600586,
+    "trace": "curve-v2-1-1-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 58,
+    "query_ms_sum": 94
+  },
+  {
+    "operation": "update",
+    "databases": 1,
+    "rep": 1,
+    "seconds": 0.33748014899902046,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.36181640625,
+      6.31884765625,
+      6.50048828125
+    ],
+    "available_GiB": 116.34921264648438,
+    "trace": "curve-v2-1-1-update.jsonl",
+    "query_count": 52,
+    "catalog_query_count": 2,
+    "catalog_ms": 63,
+    "query_ms_sum": 97
+  },
+  {
+    "operation": "comment",
+    "databases": 1,
+    "rep": 1,
+    "seconds": 0.27714900695718825,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.36181640625,
+      6.31884765625,
+      6.50048828125
+    ],
+    "available_GiB": 116.35146713256836,
+    "trace": "curve-v2-1-1-comment.jsonl",
+    "query_count": 45,
+    "catalog_query_count": 2,
+    "catalog_ms": 40,
+    "query_ms_sum": 59
+  },
+  {
+    "operation": "set-state",
+    "databases": 1,
+    "rep": 1,
+    "seconds": 0.4998335901182145,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.36181640625,
+      6.31884765625,
+      6.50048828125
+    ],
+    "available_GiB": 116.3227424621582,
+    "trace": "curve-v2-1-1-set-state.jsonl",
+    "query_count": 93,
+    "catalog_query_count": 2,
+    "catalog_ms": 57,
+    "query_ms_sum": 191
+  },
+  {
+    "operation": "claim",
+    "databases": 1,
+    "rep": 1,
+    "seconds": 0.3217682018876076,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.36181640625,
+      6.31884765625,
+      6.50048828125
+    ],
+    "available_GiB": 116.3491096496582,
+    "trace": "curve-v2-1-1-claim.jsonl",
+    "query_count": 48,
+    "catalog_query_count": 2,
+    "catalog_ms": 59,
+    "query_ms_sum": 96
+  },
+  {
+    "operation": "merge-check",
+    "databases": 1,
+    "rep": 1,
+    "seconds": 0.2663744550663978,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.4130859375,
+      6.3134765625,
+      6.49755859375
+    ],
+    "available_GiB": 116.3405532836914,
+    "trace": "curve-v2-1-1-merge-check.jsonl",
+    "query_count": 31,
+    "catalog_query_count": 2,
+    "catalog_ms": 52,
+    "query_ms_sum": 58
+  },
+  {
+    "operation": "merge-acquire",
+    "databases": 1,
+    "rep": 1,
+    "seconds": 0.30162219307385385,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.4130859375,
+      6.3134765625,
+      6.49755859375
+    ],
+    "available_GiB": 116.34306335449219,
+    "trace": "curve-v2-1-1-merge-acquire.jsonl",
+    "query_count": 43,
+    "catalog_query_count": 2,
+    "catalog_ms": 55,
+    "query_ms_sum": 78
+  },
+  {
+    "operation": "merge-release",
+    "databases": 1,
+    "rep": 1,
+    "seconds": 0.3746827181894332,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.4130859375,
+      6.3134765625,
+      6.49755859375
+    ],
+    "available_GiB": 116.32420349121094,
+    "trace": "curve-v2-1-1-merge-release.jsonl",
+    "query_count": 46,
+    "catalog_query_count": 2,
+    "catalog_ms": 71,
+    "query_ms_sum": 100
+  },
+  {
+    "operation": "list",
+    "databases": 1,
+    "rep": 1,
+    "seconds": 0.23074404220096767,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.4130859375,
+      6.3134765625,
+      6.49755859375
+    ],
+    "available_GiB": 116.3419303894043,
+    "trace": "curve-v2-1-1-list.jsonl",
+    "query_count": 22,
+    "catalog_query_count": 0,
+    "catalog_ms": 0,
+    "query_ms_sum": 14
+  },
+  {
+    "operation": "show",
+    "databases": 1,
+    "rep": 1,
+    "seconds": 0.18248482909984887,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.4130859375,
+      6.3134765625,
+      6.49755859375
+    ],
+    "available_GiB": 116.3239631652832,
+    "trace": "curve-v2-1-1-show.jsonl",
+    "query_count": 33,
+    "catalog_query_count": 0,
+    "catalog_ms": 0,
+    "query_ms_sum": 8
+  },
+  {
+    "operation": "filtered-columns",
+    "databases": 1,
+    "rep": 1,
+    "seconds": 0.0818959039170295,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.4130859375,
+      6.3134765625,
+      6.49755859375
+    ],
+    "available_GiB": 116.27792358398438,
+    "trace": "curve-v2-1-1-filtered-columns.jsonl",
+    "query_count": 4,
+    "catalog_query_count": 1,
+    "catalog_ms": 16,
+    "query_ms_sum": 18
+  },
+  {
+    "operation": "ordinary-query",
+    "databases": 1,
+    "rep": 1,
+    "seconds": 0.0572565090842545,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.4130859375,
+      6.3134765625,
+      6.49755859375
+    ],
+    "available_GiB": 116.24543762207031,
+    "trace": "curve-v2-1-1-ordinary-query.jsonl",
+    "query_count": 4,
+    "catalog_query_count": 0,
+    "catalog_ms": 0,
+    "query_ms_sum": 2
+  },
+  {
+    "operation": "create",
+    "databases": 1,
+    "rep": 2,
+    "seconds": 0.2991887310054153,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.4130859375,
+      6.3134765625,
+      6.49755859375
+    ],
+    "available_GiB": 116.24781799316406,
+    "trace": "curve-v2-1-2-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 31,
+    "query_ms_sum": 64
+  },
+  {
+    "operation": "update",
+    "databases": 1,
+    "rep": 2,
+    "seconds": 0.3070729160681367,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.4130859375,
+      6.3134765625,
+      6.49755859375
+    ],
+    "available_GiB": 116.26258850097656,
+    "trace": "curve-v2-1-2-update.jsonl",
+    "query_count": 52,
+    "catalog_query_count": 2,
+    "catalog_ms": 57,
+    "query_ms_sum": 86
+  },
+  {
+    "operation": "comment",
+    "databases": 1,
+    "rep": 2,
+    "seconds": 0.2584111401811242,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.4130859375,
+      6.3134765625,
+      6.49755859375
+    ],
+    "available_GiB": 116.31204223632812,
+    "trace": "curve-v2-1-2-comment.jsonl",
+    "query_count": 45,
+    "catalog_query_count": 2,
+    "catalog_ms": 42,
+    "query_ms_sum": 63
+  },
+  {
+    "operation": "set-state",
+    "databases": 1,
+    "rep": 2,
+    "seconds": 0.5300119458697736,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.4130859375,
+      6.3134765625,
+      6.49755859375
+    ],
+    "available_GiB": 116.2959976196289,
+    "trace": "curve-v2-1-2-set-state.jsonl",
+    "query_count": 93,
+    "catalog_query_count": 2,
+    "catalog_ms": 60,
+    "query_ms_sum": 194
+  },
+  {
+    "operation": "claim",
+    "databases": 1,
+    "rep": 2,
+    "seconds": 0.3186178768519312,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.4130859375,
+      6.3134765625,
+      6.49755859375
+    ],
+    "available_GiB": 116.32734680175781,
+    "trace": "curve-v2-1-2-claim.jsonl",
+    "query_count": 48,
+    "catalog_query_count": 2,
+    "catalog_ms": 52,
+    "query_ms_sum": 80
+  },
+  {
+    "operation": "merge-check",
+    "databases": 1,
+    "rep": 2,
+    "seconds": 0.29814365901984274,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.4130859375,
+      6.3134765625,
+      6.49755859375
+    ],
+    "available_GiB": 116.29234313964844,
+    "trace": "curve-v2-1-2-merge-check.jsonl",
+    "query_count": 31,
+    "catalog_query_count": 2,
+    "catalog_ms": 56,
+    "query_ms_sum": 60
+  },
+  {
+    "operation": "merge-acquire",
+    "databases": 1,
+    "rep": 2,
+    "seconds": 0.3273208278696984,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.4130859375,
+      6.3134765625,
+      6.49755859375
+    ],
+    "available_GiB": 116.38473510742188,
+    "trace": "curve-v2-1-2-merge-acquire.jsonl",
+    "query_count": 43,
+    "catalog_query_count": 2,
+    "catalog_ms": 66,
+    "query_ms_sum": 103
+  },
+  {
+    "operation": "merge-release",
+    "databases": 1,
+    "rep": 2,
+    "seconds": 0.2817892609164119,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.4130859375,
+      6.3134765625,
+      6.49755859375
+    ],
+    "available_GiB": 116.3820915222168,
+    "trace": "curve-v2-1-2-merge-release.jsonl",
+    "query_count": 46,
+    "catalog_query_count": 2,
+    "catalog_ms": 58,
+    "query_ms_sum": 83
+  },
+  {
+    "operation": "list",
+    "databases": 1,
+    "rep": 2,
+    "seconds": 0.22872759005986154,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.4130859375,
+      6.3134765625,
+      6.49755859375
+    ],
+    "available_GiB": 116.37831115722656,
+    "trace": "curve-v2-1-2-list.jsonl",
+    "query_count": 22,
+    "catalog_query_count": 0,
+    "catalog_ms": 0,
+    "query_ms_sum": 22
+  },
+  {
+    "operation": "show",
+    "databases": 1,
+    "rep": 2,
+    "seconds": 0.20250477106310427,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.54052734375,
+      6.3251953125,
+      6.50048828125
+    ],
+    "available_GiB": 116.3827896118164,
+    "trace": "curve-v2-1-2-show.jsonl",
+    "query_count": 33,
+    "catalog_query_count": 0,
+    "catalog_ms": 0,
+    "query_ms_sum": 7
+  },
+  {
+    "operation": "filtered-columns",
+    "databases": 1,
+    "rep": 2,
+    "seconds": 0.08807258307933807,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.54052734375,
+      6.3251953125,
+      6.50048828125
+    ],
+    "available_GiB": 116.40654754638672,
+    "trace": "curve-v2-1-2-filtered-columns.jsonl",
+    "query_count": 4,
+    "catalog_query_count": 1,
+    "catalog_ms": 24,
+    "query_ms_sum": 28
+  },
+  {
+    "operation": "ordinary-query",
+    "databases": 1,
+    "rep": 2,
+    "seconds": 0.06949677411466837,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.54052734375,
+      6.3251953125,
+      6.50048828125
+    ],
+    "available_GiB": 116.40383911132812,
+    "trace": "curve-v2-1-2-ordinary-query.jsonl",
+    "query_count": 4,
+    "catalog_query_count": 0,
+    "catalog_ms": 0,
+    "query_ms_sum": 4
+  },
+  {
+    "operation": "create",
+    "databases": 1,
+    "rep": 3,
+    "seconds": 0.3173218409065157,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.54052734375,
+      6.3251953125,
+      6.50048828125
+    ],
+    "available_GiB": 116.38563919067383,
+    "trace": "curve-v2-1-3-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 59,
+    "query_ms_sum": 96
+  },
+  {
+    "operation": "update",
+    "databases": 1,
+    "rep": 3,
+    "seconds": 0.3484381828457117,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.54052734375,
+      6.3251953125,
+      6.50048828125
+    ],
+    "available_GiB": 116.36190414428711,
+    "trace": "curve-v2-1-3-update.jsonl",
+    "query_count": 52,
+    "catalog_query_count": 2,
+    "catalog_ms": 66,
+    "query_ms_sum": 89
+  },
+  {
+    "operation": "comment",
+    "databases": 1,
+    "rep": 3,
+    "seconds": 0.30435580597259104,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.54052734375,
+      6.3251953125,
+      6.50048828125
+    ],
+    "available_GiB": 116.35808181762695,
+    "trace": "curve-v2-1-3-comment.jsonl",
+    "query_count": 45,
+    "catalog_query_count": 2,
+    "catalog_ms": 62,
+    "query_ms_sum": 87
+  },
+  {
+    "operation": "set-state",
+    "databases": 1,
+    "rep": 3,
+    "seconds": 0.5013877509627491,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.54052734375,
+      6.3251953125,
+      6.50048828125
+    ],
+    "available_GiB": 116.37018585205078,
+    "trace": "curve-v2-1-3-set-state.jsonl",
+    "query_count": 93,
+    "catalog_query_count": 2,
+    "catalog_ms": 59,
+    "query_ms_sum": 186
+  },
+  {
+    "operation": "claim",
+    "databases": 1,
+    "rep": 3,
+    "seconds": 0.3654481270350516,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.54052734375,
+      6.3251953125,
+      6.50048828125
+    ],
+    "available_GiB": 116.31045913696289,
+    "trace": "curve-v2-1-3-claim.jsonl",
+    "query_count": 48,
+    "catalog_query_count": 2,
+    "catalog_ms": 65,
+    "query_ms_sum": 99
+  },
+  {
+    "operation": "merge-check",
+    "databases": 1,
+    "rep": 3,
+    "seconds": 0.25490078306756914,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.54052734375,
+      6.3251953125,
+      6.50048828125
+    ],
+    "available_GiB": 116.30921173095703,
+    "trace": "curve-v2-1-3-merge-check.jsonl",
+    "query_count": 31,
+    "catalog_query_count": 2,
+    "catalog_ms": 53,
+    "query_ms_sum": 54
+  },
+  {
+    "operation": "merge-acquire",
+    "databases": 1,
+    "rep": 3,
+    "seconds": 0.2851145500317216,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.54052734375,
+      6.3251953125,
+      6.50048828125
+    ],
+    "available_GiB": 116.38113021850586,
+    "trace": "curve-v2-1-3-merge-acquire.jsonl",
+    "query_count": 43,
+    "catalog_query_count": 2,
+    "catalog_ms": 57,
+    "query_ms_sum": 83
+  },
+  {
+    "operation": "merge-release",
+    "databases": 1,
+    "rep": 3,
+    "seconds": 0.26799326390028,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.54052734375,
+      6.3251953125,
+      6.50048828125
+    ],
+    "available_GiB": 116.37319946289062,
+    "trace": "curve-v2-1-3-merge-release.jsonl",
+    "query_count": 46,
+    "catalog_query_count": 2,
+    "catalog_ms": 29,
+    "query_ms_sum": 44
+  },
+  {
+    "operation": "list",
+    "databases": 1,
+    "rep": 3,
+    "seconds": 0.2093607960268855,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.54052734375,
+      6.3251953125,
+      6.50048828125
+    ],
+    "available_GiB": 116.36711120605469,
+    "trace": "curve-v2-1-3-list.jsonl",
+    "query_count": 22,
+    "catalog_query_count": 0,
+    "catalog_ms": 0,
+    "query_ms_sum": 16
+  },
+  {
+    "operation": "show",
+    "databases": 1,
+    "rep": 3,
+    "seconds": 0.20229695015586913,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.54052734375,
+      6.3251953125,
+      6.50048828125
+    ],
+    "available_GiB": 116.3718376159668,
+    "trace": "curve-v2-1-3-show.jsonl",
+    "query_count": 33,
+    "catalog_query_count": 0,
+    "catalog_ms": 0,
+    "query_ms_sum": 16
+  },
+  {
+    "operation": "filtered-columns",
+    "databases": 1,
+    "rep": 3,
+    "seconds": 0.0948330769315362,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.54052734375,
+      6.3251953125,
+      6.50048828125
+    ],
+    "available_GiB": 116.3941535949707,
+    "trace": "curve-v2-1-3-filtered-columns.jsonl",
+    "query_count": 4,
+    "catalog_query_count": 1,
+    "catalog_ms": 29,
+    "query_ms_sum": 34
+  },
+  {
+    "operation": "ordinary-query",
+    "databases": 1,
+    "rep": 3,
+    "seconds": 0.05868319608271122,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.54052734375,
+      6.3251953125,
+      6.50048828125
+    ],
+    "available_GiB": 116.37969589233398,
+    "trace": "curve-v2-1-3-ordinary-query.jsonl",
+    "query_count": 4,
+    "catalog_query_count": 0,
+    "catalog_ms": 0,
+    "query_ms_sum": 4
+  },
+  {
+    "operation": "create",
+    "databases": 1,
+    "rep": 11,
+    "seconds": 0.2876810838934034,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.4970703125,
+      6.302734375,
+      6.4921875
+    ],
+    "available_GiB": 116.42770767211914
+  },
+  {
+    "operation": "update",
+    "databases": 1,
+    "rep": 11,
+    "seconds": 0.3390509330201894,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.4970703125,
+      6.302734375,
+      6.4921875
+    ],
+    "available_GiB": 116.40849685668945
+  },
+  {
+    "operation": "comment",
+    "databases": 1,
+    "rep": 11,
+    "seconds": 0.3195146070793271,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.4970703125,
+      6.302734375,
+      6.4921875
+    ],
+    "available_GiB": 116.39288330078125
+  },
+  {
+    "operation": "set-state",
+    "databases": 1,
+    "rep": 11,
+    "seconds": 0.575859361095354,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.4970703125,
+      6.302734375,
+      6.4921875
+    ],
+    "available_GiB": 116.36481475830078
+  },
+  {
+    "operation": "claim",
+    "databases": 1,
+    "rep": 11,
+    "seconds": 0.32932308898307383,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.4970703125,
+      6.302734375,
+      6.4921875
+    ],
+    "available_GiB": 116.42210006713867
+  },
+  {
+    "operation": "merge-check",
+    "databases": 1,
+    "rep": 11,
+    "seconds": 0.2244185779709369,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.4970703125,
+      6.302734375,
+      6.4921875
+    ],
+    "available_GiB": 116.40248489379883
+  },
+  {
+    "operation": "merge-acquire",
+    "databases": 1,
+    "rep": 11,
+    "seconds": 0.30387319601140916,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.4970703125,
+      6.302734375,
+      6.4921875
+    ],
+    "available_GiB": 116.41463851928711
+  },
+  {
+    "operation": "merge-release",
+    "databases": 1,
+    "rep": 11,
+    "seconds": 0.3174190840218216,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.4970703125,
+      6.302734375,
+      6.4921875
+    ],
+    "available_GiB": 116.37914657592773
+  },
+  {
+    "operation": "list",
+    "databases": 1,
+    "rep": 11,
+    "seconds": 0.2142501559574157,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.4970703125,
+      6.302734375,
+      6.4921875
+    ],
+    "available_GiB": 116.38050079345703
+  },
+  {
+    "operation": "show",
+    "databases": 1,
+    "rep": 11,
+    "seconds": 0.19435283401980996,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.4970703125,
+      6.302734375,
+      6.4921875
+    ],
+    "available_GiB": 116.35212326049805
+  },
+  {
+    "operation": "filtered-columns",
+    "databases": 1,
+    "rep": 11,
+    "seconds": 0.07340654195286334,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.4970703125,
+      6.302734375,
+      6.4921875
+    ],
+    "available_GiB": 116.32205200195312
+  },
+  {
+    "operation": "ordinary-query",
+    "databases": 1,
+    "rep": 11,
+    "seconds": 0.06524368887767196,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.4970703125,
+      6.302734375,
+      6.4921875
+    ],
+    "available_GiB": 116.29052352905273
+  },
+  {
+    "operation": "create",
+    "databases": 1,
+    "rep": 12,
+    "seconds": 0.3378715659491718,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.4970703125,
+      6.302734375,
+      6.4921875
+    ],
+    "available_GiB": 116.30512237548828
+  },
+  {
+    "operation": "update",
+    "databases": 1,
+    "rep": 12,
+    "seconds": 0.2800693209283054,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.4970703125,
+      6.302734375,
+      6.4921875
+    ],
+    "available_GiB": 116.30675506591797
+  },
+  {
+    "operation": "comment",
+    "databases": 1,
+    "rep": 12,
+    "seconds": 0.3313138480298221,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.4970703125,
+      6.302734375,
+      6.4921875
+    ],
+    "available_GiB": 116.37569427490234
+  },
+  {
+    "operation": "set-state",
+    "databases": 1,
+    "rep": 12,
+    "seconds": 0.5827183430083096,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.4970703125,
+      6.302734375,
+      6.4921875
+    ],
+    "available_GiB": 116.38125991821289
+  },
+  {
+    "operation": "claim",
+    "databases": 1,
+    "rep": 12,
+    "seconds": 0.3405425080563873,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.45703125,
+      6.28076171875,
+      6.48388671875
+    ],
+    "available_GiB": 116.3592529296875
+  },
+  {
+    "operation": "merge-check",
+    "databases": 1,
+    "rep": 12,
+    "seconds": 0.2677832611370832,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.45703125,
+      6.28076171875,
+      6.48388671875
+    ],
+    "available_GiB": 116.33480453491211
+  },
+  {
+    "operation": "merge-acquire",
+    "databases": 1,
+    "rep": 12,
+    "seconds": 0.31822335883043706,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.45703125,
+      6.28076171875,
+      6.48388671875
+    ],
+    "available_GiB": 116.33057403564453
+  },
+  {
+    "operation": "merge-release",
+    "databases": 1,
+    "rep": 12,
+    "seconds": 0.3194996612146497,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.45703125,
+      6.28076171875,
+      6.48388671875
+    ],
+    "available_GiB": 116.31404113769531
+  },
+  {
+    "operation": "list",
+    "databases": 1,
+    "rep": 12,
+    "seconds": 0.21802760008722544,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.45703125,
+      6.28076171875,
+      6.48388671875
+    ],
+    "available_GiB": 116.32990646362305
+  },
+  {
+    "operation": "show",
+    "databases": 1,
+    "rep": 12,
+    "seconds": 0.22725607315078378,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.45703125,
+      6.28076171875,
+      6.48388671875
+    ],
+    "available_GiB": 116.31146240234375
+  },
+  {
+    "operation": "filtered-columns",
+    "databases": 1,
+    "rep": 12,
+    "seconds": 0.08538012718781829,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.45703125,
+      6.28076171875,
+      6.48388671875
+    ],
+    "available_GiB": 116.30337905883789
+  },
+  {
+    "operation": "ordinary-query",
+    "databases": 1,
+    "rep": 12,
+    "seconds": 0.05428080097772181,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.45703125,
+      6.28076171875,
+      6.48388671875
+    ],
+    "available_GiB": 116.30211639404297
+  },
+  {
+    "operation": "create",
+    "databases": 1,
+    "rep": 13,
+    "seconds": 0.3597858278080821,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.45703125,
+      6.28076171875,
+      6.48388671875
+    ],
+    "available_GiB": 116.30120468139648
+  },
+  {
+    "operation": "update",
+    "databases": 1,
+    "rep": 13,
+    "seconds": 0.3330496789421886,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.45703125,
+      6.28076171875,
+      6.48388671875
+    ],
+    "available_GiB": 116.30123901367188
+  },
+  {
+    "operation": "comment",
+    "databases": 1,
+    "rep": 13,
+    "seconds": 0.26367518305778503,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.45703125,
+      6.28076171875,
+      6.48388671875
+    ],
+    "available_GiB": 116.29974365234375
+  },
+  {
+    "operation": "set-state",
+    "databases": 1,
+    "rep": 13,
+    "seconds": 0.4982019062153995,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.45703125,
+      6.28076171875,
+      6.48388671875
+    ],
+    "available_GiB": 116.27672958374023
+  },
+  {
+    "operation": "claim",
+    "databases": 1,
+    "rep": 13,
+    "seconds": 0.2990442430600524,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.45703125,
+      6.28076171875,
+      6.48388671875
+    ],
+    "available_GiB": 116.25936889648438
+  },
+  {
+    "operation": "merge-check",
+    "databases": 1,
+    "rep": 13,
+    "seconds": 0.2389352999161929,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.45703125,
+      6.28076171875,
+      6.48388671875
+    ],
+    "available_GiB": 116.31705856323242
+  },
+  {
+    "operation": "merge-acquire",
+    "databases": 1,
+    "rep": 13,
+    "seconds": 0.30951121007092297,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.45703125,
+      6.28076171875,
+      6.48388671875
+    ],
+    "available_GiB": 116.30843353271484
+  },
+  {
+    "operation": "merge-release",
+    "databases": 1,
+    "rep": 13,
+    "seconds": 0.24308079900220037,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.45703125,
+      6.28076171875,
+      6.48388671875
+    ],
+    "available_GiB": 116.23652648925781
+  },
+  {
+    "operation": "list",
+    "databases": 1,
+    "rep": 13,
+    "seconds": 0.1867131821345538,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.45703125,
+      6.28076171875,
+      6.48388671875
+    ],
+    "available_GiB": 116.21925735473633
+  },
+  {
+    "operation": "show",
+    "databases": 1,
+    "rep": 13,
+    "seconds": 0.22455834900029004,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.45703125,
+      6.28076171875,
+      6.48388671875
+    ],
+    "available_GiB": 116.20267868041992
+  },
+  {
+    "operation": "filtered-columns",
+    "databases": 1,
+    "rep": 13,
+    "seconds": 0.0955893590580672,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.45703125,
+      6.28076171875,
+      6.48388671875
+    ],
+    "available_GiB": 116.27135467529297
+  },
+  {
+    "operation": "ordinary-query",
+    "databases": 1,
+    "rep": 13,
+    "seconds": 0.05223121796734631,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.7412109375,
+      6.326171875,
+      6.49755859375
+    ],
+    "available_GiB": 116.24691390991211
+  },
+  {
+    "operation": "add-project",
+    "databases": 1,
+    "rep": 0,
+    "seconds": 7.114674835000187,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.7412109375,
+      6.326171875,
+      6.49755859375
+    ],
+    "available_GiB": 116.27872467041016,
+    "trace": "curve-v2-1-0-add-project.jsonl",
+    "query_count": 1552,
+    "catalog_query_count": 73,
+    "catalog_ms": 2746,
+    "query_ms_sum": 4277
+  },
+  {
+    "operation": "add-project",
+    "databases": 2,
+    "rep": 0,
+    "seconds": 7.491715537151322,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.92236328125,
+      6.35400390625,
+      6.505859375
+    ],
+    "available_GiB": 115.98588562011719,
+    "trace": "curve-v2-2-0-add-project.jsonl",
+    "query_count": 1552,
+    "catalog_query_count": 73,
+    "catalog_ms": 3223,
+    "query_ms_sum": 4625
+  },
+  {
+    "operation": "add-project",
+    "databases": 3,
+    "rep": 0,
+    "seconds": 7.947224212111905,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      7.11669921875,
+      6.5908203125,
+      6.58154296875
+    ],
+    "available_GiB": 115.74039459228516,
+    "trace": "curve-v2-3-0-add-project.jsonl",
+    "query_count": 1552,
+    "catalog_query_count": 73,
+    "catalog_ms": 3854,
+    "query_ms_sum": 5196
+  },
+  {
+    "operation": "add-project",
+    "databases": 4,
+    "rep": 0,
+    "seconds": 8.726635203929618,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      7.1875,
+      6.6142578125,
+      6.58935546875
+    ],
+    "available_GiB": 115.60575866699219,
+    "trace": "curve-v2-4-0-add-project.jsonl",
+    "query_count": 1552,
+    "catalog_query_count": 73,
+    "catalog_ms": 4559,
+    "query_ms_sum": 5948
+  },
+  {
+    "operation": "create",
+    "databases": 5,
+    "rep": 1,
+    "seconds": 0.4495456989388913,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      7.31884765625,
+      6.66064453125,
+      6.60498046875
+    ],
+    "available_GiB": 115.41696548461914,
+    "trace": "curve-v2-5-1-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 159,
+    "query_ms_sum": 193
+  },
+  {
+    "operation": "update",
+    "databases": 5,
+    "rep": 1,
+    "seconds": 0.4258524947799742,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      7.31884765625,
+      6.66064453125,
+      6.60498046875
+    ],
+    "available_GiB": 115.43056869506836,
+    "trace": "curve-v2-5-1-update.jsonl",
+    "query_count": 52,
+    "catalog_query_count": 2,
+    "catalog_ms": 153,
+    "query_ms_sum": 179
+  },
+  {
+    "operation": "comment",
+    "databases": 5,
+    "rep": 1,
+    "seconds": 0.4104755138978362,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      7.31884765625,
+      6.66064453125,
+      6.60498046875
+    ],
+    "available_GiB": 115.42991638183594,
+    "trace": "curve-v2-5-1-comment.jsonl",
+    "query_count": 45,
+    "catalog_query_count": 2,
+    "catalog_ms": 157,
+    "query_ms_sum": 167
+  },
+  {
+    "operation": "set-state",
+    "databases": 5,
+    "rep": 1,
+    "seconds": 0.5156557050067931,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      7.31884765625,
+      6.66064453125,
+      6.60498046875
+    ],
+    "available_GiB": 115.40917205810547,
+    "trace": "curve-v2-5-1-set-state.jsonl",
+    "query_count": 93,
+    "catalog_query_count": 2,
+    "catalog_ms": 148,
+    "query_ms_sum": 248
+  },
+  {
+    "operation": "claim",
+    "databases": 5,
+    "rep": 1,
+    "seconds": 0.40854632086120546,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.05712890625,
+      7.44677734375,
+      6.85986328125
+    ],
+    "available_GiB": 115.30168151855469,
+    "trace": "curve-v2-5-1-claim.jsonl",
+    "query_count": 48,
+    "catalog_query_count": 2,
+    "catalog_ms": 158,
+    "query_ms_sum": 173
+  },
+  {
+    "operation": "merge-check",
+    "databases": 5,
+    "rep": 1,
+    "seconds": 0.34113836591131985,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.05712890625,
+      7.44677734375,
+      6.85986328125
+    ],
+    "available_GiB": 115.39876174926758,
+    "trace": "curve-v2-5-1-merge-check.jsonl",
+    "query_count": 31,
+    "catalog_query_count": 2,
+    "catalog_ms": 125,
+    "query_ms_sum": 135
+  },
+  {
+    "operation": "merge-acquire",
+    "databases": 5,
+    "rep": 1,
+    "seconds": 0.4575879801996052,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.05712890625,
+      7.44677734375,
+      6.85986328125
+    ],
+    "available_GiB": 115.36993408203125,
+    "trace": "curve-v2-5-1-merge-acquire.jsonl",
+    "query_count": 43,
+    "catalog_query_count": 2,
+    "catalog_ms": 185,
+    "query_ms_sum": 216
+  },
+  {
+    "operation": "merge-release",
+    "databases": 5,
+    "rep": 1,
+    "seconds": 0.43641384108923376,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.05712890625,
+      7.44677734375,
+      6.85986328125
+    ],
+    "available_GiB": 115.38773727416992,
+    "trace": "curve-v2-5-1-merge-release.jsonl",
+    "query_count": 46,
+    "catalog_query_count": 2,
+    "catalog_ms": 132,
+    "query_ms_sum": 175
+  },
+  {
+    "operation": "list",
+    "databases": 5,
+    "rep": 1,
+    "seconds": 0.20002859691157937,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.05712890625,
+      7.44677734375,
+      6.85986328125
+    ],
+    "available_GiB": 115.33874893188477,
+    "trace": "curve-v2-5-1-list.jsonl",
+    "query_count": 22,
+    "catalog_query_count": 0,
+    "catalog_ms": 0,
+    "query_ms_sum": 10
+  },
+  {
+    "operation": "show",
+    "databases": 5,
+    "rep": 1,
+    "seconds": 0.18807996693067253,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.05712890625,
+      7.44677734375,
+      6.85986328125
+    ],
+    "available_GiB": 115.37423324584961,
+    "trace": "curve-v2-5-1-show.jsonl",
+    "query_count": 33,
+    "catalog_query_count": 0,
+    "catalog_ms": 0,
+    "query_ms_sum": 7
+  },
+  {
+    "operation": "filtered-columns",
+    "databases": 5,
+    "rep": 1,
+    "seconds": 0.15302075305953622,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.05712890625,
+      7.44677734375,
+      6.85986328125
+    ],
+    "available_GiB": 115.39383316040039,
+    "trace": "curve-v2-5-1-filtered-columns.jsonl",
+    "query_count": 4,
+    "catalog_query_count": 1,
+    "catalog_ms": 86,
+    "query_ms_sum": 91
+  },
+  {
+    "operation": "ordinary-query",
+    "databases": 5,
+    "rep": 1,
+    "seconds": 0.05283441301435232,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.05712890625,
+      7.44677734375,
+      6.85986328125
+    ],
+    "available_GiB": 115.39525604248047,
+    "trace": "curve-v2-5-1-ordinary-query.jsonl",
+    "query_count": 4,
+    "catalog_query_count": 0,
+    "catalog_ms": 0,
+    "query_ms_sum": 4
+  },
+  {
+    "operation": "create",
+    "databases": 5,
+    "rep": 2,
+    "seconds": 0.39543212996795774,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.05712890625,
+      7.44677734375,
+      6.85986328125
+    ],
+    "available_GiB": 115.37892150878906,
+    "trace": "curve-v2-5-2-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 107,
+    "query_ms_sum": 145
+  },
+  {
+    "operation": "update",
+    "databases": 5,
+    "rep": 2,
+    "seconds": 0.4293698510155082,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.05712890625,
+      7.44677734375,
+      6.85986328125
+    ],
+    "available_GiB": 115.3533935546875,
+    "trace": "curve-v2-5-2-update.jsonl",
+    "query_count": 52,
+    "catalog_query_count": 2,
+    "catalog_ms": 153,
+    "query_ms_sum": 185
+  },
+  {
+    "operation": "comment",
+    "databases": 5,
+    "rep": 2,
+    "seconds": 0.41943600680679083,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.05712890625,
+      7.44677734375,
+      6.85986328125
+    ],
+    "available_GiB": 115.40619659423828,
+    "trace": "curve-v2-5-2-comment.jsonl",
+    "query_count": 45,
+    "catalog_query_count": 2,
+    "catalog_ms": 181,
+    "query_ms_sum": 201
+  },
+  {
+    "operation": "set-state",
+    "databases": 5,
+    "rep": 2,
+    "seconds": 0.4595277819316834,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.05712890625,
+      7.44677734375,
+      6.85986328125
+    ],
+    "available_GiB": 115.36153030395508,
+    "trace": "curve-v2-5-2-set-state.jsonl",
+    "query_count": 93,
+    "catalog_query_count": 2,
+    "catalog_ms": 105,
+    "query_ms_sum": 195
+  },
+  {
+    "operation": "claim",
+    "databases": 5,
+    "rep": 2,
+    "seconds": 0.40638616401702166,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.05712890625,
+      7.44677734375,
+      6.85986328125
+    ],
+    "available_GiB": 115.34970474243164,
+    "trace": "curve-v2-5-2-claim.jsonl",
+    "query_count": 48,
+    "catalog_query_count": 2,
+    "catalog_ms": 157,
+    "query_ms_sum": 185
+  },
+  {
+    "operation": "merge-check",
+    "databases": 5,
+    "rep": 2,
+    "seconds": 0.33306525088846684,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      10.89208984375,
+      7.47265625,
+      6.87158203125
+    ],
+    "available_GiB": 115.34790420532227,
+    "trace": "curve-v2-5-2-merge-check.jsonl",
+    "query_count": 31,
+    "catalog_query_count": 2,
+    "catalog_ms": 117,
+    "query_ms_sum": 119
+  },
+  {
+    "operation": "merge-acquire",
+    "databases": 5,
+    "rep": 2,
+    "seconds": 0.35185650712810457,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      10.89208984375,
+      7.47265625,
+      6.87158203125
+    ],
+    "available_GiB": 115.42811965942383,
+    "trace": "curve-v2-5-2-merge-acquire.jsonl",
+    "query_count": 43,
+    "catalog_query_count": 2,
+    "catalog_ms": 108,
+    "query_ms_sum": 131
+  },
+  {
+    "operation": "merge-release",
+    "databases": 5,
+    "rep": 2,
+    "seconds": 0.353968437993899,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      10.89208984375,
+      7.47265625,
+      6.87158203125
+    ],
+    "available_GiB": 115.37017822265625,
+    "trace": "curve-v2-5-2-merge-release.jsonl",
+    "query_count": 46,
+    "catalog_query_count": 2,
+    "catalog_ms": 112,
+    "query_ms_sum": 133
+  },
+  {
+    "operation": "list",
+    "databases": 5,
+    "rep": 2,
+    "seconds": 0.21985827013850212,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      10.89208984375,
+      7.47265625,
+      6.87158203125
+    ],
+    "available_GiB": 115.44195556640625,
+    "trace": "curve-v2-5-2-list.jsonl",
+    "query_count": 22,
+    "catalog_query_count": 0,
+    "catalog_ms": 0,
+    "query_ms_sum": 19
+  },
+  {
+    "operation": "show",
+    "databases": 5,
+    "rep": 2,
+    "seconds": 0.1865888638421893,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      10.89208984375,
+      7.47265625,
+      6.87158203125
+    ],
+    "available_GiB": 115.4410400390625,
+    "trace": "curve-v2-5-2-show.jsonl",
+    "query_count": 33,
+    "catalog_query_count": 0,
+    "catalog_ms": 0,
+    "query_ms_sum": 13
+  },
+  {
+    "operation": "filtered-columns",
+    "databases": 5,
+    "rep": 2,
+    "seconds": 0.1300652059726417,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      10.89208984375,
+      7.47265625,
+      6.87158203125
+    ],
+    "available_GiB": 115.42879104614258,
+    "trace": "curve-v2-5-2-filtered-columns.jsonl",
+    "query_count": 4,
+    "catalog_query_count": 1,
+    "catalog_ms": 72,
+    "query_ms_sum": 74
+  },
+  {
+    "operation": "ordinary-query",
+    "databases": 5,
+    "rep": 2,
+    "seconds": 0.06026758695952594,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      10.89208984375,
+      7.47265625,
+      6.87158203125
+    ],
+    "available_GiB": 115.44663619995117,
+    "trace": "curve-v2-5-2-ordinary-query.jsonl",
+    "query_count": 4,
+    "catalog_query_count": 0,
+    "catalog_ms": 0,
+    "query_ms_sum": 6
+  },
+  {
+    "operation": "create",
+    "databases": 5,
+    "rep": 3,
+    "seconds": 0.46640531602315605,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      10.89208984375,
+      7.47265625,
+      6.87158203125
+    ],
+    "available_GiB": 115.45332336425781,
+    "trace": "curve-v2-5-3-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 172,
+    "query_ms_sum": 196
+  },
+  {
+    "operation": "update",
+    "databases": 5,
+    "rep": 3,
+    "seconds": 0.4344003649894148,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      10.89208984375,
+      7.47265625,
+      6.87158203125
+    ],
+    "available_GiB": 115.39252853393555,
+    "trace": "curve-v2-5-3-update.jsonl",
+    "query_count": 52,
+    "catalog_query_count": 2,
+    "catalog_ms": 161,
+    "query_ms_sum": 197
+  },
+  {
+    "operation": "comment",
+    "databases": 5,
+    "rep": 3,
+    "seconds": 0.4522325471043587,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      10.89208984375,
+      7.47265625,
+      6.87158203125
+    ],
+    "available_GiB": 115.40073013305664,
+    "trace": "curve-v2-5-3-comment.jsonl",
+    "query_count": 45,
+    "catalog_query_count": 2,
+    "catalog_ms": 175,
+    "query_ms_sum": 203
+  },
+  {
+    "operation": "set-state",
+    "databases": 5,
+    "rep": 3,
+    "seconds": 0.6198881329037249,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      10.89208984375,
+      7.47265625,
+      6.87158203125
+    ],
+    "available_GiB": 115.38839340209961,
+    "trace": "curve-v2-5-3-set-state.jsonl",
+    "query_count": 93,
+    "catalog_query_count": 2,
+    "catalog_ms": 178,
+    "query_ms_sum": 312
+  },
+  {
+    "operation": "claim",
+    "databases": 5,
+    "rep": 3,
+    "seconds": 0.40222844015806913,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      10.89208984375,
+      7.47265625,
+      6.87158203125
+    ],
+    "available_GiB": 115.3813705444336,
+    "trace": "curve-v2-5-3-claim.jsonl",
+    "query_count": 48,
+    "catalog_query_count": 2,
+    "catalog_ms": 132,
+    "query_ms_sum": 165
+  },
+  {
+    "operation": "merge-check",
+    "databases": 5,
+    "rep": 3,
+    "seconds": 0.3954282889608294,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      10.89208984375,
+      7.47265625,
+      6.87158203125
+    ],
+    "available_GiB": 115.39199447631836,
+    "trace": "curve-v2-5-3-merge-check.jsonl",
+    "query_count": 31,
+    "catalog_query_count": 2,
+    "catalog_ms": 164,
+    "query_ms_sum": 173
+  },
+  {
+    "operation": "merge-acquire",
+    "databases": 5,
+    "rep": 3,
+    "seconds": 0.4093646090477705,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      10.419921875,
+      7.43115234375,
+      6.861328125
+    ],
+    "available_GiB": 115.38080596923828,
+    "trace": "curve-v2-5-3-merge-acquire.jsonl",
+    "query_count": 43,
+    "catalog_query_count": 2,
+    "catalog_ms": 157,
+    "query_ms_sum": 189
+  },
+  {
+    "operation": "merge-release",
+    "databases": 5,
+    "rep": 3,
+    "seconds": 0.4085240592248738,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      10.419921875,
+      7.43115234375,
+      6.861328125
+    ],
+    "available_GiB": 115.34069442749023,
+    "trace": "curve-v2-5-3-merge-release.jsonl",
+    "query_count": 46,
+    "catalog_query_count": 2,
+    "catalog_ms": 141,
+    "query_ms_sum": 174
+  },
+  {
+    "operation": "list",
+    "databases": 5,
+    "rep": 3,
+    "seconds": 0.18120446102693677,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      10.419921875,
+      7.43115234375,
+      6.861328125
+    ],
+    "available_GiB": 115.37054824829102,
+    "trace": "curve-v2-5-3-list.jsonl",
+    "query_count": 22,
+    "catalog_query_count": 0,
+    "catalog_ms": 0,
+    "query_ms_sum": 10
+  },
+  {
+    "operation": "show",
+    "databases": 5,
+    "rep": 3,
+    "seconds": 0.15987939201295376,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      10.419921875,
+      7.43115234375,
+      6.861328125
+    ],
+    "available_GiB": 115.32137680053711,
+    "trace": "curve-v2-5-3-show.jsonl",
+    "query_count": 33,
+    "catalog_query_count": 0,
+    "catalog_ms": 0,
+    "query_ms_sum": 4
+  },
+  {
+    "operation": "filtered-columns",
+    "databases": 5,
+    "rep": 3,
+    "seconds": 0.17933685099706054,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      10.419921875,
+      7.43115234375,
+      6.861328125
+    ],
+    "available_GiB": 115.27131271362305,
+    "trace": "curve-v2-5-3-filtered-columns.jsonl",
+    "query_count": 4,
+    "catalog_query_count": 1,
+    "catalog_ms": 125,
+    "query_ms_sum": 129
+  },
+  {
+    "operation": "ordinary-query",
+    "databases": 5,
+    "rep": 3,
+    "seconds": 0.049193229991942644,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      10.419921875,
+      7.43115234375,
+      6.861328125
+    ],
+    "available_GiB": 115.2407341003418,
+    "trace": "curve-v2-5-3-ordinary-query.jsonl",
+    "query_count": 4,
+    "catalog_query_count": 0,
+    "catalog_ms": 0,
+    "query_ms_sum": 3
+  },
+  {
+    "operation": "create",
+    "databases": 5,
+    "rep": 11,
+    "seconds": 0.4586645760573447,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.419921875,
+      7.43115234375,
+      6.861328125
+    ],
+    "available_GiB": 115.45882034301758
+  },
+  {
+    "operation": "update",
+    "databases": 5,
+    "rep": 11,
+    "seconds": 0.47812938084825873,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.419921875,
+      7.43115234375,
+      6.861328125
+    ],
+    "available_GiB": 115.39896011352539
+  },
+  {
+    "operation": "comment",
+    "databases": 5,
+    "rep": 11,
+    "seconds": 0.3978107930161059,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.419921875,
+      7.43115234375,
+      6.861328125
+    ],
+    "available_GiB": 115.33398818969727
+  },
+  {
+    "operation": "set-state",
+    "databases": 5,
+    "rep": 11,
+    "seconds": 0.6111026778817177,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.419921875,
+      7.43115234375,
+      6.861328125
+    ],
+    "available_GiB": 115.2677230834961
+  },
+  {
+    "operation": "claim",
+    "databases": 5,
+    "rep": 11,
+    "seconds": 0.41202529007568955,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.419921875,
+      7.43115234375,
+      6.861328125
+    ],
+    "available_GiB": 115.29472351074219
+  },
+  {
+    "operation": "merge-check",
+    "databases": 5,
+    "rep": 11,
+    "seconds": 0.3350409478880465,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.22607421875,
+      7.44091796875,
+      6.86767578125
+    ],
+    "available_GiB": 115.24800109863281
+  },
+  {
+    "operation": "merge-acquire",
+    "databases": 5,
+    "rep": 11,
+    "seconds": 0.44589585391804576,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.22607421875,
+      7.44091796875,
+      6.86767578125
+    ],
+    "available_GiB": 115.22732543945312
+  },
+  {
+    "operation": "merge-release",
+    "databases": 5,
+    "rep": 11,
+    "seconds": 0.3522106031887233,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.22607421875,
+      7.44091796875,
+      6.86767578125
+    ],
+    "available_GiB": 115.21279525756836
+  },
+  {
+    "operation": "list",
+    "databases": 5,
+    "rep": 11,
+    "seconds": 0.1985384749714285,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.22607421875,
+      7.44091796875,
+      6.86767578125
+    ],
+    "available_GiB": 115.15264892578125
+  },
+  {
+    "operation": "show",
+    "databases": 5,
+    "rep": 11,
+    "seconds": 0.26499918499030173,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.22607421875,
+      7.44091796875,
+      6.86767578125
+    ],
+    "available_GiB": 115.1312026977539
+  },
+  {
+    "operation": "filtered-columns",
+    "databases": 5,
+    "rep": 11,
+    "seconds": 0.13309109886176884,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.22607421875,
+      7.44091796875,
+      6.86767578125
+    ],
+    "available_GiB": 115.12434387207031
+  },
+  {
+    "operation": "ordinary-query",
+    "databases": 5,
+    "rep": 11,
+    "seconds": 0.04818864120170474,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.22607421875,
+      7.44091796875,
+      6.86767578125
+    ],
+    "available_GiB": 115.12117385864258
+  },
+  {
+    "operation": "create",
+    "databases": 5,
+    "rep": 12,
+    "seconds": 0.41110335011035204,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.22607421875,
+      7.44091796875,
+      6.86767578125
+    ],
+    "available_GiB": 115.12002182006836
+  },
+  {
+    "operation": "update",
+    "databases": 5,
+    "rep": 12,
+    "seconds": 0.3714441889896989,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.22607421875,
+      7.44091796875,
+      6.86767578125
+    ],
+    "available_GiB": 115.08809661865234
+  },
+  {
+    "operation": "comment",
+    "databases": 5,
+    "rep": 12,
+    "seconds": 0.4116293729748577,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.22607421875,
+      7.44091796875,
+      6.86767578125
+    ],
+    "available_GiB": 115.00256729125977
+  },
+  {
+    "operation": "set-state",
+    "databases": 5,
+    "rep": 12,
+    "seconds": 0.5453279649373144,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.22607421875,
+      7.44091796875,
+      6.86767578125
+    ],
+    "available_GiB": 114.9751968383789
+  },
+  {
+    "operation": "claim",
+    "databases": 5,
+    "rep": 12,
+    "seconds": 0.3604905048850924,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.22607421875,
+      7.44091796875,
+      6.86767578125
+    ],
+    "available_GiB": 115.01570129394531
+  },
+  {
+    "operation": "merge-check",
+    "databases": 5,
+    "rep": 12,
+    "seconds": 0.40764347300864756,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.22607421875,
+      7.44091796875,
+      6.86767578125
+    ],
+    "available_GiB": 115.12520599365234
+  },
+  {
+    "operation": "merge-acquire",
+    "databases": 5,
+    "rep": 12,
+    "seconds": 0.4518807560671121,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.22607421875,
+      7.44091796875,
+      6.86767578125
+    ],
+    "available_GiB": 115.0628890991211
+  },
+  {
+    "operation": "merge-release",
+    "databases": 5,
+    "rep": 12,
+    "seconds": 0.4000775220338255,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.22607421875,
+      7.44091796875,
+      6.86767578125
+    ],
+    "available_GiB": 115.07449722290039
+  },
+  {
+    "operation": "list",
+    "databases": 5,
+    "rep": 12,
+    "seconds": 0.24441727413795888,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.04736328125,
+      7.45068359375,
+      6.8740234375
+    ],
+    "available_GiB": 115.04291915893555
+  },
+  {
+    "operation": "show",
+    "databases": 5,
+    "rep": 12,
+    "seconds": 0.2484850490000099,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.04736328125,
+      7.45068359375,
+      6.8740234375
+    ],
+    "available_GiB": 115.01824569702148
+  },
+  {
+    "operation": "filtered-columns",
+    "databases": 5,
+    "rep": 12,
+    "seconds": 0.16184613201767206,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.04736328125,
+      7.45068359375,
+      6.8740234375
+    ],
+    "available_GiB": 114.99869537353516
+  },
+  {
+    "operation": "ordinary-query",
+    "databases": 5,
+    "rep": 12,
+    "seconds": 0.05235958308912814,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.04736328125,
+      7.45068359375,
+      6.8740234375
+    ],
+    "available_GiB": 115.0263786315918
+  },
+  {
+    "operation": "create",
+    "databases": 5,
+    "rep": 13,
+    "seconds": 0.4428334010299295,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.04736328125,
+      7.45068359375,
+      6.8740234375
+    ],
+    "available_GiB": 115.0196762084961
+  },
+  {
+    "operation": "update",
+    "databases": 5,
+    "rep": 13,
+    "seconds": 0.40520830592140555,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.04736328125,
+      7.45068359375,
+      6.8740234375
+    ],
+    "available_GiB": 115.00173568725586
+  },
+  {
+    "operation": "comment",
+    "databases": 5,
+    "rep": 13,
+    "seconds": 0.3724667760543525,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.04736328125,
+      7.45068359375,
+      6.8740234375
+    ],
+    "available_GiB": 114.98632431030273
+  },
+  {
+    "operation": "set-state",
+    "databases": 5,
+    "rep": 13,
+    "seconds": 0.6284596379846334,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.04736328125,
+      7.45068359375,
+      6.8740234375
+    ],
+    "available_GiB": 114.97114562988281
+  },
+  {
+    "operation": "claim",
+    "databases": 5,
+    "rep": 13,
+    "seconds": 0.3968183039687574,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.04736328125,
+      7.45068359375,
+      6.8740234375
+    ],
+    "available_GiB": 114.97038650512695
+  },
+  {
+    "operation": "merge-check",
+    "databases": 5,
+    "rep": 13,
+    "seconds": 0.4111519770231098,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.04736328125,
+      7.45068359375,
+      6.8740234375
+    ],
+    "available_GiB": 114.90291213989258
+  },
+  {
+    "operation": "merge-acquire",
+    "databases": 5,
+    "rep": 13,
+    "seconds": 0.4615226830355823,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.04736328125,
+      7.45068359375,
+      6.8740234375
+    ],
+    "available_GiB": 114.82221984863281
+  },
+  {
+    "operation": "merge-release",
+    "databases": 5,
+    "rep": 13,
+    "seconds": 0.4422426500823349,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.04736328125,
+      7.45068359375,
+      6.8740234375
+    ],
+    "available_GiB": 114.9261474609375
+  },
+  {
+    "operation": "list",
+    "databases": 5,
+    "rep": 13,
+    "seconds": 0.2162750030402094,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.04736328125,
+      7.45068359375,
+      6.8740234375
+    ],
+    "available_GiB": 114.8674545288086
+  },
+  {
+    "operation": "show",
+    "databases": 5,
+    "rep": 13,
+    "seconds": 0.19725393108092248,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.04736328125,
+      7.45068359375,
+      6.8740234375
+    ],
+    "available_GiB": 114.8846206665039
+  },
+  {
+    "operation": "filtered-columns",
+    "databases": 5,
+    "rep": 13,
+    "seconds": 0.11911997618153691,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      9.80322265625,
+      7.44287109375,
+      6.875
+    ],
+    "available_GiB": 114.85000991821289
+  },
+  {
+    "operation": "ordinary-query",
+    "databases": 5,
+    "rep": 13,
+    "seconds": 0.06810775492340326,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      9.80322265625,
+      7.44287109375,
+      6.875
+    ],
+    "available_GiB": 114.96232604980469
+  },
+  {
+    "operation": "add-project",
+    "databases": 5,
+    "rep": 0,
+    "seconds": 10.030598444165662,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      9.80322265625,
+      7.44287109375,
+      6.875
+    ],
+    "available_GiB": 115.02731323242188,
+    "trace": "curve-v2-5-0-add-project.jsonl",
+    "query_count": 1552,
+    "catalog_query_count": 73,
+    "catalog_ms": 5325,
+    "query_ms_sum": 6971
+  },
+  {
+    "operation": "add-project",
+    "databases": 6,
+    "rep": 0,
+    "seconds": 10.399466037051752,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      9.69921875,
+      7.49462890625,
+      6.89794921875
+    ],
+    "available_GiB": 114.51571273803711,
+    "trace": "curve-v2-6-0-add-project.jsonl",
+    "query_count": 1552,
+    "catalog_query_count": 73,
+    "catalog_ms": 5751,
+    "query_ms_sum": 7351
+  },
+  {
+    "operation": "add-project",
+    "databases": 7,
+    "rep": 0,
+    "seconds": 11.50025092693977,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      9.4375,
+      7.51171875,
+      6.91064453125
+    ],
+    "available_GiB": 114.46979141235352,
+    "trace": "curve-v2-7-0-add-project.jsonl",
+    "query_count": 1552,
+    "catalog_query_count": 73,
+    "catalog_ms": 6699,
+    "query_ms_sum": 8431
+  },
+  {
+    "operation": "add-project",
+    "databases": 8,
+    "rep": 0,
+    "seconds": 12.22123664803803,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      8.98876953125,
+      7.47802734375,
+      6.90625
+    ],
+    "available_GiB": 114.25664901733398,
+    "trace": "curve-v2-8-0-add-project.jsonl",
+    "query_count": 1552,
+    "catalog_query_count": 73,
+    "catalog_ms": 7502,
+    "query_ms_sum": 9156
+  },
+  {
+    "operation": "add-project",
+    "databases": 9,
+    "rep": 0,
+    "seconds": 13.306086763041094,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      12.6796875,
+      8.369140625,
+      7.2080078125
+    ],
+    "available_GiB": 114.14816284179688,
+    "trace": "curve-v2-9-0-add-project.jsonl",
+    "query_count": 1552,
+    "catalog_query_count": 73,
+    "catalog_ms": 8366,
+    "query_ms_sum": 10140
+  },
+  {
+    "operation": "create",
+    "databases": 10,
+    "rep": 1,
+    "seconds": 0.526498895836994,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.732421875,
+      8.30712890625,
+      7.19970703125
+    ],
+    "available_GiB": 114.04521560668945,
+    "trace": "curve-v2-10-1-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 239,
+    "query_ms_sum": 271
+  },
+  {
+    "operation": "update",
+    "databases": 10,
+    "rep": 1,
+    "seconds": 0.561453856062144,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.59326171875,
+      8.33544921875,
+      7.21484375
+    ],
+    "available_GiB": 114.05688095092773,
+    "trace": "curve-v2-10-1-update.jsonl",
+    "query_count": 52,
+    "catalog_query_count": 2,
+    "catalog_ms": 277,
+    "query_ms_sum": 302
+  },
+  {
+    "operation": "comment",
+    "databases": 10,
+    "rep": 1,
+    "seconds": 0.4522634199820459,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.59326171875,
+      8.33544921875,
+      7.21484375
+    ],
+    "available_GiB": 114.06079864501953,
+    "trace": "curve-v2-10-1-comment.jsonl",
+    "query_count": 45,
+    "catalog_query_count": 2,
+    "catalog_ms": 214,
+    "query_ms_sum": 233
+  },
+  {
+    "operation": "set-state",
+    "databases": 10,
+    "rep": 1,
+    "seconds": 0.7637050731573254,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.59326171875,
+      8.33544921875,
+      7.21484375
+    ],
+    "available_GiB": 114.07809066772461,
+    "trace": "curve-v2-10-1-set-state.jsonl",
+    "query_count": 93,
+    "catalog_query_count": 2,
+    "catalog_ms": 265,
+    "query_ms_sum": 416
+  },
+  {
+    "operation": "claim",
+    "databases": 10,
+    "rep": 1,
+    "seconds": 0.6298874490894377,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.59326171875,
+      8.33544921875,
+      7.21484375
+    ],
+    "available_GiB": 114.07923126220703,
+    "trace": "curve-v2-10-1-claim.jsonl",
+    "query_count": 48,
+    "catalog_query_count": 2,
+    "catalog_ms": 324,
+    "query_ms_sum": 344
+  },
+  {
+    "operation": "merge-check",
+    "databases": 10,
+    "rep": 1,
+    "seconds": 0.48486457392573357,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.59326171875,
+      8.33544921875,
+      7.21484375
+    ],
+    "available_GiB": 114.14025115966797,
+    "trace": "curve-v2-10-1-merge-check.jsonl",
+    "query_count": 31,
+    "catalog_query_count": 2,
+    "catalog_ms": 260,
+    "query_ms_sum": 264
+  },
+  {
+    "operation": "merge-acquire",
+    "databases": 10,
+    "rep": 1,
+    "seconds": 0.6327465260401368,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.59326171875,
+      8.33544921875,
+      7.21484375
+    ],
+    "available_GiB": 114.08859252929688,
+    "trace": "curve-v2-10-1-merge-acquire.jsonl",
+    "query_count": 43,
+    "catalog_query_count": 2,
+    "catalog_ms": 329,
+    "query_ms_sum": 364
+  },
+  {
+    "operation": "merge-release",
+    "databases": 10,
+    "rep": 1,
+    "seconds": 0.5795249501243234,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.59326171875,
+      8.33544921875,
+      7.21484375
+    ],
+    "available_GiB": 114.14651870727539,
+    "trace": "curve-v2-10-1-merge-release.jsonl",
+    "query_count": 46,
+    "catalog_query_count": 2,
+    "catalog_ms": 298,
+    "query_ms_sum": 328
+  },
+  {
+    "operation": "list",
+    "databases": 10,
+    "rep": 1,
+    "seconds": 0.2068322109989822,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.59326171875,
+      8.33544921875,
+      7.21484375
+    ],
+    "available_GiB": 114.10307312011719,
+    "trace": "curve-v2-10-1-list.jsonl",
+    "query_count": 22,
+    "catalog_query_count": 0,
+    "catalog_ms": 0,
+    "query_ms_sum": 19
+  },
+  {
+    "operation": "show",
+    "databases": 10,
+    "rep": 1,
+    "seconds": 0.21373870689421892,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.59326171875,
+      8.33544921875,
+      7.21484375
+    ],
+    "available_GiB": 114.09701538085938,
+    "trace": "curve-v2-10-1-show.jsonl",
+    "query_count": 33,
+    "catalog_query_count": 0,
+    "catalog_ms": 0,
+    "query_ms_sum": 10
+  },
+  {
+    "operation": "filtered-columns",
+    "databases": 10,
+    "rep": 1,
+    "seconds": 0.20007028011605144,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.22509765625,
+      8.31298828125,
+      7.21337890625
+    ],
+    "available_GiB": 114.08945846557617,
+    "trace": "curve-v2-10-1-filtered-columns.jsonl",
+    "query_count": 4,
+    "catalog_query_count": 1,
+    "catalog_ms": 146,
+    "query_ms_sum": 151
+  },
+  {
+    "operation": "ordinary-query",
+    "databases": 10,
+    "rep": 1,
+    "seconds": 0.05674607283435762,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.22509765625,
+      8.31298828125,
+      7.21337890625
+    ],
+    "available_GiB": 114.07144927978516,
+    "trace": "curve-v2-10-1-ordinary-query.jsonl",
+    "query_count": 4,
+    "catalog_query_count": 0,
+    "catalog_ms": 0,
+    "query_ms_sum": 3
+  },
+  {
+    "operation": "create",
+    "databases": 10,
+    "rep": 2,
+    "seconds": 0.5614221540745348,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.22509765625,
+      8.31298828125,
+      7.21337890625
+    ],
+    "available_GiB": 114.05669021606445,
+    "trace": "curve-v2-10-2-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 262,
+    "query_ms_sum": 293
+  },
+  {
+    "operation": "update",
+    "databases": 10,
+    "rep": 2,
+    "seconds": 0.5725404929835349,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.22509765625,
+      8.31298828125,
+      7.21337890625
+    ],
+    "available_GiB": 114.06761169433594,
+    "trace": "curve-v2-10-2-update.jsonl",
+    "query_count": 52,
+    "catalog_query_count": 2,
+    "catalog_ms": 264,
+    "query_ms_sum": 297
+  },
+  {
+    "operation": "comment",
+    "databases": 10,
+    "rep": 2,
+    "seconds": 0.49418338295072317,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.22509765625,
+      8.31298828125,
+      7.21337890625
+    ],
+    "available_GiB": 114.03553009033203,
+    "trace": "curve-v2-10-2-comment.jsonl",
+    "query_count": 45,
+    "catalog_query_count": 2,
+    "catalog_ms": 237,
+    "query_ms_sum": 265
+  },
+  {
+    "operation": "set-state",
+    "databases": 10,
+    "rep": 2,
+    "seconds": 0.6855206929612905,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.22509765625,
+      8.31298828125,
+      7.21337890625
+    ],
+    "available_GiB": 114.04371643066406,
+    "trace": "curve-v2-10-2-set-state.jsonl",
+    "query_count": 93,
+    "catalog_query_count": 2,
+    "catalog_ms": 252,
+    "query_ms_sum": 367
+  },
+  {
+    "operation": "claim",
+    "databases": 10,
+    "rep": 2,
+    "seconds": 0.5404902019072324,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.22509765625,
+      8.31298828125,
+      7.21337890625
+    ],
+    "available_GiB": 114.02561569213867,
+    "trace": "curve-v2-10-2-claim.jsonl",
+    "query_count": 48,
+    "catalog_query_count": 2,
+    "catalog_ms": 220,
+    "query_ms_sum": 255
+  },
+  {
+    "operation": "merge-check",
+    "databases": 10,
+    "rep": 2,
+    "seconds": 0.46995630697347224,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.22509765625,
+      8.31298828125,
+      7.21337890625
+    ],
+    "available_GiB": 113.9573974609375,
+    "trace": "curve-v2-10-2-merge-check.jsonl",
+    "query_count": 31,
+    "catalog_query_count": 2,
+    "catalog_ms": 242,
+    "query_ms_sum": 252
+  },
+  {
+    "operation": "merge-acquire",
+    "databases": 10,
+    "rep": 2,
+    "seconds": 0.5766552279237658,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.22509765625,
+      8.31298828125,
+      7.21337890625
+    ],
+    "available_GiB": 113.93094253540039,
+    "trace": "curve-v2-10-2-merge-acquire.jsonl",
+    "query_count": 43,
+    "catalog_query_count": 2,
+    "catalog_ms": 267,
+    "query_ms_sum": 282
+  },
+  {
+    "operation": "merge-release",
+    "databases": 10,
+    "rep": 2,
+    "seconds": 0.5839933808892965,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.22509765625,
+      8.31298828125,
+      7.21337890625
+    ],
+    "available_GiB": 113.99071502685547,
+    "trace": "curve-v2-10-2-merge-release.jsonl",
+    "query_count": 46,
+    "catalog_query_count": 2,
+    "catalog_ms": 329,
+    "query_ms_sum": 354
+  },
+  {
+    "operation": "list",
+    "databases": 10,
+    "rep": 2,
+    "seconds": 0.20550447399728,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.046875,
+      8.32470703125,
+      7.22314453125
+    ],
+    "available_GiB": 113.94448852539062,
+    "trace": "curve-v2-10-2-list.jsonl",
+    "query_count": 22,
+    "catalog_query_count": 0,
+    "catalog_ms": 0,
+    "query_ms_sum": 13
+  },
+  {
+    "operation": "show",
+    "databases": 10,
+    "rep": 2,
+    "seconds": 0.1791014748159796,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.046875,
+      8.32470703125,
+      7.22314453125
+    ],
+    "available_GiB": 113.93931198120117,
+    "trace": "curve-v2-10-2-show.jsonl",
+    "query_count": 33,
+    "catalog_query_count": 0,
+    "catalog_ms": 0,
+    "query_ms_sum": 6
+  },
+  {
+    "operation": "filtered-columns",
+    "databases": 10,
+    "rep": 2,
+    "seconds": 0.25947005301713943,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.046875,
+      8.32470703125,
+      7.22314453125
+    ],
+    "available_GiB": 113.94964599609375,
+    "trace": "curve-v2-10-2-filtered-columns.jsonl",
+    "query_count": 4,
+    "catalog_query_count": 1,
+    "catalog_ms": 178,
+    "query_ms_sum": 183
+  },
+  {
+    "operation": "ordinary-query",
+    "databases": 10,
+    "rep": 2,
+    "seconds": 0.06074242992326617,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.046875,
+      8.32470703125,
+      7.22314453125
+    ],
+    "available_GiB": 114.08996200561523,
+    "trace": "curve-v2-10-2-ordinary-query.jsonl",
+    "query_count": 4,
+    "catalog_query_count": 0,
+    "catalog_ms": 0,
+    "query_ms_sum": 4
+  },
+  {
+    "operation": "create",
+    "databases": 10,
+    "rep": 3,
+    "seconds": 0.6049561938270926,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.046875,
+      8.32470703125,
+      7.22314453125
+    ],
+    "available_GiB": 114.0874137878418,
+    "trace": "curve-v2-10-3-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 279,
+    "query_ms_sum": 311
+  },
+  {
+    "operation": "update",
+    "databases": 10,
+    "rep": 3,
+    "seconds": 0.5699590048752725,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.046875,
+      8.32470703125,
+      7.22314453125
+    ],
+    "available_GiB": 114.06187438964844,
+    "trace": "curve-v2-10-3-update.jsonl",
+    "query_count": 52,
+    "catalog_query_count": 2,
+    "catalog_ms": 272,
+    "query_ms_sum": 307
+  },
+  {
+    "operation": "comment",
+    "databases": 10,
+    "rep": 3,
+    "seconds": 0.5498813958838582,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.046875,
+      8.32470703125,
+      7.22314453125
+    ],
+    "available_GiB": 114.0787353515625,
+    "trace": "curve-v2-10-3-comment.jsonl",
+    "query_count": 45,
+    "catalog_query_count": 2,
+    "catalog_ms": 277,
+    "query_ms_sum": 300
+  },
+  {
+    "operation": "set-state",
+    "databases": 10,
+    "rep": 3,
+    "seconds": 0.6831458930391818,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.046875,
+      8.32470703125,
+      7.22314453125
+    ],
+    "available_GiB": 114.05117416381836,
+    "trace": "curve-v2-10-3-set-state.jsonl",
+    "query_count": 93,
+    "catalog_query_count": 2,
+    "catalog_ms": 203,
+    "query_ms_sum": 298
+  },
+  {
+    "operation": "claim",
+    "databases": 10,
+    "rep": 3,
+    "seconds": 0.5605795860756189,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.046875,
+      8.32470703125,
+      7.22314453125
+    ],
+    "available_GiB": 114.07262420654297,
+    "trace": "curve-v2-10-3-claim.jsonl",
+    "query_count": 48,
+    "catalog_query_count": 2,
+    "catalog_ms": 282,
+    "query_ms_sum": 312
+  },
+  {
+    "operation": "merge-check",
+    "databases": 10,
+    "rep": 3,
+    "seconds": 0.5578948229085654,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.046875,
+      8.32470703125,
+      7.22314453125
+    ],
+    "available_GiB": 114.02437210083008,
+    "trace": "curve-v2-10-3-merge-check.jsonl",
+    "query_count": 31,
+    "catalog_query_count": 2,
+    "catalog_ms": 332,
+    "query_ms_sum": 339
+  },
+  {
+    "operation": "merge-acquire",
+    "databases": 10,
+    "rep": 3,
+    "seconds": 0.5684248618781567,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.12353515625,
+      8.3857421875,
+      7.2490234375
+    ],
+    "available_GiB": 113.97867965698242,
+    "trace": "curve-v2-10-3-merge-acquire.jsonl",
+    "query_count": 43,
+    "catalog_query_count": 2,
+    "catalog_ms": 259,
+    "query_ms_sum": 298
+  },
+  {
+    "operation": "merge-release",
+    "databases": 10,
+    "rep": 3,
+    "seconds": 0.47567298891954124,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.12353515625,
+      8.3857421875,
+      7.2490234375
+    ],
+    "available_GiB": 114.02836608886719,
+    "trace": "curve-v2-10-3-merge-release.jsonl",
+    "query_count": 46,
+    "catalog_query_count": 2,
+    "catalog_ms": 232,
+    "query_ms_sum": 258
+  },
+  {
+    "operation": "list",
+    "databases": 10,
+    "rep": 3,
+    "seconds": 0.17368804896250367,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.12353515625,
+      8.3857421875,
+      7.2490234375
+    ],
+    "available_GiB": 114.02937316894531,
+    "trace": "curve-v2-10-3-list.jsonl",
+    "query_count": 22,
+    "catalog_query_count": 0,
+    "catalog_ms": 0,
+    "query_ms_sum": 10
+  },
+  {
+    "operation": "show",
+    "databases": 10,
+    "rep": 3,
+    "seconds": 0.17961912602186203,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.12353515625,
+      8.3857421875,
+      7.2490234375
+    ],
+    "available_GiB": 114.04966354370117,
+    "trace": "curve-v2-10-3-show.jsonl",
+    "query_count": 33,
+    "catalog_query_count": 0,
+    "catalog_ms": 0,
+    "query_ms_sum": 6
+  },
+  {
+    "operation": "filtered-columns",
+    "databases": 10,
+    "rep": 3,
+    "seconds": 0.2101414070930332,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.12353515625,
+      8.3857421875,
+      7.2490234375
+    ],
+    "available_GiB": 114.01497268676758,
+    "trace": "curve-v2-10-3-filtered-columns.jsonl",
+    "query_count": 4,
+    "catalog_query_count": 1,
+    "catalog_ms": 146,
+    "query_ms_sum": 151
+  },
+  {
+    "operation": "ordinary-query",
+    "databases": 10,
+    "rep": 3,
+    "seconds": 0.08681238489225507,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.12353515625,
+      8.3857421875,
+      7.2490234375
+    ],
+    "available_GiB": 114.02825546264648,
+    "trace": "curve-v2-10-3-ordinary-query.jsonl",
+    "query_count": 4,
+    "catalog_query_count": 0,
+    "catalog_ms": 0,
+    "query_ms_sum": 5
+  },
+  {
+    "operation": "create",
+    "databases": 10,
+    "rep": 11,
+    "seconds": 0.5525878029875457,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      11.12353515625,
+      8.3857421875,
+      7.2490234375
+    ],
+    "available_GiB": 114.20348358154297
+  },
+  {
+    "operation": "update",
+    "databases": 10,
+    "rep": 11,
+    "seconds": 0.534469319973141,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      11.12353515625,
+      8.3857421875,
+      7.2490234375
+    ],
+    "available_GiB": 114.16612243652344
+  },
+  {
+    "operation": "comment",
+    "databases": 10,
+    "rep": 11,
+    "seconds": 0.580947679001838,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      11.12353515625,
+      8.3857421875,
+      7.2490234375
+    ],
+    "available_GiB": 114.2103271484375
+  },
+  {
+    "operation": "set-state",
+    "databases": 10,
+    "rep": 11,
+    "seconds": 0.7881524220574647,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      11.12353515625,
+      8.3857421875,
+      7.2490234375
+    ],
+    "available_GiB": 114.14175033569336
+  },
+  {
+    "operation": "claim",
+    "databases": 10,
+    "rep": 11,
+    "seconds": 0.5646817060187459,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.873046875,
+      8.37890625,
+      7.25341796875
+    ],
+    "available_GiB": 114.10273742675781
+  },
+  {
+    "operation": "merge-check",
+    "databases": 10,
+    "rep": 11,
+    "seconds": 0.4862586560193449,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.873046875,
+      8.37890625,
+      7.25341796875
+    ],
+    "available_GiB": 114.01897430419922
+  },
+  {
+    "operation": "merge-acquire",
+    "databases": 10,
+    "rep": 11,
+    "seconds": 0.5184365871828049,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.873046875,
+      8.37890625,
+      7.25341796875
+    ],
+    "available_GiB": 114.06750106811523
+  },
+  {
+    "operation": "merge-release",
+    "databases": 10,
+    "rep": 11,
+    "seconds": 0.5653528110124171,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.873046875,
+      8.37890625,
+      7.25341796875
+    ],
+    "available_GiB": 114.05382919311523
+  },
+  {
+    "operation": "list",
+    "databases": 10,
+    "rep": 11,
+    "seconds": 0.24866949790157378,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.873046875,
+      8.37890625,
+      7.25341796875
+    ],
+    "available_GiB": 114.06672668457031
+  },
+  {
+    "operation": "show",
+    "databases": 10,
+    "rep": 11,
+    "seconds": 0.22523196414113045,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.873046875,
+      8.37890625,
+      7.25341796875
+    ],
+    "available_GiB": 114.03299713134766
+  },
+  {
+    "operation": "filtered-columns",
+    "databases": 10,
+    "rep": 11,
+    "seconds": 0.17778137978166342,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.873046875,
+      8.37890625,
+      7.25341796875
+    ],
+    "available_GiB": 113.99728393554688
+  },
+  {
+    "operation": "ordinary-query",
+    "databases": 10,
+    "rep": 11,
+    "seconds": 0.05336014204658568,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.873046875,
+      8.37890625,
+      7.25341796875
+    ],
+    "available_GiB": 113.960693359375
+  },
+  {
+    "operation": "create",
+    "databases": 10,
+    "rep": 12,
+    "seconds": 0.5713400519452989,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.873046875,
+      8.37890625,
+      7.25341796875
+    ],
+    "available_GiB": 113.95651626586914
+  },
+  {
+    "operation": "update",
+    "databases": 10,
+    "rep": 12,
+    "seconds": 0.49580621300265193,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.873046875,
+      8.37890625,
+      7.25341796875
+    ],
+    "available_GiB": 113.96938705444336
+  },
+  {
+    "operation": "comment",
+    "databases": 10,
+    "rep": 12,
+    "seconds": 0.5645532330963761,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.873046875,
+      8.37890625,
+      7.25341796875
+    ],
+    "available_GiB": 113.93620681762695
+  },
+  {
+    "operation": "set-state",
+    "databases": 10,
+    "rep": 12,
+    "seconds": 0.7111036130227149,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.96337890625,
+      8.439453125,
+      7.279296875
+    ],
+    "available_GiB": 113.93962478637695
+  },
+  {
+    "operation": "claim",
+    "databases": 10,
+    "rep": 12,
+    "seconds": 0.48362583108246326,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.96337890625,
+      8.439453125,
+      7.279296875
+    ],
+    "available_GiB": 113.90111541748047
+  },
+  {
+    "operation": "merge-check",
+    "databases": 10,
+    "rep": 12,
+    "seconds": 0.5222568910103291,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.96337890625,
+      8.439453125,
+      7.279296875
+    ],
+    "available_GiB": 114.00876235961914
+  },
+  {
+    "operation": "merge-acquire",
+    "databases": 10,
+    "rep": 12,
+    "seconds": 0.6060405210591853,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.96337890625,
+      8.439453125,
+      7.279296875
+    ],
+    "available_GiB": 113.94765090942383
+  },
+  {
+    "operation": "merge-release",
+    "databases": 10,
+    "rep": 12,
+    "seconds": 0.6267240350134671,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.96337890625,
+      8.439453125,
+      7.279296875
+    ],
+    "available_GiB": 114.05085754394531
+  },
+  {
+    "operation": "list",
+    "databases": 10,
+    "rep": 12,
+    "seconds": 0.20014352700673044,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.96337890625,
+      8.439453125,
+      7.279296875
+    ],
+    "available_GiB": 114.03435516357422
+  },
+  {
+    "operation": "show",
+    "databases": 10,
+    "rep": 12,
+    "seconds": 0.19523745588958263,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.96337890625,
+      8.439453125,
+      7.279296875
+    ],
+    "available_GiB": 114.03462219238281
+  },
+  {
+    "operation": "filtered-columns",
+    "databases": 10,
+    "rep": 12,
+    "seconds": 0.193934828042984,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.96337890625,
+      8.439453125,
+      7.279296875
+    ],
+    "available_GiB": 114.07458114624023
+  },
+  {
+    "operation": "ordinary-query",
+    "databases": 10,
+    "rep": 12,
+    "seconds": 0.06844891817308962,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.96337890625,
+      8.439453125,
+      7.279296875
+    ],
+    "available_GiB": 114.05638122558594
+  },
+  {
+    "operation": "create",
+    "databases": 10,
+    "rep": 13,
+    "seconds": 0.6247356189414859,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.96337890625,
+      8.439453125,
+      7.279296875
+    ],
+    "available_GiB": 114.0416374206543
+  },
+  {
+    "operation": "update",
+    "databases": 10,
+    "rep": 13,
+    "seconds": 0.5133470559958369,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.96337890625,
+      8.439453125,
+      7.279296875
+    ],
+    "available_GiB": 114.0302734375
+  },
+  {
+    "operation": "comment",
+    "databases": 10,
+    "rep": 13,
+    "seconds": 0.5274169379845262,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.96337890625,
+      8.439453125,
+      7.279296875
+    ],
+    "available_GiB": 113.99460983276367
+  },
+  {
+    "operation": "set-state",
+    "databases": 10,
+    "rep": 13,
+    "seconds": 0.8148133230861276,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.64599609375,
+      8.41552734375,
+      7.27734375
+    ],
+    "available_GiB": 114.02143478393555
+  },
+  {
+    "operation": "claim",
+    "databases": 10,
+    "rep": 13,
+    "seconds": 0.5131000061519444,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.64599609375,
+      8.41552734375,
+      7.27734375
+    ],
+    "available_GiB": 114.01192474365234
+  },
+  {
+    "operation": "merge-check",
+    "databases": 10,
+    "rep": 13,
+    "seconds": 0.4761488081421703,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.64599609375,
+      8.41552734375,
+      7.27734375
+    ],
+    "available_GiB": 113.97980117797852
+  },
+  {
+    "operation": "merge-acquire",
+    "databases": 10,
+    "rep": 13,
+    "seconds": 0.5477187999058515,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.64599609375,
+      8.41552734375,
+      7.27734375
+    ],
+    "available_GiB": 114.01498794555664
+  },
+  {
+    "operation": "merge-release",
+    "databases": 10,
+    "rep": 13,
+    "seconds": 0.6060798750258982,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.64599609375,
+      8.41552734375,
+      7.27734375
+    ],
+    "available_GiB": 113.90834426879883
+  },
+  {
+    "operation": "list",
+    "databases": 10,
+    "rep": 13,
+    "seconds": 0.20674485899508,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.64599609375,
+      8.41552734375,
+      7.27734375
+    ],
+    "available_GiB": 114.11122512817383
+  },
+  {
+    "operation": "show",
+    "databases": 10,
+    "rep": 13,
+    "seconds": 0.18676083907485008,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.64599609375,
+      8.41552734375,
+      7.27734375
+    ],
+    "available_GiB": 114.10879135131836
+  },
+  {
+    "operation": "filtered-columns",
+    "databases": 10,
+    "rep": 13,
+    "seconds": 0.17570355697534978,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.64599609375,
+      8.41552734375,
+      7.27734375
+    ],
+    "available_GiB": 114.09004211425781
+  },
+  {
+    "operation": "ordinary-query",
+    "databases": 10,
+    "rep": 13,
+    "seconds": 0.05298521788790822,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      10.64599609375,
+      8.41552734375,
+      7.27734375
+    ],
+    "available_GiB": 114.07395553588867
+  },
+  {
+    "operation": "add-project",
+    "databases": 10,
+    "rep": 0,
+    "seconds": 14.227796100080013,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      10.64599609375,
+      8.41552734375,
+      7.27734375
+    ],
+    "available_GiB": 114.2144546508789,
+    "trace": "curve-v2-10-0-add-project.jsonl",
+    "query_count": 1552,
+    "catalog_query_count": 73,
+    "catalog_ms": 8943,
+    "query_ms_sum": 10890
+  },
+  {
+    "operation": "add-project",
+    "databases": 11,
+    "rep": 0,
+    "seconds": 15.748619643040001,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      12.3828125,
+      8.87646484375,
+      7.4443359375
+    ],
+    "available_GiB": 113.78579330444336,
+    "trace": "curve-v2-11-0-add-project.jsonl",
+    "query_count": 1552,
+    "catalog_query_count": 73,
+    "catalog_ms": 10318,
+    "query_ms_sum": 12345
+  },
+  {
+    "operation": "add-project",
+    "databases": 12,
+    "rep": 0,
+    "seconds": 15.818394897971302,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      10.931640625,
+      8.7841796875,
+      7.44482421875
+    ],
+    "available_GiB": 113.83674621582031,
+    "trace": "curve-v2-12-0-add-project.jsonl",
+    "query_count": 1552,
+    "catalog_query_count": 73,
+    "catalog_ms": 10299,
+    "query_ms_sum": 12356
+  },
+  {
+    "operation": "add-project",
+    "databases": 13,
+    "rep": 0,
+    "seconds": 25.635303703835234,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      10.66845703125,
+      8.828125,
+      7.48095703125
+    ],
+    "available_GiB": 113.78156280517578,
+    "trace": "curve-v2-13-0-add-project.jsonl",
+    "query_count": 1552,
+    "catalog_query_count": 73,
+    "catalog_ms": 11479,
+    "query_ms_sum": 13782
+  },
+  {
+    "operation": "add-project",
+    "databases": 14,
+    "rep": 0,
+    "seconds": 17.727382534183562,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      9.37109375,
+      8.67822265625,
+      7.46728515625
+    ],
+    "available_GiB": 113.97915649414062,
+    "trace": "curve-v2-14-0-add-project.jsonl",
+    "query_count": 1552,
+    "catalog_query_count": 73,
+    "catalog_ms": 12065,
+    "query_ms_sum": 14161
+  },
+  {
+    "operation": "add-project",
+    "databases": 15,
+    "rep": 0,
+    "seconds": 18.904343242989853,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      12.04296875,
+      9.36962890625,
+      7.7216796875
+    ],
+    "available_GiB": 113.80630111694336,
+    "trace": "curve-v2-15-0-add-project.jsonl",
+    "query_count": 1552,
+    "catalog_query_count": 73,
+    "catalog_ms": 12807,
+    "query_ms_sum": 15137
+  },
+  {
+    "operation": "add-project",
+    "databases": 16,
+    "rep": 0,
+    "seconds": 18.959061986068264,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      10.2724609375,
+      9.10693359375,
+      7.66162109375
+    ],
+    "available_GiB": 113.96653747558594,
+    "trace": "curve-v2-16-0-add-project.jsonl",
+    "query_count": 1552,
+    "catalog_query_count": 73,
+    "catalog_ms": 12914,
+    "query_ms_sum": 15176
+  },
+  {
+    "operation": "add-project",
+    "databases": 17,
+    "rep": 0,
+    "seconds": 20.339448884129524,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      8.45703125,
+      8.7734375,
+      7.58251953125
+    ],
+    "available_GiB": 113.89969253540039,
+    "trace": "curve-v2-17-0-add-project.jsonl",
+    "query_count": 1552,
+    "catalog_query_count": 73,
+    "catalog_ms": 14239,
+    "query_ms_sum": 16516
+  },
+  {
+    "operation": "add-project",
+    "databases": 18,
+    "rep": 0,
+    "seconds": 21.59630996384658,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      7.3271484375,
+      8.4951171875,
+      7.515625
+    ],
+    "available_GiB": 113.77460479736328,
+    "trace": "curve-v2-18-0-add-project.jsonl",
+    "query_count": 1552,
+    "catalog_query_count": 73,
+    "catalog_ms": 15220,
+    "query_ms_sum": 17797
+  },
+  {
+    "operation": "add-project",
+    "databases": 19,
+    "rep": 0,
+    "seconds": 24.520555024035275,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      6.4541015625,
+      8.21044921875,
+      7.44775390625
+    ],
+    "available_GiB": 113.54674530029297,
+    "trace": "curve-v2-19-0-add-project.jsonl",
+    "query_count": 1552,
+    "catalog_query_count": 73,
+    "catalog_ms": 16249,
+    "query_ms_sum": 18719
+  },
+  {
+    "operation": "create",
+    "databases": 20,
+    "rep": 1,
+    "seconds": 0.8520059841684997,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      8.49609375,
+      8.5986328125,
+      7.5986328125
+    ],
+    "available_GiB": 113.5190658569336,
+    "trace": "curve-v2-20-1-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 476,
+    "query_ms_sum": 522
+  },
+  {
+    "operation": "update",
+    "databases": 20,
+    "rep": 1,
+    "seconds": 0.8183464130852371,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      8.49609375,
+      8.5986328125,
+      7.5986328125
+    ],
+    "available_GiB": 113.52298355102539,
+    "trace": "curve-v2-20-1-update.jsonl",
+    "query_count": 52,
+    "catalog_query_count": 2,
+    "catalog_ms": 480,
+    "query_ms_sum": 509
+  },
+  {
+    "operation": "comment",
+    "databases": 20,
+    "rep": 1,
+    "seconds": 0.840304380049929,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      8.49609375,
+      8.5986328125,
+      7.5986328125
+    ],
+    "available_GiB": 113.60225677490234,
+    "trace": "curve-v2-20-1-comment.jsonl",
+    "query_count": 45,
+    "catalog_query_count": 2,
+    "catalog_ms": 547,
+    "query_ms_sum": 567
+  },
+  {
+    "operation": "set-state",
+    "databases": 20,
+    "rep": 1,
+    "seconds": 1.027875515865162,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      8.49609375,
+      8.5986328125,
+      7.5986328125
+    ],
+    "available_GiB": 113.58451080322266,
+    "trace": "curve-v2-20-1-set-state.jsonl",
+    "query_count": 93,
+    "catalog_query_count": 2,
+    "catalog_ms": 496,
+    "query_ms_sum": 635
+  },
+  {
+    "operation": "claim",
+    "databases": 20,
+    "rep": 1,
+    "seconds": 0.8807009849697351,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      8.49609375,
+      8.5986328125,
+      7.5986328125
+    ],
+    "available_GiB": 113.58204650878906,
+    "trace": "curve-v2-20-1-claim.jsonl",
+    "query_count": 48,
+    "catalog_query_count": 2,
+    "catalog_ms": 526,
+    "query_ms_sum": 560
+  },
+  {
+    "operation": "merge-check",
+    "databases": 20,
+    "rep": 1,
+    "seconds": 0.8172120249364525,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      8.2158203125,
+      8.53857421875,
+      7.58447265625
+    ],
+    "available_GiB": 113.54909896850586,
+    "trace": "curve-v2-20-1-merge-check.jsonl",
+    "query_count": 31,
+    "catalog_query_count": 2,
+    "catalog_ms": 503,
+    "query_ms_sum": 516
+  },
+  {
+    "operation": "merge-acquire",
+    "databases": 20,
+    "rep": 1,
+    "seconds": 0.9117092390079051,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      8.2158203125,
+      8.53857421875,
+      7.58447265625
+    ],
+    "available_GiB": 113.53205490112305,
+    "trace": "curve-v2-20-1-merge-acquire.jsonl",
+    "query_count": 43,
+    "catalog_query_count": 2,
+    "catalog_ms": 574,
+    "query_ms_sum": 616
+  },
+  {
+    "operation": "merge-release",
+    "databases": 20,
+    "rep": 1,
+    "seconds": 0.9066084041260183,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      8.2158203125,
+      8.53857421875,
+      7.58447265625
+    ],
+    "available_GiB": 113.56929016113281,
+    "trace": "curve-v2-20-1-merge-release.jsonl",
+    "query_count": 46,
+    "catalog_query_count": 2,
+    "catalog_ms": 523,
+    "query_ms_sum": 562
+  },
+  {
+    "operation": "list",
+    "databases": 20,
+    "rep": 1,
+    "seconds": 0.21066386089660227,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      8.2158203125,
+      8.53857421875,
+      7.58447265625
+    ],
+    "available_GiB": 113.52653503417969,
+    "trace": "curve-v2-20-1-list.jsonl",
+    "query_count": 22,
+    "catalog_query_count": 0,
+    "catalog_ms": 0,
+    "query_ms_sum": 13
+  },
+  {
+    "operation": "show",
+    "databases": 20,
+    "rep": 1,
+    "seconds": 0.20683506084606051,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      8.2158203125,
+      8.53857421875,
+      7.58447265625
+    ],
+    "available_GiB": 113.46260833740234,
+    "trace": "curve-v2-20-1-show.jsonl",
+    "query_count": 33,
+    "catalog_query_count": 0,
+    "catalog_ms": 0,
+    "query_ms_sum": 12
+  },
+  {
+    "operation": "filtered-columns",
+    "databases": 20,
+    "rep": 1,
+    "seconds": 0.4076502479147166,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      8.2158203125,
+      8.53857421875,
+      7.58447265625
+    ],
+    "available_GiB": 113.44601821899414,
+    "trace": "curve-v2-20-1-filtered-columns.jsonl",
+    "query_count": 4,
+    "catalog_query_count": 1,
+    "catalog_ms": 348,
+    "query_ms_sum": 351
+  },
+  {
+    "operation": "ordinary-query",
+    "databases": 20,
+    "rep": 1,
+    "seconds": 0.0692709821742028,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      8.2158203125,
+      8.53857421875,
+      7.58447265625
+    ],
+    "available_GiB": 113.52006530761719,
+    "trace": "curve-v2-20-1-ordinary-query.jsonl",
+    "query_count": 4,
+    "catalog_query_count": 0,
+    "catalog_ms": 0,
+    "query_ms_sum": 6
+  },
+  {
+    "operation": "create",
+    "databases": 20,
+    "rep": 2,
+    "seconds": 0.9053791200276464,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      8.2158203125,
+      8.53857421875,
+      7.58447265625
+    ],
+    "available_GiB": 113.51898193359375,
+    "trace": "curve-v2-20-2-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 520,
+    "query_ms_sum": 565
+  },
+  {
+    "operation": "update",
+    "databases": 20,
+    "rep": 2,
+    "seconds": 0.9317425498738885,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      7.9580078125,
+      8.4794921875,
+      7.5703125
+    ],
+    "available_GiB": 113.48736953735352,
+    "trace": "curve-v2-20-2-update.jsonl",
+    "query_count": 52,
+    "catalog_query_count": 2,
+    "catalog_ms": 570,
+    "query_ms_sum": 601
+  },
+  {
+    "operation": "comment",
+    "databases": 20,
+    "rep": 2,
+    "seconds": 0.9082694789394736,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      7.9580078125,
+      8.4794921875,
+      7.5703125
+    ],
+    "available_GiB": 113.45768737792969,
+    "trace": "curve-v2-20-2-comment.jsonl",
+    "query_count": 45,
+    "catalog_query_count": 2,
+    "catalog_ms": 538,
+    "query_ms_sum": 574
+  },
+  {
+    "operation": "set-state",
+    "databases": 20,
+    "rep": 2,
+    "seconds": 0.9582788050174713,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      7.9580078125,
+      8.4794921875,
+      7.5703125
+    ],
+    "available_GiB": 113.43652725219727,
+    "trace": "curve-v2-20-2-set-state.jsonl",
+    "query_count": 93,
+    "catalog_query_count": 2,
+    "catalog_ms": 468,
+    "query_ms_sum": 578
+  },
+  {
+    "operation": "claim",
+    "databases": 20,
+    "rep": 2,
+    "seconds": 0.9395137918181717,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      7.9580078125,
+      8.4794921875,
+      7.5703125
+    ],
+    "available_GiB": 113.49712371826172,
+    "trace": "curve-v2-20-2-claim.jsonl",
+    "query_count": 48,
+    "catalog_query_count": 2,
+    "catalog_ms": 558,
+    "query_ms_sum": 599
+  },
+  {
+    "operation": "merge-check",
+    "databases": 20,
+    "rep": 2,
+    "seconds": 0.942132132127881,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      7.9580078125,
+      8.4794921875,
+      7.5703125
+    ],
+    "available_GiB": 113.37298965454102,
+    "trace": "curve-v2-20-2-merge-check.jsonl",
+    "query_count": 31,
+    "catalog_query_count": 2,
+    "catalog_ms": 635,
+    "query_ms_sum": 649
+  },
+  {
+    "operation": "merge-acquire",
+    "databases": 20,
+    "rep": 2,
+    "seconds": 0.7518088379874825,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      7.80078125,
+      8.43798828125,
+      7.5615234375
+    ],
+    "available_GiB": 113.40989303588867,
+    "trace": "curve-v2-20-2-merge-acquire.jsonl",
+    "query_count": 43,
+    "catalog_query_count": 2,
+    "catalog_ms": 444,
+    "query_ms_sum": 471
+  },
+  {
+    "operation": "merge-release",
+    "databases": 20,
+    "rep": 2,
+    "seconds": 0.8584875101223588,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      7.80078125,
+      8.43798828125,
+      7.5615234375
+    ],
+    "available_GiB": 113.4037094116211,
+    "trace": "curve-v2-20-2-merge-release.jsonl",
+    "query_count": 46,
+    "catalog_query_count": 2,
+    "catalog_ms": 513,
+    "query_ms_sum": 555
+  },
+  {
+    "operation": "list",
+    "databases": 20,
+    "rep": 2,
+    "seconds": 0.24277319596149027,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      7.80078125,
+      8.43798828125,
+      7.5615234375
+    ],
+    "available_GiB": 113.36424255371094,
+    "trace": "curve-v2-20-2-list.jsonl",
+    "query_count": 22,
+    "catalog_query_count": 0,
+    "catalog_ms": 0,
+    "query_ms_sum": 13
+  },
+  {
+    "operation": "show",
+    "databases": 20,
+    "rep": 2,
+    "seconds": 0.22163926903158426,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      7.80078125,
+      8.43798828125,
+      7.5615234375
+    ],
+    "available_GiB": 113.3612174987793,
+    "trace": "curve-v2-20-2-show.jsonl",
+    "query_count": 33,
+    "catalog_query_count": 0,
+    "catalog_ms": 0,
+    "query_ms_sum": 12
+  },
+  {
+    "operation": "filtered-columns",
+    "databases": 20,
+    "rep": 2,
+    "seconds": 0.30575249693356454,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      7.80078125,
+      8.43798828125,
+      7.5615234375
+    ],
+    "available_GiB": 113.32814025878906,
+    "trace": "curve-v2-20-2-filtered-columns.jsonl",
+    "query_count": 4,
+    "catalog_query_count": 1,
+    "catalog_ms": 255,
+    "query_ms_sum": 258
+  },
+  {
+    "operation": "ordinary-query",
+    "databases": 20,
+    "rep": 2,
+    "seconds": 0.07993289898149669,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      7.80078125,
+      8.43798828125,
+      7.5615234375
+    ],
+    "available_GiB": 113.30916213989258,
+    "trace": "curve-v2-20-2-ordinary-query.jsonl",
+    "query_count": 4,
+    "catalog_query_count": 0,
+    "catalog_ms": 0,
+    "query_ms_sum": 3
+  },
+  {
+    "operation": "create",
+    "databases": 20,
+    "rep": 3,
+    "seconds": 0.9318921719677746,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      7.80078125,
+      8.43798828125,
+      7.5615234375
+    ],
+    "available_GiB": 113.31069946289062,
+    "trace": "curve-v2-20-3-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 567,
+    "query_ms_sum": 614
+  },
+  {
+    "operation": "update",
+    "databases": 20,
+    "rep": 3,
+    "seconds": 2.184583195950836,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      7.80078125,
+      8.43798828125,
+      7.5615234375
+    ],
+    "available_GiB": 113.28501892089844,
+    "trace": "curve-v2-20-3-update.jsonl",
+    "query_count": 52,
+    "catalog_query_count": 2,
+    "catalog_ms": 529,
+    "query_ms_sum": 560
+  },
+  {
+    "operation": "comment",
+    "databases": 20,
+    "rep": 3,
+    "seconds": 0.7703042279463261,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      7.736328125,
+      8.4140625,
+      7.55810546875
+    ],
+    "available_GiB": 113.49435424804688,
+    "trace": "curve-v2-20-3-comment.jsonl",
+    "query_count": 45,
+    "catalog_query_count": 2,
+    "catalog_ms": 472,
+    "query_ms_sum": 498
+  },
+  {
+    "operation": "set-state",
+    "databases": 20,
+    "rep": 3,
+    "seconds": 1.074617720907554,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      7.736328125,
+      8.4140625,
+      7.55810546875
+    ],
+    "available_GiB": 113.45064544677734,
+    "trace": "curve-v2-20-3-set-state.jsonl",
+    "query_count": 93,
+    "catalog_query_count": 2,
+    "catalog_ms": 537,
+    "query_ms_sum": 680
+  },
+  {
+    "operation": "claim",
+    "databases": 20,
+    "rep": 3,
+    "seconds": 0.768329227110371,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      7.736328125,
+      8.4140625,
+      7.55810546875
+    ],
+    "available_GiB": 113.41427230834961,
+    "trace": "curve-v2-20-3-claim.jsonl",
+    "query_count": 48,
+    "catalog_query_count": 2,
+    "catalog_ms": 487,
+    "query_ms_sum": 524
+  },
+  {
+    "operation": "merge-check",
+    "databases": 20,
+    "rep": 3,
+    "seconds": 0.8047012810129672,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      7.736328125,
+      8.4140625,
+      7.55810546875
+    ],
+    "available_GiB": 113.3911361694336,
+    "trace": "curve-v2-20-3-merge-check.jsonl",
+    "query_count": 31,
+    "catalog_query_count": 2,
+    "catalog_ms": 475,
+    "query_ms_sum": 487
+  },
+  {
+    "operation": "merge-acquire",
+    "databases": 20,
+    "rep": 3,
+    "seconds": 0.9144538349937648,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      7.43701171875,
+      8.34033203125,
+      7.53857421875
+    ],
+    "available_GiB": 113.42616653442383,
+    "trace": "curve-v2-20-3-merge-acquire.jsonl",
+    "query_count": 43,
+    "catalog_query_count": 2,
+    "catalog_ms": 571,
+    "query_ms_sum": 605
+  },
+  {
+    "operation": "merge-release",
+    "databases": 20,
+    "rep": 3,
+    "seconds": 0.8874405678361654,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      7.43701171875,
+      8.34033203125,
+      7.53857421875
+    ],
+    "available_GiB": 113.33127975463867,
+    "trace": "curve-v2-20-3-merge-release.jsonl",
+    "query_count": 46,
+    "catalog_query_count": 2,
+    "catalog_ms": 586,
+    "query_ms_sum": 615
+  },
+  {
+    "operation": "list",
+    "databases": 20,
+    "rep": 3,
+    "seconds": 0.21219378802925348,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      7.43701171875,
+      8.34033203125,
+      7.53857421875
+    ],
+    "available_GiB": 113.35303497314453,
+    "trace": "curve-v2-20-3-list.jsonl",
+    "query_count": 22,
+    "catalog_query_count": 0,
+    "catalog_ms": 0,
+    "query_ms_sum": 22
+  },
+  {
+    "operation": "show",
+    "databases": 20,
+    "rep": 3,
+    "seconds": 0.20780031709000468,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      7.43701171875,
+      8.34033203125,
+      7.53857421875
+    ],
+    "available_GiB": 113.33312606811523,
+    "trace": "curve-v2-20-3-show.jsonl",
+    "query_count": 33,
+    "catalog_query_count": 0,
+    "catalog_ms": 0,
+    "query_ms_sum": 12
+  },
+  {
+    "operation": "filtered-columns",
+    "databases": 20,
+    "rep": 3,
+    "seconds": 0.3046964730601758,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      7.43701171875,
+      8.34033203125,
+      7.53857421875
+    ],
+    "available_GiB": 113.33660888671875,
+    "trace": "curve-v2-20-3-filtered-columns.jsonl",
+    "query_count": 4,
+    "catalog_query_count": 1,
+    "catalog_ms": 242,
+    "query_ms_sum": 248
+  },
+  {
+    "operation": "ordinary-query",
+    "databases": 20,
+    "rep": 3,
+    "seconds": 0.05664617009460926,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      7.43701171875,
+      8.34033203125,
+      7.53857421875
+    ],
+    "available_GiB": 113.32210159301758,
+    "trace": "curve-v2-20-3-ordinary-query.jsonl",
+    "query_count": 4,
+    "catalog_query_count": 0,
+    "catalog_ms": 0,
+    "query_ms_sum": 7
+  },
+  {
+    "operation": "create",
+    "databases": 20,
+    "rep": 11,
+    "seconds": 0.9601191449910402,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      7.43701171875,
+      8.34033203125,
+      7.53857421875
+    ],
+    "available_GiB": 113.71540451049805
+  },
+  {
+    "operation": "update",
+    "databases": 20,
+    "rep": 11,
+    "seconds": 0.8749951790086925,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      7.43701171875,
+      8.34033203125,
+      7.53857421875
+    ],
+    "available_GiB": 113.65060043334961
+  },
+  {
+    "operation": "comment",
+    "databases": 20,
+    "rep": 11,
+    "seconds": 0.8743986210320145,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      7.24169921875,
+      8.28466796875,
+      7.52490234375
+    ],
+    "available_GiB": 113.52680587768555
+  },
+  {
+    "operation": "set-state",
+    "databases": 20,
+    "rep": 11,
+    "seconds": 1.1078783608973026,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      7.24169921875,
+      8.28466796875,
+      7.52490234375
+    ],
+    "available_GiB": 113.51640319824219
+  },
+  {
+    "operation": "claim",
+    "databases": 20,
+    "rep": 11,
+    "seconds": 0.8783511379733682,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      7.24169921875,
+      8.28466796875,
+      7.52490234375
+    ],
+    "available_GiB": 113.48941802978516
+  },
+  {
+    "operation": "merge-check",
+    "databases": 20,
+    "rep": 11,
+    "seconds": 0.8652262059040368,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      7.24169921875,
+      8.28466796875,
+      7.52490234375
+    ],
+    "available_GiB": 113.47092819213867
+  },
+  {
+    "operation": "merge-acquire",
+    "databases": 20,
+    "rep": 11,
+    "seconds": 0.8034680420532823,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      7.24169921875,
+      8.28466796875,
+      7.52490234375
+    ],
+    "available_GiB": 113.41679382324219
+  },
+  {
+    "operation": "merge-release",
+    "databases": 20,
+    "rep": 11,
+    "seconds": 0.8147590088192374,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      7.14208984375,
+      8.24658203125,
+      7.5166015625
+    ],
+    "available_GiB": 113.5098991394043
+  },
+  {
+    "operation": "list",
+    "databases": 20,
+    "rep": 11,
+    "seconds": 0.22375048091635108,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      7.14208984375,
+      8.24658203125,
+      7.5166015625
+    ],
+    "available_GiB": 113.46926879882812
+  },
+  {
+    "operation": "show",
+    "databases": 20,
+    "rep": 11,
+    "seconds": 0.23269681609235704,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      7.14208984375,
+      8.24658203125,
+      7.5166015625
+    ],
+    "available_GiB": 113.4722671508789
+  },
+  {
+    "operation": "filtered-columns",
+    "databases": 20,
+    "rep": 11,
+    "seconds": 0.32241732510738075,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      7.14208984375,
+      8.24658203125,
+      7.5166015625
+    ],
+    "available_GiB": 113.48636245727539
+  },
+  {
+    "operation": "ordinary-query",
+    "databases": 20,
+    "rep": 11,
+    "seconds": 0.07392312400043011,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      7.14208984375,
+      8.24658203125,
+      7.5166015625
+    ],
+    "available_GiB": 113.44945526123047
+  },
+  {
+    "operation": "create",
+    "databases": 20,
+    "rep": 12,
+    "seconds": 0.8872040479909629,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      7.14208984375,
+      8.24658203125,
+      7.5166015625
+    ],
+    "available_GiB": 113.46758270263672
+  },
+  {
+    "operation": "update",
+    "databases": 20,
+    "rep": 12,
+    "seconds": 0.9470534510910511,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      7.14208984375,
+      8.24658203125,
+      7.5166015625
+    ],
+    "available_GiB": 113.38504409790039
+  },
+  {
+    "operation": "comment",
+    "databases": 20,
+    "rep": 12,
+    "seconds": 0.8501311200670898,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      7.14208984375,
+      8.24658203125,
+      7.5166015625
+    ],
+    "available_GiB": 113.37666702270508
+  },
+  {
+    "operation": "set-state",
+    "databases": 20,
+    "rep": 12,
+    "seconds": 1.013307749060914,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      7.14208984375,
+      8.24658203125,
+      7.5166015625
+    ],
+    "available_GiB": 113.23279571533203
+  },
+  {
+    "operation": "claim",
+    "databases": 20,
+    "rep": 12,
+    "seconds": 0.8869702650699764,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      7.05029296875,
+      8.208984375,
+      7.50830078125
+    ],
+    "available_GiB": 113.3184585571289
+  },
+  {
+    "operation": "merge-check",
+    "databases": 20,
+    "rep": 12,
+    "seconds": 0.7598304010462016,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      7.05029296875,
+      8.208984375,
+      7.50830078125
+    ],
+    "available_GiB": 113.43019485473633
+  },
+  {
+    "operation": "merge-acquire",
+    "databases": 20,
+    "rep": 12,
+    "seconds": 0.8004044611006975,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      7.05029296875,
+      8.208984375,
+      7.50830078125
+    ],
+    "available_GiB": 113.41950225830078
+  },
+  {
+    "operation": "merge-release",
+    "databases": 20,
+    "rep": 12,
+    "seconds": 0.8428337620571256,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      7.05029296875,
+      8.208984375,
+      7.50830078125
+    ],
+    "available_GiB": 113.46170425415039
+  },
+  {
+    "operation": "list",
+    "databases": 20,
+    "rep": 12,
+    "seconds": 0.20024990406818688,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      7.05029296875,
+      8.208984375,
+      7.50830078125
+    ],
+    "available_GiB": 113.37692260742188
+  },
+  {
+    "operation": "show",
+    "databases": 20,
+    "rep": 12,
+    "seconds": 0.21239345194771886,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      7.05029296875,
+      8.208984375,
+      7.50830078125
+    ],
+    "available_GiB": 113.35565567016602
+  },
+  {
+    "operation": "filtered-columns",
+    "databases": 20,
+    "rep": 12,
+    "seconds": 0.3361989469267428,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      7.05029296875,
+      8.208984375,
+      7.50830078125
+    ],
+    "available_GiB": 113.4222297668457
+  },
+  {
+    "operation": "ordinary-query",
+    "databases": 20,
+    "rep": 12,
+    "seconds": 0.045251372968778014,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      7.05029296875,
+      8.208984375,
+      7.50830078125
+    ],
+    "available_GiB": 113.41574096679688
+  },
+  {
+    "operation": "create",
+    "databases": 20,
+    "rep": 13,
+    "seconds": 0.9091449191328138,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      7.05029296875,
+      8.208984375,
+      7.50830078125
+    ],
+    "available_GiB": 113.42334365844727
+  },
+  {
+    "operation": "update",
+    "databases": 20,
+    "rep": 13,
+    "seconds": 0.9098113931249827,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      6.9658203125,
+      8.171875,
+      7.5
+    ],
+    "available_GiB": 113.37112808227539
+  },
+  {
+    "operation": "comment",
+    "databases": 20,
+    "rep": 13,
+    "seconds": 0.8515238540712744,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      6.9658203125,
+      8.171875,
+      7.5
+    ],
+    "available_GiB": 113.32538604736328
+  },
+  {
+    "operation": "set-state",
+    "databases": 20,
+    "rep": 13,
+    "seconds": 1.0468456659000367,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      6.9658203125,
+      8.171875,
+      7.5
+    ],
+    "available_GiB": 113.26036071777344
+  },
+  {
+    "operation": "claim",
+    "databases": 20,
+    "rep": 13,
+    "seconds": 0.7550276299007237,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      6.9658203125,
+      8.171875,
+      7.5
+    ],
+    "available_GiB": 113.3394775390625
+  },
+  {
+    "operation": "merge-check",
+    "databases": 20,
+    "rep": 13,
+    "seconds": 0.8600836088880897,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      6.9658203125,
+      8.171875,
+      7.5
+    ],
+    "available_GiB": 113.3460578918457
+  },
+  {
+    "operation": "merge-acquire",
+    "databases": 20,
+    "rep": 13,
+    "seconds": 0.7769548238720745,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      6.88818359375,
+      8.1357421875,
+      7.49169921875
+    ],
+    "available_GiB": 113.36684799194336
+  },
+  {
+    "operation": "merge-release",
+    "databases": 20,
+    "rep": 13,
+    "seconds": 0.7822564460802823,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      6.88818359375,
+      8.1357421875,
+      7.49169921875
+    ],
+    "available_GiB": 113.29185485839844
+  },
+  {
+    "operation": "list",
+    "databases": 20,
+    "rep": 13,
+    "seconds": 0.20886233705095947,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      6.88818359375,
+      8.1357421875,
+      7.49169921875
+    ],
+    "available_GiB": 113.23913955688477
+  },
+  {
+    "operation": "show",
+    "databases": 20,
+    "rep": 13,
+    "seconds": 0.1988953819964081,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      6.88818359375,
+      8.1357421875,
+      7.49169921875
+    ],
+    "available_GiB": 113.24843215942383
+  },
+  {
+    "operation": "filtered-columns",
+    "databases": 20,
+    "rep": 13,
+    "seconds": 0.35603838693350554,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      6.88818359375,
+      8.1357421875,
+      7.49169921875
+    ],
+    "available_GiB": 113.24761581420898
+  },
+  {
+    "operation": "ordinary-query",
+    "databases": 20,
+    "rep": 13,
+    "seconds": 0.05849821213632822,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      6.88818359375,
+      8.1357421875,
+      7.49169921875
+    ],
+    "available_GiB": 113.23513412475586
+  },
+  {
+    "operation": "add-project",
+    "databases": 20,
+    "rep": 0,
+    "seconds": 24.539270067820325,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      6.88818359375,
+      8.1357421875,
+      7.49169921875
+    ],
+    "available_GiB": 113.43663024902344,
+    "trace": "curve-v2-20-0-add-project.jsonl",
+    "query_count": 1552,
+    "catalog_query_count": 73,
+    "catalog_ms": 17865,
+    "query_ms_sum": 20610
+  },
+  {
+    "operation": "add-project",
+    "databases": 21,
+    "rep": 0,
+    "seconds": 24.799958599032834,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      6.8984375,
+      8.0419921875,
+      7.47802734375
+    ],
+    "available_GiB": 113.33815002441406,
+    "trace": "curve-v2-21-0-add-project.jsonl",
+    "query_count": 1552,
+    "catalog_query_count": 73,
+    "catalog_ms": 18298,
+    "query_ms_sum": 20924
+  },
+  {
+    "operation": "add-project",
+    "databases": 22,
+    "rep": 0,
+    "seconds": 25.832447783090174,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      6.16552734375,
+      7.779296875,
+      7.4052734375
+    ],
+    "available_GiB": 113.43476104736328,
+    "trace": "curve-v2-22-0-add-project.jsonl",
+    "query_count": 1552,
+    "catalog_query_count": 73,
+    "catalog_ms": 18717,
+    "query_ms_sum": 21639
+  },
+  {
+    "operation": "add-project",
+    "databases": 23,
+    "rep": 0,
+    "seconds": 27.10056222998537,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.68701171875,
+      7.53857421875,
+      7.33447265625
+    ],
+    "available_GiB": 113.38913345336914,
+    "trace": "curve-v2-23-0-add-project.jsonl",
+    "query_count": 1552,
+    "catalog_query_count": 73,
+    "catalog_ms": 20016,
+    "query_ms_sum": 22847
+  },
+  {
+    "operation": "add-project",
+    "databases": 24,
+    "rep": 0,
+    "seconds": 27.496237175073475,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      9.50537109375,
+      8.20751953125,
+      7.55810546875
+    ],
+    "available_GiB": 113.37127685546875,
+    "trace": "curve-v2-24-0-add-project.jsonl",
+    "query_count": 1552,
+    "catalog_query_count": 73,
+    "catalog_ms": 20432,
+    "query_ms_sum": 23291
+  },
+  {
+    "operation": "add-project",
+    "databases": 25,
+    "rep": 0,
+    "seconds": 28.427763707004488,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      7.9619140625,
+      7.94873046875,
+      7.48876953125
+    ],
+    "available_GiB": 113.3914680480957,
+    "trace": "curve-v2-25-0-add-project.jsonl",
+    "query_count": 1553,
+    "catalog_query_count": 73,
+    "catalog_ms": 21546,
+    "query_ms_sum": 24352
+  },
+  {
+    "operation": "add-project",
+    "databases": 26,
+    "rep": 0,
+    "seconds": 29.39258602121845,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      10.31982421875,
+      8.67578125,
+      7.7548828125
+    ],
+    "available_GiB": 113.32902908325195,
+    "trace": "curve-v2-26-0-add-project.jsonl",
+    "query_count": 1553,
+    "catalog_query_count": 73,
+    "catalog_ms": 22547,
+    "query_ms_sum": 25360
+  },
+  {
+    "operation": "add-project",
+    "databases": 27,
+    "rep": 0,
+    "seconds": 31.22992837592028,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      8.076171875,
+      8.291015625,
+      7.65478515625
+    ],
+    "available_GiB": 113.6355094909668,
+    "trace": "curve-v2-27-0-add-project.jsonl",
+    "query_count": 1553,
+    "catalog_query_count": 73,
+    "catalog_ms": 24010,
+    "query_ms_sum": 26961
+  },
+  {
+    "operation": "add-project",
+    "databases": 28,
+    "rep": 0,
+    "seconds": 31.77236029994674,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      6.552734375,
+      7.89697265625,
+      7.54248046875
+    ],
+    "available_GiB": 113.46989440917969,
+    "trace": "curve-v2-28-0-add-project.jsonl",
+    "query_count": 1553,
+    "catalog_query_count": 73,
+    "catalog_ms": 24216,
+    "query_ms_sum": 27362
+  },
+  {
+    "operation": "add-project",
+    "databases": 29,
+    "rep": 0,
+    "seconds": 33.898868553107604,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.552734375,
+      7.52197265625,
+      7.43115234375
+    ],
+    "available_GiB": 113.74676895141602,
+    "trace": "curve-v2-29-0-add-project.jsonl",
+    "query_count": 1553,
+    "catalog_query_count": 73,
+    "catalog_ms": 25896,
+    "query_ms_sum": 29342
+  },
+  {
+    "operation": "add-project",
+    "databases": 30,
+    "rep": 0,
+    "seconds": 34.49681130587123,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      7.61083984375,
+      7.88916015625,
+      7.56005859375
+    ],
+    "available_GiB": 113.71451187133789,
+    "trace": "curve-v2-30-0-add-project.jsonl",
+    "query_count": 1553,
+    "catalog_query_count": 73,
+    "catalog_ms": 26697,
+    "query_ms_sum": 30008
+  },
+  {
+    "operation": "add-project",
+    "databases": 31,
+    "rep": 0,
+    "seconds": 34.61450455384329,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.74658203125,
+      7.40576171875,
+      7.408203125
+    ],
+    "available_GiB": 117.43154525756836,
+    "trace": "curve-v2-31-0-add-project.jsonl",
+    "query_count": 1553,
+    "catalog_query_count": 73,
+    "catalog_ms": 26793,
+    "query_ms_sum": 30221
+  },
+  {
+    "operation": "add-project",
+    "databases": 32,
+    "rep": 0,
+    "seconds": 36.57326999795623,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      4.7021484375,
+      6.96337890625,
+      7.2587890625
+    ],
+    "available_GiB": 117.36953353881836,
+    "trace": "curve-v2-32-0-add-project.jsonl",
+    "query_count": 1553,
+    "catalog_query_count": 73,
+    "catalog_ms": 28889,
+    "query_ms_sum": 32195
+  },
+  {
+    "operation": "add-project",
+    "databases": 33,
+    "rep": 0,
+    "seconds": 38.677682467969134,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      6.9716796875,
+      7.3525390625,
+      7.38134765625
+    ],
+    "available_GiB": 117.16276931762695,
+    "trace": "curve-v2-33-0-add-project.jsonl",
+    "query_count": 1553,
+    "catalog_query_count": 73,
+    "catalog_ms": 30530,
+    "query_ms_sum": 34040
+  },
+  {
+    "operation": "add-project",
+    "databases": 34,
+    "rep": 0,
+    "seconds": 40.61291926703416,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      9.10498046875,
+      8.0048828125,
+      7.60791015625
+    ],
+    "available_GiB": 117.04798889160156,
+    "trace": "curve-v2-34-0-add-project.jsonl",
+    "query_count": 1553,
+    "catalog_query_count": 73,
+    "catalog_ms": 32181,
+    "query_ms_sum": 35958
+  },
+  {
+    "operation": "create",
+    "databases": 35,
+    "rep": 1,
+    "seconds": 1.3060188689269125,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      7.5390625,
+      7.724609375,
+      7.52880859375
+    ],
+    "available_GiB": 116.87346267700195,
+    "trace": "curve-v2-35-1-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 875,
+    "query_ms_sum": 933
+  },
+  {
+    "operation": "update",
+    "databases": 35,
+    "rep": 1,
+    "seconds": 1.2742760409601033,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      7.5390625,
+      7.724609375,
+      7.52880859375
+    ],
+    "available_GiB": 116.8810806274414,
+    "trace": "curve-v2-35-1-update.jsonl",
+    "query_count": 52,
+    "catalog_query_count": 2,
+    "catalog_ms": 866,
+    "query_ms_sum": 915
+  },
+  {
+    "operation": "comment",
+    "databases": 35,
+    "rep": 1,
+    "seconds": 1.427527624182403,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      7.5390625,
+      7.724609375,
+      7.52880859375
+    ],
+    "available_GiB": 116.88057708740234,
+    "trace": "curve-v2-35-1-comment.jsonl",
+    "query_count": 45,
+    "catalog_query_count": 2,
+    "catalog_ms": 1070,
+    "query_ms_sum": 1106
+  },
+  {
+    "operation": "set-state",
+    "databases": 35,
+    "rep": 1,
+    "seconds": 1.4937466201372445,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      7.25537109375,
+      7.66259765625,
+      7.509765625
+    ],
+    "available_GiB": 116.85840225219727,
+    "trace": "curve-v2-35-1-set-state.jsonl",
+    "query_count": 93,
+    "catalog_query_count": 2,
+    "catalog_ms": 995,
+    "query_ms_sum": 1107
+  },
+  {
+    "operation": "claim",
+    "databases": 35,
+    "rep": 1,
+    "seconds": 1.3074351488612592,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      7.25537109375,
+      7.66259765625,
+      7.509765625
+    ],
+    "available_GiB": 116.92642211914062,
+    "trace": "curve-v2-35-1-claim.jsonl",
+    "query_count": 48,
+    "catalog_query_count": 2,
+    "catalog_ms": 892,
+    "query_ms_sum": 930
+  },
+  {
+    "operation": "merge-check",
+    "databases": 35,
+    "rep": 1,
+    "seconds": 1.2745040089357644,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      7.25537109375,
+      7.66259765625,
+      7.509765625
+    ],
+    "available_GiB": 116.90229034423828,
+    "trace": "curve-v2-35-1-merge-check.jsonl",
+    "query_count": 31,
+    "catalog_query_count": 2,
+    "catalog_ms": 944,
+    "query_ms_sum": 961
+  },
+  {
+    "operation": "merge-acquire",
+    "databases": 35,
+    "rep": 1,
+    "seconds": 1.2689030240289867,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      7.25537109375,
+      7.66259765625,
+      7.509765625
+    ],
+    "available_GiB": 116.88134002685547,
+    "trace": "curve-v2-35-1-merge-acquire.jsonl",
+    "query_count": 43,
+    "catalog_query_count": 2,
+    "catalog_ms": 884,
+    "query_ms_sum": 923
+  },
+  {
+    "operation": "merge-release",
+    "databases": 35,
+    "rep": 1,
+    "seconds": 1.3962168481666595,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      6.99462890625,
+      7.6015625,
+      7.49072265625
+    ],
+    "available_GiB": 116.86891174316406,
+    "trace": "curve-v2-35-1-merge-release.jsonl",
+    "query_count": 46,
+    "catalog_query_count": 2,
+    "catalog_ms": 999,
+    "query_ms_sum": 1051
+  },
+  {
+    "operation": "list",
+    "databases": 35,
+    "rep": 1,
+    "seconds": 0.18297075713053346,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      6.99462890625,
+      7.6015625,
+      7.49072265625
+    ],
+    "available_GiB": 116.80284881591797,
+    "trace": "curve-v2-35-1-list.jsonl",
+    "query_count": 22,
+    "catalog_query_count": 0,
+    "catalog_ms": 0,
+    "query_ms_sum": 15
+  },
+  {
+    "operation": "show",
+    "databases": 35,
+    "rep": 1,
+    "seconds": 0.22569929296150804,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      6.99462890625,
+      7.6015625,
+      7.49072265625
+    ],
+    "available_GiB": 116.89308547973633,
+    "trace": "curve-v2-35-1-show.jsonl",
+    "query_count": 33,
+    "catalog_query_count": 0,
+    "catalog_ms": 0,
+    "query_ms_sum": 12
+  },
+  {
+    "operation": "filtered-columns",
+    "databases": 35,
+    "rep": 1,
+    "seconds": 0.5385412760078907,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      6.99462890625,
+      7.6015625,
+      7.49072265625
+    ],
+    "available_GiB": 116.8894157409668,
+    "trace": "curve-v2-35-1-filtered-columns.jsonl",
+    "query_count": 4,
+    "catalog_query_count": 1,
+    "catalog_ms": 454,
+    "query_ms_sum": 463
+  },
+  {
+    "operation": "ordinary-query",
+    "databases": 35,
+    "rep": 1,
+    "seconds": 0.05901896907016635,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      6.99462890625,
+      7.6015625,
+      7.49072265625
+    ],
+    "available_GiB": 116.89001846313477,
+    "trace": "curve-v2-35-1-ordinary-query.jsonl",
+    "query_count": 4,
+    "catalog_query_count": 0,
+    "catalog_ms": 0,
+    "query_ms_sum": 8
+  },
+  {
+    "operation": "create",
+    "databases": 35,
+    "rep": 2,
+    "seconds": 1.2740051029250026,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      6.99462890625,
+      7.6015625,
+      7.49072265625
+    ],
+    "available_GiB": 116.8980827331543,
+    "trace": "curve-v2-35-2-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 822,
+    "query_ms_sum": 863
+  },
+  {
+    "operation": "update",
+    "databases": 35,
+    "rep": 2,
+    "seconds": 1.356107496889308,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      6.67431640625,
+      7.52490234375,
+      7.46630859375
+    ],
+    "available_GiB": 116.88080215454102,
+    "trace": "curve-v2-35-2-update.jsonl",
+    "query_count": 52,
+    "catalog_query_count": 2,
+    "catalog_ms": 958,
+    "query_ms_sum": 994
+  },
+  {
+    "operation": "comment",
+    "databases": 35,
+    "rep": 2,
+    "seconds": 1.2728712770622224,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      6.67431640625,
+      7.52490234375,
+      7.46630859375
+    ],
+    "available_GiB": 116.88873291015625,
+    "trace": "curve-v2-35-2-comment.jsonl",
+    "query_count": 45,
+    "catalog_query_count": 2,
+    "catalog_ms": 893,
+    "query_ms_sum": 921
+  },
+  {
+    "operation": "set-state",
+    "databases": 35,
+    "rep": 2,
+    "seconds": 1.5619546710513532,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      6.67431640625,
+      7.52490234375,
+      7.46630859375
+    ],
+    "available_GiB": 116.83920669555664,
+    "trace": "curve-v2-35-2-set-state.jsonl",
+    "query_count": 93,
+    "catalog_query_count": 2,
+    "catalog_ms": 984,
+    "query_ms_sum": 1123
+  },
+  {
+    "operation": "claim",
+    "databases": 35,
+    "rep": 2,
+    "seconds": 1.3081757039763033,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      6.67431640625,
+      7.52490234375,
+      7.46630859375
+    ],
+    "available_GiB": 116.87732696533203,
+    "trace": "curve-v2-35-2-claim.jsonl",
+    "query_count": 48,
+    "catalog_query_count": 2,
+    "catalog_ms": 943,
+    "query_ms_sum": 984
+  },
+  {
+    "operation": "merge-check",
+    "databases": 35,
+    "rep": 2,
+    "seconds": 1.297522887121886,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      6.5400390625,
+      7.48291015625,
+      7.45263671875
+    ],
+    "available_GiB": 116.85242462158203,
+    "trace": "curve-v2-35-2-merge-check.jsonl",
+    "query_count": 31,
+    "catalog_query_count": 2,
+    "catalog_ms": 953,
+    "query_ms_sum": 972
+  },
+  {
+    "operation": "merge-acquire",
+    "databases": 35,
+    "rep": 2,
+    "seconds": 1.338681128108874,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      6.5400390625,
+      7.48291015625,
+      7.45263671875
+    ],
+    "available_GiB": 116.84623718261719,
+    "trace": "curve-v2-35-2-merge-acquire.jsonl",
+    "query_count": 43,
+    "catalog_query_count": 2,
+    "catalog_ms": 928,
+    "query_ms_sum": 971
+  },
+  {
+    "operation": "merge-release",
+    "databases": 35,
+    "rep": 2,
+    "seconds": 1.4425811129622161,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      6.5400390625,
+      7.48291015625,
+      7.45263671875
+    ],
+    "available_GiB": 116.85946273803711,
+    "trace": "curve-v2-35-2-merge-release.jsonl",
+    "query_count": 46,
+    "catalog_query_count": 2,
+    "catalog_ms": 1032,
+    "query_ms_sum": 1070
+  },
+  {
+    "operation": "list",
+    "databases": 35,
+    "rep": 2,
+    "seconds": 0.22285149293020368,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      6.33642578125,
+      7.4248046875,
+      7.43408203125
+    ],
+    "available_GiB": 116.85887145996094,
+    "trace": "curve-v2-35-2-list.jsonl",
+    "query_count": 22,
+    "catalog_query_count": 0,
+    "catalog_ms": 0,
+    "query_ms_sum": 25
+  },
+  {
+    "operation": "show",
+    "databases": 35,
+    "rep": 2,
+    "seconds": 0.2549863578751683,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      6.33642578125,
+      7.4248046875,
+      7.43408203125
+    ],
+    "available_GiB": 116.85838317871094,
+    "trace": "curve-v2-35-2-show.jsonl",
+    "query_count": 33,
+    "catalog_query_count": 0,
+    "catalog_ms": 0,
+    "query_ms_sum": 16
+  },
+  {
+    "operation": "filtered-columns",
+    "databases": 35,
+    "rep": 2,
+    "seconds": 0.5089145549573004,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      6.33642578125,
+      7.4248046875,
+      7.43408203125
+    ],
+    "available_GiB": 116.84618377685547,
+    "trace": "curve-v2-35-2-filtered-columns.jsonl",
+    "query_count": 4,
+    "catalog_query_count": 1,
+    "catalog_ms": 450,
+    "query_ms_sum": 457
+  },
+  {
+    "operation": "ordinary-query",
+    "databases": 35,
+    "rep": 2,
+    "seconds": 0.0889307230245322,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      6.33642578125,
+      7.4248046875,
+      7.43408203125
+    ],
+    "available_GiB": 116.84407043457031,
+    "trace": "curve-v2-35-2-ordinary-query.jsonl",
+    "query_count": 4,
+    "catalog_query_count": 0,
+    "catalog_ms": 0,
+    "query_ms_sum": 7
+  },
+  {
+    "operation": "create",
+    "databases": 35,
+    "rep": 3,
+    "seconds": 1.3919621969107538,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      6.33642578125,
+      7.4248046875,
+      7.43408203125
+    ],
+    "available_GiB": 116.8402099609375,
+    "trace": "curve-v2-35-3-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 920,
+    "query_ms_sum": 972
+  },
+  {
+    "operation": "update",
+    "databases": 35,
+    "rep": 3,
+    "seconds": 1.2916992390528321,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      6.33642578125,
+      7.4248046875,
+      7.43408203125
+    ],
+    "available_GiB": 116.8338851928711,
+    "trace": "curve-v2-35-3-update.jsonl",
+    "query_count": 52,
+    "catalog_query_count": 2,
+    "catalog_ms": 919,
+    "query_ms_sum": 959
+  },
+  {
+    "operation": "comment",
+    "databases": 35,
+    "rep": 3,
+    "seconds": 1.4513906459324062,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      6.33642578125,
+      7.4248046875,
+      7.43408203125
+    ],
+    "available_GiB": 116.84910583496094,
+    "trace": "curve-v2-35-3-comment.jsonl",
+    "query_count": 45,
+    "catalog_query_count": 2,
+    "catalog_ms": 1067,
+    "query_ms_sum": 1103
+  },
+  {
+    "operation": "set-state",
+    "databases": 35,
+    "rep": 3,
+    "seconds": 1.4507846632041037,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      6.14892578125,
+      7.36767578125,
+      7.41552734375
+    ],
+    "available_GiB": 116.85935592651367,
+    "trace": "curve-v2-35-3-set-state.jsonl",
+    "query_count": 93,
+    "catalog_query_count": 2,
+    "catalog_ms": 898,
+    "query_ms_sum": 1029
+  },
+  {
+    "operation": "claim",
+    "databases": 35,
+    "rep": 3,
+    "seconds": 1.3517436580732465,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      6.14892578125,
+      7.36767578125,
+      7.41552734375
+    ],
+    "available_GiB": 116.8590202331543,
+    "trace": "curve-v2-35-3-claim.jsonl",
+    "query_count": 48,
+    "catalog_query_count": 2,
+    "catalog_ms": 948,
+    "query_ms_sum": 983
+  },
+  {
+    "operation": "merge-check",
+    "databases": 35,
+    "rep": 3,
+    "seconds": 1.25871372804977,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      6.14892578125,
+      7.36767578125,
+      7.41552734375
+    ],
+    "available_GiB": 116.8122329711914,
+    "trace": "curve-v2-35-3-merge-check.jsonl",
+    "query_count": 31,
+    "catalog_query_count": 2,
+    "catalog_ms": 892,
+    "query_ms_sum": 912
+  },
+  {
+    "operation": "merge-acquire",
+    "databases": 35,
+    "rep": 3,
+    "seconds": 1.4949668999761343,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.896484375,
+      7.294921875,
+      7.3916015625
+    ],
+    "available_GiB": 116.80591583251953,
+    "trace": "curve-v2-35-3-merge-acquire.jsonl",
+    "query_count": 43,
+    "catalog_query_count": 2,
+    "catalog_ms": 1107,
+    "query_ms_sum": 1150
+  },
+  {
+    "operation": "merge-release",
+    "databases": 35,
+    "rep": 3,
+    "seconds": 1.2702219518832862,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.896484375,
+      7.294921875,
+      7.3916015625
+    ],
+    "available_GiB": 116.76596069335938,
+    "trace": "curve-v2-35-3-merge-release.jsonl",
+    "query_count": 46,
+    "catalog_query_count": 2,
+    "catalog_ms": 881,
+    "query_ms_sum": 923
+  },
+  {
+    "operation": "list",
+    "databases": 35,
+    "rep": 3,
+    "seconds": 0.21782050281763077,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.896484375,
+      7.294921875,
+      7.3916015625
+    ],
+    "available_GiB": 116.74306869506836,
+    "trace": "curve-v2-35-3-list.jsonl",
+    "query_count": 22,
+    "catalog_query_count": 0,
+    "catalog_ms": 0,
+    "query_ms_sum": 28
+  },
+  {
+    "operation": "show",
+    "databases": 35,
+    "rep": 3,
+    "seconds": 0.22662571701221168,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.896484375,
+      7.294921875,
+      7.3916015625
+    ],
+    "available_GiB": 116.71207046508789,
+    "trace": "curve-v2-35-3-show.jsonl",
+    "query_count": 33,
+    "catalog_query_count": 0,
+    "catalog_ms": 0,
+    "query_ms_sum": 16
+  },
+  {
+    "operation": "filtered-columns",
+    "databases": 35,
+    "rep": 3,
+    "seconds": 0.5677217119373381,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.896484375,
+      7.294921875,
+      7.3916015625
+    ],
+    "available_GiB": 116.73854064941406,
+    "trace": "curve-v2-35-3-filtered-columns.jsonl",
+    "query_count": 4,
+    "catalog_query_count": 1,
+    "catalog_ms": 500,
+    "query_ms_sum": 508
+  },
+  {
+    "operation": "ordinary-query",
+    "databases": 35,
+    "rep": 3,
+    "seconds": 0.0727997359354049,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.896484375,
+      7.294921875,
+      7.3916015625
+    ],
+    "available_GiB": 116.71396255493164,
+    "trace": "curve-v2-35-3-ordinary-query.jsonl",
+    "query_count": 4,
+    "catalog_query_count": 0,
+    "catalog_ms": 0,
+    "query_ms_sum": 9
+  },
+  {
+    "operation": "create",
+    "databases": 35,
+    "rep": 11,
+    "seconds": 1.5493737668730319,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.6640625,
+      7.22314453125,
+      7.36767578125
+    ],
+    "available_GiB": 117.2873306274414
+  },
+  {
+    "operation": "update",
+    "databases": 35,
+    "rep": 11,
+    "seconds": 1.4164524942170829,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.6640625,
+      7.22314453125,
+      7.36767578125
+    ],
+    "available_GiB": 117.19093704223633
+  },
+  {
+    "operation": "comment",
+    "databases": 35,
+    "rep": 11,
+    "seconds": 1.351320143090561,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.6640625,
+      7.22314453125,
+      7.36767578125
+    ],
+    "available_GiB": 116.94129180908203
+  },
+  {
+    "operation": "set-state",
+    "databases": 35,
+    "rep": 11,
+    "seconds": 1.556641980074346,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.6640625,
+      7.22314453125,
+      7.36767578125
+    ],
+    "available_GiB": 116.93168258666992
+  },
+  {
+    "operation": "claim",
+    "databases": 35,
+    "rep": 11,
+    "seconds": 1.4308644249103963,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.53076171875,
+      7.16943359375,
+      7.34912109375
+    ],
+    "available_GiB": 116.80966567993164
+  },
+  {
+    "operation": "merge-check",
+    "databases": 35,
+    "rep": 11,
+    "seconds": 1.2221955170389265,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.53076171875,
+      7.16943359375,
+      7.34912109375
+    ],
+    "available_GiB": 116.86434936523438
+  },
+  {
+    "operation": "merge-acquire",
+    "databases": 35,
+    "rep": 11,
+    "seconds": 1.185791523894295,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.53076171875,
+      7.16943359375,
+      7.34912109375
+    ],
+    "available_GiB": 116.8561019897461
+  },
+  {
+    "operation": "merge-release",
+    "databases": 35,
+    "rep": 11,
+    "seconds": 1.3994830269366503,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.32763671875,
+      7.10009765625,
+      7.32568359375
+    ],
+    "available_GiB": 116.8490219116211
+  },
+  {
+    "operation": "list",
+    "databases": 35,
+    "rep": 11,
+    "seconds": 0.22224176302552223,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.32763671875,
+      7.10009765625,
+      7.32568359375
+    ],
+    "available_GiB": 116.83021545410156
+  },
+  {
+    "operation": "show",
+    "databases": 35,
+    "rep": 11,
+    "seconds": 0.2161038820631802,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.32763671875,
+      7.10009765625,
+      7.32568359375
+    ],
+    "available_GiB": 116.8204574584961
+  },
+  {
+    "operation": "filtered-columns",
+    "databases": 35,
+    "rep": 11,
+    "seconds": 0.5684708550106734,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.32763671875,
+      7.10009765625,
+      7.32568359375
+    ],
+    "available_GiB": 116.81759643554688
+  },
+  {
+    "operation": "ordinary-query",
+    "databases": 35,
+    "rep": 11,
+    "seconds": 0.06403246382251382,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.32763671875,
+      7.10009765625,
+      7.32568359375
+    ],
+    "available_GiB": 116.7797737121582
+  },
+  {
+    "operation": "create",
+    "databases": 35,
+    "rep": 12,
+    "seconds": 1.558996374020353,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.32763671875,
+      7.10009765625,
+      7.32568359375
+    ],
+    "available_GiB": 116.78131103515625
+  },
+  {
+    "operation": "update",
+    "databases": 35,
+    "rep": 12,
+    "seconds": 1.4394785659387708,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.32763671875,
+      7.10009765625,
+      7.32568359375
+    ],
+    "available_GiB": 116.78978729248047
+  },
+  {
+    "operation": "comment",
+    "databases": 35,
+    "rep": 12,
+    "seconds": 1.3411725349724293,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.14111328125,
+      7.03173828125,
+      7.30224609375
+    ],
+    "available_GiB": 116.76450729370117
+  },
+  {
+    "operation": "set-state",
+    "databases": 35,
+    "rep": 12,
+    "seconds": 1.514687520917505,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.14111328125,
+      7.03173828125,
+      7.30224609375
+    ],
+    "available_GiB": 116.69160461425781
+  },
+  {
+    "operation": "claim",
+    "databases": 35,
+    "rep": 12,
+    "seconds": 1.402401264058426,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.14111328125,
+      7.03173828125,
+      7.30224609375
+    ],
+    "available_GiB": 116.65731811523438
+  },
+  {
+    "operation": "merge-check",
+    "databases": 35,
+    "rep": 12,
+    "seconds": 1.3258329047821462,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.04931640625,
+      6.98095703125,
+      7.2841796875
+    ],
+    "available_GiB": 116.69989776611328
+  },
+  {
+    "operation": "merge-acquire",
+    "databases": 35,
+    "rep": 12,
+    "seconds": 1.3068306660279632,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.04931640625,
+      6.98095703125,
+      7.2841796875
+    ],
+    "available_GiB": 116.67763137817383
+  },
+  {
+    "operation": "merge-release",
+    "databases": 35,
+    "rep": 12,
+    "seconds": 1.33505784207955,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.04931640625,
+      6.98095703125,
+      7.2841796875
+    ],
+    "available_GiB": 116.64481735229492
+  },
+  {
+    "operation": "list",
+    "databases": 35,
+    "rep": 12,
+    "seconds": 0.20965101686306298,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.04931640625,
+      6.98095703125,
+      7.2841796875
+    ],
+    "available_GiB": 116.68851852416992
+  },
+  {
+    "operation": "show",
+    "databases": 35,
+    "rep": 12,
+    "seconds": 0.2516343239694834,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.04931640625,
+      6.98095703125,
+      7.2841796875
+    ],
+    "available_GiB": 116.69890594482422
+  },
+  {
+    "operation": "filtered-columns",
+    "databases": 35,
+    "rep": 12,
+    "seconds": 0.7310206319671124,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.04931640625,
+      6.98095703125,
+      7.2841796875
+    ],
+    "available_GiB": 116.64568710327148
+  },
+  {
+    "operation": "ordinary-query",
+    "databases": 35,
+    "rep": 12,
+    "seconds": 0.049765328876674175,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.044921875,
+      6.94775390625,
+      7.271484375
+    ],
+    "available_GiB": 116.56518936157227
+  },
+  {
+    "operation": "create",
+    "databases": 35,
+    "rep": 13,
+    "seconds": 1.4061857259366661,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.044921875,
+      6.94775390625,
+      7.271484375
+    ],
+    "available_GiB": 116.60301971435547
+  },
+  {
+    "operation": "update",
+    "databases": 35,
+    "rep": 13,
+    "seconds": 1.3771146389190108,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.044921875,
+      6.94775390625,
+      7.271484375
+    ],
+    "available_GiB": 116.66828918457031
+  },
+  {
+    "operation": "comment",
+    "databases": 35,
+    "rep": 13,
+    "seconds": 1.2657652059569955,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.044921875,
+      6.94775390625,
+      7.271484375
+    ],
+    "available_GiB": 116.65785598754883
+  },
+  {
+    "operation": "set-state",
+    "databases": 35,
+    "rep": 13,
+    "seconds": 1.685523136984557,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      5.044921875,
+      6.94775390625,
+      7.271484375
+    ],
+    "available_GiB": 116.67583084106445
+  },
+  {
+    "operation": "claim",
+    "databases": 35,
+    "rep": 13,
+    "seconds": 1.2984855349641293,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      4.9609375,
+      6.8984375,
+      7.25390625
+    ],
+    "available_GiB": 116.55573654174805
+  },
+  {
+    "operation": "merge-check",
+    "databases": 35,
+    "rep": 13,
+    "seconds": 1.237534720916301,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      4.9609375,
+      6.8984375,
+      7.25390625
+    ],
+    "available_GiB": 116.64375305175781
+  },
+  {
+    "operation": "merge-acquire",
+    "databases": 35,
+    "rep": 13,
+    "seconds": 1.4014709929469973,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      4.9609375,
+      6.8984375,
+      7.25390625
+    ],
+    "available_GiB": 116.72592163085938
+  },
+  {
+    "operation": "merge-release",
+    "databases": 35,
+    "rep": 13,
+    "seconds": 1.3146625058725476,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      4.8037109375,
+      6.83349609375,
+      7.23095703125
+    ],
+    "available_GiB": 116.72064208984375
+  },
+  {
+    "operation": "list",
+    "databases": 35,
+    "rep": 13,
+    "seconds": 0.20729711512103677,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      4.8037109375,
+      6.83349609375,
+      7.23095703125
+    ],
+    "available_GiB": 116.66023635864258
+  },
+  {
+    "operation": "show",
+    "databases": 35,
+    "rep": 13,
+    "seconds": 0.22308427095413208,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      4.8037109375,
+      6.83349609375,
+      7.23095703125
+    ],
+    "available_GiB": 116.61104965209961
+  },
+  {
+    "operation": "filtered-columns",
+    "databases": 35,
+    "rep": 13,
+    "seconds": 0.5563697419129312,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      4.8037109375,
+      6.83349609375,
+      7.23095703125
+    ],
+    "available_GiB": 116.60796737670898
+  },
+  {
+    "operation": "ordinary-query",
+    "databases": 35,
+    "rep": 13,
+    "seconds": 0.04699520207941532,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      4.8037109375,
+      6.83349609375,
+      7.23095703125
+    ],
+    "available_GiB": 116.7060317993164
+  },
+  {
+    "operation": "add-project",
+    "databases": 35,
+    "rep": 0,
+    "seconds": 42.09629697003402,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      4.8037109375,
+      6.83349609375,
+      7.23095703125
+    ],
+    "available_GiB": 117.033203125,
+    "trace": "curve-v2-35-0-add-project.jsonl",
+    "query_count": 1553,
+    "catalog_query_count": 73,
+    "catalog_ms": 33782,
+    "query_ms_sum": 37542
+  },
+  {
+    "operation": "add-project",
+    "databases": 36,
+    "rep": 0,
+    "seconds": 42.50654701516032,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      4.494140625,
+      6.46533203125,
+      7.0859375
+    ],
+    "available_GiB": 116.83080291748047,
+    "trace": "curve-v2-36-0-add-project.jsonl",
+    "query_count": 1553,
+    "catalog_query_count": 73,
+    "catalog_ms": 33848,
+    "query_ms_sum": 37807
+  },
+  {
+    "operation": "add-project",
+    "databases": 37,
+    "rep": 0,
+    "seconds": 44.13025724305771,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      4.4873046875,
+      6.2294921875,
+      6.98095703125
+    ],
+    "available_GiB": 116.68918991088867,
+    "trace": "curve-v2-37-0-add-project.jsonl",
+    "query_count": 1553,
+    "catalog_query_count": 73,
+    "catalog_ms": 35702,
+    "query_ms_sum": 39541
+  },
+  {
+    "operation": "add-project",
+    "databases": 38,
+    "rep": 0,
+    "seconds": 45.24399037589319,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.8583984375,
+      6.3515625,
+      6.98779296875
+    ],
+    "available_GiB": 116.65795516967773,
+    "trace": "curve-v2-38-0-add-project.jsonl",
+    "query_count": 1553,
+    "catalog_query_count": 73,
+    "catalog_ms": 36350,
+    "query_ms_sum": 40470
+  },
+  {
+    "operation": "add-project",
+    "databases": 39,
+    "rep": 0,
+    "seconds": 46.18135707406327,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      6.05517578125,
+      6.29541015625,
+      6.935546875
+    ],
+    "available_GiB": 116.60135650634766,
+    "trace": "curve-v2-39-0-add-project.jsonl",
+    "query_count": 1553,
+    "catalog_query_count": 73,
+    "catalog_ms": 37256,
+    "query_ms_sum": 41177
+  },
+  {
+    "operation": "add-project",
+    "databases": 40,
+    "rep": 0,
+    "seconds": 47.63428637594916,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      4.9853515625,
+      5.96923828125,
+      6.78955078125
+    ],
+    "available_GiB": 116.93925476074219,
+    "trace": "curve-v2-40-0-add-project.jsonl",
+    "query_count": 1553,
+    "catalog_query_count": 73,
+    "catalog_ms": 38660,
+    "query_ms_sum": 42737
+  },
+  {
+    "operation": "add-project",
+    "databases": 41,
+    "rep": 0,
+    "seconds": 51.29431584710255,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      8.669921875,
+      6.6884765625,
+      6.9853515625
+    ],
+    "available_GiB": 116.41997146606445,
+    "trace": "curve-v2-41-0-add-project.jsonl",
+    "query_count": 1553,
+    "catalog_query_count": 73,
+    "catalog_ms": 42249,
+    "query_ms_sum": 46276
+  },
+  {
+    "operation": "add-project",
+    "databases": 42,
+    "rep": 0,
+    "seconds": 53.1914688188117,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      7.35400390625,
+      6.666015625,
+      6.96435546875
+    ],
+    "available_GiB": 116.37937927246094,
+    "trace": "curve-v2-42-0-add-project.jsonl",
+    "query_count": 1553,
+    "catalog_query_count": 73,
+    "catalog_ms": 43811,
+    "query_ms_sum": 48088
+  },
+  {
+    "operation": "add-project",
+    "databases": 43,
+    "rep": 0,
+    "seconds": 55.02618305408396,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      6.93359375,
+      6.68603515625,
+      6.9560546875
+    ],
+    "available_GiB": 116.27546310424805,
+    "trace": "curve-v2-43-0-add-project.jsonl",
+    "query_count": 1553,
+    "catalog_query_count": 73,
+    "catalog_ms": 45848,
+    "query_ms_sum": 49995
+  },
+  {
+    "operation": "add-project",
+    "databases": 44,
+    "rep": 0,
+    "seconds": 55.67947690701112,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      6.322265625,
+      6.5537109375,
+      6.89404296875
+    ],
+    "available_GiB": 116.23942184448242,
+    "trace": "curve-v2-44-0-add-project.jsonl",
+    "query_count": 1553,
+    "catalog_query_count": 73,
+    "catalog_ms": 46295,
+    "query_ms_sum": 50618
+  },
+  {
+    "operation": "add-project",
+    "databases": 45,
+    "rep": 0,
+    "seconds": 56.458797280909494,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      7.98193359375,
+      7.0068359375,
+      7.029296875
+    ],
+    "available_GiB": 116.28805160522461,
+    "trace": "curve-v2-45-0-add-project.jsonl",
+    "query_count": 1553,
+    "catalog_query_count": 73,
+    "catalog_ms": 47002,
+    "query_ms_sum": 51464
+  },
+  {
+    "operation": "add-project",
+    "databases": 46,
+    "rep": 0,
+    "seconds": 59.496580719947815,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.61572265625,
+      8.294921875,
+      7.47265625
+    ],
+    "available_GiB": 116.09706115722656,
+    "trace": "curve-v2-46-0-add-project.jsonl",
+    "query_count": 1553,
+    "catalog_query_count": 73,
+    "catalog_ms": 50026,
+    "query_ms_sum": 54388
+  },
+  {
+    "operation": "add-project",
+    "databases": 47,
+    "rep": 0,
+    "seconds": 60.876883048098534,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      7.9560546875,
+      7.83251953125,
+      7.36181640625
+    ],
+    "available_GiB": 116.09185028076172,
+    "trace": "curve-v2-47-0-add-project.jsonl",
+    "query_count": 1553,
+    "catalog_query_count": 73,
+    "catalog_ms": 50593,
+    "query_ms_sum": 55522
+  },
+  {
+    "operation": "add-project",
+    "databases": 48,
+    "rep": 0,
+    "seconds": 62.14805240696296,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      6.240234375,
+      7.38525390625,
+      7.23779296875
+    ],
+    "available_GiB": 116.03036117553711,
+    "trace": "curve-v2-48-0-add-project.jsonl",
+    "query_count": 1553,
+    "catalog_query_count": 73,
+    "catalog_ms": 52166,
+    "query_ms_sum": 56975
+  },
+  {
+    "operation": "add-project",
+    "databases": 49,
+    "rep": 0,
+    "seconds": 62.62079274398275,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      7.423828125,
+      7.4765625,
+      7.27490234375
+    ],
+    "available_GiB": 116.1070442199707,
+    "trace": "curve-v2-49-0-add-project.jsonl",
+    "query_count": 1553,
+    "catalog_query_count": 73,
+    "catalog_ms": 52482,
+    "query_ms_sum": 57296
+  },
+  {
+    "operation": "create",
+    "databases": 50,
+    "rep": 1,
+    "seconds": 1.969797478057444,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.9052734375,
+      7.01904296875,
+      7.12841796875
+    ],
+    "available_GiB": 116.14484405517578,
+    "trace": "curve-v2-50-1-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 1495,
+    "query_ms_sum": 1549
+  },
+  {
+    "operation": "update",
+    "databases": 50,
+    "rep": 1,
+    "seconds": 2.033454224932939,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.9052734375,
+      7.01904296875,
+      7.12841796875
+    ],
+    "available_GiB": 116.12832641601562,
+    "trace": "curve-v2-50-1-update.jsonl",
+    "query_count": 52,
+    "catalog_query_count": 2,
+    "catalog_ms": 1567,
+    "query_ms_sum": 1614
+  },
+  {
+    "operation": "comment",
+    "databases": 50,
+    "rep": 1,
+    "seconds": 1.9269864589441568,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.9130859375,
+      7.001953125,
+      7.1220703125
+    ],
+    "available_GiB": 116.13688278198242,
+    "trace": "curve-v2-50-1-comment.jsonl",
+    "query_count": 45,
+    "catalog_query_count": 2,
+    "catalog_ms": 1474,
+    "query_ms_sum": 1504
+  },
+  {
+    "operation": "set-state",
+    "databases": 50,
+    "rep": 1,
+    "seconds": 2.135812556138262,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.9130859375,
+      7.001953125,
+      7.1220703125
+    ],
+    "available_GiB": 116.12146377563477,
+    "trace": "curve-v2-50-1-set-state.jsonl",
+    "query_count": 93,
+    "catalog_query_count": 2,
+    "catalog_ms": 1511,
+    "query_ms_sum": 1650
+  },
+  {
+    "operation": "claim",
+    "databases": 50,
+    "rep": 1,
+    "seconds": 2.1651110311504453,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.9130859375,
+      7.001953125,
+      7.1220703125
+    ],
+    "available_GiB": 116.11237716674805,
+    "trace": "curve-v2-50-1-claim.jsonl",
+    "query_count": 48,
+    "catalog_query_count": 2,
+    "catalog_ms": 1762,
+    "query_ms_sum": 1805
+  },
+  {
+    "operation": "merge-check",
+    "databases": 50,
+    "rep": 1,
+    "seconds": 1.970980903832242,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.92041015625,
+      6.98486328125,
+      7.11572265625
+    ],
+    "available_GiB": 116.13797378540039,
+    "trace": "curve-v2-50-1-merge-check.jsonl",
+    "query_count": 31,
+    "catalog_query_count": 2,
+    "catalog_ms": 1575,
+    "query_ms_sum": 1597
+  },
+  {
+    "operation": "merge-acquire",
+    "databases": 50,
+    "rep": 1,
+    "seconds": 1.9916949709877372,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.92041015625,
+      6.98486328125,
+      7.11572265625
+    ],
+    "available_GiB": 116.06526565551758,
+    "trace": "curve-v2-50-1-merge-acquire.jsonl",
+    "query_count": 43,
+    "catalog_query_count": 2,
+    "catalog_ms": 1552,
+    "query_ms_sum": 1600
+  },
+  {
+    "operation": "merge-release",
+    "databases": 50,
+    "rep": 1,
+    "seconds": 2.105799169978127,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      6.00732421875,
+      6.9853515625,
+      7.11474609375
+    ],
+    "available_GiB": 116.05356216430664,
+    "trace": "curve-v2-50-1-merge-release.jsonl",
+    "query_count": 46,
+    "catalog_query_count": 2,
+    "catalog_ms": 1629,
+    "query_ms_sum": 1675
+  },
+  {
+    "operation": "list",
+    "databases": 50,
+    "rep": 1,
+    "seconds": 0.22880305303260684,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      6.00732421875,
+      6.9853515625,
+      7.11474609375
+    ],
+    "available_GiB": 116.00882339477539,
+    "trace": "curve-v2-50-1-list.jsonl",
+    "query_count": 22,
+    "catalog_query_count": 0,
+    "catalog_ms": 0,
+    "query_ms_sum": 30
+  },
+  {
+    "operation": "show",
+    "databases": 50,
+    "rep": 1,
+    "seconds": 0.2205077181570232,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      6.00732421875,
+      6.9853515625,
+      7.11474609375
+    ],
+    "available_GiB": 115.90264129638672,
+    "trace": "curve-v2-50-1-show.jsonl",
+    "query_count": 33,
+    "catalog_query_count": 0,
+    "catalog_ms": 0,
+    "query_ms_sum": 18
+  },
+  {
+    "operation": "filtered-columns",
+    "databases": 50,
+    "rep": 1,
+    "seconds": 0.8744775231461972,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      6.00732421875,
+      6.9853515625,
+      7.11474609375
+    ],
+    "available_GiB": 116.00579452514648,
+    "trace": "curve-v2-50-1-filtered-columns.jsonl",
+    "query_count": 4,
+    "catalog_query_count": 1,
+    "catalog_ms": 817,
+    "query_ms_sum": 824
+  },
+  {
+    "operation": "ordinary-query",
+    "databases": 50,
+    "rep": 1,
+    "seconds": 0.05010734894312918,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      6.00732421875,
+      6.9853515625,
+      7.11474609375
+    ],
+    "available_GiB": 115.98531723022461,
+    "trace": "curve-v2-50-1-ordinary-query.jsonl",
+    "query_count": 4,
+    "catalog_query_count": 0,
+    "catalog_ms": 0,
+    "query_ms_sum": 5
+  },
+  {
+    "operation": "create",
+    "databases": 50,
+    "rep": 2,
+    "seconds": 2.0461097368970513,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      6.0869140625,
+      6.98583984375,
+      7.11376953125
+    ],
+    "available_GiB": 115.99166488647461,
+    "trace": "curve-v2-50-2-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 1475,
+    "query_ms_sum": 1535
+  },
+  {
+    "operation": "update",
+    "databases": 50,
+    "rep": 2,
+    "seconds": 2.306233906187117,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      6.0869140625,
+      6.98583984375,
+      7.11376953125
+    ],
+    "available_GiB": 116.07479858398438,
+    "trace": "curve-v2-50-2-update.jsonl",
+    "query_count": 52,
+    "catalog_query_count": 2,
+    "catalog_ms": 1890,
+    "query_ms_sum": 1917
+  },
+  {
+    "operation": "comment",
+    "databases": 50,
+    "rep": 2,
+    "seconds": 1.994195592124015,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      6.0869140625,
+      6.98583984375,
+      7.11376953125
+    ],
+    "available_GiB": 116.02277755737305,
+    "trace": "curve-v2-50-2-comment.jsonl",
+    "query_count": 45,
+    "catalog_query_count": 2,
+    "catalog_ms": 1532,
+    "query_ms_sum": 1573
+  },
+  {
+    "operation": "set-state",
+    "databases": 50,
+    "rep": 2,
+    "seconds": 2.2618957029189914,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      6.16015625,
+      6.986328125,
+      7.11279296875
+    ],
+    "available_GiB": 115.98619842529297,
+    "trace": "curve-v2-50-2-set-state.jsonl",
+    "query_count": 93,
+    "catalog_query_count": 2,
+    "catalog_ms": 1649,
+    "query_ms_sum": 1777
+  },
+  {
+    "operation": "claim",
+    "databases": 50,
+    "rep": 2,
+    "seconds": 1.9782749069854617,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      6.16015625,
+      6.986328125,
+      7.11279296875
+    ],
+    "available_GiB": 116.01143646240234,
+    "trace": "curve-v2-50-2-claim.jsonl",
+    "query_count": 48,
+    "catalog_query_count": 2,
+    "catalog_ms": 1552,
+    "query_ms_sum": 1588
+  },
+  {
+    "operation": "merge-check",
+    "databases": 50,
+    "rep": 2,
+    "seconds": 1.8359343640040606,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      6.14697265625,
+      6.9697265625,
+      7.1064453125
+    ],
+    "available_GiB": 116.08642959594727,
+    "trace": "curve-v2-50-2-merge-check.jsonl",
+    "query_count": 31,
+    "catalog_query_count": 2,
+    "catalog_ms": 1443,
+    "query_ms_sum": 1468
+  },
+  {
+    "operation": "merge-acquire",
+    "databases": 50,
+    "rep": 2,
+    "seconds": 2.0785518980119377,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      6.14697265625,
+      6.9697265625,
+      7.1064453125
+    ],
+    "available_GiB": 116.03279495239258,
+    "trace": "curve-v2-50-2-merge-acquire.jsonl",
+    "query_count": 43,
+    "catalog_query_count": 2,
+    "catalog_ms": 1649,
+    "query_ms_sum": 1702
+  },
+  {
+    "operation": "merge-release",
+    "databases": 50,
+    "rep": 2,
+    "seconds": 2.046776060014963,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      9.65869140625,
+      7.6845703125,
+      7.3369140625
+    ],
+    "available_GiB": 116.15017700195312,
+    "trace": "curve-v2-50-2-merge-release.jsonl",
+    "query_count": 46,
+    "catalog_query_count": 2,
+    "catalog_ms": 1650,
+    "query_ms_sum": 1688
+  },
+  {
+    "operation": "list",
+    "databases": 50,
+    "rep": 2,
+    "seconds": 0.2161664019804448,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      9.65869140625,
+      7.6845703125,
+      7.3369140625
+    ],
+    "available_GiB": 116.14044570922852,
+    "trace": "curve-v2-50-2-list.jsonl",
+    "query_count": 22,
+    "catalog_query_count": 0,
+    "catalog_ms": 0,
+    "query_ms_sum": 28
+  },
+  {
+    "operation": "show",
+    "databases": 50,
+    "rep": 2,
+    "seconds": 0.22498748707585037,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      9.65869140625,
+      7.6845703125,
+      7.3369140625
+    ],
+    "available_GiB": 116.13859939575195,
+    "trace": "curve-v2-50-2-show.jsonl",
+    "query_count": 33,
+    "catalog_query_count": 0,
+    "catalog_ms": 0,
+    "query_ms_sum": 23
+  },
+  {
+    "operation": "filtered-columns",
+    "databases": 50,
+    "rep": 2,
+    "seconds": 0.9301030531059951,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      9.65869140625,
+      7.6845703125,
+      7.3369140625
+    ],
+    "available_GiB": 116.14006805419922,
+    "trace": "curve-v2-50-2-filtered-columns.jsonl",
+    "query_count": 4,
+    "catalog_query_count": 1,
+    "catalog_ms": 858,
+    "query_ms_sum": 869
+  },
+  {
+    "operation": "ordinary-query",
+    "databases": 50,
+    "rep": 2,
+    "seconds": 0.0836397921666503,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      9.65869140625,
+      7.6845703125,
+      7.3369140625
+    ],
+    "available_GiB": 116.13807678222656,
+    "trace": "curve-v2-50-2-ordinary-query.jsonl",
+    "query_count": 4,
+    "catalog_query_count": 0,
+    "catalog_ms": 0,
+    "query_ms_sum": 10
+  },
+  {
+    "operation": "create",
+    "databases": 50,
+    "rep": 3,
+    "seconds": 2.063981929095462,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      9.65869140625,
+      7.6845703125,
+      7.3369140625
+    ],
+    "available_GiB": 116.13660049438477,
+    "trace": "curve-v2-50-3-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 1624,
+    "query_ms_sum": 1672
+  },
+  {
+    "operation": "update",
+    "databases": 50,
+    "rep": 3,
+    "seconds": 1.9233439972158521,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      9.28515625,
+      7.6396484375,
+      7.32421875
+    ],
+    "available_GiB": 116.13861083984375,
+    "trace": "curve-v2-50-3-update.jsonl",
+    "query_count": 52,
+    "catalog_query_count": 2,
+    "catalog_ms": 1468,
+    "query_ms_sum": 1513
+  },
+  {
+    "operation": "comment",
+    "databases": 50,
+    "rep": 3,
+    "seconds": 1.9403113850858063,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      9.28515625,
+      7.6396484375,
+      7.32421875
+    ],
+    "available_GiB": 116.13471603393555,
+    "trace": "curve-v2-50-3-comment.jsonl",
+    "query_count": 45,
+    "catalog_query_count": 2,
+    "catalog_ms": 1500,
+    "query_ms_sum": 1537
+  },
+  {
+    "operation": "set-state",
+    "databases": 50,
+    "rep": 3,
+    "seconds": 2.2404503421857953,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      9.28515625,
+      7.6396484375,
+      7.32421875
+    ],
+    "available_GiB": 116.13574600219727,
+    "trace": "curve-v2-50-3-set-state.jsonl",
+    "query_count": 93,
+    "catalog_query_count": 2,
+    "catalog_ms": 1630,
+    "query_ms_sum": 1781
+  },
+  {
+    "operation": "claim",
+    "databases": 50,
+    "rep": 3,
+    "seconds": 2.0129190059378743,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      8.70166015625,
+      7.5458984375,
+      7.29541015625
+    ],
+    "available_GiB": 116.1657485961914,
+    "trace": "curve-v2-50-3-claim.jsonl",
+    "query_count": 48,
+    "catalog_query_count": 2,
+    "catalog_ms": 1582,
+    "query_ms_sum": 1624
+  },
+  {
+    "operation": "merge-check",
+    "databases": 50,
+    "rep": 3,
+    "seconds": 2.0097078438848257,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      8.70166015625,
+      7.5458984375,
+      7.29541015625
+    ],
+    "available_GiB": 116.0821647644043,
+    "trace": "curve-v2-50-3-merge-check.jsonl",
+    "query_count": 31,
+    "catalog_query_count": 2,
+    "catalog_ms": 1594,
+    "query_ms_sum": 1616
+  },
+  {
+    "operation": "merge-acquire",
+    "databases": 50,
+    "rep": 3,
+    "seconds": 2.186567958910018,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      8.48486328125,
+      7.52001953125,
+      7.2880859375
+    ],
+    "available_GiB": 116.0502700805664,
+    "trace": "curve-v2-50-3-merge-acquire.jsonl",
+    "query_count": 43,
+    "catalog_query_count": 2,
+    "catalog_ms": 1731,
+    "query_ms_sum": 1786
+  },
+  {
+    "operation": "merge-release",
+    "databases": 50,
+    "rep": 3,
+    "seconds": 2.0643663411028683,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      8.48486328125,
+      7.52001953125,
+      7.2880859375
+    ],
+    "available_GiB": 115.96819305419922,
+    "trace": "curve-v2-50-3-merge-release.jsonl",
+    "query_count": 46,
+    "catalog_query_count": 2,
+    "catalog_ms": 1610,
+    "query_ms_sum": 1664
+  },
+  {
+    "operation": "list",
+    "databases": 50,
+    "rep": 3,
+    "seconds": 0.22671107714995742,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      8.20556640625,
+      7.47802734375,
+      7.275390625
+    ],
+    "available_GiB": 116.10381698608398,
+    "trace": "curve-v2-50-3-list.jsonl",
+    "query_count": 22,
+    "catalog_query_count": 0,
+    "catalog_ms": 0,
+    "query_ms_sum": 34
+  },
+  {
+    "operation": "show",
+    "databases": 50,
+    "rep": 3,
+    "seconds": 0.22943861386738718,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      8.20556640625,
+      7.47802734375,
+      7.275390625
+    ],
+    "available_GiB": 116.1086196899414,
+    "trace": "curve-v2-50-3-show.jsonl",
+    "query_count": 33,
+    "catalog_query_count": 0,
+    "catalog_ms": 0,
+    "query_ms_sum": 23
+  },
+  {
+    "operation": "filtered-columns",
+    "databases": 50,
+    "rep": 3,
+    "seconds": 0.8555297879502177,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      8.20556640625,
+      7.47802734375,
+      7.275390625
+    ],
+    "available_GiB": 116.10990905761719,
+    "trace": "curve-v2-50-3-filtered-columns.jsonl",
+    "query_count": 4,
+    "catalog_query_count": 1,
+    "catalog_ms": 785,
+    "query_ms_sum": 796
+  },
+  {
+    "operation": "ordinary-query",
+    "databases": 50,
+    "rep": 3,
+    "seconds": 0.06749969511292875,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      8.20556640625,
+      7.47802734375,
+      7.275390625
+    ],
+    "available_GiB": 116.05850219726562,
+    "trace": "curve-v2-50-3-ordinary-query.jsonl",
+    "query_count": 4,
+    "catalog_query_count": 0,
+    "catalog_ms": 0,
+    "query_ms_sum": 10
+  },
+  {
+    "operation": "create",
+    "databases": 50,
+    "rep": 11,
+    "seconds": 2.4393286400008947,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      8.20556640625,
+      7.47802734375,
+      7.275390625
+    ],
+    "available_GiB": 116.66892623901367
+  },
+  {
+    "operation": "update",
+    "databases": 50,
+    "rep": 11,
+    "seconds": 2.2354557160288095,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      8.10888671875,
+      7.4697265625,
+      7.2734375
+    ],
+    "available_GiB": 116.39053344726562
+  },
+  {
+    "operation": "comment",
+    "databases": 50,
+    "rep": 11,
+    "seconds": 2.307444579200819,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      8.10888671875,
+      7.4697265625,
+      7.2734375
+    ],
+    "available_GiB": 116.27141189575195
+  },
+  {
+    "operation": "set-state",
+    "databases": 50,
+    "rep": 11,
+    "seconds": 2.307033535093069,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      7.93994140625,
+      7.4453125,
+      7.26611328125
+    ],
+    "available_GiB": 116.27215957641602
+  },
+  {
+    "operation": "claim",
+    "databases": 50,
+    "rep": 11,
+    "seconds": 2.205565358977765,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      7.93994140625,
+      7.4453125,
+      7.26611328125
+    ],
+    "available_GiB": 116.23956680297852
+  },
+  {
+    "operation": "merge-check",
+    "databases": 50,
+    "rep": 11,
+    "seconds": 2.039722464978695,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      8.10498046875,
+      7.48779296875,
+      7.28125
+    ],
+    "available_GiB": 116.07218551635742
+  },
+  {
+    "operation": "merge-acquire",
+    "databases": 50,
+    "rep": 11,
+    "seconds": 2.006374203134328,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      8.10498046875,
+      7.48779296875,
+      7.28125
+    ],
+    "available_GiB": 116.15292739868164
+  },
+  {
+    "operation": "merge-release",
+    "databases": 50,
+    "rep": 11,
+    "seconds": 2.3293076660484076,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      8.10498046875,
+      7.48779296875,
+      7.28125
+    ],
+    "available_GiB": 116.03705215454102
+  },
+  {
+    "operation": "list",
+    "databases": 50,
+    "rep": 11,
+    "seconds": 0.2478849021717906,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      8.09619140625,
+      7.49658203125,
+      7.28515625
+    ],
+    "available_GiB": 116.12752914428711
+  },
+  {
+    "operation": "show",
+    "databases": 50,
+    "rep": 11,
+    "seconds": 0.1947614699602127,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      8.09619140625,
+      7.49658203125,
+      7.28515625
+    ],
+    "available_GiB": 116.14041519165039
+  },
+  {
+    "operation": "filtered-columns",
+    "databases": 50,
+    "rep": 11,
+    "seconds": 0.9490750229451805,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      8.09619140625,
+      7.49658203125,
+      7.28515625
+    ],
+    "available_GiB": 116.14352798461914
+  },
+  {
+    "operation": "ordinary-query",
+    "databases": 50,
+    "rep": 11,
+    "seconds": 0.054686814080923796,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      8.09619140625,
+      7.49658203125,
+      7.28515625
+    ],
+    "available_GiB": 116.12753295898438
+  },
+  {
+    "operation": "create",
+    "databases": 50,
+    "rep": 12,
+    "seconds": 2.040213973959908,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      8.09619140625,
+      7.49658203125,
+      7.28515625
+    ],
+    "available_GiB": 116.12020492553711
+  },
+  {
+    "operation": "update",
+    "databases": 50,
+    "rep": 12,
+    "seconds": 2.0991420871578157,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      8.1689453125,
+      7.52197265625,
+      7.29443359375
+    ],
+    "available_GiB": 116.05921936035156
+  },
+  {
+    "operation": "comment",
+    "databases": 50,
+    "rep": 12,
+    "seconds": 1.9131372179836035,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      8.1689453125,
+      7.52197265625,
+      7.29443359375
+    ],
+    "available_GiB": 116.15895080566406
+  },
+  {
+    "operation": "set-state",
+    "databases": 50,
+    "rep": 12,
+    "seconds": 2.1623348349239677,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      8.1689453125,
+      7.52197265625,
+      7.29443359375
+    ],
+    "available_GiB": 116.16203308105469
+  },
+  {
+    "operation": "claim",
+    "databases": 50,
+    "rep": 12,
+    "seconds": 2.244231783784926,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      8.0751953125,
+      7.51318359375,
+      7.29248046875
+    ],
+    "available_GiB": 116.10358047485352
+  },
+  {
+    "operation": "merge-check",
+    "databases": 50,
+    "rep": 12,
+    "seconds": 2.2805347880348563,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      8.0751953125,
+      7.51318359375,
+      7.29248046875
+    ],
+    "available_GiB": 116.17284393310547
+  },
+  {
+    "operation": "merge-acquire",
+    "databases": 50,
+    "rep": 12,
+    "seconds": 2.062762897927314,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      7.90869140625,
+      7.48779296875,
+      7.28515625
+    ],
+    "available_GiB": 116.17528915405273
+  },
+  {
+    "operation": "merge-release",
+    "databases": 50,
+    "rep": 12,
+    "seconds": 2.0889116558246315,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      7.90869140625,
+      7.48779296875,
+      7.28515625
+    ],
+    "available_GiB": 116.14079666137695
+  },
+  {
+    "operation": "list",
+    "databases": 50,
+    "rep": 12,
+    "seconds": 0.23273281706497073,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      8.076171875,
+      7.52978515625,
+      7.2998046875
+    ],
+    "available_GiB": 116.1010856628418
+  },
+  {
+    "operation": "show",
+    "databases": 50,
+    "rep": 12,
+    "seconds": 0.19170508277602494,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      8.076171875,
+      7.52978515625,
+      7.2998046875
+    ],
+    "available_GiB": 116.10404968261719
+  },
+  {
+    "operation": "filtered-columns",
+    "databases": 50,
+    "rep": 12,
+    "seconds": 0.8729717810638249,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      8.076171875,
+      7.52978515625,
+      7.2998046875
+    ],
+    "available_GiB": 116.1052360534668
+  },
+  {
+    "operation": "ordinary-query",
+    "databases": 50,
+    "rep": 12,
+    "seconds": 0.056583112105727196,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      8.076171875,
+      7.52978515625,
+      7.2998046875
+    ],
+    "available_GiB": 116.13915634155273
+  },
+  {
+    "operation": "create",
+    "databases": 50,
+    "rep": 13,
+    "seconds": 2.125690588960424,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      8.076171875,
+      7.52978515625,
+      7.2998046875
+    ],
+    "available_GiB": 116.14349746704102
+  },
+  {
+    "operation": "update",
+    "databases": 50,
+    "rep": 13,
+    "seconds": 2.236986809875816,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      8.076171875,
+      7.52978515625,
+      7.2998046875
+    ],
+    "available_GiB": 116.10656356811523
+  },
+  {
+    "operation": "comment",
+    "databases": 50,
+    "rep": 13,
+    "seconds": 2.030690271174535,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      8.7109375,
+      7.67041015625,
+      7.3466796875
+    ],
+    "available_GiB": 116.06652069091797
+  },
+  {
+    "operation": "set-state",
+    "databases": 50,
+    "rep": 13,
+    "seconds": 2.2995741879567504,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      8.7109375,
+      7.67041015625,
+      7.3466796875
+    ],
+    "available_GiB": 116.0078239440918
+  },
+  {
+    "operation": "claim",
+    "databases": 50,
+    "rep": 13,
+    "seconds": 2.053853752091527,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      8.25341796875,
+      7.5927734375,
+      7.3232421875
+    ],
+    "available_GiB": 116.05886459350586
+  },
+  {
+    "operation": "merge-check",
+    "databases": 50,
+    "rep": 13,
+    "seconds": 2.0065147820860147,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      8.25341796875,
+      7.5927734375,
+      7.3232421875
+    ],
+    "available_GiB": 116.16225814819336
+  },
+  {
+    "operation": "merge-acquire",
+    "databases": 50,
+    "rep": 13,
+    "seconds": 1.9586725879926234,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      8.25341796875,
+      7.5927734375,
+      7.3232421875
+    ],
+    "available_GiB": 116.11597442626953
+  },
+  {
+    "operation": "merge-release",
+    "databases": 50,
+    "rep": 13,
+    "seconds": 2.007234136108309,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      7.99267578125,
+      7.54931640625,
+      7.310546875
+    ],
+    "available_GiB": 116.06425857543945
+  },
+  {
+    "operation": "list",
+    "databases": 50,
+    "rep": 13,
+    "seconds": 0.2291492430958897,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      7.99267578125,
+      7.54931640625,
+      7.310546875
+    ],
+    "available_GiB": 116.09271621704102
+  },
+  {
+    "operation": "show",
+    "databases": 50,
+    "rep": 13,
+    "seconds": 0.21101230313070118,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      7.99267578125,
+      7.54931640625,
+      7.310546875
+    ],
+    "available_GiB": 116.0877799987793
+  },
+  {
+    "operation": "filtered-columns",
+    "databases": 50,
+    "rep": 13,
+    "seconds": 0.8483074200339615,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      7.99267578125,
+      7.54931640625,
+      7.310546875
+    ],
+    "available_GiB": 116.09319305419922
+  },
+  {
+    "operation": "ordinary-query",
+    "databases": 50,
+    "rep": 13,
+    "seconds": 0.053503829054534435,
+    "logging": "warning",
+    "outcome": "passed",
+    "load": [
+      7.99267578125,
+      7.54931640625,
+      7.310546875
+    ],
+    "available_GiB": 116.08002090454102
+  }
+]
