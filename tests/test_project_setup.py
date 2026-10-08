@@ -1,6 +1,7 @@
 """The project setup page's data, the repository field and the host's setup status (kittrial-5bb.118)."""
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -172,8 +173,11 @@ class InProcessSetupTests(test_http_agents.AgentHarness):
         self.assertEqual([item['id'] for item in answer.data['steps']], STEP_IDS)
         steps = by_id(answer.data)
         for item in answer.data['steps']:
-            self.assertEqual(sorted(item), ['command', 'detail', 'id', 'link', 'note', 'state', 'title', 'who',
+            self.assertEqual(sorted(item), ['command', 'commands', 'detail', 'id', 'link', 'note', 'state', 'title', 'who',
                                             'who_text'])
+            for one in item['commands']:
+                self.assertEqual(sorted(one), ['kind', 'label', 'note', 'replace', 'text'])
+                self.assertIn(one['kind'], project_setup.KINDS)
             self.assertIn(item['state'], project_setup.STATES)
         # The admin who registered it and the owner: two members.
         self.assertEqual((steps['members']['state'], steps['repository']['state'], steps['first-task']['state'],
@@ -365,7 +369,7 @@ class HostStatusTests(unittest.TestCase):
 
     def test_a_bare_project(self):
         status = self.status()
-        self.assertEqual(sorted(status), ['backup', 'creation_record', 'guidance', 'onboarding', 'project',
+        self.assertEqual(sorted(status), ['admin', 'backup', 'creation_record', 'guidance', 'onboarding', 'project',
                                           'project_databases', 'schema_version'])
         self.assertEqual(status['project_databases'], {'used': 1, 'limit': 20})
         self.assertIsNone(status['creation_record'])                    # nothing against registering it
@@ -373,6 +377,16 @@ class HostStatusTests(unittest.TestCase):
         self.assertEqual(status['onboarding'], {'state': 'not-set', 'updated_at': None})
         self.assertEqual((status['backup']['scheduled'], status['backup']['last_run']), ('not-covered', None))
         self.assertEqual(status['backup']['line'], admin.scheduled_backup_execstart(self.root))
+        # What can be pasted, beside the unit-file line that cannot (kittrial-5bb.200).
+        self.assertTrue(status['backup']['line'].startswith('ExecStart='))
+        import shlex
+        self.assertEqual(shlex.split(status['backup']['run_now'])[-4:], ['--root', str(self.root), 'backup', '--all'])
+        if os.name == 'posix':                 # a unit line is a POSIX command line; nothing needs quoting there
+            self.assertEqual('ExecStart=' + status['backup']['run_now'], status['backup']['line'])
+        self.assertEqual(status['backup']['run_now'], status['admin'] + ' backup --all')
+        self.assertEqual(status['backup']['check'], status['admin'] + ' backup-status --require-complete')
+        self.assertEqual(status['backup']['unit_directory'], str(self.units))
+        self.assertEqual(shlex.split(status['admin'])[-2:], ['--root', str(self.root)])
 
     def test_a_damaged_creation_record_is_said_as_a_sentence_without_a_path(self):
         """kittrial-5bb.149: the register route asks here, since the endpoint serves such a project."""
@@ -523,11 +537,24 @@ class EndpointSetupTests(fixes.EndpointCase):
     def test_the_host_steps_follow_the_host(self):
         steps = by_id(self.setup())
         self.assertEqual((steps['guidance']['state'], steps['onboarding']['state']), ('todo', 'todo'))
-        self.assertEqual(steps['guidance']['command'], 'admin.py set-guidance %s --actor OPERATOR --file FILE'
-                         % self.project)
-        self.assertEqual(steps['onboarding']['command'], 'admin.py set-onboarding %s --file FILE' % self.project)
+        # Each is a shell command that begins as the host says its commands begin: `admin.py ...` alone
+        # is not on PATH and, in a release, not executable (kittrial-5bb.200).
+        for name, words, replace in (('guidance', 'set-guidance %s --actor OPERATOR --file FILE', ['OPERATOR', 'FILE']),
+                                     ('onboarding', 'set-onboarding %s --file FILE', ['FILE'])):
+            self.assertEqual(len(steps[name]['commands']), 1)
+            one = steps[name]['commands'][0]
+            self.assertEqual((one['kind'], one['replace']), ('shell-fill', replace))
+            begins, _, rest = one['text'].partition(' --root ')
+            self.assertTrue(begins.endswith('admin.py') or begins.endswith("admin.py'"), one['text'])
+            self.assertGreater(len(begins.split()), 1, one['text'])              # an interpreter, then admin.py
+            self.assertTrue(rest.endswith(' ' + words % self.project), one['text'])
+            self.assertEqual(steps[name]['command'], one['text'])
+            for word in replace:
+                self.assertIn('Replace ', one['note'])
+                self.assertIn(word, one['note'])
         self.assertIn(steps['backup']['state'], ('todo', 'done', 'unknown'))
-        self.assertIn('backup --all', steps['backup']['command'] or 'backup --all')
+        self.assertEqual([one['kind'] for one in steps['backup']['commands']] if steps['backup']['state'] != 'done' else
+                         ['shell', 'unit-line', 'shell'], ['shell', 'unit-line', 'shell'])
         # Guidance is the operator's alone. Onboarding an owner may set on the page, or the operator on the server.
         self.assertEqual((steps['guidance']['who'], steps['onboarding']['who']), ('operator', 'owner-or-operator'))
         self.assertIn('cannot do this step', steps['guidance']['note'])
@@ -539,6 +566,7 @@ class EndpointSetupTests(fixes.EndpointCase):
         steps = by_id(body)
         self.assertEqual((steps['guidance']['state'], steps['onboarding']['state']), ('done', 'done'))
         self.assertIsNone(steps['guidance']['command'])
+        self.assertEqual((steps['guidance']['commands'], steps['onboarding']['commands']), ([], []))
         self.assertEqual(body['host'], 'available')
         self.assertNotIn('SECRET', json.dumps(body))
         # A guidance file whose record does not match is not "done".
@@ -596,12 +624,45 @@ class EndpointSetupTests(fixes.EndpointCase):
                 'onboarding': {'state': 'not-set', 'updated_at': None}, 'backup': block}
             body = self.setup()
             return by_id(body)['backup'], body
+        # An endpoint older than this service says the line and nothing that can be pasted: the page is
+        # given the line as a line of a unit file, never as a command.
         step, body = host('not-covered')
         self.assertEqual((step['state'], step['command']), ('todo', line))
-        self.assertIn('No scheduled backup on the server covers this project', step['detail'])
+        self.assertEqual([(one['kind'], one['text']) for one in step['commands']], [('unit-line', line)])
+        self.assertIn('not a shell command', step['commands'][0]['label'])
         self.assertIn('backup', [item['id'] for item in body['steps'] if item['state'] == 'todo'])
+        # This kit's endpoint: what to run now, the line for a schedule, and the check, each labelled.
+        run, check = '/opt/py/bin/python3 /opt/kit/admin.py --root /srv/rt backup --all', \
+            '/opt/py/bin/python3 /opt/kit/admin.py --root /srv/rt backup-status --require-complete'
+        step, _ = host('not-covered', run_now=run, check=check, unit_directory='/home/svc/.config/systemd/user')
+        self.assertEqual([(one['kind'], one['text']) for one in step['commands']],
+                         [('shell', run), ('unit-line', line), ('shell', check)])
+        self.assertEqual(step['command'], run)                     # what an older page shows can be pasted
+        labels = [one['label'] for one in step['commands']]
+        self.assertTrue(labels[0].startswith('Run a backup now (a shell command'))
+        self.assertTrue(labels[1].startswith('The line for a schedule (a line of a systemd unit file, not a shell command)'))
+        self.assertIn('[Service] section of a beads-*backup*.service unit in /home/svc/.config/systemd/user', step['commands'][1]['note'])
+        self.assertIn('To check, reload this page', step['commands'][1]['note'])
+        self.assertIn('It does not schedule anything', step['commands'][0]['note'])
+        self.assertNotIn('with the command shown', step['note'])
+        # The state says WHICH of the two is missing: a backup that was run, a schedule that will run the next.
+        self.assertIn('No backup of this project has been run, and no schedule on the server covers it: both are missing',
+                      step['detail'])
+        ran = {'status': 'complete', 'completed_at': '2026-10-07T09:00:00Z', 'degraded': False, 'scope': 'all'}
+        step, _ = host('not-covered', run_now=run, last_run=ran)
+        self.assertEqual(step['state'], 'todo')
+        self.assertIn('A backup of this project was run on 2026-10-07 and recorded it complete, but no schedule on the '
+                      'server covers it, so it will not be backed up again by itself. What is missing is the schedule.',
+                      step['detail'])
+        self.assertNotIn('The last backup run recorded', step['detail'])
+        self.assertIn('a schedule kept anywhere else is not seen here', step['detail'])
+        step, _ = host('covered', last_run=ran)
+        self.assertEqual((step['state'], step['commands'], step['command']), ('done', [], None))
+        self.assertEqual(step['detail'], 'A scheduled backup on the server covers this project. A backup of this project '
+                                         'was run on 2026-10-07 and recorded it complete.')
         step, body = host('covered')
         self.assertEqual(step['state'], 'done')
+        self.assertIn('It has not run yet: no backup run has recorded this project.', step['detail'])
         self.assertNotIn('backup', [item['id'] for item in body['steps'] if item['state'] == 'todo'])
         step, _ = host('unknown', reason='no-account-home')
         self.assertEqual(step['state'], 'unknown')
@@ -813,9 +874,26 @@ class SetupScreenTests(test_http_agents.AgentHarness):
         self.assertEqual(steps['members']['links'], ['#/p/%s/settings' % project])
         # A step still to do leads with the way there; a done one keeps a quiet link.
         self.assertEqual((steps['first-task']['linkTexts'], steps['members']['linkTexts']), (['Go there'], ['Open']))
+        # No host behind this service, so it cannot say how its commands begin: the words to replace are named.
         self.assertEqual(steps['guidance']['commands'],
-                         ['admin.py set-guidance %s --actor OPERATOR --file FILE' % project])
+                         ['PYTHON KIT/admin.py --root RUNTIME_ROOT set-guidance %s --actor OPERATOR --file FILE' % project])
+        self.assertIn('PYTHON is the interpreter the kit runs under', steps['guidance']['text'])
         self.assertIn('The web interface cannot do this step', steps['guidance']['text'])
+        # kittrial-5bb.200: each thing to copy is shown under its label with its own button, and a line of a
+        # unit file is not called a command.
+        shown = seen['labelled']
+        self.assertEqual(shown['kinds'], ['shell', 'unit-line', 'shell'])
+        self.assertEqual(shown['texts'], ['/opt/py/bin/python3 /opt/kit/admin.py --root /srv/rt backup --all',
+                                          'ExecStart=/opt/py/bin/python3 /opt/kit/admin.py --root /srv/rt backup --all',
+                                          '/opt/py/bin/python3 /opt/kit/admin.py --root /srv/rt backup-status --require-complete'])
+        self.assertEqual(shown['labels'], ['Run a backup now (a shell command)', 'The line for a schedule (not a shell command)',
+                                           'Check'])
+        self.assertEqual(shown['buttons'], ['Copy command', 'Copy line', 'Copy command'])
+        self.assertIn('It goes in the [Service] section', shown['text'])
+        # A service older than the page sends one `command`: it is still shown, as before.
+        self.assertEqual(seen['older'], {'kinds': ['shell'], 'texts': ['admin.py set-guidance p1 --actor OPERATOR --file FILE'],
+                                         'buttons': ['Copy command']})
+        self.assertEqual(seen['none'], {'kinds': [], 'texts': [], 'buttons': []})
         self.assertIn('does not check that the repository exists', steps['repository']['text'])
 
         # The repository form.
@@ -852,3 +930,111 @@ class SetupScreenTests(test_http_agents.AgentHarness):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+@unittest.skipUnless(os.name == 'posix', 'the commands are pasted into a POSIX shell on the server')
+class PastedIntoAShellTests(unittest.TestCase):
+    """kittrial-5bb.200: James pasted what the backup step called "the command" and the shell answered
+    Permission denied, because it was a line of a unit file (``ExecStart=...``). Whatever a step labels
+    as a shell command is run here through ``sh -c`` exactly as shown, by this kit's own admin.py."""
+
+    NOT_A_COMMAND = (126, 127)            # the shell's own: cannot execute, not found
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
+        self.root = Path(os.path.realpath(self.tmp.name)) / 'runtime'
+        (self.root / 'projects' / 'alpha' / '.beads').mkdir(parents=True)
+        (self.root / 'projects' / 'alpha' / '.beads' / 'metadata.json').write_text('{}', encoding='utf-8')
+        self.status = admin.project_setup_status(self.root, 'alpha')
+
+    def pasted(self, text):
+        return subprocess.run(['sh', '-c', text], capture_output=True, text=True, timeout=300, cwd=self.tmp.name,
+                              env=dict(os.environ, HOME=self.tmp.name))
+
+    def ran_admin(self, done):
+        """The shell found and started the program: whatever came back is admin.py's own answer."""
+        said = done.stdout + done.stderr
+        self.assertNotIn(done.returncode, self.NOT_A_COMMAND, said)
+        for words in ('ermission denied', 'command not found'):
+            self.assertNotIn(words, said)
+        return said
+
+    def test_the_unit_line_is_not_a_command_and_that_was_the_fault(self):
+        line = self.status['backup']['line']
+        self.assertTrue(line.startswith('ExecStart='))
+        done = self.pasted(line)
+        self.assertIn(done.returncode, self.NOT_A_COMMAND)
+        self.assertIn('ermission denied', done.stderr)        # sh reads ExecStart=... as a variable and runs admin.py itself
+        self.assertFalse(os.access(str(KIT / 'admin.py'), os.X_OK), 'admin.py is not executable, and should not be made so')
+
+    def test_what_the_backup_step_labels_a_shell_command_runs_as_shown(self):
+        commands = {one['kind'] + ':' + one['label'][:5]: one for one in self.step('backup')['commands']}
+        self.assertEqual(sorted(commands), ['shell:Check', 'shell:Run a', 'unit-line:The l'])
+        for key in ('shell:Run a', 'shell:Check'):
+            with self.subTest(command=key):
+                self.assertEqual(commands[key]['replace'], [])
+                said = self.ran_admin(self.pasted(commands[key]['text']))
+                # A scratch runtime has no database behind it, so admin.py answers in its own words
+                # (a refusal, or its own traceback): the point is that it was admin.py that answered.
+                self.assertTrue('admin.py' in said or 'backup' in said.lower(), said)
+        self.assertEqual(commands['unit-line:The l']['text'], self.status['backup']['line'])
+
+    def test_the_fill_in_commands_run_once_their_words_are_replaced(self):
+        text = Path(self.tmp.name) / 'text.md'
+        text.write_text('Read this first.\n', encoding='utf-8')
+        onboarding = self.step('onboarding')['commands'][0]
+        self.assertEqual((onboarding['kind'], onboarding['replace']), ('shell-fill', ['FILE']))
+        done = self.pasted(onboarding['text'].replace('FILE', str(text)))
+        self.ran_admin(done)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual((self.root / 'projects' / 'alpha' / 'ONBOARDING.md').read_text(encoding='utf-8').strip().splitlines()[-1],
+                         'Read this first.')
+        guidance_step = self.step('guidance')['commands'][0]
+        self.assertEqual((guidance_step['kind'], guidance_step['replace']), ('shell-fill', ['OPERATOR', 'FILE']))
+        done = self.pasted(guidance_step['text'].replace('OPERATOR', 'nobody-listed').replace('FILE', str(text)))
+        said = self.ran_admin(done)
+        self.assertNotEqual(done.returncode, 0)                   # admin.py's own refusal: the name is on no operator list
+        self.assertIn('operator', said.lower())
+        # As it stands, with its words not replaced, it is still a command the shell can start.
+        self.ran_admin(self.pasted(onboarding['text']))
+
+    def test_what_add_project_prints_for_the_schedule_is_labelled_and_its_command_runs(self):
+        """It printed the unit-file line alone, as "A schedule that covers every project ... is:"."""
+        with patch.dict(os.environ, {'HOME': self.tmp.name}):
+            covered, said = admin.scheduled_backup_coverage(self.root, 'alpha')
+        self.assertFalse(covered)
+        lines = said.splitlines()
+        now = lines.index('To run a backup of every project now, as this account (a shell command):')
+        self.assertEqual(lines[now + 1].strip(), self.status['backup']['run_now'])
+        unit = next(index for index, line in enumerate(lines) if line.startswith('The line for a schedule (a line of a systemd unit file, not a shell command;'))
+        self.assertIn('[Service] section of a beads-*backup*.service unit in %s/.config/systemd/user' % self.tmp.name, lines[unit])
+        self.assertEqual(lines[unit + 1].strip(), self.status['backup']['line'])
+        check = lines.index('To check afterwards: `systemctl --user list-timers`, and')
+        self.assertEqual(lines[check + 1].strip(), self.status['backup']['check'])
+        # Every line that begins ExecStart= stands under the label that says it is not a command.
+        self.assertEqual([index for index, line in enumerate(lines) if line.strip().startswith('ExecStart=')], [unit + 1])
+        self.ran_admin(self.pasted(lines[now + 1].strip()))
+        self.ran_admin(self.pasted(lines[check + 1].strip()))
+        self.assertEqual(admin.schedule_text(self.root).count('ExecStart='), 1)
+
+    def step(self, identifier):
+        """The step as the page is given it, from this runtime's own host status."""
+        class Backend:
+            def setup_status(_, project_id):
+                return self.status
+
+            def read_tasks(_, project_id):
+                return {'items': []}
+
+        class Service:
+            def project_view(_, principal, project_id):
+                return {'id': project_id, 'name': 'Alpha', 'repository': None}
+
+            def list_members(_, principal, project_id):
+                return [{}]
+
+            def list_project_agents(_, principal, project_id):
+                return []
+        handler = type('Handler', (), {'service': Service(), 'backend': Backend()})()
+        principal = type('Principal', (), {'user_id': 'u1', 'superuser': True})()
+        return by_id(project_setup.steps(handler, principal, 'alpha'))[identifier]
