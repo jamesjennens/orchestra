@@ -1765,27 +1765,7 @@ def office_bundled_python():
     if not executable.is_file():return None
     return install_current_path(executable)
 
-def office_public_address(path):
-    """``(public_url, its host)`` from an office service configuration, for add-project's text.
-
-    The file is the private JSON ``office_service.py run --config`` is given; add-project
-    reads it only when it is named with ``--office-config``. A file that cannot be read as
-    that is refused before anything is created; one without ``public_url`` gives (None, None).
-    """
-    try:
-        document=record_json.loads(Path(path).read_text(encoding='utf-8'))
-    except (OSError,UnicodeError,ValueError) as error:
-        raise ValueError(f'--office-config {path}: cannot be read as the office service configuration ({str(error)[:120]})') from None
-    if not isinstance(document,dict):
-        raise ValueError(f'--office-config {path}: not a JSON object')
-    url=document.get('public_url')
-    if url is None:return None,None
-    host=urlsplit(url).hostname if isinstance(url,str) else None
-    if not host:
-        raise ValueError(f'--office-config {path}: public_url is not an address with a host')
-    return url,host
-
-def worker_client_setup(root,name,public=(None,None)):
+def worker_client_setup(root,name):
     """Exact worker client configuration and bootstrap command for one project.
 
     The endpoint is this kit's generic ``endpoint.py`` (the file beside this
@@ -1826,9 +1806,6 @@ def worker_client_setup(root,name,public=(None,None)):
     # the worker's network (kittrial-5bb.191: the first use of this route from another machine).
     host_note=('WORKER_SSH_HOST must lead to a name or address the worker\'s machine can reach; this\n'
                'server\'s own host name may not resolve from the worker\'s network.')
-    if public[1]:
-        host_note+=(f' The office configuration publishes\nthis service as {public[0]}: {public[1]} is the '
-                    f'address clients reach.')
     return (f'Worker client configuration for {name} (save as client.local.json in the worker\'s own\n'
             f'directory and replace WORKER_SSH_HOST with that worker\'s SSH alias; this kit endpoint serves\n'
             f'every project, so do not point it at a project-specific wrapper). {endpoint_note}:\n{config}\n'
@@ -2491,7 +2468,7 @@ def finish_project_steps(root,name):
     provision_merge_slot(root,name)
     backup_project(root,name)
 
-def add_project(root,name,office_config=None):
+def add_project(root,name):
     """Initialize one project, provision its merge slot and back it up once.
 
     The schedule guidance this prints (``scheduled_backup_coverage``) is deliberately
@@ -2504,11 +2481,10 @@ def add_project(root,name,office_config=None):
     direction: it can only prompt an operator to double-check, never hide a gap. This is a
     deliberate choice, not a missed case, and it never edits, installs or enables a unit.
     """
-    public=office_public_address(office_config) if office_config else (None,None)     # refused before anything is made
     initialize_project(root,name)
     print(f'Created project {name}')
     print(scheduled_backup_coverage(root,name)[1])
-    print(worker_client_setup(root,name,public) if public[1] else worker_client_setup(root,name))
+    print(worker_client_setup(root,name))
 
 @contextmanager
 def backup_lock(root,name):
@@ -4701,8 +4677,6 @@ def main():
     sub=p.add_subparsers(dest='command',required=True)
     a=sub.add_parser('install');a.add_argument('--port',type=int,default=13317);a.add_argument('--unit',default='beads-team.service')
     a=sub.add_parser('add-project');a.add_argument('project')
-    a.add_argument('--office-config',help='the office service configuration (the JSON given to office_service.py run '
-                   '--config): its public_url is named as the address clients reach in the printed client configuration')
     a=sub.add_parser('finish-project',help='complete a project creation the web interface started and that stopped half way')
     a.add_argument('project')
     a=sub.add_parser('project-creations',help='list the project creations the web interface started (JSON), or set the limit of project databases on this server')
@@ -4876,7 +4850,7 @@ def main():
                    help='report the journal size (rows by state, bytes on disk, bounds); this is the default inspection')
     args=p.parse_args();root=root_path(args.root)
     if args.command=='install':install(root,args.port,args.unit)
-    elif args.command=='add-project':add_project(root,args.project,args.office_config)
+    elif args.command=='add-project':add_project(root,args.project)
     elif args.command=='finish-project':
         import project_creation
         result=project_creation.finish(root,args.project)

@@ -259,9 +259,7 @@ class NoUnguardedParseTests(unittest.TestCase):
             # The third (kittrial-5bb.182) reads an office release's manifest.json for the
             # bundled interpreter: a manifest that is unreadable or nested too deeply must
             # fall back to the default interpreter, not traceback out of add-project.
-            # The fourth (kittrial-5bb.191) reads the office service configuration that
-            # `add-project --office-config` names, for its public_url: an operator's file.
-            'admin.py': 4,
+            'admin.py': 3,
             'briefing.py': 3, 'coordination.py': 3, 'endpoint.py': 4, 'export_requirements.py': 1, 'feedback.py': 3, 'guidance.py': 3,
             'handoff.py': 1, 'http_service.py': 2, 'lifecycle.py': 1, 'recovery.py': 1, 'requirements.py': 1, 'reserved_comments.py': 1,
             'review_recommendations.py': 2, 'review_workflow.py': 4, 'work.py': 1, 'worker_gate.py': 1})

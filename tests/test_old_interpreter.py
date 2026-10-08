@@ -15,14 +15,27 @@ import subprocess
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
-ENTRY_POINTS = ('endpoint.py', 'client.py', 'admin.py', 'office_service.py')
-#: What each one says to do, by a phrase of it.
+sys.path.insert(0, str(ROOT))
+SERVER = 'on an office installation that is the bundled interpreter, INSTALL_ROOT/current/python-runtime/'
+OWN = 'Run it with Python 3.10 or newer.'
+#: Every program that carries the check, with a phrase of what it says to do.
 ADVICE = {'endpoint.py': 'Set "python" in the client configuration to an interpreter of 3.10 or newer on the server',
           'client.py': 'Run the client with Python 3.10 or newer',
-          'admin.py': 'on an office installation that is the bundled interpreter, INSTALL_ROOT/current/python-runtime/',
-          'office_service.py': 'on an office installation that is the bundled interpreter, INSTALL_ROOT/current/python-runtime/'}
+          'admin.py': SERVER, 'office_service.py': SERVER, 'http_service.py': SERVER, 'tools/office_verify.py': SERVER,
+          'capabilities.py': OWN, 'http_client.py': OWN, 'lifecycle.py': OWN, 'coordination.py': OWN,
+          'requirement_records.py': OWN, 'setup_assistant.py': OWN, 'worker.py': OWN, 'worker_gate.py': OWN}
+ENTRY_POINTS = tuple(ADVICE)
+#: Programs with a ``__main__`` block and NO check, and why. The first two run under the host's
+#: Python 3.6 on purpose. The others were started with ``--help`` under a real Python 3.6.8
+#: (almalinux 8 platform-python, 2026-10-08) and ended without an error; that is all that is
+#: claimed of them. A new program belongs in ADVICE unless somebody has shown the same of it.
+RUN_UNDER_3_6 = ('ssh_forced_command.py', 'tools/office_release.py')
+STARTED_UNDER_3_6 = ('activity.py', 'bootstrap.py', 'export_requirements.py', 'publish_brd.py', 'requirement_impact.py',
+                     'requirements.py', 'tools/http_rev3_probe.py', 'tools/http_rev4_probe.py', 'tools/http_rev5_probe.py',
+                     'tools/http_security_probe.py', 'tools/strict_canonical_endpoint.py')
 
 AS_VERSION = """
 import collections, runpy, sys
@@ -54,7 +67,7 @@ class TooOldTests(unittest.TestCase):
                     self.assertEqual(len(said.strip().splitlines()), 1, said)
                     self.assertNotIn('Traceback', said)
                     self.assertTrue(said.startswith('%s needs Python 3.10 or newer and was started with Python %s (%s). '
-                                                    'Nothing was carried out. ' % (name, version, sys.executable)), said)
+                                                    'Nothing was carried out. ' % (name.rpartition('/')[2], version, sys.executable)), said)
                     self.assertIn(ADVICE[name], said)
                     self.assertTrue(said.endswith('.\n'), said)
 
@@ -78,6 +91,53 @@ class TooOldTests(unittest.TestCase):
                               capture_output=True, text=True, encoding='utf-8', timeout=120)
         self.assertEqual((done.returncode, done.stdout), (2, ''))
         self.assertIn('endpoint.py needs Python 3.10 or newer and was started with Python 3.6.8', done.stderr)
+
+
+class ClientSaysItTests(unittest.TestCase):
+    """Through client.py the user read 'SSH failed (2); outcome may be uncertain. endpoint.py needs ... Nothing
+    was carried out.': two statements that contradict each other (review of kittrial-5bb.191)."""
+
+    SAID = ('endpoint.py needs Python 3.10 or newer and was started with Python 3.6.8 (/usr/libexec/platform-python). '
+            'Nothing was carried out. Set "python" in the client configuration to an interpreter of 3.10 or newer on the '
+            'server; on an office installation that is the bundled one, INSTALL_ROOT/current/python-runtime/..., as '
+            'add-project prints it.\n')
+    SSH = {'host': 'sample', 'endpoint': '/srv/kit/endpoint.py', 'root': '/srv/state'}
+
+    def answered(self, returncode, stdout, stderr, config=None):
+        import client
+        done = subprocess.CompletedProcess([], returncode, stdout, stderr)
+        with mock.patch.object(client.subprocess, 'run', return_value=done), self.assertRaises(RuntimeError) as failed:
+            client.request(config or self.SSH, 'alpha', 'alex/s1', ['list'])
+        return str(failed.exception)
+
+    def test_the_sentence_the_test_uses_is_the_one_the_endpoint_writes(self):
+        source = (ROOT/'endpoint.py').read_text(encoding='utf-8')
+        self.assertIn(self.SAID.strip().partition('Nothing was carried out. ')[2], source)
+
+    def test_the_endpoints_sentence_is_shown_as_it_is(self):
+        said = self.answered(2, '', self.SAID)
+        self.assertEqual(said, 'SSH: ' + self.SAID.strip())
+        self.assertNotIn('uncertain', said)
+        local = self.answered(2, '', self.SAID, {'transport': 'local', 'python': '/usr/bin/python3',
+                                                 'endpoint': '/srv/kit/endpoint.py', 'root': '/srv/state'})
+        self.assertEqual(local, 'Local endpoint: ' + self.SAID.strip())
+
+    def test_with_a_forced_command_the_advice_is_about_the_key_line(self):
+        said = self.answered(2, '', self.SAID, dict(self.SSH, forced_command=True))
+        self.assertTrue(said.startswith('SSH: endpoint.py needs Python 3.10 or newer and was started with Python 3.6.8 '
+                                        '(/usr/libexec/platform-python). Nothing was carried out. This key runs a forced command'))
+        self.assertIn('print that line again (admin.py authorized-keys) with an interpreter of 3.10 or newer', said)
+        self.assertNotIn('Set "python" in the client configuration', said)
+        self.assertNotIn('uncertain', said)
+
+    def test_anything_else_keeps_what_the_client_always_said(self):
+        for returncode, stdout, stderr in ((1, '', self.SAID), (2, 'x', self.SAID), (2, '', 'Traceback\n' + self.SAID),
+                                           (2, '', self.SAID + 'and more\n'), (2, '', 'bash: python3: command not found\n'),
+                                           (2, '', self.SAID.replace('endpoint.py', 'admin.py')),
+                                           (2, '', self.SAID.replace('Nothing was carried out.', 'Something was.')), (255, '', '')):
+            with self.subTest(returncode=returncode, stderr=stderr[:30]):
+                said = self.answered(returncode, stdout, stderr)
+                self.assertTrue(said.startswith('SSH failed (%d); outcome may be uncertain. ' % returncode), said)
 
 
 class SourceTests(unittest.TestCase):
@@ -111,6 +171,7 @@ class SourceTests(unittest.TestCase):
             source = (ROOT/name).read_text(encoding='utf-8')
             begins = source.index('import sys\nif sys.version_info < (3, 10):\n')
             block = source[begins:source.index('    sys.exit(2)\n', begins) + len('    sys.exit(2)\n')]
+            name = name.rpartition('/')[2]
             self.assertIn("sys.stderr.write('%s needs Python 3.10 or newer" % name, block)
             advice = block[block.index('Nothing was carried out. ') + len('Nothing was carried out. '):block.index("% (sys.version_info[0]")]
             shapes.add(block.replace(advice, 'ADVICE ').replace(name, 'PROGRAM'))
@@ -123,6 +184,30 @@ class SourceTests(unittest.TestCase):
         for name in ENTRY_POINTS:
             with self.subTest(program=name):
                 ast.parse((ROOT/name).read_text(encoding='utf-8'), feature_version=(3, 6))
+
+    def test_every_program_of_the_kit_has_the_check_or_is_known_to_start_without_it(self):
+        """Review of kittrial-5bb.191: six programs had been missed. Every file with a ``__main__`` block is
+        in ADVICE (and so in every test above) or on one of the two short lists, and on one only."""
+        programs = set()
+        for folder in (ROOT, ROOT/'tools'):
+            for path in folder.glob('*.py'):
+                if any(isinstance(node, ast.If) and '__main__' in ast.unparse(node.test) and '__name__' in ast.unparse(node.test)
+                       for node in ast.parse(path.read_text(encoding='utf-8')).body):
+                    programs.add(path.relative_to(ROOT).as_posix())
+        self.assertGreaterEqual(len(programs), 27)
+        listed = list(ADVICE) + list(RUN_UNDER_3_6) + list(STARTED_UNDER_3_6)
+        self.assertEqual(len(listed), len(set(listed)))
+        self.assertEqual(sorted(programs), sorted(listed))
+        for name in RUN_UNDER_3_6 + STARTED_UNDER_3_6:
+            self.assertNotIn('needs Python 3.10 or newer', (ROOT/name).read_text(encoding='utf-8'), name)
+
+    def test_no_future_import_stands_where_python_3_6_would_stop_at_it(self):
+        """``from __future__ import annotations`` is refused by 3.6 when the file is COMPILED, before its first
+        line runs: setup_assistant.py had it and answered a SyntaxError. No program with the check has one."""
+        for name in ENTRY_POINTS:
+            with self.subTest(program=name):
+                self.assertFalse([node for node in self.tree(name).body
+                                  if isinstance(node, ast.ImportFrom) and node.module == '__future__'])
 
     def test_the_guard_of_that_test_bites(self):
         for newer in ('if (n := 1):\n    pass\n', 'def f(a, /):\n    pass\n'):
