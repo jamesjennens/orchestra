@@ -1217,5 +1217,156 @@ class NoScheduledWorkTests(AgentHarness):
         self.assertEqual(1, after['attention']['counts']['claimable'])
 
 
+class RenewalScopeTests(AgentHarness):
+    """kittrial-5bb.208: a new credential for an agent carried the default four scopes whenever no list
+    was sent, and the agents page sends none: a read-only agent became a writing one when its owner
+    clicked "new secret", and an agent with all six lost one. Through the real route."""
+
+    #: What web/js/api.js sends for "Issue a new secret".
+    PAGE = {'label': 'web: new secret'}
+    ALL = ['checkpoints', 'feedback', 'proposals', 'read', 'reviews', 'tasks']
+
+    def setUp(self):
+        super().setUp()
+        self.admin = self.admin_token()
+        self.alex_id = self.create_account(self.admin, 'alex', 'alex-password-1')
+        self.alex = self.login('alex', 'alex-password-1')[0]
+        self.project = self.create_project(self.admin, 'Alpha')
+        self.assertEqual(200, self.request('PUT', '/v1/projects/%s/members/%s' % (self.project, self.alex_id),
+                                           {'role': 'contributor'}, token=self.admin).status)
+
+    def agent(self, scopes=None, name='Kestrel'):
+        body = {'projects': [self.project], 'name': name}
+        if scopes is not None:
+            body['scopes'] = scopes
+        agent_id, secret, data = self.agent_secret(self.alex, **body)
+        return agent_id, secret, data
+
+    def renew(self, agent_id, body=None, token=None, key=None):
+        return self.request('POST', '/v1/agents/%s/credentials' % agent_id, dict(self.PAGE if body is None else body),
+                            token=token or self.alex, key=key)
+
+    def writes(self, secret):
+        return self.request('POST', '/v1/projects/%s/tasks' % self.project, {'title': 'a task'}, token=secret).status
+
+    def has(self, agent_id):
+        return self.request('GET', '/v1/agents/%s' % agent_id, token=self.alex).data['scopes']
+
+    def test_a_read_only_agent_renewed_from_the_page_stays_read_only(self):
+        agent_id, first, made = self.agent(['read'])
+        self.assertEqual((made['credential']['scopes'], self.writes(first)), (['read'], 403))
+        renewed = self.renew(agent_id)
+        self.assertEqual(201, renewed.status, renewed.data)
+        self.assertEqual(renewed.data['credential']['scopes'], ['read'])           # it was the default four
+        again = renewed.data['credential']['secret']
+        self.assertEqual(200, self.request('GET', '/v1/projects/%s/tasks' % self.project, token=again).status)
+        self.assertEqual(self.writes(again), 403)                                  # it wrote a task
+        self.assertEqual(self.has(agent_id), ['read'])
+
+    def test_an_agent_with_every_scope_keeps_every_scope(self):
+        agent_id, _, made = self.agent(self.ALL)
+        self.assertEqual(sorted(made['credential']['scopes']), self.ALL)
+        renewed = self.renew(agent_id)
+        self.assertEqual(sorted(renewed.data['credential']['scopes']), self.ALL)   # it lost proposals
+        # With no label and no body either, as a client may send.
+        self.assertEqual(sorted(self.renew(agent_id, {}).data['credential']['scopes']), self.ALL)
+
+    def test_an_agent_made_with_the_default_keeps_the_default(self):
+        agent_id, _, made = self.agent()
+        self.assertEqual(made['credential']['scopes'], ['tasks', 'checkpoints', 'reviews', 'feedback'])
+        self.assertEqual(sorted(self.renew(agent_id).data['credential']['scopes']), ['checkpoints', 'feedback', 'reviews', 'tasks'])
+
+    def test_a_list_that_asks_for_no_more_is_taken_and_decides_what_the_agent_has_next(self):
+        agent_id, _, _ = self.agent(self.ALL)
+        narrower = self.renew(agent_id, {'scopes': ['read', 'tasks']})
+        self.assertEqual(201, narrower.status, narrower.data)
+        self.assertEqual(narrower.data['credential']['scopes'], ['read', 'tasks'])
+        self.assertEqual(self.has(agent_id), ['read', 'tasks'])                    # the newest credential that works
+        self.assertEqual(self.renew(agent_id).data['credential']['scopes'], ['read', 'tasks'])
+        # The same list again, and a part of it: neither asks for more.
+        self.assertEqual(201, self.renew(agent_id, {'scopes': ['tasks', 'read']}).status)
+        self.assertEqual(201, self.renew(agent_id, {'scopes': ['read']}).status)
+
+    def test_the_newest_credential_that_still_works_decides(self):
+        agent_id, _, made = self.agent(self.ALL)
+        narrow = self.renew(agent_id, {'scopes': ['read']}).data['credential']
+        self.assertEqual(self.has(agent_id), ['read'])
+        self.assertEqual(204, self.request('POST', '/v1/agents/%s/credentials/%s/revoke' % (agent_id, narrow['id']),
+                                           {}, token=self.alex).status)
+        self.assertEqual(sorted(self.has(agent_id)), self.ALL)                     # the first one works again alone
+        self.assertEqual(sorted(self.renew(agent_id).data['credential']['scopes']), self.ALL)
+        # With none that works, the newest of the dead ones.
+        for credential in self.request('GET', '/v1/agents/%s' % agent_id, token=self.alex).data['credentials']:
+            if not credential['revoked']:
+                self.request('POST', '/v1/agents/%s/credentials/%s/revoke' % (agent_id, credential['id']), {}, token=self.alex)
+        self.assertEqual(sorted(self.has(agent_id)), self.ALL)
+        self.assertEqual(sorted(self.renew(agent_id).data['credential']['scopes']), self.ALL)
+
+    def test_only_the_agents_own_account_may_give_it_more(self):
+        agent_id, _, _ = self.agent(['read'])
+        refused = self.renew(agent_id, {'scopes': ['read', 'tasks', 'reviews']}, token=self.admin)
+        self.assertEqual(403, refused.status, refused.data)
+        self.assertEqual(refused.data['error']['message'],
+                         'This agent has read. Only its own account may give it more (asked for beyond that: reviews, tasks)')
+        self.assertEqual(self.has(agent_id), ['read'])
+        self.assertEqual(len(self.request('GET', '/v1/agents/%s' % agent_id, token=self.alex).data['credentials']), 1)
+        # A superuser may renew it as it is, with no list or with one that asks for no more.
+        self.assertEqual(self.renew(agent_id, token=self.admin).data['credential']['scopes'], ['read'])
+        self.assertEqual(201, self.renew(agent_id, {'scopes': ['read']}, token=self.admin).status)
+        # Its own account could have made it with those scopes, and may widen it.
+        widened = self.renew(agent_id, {'scopes': ['read', 'tasks']})
+        self.assertEqual(201, widened.status, widened.data)
+        self.assertEqual(self.writes(widened.data['credential']['secret']), 201)
+        self.assertEqual(self.has(agent_id), ['read', 'tasks'])
+
+    def test_a_scope_that_does_not_exist_is_refused_before_anything_else(self):
+        agent_id, _, _ = self.agent(['read'])
+        for token in (self.alex, self.admin):
+            refused = self.renew(agent_id, {'scopes': ['read', 'everything']}, token=token)
+            self.assertEqual(422, refused.status, refused.data)
+        self.assertEqual(len(self.request('GET', '/v1/agents/%s' % agent_id, token=self.alex).data['credentials']), 1)
+
+    def test_a_replay_returns_the_same_credential_and_changes_nothing(self):
+        agent_id, _, _ = self.agent(['read'])
+        first = self.renew(agent_id, key='renew-0001')
+        replay = self.renew(agent_id, key='renew-0001')
+        self.assertEqual((first.status, replay.status), (201, 200))
+        self.assertEqual(replay.data['credential']['id'], first.data['credential']['id'])
+        self.assertEqual(replay.data['credential']['scopes'], ['read'])
+        self.assertNotIn('secret', replay.data['credential'])
+
+    def test_twenty_that_still_work_and_dead_ones_are_not_counted(self):
+        """The limit counted every credential the agent ever had: after nineteen renewals an agent could
+        never be given another, however many of them were revoked or expired."""
+        agent_id, _, _ = self.agent(['read'])
+        for _ in range(19):
+            self.assertEqual(201, self.renew(agent_id).status)
+        full = self.renew(agent_id)
+        self.assertEqual(409, full.status, full.data)
+        self.assertEqual(full.data['error']['message'], 'An agent may hold at most 20 credentials that still work; revoke one first')
+        credentials = self.request('GET', '/v1/agents/%s' % agent_id, token=self.alex).data['credentials']
+        self.assertEqual(len(credentials), 20)
+        # One revoked: one more may be issued, and then it is full again.
+        self.assertEqual(204, self.request('POST', '/v1/agents/%s/credentials/%s/revoke' % (agent_id, credentials[0]['id']),
+                                           {}, token=self.alex).status)
+        after = self.renew(agent_id)
+        self.assertEqual((after.status, after.data['credential']['scopes']), (201, ['read']))
+        self.assertEqual(409, self.renew(agent_id).status)
+        # All of them expired, as after a month away: the next renewal passes and carries what the agent had.
+        with self.service.store.lock:
+            for credential in self.service.state['credentials'].values():
+                if credential.get('agent_id') == agent_id:
+                    credential['expires_at'] = 0
+            self.service.store.save()
+        late = self.renew(agent_id)
+        self.assertEqual((late.status, late.data['credential']['scopes']), (201, ['read']))
+        self.assertEqual(len(self.request('GET', '/v1/agents/%s' % agent_id, token=self.alex).data['credentials']), 22)
+
+    def test_making_an_agent_is_as_it_was(self):
+        self.assertEqual(self.agent(name='One')[2]['credential']['scopes'], ['tasks', 'checkpoints', 'reviews', 'feedback'])
+        self.assertEqual(self.agent(['read'], name='Two')[2]['credential']['scopes'], ['read'])
+        self.assertEqual(422, self.create_agent(self.alex, name='Three', scopes=['nothing']).status)
+
+
 if __name__ == '__main__':
     unittest.main()

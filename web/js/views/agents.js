@@ -298,12 +298,16 @@ function secretSection(secret, heading, payload) {
 
 // Reopened dialog: no secret. The secret was shown once when its credential was
 // issued; if it is lost, issue a NEW credential (the old secret is never re-shown).
+// ": read, tasks" for a list of scopes, or "" when the server sent none (an older service).
+function scopeList(scopes) {
+  return Array.isArray(scopes) && scopes.length ? ': ' + scopes.join(', ') : '';
+}
 function reissueSection(ctx, agent, payload) {
   const section = h('div', { class: 'setup-block' });
   const issue = h('button', { type: 'button', onclick: async () => {
     const ok = await confirmDialog({
       title: 'Issue a new secret?',
-      body: `A new credential is created for ${agent.name || agent.display_name} and its secret is shown once. The agent's current credential keeps working until you revoke it.`,
+      body: `A new credential is created for ${agent.name || agent.display_name} and its secret is shown once. It carries what the agent has now${scopeList(agent.scopes)}. The agent's current credential keeps working until you revoke it.`,
       confirmLabel: 'Issue new secret',
     });
     if (!ok) return;
@@ -314,7 +318,10 @@ function reissueSection(ctx, agent, payload) {
       section.replaceChildren(h('p', { class: 'small', role: 'alert' }, 'The new credential was created, but its secret cannot be shown again (secrets are shown only once). Issue another one and revoke this one.'));
       return;
     }
-    section.replaceChildren(secretSection(credential.secret, 'New secret (shown once)', payload), olderCredentials(ctx, agent, credential.id));
+    // What the new credential may do is said with it: a renewal used to change that without a word (kittrial-5bb.208).
+    section.replaceChildren(secretSection(credential.secret, 'New secret (shown once)', payload),
+      h('p', { class: 'small', 'data-scopes': (credential.scopes || []).join(' ') }, 'This credential carries' + (scopeList(credential.scopes) || ': nothing beyond reading') + '.'),
+      olderCredentials(ctx, agent, credential.id));
   } }, 'Issue a new secret');
   section.append(
     h('p', { class: 'small muted' }, 'The secret was shown once, when the agent’s credential was issued, and cannot be shown again. If you stored it as below, nothing more is needed here. If it is lost, issue a new one.'),

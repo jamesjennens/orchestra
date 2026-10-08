@@ -1507,7 +1507,20 @@ literal `export` would persist in shell history and the process list, and curl r
 header from it with `-K`, so no shell expansion ever puts the secret in the
 process list either. A lost secret is replaced, never re-shown: `POST
 /v1/agents/{id}/credentials` issues a new one (the old credential works until revoked
-with `POST /v1/agents/{id}/credentials/{credential}/revoke`). The
+with `POST /v1/agents/{id}/credentials/{credential}/revoke`). **A new credential
+carries what the agent has** (kittrial-5bb.208): with no `scopes` in the body, which is
+what the agents page sends, it carries the scopes of the agent's newest credential that
+still works (with none that works, of its newest credential). Before that fix it carried
+the default four whatever the agent had, so a read-only agent became a writing one when
+its owner clicked "new secret" and an agent with all six lost `proposals`. A `scopes`
+list is taken when it asks for nothing the agent has not got, from the agent's account or
+a superuser; a list that asks for more is taken only from the agent's own account, the one
+caller who could have made the agent with those scopes, and is refused with 403 from a
+superuser renewing somebody else's agent ("This agent has read. Only its own account may
+give it more ..."). `GET /v1/agents/{id}` carries `scopes`, what the next credential will
+carry, and the page shows what a new credential carries beside its secret. An agent may
+hold at most 20 credentials **that still work**; revoked and expired ones are kept as
+records and not counted (counted, an agent could not be renewed a twentieth time). The
 agent then calls `GET /v1/agents/me` and `GET /v1/agents/me/next` with its credential as a
 bearer token (`Authorization: Bearer <agent-secret>`); every other project route works as
 before, capped at the owner's live role and the agent's granted projects. A grant may

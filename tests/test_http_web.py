@@ -1695,9 +1695,15 @@ class AgentSetupDialogCase(unittest.TestCase):
         uses = [line.strip() for line in reissue.splitlines()
                 if re.search(r'\bsecret\b', self.unquoted(line))]
         self.assertEqual(['if (!credential.secret) {',
-                          "section.replaceChildren(secretSection(credential.secret, "
-                          "'New secret (shown once)', payload), olderCredentials(ctx, agent, credential.id));"],
+                          "section.replaceChildren(secretSection(credential.secret, 'New secret (shown once)', payload),"],
                          uses)
+        # What the new credential carries is shown with it, and the confirmation says what a renewal keeps
+        # (kittrial-5bb.208: the page sends no scope list, and the server used to answer the default four).
+        self.assertIn("'data-scopes': (credential.scopes || []).join(' ')", reissue)
+        self.assertIn("'This credential carries' + (scopeList(credential.scopes) || ': nothing beyond reading') + '.'", reissue)
+        self.assertIn('It carries what the agent has now${scopeList(agent.scopes)}.', reissue)
+        self.assertIn("issueAgentCredential: (aid) => mutate('POST', `/v1/agents/${aid}/credentials`, { label: 'web: new secret' })",
+                      (WEB / 'js' / 'api.js').read_text(encoding='utf-8'))
         # Without a fresh secret the steps show the placeholder line only.
         self.assertIn('secretSteps(payload, setupText.headerLine(), { withSecret: false })', reissue)
         older = self.function_body(code, 'olderCredentials')
