@@ -205,6 +205,20 @@ otherwise untouched; a new deployment root is the documented way forward. That
 release's installer is readable as `git show 87a356c^1:bootstrap.py`. A rollback
 that stays within releases that know both pins has no such step.
 
+Rules 1 and 2 on rollback (kittrial-5bb.194). A rollback to a kit built before
+kittrial-5bb.194 also rolls back the session registry's `owners` map and the
+`--principal` key binding. The older kit's session validator refuses a registry that
+carries `owners`, so for a project where an actor was adopted or a session was registered
+under a bound key it refuses `session show`, `session resume`, `session register`,
+`session run start` and `actor-standing`, and **`admin.py backup PROJECT` fails for that
+project with status incomplete**. A key whose line carries `--principal` is refused on
+every request (the older wrapper does not know the argument), while `bd` itself, `work`
+and `review` keep working. The way forward is the one OPERATIONS.md ("Bind a key to its
+principal", Downgrade limit) documents: remove the `owners` key from
+`projects/PROJECT/.sessions.json` by hand and reprint the keys without `--principal`
+before the rollback, or restore with a kit that knows rule 2. Decide this before rolling
+back an installation that has used rule 2, exactly as for the binary pins above.
+
 ## Prepare a private runtime
 
 Use the bundled interpreter, with `<PYTHON>` denoting
