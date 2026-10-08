@@ -82,7 +82,7 @@ class TooOldTests(unittest.TestCase):
                         # The others import fcntl, which Windows has not: there they end in that
                         # ImportError, as they did before, and not in the sentence.
                         self.assertEqual(done.returncode, 0, done.stderr)
-                        self.assertIn('usage:', done.stdout)
+                        self.assertIn('usage', done.stdout)        # argparse's "usage:", or the JSON help of capabilities.py
 
     def test_the_endpoint_says_it_whatever_it_is_sent(self):
         """Over SSH the client reads the endpoint's exit code and shows its stderr: 'SSH failed (2); ...'."""
