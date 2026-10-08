@@ -3,7 +3,9 @@
 **Status: design note (kittrial-5bb.178), second version after review; James
 decided the seven questions on 2026-10-07 ("recommended for all"). Built so far:
 slice 1, a key names its projects (kittrial-5bb.193; see "Bind a key to its
-projects" in [OPERATIONS.md](OPERATIONS.md)). The rest of this note describes
+projects" in [OPERATIONS.md](OPERATIONS.md)), and slice 2, a key names its
+principal and actors belong to principals (kittrial-5bb.194; see "Bind a key to
+its principal" in [OPERATIONS.md](OPERATIONS.md)). The rest of this note describes
 the design and the state of main when it was written, not what is built.**
 
 **For an installation where nobody but its owner is to have SSH (the office),
@@ -216,22 +218,30 @@ anywhere else.
 
 ### Rule 2: a key names its principal, and actors belong to principals
 
-A **principal** is who a key belongs to: a short name James chooses when he
-issues the key, in the `person:NAME` form the proposal settings already use
-(`proposal-settings --map-actor ... --to person:NAME`). Several keys may carry
+A **principal** is a LANE (James, 2026-10-07), not a person: a short name James
+chooses when he issues the key, in the `lane:NAME` form. `person:NAME` is accepted
+too, under the same name rules and with case kept, and the two prefixes are
+DIFFERENT principals; `lane:NAME` is the spelling this slice's documents, help
+texts and examples use for a lane. Nothing reads the proposal settings' `person:`
+map (that map is about people, and a principal is not one). Several keys may carry
 the same principal.
 
-- The wrapper takes `--principal NAME` and passes `--key-principal NAME`.
+- The wrapper takes `--principal NAME` and passes `--key-principal NAME`; a line
+  that names a principal twice is refused, as a project named twice is.
 - The project's session registry gains one map, `owners`: actor to principal.
   `session register` over a bound key records the new actor under the key's
   principal.
 - Over a bound key every other action is refused unless the request's actor is
   owned by the key's principal in that project. So a bound key cannot write
-  under another's name, an operator's included.
+  under another's name, an operator's included. Only `session register`, with
+  `register` as its first argument, is exempt.
 - Actors that exist already (the present coordinators and workers) are given to
   a principal once by a host command, with `--actor`, `--reason` and an audit
-  entry, so they keep their names and their history. It refuses a name on the
-  operator list that another principal owns in another project.
+  entry, so they keep their names and their history. The name must appear in the
+  project (a registration, an owner entry or a tracker row). It refuses a name
+  on the operator list that another principal owns in another project. Moving an
+  actor another principal already owns needs `--from OWNER` and is recorded as a
+  move; nothing removes an owner.
 
 The registry is written only by the server and is not reachable through `bd`.
 Why the registry and not a stamp in every record: one place, and none of the
@@ -270,7 +280,7 @@ The refusals name the rule and say who may approve.
 What "the same" means is James's choice when he names principals. One principal
 per person is the web's rule (an agent is its owner) and would mean that no
 agent of James may approve the work of another agent of James. One principal
-per lane (`person:kittrial-coordinator`, `person:orc-coord`) stops an agent
+per lane (`lane:kittrial-coordinator`, `lane:orc-coord`) stops an agent
 passing its own work and nothing more. See the questions.
 
 ### What these rules do not do
@@ -406,7 +416,7 @@ because they cannot integrate over the web.
 
 Making one, by the installation's operator:
 
-1. Issue the key: `authorized-keys --key-file K --principal person:NAME
+1. Issue the key: `authorized-keys --key-file K --principal lane:NAME
    --project P` and install the printed line.
 2. The coordinator registers its session; the actor is recorded as its
    principal's.

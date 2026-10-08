@@ -44,6 +44,13 @@ The contract, deliberately narrow:
   refuses every request that names another project. The project stays in the request; the
   caller cannot add a name or drop one, because nothing of the connection reaches this
   command line. A line with no ``--project`` starts the endpoint exactly as before.
+* A key may be BOUND to a PRINCIPAL (kittrial-5bb.194, rule 2): ``--principal NAME`` of the
+  line (a lane, ``lane:NAME`` or ``person:NAME``; the two prefixes are different principals)
+  is handed to the endpoint as ``--key-principal NAME``, and the endpoint then refuses every
+  request whose actor that principal does not own in the project - except a session
+  registration, which makes the new actor that principal's. A line with no ``--principal``
+  starts the endpoint exactly as before, and looks at no owner. A line that names a principal
+  twice is refused, like a project named twice.
 * The endpoint is exec'd with a minimal, explicit environment: ``PATH``, ``HOME``, the
   locale variables (``LANG``, ``LC_*``), and the variables this kit sets for the endpoint
   itself (none today). Everything else the session carried - ``PYTHONPATH``, ``BASH_ENV``,
@@ -80,6 +87,11 @@ KIT_ENVIRONMENT = {}
 # A project name as the kit makes them (admin.validate_name; not imported here, so that this
 # wrapper stays one file that starts on any interpreter the account has).
 PROJECT_NAME = re.compile(r'[a-z][a-z0-9]{1,23}')
+# A principal name (kittrial-5bb.194): a lane, spelled `lane:NAME` or `person:NAME` (the
+# coordinator decision of 2026-10-08; the two prefixes are different principals), one token
+# with no space, because it is an argument of the authorized_keys command line and that line
+# is split on spaces. Kept here as a regex for the same one-file reason.
+PRINCIPAL_NAME = re.compile(r'(?:lane|person):[A-Za-z0-9][A-Za-z0-9_.-]{0,94}')
 # Forwarded from the session because the kit needs them: PATH to find the interpreter,
 # HOME for the account's own files, and the locale so text handling matches the terminal.
 LOCALE_NAMES = ('LANG',)
@@ -121,6 +133,9 @@ def parse_args(argv):
     parser.add_argument('--project', action='append', default=[], metavar='NAME',
                         help='a project this key is bound to (repeatable); with none the key may '
                              'name any project, as before')
+    parser.add_argument('--principal', action='append', default=None, metavar='NAME',
+                        help='the principal (a lane, lane:NAME or person:NAME) this key belongs to; '
+                             'with none the key acts as any actor, as before (given twice, refused)')
     return parser.parse_args(argv)
 
 
@@ -149,6 +164,27 @@ def _projects(values):
             raise ValueError('--project names %s twice' % value)
         projects.append(value)
     return projects
+
+
+def _principal(value):
+    """The principal of a bound line, or None for an unbound one.
+
+    ``--principal`` is an append argument, so a line that names one twice is refused here
+    rather than silently taking the last: the listing and the wrapper must agree about which
+    principal a line binds (kittrial-5bb.194 review, finding 3; slice 1 refuses a project
+    named twice the same way).
+    """
+    if isinstance(value, list):
+        if len(value) > 1:
+            raise ValueError('--principal names %s twice; a line may name at most one principal'
+                             % _echo(', '.join(str(item) for item in value)))
+        value = value[0] if value else None
+    if value is None:
+        return None
+    if not isinstance(value, str) or not PRINCIPAL_NAME.fullmatch(value):
+        raise ValueError('--principal must be a principal name of the form lane:NAME or person:NAME (one token: '
+                         'letters, digits, dot, underscore, dash; no space); refused %s' % _echo(value))
+    return value
 
 
 def configured(args):
@@ -200,12 +236,15 @@ def select_endpoint(tokens, endpoints):
     return chosen, None
 
 
-def endpoint_argv(python, endpoint, root, projects=()):
-    """The exact command line the endpoint is launched with: the fixed root and, for a bound
-    key, the projects of its line. No other flag, and none of it from the connection."""
+def endpoint_argv(python, endpoint, root, projects=(), principal=None):
+    """The exact command line the endpoint is launched with: the fixed root, and for a bound
+    key the projects of its line and its principal. No other flag, and none of it from the
+    connection."""
     command = [python, endpoint, '--root', root]
     for project in projects:
         command.extend(['--key-project', project])
+    if principal is not None:
+        command.extend(['--key-principal', principal])
     return command
 
 
@@ -219,6 +258,7 @@ def main(argv=None):
         args = parse_args(sys.argv[1:] if argv is None else list(argv))
         root, endpoints, python = configured(args)
         projects = _projects(args.project)
+        principal = _principal(args.principal)
         try:
             tokens = shlex.split(os.environ.get('SSH_ORIGINAL_COMMAND', ''))
         except ValueError as error:
@@ -226,7 +266,7 @@ def main(argv=None):
         chosen, reason = select_endpoint(tokens, endpoints)
         if chosen is None:
             return refuse(reason)
-        command = endpoint_argv(python, chosen, root, projects)
+        command = endpoint_argv(python, chosen, root, projects, principal)
         # Replace this process: the endpoint inherits the caller's stdio byte for byte, but
         # not the caller-influenced environment (see child_environment).
         os.execvpe(command[0], command, child_environment())
