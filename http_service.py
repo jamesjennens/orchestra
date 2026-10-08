@@ -6607,6 +6607,21 @@ def runtime_service_lock(root):
     return fd
 
 
+def bootstrap_refusal_advice(error):
+    """What the person at the terminal has to do about a refused ``--bootstrap-user``.
+
+    Only "a superuser already exists" can be answered with "add this person as an account
+    inside the service": on a first bootstrap there is no superuser who could, so a refused
+    password or user name says to run the command again with a good one (kittrial-5bb.176
+    item 3).
+    """
+    if getattr(error, 'status', None) == 409:
+        return 'Add this person as an account inside the service instead.'
+    if 'Password' in getattr(error, 'message', ''):
+        return 'Run the command again with a password of 8 to 1024 characters.'
+    return 'Run the command again with a name of 2 to 64 characters of letters, digits, . _ @ -.'
+
+
 def build_backend(service, args):
     """Select the canonical backend. ``endpoint`` is the documented Linux service."""
     if args.backend == 'endpoint':
@@ -6711,10 +6726,11 @@ def main(argv=None):
             password = getpass.getpass('New superuser password: ')
             Service.bootstrap_superuser(store, args.bootstrap_user, password)
         except HttpError as error:
-            # A second bootstrap, or a name the kit refuses: one sentence, not a traceback
-            # (kittrial-5bb.176 item 2).
-            print('Refusing to bootstrap %s: %s. Add this person as an account inside the service instead.'
-                  % (args.bootstrap_user, error.message), file=sys.stderr)
+            # A second bootstrap, a refused user name or a password the kit refuses: one
+            # sentence and the one thing to do about it, never a traceback
+            # (kittrial-5bb.176 items 2 and 3).
+            print('Refusing to bootstrap %s: %s. %s'
+                  % (args.bootstrap_user, error.message, bootstrap_refusal_advice(error)), file=sys.stderr)
             return 1
         finally:
             import fcntl

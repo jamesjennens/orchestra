@@ -34,7 +34,9 @@ class BackupTests(unittest.TestCase):
         self.receipt = {'sha256': 'b' * 64, 'status': 'complete', 'id': 'source-1.1'}
         self.context = {'holder': 'alice/session', 'task': 'source-1.1', 'target': 'main'}
         self.flock = Mock()
-        self.fake_fcntl = types.SimpleNamespace(flock=self.flock, LOCK_EX=2)
+        # ``add-project`` takes the creation lock too (kittrial-5bb.176), so the stand-in
+        # needs the whole fcntl surface ``http_authority.file_lock`` uses.
+        self.fake_fcntl = types.SimpleNamespace(flock=self.flock, LOCK_EX=2, LOCK_NB=4, LOCK_UN=8)
         self.patcher = patch.dict(sys.modules, {'fcntl': self.fake_fcntl})
         self.patcher.start()
         self.addCleanup(self.patcher.stop)
@@ -593,7 +595,8 @@ class RequirementJournalBackupTests(unittest.TestCase):
                          'records': ['source-1.1'],
                          'evidence': {'source-1.1': 'decision-bf'}}
         self.flock = Mock()
-        self.fake_fcntl = types.SimpleNamespace(flock=self.flock, LOCK_EX=2)
+        # As above: the creation lock ``add-project`` now takes uses the same surface.
+        self.fake_fcntl = types.SimpleNamespace(flock=self.flock, LOCK_EX=2, LOCK_NB=4, LOCK_UN=8)
         self.patcher = patch.dict(sys.modules, {'fcntl': self.fake_fcntl})
         self.patcher.start()
         self.addCleanup(self.patcher.stop)
