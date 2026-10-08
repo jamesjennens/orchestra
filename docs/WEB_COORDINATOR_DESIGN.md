@@ -349,6 +349,9 @@ kittrial-5bb.192 (the operator and verifier lists audited) is independent.
 kittrial-5bb.198 is slice 9's first page. kittrial-5bb.199 is in slice 1.
 kittrial-5bb.106 decides the list slice 2 uses. kittrial-5bb.202 (a project
 without a merge slot) should be done before slice 2 reaches an old project.
+kittrial-5bb.200 (the set-up page shows a backup command that cannot be pasted)
+is a fault of a page that exists and is independent of all of this; it matters
+here only because backups stay James's to run.
 
 ## What James can do today, on release 1008t
 
@@ -385,7 +388,12 @@ Each has a recommendation; none needs the code.
    account of its own, and "nobody passes their own work" means their own
    account's. The alternative is a lane label that you set on each agent, which
    lets all agents hang under your one account but adds a second notion of
-   "same party" that somebody must keep honest. *Recommendation: accounts.*
+   "same party" that somebody must keep honest. One consequence to accept with
+   it: a person cannot approve the work of an agent made under their OWN
+   account, so agents belong under lane accounts and not under yours; as
+   superuser you can still approve anything of any lane. kittrial-5bb.199 has
+   to decide the same point (an owner approving their own agent's work) and
+   should decide it the same way. *Recommendation: accounts.*
 2. **Who makes a lane's agents?** Today only the account itself can. Either you
    sign in as each lane account once, or a superuser is allowed to make an
    agent for another account. *Recommendation: let a superuser do it, as part
