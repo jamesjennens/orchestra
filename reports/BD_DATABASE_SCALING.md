@@ -2,11 +2,13 @@
 
 Investigation only. Measurements use disposable synthetic databases at kit source `f615440bea48fdba534ba6efb1dfb56ed18eca2d`. This document proposes operational bounds; it does not change the database cap, dependencies, authority or production behavior.
 
+Keep the Beads 1.2.2 and Dolt 2.2.0 pins: the available evidence does not establish a cost reduction from Beads 1.3.1, and the kit is not compatible with it yet. Migrating a database to the new schema prevents Beads 1.2.2 from using it, including reads; this is not a reversible binary-only upgrade.
+
 ## Finding
 
 Each measured pinned-version native write and merge-slot command sends two filtered `INFORMATION_SCHEMA.COLUMNS` checks. Their logged duration grows with the number of databases while their count stays fixed. The equivalent filtered query grows on its own; an ordinary query and native list/show remain comparatively flat. Together with the pinned source path, this supports catalog enumeration as a major source of the observed write cost. Query durations are elapsed server times, not CPU profiles or proof that every component of latency has the same cause.
 
-The matched 1.3.1 comparison below removes the two cursor probes but retains one lease-column catalog check. At 50 databases its create/claim medians are about 7%/5% lower, while add-project is about 63% slower. At 1 and 20 databases the newer create/claim medians are higher. These fixtures establish a limited route-specific reduction candidate, with additional initialization and migration costs; they do not support a general upgrade speedup.
+Beads 1.3.1 replaces the two cursor-column probes, but each measured write retains one lease-column check and adds eleven `INFORMATION_SCHEMA.TABLES` probes; reads gain one TABLES probe. The COLUMNS-only count below omits that work. Our target-only migrated fixture favours 1.3.1: the other databases retain 26 tables/222 columns, while a migrated database has 30 tables/252 columns. The independent second review measured create at 30 fully migrated databases as 1.627 s, versus 1.364 s with 1.2.2, with non-overlapping observed ranges. On this evidence 1.3.1 does not reduce the cost. Our limited 50-database create/claim decreases remain observations of the biased fixture; add-project was about 1.6 times slower.
 
 ## Native commands
 
@@ -50,7 +52,7 @@ Warning-mode medians in seconds, three samples per cell. Timers include endpoint
 
 ## Captured SQL
 
-Debug-mode counts and catalog durations below are medians of three samples. The JSON [measurement table](data/bd-database-scaling.json) preserves ranges, load, memory and both logging modes. Catalog queries mean completed queries containing `INFORMATION_SCHEMA.COLUMNS`; the total query count counts `Starting query` events. Timings have millisecond resolution.
+Debug-mode counts and catalog durations below are medians of three samples, except filtered-columns at 50 databases: that cell pools the six debug samples in native-curve-v2 and native-post-v1 (817, 858, 785, 820, 908, 792 ms), whose median is 818.5 ms. The JSON [measurement table](data/bd-database-scaling.json) links the unchanged raw samples containing ranges, load, memory and both logging modes; derived aggregates can be regenerated with `python3 reports/data/summarize_bd_scaling.py`. In all tables, catalog queries and catalog ms count only completed `INFORMATION_SCHEMA.COLUMNS` queries; they omit `INFORMATION_SCHEMA.TABLES` and other catalog access. A lower count here therefore does not imply less total catalog work; the total query count counts `Starting query` events. Timings have millisecond resolution.
 
 | Operation | SQL queries: 1 / 50 / 100 DB | Catalog queries: 1 / 50 / 100 DB | Catalog ms: 1 / 20 / 50 / 100 DB |
 |---|---:|---:|---:|
@@ -64,7 +66,7 @@ Debug-mode counts and catalog durations below are medians of three samples. The 
 | merge-release | 46 / 46 / 46 | 2 / 2 / 2 | 58 / 523 / 1629 / 4108 |
 | list | 22 / 22 / 22 | 0 / 0 / 0 | 0 / 0 / 0 / 0 |
 | show | 33 / 33 / 33 | 0 / 0 / 0 | 0 / 0 / 0 / 0 |
-| filtered-columns | 4 / 4 / 4 | 1 / 1 / 1 | 24 / 255 / 817 / 2083 |
+| filtered-columns | 4 / 4 / 4 | 1 / 1 / 1 | 24 / 255 / 818.5 / 2083 |
 | ordinary-query | 4 / 4 / 4 | 0 / 0 / 0 | 0 / 0 / 0 / 0 |
 
 The two checks are already restricted to the selected database and migration cursor tables:
@@ -110,7 +112,7 @@ Propose an operator warning at 10 counted names for a default limit of 20, and a
 | Option | Expected benefit and cost | Required validation / risk |
 |---|---|---|
 | Add a schema WHERE clause | The captured migration query already has one; adding the same filter offers no measured improvement. | A fix must change catalog construction or avoid repeated checks without accepting an unvalidated migration. |
-| Beads 1.3.0 / 1.3.1 | The [released probe change](https://github.com/gastownhall/beads/commit/3594a3762) uses `SHOW COLUMNS FROM <cursor table> LIKE 'content_hash'`, avoiding the per-write `INFORMATION_SCHEMA.COLUMNS` probe. This is a concrete reduction candidate; the version comparison below is required to quantify it. | Coordinate all clients, verify official and static builds, explicitly consent to shared-server migrations, and test authority, schema, backups and restore before changing any pin. |
+| Beads 1.3.0 / 1.3.1 | The [released probe change](https://github.com/gastownhall/beads/commit/3594a3762) uses `SHOW COLUMNS FROM <cursor table> LIKE 'content_hash'`, avoiding the per-write `INFORMATION_SCHEMA.COLUMNS` probe. The replacement alone does not reduce the observed cost: additional TABLES probes, migration expansion and initialization work offset it. Keep the current pin; see the comparison and compatibility failures below. | Coordinate all clients, verify official and static builds, explicitly consent to shared-server migrations, and test authority, schema, backups and restore before changing any pin. |
 | Newer Dolt | A server-side catalog optimization could reduce remaining probes, but no newer Dolt binary was measured here. | Compare an exact candidate against the same catalog and SQL before claiming improvement; do not infer it from a newer release number. |
 | Move retired databases off the server | Reduces the catalog only after the databases actually leave it; hiding/archiving project records alone does not. | Operator and owner design decision: verified native plus coordination backup, restore-new rehearsal, routes/dependencies/retention handling, and explicit drop authorization. No database move or drop was performed. |
 | Second Dolt server / installation | Bounds the catalog per server; comes with additional service, storage and operating cost. | Explicit routing, project authority, backup/restore ownership, cross-project dependencies and failure handling. No multi-server performance or failover was verified. |
@@ -119,11 +121,11 @@ Keep the pins and cap until an alternative has measured benefit and the above co
 
 ## Released Beads option and upgrade requirements
 
-The probe replacement is Beads commit `3594a3762` ([schema source at v1.3.1](https://github.com/gastownhall/beads/blob/v1.3.1/internal/storage/schema/schema.go#L1192)); it is present in v1.3.0 and v1.3.1, and absent from the pinned v1.2.2. `SHOW COLUMNS` targets one cursor table; the code compares the returned field exactly because the underscore in a LIKE pattern is a wildcard. Removing those probes can reduce write latency without changing Dolt.
+The probe replacement is Beads commit `3594a3762` ([schema source at v1.3.1](https://github.com/gastownhall/beads/blob/v1.3.1/internal/storage/schema/schema.go#L1192)); it is present in v1.3.0 and v1.3.1, and absent from the pinned v1.2.2. `SHOW COLUMNS` targets one cursor table; the code compares the returned field exactly because the underscore in a LIKE pattern is a wildcard. Removing those probes does not establish lower write latency: the newer binary adds other catalog probes, and the available full-fleet evidence is slower.
 
 [Beads 1.3.0 upgrade notes](https://github.com/gastownhall/beads/releases/tag/v1.3.0#upgrading-notes) describe a v53-to-v66 main-schema change and a separate clone-local migration series. Shared servers require deliberate migration consent: upgrade every client, take backups using the old binary first, then run `bd migrate schema` once; scripted standing consent is `BD_ALLOW_REMOTE_MIGRATE=1`. Remote-backed stores require a designated migrator and sync handling as documented there. [1.3.1 notes](https://github.com/gastownhall/beads/releases/tag/v1.3.1#upgrading-notes) add no migration beyond 1.3.0, but upgrading from 1.2.2 still includes that change. Consent is confined to new disposable comparison copies in this investigation, not a recommendation to bypass a live gate.
 
-A kit pin change also requires a reproducible 1.3.1 static build for the hosts that cannot run upstream's dynamically linked Linux asset; the existing `tools/build_bd_static.sh` and `versions.json` static receipt are specific to 1.2.2. Verify hashes, ABI/architecture, fresh init, all-client migration/compatibility, endpoint/authority behavior, native plus coordination backups, and restore/rollback before an operator changes pins. Old clients must not be assumed to work against the promoted schema. No binary replacement or migration occurred in any live runtime.
+A kit pin change also requires a reproducible 1.3.1 static build for the hosts that cannot run upstream's dynamically linked Linux asset; the existing `tools/build_bd_static.sh` and `versions.json` static receipt are specific to 1.2.2. Verify hashes, ABI/architecture, fresh init, all-client migration/compatibility, endpoint/authority behavior, native plus coordination backups, and restore/rollback before an operator changes pins. After migration from schema v53 to v66, Beads 1.2.2 refuses every command on that database, reads included, with a schema-version mismatch; the independent reviewer confirmed it still writes an unmigrated sibling. Upstream provides no data downgrade. Before consent/migration, the reviewer found 1.3.1 writes refused and `bd list` failed with `table not found: leases`, despite the refusal claiming reads keep working. The kit is not ready for this upgrade: the independent reviewer ran 87 real-bd tests and found 22 failures on 1.3.1 versus zero on 1.2.2, including a held claim returning 503 uncertain instead of 409, changed refusal text and flags absent from the kit tables. These are independent review findings, not additional worker test results. No binary replacement or migration occurred in any live runtime.
 
 Replacing the cursor probes does not make initialization constant-time. Of the 73 catalog checks captured during pinned initialization, 57 are other statements. New migrations and other catalog checks can still dominate; use the measured new-version SQL counts rather than extrapolating all 73 away.
 
@@ -160,6 +162,8 @@ Explicit `bd migrate schema` on the new-version target is outside the create/cla
 | 20 | 15.409 | 15.219–16.212 | 15.617 |
 | 50 | 42.557 | 42.209–42.699 | 41.678 |
 
+Fleet planning: multiplying the observed warning-mode per-target median by the database count gives about 308 s (5.1 minutes) for 20 databases and 2,128 s (35.5 minutes) for 50. These are estimates, not measured fleet migrations: our fixture migrated only one target at a time, and catalog expansion during a whole-fleet migration can change the cost. The independent reviewer actually migrated 30 databases in about 12 minutes.
+
 Debug SQL medians (three captures each). Each row reports create / claim / add-project, at the stated existing database count.
 
 | DB | Version | All query counts | Catalog query counts | SHOW COLUMNS counts |
@@ -171,15 +175,15 @@ Debug SQL medians (three captures each). Each row reports create / claim / add-p
 | 50 | 1.2.2 | 64 / 48 / 1553 | 2 / 2 / 73 | 0 / 0 / 0 |
 | 50 | 1.3.1 | 99 / 77 / 2343 | 1 / 1 / 107 | 2 / 2 / 16 |
 
-The two cursor-table probes are replaced, but new-version create/claim still issue one catalog query checking `leases.granted_node`. The newer binary also performs other additional work. Thus an upgrade can change the slope and the fixed cost in opposite directions: judge the measured operations separately. The table establishes these versions on these fixtures only; it does not establish a live upgrade benefit, correctness of every kit route or universal capacity.
+The two cursor-table probes are replaced, but new-version create/claim still issue one COLUMNS query checking `leases.granted_node` and eleven TABLES queries. In our captured `1.3.1-50-1-create.json`, TABLES queries sum to 756 ms, while the COLUMNS query takes 773 ms; the table above counts only the latter. The independent review observed about 50 ms per TABLES probe at 30 databases; together they cost more than the remaining COLUMNS check. Reads also acquire a TABLES probe. This work grows with database count, so halving the displayed COLUMNS count is not a halving of elapsed work. The evidence does not support a cost-reducing upgrade.
 
-Initialization remains expensive. The 57 other pinned initialization catalog statements remain relevant, and 1.3.1 adds schema/migration work; the new-version counts above must not be inferred by subtracting all pinned probes. Migration is timed separately from steady writes and add-project. The copies begin with identical pinned schema/data; each new-version target is explicitly migrated, while the other catalog databases retain the pinned schema. A fully migrated fleet could have a different catalog population and cost.
+Initialization remains expensive. The 57 other pinned initialization catalog statements remain relevant, and 1.3.1 adds schema/migration work; the new-version counts above must not be inferred by subtracting all pinned probes. Migration is timed separately from steady writes and add-project. The copies begin with identical pinned schema/data; each new-version target is explicitly migrated, while the other catalog databases retain the pinned schema. Only our target is migrated; a fully migrated fleet has 30 tables/252 columns per database rather than 26/222 and therefore more catalog work. The independent fully migrated 30-database comparison was slower on 1.3.1, as stated above.
 
 Each fresh repetition uses copies of a stopped synthetic 26-table/222-column seed database, with its provisioned synthetic merge slot. Only the target project needs a workspace directory; other cloned databases contribute the same seed catalog schema. This controls catalog population but differs from the original sequentially initialized fixture and from real project histories. Each create/claim pair uses one fresh task; add-project starts at exactly 1/20/50 existing databases, then ends one higher. It includes kit initialization, merge-slot provisioning and its initial backup. Debug and warning runs use separate fresh copies and are ordered, not randomized. Load/memory and all timings remain in the raw samples.
 
 The first harness attempt failed before sending SQL because a copied `.beads/dolt-server.port` still named the seed port despite updated metadata. It was excluded and retained in private investigation evidence; the corrected fresh comparison updates both port sources. No product source was changed, no existing fixture was modified, and every owned comparison server stopped.
 
-[Raw comparison samples](data/raw/bd-version-comparison.json) and [summary metadata](data/bd-database-scaling.json) preserve all 126 timings and hashes.
+[Raw comparison samples](data/raw/bd-version-comparison.json) and [measurement metadata](data/bd-database-scaling.json) preserve all 126 timings and hashes. The six committed raw files are the measurements; the large redundant derived summary has been removed. Raw-row trace names identify captures in the immutable evidence archive `orchestra-sol1-133-r2-evidence-5963cb5-20261008.tgz` (SHA256 `d93c7ae10c27fa1793bebc62b31096d8a7aaa2f241d95eea0aaaf820655ce9a0`) under the owned .133 scratch folder on koopa, not files promised in this repository. The deterministic summarizer groups by actual raw filename, operation, database count, logging and version; it invents no post50 group names. Independent second-review findings are attributed to review `01a11b9a-76a2-732a-ad4f-25a0fed1b292` and its evidence at `koopa:/home/james/orchestra-review-evidence/1009-133/r2/README.md`; those originals were not changed or copied.
 
 ## Reproduction and limits
 

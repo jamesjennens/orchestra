@@ -972,13 +972,12 @@ not guarantees for other schemas, concurrent loads or arbitrary read histories.
   73 such checks, in addition to other SQL. The count is captured, not inferred.
   The predicates name the selected schema, but pinned Dolt still builds the catalog
   across databases. See the report for elapsed query times and exact sources.
-- **Released reduction candidate.** Beads 1.3.0 and 1.3.1 replace the cursor-table
-  probe with `SHOW COLUMNS`. In the matched comparison, 1.3.1 create/claim medians
-  at 50 databases were about 7%/5% lower, but add-project was about 63% slower;
-  create/claim at 1 and 20 databases were slower too. One lease-column catalog
-  check remains. The report gives the migration costs, fixture limits and static-build
-  checks. These results do not establish a general upgrade benefit, and this
-  documentation changes no kit pin or live server.
+- **Keep the current pin.** Beads 1.3.1 replaces two cursor-column probes but
+  adds TABLES probes and expands migrated schemas. The available evidence does
+  not show a cost reduction; add-project was about 1.6 times slower. The kit also
+  fails compatibility checks with 1.3.1. Migration prevents 1.2.2 from using that
+  database, reads included, and has no data downgrade. See the report for the
+  measurements, independent review findings and upgrade requirements.
 - **Names and the limit.** `admin.py project-creations --usage` and the operator
   setup-status view report `project_databases` used/limit. The default limit is 20;
   a listed operator can record another value with
@@ -987,18 +986,20 @@ not guarantees for other schemas, concurrent loads or arbitrary read histories.
   holding names, including damaged records. It is not a server-catalog query;
   an unrepresented database can be missed, while a reservation may precede one.
 - **Enforcement.** The cap stops web creation only. Operator `add-project` remains
-  permitted above it; the independent review observed used 30 at a limit of 20.
+  permitted above it.
   Archived/retired records do not remove the database or its catalog cost. The kit
   never drops a database. Twelve visible projects can therefore exhaust 20 names.
+- **Creation time.** Pinned add-project took about 7 s with one existing database,
+  23 to 26 s at 20 and 62 s at 50 in the synthetic measurements. One creation
+  runs at a time on a server, so at 20 to 50 databases it can keep every other
+  creation refused as busy for about 25 to 60 seconds, longer as the server fills.
+  Web creation can take up to the service's `--create-timeout` (900 seconds).
 - **Planning.** Retain 20 for these pins: measured create at 20 is about 2.7 times
-  the one-database cost. Propose warning at 10 names for the default limit, plus
-  reached/exceeded warnings at the configured limit. These warnings are not yet
-  implemented. Compare the filesystem count with an operator-authorized catalog
-  count and passive operation timings; count errors are not zero usage.
+  the one-database cost. Compare the filesystem count with an operator-authorized
+  catalog count and passive operation timings; count errors are not zero usage.
 - **Release and backup.** The report's 25-target synthetic releases and backups at
   50/100 databases are single observations, not a repeated curve or deployment
   guarantee. Backup sends no catalog checks; its growth follows project count.
-  Web creation can take up to the service's `--create-timeout` (900 seconds).
 
 ### Retiring a project
 
