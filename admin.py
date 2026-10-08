@@ -2449,6 +2449,23 @@ def require_bd_init_tools(root):
         raise ValueError('This host has no %s on PATH, which bd init needs to create a project. '
                          'Install %s and run this command again; nothing was created.'%(names,names))
 
+def require_creatable_project(root,name):
+    """The checks a creation needs before anything is made; returns the project directory.
+
+    ``add-project`` runs this before it writes its creation record, and
+    ``initialize_project`` runs it again: every refusal here must leave no directory, no
+    database and no record, so the operator's route never has to take a record back
+    (kittrial-5bb.176). The order is the order ``add-project`` has always used.
+    """
+    import project_creation
+    path=project_dir(root,name)
+    if name in project_creation.RESERVED_NAMES:
+        raise ValueError('Project name %s is used by the database server itself: choose another name'%name)
+    refuse_retired_name(root,name)
+    if path.exists() and any(path.iterdir()): raise ValueError('Project already exists; use it rather than initializing again')
+    require_bd_init_tools(root)
+    return path
+
 def initialize_project(root,name,stage=None):
     """The work of ``add-project``: database, settings, backup target, merge slot, first backup.
 
@@ -2457,13 +2474,7 @@ def initialize_project(root,name,stage=None):
     passes ``stage`` to record which step was running if the work stops.
     """
     at=stage or (lambda label:None)
-    path=project_dir(root,name)
-    import project_creation
-    if name in project_creation.RESERVED_NAMES:
-        raise ValueError('Project name %s is used by the database server itself: choose another name'%name)
-    refuse_retired_name(root,name)
-    if path.exists() and any(path.iterdir()): raise ValueError('Project already exists; use it rather than initializing again')
-    require_bd_init_tools(root)
+    path=require_creatable_project(root,name)
     # Deliberately NO clean-up of a failed creation here. An earlier revision removed
     # ``projects/NAME`` whenever ``.beads/metadata.json`` was not there yet, so that a
     # failed creation would "leave nothing". The review (kittrial-5bb.162 items
@@ -2512,6 +2523,12 @@ def finish_project_steps(root,name):
 def add_project(root,name):
     """Initialize one project, provision its merge slot and back it up once.
 
+    The operator's route keeps the same creation record the web route keeps
+    (``project_creation``, kittrial-5bb.176): a run that stops after ``bd init`` leaves an
+    ``incomplete`` record, so ``finish-project`` and ``remove-creation`` act on it instead
+    of refusing with "no project creation record", and a re-run that meets one is told
+    those two commands rather than only "Project already exists".
+
     The schedule guidance this prints (``scheduled_backup_coverage``) is deliberately
     CONSERVATIVE about a unit whose ``ExecStart`` runs the backup through ``sh -c``: such a
     line is reported as not backing up this runtime, because only a recognised ``admin.py``
@@ -2522,7 +2539,15 @@ def add_project(root,name):
     direction: it can only prompt an operator to double-check, never hide a gap. This is a
     deliberate choice, not a missed case, and it never edits, installs or enables a unit.
     """
-    initialize_project(root,name)
+    import project_creation
+    try:
+        project_creation.host_create(root,name,initialize_project,require_creatable_project)
+    except ValueError as error:
+        # A name held by a creation that stopped is not a dead end: the record names the
+        # commands that act on it (kittrial-5bb.176).
+        hint=project_creation.unfinished_sentence(root,name) if 'Project already exists' in str(error) else ''
+        if hint:raise ValueError('%s %s'%(error,hint)) from None
+        raise
     print(f'Created project {name}')
     print(scheduled_backup_coverage(root,name)[1])
     print(worker_client_setup(root,name))

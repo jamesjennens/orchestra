@@ -3529,6 +3529,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                            'projects', 'scopes')
     AGENT_UPDATE_FIELDS = ('name', 'tool', 'working_directory', 'machine', 'notes',
                            'projects', 'enabled')
+    AGENT_CREDENTIAL_FIELDS = ('label', 'scopes')
     ACCOUNT_CREATE_FIELDS = ('username', 'display_name')
 
     #: What a task change may change, and what else its body may carry: ``version`` is the
@@ -4791,6 +4792,11 @@ class ApiHandler(BaseHTTPRequestHandler):
                 # sentence (kittrial-5bb.90 review item 3.2).
                 for project_id in agent.get('projects') or ():
                     self._require_usable(project_id)
+            # A field this route does not take is refused, not dropped, as when an agent is
+            # made (kittrial-5bb.208 review). After the checks above: who may not see the
+            # agent keeps the service's 404.
+            self.service.get_agent(ctx.principal, ctx.params['aid'])
+            refuse_unknown_fields(payload, self.AGENT_CREDENTIAL_FIELDS, 'A new agent credential')
             result = self.service.issue_agent_credential(
                 ctx.principal, ctx.params['aid'], scopes=payload.get('scopes'),
                 label=payload.get('label'), request_id=ctx.request_id)
@@ -6607,6 +6613,21 @@ def runtime_service_lock(root):
     return fd
 
 
+def bootstrap_refusal_advice(error):
+    """What the person at the terminal has to do about a refused ``--bootstrap-user``.
+
+    Only "a superuser already exists" can be answered with "add this person as an account
+    inside the service": on a first bootstrap there is no superuser who could, so a refused
+    password or user name says to run the command again with a good one (kittrial-5bb.176
+    item 3).
+    """
+    if getattr(error, 'status', None) == 409:
+        return 'Add this person as an account inside the service instead.'
+    if 'Password' in getattr(error, 'message', ''):
+        return 'Run the command again with a password of 8 to 1024 characters.'
+    return 'Run the command again with a name of 2 to 64 characters of letters, digits, . _ @ -.'
+
+
 def build_backend(service, args):
     """Select the canonical backend. ``endpoint`` is the documented Linux service."""
     if args.backend == 'endpoint':
@@ -6691,7 +6712,14 @@ def main(argv=None):
             print('Refusing to bootstrap %s: --root must name an existing runtime directory, and %s is not one.'
                   % (args.bootstrap_user, args.root), file=sys.stderr)
             return 1
-        lock_fd = runtime_service_lock(args.root)
+        try:
+            lock_fd = runtime_service_lock(args.root)
+        except ValueError as error:
+            # A host without fcntl (Windows): one sentence instead of a traceback, before the
+            # state store is opened (kittrial-5bb.176 item 2).
+            print('Refusing to bootstrap %s: %s. Run this command on the POSIX host that runs the service.'
+                  % (args.bootstrap_user, error), file=sys.stderr)
+            return 1
         if lock_fd is None:
             print('Refusing to bootstrap %s: a service is running for runtime %s (it holds '
                   'office-service.lock). Stop the service and bootstrap while it is stopped; a running '
@@ -6703,6 +6731,13 @@ def main(argv=None):
             store = Store(args.state)
             password = getpass.getpass('New superuser password: ')
             Service.bootstrap_superuser(store, args.bootstrap_user, password)
+        except HttpError as error:
+            # A second bootstrap, a refused user name or a password the kit refuses: one
+            # sentence and the one thing to do about it, never a traceback
+            # (kittrial-5bb.176 items 2 and 3).
+            print('Refusing to bootstrap %s: %s. %s'
+                  % (args.bootstrap_user, error.message, bootstrap_refusal_advice(error)), file=sys.stderr)
+            return 1
         finally:
             import fcntl
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
