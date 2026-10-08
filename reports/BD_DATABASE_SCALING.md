@@ -1,17 +1,21 @@
-# Database count and write latency in Beads 1.2.2 / Dolt 2.2.0
+# Database count and write latency: Beads 1.2.2 and 1.3.1 on Dolt 2.2.0
 
 Investigation only. Measurements use disposable synthetic databases at kit source `f615440bea48fdba534ba6efb1dfb56ed18eca2d`. This document proposes operational bounds; it does not change the database cap, dependencies, authority or production behavior.
 
 ## Finding
 
-Each measured native write and merge-slot command sends two filtered `INFORMATION_SCHEMA.COLUMNS` checks. Their logged duration grows with the number of databases while their count stays fixed. The equivalent filtered query grows on its own; an ordinary query and native list/show remain comparatively flat. Together with the pinned source path, this supports catalog enumeration as a major source of the observed write cost. Query durations are elapsed server times, not CPU profiles or proof that every component of latency has the same cause.
+Each measured pinned-version native write and merge-slot command sends two filtered `INFORMATION_SCHEMA.COLUMNS` checks. Their logged duration grows with the number of databases while their count stays fixed. The equivalent filtered query grows on its own; an ordinary query and native list/show remain comparatively flat. Together with the pinned source path, this supports catalog enumeration as a major source of the observed write cost. Query durations are elapsed server times, not CPU profiles or proof that every component of latency has the same cause.
+
+The matched 1.3.1 comparison below removes the two cursor probes but retains one lease-column catalog check. At 50 databases its create/claim medians are about 7%/5% lower, while add-project is about 63% slower. At 1 and 20 databases the newer create/claim medians are higher. These fixtures establish a limited route-specific reduction candidate, with additional initialization and migration costs; they do not support a general upgrade speedup.
 
 ## Native commands
+
+The pinned fixture has 26 tables and 222 columns per project database. The task records 17,944 column rows at 52 real databases (about 345 per database), so real projects may impose greater catalog cost. These timings do not establish a per-database cost for arbitrary real installations.
 
 Warning-mode medians in seconds, three samples per cell. Native timers include process startup. Counts come from `SHOW DATABASES` after excluding system schemas. At 100 databases the native supplement uses the endpoint fixture after its staged measurements; schema count is matched but issue history and table contents differ from the earlier native fixture.
 
 | Operation | 1 DB | 5 DB | 10 DB | 20 DB | 35 DB | 50 DB | 100 DB |
-|---|---:|---:|---:|---:|---:|---:|---:|
+|---|---|---:|---:|---:|---:|---:|---:|---:|
 | create | 0.338 | 0.443 | 0.571 | 0.909 | 1.549 | 2.126 | 4.930 |
 | update | 0.333 | 0.405 | 0.513 | 0.910 | 1.416 | 2.235 | 5.069 |
 | comment | 0.320 | 0.398 | 0.565 | 0.852 | 1.341 | 2.031 | 5.069 |
@@ -25,12 +29,14 @@ Warning-mode medians in seconds, three samples per cell. Native timers include p
 | filtered-columns | 0.085 | 0.133 | 0.178 | 0.336 | 0.568 | 0.873 | 2.292 |
 | ordinary-query | 0.054 | 0.052 | 0.053 | 0.058 | 0.050 | 0.055 | 0.059 |
 
+The excess create cost per additional database is about 26 ms from 1 to 10 databases, 36 ms from 1 to 35, and 46 ms from 1 to 100, calculated after subtracting the one-database median. The high-count growth is faster than a constant linear increment; the 100-database fixture has different issue history, so the data do not isolate a universal nonlinear exponent.
+
 ## Endpoint commands
 
 Warning-mode medians in seconds, three samples per cell. Timers include endpoint validation, locking and native calls, and exclude SSH and starting the measurement interpreter. New synthetic tasks keep each checkpoint/review history bounded. Prerequisite reads and fixture preparation are outside the write timer; reads performed by the endpoint itself stay inside it.
 
 | Operation | 1 DB | 5 DB | 10 DB | 20 DB | 35 DB | 50 DB | 100 DB |
-|---|---:|---:|---:|---:|---:|---:|---:|
+|---|---|---:|---:|---:|---:|---:|---:|---:|
 | endpoint-create | 0.343 | 0.439 | 0.635 | 0.851 | 1.369 | 2.041 | 4.838 |
 | endpoint-claim | 0.746 | 0.883 | 0.927 | 1.336 | 1.937 | 2.517 | 5.492 |
 | endpoint-checkpoint | 0.506 | 0.653 | 0.758 | 1.146 | 1.682 | 2.418 | 5.149 |
@@ -73,16 +79,16 @@ AND COLUMN_NAME = 'content_hash';
 
 Initialization also sends catalog checks. Representative single add-project samples, including kit setup and initial backup, are in the JSON table. These single samples are not medians; elapsed initialization includes more than the catalog query durations.
 
-| Existing DB | Add-project seconds | SQL queries | Catalog queries | Summed catalog seconds |
-|---:|---:|---:|---:|---:|
-| 19 | 24.521 | 1552 | 73 | 16.249 |
-| 42 | 53.191 | 1553 | 73 | 43.811 |
-| 48 | 62.148 | 1553 | 73 | 52.166 |
-| 99 | 166.005 | 1553 | 73 | 147.739 |
+| Fixture | Existing DB | Add-project seconds | SQL queries | Catalog queries | Summed catalog seconds |
+|---|---:|---:|---:|---:|---:|
+| native | 19 | 24.521 | 1552 | 73 | 16.249 |
+| native | 42 | 53.191 | 1553 | 73 | 43.811 |
+| native | 48 | 62.148 | 1553 | 73 | 52.166 |
+| endpoint | 99 | 166.005 | 1553 | 73 | 147.739 |
 
 ## Release and backup
 
-These are initial synthetic tracker release batches, not file deployments, upgrades or rollbacks. Each batch has 25 fresh targets with scoped integration facts. The timer covers the release operation; the 75 prerequisite fixture writes are measured separately. Release and backup entries are **single debug-mode samples**, not a repeated curve or a guarantee. Backup completion does not verify restore.
+These are initial synthetic tracker release batches, not file deployments, upgrades or rollbacks. Each batch has 25 fresh targets with scoped integration facts. The timer covers the release operation; the 75 prerequisite fixture writes are measured separately. Release and backup entries are **single debug-mode samples**, not a repeated curve or a guarantee. These two observations at 50 and 100 databases are not a release or backup curve: there is no repeated release/backup sample at 1 or 20 databases. Backup completion does not verify restore. `backup --all` issued no catalog queries (0 of 150 at 50 projects, 0 of 300 at 100); its observed growth follows the number of projects backed up, rather than the catalog-probe mechanism measured on writes.
 
 | DB | Operation | Seconds | SQL queries | Catalog queries | Summed catalog seconds |
 |---:|---|---:|---:|---:|---:|
@@ -93,22 +99,87 @@ These are initial synthetic tracker release batches, not file deployments, upgra
 
 ## Recommended bound and operator warning
 
-Retain the default **20 project databases per server** for these pins. At 20 databases the measured native write medians remain below 1.5 seconds, but endpoint merge acquire/release already exceed that estimate because they perform additional native work. At 35, native create and set-state exceed 1.5 seconds; at 50 all measured native write/merge medians do, and at 100 they are around five seconds. Use route-specific measurements when estimating releases. This is a conservative operational recommendation for these fixtures, not a universal capacity limit.
+Retain the default **20 project names per server** for the pinned versions. The native create median increases from 0.338 s at one database to 0.909 s at 20, about 2.7 times; at 50 it is 2.126 s, and at 100 it is 4.930 s. This measured slowdown is the basis for the conservative recommendation, rather than an unsourced 1.5 s service target. Endpoint merge acquire/release cost more because they do additional native work. Use route-specific measurements for release estimates; these synthetic fixtures do not establish a universal capacity limit.
 
-The existing cap counts actual project databases, including archived, retired and incomplete creations; an account grant counts a different set. See [project creation limits](../docs/HTTP_DEPLOYMENT.md). Watch actual non-system database count against the configured cap, pending creations, representative write durations and backup health. Schema count alone does not capture issue volume, concurrent clients, large histories or host load.
+The kit already reports `project_databases: {used, limit}` from `admin.project_setup_status`, and `admin.py project-creations --usage` exposes that count to operators. `project_creation.server_names` counts names on disk under `projects/`, retired directories and creations holding names, including damaged creation records. **It does not query the server catalog.** Unrepresented databases can be missed and reservations can precede an actual database. The default cap stops only creation from the web; operator `add-project` is not stopped. The independent review observed used 30 with limit 20 and an operator creation still permitted. See [project creation limits](../docs/HTTP_DEPLOYMENT.md).
 
-An operator-only setup/backup status warning can report `database_count`, `project_cap`, count collection errors and whether the cap is reached, alongside the observation time. A latency warning should name the measured operation, sample interval and threshold, and distinguish unavailable measurements from fast writes. Prefer passive timing of an existing operation over creating a synthetic write in a live project. Ordinary contributors should not receive server-wide counts that expose other projects; the existing superuser view already supplies counts. Adding such a warning remains a coordinated core/UI change; this report does not implement it.
+Propose an operator warning at 10 counted names for a default limit of 20, and an explicit reached/exceeded warning at the configured limit. Ten is an early planning threshold: the measured create median is already about 1.7 times the one-database value, while leaving room to arrange backups or a second server. This warning is proposed, not implemented, and should distinguish the filesystem count from an operator-authorized actual non-system catalog count. Show observation time, count errors and incomplete creations; never label an unavailable count as zero. Representative passive write timings and backup health complement either count. Contributor views must retain existing server-wide information boundaries. No live synthetic writes or core/UI behavior changes are part of this report.
 
 ## Options and risks
 
 | Option | Expected benefit and cost | Required validation / risk |
 |---|---|---|
 | Add a schema WHERE clause | The captured migration query already has one; adding the same filter offers no measured improvement. | A fix must change catalog construction or avoid repeated checks without accepting an unvalidated migration. |
-| Beads/Dolt setting or newer version | May avoid enumeration or repeated migration probes; no safe bypass flag or newer-version improvement was established here. | Compare exact versions in disposable fixtures, capture SQL again, and rerun migrations, writes, authority and backup/restore tests before changing pins. |
+| Beads 1.3.0 / 1.3.1 | The [released probe change](https://github.com/gastownhall/beads/commit/3594a3762) uses `SHOW COLUMNS FROM <cursor table> LIKE 'content_hash'`, avoiding the per-write `INFORMATION_SCHEMA.COLUMNS` probe. This is a concrete reduction candidate; the version comparison below is required to quantify it. | Coordinate all clients, verify official and static builds, explicitly consent to shared-server migrations, and test authority, schema, backups and restore before changing any pin. |
+| Newer Dolt | A server-side catalog optimization could reduce remaining probes, but no newer Dolt binary was measured here. | Compare an exact candidate against the same catalog and SQL before claiming improvement; do not infer it from a newer release number. |
 | Move retired databases off the server | Reduces the catalog only after the databases actually leave it; hiding/archiving project records alone does not. | Operator and owner design decision: verified native plus coordination backup, restore-new rehearsal, routes/dependencies/retention handling, and explicit drop authorization. No database move or drop was performed. |
 | Second Dolt server / installation | Bounds the catalog per server; comes with additional service, storage and operating cost. | Explicit routing, project authority, backup/restore ownership, cross-project dependencies and failure handling. No multi-server performance or failover was verified. |
 
 Keep the pins and cap until an alternative has measured benefit and the above correctness evidence. [Dolt configuration documentation](https://www.dolthub.com/docs/sql-reference/server/configuration/) describes query logging; it is not evidence that a schema-scope optimization exists in these pinned binaries.
+
+## Released Beads option and upgrade requirements
+
+The probe replacement is Beads commit `3594a3762` ([schema source at v1.3.1](https://github.com/gastownhall/beads/blob/v1.3.1/internal/storage/schema/schema.go#L1192)); it is present in v1.3.0 and v1.3.1, and absent from the pinned v1.2.2. `SHOW COLUMNS` targets one cursor table; the code compares the returned field exactly because the underscore in a LIKE pattern is a wildcard. Removing those probes can reduce write latency without changing Dolt.
+
+[Beads 1.3.0 upgrade notes](https://github.com/gastownhall/beads/releases/tag/v1.3.0#upgrading-notes) describe a v53-to-v66 main-schema change and a separate clone-local migration series. Shared servers require deliberate migration consent: upgrade every client, take backups using the old binary first, then run `bd migrate schema` once; scripted standing consent is `BD_ALLOW_REMOTE_MIGRATE=1`. Remote-backed stores require a designated migrator and sync handling as documented there. [1.3.1 notes](https://github.com/gastownhall/beads/releases/tag/v1.3.1#upgrading-notes) add no migration beyond 1.3.0, but upgrading from 1.2.2 still includes that change. Consent is confined to new disposable comparison copies in this investigation, not a recommendation to bypass a live gate.
+
+A kit pin change also requires a reproducible 1.3.1 static build for the hosts that cannot run upstream's dynamically linked Linux asset; the existing `tools/build_bd_static.sh` and `versions.json` static receipt are specific to 1.2.2. Verify hashes, ABI/architecture, fresh init, all-client migration/compatibility, endpoint/authority behavior, native plus coordination backups, and restore/rollback before an operator changes pins. Old clients must not be assumed to work against the promoted schema. No binary replacement or migration occurred in any live runtime.
+
+Replacing the cursor probes does not make initialization constant-time. Of the 73 catalog checks captured during pinned initialization, 57 are other statements. New migrations and other catalog checks can still dominate; use the measured new-version SQL counts rather than extrapolating all 73 away.
+
+As of this source review, [Dolt 2.4.2 release notes](https://github.com/dolthub/dolt/releases/tag/v2.4.2) do not establish a fix for this workload. That tag is commit `9c835f4dc7974bb50083ab121c097cc903a91997`; its [go.mod](https://github.com/dolthub/dolt/blob/9c835f4dc7974bb50083ab121c097cc903a91997/go/go.mod) pins go-mysql-server `77662b650e46`. The corresponding [ColumnsTable source](https://github.com/dolthub/go-mysql-server/blob/77662b650e46/sql/information_schema/columns_table.go#L145) still enumerates databases in `AllColumns` and `columnsRowIter`. This is source evidence about those methods, not proof that every query plan or runtime cost is unchanged. A newer Dolt performance improvement is unverified here; the comparison keeps Dolt 2.2.0 fixed.
+
+### Matched version comparison
+
+Official bd 1.3.1 archive SHA256 `3219443a9734b89b93fb16ee8d65844759fa1b3cd3cf139c606b7353cfb0715c`; extracted binary SHA256 `a8f48d771b9e11eccfced4aed72923b59eda746f7a9b425e7ca1af7a51251653`. Fresh stopped synthetic seed copies are used at 1, 20 and 50 databases. Each repetition begins at the stated count, including add-project; it ends one database higher. The target schema is migrated explicitly only in the new-version copy. Debug and warning timings are separate.
+
+Completed comparison: 126 successful timed samples, zero failures, including 18 explicit migration samples. Three samples per cell; warning-mode medians and ranges are in the linked raw data.
+
+| Existing DB | Version | create s | claim s | add-project s |
+|---:|---|---:|---:|---:|
+| 1 | 1.2.2 | 0.364 | 0.315 | 6.821 |
+| 1 | 1.3.1 | 0.450 | 0.353 | 10.811 |
+| 20 | 1.2.2 | 1.064 | 0.865 | 26.370 |
+| 20 | 1.3.1 | 1.075 | 0.906 | 38.733 |
+| 50 | 1.2.2 | 2.227 | 2.009 | 61.902 |
+| 50 | 1.3.1 | 2.077 | 1.903 | 100.774 |
+
+Ratios below are newer/pinned warning-mode medians; below 1 is less elapsed time. Three samples are descriptive measurements, not a statistical significance or live upgrade claim.
+
+| DB | create ratio | claim ratio | add-project ratio |
+|---:|---:|---:|---:|
+| 1 | 1.23 | 1.12 | 1.59 |
+| 20 | 1.01 | 1.05 | 1.47 |
+| 50 | 0.93 | 0.95 | 1.63 |
+
+Explicit `bd migrate schema` on the new-version target is outside the create/claim/add-project timers. Each row has three fresh repetitions. These costs still grow with the catalog population.
+
+| Existing DB | warning median s | warning range s | debug median s |
+|---:|---:|---:|---:|
+| 1 | 3.121 | 3.102–3.234 | 3.105 |
+| 20 | 15.409 | 15.219–16.212 | 15.617 |
+| 50 | 42.557 | 42.209–42.699 | 41.678 |
+
+Debug SQL medians (three captures each). Each row reports create / claim / add-project, at the stated existing database count.
+
+| DB | Version | All query counts | Catalog query counts | SHOW COLUMNS counts |
+|---:|---|---:|---:|---:|
+| 1 | 1.2.2 | 64 / 48 / 1552 | 2 / 2 / 73 | 0 / 0 / 0 |
+| 1 | 1.3.1 | 99 / 77 / 2343 | 1 / 1 / 107 | 2 / 2 / 16 |
+| 20 | 1.2.2 | 64 / 48 / 1552 | 2 / 2 / 73 | 0 / 0 / 0 |
+| 20 | 1.3.1 | 99 / 77 / 2343 | 1 / 1 / 107 | 2 / 2 / 16 |
+| 50 | 1.2.2 | 64 / 48 / 1553 | 2 / 2 / 73 | 0 / 0 / 0 |
+| 50 | 1.3.1 | 99 / 77 / 2343 | 1 / 1 / 107 | 2 / 2 / 16 |
+
+The two cursor-table probes are replaced, but new-version create/claim still issue one catalog query checking `leases.granted_node`. The newer binary also performs other additional work. Thus an upgrade can change the slope and the fixed cost in opposite directions: judge the measured operations separately. The table establishes these versions on these fixtures only; it does not establish a live upgrade benefit, correctness of every kit route or universal capacity.
+
+Initialization remains expensive. The 57 other pinned initialization catalog statements remain relevant, and 1.3.1 adds schema/migration work; the new-version counts above must not be inferred by subtracting all pinned probes. Migration is timed separately from steady writes and add-project. The copies begin with identical pinned schema/data; each new-version target is explicitly migrated, while the other catalog databases retain the pinned schema. A fully migrated fleet could have a different catalog population and cost.
+
+Each fresh repetition uses copies of a stopped synthetic 26-table/222-column seed database, with its provisioned synthetic merge slot. Only the target project needs a workspace directory; other cloned databases contribute the same seed catalog schema. This controls catalog population but differs from the original sequentially initialized fixture and from real project histories. Each create/claim pair uses one fresh task; add-project starts at exactly 1/20/50 existing databases, then ends one higher. It includes kit initialization, merge-slot provisioning and its initial backup. Debug and warning runs use separate fresh copies and are ordered, not randomized. Load/memory and all timings remain in the raw samples.
+
+The first harness attempt failed before sending SQL because a copied `.beads/dolt-server.port` still named the seed port despite updated metadata. It was excluded and retained in private investigation evidence; the corrected fresh comparison updates both port sources. No product source was changed, no existing fixture was modified, and every owned comparison server stopped.
+
+[Raw comparison samples](data/raw/bd-version-comparison.json) and [summary metadata](data/bd-database-scaling.json) preserve all 126 timings and hashes.
 
 ## Reproduction and limits
 
@@ -118,6 +189,6 @@ For each ordinary route run three debug samples, restart the owned server at war
 
 Native operations: `bd create --json`, `update --description --json`, `comments add --json`, `set-state tested=passed --reason ... --json`, `update --claim --json`, `merge-slot check/acquire/release --json`, `list --all --limit 0 --json`, and `show --json`. Direct controls use the filtered catalog query above and `SELECT COUNT(*) FROM issues`. Endpoint rounds use create, claim, fresh checkpoint CAS, lifecycle scope/fact, review contribution, merge check/acquire/release and brief. Synthetic release uses a 25-target release-deploy payload with `live_verified: false`; backup uses `backup_projects(..., all_projects=True)` and a complete/no-degraded status readback.
 
-1234 successful timed samples are represented in the current measurement data. Initial harness failures (startup environment, invalid native slot spelling, and the post100 v1 nonexistent-marker assertion) are preserved separately and excluded. The marker assertion stopped before timed operations or fixture writes. Native list/show measurements are bounded to these synthetic project contents; they do not prove arbitrary-history read scaling. Other hosts/platforms, concurrency, alternative pins, real deployments and restore behavior remain unverified.
+The historical measurement data represent 1,234 successful timed samples; the matched version comparison adds 126, for 1,360 accepted timings in total. Initial harness failures (startup environment, invalid native slot spelling, and the post100 v1 nonexistent-marker assertion) are preserved separately and excluded. The marker assertion stopped before timed operations or fixture writes. Native list/show measurements are bounded to these synthetic project contents; they do not prove arbitrary-history read scaling. Other hosts/platforms, concurrency, newer Dolt, real deployments and restore behavior remain unverified. The bd comparison above has its own scope and does not verify an operational upgrade.
 
 Measurements and verification results are separate: the contribution evidence must name the exact final document commit, its actual Linux tip/base suite results and every skip or failure. No performance improvement in production code is claimed.

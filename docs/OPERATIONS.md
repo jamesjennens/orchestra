@@ -960,39 +960,45 @@ If restore is interrupted, the new destination may exist with only part of the r
 
 ### The cost of many projects on one server
 
-Every project is a database on the one Dolt server, and **every bd write on that server
-gets slower with each database it holds**, whichever project the write is for. Reads do
-not. Measured on one machine with the pinned bd 1.2.2 (kittrial-5bb.118 part 2 review):
+With pinned bd 1.2.2 and Dolt 2.2.0, catalog checks on writes get slower as the
+server holds more project databases. The [measured investigation](../reports/BD_DATABASE_SCALING.md)
+includes actual bd SQL, repeated synthetic timings, fixture limits and raw samples.
+At 1, 20 and 50 databases the native create medians were 0.338, 0.909 and 2.126 s;
+native list/show stayed near 0.2 s for the measured issue history. These values are
+not guarantees for other schemas, concurrent loads or arbitrary read histories.
 
-| Project databases on the server | `add-project` | one bd write (create, update, claim, comment, close, merge-slot, config) | one bd read (show, list, export) |
-|---|---|---|---|
-| 1 | 6 s | 0.2 to 0.4 s | 0.2 s |
-| 10 | 12 s | | |
-| 20 | 21 s | | |
-| 30 | 32 s | | |
-| 40 | 42 s | | |
-| 50 | 60 s | | |
-| 52 | 64 s | 1.9 to 2.4 s | 0.2 s |
-
-- The cause, as far as it was traced: bd checks its schema when it opens a database for
-  writing, with queries on `information_schema.columns`; Dolt answers such a query from
-  every database on the server (0.9 s at 52 databases, 0.07 s for an ordinary query),
-  and a write makes about two of them. bd's own SQL was not captured; the number of
-  queries is inferred from the timings.
-- **Archived and retired projects and unfinished creations cost the same as live ones**:
-  their databases stay on the server. The kit never drops a database.
-- **The limit.** `admin.py project-creations --usage` prints how many project databases
-  the server holds and its limit. The limit is 20 unless set:
-  `admin.py project-creations --set-server-limit N --actor OPERATOR` (a listed operator;
-  the change is recorded in `deployment.private.json` with who and when). At the limit
-  the web interface creates no project. `add-project` is the operator's own command and
-  is not stopped by the limit, but what it makes counts.
-- **Raising the limit** buys room at the price in the table: at 50 databases every task
-  write, claim, comment and merge-slot call takes about two seconds, and a creation
-  about a minute. A creation from the web interface may take up to `--create-timeout`
-  (900 seconds) of the web service.
-- The count is over everything under `projects/`, everything under `retired/`, and the
-  creations that hold a name. So twelve visible projects can reach a limit of 20.
+- **Captured cause.** Each measured native write and merge-slot command issued two
+  filtered `INFORMATION_SCHEMA.COLUMNS` checks. Pinned add-project samples issued
+  73 such checks, in addition to other SQL. The count is captured, not inferred.
+  The predicates name the selected schema, but pinned Dolt still builds the catalog
+  across databases. See the report for elapsed query times and exact sources.
+- **Released reduction candidate.** Beads 1.3.0 and 1.3.1 replace the cursor-table
+  probe with `SHOW COLUMNS`. In the matched comparison, 1.3.1 create/claim medians
+  at 50 databases were about 7%/5% lower, but add-project was about 63% slower;
+  create/claim at 1 and 20 databases were slower too. One lease-column catalog
+  check remains. The report gives the migration costs, fixture limits and static-build
+  checks. These results do not establish a general upgrade benefit, and this
+  documentation changes no kit pin or live server.
+- **Names and the limit.** `admin.py project-creations --usage` and the operator
+  setup-status view report `project_databases` used/limit. The default limit is 20;
+  a listed operator can record another value with
+  `admin.py project-creations --set-server-limit N --actor OPERATOR`.
+  The count comes from names under `projects/`, retired directories and creations
+  holding names, including damaged records. It is not a server-catalog query;
+  an unrepresented database can be missed, while a reservation may precede one.
+- **Enforcement.** The cap stops web creation only. Operator `add-project` remains
+  permitted above it; the independent review observed used 30 at a limit of 20.
+  Archived/retired records do not remove the database or its catalog cost. The kit
+  never drops a database. Twelve visible projects can therefore exhaust 20 names.
+- **Planning.** Retain 20 for these pins: measured create at 20 is about 2.7 times
+  the one-database cost. Propose warning at 10 names for the default limit, plus
+  reached/exceeded warnings at the configured limit. These warnings are not yet
+  implemented. Compare the filesystem count with an operator-authorized catalog
+  count and passive operation timings; count errors are not zero usage.
+- **Release and backup.** The report's 25-target synthetic releases and backups at
+  50/100 databases are single observations, not a repeated curve or deployment
+  guarantee. Backup sends no catalog checks; its growth follows project count.
+  Web creation can take up to the service's `--create-timeout` (900 seconds).
 
 ### Retiring a project
 

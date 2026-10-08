@@ -16,27 +16,32 @@
     {
       "name": "native-curve-v2-results.json",
       "samples": 481,
-      "sha256": "d19c91e9880cf5c887dfcfea63cec1723f630f1b72548a1607a21419cb5ca5d5"
+      "sha256": "d19c91e9880cf5c887dfcfea63cec1723f630f1b72548a1607a21419cb5ca5d5",
+      "path": "raw/native-curve-v2-results.json"
     },
     {
       "name": "native-post-v1-results.json",
       "samples": 84,
-      "sha256": "ce692231d2642cae3a4786a93f7ae8a39ec4143e32b75fccdb211f33931134d6"
+      "sha256": "ce692231d2642cae3a4786a93f7ae8a39ec4143e32b75fccdb211f33931134d6",
+      "path": "raw/native-post-v1-results.json"
     },
     {
       "name": "endpoint-curve-v1-results.json",
       "samples": 520,
-      "sha256": "8ee5bdede135d0ccec0c69548300927f6a86f714fabcb0ce10509cc32d659265"
+      "sha256": "8ee5bdede135d0ccec0c69548300927f6a86f714fabcb0ce10509cc32d659265",
+      "path": "raw/endpoint-curve-v1-results.json"
     },
     {
       "name": "native100-v1-results.json",
       "samples": 72,
-      "sha256": "fff255c6e3ca46141bee77a6059da9786e3ad9c55a267af34f96a117b481e011"
+      "sha256": "fff255c6e3ca46141bee77a6059da9786e3ad9c55a267af34f96a117b481e011",
+      "path": "raw/native100-v1-results.json"
     },
     {
       "name": "endpoint-post100-v2-results.json",
       "samples": 77,
-      "sha256": "09639d29334a81944c50b2b30f486f59309d8ca180032e23b31883d959f30738"
+      "sha256": "09639d29334a81944c50b2b30f486f59309d8ca180032e23b31883d959f30738",
+      "path": "raw/endpoint-post100-v2-results.json"
     }
   ],
   "groups": [
@@ -12471,5 +12476,945 @@
       "min_available_GiB": 115.38237380981445
     }
   ],
-  "method": "Three debug and three warning samples per ordinary operation/count; release/backup are single debug samples. Native100 uses the larger endpoint fixture, not the original native fixture."
+  "method": "Three debug and three warning samples per ordinary operation/count; release/backup are single debug samples. Native100 uses the larger endpoint fixture, not the original native fixture.",
+  "version_comparison": {
+    "measurement_source": "f615440bea48fdba534ba6efb1dfb56ed18eca2d",
+    "bd131_commit": "c1c4b642ac1c08d8c828007a1c2f96e47e43ef7c",
+    "bd131_archive_sha256": "3219443a9734b89b93fb16ee8d65844759fa1b3cd3cf139c606b7353cfb0715c",
+    "bd131_binary_sha256": "a8f48d771b9e11eccfced4aed72923b59eda746f7a9b425e7ca1af7a51251653",
+    "dolt_version": "2.2.0",
+    "completed_samples": 126,
+    "failed_samples": 0,
+    "raw": {
+      "path": "raw/bd-version-comparison.json",
+      "sha256": "2fc018e8162876765d9ecfd429d702b8d5b0fd2908d62b2d2964a475a84fbf37"
+    },
+    "fixture": "Fresh stopped pinned seed copies,26tables/222columns; migrate target only for new version; actual existing DB count1/20/50 for each repetition. Other databases retain seed schema.",
+    "groups": [
+      {
+        "bd_version": "1.2.2",
+        "databases": 1,
+        "operation": "add-project",
+        "logging": "debug",
+        "samples": 3,
+        "seconds": {
+          "median": 6.748012290103361,
+          "min": 6.7441376321949065,
+          "max": 6.895601619966328
+        },
+        "query_count": {
+          "median": 1552,
+          "min": 1552,
+          "max": 1552
+        },
+        "catalog_query_count": {
+          "median": 73,
+          "min": 73,
+          "max": 73
+        },
+        "catalog_ms": {
+          "median": 2475,
+          "min": 2427,
+          "max": 2488
+        },
+        "show_columns_count": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        }
+      },
+      {
+        "bd_version": "1.2.2",
+        "databases": 1,
+        "operation": "add-project",
+        "logging": "warning",
+        "samples": 3,
+        "seconds": {
+          "median": 6.820851707132533,
+          "min": 6.79921834403649,
+          "max": 7.017756899120286
+        }
+      },
+      {
+        "bd_version": "1.2.2",
+        "databases": 1,
+        "operation": "claim",
+        "logging": "debug",
+        "samples": 3,
+        "seconds": {
+          "median": 0.3148666580673307,
+          "min": 0.30224187998101115,
+          "max": 0.3385053521487862
+        },
+        "query_count": {
+          "median": 48,
+          "min": 48,
+          "max": 48
+        },
+        "catalog_query_count": {
+          "median": 2,
+          "min": 2,
+          "max": 2
+        },
+        "catalog_ms": {
+          "median": 55,
+          "min": 48,
+          "max": 59
+        },
+        "show_columns_count": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        }
+      },
+      {
+        "bd_version": "1.2.2",
+        "databases": 1,
+        "operation": "claim",
+        "logging": "warning",
+        "samples": 3,
+        "seconds": {
+          "median": 0.3148210479412228,
+          "min": 0.28611423587426543,
+          "max": 0.3437554279807955
+        }
+      },
+      {
+        "bd_version": "1.2.2",
+        "databases": 1,
+        "operation": "create",
+        "logging": "debug",
+        "samples": 3,
+        "seconds": {
+          "median": 0.3361849708016962,
+          "min": 0.3121327920816839,
+          "max": 0.37041517812758684
+        },
+        "query_count": {
+          "median": 64,
+          "min": 64,
+          "max": 64
+        },
+        "catalog_query_count": {
+          "median": 2,
+          "min": 2,
+          "max": 2
+        },
+        "catalog_ms": {
+          "median": 50,
+          "min": 48,
+          "max": 68
+        },
+        "show_columns_count": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        }
+      },
+      {
+        "bd_version": "1.2.2",
+        "databases": 1,
+        "operation": "create",
+        "logging": "warning",
+        "samples": 3,
+        "seconds": {
+          "median": 0.3643749800976366,
+          "min": 0.3563514440320432,
+          "max": 0.3705388349480927
+        }
+      },
+      {
+        "bd_version": "1.2.2",
+        "databases": 20,
+        "operation": "add-project",
+        "logging": "debug",
+        "samples": 3,
+        "seconds": {
+          "median": 27.14068408496678,
+          "min": 24.191357663832605,
+          "max": 27.981404558056965
+        },
+        "query_count": {
+          "median": 1552,
+          "min": 1552,
+          "max": 1552
+        },
+        "catalog_query_count": {
+          "median": 73,
+          "min": 73,
+          "max": 73
+        },
+        "catalog_ms": {
+          "median": 17942,
+          "min": 17466,
+          "max": 18031
+        },
+        "show_columns_count": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        }
+      },
+      {
+        "bd_version": "1.2.2",
+        "databases": 20,
+        "operation": "add-project",
+        "logging": "warning",
+        "samples": 3,
+        "seconds": {
+          "median": 26.370442155050114,
+          "min": 24.43647810211405,
+          "max": 27.518143275985494
+        }
+      },
+      {
+        "bd_version": "1.2.2",
+        "databases": 20,
+        "operation": "claim",
+        "logging": "debug",
+        "samples": 3,
+        "seconds": {
+          "median": 0.928892893018201,
+          "min": 0.8022345609497279,
+          "max": 3.7632805230095983
+        },
+        "query_count": {
+          "median": 48,
+          "min": 48,
+          "max": 48
+        },
+        "catalog_query_count": {
+          "median": 2,
+          "min": 2,
+          "max": 2
+        },
+        "catalog_ms": {
+          "median": 509,
+          "min": 443,
+          "max": 544
+        },
+        "show_columns_count": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        }
+      },
+      {
+        "bd_version": "1.2.2",
+        "databases": 20,
+        "operation": "claim",
+        "logging": "warning",
+        "samples": 3,
+        "seconds": {
+          "median": 0.864681530976668,
+          "min": 0.8576412261463702,
+          "max": 1.6074342550709844
+        }
+      },
+      {
+        "bd_version": "1.2.2",
+        "databases": 20,
+        "operation": "create",
+        "logging": "debug",
+        "samples": 3,
+        "seconds": {
+          "median": 0.9639315530657768,
+          "min": 0.9408956149127334,
+          "max": 1.0232174410484731
+        },
+        "query_count": {
+          "median": 64,
+          "min": 64,
+          "max": 64
+        },
+        "catalog_query_count": {
+          "median": 2,
+          "min": 2,
+          "max": 2
+        },
+        "catalog_ms": {
+          "median": 542,
+          "min": 513,
+          "max": 628
+        },
+        "show_columns_count": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        }
+      },
+      {
+        "bd_version": "1.2.2",
+        "databases": 20,
+        "operation": "create",
+        "logging": "warning",
+        "samples": 3,
+        "seconds": {
+          "median": 1.0641700690612197,
+          "min": 1.0395828587934375,
+          "max": 2.2474771740380675
+        }
+      },
+      {
+        "bd_version": "1.2.2",
+        "databases": 50,
+        "operation": "add-project",
+        "logging": "debug",
+        "samples": 3,
+        "seconds": {
+          "median": 65.64850022108294,
+          "min": 64.0265782258939,
+          "max": 66.4493023159448
+        },
+        "query_count": {
+          "median": 1553,
+          "min": 1553,
+          "max": 1553
+        },
+        "catalog_query_count": {
+          "median": 73,
+          "min": 73,
+          "max": 73
+        },
+        "catalog_ms": {
+          "median": 55274,
+          "min": 53823,
+          "max": 55428
+        },
+        "show_columns_count": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        }
+      },
+      {
+        "bd_version": "1.2.2",
+        "databases": 50,
+        "operation": "add-project",
+        "logging": "warning",
+        "samples": 3,
+        "seconds": {
+          "median": 61.90173776494339,
+          "min": 61.652352835051715,
+          "max": 63.95861478499137
+        }
+      },
+      {
+        "bd_version": "1.2.2",
+        "databases": 50,
+        "operation": "claim",
+        "logging": "debug",
+        "samples": 3,
+        "seconds": {
+          "median": 2.0644735919777304,
+          "min": 2.0287362940143794,
+          "max": 2.2086783370468765
+        },
+        "query_count": {
+          "median": 48,
+          "min": 48,
+          "max": 48
+        },
+        "catalog_query_count": {
+          "median": 2,
+          "min": 2,
+          "max": 2
+        },
+        "catalog_ms": {
+          "median": 1593,
+          "min": 1539,
+          "max": 1758
+        },
+        "show_columns_count": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        }
+      },
+      {
+        "bd_version": "1.2.2",
+        "databases": 50,
+        "operation": "claim",
+        "logging": "warning",
+        "samples": 3,
+        "seconds": {
+          "median": 2.0086220279335976,
+          "min": 1.8151298470329493,
+          "max": 2.1025490269530565
+        }
+      },
+      {
+        "bd_version": "1.2.2",
+        "databases": 50,
+        "operation": "create",
+        "logging": "debug",
+        "samples": 3,
+        "seconds": {
+          "median": 2.139900556067005,
+          "min": 2.0990421399474144,
+          "max": 2.4204705969896168
+        },
+        "query_count": {
+          "median": 64,
+          "min": 64,
+          "max": 64
+        },
+        "catalog_query_count": {
+          "median": 2,
+          "min": 2,
+          "max": 2
+        },
+        "catalog_ms": {
+          "median": 1587,
+          "min": 1582,
+          "max": 1679
+        },
+        "show_columns_count": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        }
+      },
+      {
+        "bd_version": "1.2.2",
+        "databases": 50,
+        "operation": "create",
+        "logging": "warning",
+        "samples": 3,
+        "seconds": {
+          "median": 2.2271785160992295,
+          "min": 2.0060621311422437,
+          "max": 2.22948184190318
+        }
+      },
+      {
+        "bd_version": "1.3.1",
+        "databases": 1,
+        "operation": "add-project",
+        "logging": "debug",
+        "samples": 3,
+        "seconds": {
+          "median": 10.702792858937755,
+          "min": 10.655896656913683,
+          "max": 10.70879670092836
+        },
+        "query_count": {
+          "median": 2343,
+          "min": 2343,
+          "max": 2343
+        },
+        "catalog_query_count": {
+          "median": 107,
+          "min": 107,
+          "max": 107
+        },
+        "catalog_ms": {
+          "median": 3934,
+          "min": 3873,
+          "max": 4041
+        },
+        "show_columns_count": {
+          "median": 16,
+          "min": 16,
+          "max": 16
+        }
+      },
+      {
+        "bd_version": "1.3.1",
+        "databases": 1,
+        "operation": "add-project",
+        "logging": "warning",
+        "samples": 3,
+        "seconds": {
+          "median": 10.811188224935904,
+          "min": 10.734691780991852,
+          "max": 10.921672408934683
+        }
+      },
+      {
+        "bd_version": "1.3.1",
+        "databases": 1,
+        "operation": "claim",
+        "logging": "debug",
+        "samples": 3,
+        "seconds": {
+          "median": 0.38450757786631584,
+          "min": 0.34207966597750783,
+          "max": 0.5085447991732508
+        },
+        "query_count": {
+          "median": 77,
+          "min": 77,
+          "max": 77
+        },
+        "catalog_query_count": {
+          "median": 1,
+          "min": 1,
+          "max": 1
+        },
+        "catalog_ms": {
+          "median": 33,
+          "min": 30,
+          "max": 35
+        },
+        "show_columns_count": {
+          "median": 2,
+          "min": 2,
+          "max": 2
+        }
+      },
+      {
+        "bd_version": "1.3.1",
+        "databases": 1,
+        "operation": "claim",
+        "logging": "warning",
+        "samples": 3,
+        "seconds": {
+          "median": 0.35298295598477125,
+          "min": 0.3392167859710753,
+          "max": 0.3690548208542168
+        }
+      },
+      {
+        "bd_version": "1.3.1",
+        "databases": 1,
+        "operation": "create",
+        "logging": "debug",
+        "samples": 3,
+        "seconds": {
+          "median": 0.4720184779725969,
+          "min": 0.46679361001588404,
+          "max": 0.49088232312351465
+        },
+        "query_count": {
+          "median": 99,
+          "min": 99,
+          "max": 99
+        },
+        "catalog_query_count": {
+          "median": 1,
+          "min": 1,
+          "max": 1
+        },
+        "catalog_ms": {
+          "median": 32,
+          "min": 22,
+          "max": 33
+        },
+        "show_columns_count": {
+          "median": 2,
+          "min": 2,
+          "max": 2
+        }
+      },
+      {
+        "bd_version": "1.3.1",
+        "databases": 1,
+        "operation": "create",
+        "logging": "warning",
+        "samples": 3,
+        "seconds": {
+          "median": 0.4498453480191529,
+          "min": 0.4351911360863596,
+          "max": 0.4788760608062148
+        }
+      },
+      {
+        "bd_version": "1.3.1",
+        "databases": 1,
+        "operation": "migration",
+        "logging": "debug",
+        "samples": 3,
+        "seconds": {
+          "median": 3.1054154310841113,
+          "min": 3.047408931190148,
+          "max": 3.1719417630229145
+        },
+        "query_count": {
+          "median": 614,
+          "min": 614,
+          "max": 614
+        },
+        "catalog_query_count": {
+          "median": 44,
+          "min": 44,
+          "max": 44
+        },
+        "catalog_ms": {
+          "median": 1162,
+          "min": 1109,
+          "max": 1172
+        },
+        "show_columns_count": {
+          "median": 6,
+          "min": 6,
+          "max": 6
+        }
+      },
+      {
+        "bd_version": "1.3.1",
+        "databases": 1,
+        "operation": "migration",
+        "logging": "warning",
+        "samples": 3,
+        "seconds": {
+          "median": 3.1211632369086146,
+          "min": 3.102185823954642,
+          "max": 3.233890392119065
+        }
+      },
+      {
+        "bd_version": "1.3.1",
+        "databases": 20,
+        "operation": "add-project",
+        "logging": "debug",
+        "samples": 3,
+        "seconds": {
+          "median": 39.511510357959196,
+          "min": 38.769062211038545,
+          "max": 39.870931833051145
+        },
+        "query_count": {
+          "median": 2343,
+          "min": 2343,
+          "max": 2343
+        },
+        "catalog_query_count": {
+          "median": 107,
+          "min": 107,
+          "max": 107
+        },
+        "catalog_ms": {
+          "median": 27358,
+          "min": 26631,
+          "max": 27485
+        },
+        "show_columns_count": {
+          "median": 16,
+          "min": 16,
+          "max": 16
+        }
+      },
+      {
+        "bd_version": "1.3.1",
+        "databases": 20,
+        "operation": "add-project",
+        "logging": "warning",
+        "samples": 3,
+        "seconds": {
+          "median": 38.732660255162045,
+          "min": 38.69606726500206,
+          "max": 39.22572845313698
+        }
+      },
+      {
+        "bd_version": "1.3.1",
+        "databases": 20,
+        "operation": "claim",
+        "logging": "debug",
+        "samples": 3,
+        "seconds": {
+          "median": 1.0404963770415634,
+          "min": 0.9354045011568815,
+          "max": 1.0434453811030835
+        },
+        "query_count": {
+          "median": 77,
+          "min": 77,
+          "max": 77
+        },
+        "catalog_query_count": {
+          "median": 1,
+          "min": 1,
+          "max": 1
+        },
+        "catalog_ms": {
+          "median": 305,
+          "min": 269,
+          "max": 356
+        },
+        "show_columns_count": {
+          "median": 2,
+          "min": 2,
+          "max": 2
+        }
+      },
+      {
+        "bd_version": "1.3.1",
+        "databases": 20,
+        "operation": "claim",
+        "logging": "warning",
+        "samples": 3,
+        "seconds": {
+          "median": 0.9064267301000655,
+          "min": 0.9004363720305264,
+          "max": 1.0835651049856097
+        }
+      },
+      {
+        "bd_version": "1.3.1",
+        "databases": 20,
+        "operation": "create",
+        "logging": "debug",
+        "samples": 3,
+        "seconds": {
+          "median": 1.0853121948894113,
+          "min": 1.0440962701104581,
+          "max": 1.109882164048031
+        },
+        "query_count": {
+          "median": 99,
+          "min": 99,
+          "max": 99
+        },
+        "catalog_query_count": {
+          "median": 1,
+          "min": 1,
+          "max": 1
+        },
+        "catalog_ms": {
+          "median": 290,
+          "min": 270,
+          "max": 296
+        },
+        "show_columns_count": {
+          "median": 2,
+          "min": 2,
+          "max": 2
+        }
+      },
+      {
+        "bd_version": "1.3.1",
+        "databases": 20,
+        "operation": "create",
+        "logging": "warning",
+        "samples": 3,
+        "seconds": {
+          "median": 1.0748742558062077,
+          "min": 1.0740529680624604,
+          "max": 1.0821014938410372
+        }
+      },
+      {
+        "bd_version": "1.3.1",
+        "databases": 20,
+        "operation": "migration",
+        "logging": "debug",
+        "samples": 3,
+        "seconds": {
+          "median": 15.61742133111693,
+          "min": 15.063432095106691,
+          "max": 15.853020037990063
+        },
+        "query_count": {
+          "median": 614,
+          "min": 614,
+          "max": 614
+        },
+        "catalog_query_count": {
+          "median": 44,
+          "min": 44,
+          "max": 44
+        },
+        "catalog_ms": {
+          "median": 10812,
+          "min": 10423,
+          "max": 11007
+        },
+        "show_columns_count": {
+          "median": 6,
+          "min": 6,
+          "max": 6
+        }
+      },
+      {
+        "bd_version": "1.3.1",
+        "databases": 20,
+        "operation": "migration",
+        "logging": "warning",
+        "samples": 3,
+        "seconds": {
+          "median": 15.40902923210524,
+          "min": 15.218922775937244,
+          "max": 16.21171237109229
+        }
+      },
+      {
+        "bd_version": "1.3.1",
+        "databases": 50,
+        "operation": "add-project",
+        "logging": "debug",
+        "samples": 3,
+        "seconds": {
+          "median": 99.36393487500027,
+          "min": 97.72756553487852,
+          "max": 102.14117719302885
+        },
+        "query_count": {
+          "median": 2343,
+          "min": 2343,
+          "max": 2343
+        },
+        "catalog_query_count": {
+          "median": 107,
+          "min": 107,
+          "max": 107
+        },
+        "catalog_ms": {
+          "median": 80801,
+          "min": 78766,
+          "max": 83496
+        },
+        "show_columns_count": {
+          "median": 16,
+          "min": 16,
+          "max": 16
+        }
+      },
+      {
+        "bd_version": "1.3.1",
+        "databases": 50,
+        "operation": "add-project",
+        "logging": "warning",
+        "samples": 3,
+        "seconds": {
+          "median": 100.7738940899726,
+          "min": 99.38986644800752,
+          "max": 102.06840105098672
+        }
+      },
+      {
+        "bd_version": "1.3.1",
+        "databases": 50,
+        "operation": "claim",
+        "logging": "debug",
+        "samples": 3,
+        "seconds": {
+          "median": 1.9409462199546397,
+          "min": 1.8033427249174565,
+          "max": 2.124770904891193
+        },
+        "query_count": {
+          "median": 77,
+          "min": 77,
+          "max": 77
+        },
+        "catalog_query_count": {
+          "median": 1,
+          "min": 1,
+          "max": 1
+        },
+        "catalog_ms": {
+          "median": 790,
+          "min": 749,
+          "max": 861
+        },
+        "show_columns_count": {
+          "median": 2,
+          "min": 2,
+          "max": 2
+        }
+      },
+      {
+        "bd_version": "1.3.1",
+        "databases": 50,
+        "operation": "claim",
+        "logging": "warning",
+        "samples": 3,
+        "seconds": {
+          "median": 1.9025070741772652,
+          "min": 1.8482062581460923,
+          "max": 2.001769848866388
+        }
+      },
+      {
+        "bd_version": "1.3.1",
+        "databases": 50,
+        "operation": "create",
+        "logging": "debug",
+        "samples": 3,
+        "seconds": {
+          "median": 1.9927137230988592,
+          "min": 1.8901735879480839,
+          "max": 2.1049660281278193
+        },
+        "query_count": {
+          "median": 99,
+          "min": 99,
+          "max": 99
+        },
+        "catalog_query_count": {
+          "median": 1,
+          "min": 1,
+          "max": 1
+        },
+        "catalog_ms": {
+          "median": 780,
+          "min": 773,
+          "max": 873
+        },
+        "show_columns_count": {
+          "median": 2,
+          "min": 2,
+          "max": 2
+        }
+      },
+      {
+        "bd_version": "1.3.1",
+        "databases": 50,
+        "operation": "create",
+        "logging": "warning",
+        "samples": 3,
+        "seconds": {
+          "median": 2.076687344815582,
+          "min": 1.8701616488397121,
+          "max": 2.0872120279818773
+        }
+      },
+      {
+        "bd_version": "1.3.1",
+        "databases": 50,
+        "operation": "migration",
+        "logging": "debug",
+        "samples": 3,
+        "seconds": {
+          "median": 41.67790884990245,
+          "min": 40.893912993138656,
+          "max": 42.53725061821751
+        },
+        "query_count": {
+          "median": 614,
+          "min": 614,
+          "max": 614
+        },
+        "catalog_query_count": {
+          "median": 44,
+          "min": 44,
+          "max": 44
+        },
+        "catalog_ms": {
+          "median": 33288,
+          "min": 31082,
+          "max": 34274
+        },
+        "show_columns_count": {
+          "median": 6,
+          "min": 6,
+          "max": 6
+        }
+      },
+      {
+        "bd_version": "1.3.1",
+        "databases": 50,
+        "operation": "migration",
+        "logging": "warning",
+        "samples": 3,
+        "seconds": {
+          "median": 42.557365105021745,
+          "min": 42.20911922585219,
+          "max": 42.699239935027435
+        }
+      }
+    ]
+  }
 }
