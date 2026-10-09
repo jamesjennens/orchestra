@@ -2016,10 +2016,11 @@ class Service:
                 raise invalid('Invalid credential actor namespace')
             # The id shapes are what make a record read as written by that account or
             # agent (kittrial-5bb.70 review 01a10262): the only one an owner may name is
-            # their own account id.
+            # their own account id. Compared case-folded (kittrial-5bb.199 round 2, N8), so
+            # an id in capitals is the same id rather than a name that only looks like it.
             claimed = actor.split('/', 1)[0] if actor is not None else None
-            if claimed is not None and re.fullmatch(r'(?:usr|agent)_[0-9a-f]{16}', claimed) \
-                    and claimed != principal.user_id:
+            if claimed is not None and re.fullmatch(r'(?:usr|agent)_[0-9a-f]{16}', claimed.casefold()) \
+                    and claimed.casefold() != str(principal.user_id).casefold():
                 raise invalid('A credential actor namespace cannot have the shape of an account or agent id '
                               'other than your own account id')
             if actor is not None:
@@ -2315,25 +2316,39 @@ class Service:
         # A credential issued with NO name has ``actor`` None and holds no name: it writes under its
         # issuer's account id, which no other account can be issued (review of kittrial-5bb.199, round 2:
         # a None here raised AttributeError and answered 500 to every other account's named credential).
-        return isinstance(namespace, str) and bool(namespace) and isinstance(name, str) and (
-            name == namespace or name.startswith(namespace.rstrip('/') + '/'))
+        #
+        # The head is compared CASE-FOLDED, as the tracker's own name rule folds it (kittrial-5bb.199
+        # round 2, N2: actor_names.head). ``IT-A745`` and ``it-a745`` are one name: a second account may
+        # not take the other spelling, and work under either spelling belongs to everyone who held it.
+        # Without this, the first holder's credentials could be revoked and the other account issued the
+        # lower-case name with no waiver, after which old work belonged to both and neither could approve.
+        if not (isinstance(namespace, str) and namespace and isinstance(name, str) and name):
+            return False
+        namespace = namespace.casefold()
+        name = name.casefold()
+        return name == namespace or name.startswith(namespace.rstrip('/') + '/')
 
     def note_settings(self):
         """Record what the installation's settings are at this start; answers ``(was, is)``.
 
         Turning ``approval_by_another_party`` on or off is done outside the service (a flag,
         or the office configuration) and used to leave no trace. The state keeps what the
-        last start had, and a start that differs writes one audit entry. A state that has
-        never recorded it counts as off, which is what every earlier kit was.
+        last start had, and a start whose rule differs from a readable record writes one
+        audit entry. A record that is anything but a JSON ``true`` or ``false`` -- absent,
+        null, a string such as ``"yes"`` or ``"false"``, a list, an object or a number -- is
+        UNKNOWN, not off (kittrial-5bb.199 round 2, N5): the entry and the start line say so
+        rather than inventing an ``off -> on`` change or staying silent after a lost ON.
         """
         with self.store.lock:
             seen = self.state.get('settings_seen')
-            was = bool(seen.get('approval_by_another_party')) if isinstance(seen, dict) else False
+            raw = seen.get('approval_by_another_party') if isinstance(seen, dict) else None
+            was = raw if isinstance(raw, bool) else None
             now = bool(self.approval_by_another_party)
             if was != now:
                 self.audit(None, None, 'settings.approval_by_another_party', 'committed',
-                           reason='%s -> %s at service start' % ('on' if was else 'off', 'on' if now else 'off'))
-            if not isinstance(seen, dict) or was != now or 'approval_by_another_party' not in seen:
+                           reason='%s -> %s at service start'
+                                  % ('unknown' if was is None else ('on' if was else 'off'),
+                                     'on' if now else 'off'))
                 self.state['settings_seen'] = {'approval_by_another_party': now}
                 self.store.save()
             return was, now

@@ -3634,9 +3634,12 @@ class ApiHandler(BaseHTTPRequestHandler):
                        'task\'s assignee, the person who owns the agent that delivered it, and that person\'s '
                        'other agents cannot recommend it')
 
-    #: The same with the installation's setting on (kittrial-5bb.199): a worker credential is a reason too.
+    #: The same with the installation's setting on (kittrial-5bb.199): a worker credential is a reason too,
+    #: in both directions -- work delivered under your credential, and a credential you issued recommending
+    #: your own work (round 2, N6).
     NOT_INDEPENDENT_PARTY = (NOT_INDEPENDENT + '; and on this server neither can the account that issued the worker '
-                             'credential it was delivered under, nor that account\'s agents')
+                             'credential it was delivered under, nor that account\'s agents, nor a worker credential '
+                             'issued by the contribution\'s author or by the task\'s assignee')
 
     #: Said to an approver of the party the work belongs to (the setting of kittrial-5bb.199). Which of
     #: the three is said depends on what is true; each ends with OWN_PARTY_NEXT.
@@ -6167,7 +6170,10 @@ class ApiHandler(BaseHTTPRequestHandler):
         memberships, re-authorizing each project with the live ``CAP_READ`` check,
         one queue read per project and at most :data:`ME_WORK_MAX_PROJECTS` projects.
         ``to_review`` lists contributions only in projects where the caller holds the
-        approval capability. Computed at read time; nothing is scheduled or marked.
+        approval capability. With the party rule on it holds only work the caller may
+        actually approve: a row of the caller's own party is left out, since approving it
+        would be refused (kittrial-5bb.199 review, N4). Computed at read time; nothing is
+        scheduled or marked.
         """
         principal = ctx.principal
         if principal.via == 'credential':
@@ -6218,7 +6224,14 @@ class ApiHandler(BaseHTTPRequestHandler):
                 if CAP_APPROVE in capabilities and item['review_state'] in (
                         'awaiting-review', 'legacy-review-ready', 'awaiting-integration',
                         'approved'):
-                    to_review.append(row)
+                    # The party rule's read (kittrial-5bb.199 review, N4): a row whose author or
+                    # assignee is the caller's own party would be refused at approval, so My work
+                    # does not offer it. Off, `_independent_all` is by person, as it always was.
+                    if not self.service.approval_by_another_party or self._independent_all(
+                            [actor, principal.user_id],
+                            [item.get('assignee'), item.get('contribution_author')],
+                            project['id']):
+                        to_review.append(row)
         if len(assigned) > MAX_PAGE or len(to_review) > MAX_PAGE:
             truncated = True
         try:
@@ -6796,11 +6809,14 @@ def build_backend(service, args):
 
 def settings_lines(service):
     """What the service says about its rule settings when it starts: one line each, and the
-    change is in the audit when it differs from the last start (``Service.note_settings``)."""
+    change is in the audit when it differs from the last start (``Service.note_settings``).
+    A last start that cannot be read is named as unknown, not shown as ``off`` (N5)."""
     was, now = service.note_settings()
     word = {True: 'on', False: 'off'}
     line = 'approval by another party (--approval-by-another-party): %s' % word[now]
-    if was != now:
+    if was is None:
+        line += ' (the last start was not recorded; that is written to the audit)'
+    elif was != now:
         line += ' (it was %s at the last start; recorded in the audit)' % word[was]
     return [line]
 
