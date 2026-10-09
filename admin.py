@@ -4999,13 +4999,22 @@ def authorized_keys(root,key_file,role='both',python=None,comment=None,projects=
                 'a new session under this key makes the new actor that principal\'s. The binding is the '
                 '--principal argument of the line; the comment only repeats it. A lane is spelled lane:NAME '
                 '(or person:NAME, which is a different principal).')
+            payload['notes'].append(
+                'A bound key owns no actors in the project before its first registration, so its first kit '
+                'call must be session register. No other command (such as docs or ready) can precede '
+                'registration or be used as a check of the key: client.py requires --actor, and the '
+                'endpoint\'s principal gate refuses any actor until registered. To verify the key without '
+                'registering (or without making an actor), check the line on the server with admin.py '
+                '--root RUNTIME authorized-keys-list, or test client SSH access with plain ssh HOST exit or '
+                'ssh -T HOST (refused on stderr with status 2 by the forced command wrapper, confirming '
+                'connection and confinement).')
         bound_note='--project or --principal' if principal is not None else '--project'
         payload['notes'].extend([
             'The operator line is not printed with %s: an unrestricted key has the account\'s shell and '
             'cannot be bound. A key that already has an unrestricted or an unbound line in authorized_keys '
             'is not bound by adding this one: replace that line.'%bound_note,
-            'admin.py authorized-keys-list shows every line of authorized_keys, what it is bound to and '
-            'whether it still points at the installed kit.'])
+            'admin.py --root RUNTIME authorized-keys-list shows every line of authorized_keys, what it is '
+            'bound to and whether it still points at the installed kit.'])
     if role in ('contributor','both'):payload['contributor']=lines['contributor']
     if role in ('operator','both'):payload['operator']=lines['operator']
     print(json.dumps(payload,ensure_ascii=True,indent=2))
