@@ -100,7 +100,7 @@ def help_payload(action='work'):
                              'contribution comment ID, not a Git commit or latest_comment_id',
             'item_fields': ['task', 'title', 'owner', 'status', 'review_state', 'contribution_id',
                             'commit', 'pending_review_items', 'pending_change_requests', 'open_items',
-                            'checkpoint_at', 'newer_activity',
+                            'blocking_items', 'checkpoint_at', 'newer_activity',
                             'pending_handoff_requests',
                             'pending_handoff_total', 'pending_handoff_next_offset', 'lifecycle',
                             'lifecycle_scope', 'lifecycle_matches_contribution', 'error',
@@ -422,6 +422,8 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
             checkpoint_states[row['id']]=checkpoint_state(row,normalize=False)
             latest_checkpoint=checkpoint_states[row['id']]['current']
             open_items=len(latest_checkpoint[0]['open_items']) if latest_checkpoint else 0
+            blocking_items=sum(item['kind'] in ('blocker','dependency')
+                               for item in latest_checkpoint[0]['open_items']) if latest_checkpoint else 0
             if latest_checkpoint:
                 comments=row.get('comments') or []
                 position=next(index for index,comment in enumerate(comments)
@@ -430,11 +432,12 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
                 newer_activity=any(comment.get('author')!=row.get('assignee')
                                    for comment in comments[position+1:])
         except (ValueError,TypeError,KeyError,StopIteration):
-            open_items=None;checkpoint_at=None;newer_activity=None
+            open_items=None;blocking_items=None;checkpoint_at=None;newer_activity=None
         pending_change_requests=[]
         for pending in review.get('pending_requests',[]):
             if pending.get('request') not in pending_change_requests:pending_change_requests.append(pending.get('request'))
-        items.append({'open_items':open_items,'checkpoint_at':checkpoint_at,'newer_activity':newer_activity,
+        items.append({'open_items':open_items,'blocking_items':blocking_items,
+                      'checkpoint_at':checkpoint_at,'newer_activity':newer_activity,
                       'pending_change_requests':pending_change_requests[:PENDING_REQUEST_IDS_MAX],
                       'task':row['id'],'title':str(row.get('title',''))[:200],'owner':row.get('assignee'),'status':row.get('status'),'review_state':state,
                       'contribution_id':contribution.get('comment_id'),'commit':contribution.get('commit'),'pending_review_items':len(review.get('pending_requests',[])),

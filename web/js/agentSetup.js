@@ -114,7 +114,7 @@ export function runSteps(server, file) {
     `2. Your own tasks: GET ${server}/v1/agents/me/next, for example curl.exe -fsS -K "${file.powershell}" ${server}/v1/agents/me/next. The reply lists your own tasks first: review feedback to address, then a task you left blocked, then one in progress. Act on the first. Before you act, read the task brief it links to; it does not carry comments yet, so if you expect word from your coordinator on that task, read its history too (the same address ending in /history).`,
     '3. Only when none of your own tasks needs action: the tasks the same reply says you could claim. Claim exactly one that nobody holds, and work on that one until it is delivered.',
     '4. A task assigned to somebody else is held, and so is one somebody else claimed: leave it. A parent or coordination task is background for a task you picked, not an inbox: nothing is posted there for you.',
-    '5. Record a checkpoint when you stop, with what you need to continue, and deliver work for review through the API, always with curl -K as above.',
+    '5. Record a checkpoint when you stop, with what you need to continue, and deliver work for review through the API, always with curl -K as above. If an answer is needed before you can proceed, record an open item of kind blocker, not only a question. Only blockers and dependencies mark undelivered work as blocked; delivered work follows its review state.',
   ];
 }
 

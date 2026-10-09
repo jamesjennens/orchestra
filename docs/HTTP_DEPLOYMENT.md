@@ -2498,28 +2498,57 @@ line separately and unconfined.
   the `bd list` snapshot, whose rows carry no review state and no checkpoint, so an
   agent with changes requested, a contribution awaiting review or a blocker was told
   there was nothing to do. The agent's own tasks now come from the canonical `work`
-  view. The same unfiltered snapshot supplies own states and claimable suggestions,
-  however many agents the owner displays. `/v1/agents/me/next`, owner lists and
-  owner detail cost one canonical `work` command per page (100 rows), with no
-  additional `bd list` or owner-filtered work command. In-process projects cost one
-  snapshot read. Bounds still report `truncated`; nothing is cached across requests
+  view. Complete unfiltered snapshots supply own states and claimable suggestions
+  with one canonical `work` command per page (100 rows), without `bd list`. On the
+  single-agent route, an incomplete snapshot falls back to paged owner-filtered
+  work so tasks beyond the project snapshot bound are recovered. When the first
+  page's total exceeds the 1,000-row bound, stop once there are enough claimable
+  suggestions to fill the 30-action list. If the first page fills them, 250 own
+  tasks need three owner pages, four work commands in total. A first page filled
+  by other people's review states continues paging for claimable suggestions,
+  up to ten pages (1,000 rows). Owner-filtered recovery also stops at 1,000 rows;
+  its counts are lower bounds when more remain. Owner lists reuse the bounded
+  unfiltered snapshot and can under-count own tasks beyond it. In-process projects cost one
+  snapshot read. `snapshot_truncated` marks incomplete project suggestions/counts;
+  `own_tasks_truncated` marks incomplete own counts; `actions_truncated` marks a
+  suggestion or action cap. `truncated` is their combined signal. Counts over an
+  incomplete source are lower bounds, not project totals: summaries say "at least N".
+  An incomplete read with no observed own work says `unknown`, never `idle`;
+  observed claimable actions are still offered. A failed work read of a still-authorized
+  project says `error`, increments `read_errors`, and marks snapshot and own counts
+  incomplete. Successful projects retain their actions. Projects the principal can
+  no longer read are excluded. Nothing is cached across requests
   by the attention calculation, and live authority is checked before every project.
   - **One action per own task, in this order:** `changes-requested` (priority 1, with
     `requests`, the request-changes record ids), `blocked` (2: the latest checkpoint
-    lists open items; with `open_items`, `blocked_since` and `newer_activity`),
-    `in-progress` (3: claimed, not closed, nothing delivered yet), then review work
-    and `claimable-task` (4, see below), then `awaiting-review` and
-    `awaiting-integration` (5).
-    `review-error` names the malformed state and asks an operator to reconcile it;
+    lists an open `blocker` or `dependency` on undelivered work; with `open_items`,
+    `blocking_items`, `blocked_since` and `newer_activity`),
+    `in-progress` (3: claimed, not closed, nothing delivered yet), then
+    review work and `claimable-task` (4, see below), then `awaiting-review` and `awaiting-integration` (5).
+    `review-error` (priority 2) names the malformed state and asks an operator to reconcile it;
     other own states get `review-state`, naming the state and who acts next. Neither
     silently disappears from the action list. Action **kind names** are the client
     contract. Numeric priorities are relative sorting hints, can change between kit
     revisions, and must not be treated as a stable enum. With both undelivered work
     and a delivered contribution, the state is `working`, while the waiting action
     remains visible after work the agent can do.
-    Explicitly unreadable checkpoint history keeps `open_items: null` and gets
+    Questions, decisions and corrections do not block. If an answer is needed to
+    proceed, record a blocker rather than only a question. Delivered tasks follow
+    their review state regardless of checkpoint items.
+    On an older endpoint that omits `blocking_items`, attention and My work use
+    its validated `open_items` count to preserve that endpoint's blocking policy.
+    An explicit unreadable or malformed blocking count stays unknown.
+    The action's 20-request-id cap is defensive projection of injected oversized
+    rows. Real writes refuse a second request-changes record on the same
+    contribution; this cap is not a verified reachable review sequence.
+    Explicitly unreadable checkpoint history keeps both item counts `null` and gets
     `checkpoint-error`, asking an operator to reconcile it. Unknown does not count
     as zero unresolved items or as undelivered work the agent can safely continue.
+    Native unreadable cases include conflicting valid checkpoint roots or links,
+    cycles and missing predecessor records. A malformed ignored checkpoint comment
+    alone does not trigger this error: the last valid checkpoint still stands.
+    An invalid imported in-process checkpoint pointer can also produce unknown
+    history; it is a separate backend case. Delivered work keeps its review action.
   - **Review work (kittrial-5bb.115).** Two kinds, for an agent that holds the reviews
     capability in the project. They come from the same `work` snapshot: no further
     read.
@@ -2590,23 +2619,29 @@ line separately and unconfined.
     answered (or the reviewer records their disposition).
   - **A blocked task can stay quiet.** `blocked_since` is when the latest checkpoint
     was written; its own subsequent authored records do not make `newer_activity`
-    true. Another native actor's comment does; missing author attribution retains
-    the previous conservative wake signal. On the in-process backend attributed
-    owner edits also count. Native description edits lack reliable editor identity
-    and are awaiting the recorded owner decision; no editor is inferred from the
-    original creator. The brief's separate checkpoint freshness flag still compares
+    true. Another native actor's comment does, comparing with the current assignee
+    even when the checkpoint author held the task before reassignment. On the
+    in-process backend attributed owner edits also count. Unattributed native title
+    and description edits stay quiet; people comment to wake the agent. No editor
+    is inferred from the original creator. The brief's separate checkpoint freshness flag still compares
     the full snapshot for checkpoint reconciliation. An agent can leave a quiet task
     alone instead of
     re-reading it and writing another checkpoint on every wake.
   - **`counts`** are over the agent's own tasks: `claimed` (every task it holds that
     the `work` view lists: open ones, and closed ones whose review is still active),
     `changes_requested`, `blocked`, `in_progress` (not delivered and not blocked),
-    `awaiting_review`, `awaiting_integration`, and `claimable` for the project. A task
-    with changes requested and open checkpoint items counts in both.
-  - **`state`**: `changes-requested`, `blocked`, `working`, `waiting-review`,
-    `waiting-integration` or `idle`, the first that applies.
-  - `GET /v1/me/work` (a person's own queue) still reads its blocked signal from the
-    bounded per-task `brief` reads described above.
+    `awaiting_review`, `awaiting_integration`, `review_errors`, `checkpoint_errors`,
+    and `claimable` for the project. `read_errors` counts failed authorized-project
+    work reads. Delivered work does not count as blocked.
+    `open_items` still counts all open kinds; `blocking_items` counts the two
+    blocking kinds. Unknown counts are preserved rather than treated as zero.
+  - **`state`**: a failed authorized work read takes `error`; otherwise
+    `changes-requested`, `error`, `blocked`, `working`, `waiting-review`,
+    `waiting-integration`, `unknown` (incomplete with no observed own work), or
+    `idle`, the first that applies.
+    An error-only queue names its review/checkpoint error and operator action.
+  - `GET /v1/me/work` (a person's own queue) uses the same kind and delivered-state
+    policy, with its bounded per-task detail reads described above.
 - Administrative audit coverage is partial: login outcomes, authorization
   denials and every successful idempotent mutation are recorded; a per-field
   before/after administrative trail is not implemented.
