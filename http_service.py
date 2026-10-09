@@ -58,6 +58,8 @@ from http_auth import (AGENT_SECRET_ENV, agent_secret_file, CAP_ACCOUNTS_ADMIN, 
                        uncertain, unsupported)
 
 KIT_VERSION = '0.1.0'
+#: Where the installed kit is: the documents this service shows are read from it.
+KIT_DIRECTORY = Path(__file__).resolve().parent
 MAX_BODY_BYTES = 262144
 MAX_ATTACHMENTS = 8
 MAX_ATTACHMENT_BYTES = 65536
@@ -1064,6 +1066,8 @@ class InProcessBackend:
         at=last.get('created_at') if last and not unreadable else None
         return {'pending_change_requests':[r['id'] for r in review['requests'] if r['status']=='open'][:20],
                 'open_items':None if unreadable else (len(last.get('open_items') or []) if last else 0),
+                'blocking_items':None if unreadable else sum(item.get('kind') in ('blocker','dependency')
+                                                            for item in (last.get('open_items') or []) if isinstance(item,dict)) if last else 0,
                 'checkpoint_at':at,
                 'newer_activity':self._other_agent_activity(task,last) if last and not unreadable else None}
 
@@ -1226,6 +1230,16 @@ def queue_item(project_id, task, review_state, contribution, open_requests,
             'contribution_author': contribution_author}
 
 
+def attention_blocking_items(fields):
+    """Validate blocking count; older endpoints supplied only open_items.
+
+    An explicitly unreadable blocking count stays unknown. Only omission uses
+    the older endpoint's open-item policy.
+    """
+    value = fields.get('blocking_items', fields.get('open_items', 0))
+    return value if type(value) is int and value >= 0 else None
+
+
 def own_queue_tasks(queue, actor=None):
     """Split one current review snapshot by assignee, retaining unknown checkpoint state."""
     tasks=[]
@@ -1237,7 +1251,9 @@ def own_queue_tasks(queue, actor=None):
                       'assignee':row.get('assignee'),'review_state':row.get('review_state'),
                       'contribution_id':(row.get('contribution') or {}).get('id'),
                       'pending_change_requests':list(fields.get('pending_change_requests') or [])[:20],
-                      'open_items':fields.get('open_items',0),'checkpoint_at':fields.get('checkpoint_at'),
+                      'open_items':fields.get('open_items',0),
+                      'blocking_items':attention_blocking_items(fields),
+                      'checkpoint_at':fields.get('checkpoint_at'),
                       'newer_activity':fields.get('newer_activity')})
     return {'tasks':tasks,'complete':bool(queue.get('complete'))}
 
@@ -2528,9 +2544,11 @@ class EndpointBackend:
     def _attention_fields(row):
         """The four attention fields of one canonical ``work`` row, type-checked."""
         open_items = row.get('open_items', 0)
+        blocking_items = attention_blocking_items(row)
         return {'pending_change_requests': [value for value in row.get('pending_change_requests') or []
                                             if isinstance(value, str)][:20],
                 'open_items': open_items if type(open_items) is int and open_items>=0 else None,
+                'blocking_items':blocking_items if type(blocking_items) is int and blocking_items>=0 else None,
                 'checkpoint_at': row.get('checkpoint_at') if isinstance(row.get('checkpoint_at'), str) else None,
                 'newer_activity': row.get('newer_activity') if type(row.get('newer_activity')) is bool else None}
 
@@ -2568,6 +2586,7 @@ class EndpointBackend:
                              'contribution_id': (item.get('contribution') or {}).get('id'),
                              'pending_change_requests': list(attention.get('pending_change_requests') or []),
                              'open_items': attention.get('open_items',0),
+                             'blocking_items':attention_blocking_items(attention),
                              'checkpoint_at': attention.get('checkpoint_at'),
                              'newer_activity': attention.get('newer_activity')})
             return {'tasks': rows, 'complete': bool(queue.get('complete'))}
@@ -2595,7 +2614,7 @@ class EndpointBackend:
                 break
         return {'tasks': rows, 'complete': complete}
 
-    def review_queue(self, project_id):
+    def review_queue(self, project_id, stop_if_over_bound=False):
         """The canonical ``work`` queue (review projection per task), fully paged.
 
         ``work`` already applies the kit's own rules: structured review wins over
@@ -2642,8 +2661,20 @@ class EndpointBackend:
             if offset is None:
                 complete = True
                 break
+            # Over-bound single-agent reads recover own tasks separately. Stop
+            # once claimable suggestions fill; a review-heavy first page must
+            # not hide all unclaimed work. Keep the same bounded page walk.
+            claimable = sum(item.get('status') == 'open' and item.get('assignee') is None
+                            for item in items)
+            if (stop_if_over_bound and type(page.get('total')) is int
+                    and page['total'] > self.QUEUE_MAX_PAGES * MAX_PAGE
+                    and claimable >= min(AGENT_CLAIMABLE_LIMIT, AGENT_ACTION_LIMIT)):
+                break
         items.sort(key=queue_order)
         return {'items': items, 'complete': complete, 'warnings': sorted(warnings)}
+
+    def agent_snapshot(self,project_id):
+        return self.review_queue(project_id,stop_if_over_bound=True)
 
 
 #: What a row that cannot be read is called, in the words of the endpoint's readers
@@ -3417,7 +3448,8 @@ class ApiHandler(BaseHTTPRequestHandler):
     # -- mutation helper -------------------------------------------------------
     def _mutate(self, ctx, route_name, project_id, fn, *, capability, allow_self_user=None,
                 status=200, idempotent=True, replay_status=None, serialize=True,
-                canonical=False, reason=None, refused_reason=None):
+                canonical=False, reason=None, refused_reason=None,
+                audit_success=True, state_saved=None, audit_metadata=None):
         """Run one authorized, idempotent mutation.
 
         ``capability`` names the authority the route needs. The idempotency key is
@@ -3473,6 +3505,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                                'denied' if error.status in (401, 403) else 'rejected',
                                project_id=project_id,
                                reason=error.code if refused_reason is None else '%s: %s' % (error.code, refused_reason))
+            if not audit_success:
+                self._audited_refusal = True
             # The refusal is the answer whether or not its audit entry can be saved now
             # (kittrial-5bb.156): nothing was carried out, so a lock wait that runs out here
             # must not turn it into "cannot say". The entry is written with the next save.
@@ -3494,11 +3528,24 @@ class ApiHandler(BaseHTTPRequestHandler):
         if isinstance(public, dict) and isinstance(public.get('server_time'), str):
             at = public['server_time']
         self._written_at = at
-        self.service.idempotency_commit(digest, status, stored, written_at=at)
-        self._forget_cached_reads(ctx.principal, project_id)
-        self.service.audit(ctx.request_id, ctx.principal, route_name, 'committed',
-                           project_id=project_id, reason=reason)
-        self.service.store.save()
+        with self.service.store.lock:
+            if audit_success:
+                event = self.service.audit(ctx.request_id, ctx.principal, route_name, 'committed',
+                                           project_id=project_id, reason=reason)
+                if audit_metadata:
+                    event.update(audit_metadata)
+            if state_saved:
+                # Credential issuance/revocation owns a persistence boundary. A
+                # crash before its receipt must not replay a nonexistent credential.
+                self.service.store.save()
+                state_saved()
+                self.service.idempotency_commit(digest, status, stored, written_at=at)
+            else:
+                # Preserve ordinary routes' receipt-first retry contract: a failed
+                # state save must not strand their key as in-progress for 24 hours.
+                self.service.idempotency_commit(digest, status, stored, written_at=at)
+                self.service.store.save()
+            self._forget_cached_reads(ctx.principal, project_id)
         return status, public
 
     def require(self, ctx, capability):
@@ -3621,9 +3668,12 @@ class ApiHandler(BaseHTTPRequestHandler):
                        'task\'s assignee, the person who owns the agent that delivered it, and that person\'s '
                        'other agents cannot recommend it')
 
-    #: The same with the installation's setting on (kittrial-5bb.199): a worker credential is a reason too.
+    #: The same with the installation's setting on (kittrial-5bb.199): a worker credential is a reason too,
+    #: in both directions -- work delivered under your credential, and a credential you issued recommending
+    #: your own work (round 2, N6).
     NOT_INDEPENDENT_PARTY = (NOT_INDEPENDENT + '; and on this server neither can the account that issued the worker '
-                             'credential it was delivered under, nor that account\'s agents')
+                             'credential it was delivered under, nor that account\'s agents, nor a worker credential '
+                             'issued by the contribution\'s author or by the task\'s assignee')
 
     #: Said to an approver of the party the work belongs to (the setting of kittrial-5bb.199). Which of
     #: the three is said depends on what is true; each ends with OWN_PARTY_NEXT.
@@ -3974,8 +4024,12 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     @route('POST', r'/v1/accounts/(?P<uid>' + ID + r')/disable')
     def account_disable(self, ctx):
+        metadata = {}
+        def disable():
+            metadata.update(self._revocation_metadata(user_id=ctx.params['uid']))
+            return self._account_disabled(ctx)
         return self._mutate(ctx, 'accounts.disable', None,
-                            lambda: self._account_disabled(ctx),
+                            disable, audit_metadata=metadata,
                             capability=CAP_ACCOUNTS_ADMIN,
                             allow_self_user=ctx.params['uid'],
                             idempotent=bool(ctx.idempotency_key))
@@ -3983,6 +4037,17 @@ class ApiHandler(BaseHTTPRequestHandler):
     def _account_disabled(self, ctx):
         result = self.service.disable_user(ctx.principal, ctx.params['uid'])
         return result, result
+
+    def _revocation_metadata(self, *, agent_id=None, user_id=None):
+        """IDs affected by disable, captured under the mutation lock before pruning."""
+        agents = self.service.state['agents']
+        agent_ids = [agent_id] if agent_id is not None else sorted(
+            aid for aid, agent in agents.items() if agent.get('owner') == user_id)
+        credential_ids = sorted(cid for cid, credential in self.service.state['credentials'].items()
+                                if not credential.get('revoked') and
+                                (credential.get('agent_id') == agent_id if agent_id is not None
+                                 else credential.get('user_id') == user_id))
+        return {'agent_ids': agent_ids, 'target_credential_ids': credential_ids}
 
     # -- project and membership routes ----------------------------------------
     @route('POST', r'/v1/projects')
@@ -4322,6 +4387,34 @@ class ApiHandler(BaseHTTPRequestHandler):
                 if verdict[0] == 'no-canonical' else verdict[1]
             view['needs_confirmation'] = verdict[0] == 'unconfirmed'
         return view
+
+    # -- the kit's documents for members (kittrial-5bb.226) --------------------------------
+    #
+    # How a worker finds its work, how a coordinator reaches it, and the prompts a worker is
+    # started and woken with. The same files the client's ``docs`` serves, read by the same
+    # reader, so the page shows what the kit serves. For any signed-in member, a viewer
+    # included, and for an agent's credential; nothing of a project and no secret is in them.
+    @route('GET', r'/v1/docs')
+    def docs_list(self, ctx):
+        import onboarding
+        return 200, {'items': [{key: value for key, value in onboarding.member_document(KIT_DIRECTORY, name).items()
+                                if key != 'text' and key != 'prompt'} for name in onboarding.WEB_DOCUMENTS],
+                     'server_url': self.service.public_url or None}
+
+    @route('GET', r'/v1/docs/(?P<name>[a-z][a-z-]{0,40})')
+    def docs_get(self, ctx):
+        import onboarding
+        name = ctx.params['name']
+        if name not in onboarding.WEB_DOCUMENTS:
+            raise not_found('No such document. GET /v1/docs lists the documents this service serves.')
+        try:
+            document = onboarding.member_document(KIT_DIRECTORY, name)
+        except (OSError, ValueError) as failed:
+            raise HttpError(503, 'unavailable', 'The document %s could not be read from the installed kit (%s).'
+                            % (name, type(failed).__name__))
+        # The address this service is configured with, for the page to put into a prompt.
+        # Never the request's Host header, which a client controls.
+        return 200, dict(document, server_url=self.service.public_url or None)
 
     @route('GET', r'/v1/projects')
     def projects_list(self, ctx):
@@ -4713,9 +4806,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         return self._mutate(ctx, 'agents.create', None, create, status=201,
                             capability=CAP_AGENTS, replay_status=200)
 
-    def _agent_items(self, principal):
+    def _agent_items(self, principal, agents=None):
         items = []
-        for agent in self.service.list_agents(principal):
+        for agent in self.service.list_agents(principal) if agents is None else agents:
             # One read per project for all the agents listed, not one per agent.
             attention = self._agent_attention(principal, agent, many=True)
             items.append(dict(agent, attention=self._agent_attention_view(agent, attention),
@@ -4725,6 +4818,17 @@ class ApiHandler(BaseHTTPRequestHandler):
     @route('GET', r'/v1/agents')
     def agents_list(self, ctx):
         self.require(ctx, CAP_AGENTS)
+        if any(key in ctx.query for key in ('limit', 'cursor', 'unconfirmed')):
+            limit, state = self._page(ctx, ctx.query)
+            unconfirmed = ctx.query.get('unconfirmed', 'false')
+            if unconfirmed not in ('true', 'false'):
+                raise invalid('unconfirmed must be true or false')
+            agents, total = self.service.agent_page(ctx.principal, state['o'], limit,
+                                                  unconfirmed=unconfirmed == 'true')
+            return 200, {'items': self._agent_items(ctx.principal, agents), 'total': total,
+                         'next_cursor': make_cursor(ctx.principal, None, ctx.query, state['o'] + limit)
+                         if state['o'] + limit < total else None,
+                         'generated_at': now_iso(self.service._now())}
         items = self._agent_items(ctx.principal)
         return 200, {'items': items, 'total': len(items),
                      'generated_at': now_iso(self.service._now())}
@@ -4741,6 +4845,7 @@ class ApiHandler(BaseHTTPRequestHandler):
     @route('PATCH', r'/v1/agents/(?P<aid>' + ID + r')')
     def agents_update(self, ctx):
         payload = dict(ctx.payload or {})
+        metadata = {}
 
         def update():
             record = self.service.state['agents'].get(ctx.params['aid'])
@@ -4763,9 +4868,12 @@ class ApiHandler(BaseHTTPRequestHandler):
                 # field the route does not take. Nothing is written by the check.
                 self.service.check_agent_grant(ctx.principal, payload.get('projects'), owner_id=record['owner'])
             refuse_unknown_fields(payload, self.AGENT_UPDATE_FIELDS, 'An agent change')
+            if 'enabled' in payload and payload['enabled'] is not None and not bool(payload['enabled']):
+                metadata.update(self._revocation_metadata(agent_id=ctx.params['aid']))
             result = self.service.update_agent(ctx.principal, ctx.params['aid'], payload)
             return result, result
-        return self._mutate(ctx, 'agents.update', None, update, capability=CAP_AGENTS)
+        return self._mutate(ctx, 'agents.update', None, update, capability=CAP_AGENTS,
+                            audit_metadata=metadata)
 
     def _require_grantable(self, principal, projects, held, owner_id=None):
         """Refuse a NEW agent grant on a record the backend will not serve (kittrial-5bb.84, .90).
@@ -4804,10 +4912,13 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     @route('POST', r'/v1/agents/(?P<aid>' + ID + r')/disable')
     def agents_disable(self, ctx):
+        metadata = {}
         def disable():
+            metadata.update(self._revocation_metadata(agent_id=ctx.params['aid']))
             result = self.service.disable_agent(ctx.principal, ctx.params['aid'])
             return result, result
-        return self._mutate(ctx, 'agents.disable', None, disable, capability=CAP_AGENTS)
+        return self._mutate(ctx, 'agents.disable', None, disable, capability=CAP_AGENTS,
+                            audit_metadata=metadata)
 
     @route('POST', r'/v1/agents/(?P<aid>' + ID + r')/enable')
     def agents_enable(self, ctx):
@@ -4843,8 +4954,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                 ctx.principal, ctx.params['aid'], scopes=payload.get('scopes'),
                 label=payload.get('label'), request_id=ctx.request_id)
             return result, _redact_agent_secret(result)
-        return self._mutate(ctx, 'agents.credentials.issue', None, issue, status=201,
-                            capability=CAP_AGENTS, replay_status=200)
+        return self._mutate_agent_credential(ctx, 'agents.credentials.issue', issue, status=201,
+                                             replay_status=200)
 
     @route('POST', r'/v1/agents/(?P<aid>' + ID + r')/credentials/'
                   r'(?P<cid>' + ID + r')/revoke')
@@ -4854,8 +4965,36 @@ class ApiHandler(BaseHTTPRequestHandler):
                 ctx.principal, ctx.params['aid'], ctx.params['cid'],
                 request_id=ctx.request_id)
             return result, result
-        return self._mutate(ctx, 'agents.credentials.revoke', None, revoke, status=204,
-                            capability=CAP_AGENTS)
+        return self._mutate_agent_credential(ctx, 'agents.credentials.revoke', revoke, status=204)
+
+    def _mutate_agent_credential(self, ctx, operation, fn, **options):
+        """Save the credential and its route audit in one atomic JSON replacement.
+
+        Issuance rolls back before a successful state save. Revocation stays effective
+        in memory even if that save fails. A receipt failure after saving keeps the
+        durable effect and its in-progress reservation; it cannot issue a second secret.
+        """
+        with self.service.store.lock:
+            agent = self.service.state['agents'].get(ctx.params['aid'])
+            if not isinstance(agent, dict):
+                return self._mutate(ctx, operation, None, fn, capability=CAP_AGENTS, **options)
+            saved = [False]
+            with self.service._agent_credential_transaction(
+                    agent, rollback=operation != 'agents.credentials.revoke') as mark_saved:
+                def state_saved():
+                    mark_saved()
+                    saved[0] = True
+                try:
+                    return self._mutate(ctx, operation, None, fn, capability=CAP_AGENTS,
+                                        audit_success=False, state_saved=state_saved, **options)
+                except HttpError:
+                    raise  # _mutate already releases a refused reservation and audits it
+                except Exception:
+                    if not saved[0] and ctx.idempotency_key is not None:
+                        digest = self.service._idempotency_key(ctx.principal, None,
+                            '%s %s' % (operation, ctx.route_target), ctx.idempotency_key)
+                        self.service.idempotency_release(digest)
+                    raise
 
     # -- project-scoped agent routes (owner decision 4) ------------------------
     #
@@ -4909,25 +5048,29 @@ class ApiHandler(BaseHTTPRequestHandler):
         for task_id, items in checkpoints.items():
             if isinstance(items, list) and items:
                 last = items[-1]
-                if isinstance(last, dict) and last.get('open_items'):
+                if isinstance(last, dict) and any(item.get('kind') in ('blocker','dependency')
+                                                 for item in last.get('open_items') or [] if isinstance(item,dict)):
                     blocked.add(task_id)
         return blocked
 
     def _agent_own_tasks(self, project_id, actor, many=False):
         """Split this request's current review snapshot by the actual assignee.
 
-        Both own attention and claimable suggestions use the same paged ``work``
-        snapshot. No additional native task-list or owner-filtered read is needed,
-        whether one agent or all the owner's agents are displayed. Authority is
-        still checked per caller/project; nothing is cached across requests here.
+        Complete snapshots supply both own attention and claimable suggestions.
+        A single agent falls back to owner-filtered work when the snapshot is
+        incomplete. Owner lists reuse the bounded snapshot and report truncation.
+        Authority is checked per caller/project; nothing is cached across requests.
         """
         cache = getattr(self, '_agent_own_cache', None)
         if cache is None:
             cache = self._agent_own_cache = {}
         key = (project_id, None if many else actor)
         if key not in cache:
+            queue=self._agent_project_tasks(project_id,many=many)['queue']
+            if not many and not queue.get('complete'):
+                queue=None
             read = self.backend.agent_tasks(project_id, None if many else actor,
-                                            queue=self._review_queue(project_id))
+                                            queue=queue)
             cache[key] = {'tasks': [task for task in read.get('tasks') or [] if isinstance(task, dict)],
                           'complete': bool(read.get('complete'))}
         read = cache[key]
@@ -5001,7 +5144,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         return ordered[:self.AGENT_REVIEW_LIMIT]
 
     @staticmethod
-    def _agent_review_summary(counts):
+    def _agent_review_summary(counts, snapshot_truncated=False):
         """What to add to an agent's summary when there is review work, whatever its state.
 
         The state values do not change for review work, so without this an agent with
@@ -5009,10 +5152,12 @@ class ApiHandler(BaseHTTPRequestHandler):
         for it or for its owner.
         """
         parts = []
+        prefix = 'at least ' if snapshot_truncated else ''
         if counts.get('review_recommended'):
-            parts.append('%d contribution(s) recommended for approval: tell the owner' % counts['review_recommended'])
+            parts.append('%s%d contribution(s) recommended for approval: tell the owner'
+                         % (prefix, counts['review_recommended']))
         if counts.get('to_review'):
-            parts.append('%d contribution(s) to review' % counts['to_review'])
+            parts.append('%s%d contribution(s) to review' % (prefix, counts['to_review']))
         return (' ' + '; '.join(parts) + '.') if parts else ''
 
     #: The order of the kinds that share a priority. The ORDER of ``next_actions`` is the
@@ -5048,7 +5193,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             return False
         return True
 
-    def _agent_project_tasks(self, project_id):
+    def _agent_project_tasks(self, project_id, many=False):
         """Reuse the bounded current-work snapshot, including unclaimed open tasks.
 
         The endpoint costs one work command per page; the in-process backend reads
@@ -5058,13 +5203,16 @@ class ApiHandler(BaseHTTPRequestHandler):
         cache = getattr(self, '_agent_task_cache', None)
         if cache is None:
             cache = self._agent_task_cache = {}
-        if project_id in cache:
-            return cache[project_id]
-        snapshot = self._review_queue(project_id)
+        key=(project_id,many)
+        if key in cache:
+            return cache[key]
+        snapshot = (self._independent_queue(self.backend.agent_snapshot(project_id), project_id)
+                    if not many and hasattr(self.backend,'agent_snapshot') else self._review_queue(project_id))
         rows = [task for task in (snapshot.get('items') or []) if isinstance(task, dict)]
         bound = AGENT_MAX_PAGES * MAX_PAGE
-        result = {'tasks': rows[:bound], 'complete': len(rows) <= bound and bool(snapshot.get('complete'))}
-        cache[project_id] = result
+        result = {'tasks': rows[:bound], 'complete': len(rows) <= bound and bool(snapshot.get('complete')),
+                  'queue':snapshot}
+        cache[key] = result
         return result
 
     def _agent_attention(self, principal, agent, many=False):
@@ -5074,10 +5222,10 @@ class ApiHandler(BaseHTTPRequestHandler):
         task routes apply (:meth:`_agent_may_read`), so a project the principal can no
         longer read drops out of attention instead of leaking its tasks.
 
-        One current-work snapshot per project and request supplies both the agent's
-        own states and the unclaimed open tasks. The endpoint pays one work command
-        per page, with no extra task-list read; every agent in an owner's list reuses
-        those same rows. Nothing is cached across requests here.
+        A complete current-work snapshot supplies own states and unclaimed tasks.
+        Single-agent reads recover own tasks with an owner-filtered read when it
+        is incomplete. Owner lists reuse the bounded rows and report incomplete
+        own counts. Nothing is cached across requests here.
 
         One action per own task, the most pressing reason first, then in this order:
         changes requested (1), blocked by its latest checkpoint (2), in progress with no
@@ -5088,35 +5236,45 @@ class ApiHandler(BaseHTTPRequestHandler):
         carries ``blocked_since`` (when the checkpoint was written) and
         ``newer_activity`` (whether another actor wrote after it), so an
         agent can leave a blocked task with nothing new alone instead of re-reading it
-        and writing another checkpoint on every wake. The counts are independent of the
-        actions: a task with changes requested AND open checkpoint items counts in both.
+        and writing another checkpoint on every wake. Delivered work follows its
+        review state and does not count as blocked, regardless of open items.
         """
         actor = agent.get('actor') or agent.get('id')
         counts = {'claimable': 0, 'claimed': 0, 'changes_requested': 0,
                   'awaiting_review': 0, 'blocked': 0, 'in_progress': 0, 'awaiting_integration': 0,
+                  'review_errors': 0, 'checkpoint_errors': 0, 'read_errors': 0,
                   'review_recommended': 0, 'to_review': 0}
         own_actions = []
         claimable_actions = []
         review_actions = []
         truncated = False
+        snapshot_truncated = own_tasks_truncated = actions_truncated = False
         for project_id in agent.get('projects') or []:
             if not self._agent_may_read(principal, project_id):
                 continue
             try:
-                read = self._agent_project_tasks(project_id)
+                read = self._agent_project_tasks(project_id,many=many)
                 own = self._agent_own_tasks(project_id, actor, many=many)
             except HttpError:
-                # A project the principal can no longer open simply drops out.
+                # Authorization can change during the read. Still-authorized
+                # failed reads are unknown work, never an empty project.
+                if self._agent_may_read(principal, project_id):
+                    counts['read_errors'] += 1
+                    truncated = snapshot_truncated = own_tasks_truncated = True
                 continue
             if not read['complete'] or not own['complete']:
                 truncated = True
+            snapshot_truncated |= not read['complete']
+            own_tasks_truncated |= not own['complete']
             for task in own['tasks']:
                 counts['claimed'] += 1
                 review = task.get('review_state')
                 is_open = task.get('status') != 'closed'
                 open_items = task.get('open_items',0)
-                unreadable = is_open and open_items is None
-                blocked = is_open and type(open_items) is int and open_items > 0
+                blocking_items = attention_blocking_items(task)
+                delivered=bool(task.get('contribution_id')) or review not in (None,'none')
+                unreadable = is_open and (open_items is None or blocking_items is None)
+                blocked = is_open and not delivered and type(blocking_items) is int and blocking_items > 0
                 in_progress = (is_open and not blocked and not unreadable and not task.get('contribution_id')
                                and review in (None, 'none'))
                 integrating = review in ('awaiting-integration', 'approved')
@@ -5125,7 +5283,10 @@ class ApiHandler(BaseHTTPRequestHandler):
                 counts['awaiting_integration'] += integrating
                 counts['blocked'] += blocked
                 counts['in_progress'] += in_progress
+                counts['review_errors'] += review=='error'
+                counts['checkpoint_errors'] += unreadable and review!='error' and not delivered
                 details = {'requests': list(task.get('pending_change_requests') or [])[:20], 'open_items': open_items,
+                           'blocking_items':blocking_items,
                            'blocked_since': task.get('checkpoint_at') if blocked else None,
                            'newer_activity': task.get('newer_activity') if blocked else None}
                 if review == 'changes-requested':
@@ -5137,7 +5298,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                         2, 'review-error', project_id, task,
                         'Review state error: an operator must reconcile the malformed review history.',
                         who='operator', **details))
-                elif unreadable:
+                elif unreadable and not delivered:
                     own_actions.append(self._agent_action(
                         2,'checkpoint-error',project_id,task,
                         'Checkpoint history could not be read; an operator must reconcile it.',
@@ -5145,7 +5306,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 elif blocked:
                     own_actions.append(self._agent_action(
                         2, 'blocked', project_id, task,
-                        'The latest checkpoint left unresolved items.', **details))
+                        'The latest checkpoint left an unresolved blocker or dependency.', **details))
                 elif in_progress:
                     own_actions.append(self._agent_action(
                         3, 'in-progress', project_id, task,
@@ -5176,20 +5337,28 @@ class ApiHandler(BaseHTTPRequestHandler):
                             'Open, unclaimed work the agent may take.'))
             # Review work for this agent, from the same snapshot (kittrial-5bb.115): one call.
             review_actions += self._agent_review_actions(principal, agent, project_id, read['tasks'], counts)
-        # The count is exact over every page; only the collected suggestions are capped,
+        # Counts cover the read pages; incomplete-source counts are lower bounds.
+        # Only the collected suggestions are capped,
         # so a long claimable list can never hide the agent's own feedback.
         if counts['claimable'] > len(claimable_actions):
             truncated = True
+            actions_truncated = True
         review_actions = self._capped_review_actions(review_actions)
         if counts['review_recommended'] + counts['to_review'] > len(review_actions):
             truncated = True
+            actions_truncated = True
         actions = own_actions + review_actions + claimable_actions
         actions.sort(key=lambda a: (a['priority'], self.AGENT_KIND_ORDER.get(a['kind'], 0), a['project'], a['task']))
         if len(actions) > AGENT_ACTION_LIMIT:
             actions = actions[:AGENT_ACTION_LIMIT]
             truncated = True
-        if counts['changes_requested']:
+            actions_truncated = True
+        if counts['read_errors']:
+            state = 'error'
+        elif counts['changes_requested']:
             state = 'changes-requested'
+        elif counts['review_errors'] or counts['checkpoint_errors']:
+            state = 'error'
         elif counts['blocked']:
             state = 'blocked'
         elif counts['in_progress']:
@@ -5200,39 +5369,59 @@ class ApiHandler(BaseHTTPRequestHandler):
             state = 'waiting-integration'
         elif counts['claimed']:
             state = 'working'
+        elif snapshot_truncated or own_tasks_truncated:
+            state = 'unknown'
         else:
             state = 'idle'
-        return {'state': state, 'summary': self._agent_summary(state, counts) + self._agent_review_summary(counts),
+        return {'state': state, 'summary': self._agent_summary(
+                    state, counts, snapshot_truncated, own_tasks_truncated)
+                    + self._agent_review_summary(counts, snapshot_truncated),
                 'counts': counts, 'actions': actions, 'truncated': truncated,
+                'snapshot_truncated':snapshot_truncated,'own_tasks_truncated':own_tasks_truncated,
+                'actions_truncated':actions_truncated,
                 'computed_at': now_iso(self.service._now())}
 
     @staticmethod
-    def _agent_summary(state, counts):
+    def _agent_summary(state, counts, snapshot_truncated=False, own_tasks_truncated=False):
+        claimable = ('at least ' if snapshot_truncated else '') + str(counts.get('claimable', 0))
+        def own_count(name):
+            return ('at least ' if own_tasks_truncated else '') + str(counts.get(name, 0))
+        if state == 'error':
+            if counts.get('read_errors'):
+                return ('%d project work read(s) failed; counts are incomplete. Retry the work read.'
+                        % counts['read_errors'])
+            return ('%d review history error(s), %d unreadable checkpoint history error(s); an operator must reconcile them.'
+                    % (counts.get('review_errors',0),counts.get('checkpoint_errors',0)))
         if state == 'changes-requested':
-            return ('%d contribution(s) have changes requested; act on them first.'
-                    % counts['changes_requested'])
+            return ('%s contribution(s) have changes requested; act on them first.'
+                    % own_count('changes_requested'))
         if state == 'blocked':
-            return ('%d task(s) have unresolved checkpoint items.'
-                    % counts['blocked'])
+            return ('%s task(s) have unresolved blockers or dependencies.'
+                    % own_count('blocked'))
         if state == 'working':
-            return ('%d claimed task(s) in flight, %d not delivered yet; %d claimable.'
-                    % (counts['claimed'], counts.get('in_progress', 0), counts['claimable']))
+            return ('%s claimed task(s) in flight, %s not delivered yet; %s claimable.'
+                    % (own_count('claimed'), own_count('in_progress'), claimable))
         if state == 'waiting-review':
-            return ('%d contribution(s) waiting for a human review decision.'
-                    % counts['awaiting_review'])
+            return ('%s contribution(s) waiting for a human review decision.'
+                    % own_count('awaiting_review'))
         if state == 'waiting-integration':
-            return ('%d approved contribution(s) waiting for integration; nothing for the agent to do.'
-                    % counts.get('awaiting_integration', 0))
-        return ('Idle: %d claimable task(s), nothing in flight.' % counts['claimable'])
+            return ('%s approved contribution(s) waiting for integration; nothing for the agent to do.'
+                    % own_count('awaiting_integration'))
+        if state == 'unknown':
+            return ('Incomplete work read: %s claimable task(s) observed; check project work for more.' % claimable)
+        return ('Idle: %s claimable task(s), nothing in flight.' % claimable)
 
     @staticmethod
     def _agent_attention_view(agent, attention=None):
         if attention is None:
             attention = {'state': 'unknown', 'summary': 'Not computed.',
                          'counts': {}, 'actions': [], 'truncated': False,
+                         'snapshot_truncated': False, 'own_tasks_truncated': False,
+                         'actions_truncated': False,
                          'computed_at': None}
         return {key: attention[key] for key in
-                ('state', 'summary', 'counts', 'truncated', 'computed_at')}
+                ('state', 'summary', 'counts', 'truncated', 'snapshot_truncated',
+                 'own_tasks_truncated', 'actions_truncated', 'computed_at')}
 
     def _agent_resume_prompt(self, agent, attention):
         """A copyable prompt for the owner's local assistant. No secret is included."""
@@ -6065,7 +6254,10 @@ class ApiHandler(BaseHTTPRequestHandler):
         memberships, re-authorizing each project with the live ``CAP_READ`` check,
         one queue read per project and at most :data:`ME_WORK_MAX_PROJECTS` projects.
         ``to_review`` lists contributions only in projects where the caller holds the
-        approval capability. Computed at read time; nothing is scheduled or marked.
+        approval capability. With the party rule on it holds only work the caller may
+        actually approve: a row of the caller's own party is left out, since approving it
+        would be refused (kittrial-5bb.199 review, N4). Computed at read time; nothing is
+        scheduled or marked.
         """
         principal = ctx.principal
         if principal.via == 'credential':
@@ -6097,6 +6289,9 @@ class ApiHandler(BaseHTTPRequestHandler):
                      for item in read['items']]
             blocked |= {pid_tid[1] for pid_tid, detail in details.items()
                         if pid_tid[0] == project['id'] and detail.get('blocked')}
+            for item in items:
+                if item.get('review_state') not in (None,'none') or item.get('contribution'):
+                    blocked.discard(item.get('id'))
             names = self.service.actor_names([i.get('assignee') for i in items]
                                              + [i.get('contribution_author') for i in items])
             # What this person could recommend: someone else's contribution, by person, that
@@ -6116,7 +6311,14 @@ class ApiHandler(BaseHTTPRequestHandler):
                 if CAP_APPROVE in capabilities and item['review_state'] in (
                         'awaiting-review', 'legacy-review-ready', 'awaiting-integration',
                         'approved'):
-                    to_review.append(row)
+                    # The party rule's read (kittrial-5bb.199 review, N4): a row whose author or
+                    # assignee is the caller's own party would be refused at approval, so My work
+                    # does not offer it. Off, `_independent_all` is by person, as it always was.
+                    if not self.service.approval_by_another_party or self._independent_all(
+                            [actor, principal.user_id],
+                            [item.get('assignee'), item.get('contribution_author')],
+                            project['id']):
+                        to_review.append(row)
         if len(assigned) > MAX_PAGE or len(to_review) > MAX_PAGE:
             truncated = True
         try:
@@ -6178,6 +6380,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 ranked.append((rank, order, str(item['id']), project['id']))
         ranked.sort()
         details = {}
+        attention_rows={(project['id'],item.get('id')):item for project,_,read in reads for item in read['items']}
         for _, _, task_id, project_id in ranked[:ME_WORK_DETAIL_MAX]:
             try:
                 detail = self._cached_read(
@@ -6187,6 +6390,10 @@ class ApiHandler(BaseHTTPRequestHandler):
             except HttpError:
                 continue
             if isinstance(detail, dict):
+                row=attention_rows[(project_id,task_id)]
+                blocking=attention_blocking_items(row.get('attention') or {})
+                detail=dict(detail,blocked=row.get('review_state') in (None,'none')
+                            and not row.get('contribution') and type(blocking) is int and blocking>0)
                 details[(project_id, task_id)] = {k: v for k, v in detail.items()
                                                   if v is not None}
         return details
@@ -6694,11 +6901,14 @@ def build_backend(service, args):
 
 def settings_lines(service):
     """What the service says about its rule settings when it starts: one line each, and the
-    change is in the audit when it differs from the last start (``Service.note_settings``)."""
+    change is in the audit when it differs from the last start (``Service.note_settings``).
+    A last start that cannot be read is named as unknown, not shown as ``off`` (N5)."""
     was, now = service.note_settings()
     word = {True: 'on', False: 'off'}
     line = 'approval by another party (--approval-by-another-party): %s' % word[now]
-    if was != now:
+    if was is None:
+        line += ' (the last start was not recorded; that is written to the audit)'
+    elif was != now:
         line += ' (it was %s at the last start; recorded in the audit)' % word[was]
     return [line]
 

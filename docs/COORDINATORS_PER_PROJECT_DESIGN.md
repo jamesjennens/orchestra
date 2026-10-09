@@ -3,10 +3,13 @@
 **Status: design note (kittrial-5bb.178), second version after review; James
 decided the seven questions on 2026-10-07 ("recommended for all"). Built so far:
 slice 1, a key names its projects (kittrial-5bb.193; see "Bind a key to its
-projects" in [OPERATIONS.md](OPERATIONS.md)), and slice 2, a key names its
+projects" in [OPERATIONS.md](OPERATIONS.md)); slice 2, a key names its
 principal and actors belong to principals (kittrial-5bb.194; see "Bind a key to
-its principal" in [OPERATIONS.md](OPERATIONS.md)). The rest of this note describes
-the design and the state of main when it was written, not what is built.**
+its principal" in [OPERATIONS.md](OPERATIONS.md)); and slice 3, the acceptance
+commands a confined coordinator runs through the endpoint (kittrial-5bb.195; see
+"A confined coordinator runs the acceptance commands through the endpoint" in
+[OPERATIONS.md](OPERATIONS.md)). The rest of this note describes the design and
+the state of main when it was written, not what is built.**
 
 **For an installation where nobody but its owner is to have SSH (the office),
 see [WEB_COORDINATOR_DESIGN.md](WEB_COORDINATOR_DESIGN.md) (kittrial-5bb.201):

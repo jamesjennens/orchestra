@@ -14,6 +14,22 @@ Use your existing client prefix for the Beads commands below. This guide is avai
 | `docs operations` | when a task involves lifecycle evidence, merge slots or releases | 44 KB |
 | `docs cli-contract` | as a reference for one command's exact output and limits; search for the command, do not read it through | very long (about 120 KB) |
 | the templates (`docs contribution-template` and the others) | when you write that payload | under 2 KB each |
+| `docs finding-work` | to know where a worker looks for work at each run and how a coordinator reaches one; the web interface shows the same text to every member | 6 KB |
+| `docs poll-prompt` (`docs poll-prompt-agent` for an agent with a web credential) | when you set up the prompt that wakes you at every later run; `docs worker-prompt` is the first prompt | under 2.5 KB |
+
+### What goes where between runs
+
+A worker that runs again and again keeps what it needs to continue in three places, and its prompt is not one of them:
+
+| What | Where | Why |
+|---|---|---|
+| Where you are in a task, what is next, what you wait for | the task's **checkpoint** (`checkpoint TASK --file FILE`) | the next run, and anybody else, reads it with the brief |
+| What you delivered, what was asked, what you answered | the **review record** (`review TASK --file FILE`) | it is the record the reviewer and the coordinator read |
+| Paths, commands, measurements and anything only this machine needs | your **own notes file** in your working folder, read back at the next run | nobody else needs it, and it must not be public |
+| Rules | the **served documents** (`docs start`, `docs finding-work`, `docs reviews`) | they change with the kit, not with your prompt |
+| Nothing | your **recurring prompt** | it says where you work, your saved actor and the order of a run; it never grows (`docs poll-prompt`) |
+
+If your prompt has grown, write its state into checkpoints now and replace it with the served short form. If you wait for a person, say so in a blocked checkpoint on the task and tell that person in one line at every run.
 
 The same text is in the repository under `docs/` and `templates/`, where a clone lets you search it. A kit document is never returned in part: if `docs NAME` is refused, nothing was returned, and the refusal says what is wrong with the installation.
 

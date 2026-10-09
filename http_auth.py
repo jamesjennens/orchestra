@@ -30,6 +30,8 @@ service is a single process with a per-process lock, and the deployment runbook 
 that.
 """
 import hashlib
+import copy
+from contextlib import contextmanager
 import hmac
 import ipaddress
 import json
@@ -98,7 +100,7 @@ AGENT_MAX_PER_OWNER = 100
 AGENT_MAX_CREDENTIALS = 20
 #: How many credentials that no longer work (revoked or expired) are kept per agent, the newest
 #: ones, as the short history its card shows. Older ones are deleted from the state: the issue and
-#: the revocation of every credential stay in the audit log (kittrial-5bb.208).
+#: revocation metadata remain in the shared audit tail, capped by AUDIT_LIMIT.
 AGENT_DEAD_CREDENTIALS_KEPT = 5
 AGENT_DEFAULT_SCOPES = ('tasks', 'checkpoints', 'reviews', 'feedback')
 AGENT_CONFIG_PATH = '.orchestra/agent.json'
@@ -869,7 +871,12 @@ class Store:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_name(
             '%s.%d.%s.tmp' % (self.path.name, os.getpid(), secrets.token_hex(4)))
-        text = json.dumps(self.state, ensure_ascii=False, indent=2) + '\n'
+        # Credential rollback holds the old audit prefix until saving succeeds.
+        # Serialize its bounded tail without dropping that rollback evidence in memory.
+        state = self.state
+        if len(state['audit']) > AUDIT_LIMIT:
+            state = dict(state, audit=state['audit'][-AUDIT_LIMIT:])
+        text = json.dumps(state, ensure_ascii=False, indent=2) + '\n'
         try:
             with open(temporary, 'w', encoding='utf-8') as handle:
                 handle.write(text)
@@ -920,6 +927,7 @@ class Service:
         #: setup/resume snippets. It is deployment configuration, never request data.
         self.public_url = (public_url or '').rstrip('/') or None
         self._failures = {}
+        self._audit_defer_trim = 0
         self._logins_guard = threading.Lock()
         self._logins_room = threading.Condition(self._logins_guard)   # told whenever a log-in ends
         self._logins_waiting = {}        # address group -> its log-ins waiting for one of its places
@@ -1028,9 +1036,10 @@ class Service:
             'outcome': outcome,
             'reason': (str(reason)[:200] if reason else None),
         }
-        self.state['audit'].append(event)
-        if len(self.state['audit']) > AUDIT_LIMIT:
-            del self.state['audit'][:len(self.state['audit']) - AUDIT_LIMIT]
+        with self.store.lock:
+            self.state['audit'].append(event)
+            if not self._audit_defer_trim and len(self.state['audit']) > AUDIT_LIMIT:
+                del self.state['audit'][:len(self.state['audit']) - AUDIT_LIMIT]
         return event
 
     def _username(self, username):
@@ -2000,19 +2009,18 @@ class Service:
         with self.store.lock:
             self._refresh_authority(principal)
             project, role = self.require_project(principal, project_id, 'owner')
-            requested = tuple(scopes or ('tasks', 'checkpoints', 'reviews', 'feedback'))
-            for scope in requested:
-                if scope not in CREDENTIAL_SCOPES:
-                    raise invalid('Unknown credential scope %r' % (scope,))
+            requested = self._scope_names(scopes) or ('tasks', 'checkpoints', 'reviews', 'feedback')
+            label = self._credential_label(label)
             if actor is not None and (not isinstance(actor, str) or not re.fullmatch(
                     r'[A-Za-z0-9][A-Za-z0-9_.@/-]{0,63}', actor)):
                 raise invalid('Invalid credential actor namespace')
             # The id shapes are what make a record read as written by that account or
             # agent (kittrial-5bb.70 review 01a10262): the only one an owner may name is
-            # their own account id.
+            # their own account id. Compared case-folded (kittrial-5bb.199 round 2, N8), so
+            # an id in capitals is the same id rather than a name that only looks like it.
             claimed = actor.split('/', 1)[0] if actor is not None else None
-            if claimed is not None and re.fullmatch(r'(?:usr|agent)_[0-9a-f]{16}', claimed) \
-                    and claimed != principal.user_id:
+            if claimed is not None and re.fullmatch(r'(?:usr|agent)_[0-9a-f]{16}', claimed.casefold()) \
+                    and claimed.casefold() != str(principal.user_id).casefold():
                 raise invalid('A credential actor namespace cannot have the shape of an account or agent id '
                               'other than your own account id')
             if actor is not None:
@@ -2308,25 +2316,39 @@ class Service:
         # A credential issued with NO name has ``actor`` None and holds no name: it writes under its
         # issuer's account id, which no other account can be issued (review of kittrial-5bb.199, round 2:
         # a None here raised AttributeError and answered 500 to every other account's named credential).
-        return isinstance(namespace, str) and bool(namespace) and isinstance(name, str) and (
-            name == namespace or name.startswith(namespace.rstrip('/') + '/'))
+        #
+        # The head is compared CASE-FOLDED, as the tracker's own name rule folds it (kittrial-5bb.199
+        # round 2, N2: actor_names.head). ``IT-A745`` and ``it-a745`` are one name: a second account may
+        # not take the other spelling, and work under either spelling belongs to everyone who held it.
+        # Without this, the first holder's credentials could be revoked and the other account issued the
+        # lower-case name with no waiver, after which old work belonged to both and neither could approve.
+        if not (isinstance(namespace, str) and namespace and isinstance(name, str) and name):
+            return False
+        namespace = namespace.casefold()
+        name = name.casefold()
+        return name == namespace or name.startswith(namespace.rstrip('/') + '/')
 
     def note_settings(self):
         """Record what the installation's settings are at this start; answers ``(was, is)``.
 
         Turning ``approval_by_another_party`` on or off is done outside the service (a flag,
         or the office configuration) and used to leave no trace. The state keeps what the
-        last start had, and a start that differs writes one audit entry. A state that has
-        never recorded it counts as off, which is what every earlier kit was.
+        last start had, and a start whose rule differs from a readable record writes one
+        audit entry. A record that is anything but a JSON ``true`` or ``false`` -- absent,
+        null, a string such as ``"yes"`` or ``"false"``, a list, an object or a number -- is
+        UNKNOWN, not off (kittrial-5bb.199 round 2, N5): the entry and the start line say so
+        rather than inventing an ``off -> on`` change or staying silent after a lost ON.
         """
         with self.store.lock:
             seen = self.state.get('settings_seen')
-            was = bool(seen.get('approval_by_another_party')) if isinstance(seen, dict) else False
+            raw = seen.get('approval_by_another_party') if isinstance(seen, dict) else None
+            was = raw if isinstance(raw, bool) else None
             now = bool(self.approval_by_another_party)
             if was != now:
                 self.audit(None, None, 'settings.approval_by_another_party', 'committed',
-                           reason='%s -> %s at service start' % ('on' if was else 'off', 'on' if now else 'off'))
-            if not isinstance(seen, dict) or was != now or 'approval_by_another_party' not in seen:
+                           reason='%s -> %s at service start'
+                                  % ('unknown' if was is None else ('on' if was else 'off'),
+                                     'on' if now else 'off'))
                 self.state['settings_seen'] = {'approval_by_another_party': now}
                 self.store.save()
             return was, now
@@ -2532,16 +2554,22 @@ class Service:
         renewal, so two requests got round the refusal to widen).
 
         An agent made before the record kept them has none. ``inferred``: its working
-        credentials all carry the same list, and that is it; it is written to the record by
-        the first renewal, not by a read. ``unknown`` (scopes None): none of its credentials
+        credentials all carry the same list. This is an inference, not proof of its intended
+        scopes: revocation or expiry may have left only an unintended credential working.
+        Only its own account confirms it through plain renewal; a read writes nothing.
+        ``unknown`` (scopes None): none of its credentials
         works, or they do not carry the same, which is what an agent looks like that was
         renewed from the page before this was fixed. Nothing is guessed then: never the
         default four, never a credential that no longer works.
         """
-        stored = agent.get('scopes')
-        if isinstance(stored, list):
-            return (tuple(scope for scope in stored if scope in CREDENTIAL_SCOPES),
-                    'inferred' if agent.get('scopes_source') == 'inferred' else 'set')
+        if 'scopes' in agent:
+            stored = agent['scopes']
+            # Corruption is not a legacy record. Never infer authority from credentials
+            # when a stored value is malformed, including duplicate names.
+            if not isinstance(stored, list) or any(not isinstance(scope, str) or scope not in CREDENTIAL_SCOPES
+                                                  for scope in stored) or len(stored) != len(set(stored)):
+                return None, 'unknown'
+            return tuple(stored), 'inferred' if agent.get('scopes_source') == 'inferred' else 'set'
         moment = self._expiry_now()
         lists = {tuple(scope for scope in CREDENTIAL_SCOPES if scope in (credential.get('scopes') or ()))
                  for credential in self._agent_credentials(agent) if self._credential_live(credential, moment)}
@@ -2564,7 +2592,8 @@ class Service:
         Caller holds ``store.lock`` and saves. Without it the state grew by a record for every
         renewal for good, and every read of the agent carried them all (kittrial-5bb.208
         review). What goes is the record (label, scopes, when made and last used); that it was
-        issued and revoked, by whom and when, stays in the audit log.
+        issued and revoked, by whom and when, remains until the shared audit tail's
+        fixed AUDIT_LIMIT retention evicts it.
         """
         moment = self._expiry_now()
         dead = sorted((c for c in self._agent_credentials(agent) if not self._credential_live(c, moment)),
@@ -2792,22 +2821,101 @@ class Service:
     SCOPES_NEEDED = ('Nothing says what this agent may do: its record holds no scopes, and its credentials '
                      'that still work do not say (there is none, or they do not all allow the same). Send the '
                      'scopes it should have, for example "scopes": ["read"] for an agent that only reads')
+    SCOPES_OWNER_REQUIRED = ('Only this agent\'s own account may choose or confirm its scopes '
+                             'when they are unknown or inferred. Ask that account before issuing a new secret.')
+
+    @staticmethod
+    def _credential_label(label):
+        """Optional display text, never an arbitrary JSON value or unbounded payload."""
+        if label is None:
+            return None
+        if not isinstance(label, str) or len(label) > 64 or any(not c.isprintable() for c in label):
+            raise invalid('Credential label must be at most 64 printable characters')
+        return label.strip() or None
+
+    @contextmanager
+    def _agent_credential_transaction(self, agent, *, rollback=True):
+        """Hold the HTTP credential boundary through state save and receipt commit.
+
+        Caller holds store.lock. Snapshot only this agent's records and the audit's
+        append position; retention waits until the boundary exits. The yielded callback
+        marks a successful state save, after which a receipt failure must not undo it.
+        Revocation deliberately keeps its effect if saving fails.
+        """
+        previous_agent = copy.deepcopy(agent)
+        credentials = copy.deepcopy({key: value for key, value in self.state['credentials'].items()
+                                     if value.get('agent_id') == agent['id']})
+        tokens = {value['token_hash']: key for key, value in credentials.items()}
+        audit_start = len(self.state['audit'])
+        unsaved = self.store.unsaved_since
+        saved = [False]
+        def state_saved():
+            saved[0] = True
+        self._audit_defer_trim += 1
+        try:
+            yield state_saved
+        except BaseException as error:
+            if not saved[0] and rollback:
+                # Inspect only this operation's appended entries, never the old audit.
+                refusals = [event for event in self.state['audit'][audit_start:]
+                            if event.get('outcome') in ('denied', 'rejected')]
+                for key, value in list(self.state['credentials'].items()):
+                    if value.get('agent_id') == agent['id']:
+                        self.state['credential_tokens'].pop(value.get('token_hash'), None)
+                        del self.state['credentials'][key]
+                self.state['credentials'].update(credentials)
+                self.state['credential_tokens'].update(tokens)
+                del self.state['audit'][audit_start:]
+                self.state['audit'].extend(refusals)
+                agent.clear()
+                agent.update(previous_agent)
+                if refusals:
+                    # A refusal save may have flushed earlier pending state, or may
+                    # itself be pending. Keep its actual result through rollback.
+                    if not isinstance(error, HttpError) and self.store.unsaved_since is None:
+                        self.store.unsaved_since = self.store.clock()
+                else:
+                    self.store.unsaved_since = unsaved
+            elif not saved[0] and not isinstance(error, HttpError) and self.store.unsaved_since is None:
+                self.store.unsaved_since = self.store.clock()
+            raise
+        finally:
+            self._audit_defer_trim -= 1
+            if not self._audit_defer_trim and len(self.state['audit']) > AUDIT_LIMIT:
+                del self.state['audit'][:len(self.state['audit']) - AUDIT_LIMIT]
+
+    def _audit_agent_credential(self, principal, agent, credential, action, before, request_id):
+        """Metadata independent of credential pruning, within fixed audit retention."""
+        after = self.agent_scopes(agent)
+        event = self.audit(request_id, principal, action, 'committed', actor=self.agent_actor(agent))
+        event.update(agent_id=agent['id'], target_credential_id=credential['id'],
+                     credential_scopes=list(credential['scopes']),
+                     scopes_before=None if before[0] is None else list(before[0]),
+                     scopes_after=None if after[0] is None else list(after[0]),
+                     scopes_source_before=before[1], scopes_source_after=after[1])
 
     def _issue_agent_credential_locked(self, principal, agent, scopes=None, label=None):
         """Create one agent credential. Caller holds ``store.lock`` and has authorized.
 
         With no list it carries exactly what the agent has (:meth:`agent_scopes`), and where
         nothing says what that is, it is refused with a sentence that asks for the list. A
-        list sets what the agent has from now on: taken from anybody who may renew the agent
-        when it asks for nothing more, and from the agent's own account alone when it widens
-        (the one caller who could have made the agent with those scopes). Nothing is changed
-        by a request that is refused.
+        list sets what the agent has from now on. Only its own account may confirm
+        inferred or unknown scopes, with or without a list. Once confirmed, another
+        authorized account may narrow them, but widening remains owner-only.
         """
         requested = self._scope_names(scopes)
-        has, _ = self.agent_scopes(agent)
+        label = self._credential_label(label)
+        has, source = self.agent_scopes(agent)
+        if requested is not None and source in ('inferred', 'unknown') and principal.user_id != agent['owner']:
+            raise forbidden(self.SCOPES_OWNER_REQUIRED)
         if requested is None:
             if has is None:
-                raise conflict(self.SCOPES_NEEDED, {'scopes_needed': True})
+                message = self.SCOPES_NEEDED if principal.user_id == agent['owner'] else self.SCOPES_OWNER_REQUIRED
+                raise conflict(message, {'scopes_needed': True})
+            if source == 'inferred' and principal.user_id != agent['owner']:
+                raise conflict('These scopes are inferred from working credentials, not confirmed. '
+                               'Only the agent\'s own account may confirm them.',
+                               {'scopes_needed': True})
         else:
             more = [scope for scope in CREDENTIAL_SCOPES if scope in requested and scope not in (has or ())]
             if more and principal.user_id != agent['owner']:
@@ -2822,8 +2930,8 @@ class Service:
                            % AGENT_MAX_CREDENTIALS)
         if requested is not None:
             agent['scopes'], agent['scopes_source'] = list(requested), 'set'
-        elif not isinstance(agent.get('scopes'), list):
-            agent['scopes'], agent['scopes_source'] = list(has), 'inferred'
+        elif source == 'inferred':
+            agent['scopes'], agent['scopes_source'] = list(has), 'set'
         requested = tuple(agent['scopes'])
         secret = new_token()
         moment = self._expiry_now()
@@ -2881,6 +2989,8 @@ class Service:
             }
             self.state['agents'][agent_id] = agent
             credential, secret = self._issue_agent_credential_locked(principal, agent)
+            self._audit_agent_credential(principal, agent, credential, 'agents.credentials.issued',
+                                         self.agent_scopes(agent), request_id)
             self.store.save()
             # The one-time secret travels only in this response.
             public = {
@@ -2901,6 +3011,17 @@ class Service:
                       if principal.superuser or a['owner'] == principal.user_id]
             agents.sort(key=lambda a: a['id'])
             return [self.agent_view(a, principal) for a in agents]
+
+    def agent_page(self, principal, offset, limit, *, unconfirmed=False):
+        """Select a bounded owner-visible page before building credential/card views."""
+        with self.store.lock:
+            self._refresh_authority(principal)
+            agents = [a for a in self.state['agents'].values()
+                      if principal.superuser or a['owner'] == principal.user_id]
+            if unconfirmed:
+                agents = [a for a in agents if self.agent_scopes(a)[1] != 'set']
+            agents.sort(key=lambda a: a['id'])
+            return [self.agent_view(a, principal) for a in agents[offset:offset + limit]], len(agents)
 
     def get_agent(self, principal, agent_id):
         with self.store.lock:
@@ -2973,6 +3094,7 @@ class Service:
 
     def issue_agent_credential(self, principal, agent_id, *, scopes=None, label=None,
                                request_id=None):
+        """Mutate under the HTTP boundary, which owns saving and rollback."""
         if principal is None or principal.via == 'credential':
             raise forbidden('Session authority required to issue an agent credential')
         with self.store.lock:
@@ -2980,9 +3102,11 @@ class Service:
             agent = self._agent_owned(principal, agent_id)
             if not agent.get('enabled'):
                 raise conflict('A disabled agent cannot receive a credential')
+            before = self.agent_scopes(agent)
             credential, secret = self._issue_agent_credential_locked(
                 principal, agent, scopes=scopes, label=label)
-            self.store.save()
+            self._audit_agent_credential(principal, agent, credential, 'agents.credentials.issued',
+                                         before, request_id)
             return {
                 'operation': 'agents.credentials.issue',
                 'agent': agent['id'],
@@ -2994,6 +3118,7 @@ class Service:
 
     def revoke_agent_credential(self, principal, agent_id, credential_id,
                                 request_id=None):
+        """Revoke in memory; the HTTP boundary saves without resurrecting access."""
         if principal is None or principal.via == 'credential':
             raise forbidden('Session authority required to revoke an agent credential')
         with self.store.lock:
@@ -3003,9 +3128,15 @@ class Service:
             if not isinstance(credential, dict) or \
                     credential.get('agent_id') != agent['id']:
                 raise not_found('Credential not found')
+            if credential.get('revoked'):
+                # A retry after a failed save can persist the pending revocation,
+                # without claiming another revocation or appending a second event.
+                return {'id': credential_id, 'agent': agent['id'], 'revoked': True}
+            before = self.agent_scopes(agent)
             credential['revoked'] = True
             self._prune_agent_credentials(agent)
-            self.store.save()
+            self._audit_agent_credential(principal, agent, credential, 'agents.credentials.revoked',
+                                         before, request_id)
         return {'id': credential_id, 'agent': agent['id'], 'revoked': True}
 
     # -- idempotency -----------------------------------------------------------

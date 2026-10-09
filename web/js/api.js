@@ -137,7 +137,10 @@ export function createApi(transport) {
     review: (pid, tid, body) => mutate('POST', `/v1/projects/${pid}/tasks/${tid}/reviews`, body),
     queue: (pid, params) => call('GET', `/v1/projects/${pid}/queue`, { params }),
     myWork: () => call('GET', '/v1/me/work'),
-    agents: () => call('GET', '/v1/agents'),
+    agents: (params) => call('GET', '/v1/agents', { params }),
+    // A document of the installed kit, as the client's `docs NAME` serves it (kittrial-5bb.226).
+    docs: () => call('GET', '/v1/docs'),
+    doc: (name) => call('GET', `/v1/docs/${name}`),
     createAgent: (body) => mutate('POST', '/v1/agents', body),
     updateAgent: (aid, body) => mutate('PATCH', `/v1/agents/${aid}`, body),
     agent: (aid) => call('GET', `/v1/agents/${aid}`),

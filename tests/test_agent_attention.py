@@ -191,15 +191,14 @@ class EndpointAttentionTests(fixes.EndpointCase):
 
         def paged(action, project, reader, args, *rest, **kwargs):
             self.assertEqual(action, 'work')
-            self.assertNotIn('--owner', args)
             offset = int(args[args.index('--offset') + 1])
-            calls.append(offset)
+            calls.append((offset,'--owner' in args))
             return {'items': rows[offset:offset + 100],
                     'next_offset': offset + 100 if offset + 100 < len(rows) else None}
 
         with patch.object(self.backend, '_run', side_effect=paged):
             data = self.next()
-            self.assertEqual(calls, [0, 100])
+            self.assertEqual(calls, [(0,False), (100,False)])
             self.assertEqual(data['attention']['counts']['claimed'], 130)
             self.assertEqual(data['attention']['counts']['changes_requested'], 1)
             self.assertEqual(kinds(data)[0], ('changes-requested', 'owned-129'))
@@ -207,9 +206,13 @@ class EndpointAttentionTests(fixes.EndpointCase):
             calls.clear()
             with patch.object(self.backend, 'QUEUE_MAX_PAGES', 1):
                 bounded = self.next()
-            self.assertEqual(calls, [0])
+            self.assertEqual(calls, [(0,False),(0,True)])
             self.assertEqual(bounded['attention']['counts']['claimed'], 100)
             self.assertTrue(bounded['attention']['truncated'])
+            self.assertTrue(bounded['attention']['snapshot_truncated'])
+            self.assertTrue(bounded['attention']['own_tasks_truncated'])
+            self.assertTrue(bounded['attention']['actions_truncated'])
+            self.assertIn('at least 100 claimed', bounded['attention']['summary'])
 
     def test_conflicting_checkpoint_history_keeps_unknown_and_operator_action(self):
         task=self.tasks[0];self.claim(task)
@@ -310,7 +313,7 @@ class EndpointAttentionTests(fixes.EndpointCase):
         self.assertEqual(([task['id'] for task in read['tasks']], read['complete']), (['mine'], True))
         self.assertEqual(read['tasks'][0], {
             'id': 'mine', 'title': 'm', 'status': 'in_progress', 'assignee': 'me', 'review_state': 'none',
-            'contribution_id': None, 'pending_change_requests': [], 'open_items': 2,
+            'contribution_id': None, 'pending_change_requests': [], 'open_items': 2, 'blocking_items':2,
             'checkpoint_at': '2026-10-04T10:00:00Z', 'newer_activity': True})
         self.assertEqual(asked, [['--owner', 'me', '--limit', '100', '--offset', '0', '--json'],
                                  ['--owner', 'me', '--limit', '100', '--offset', '100', '--json']])
@@ -367,7 +370,7 @@ class InProcessAttentionTests(test_http_agents.AgentHarness):
         self.assertEqual(data['attention']['state'], 'working')
         # A blocker recorded in the latest checkpoint.
         self.backend.state.setdefault('checkpoints', {})[second] = [
-            {'created_at': '2026-10-04T10:00:00Z', 'open_items': [{'id': 'key', 'text': 'no key'}]}]
+            {'created_at': '2026-10-04T10:00:00Z', 'open_items': [{'id': 'key', 'kind':'blocker', 'text': 'no key'}]}]
         data = self.next()
         self.assertEqual(kinds(data), [('blocked', second), ('in-progress', first), ('claimable-task', spare)])
         blocked = data['next_actions'][0]
@@ -389,7 +392,7 @@ class InProcessAttentionTests(test_http_agents.AgentHarness):
         self.request('POST', '/v1/projects/%s/tasks/%s/claim' % (self.project, task), token=self.secret)
         actor = self.next()['agent']['actor']
         row = self.backend.agent_tasks(self.project, actor)['tasks'][0]
-        self.assertEqual(sorted(row), ['assignee', 'checkpoint_at', 'contribution_id', 'id', 'newer_activity',
+        self.assertEqual(sorted(row), ['assignee', 'blocking_items', 'checkpoint_at', 'contribution_id', 'id', 'newer_activity',
                                        'open_items', 'pending_change_requests', 'review_state', 'status', 'title'])
         self.assertEqual(self.backend.agent_tasks(self.project)['tasks'], [row])   # unfiltered: every held task
 
@@ -419,19 +422,20 @@ class InProcessAttentionTests(test_http_agents.AgentHarness):
         task=self.task('blocker');base='/v1/projects/%s/tasks/%s'%(self.project,task)
         self.request('POST',base+'/claim',token=self.secret)
         cp=self.request('POST',base+'/checkpoints',
-                        {'previous':None,'summary':'blocked','open_items':[{'id':'key','text':'Need a key.'}]},
+                        {'previous':None,'summary':'blocked','open_items':[{'id':'key','kind':'blocker','text':'Need a key.'}]},
                         token=self.secret)
         self.assertEqual(cp.status,201,cp.data)
         self.request('POST',base+'/reviews',
                      {'operation':'contribute','commit':test_http_agents.COMMIT,'base_commit':test_http_agents.BASE,
                       'bundle_sha256':test_http_agents.BUNDLE,'summary':'partial'},token=self.secret)
         action=next(x for x in self.next()['next_actions'] if x['task']==task)
-        self.assertFalse(action['newer_activity'])
+        self.assertEqual(action['kind'],'awaiting-review')
+        self.assertFalse(self.backend.agent_tasks(self.project)['tasks'][0]['newer_activity'])
         changed=self.request('PATCH',base,{'description':'The key is available.',
                              'version':self.backend.state['tasks'][task]['version']},token=self.alex)
         self.assertEqual(changed.status,200,changed.data)
         action=next(x for x in self.next()['next_actions'] if x['task']==task)
-        self.assertTrue(action['newer_activity'])
+        self.assertTrue(self.backend.agent_tasks(self.project)['tasks'][0]['newer_activity'])
 
     def test_every_other_open_review_state_names_who_acts_next(self):
         task=self.task('held');actor=self.next()['agent']['actor']
@@ -462,7 +466,7 @@ class InProcessAttentionTests(test_http_agents.AgentHarness):
         with patch.object(self.backend,'agent_tasks',return_value={'tasks':rows,'complete':True}):
             d=self.next();counts=d['attention']['counts']
             self.assertEqual((counts['blocked'],counts['changes_requested'],counts['awaiting_review'],
-                              counts['awaiting_integration'],counts['in_progress']),(1,2,1,1,1))
+                              counts['awaiting_integration'],counts['in_progress']),(0,2,1,1,1))
             self.assertEqual(d['attention']['state'],'changes-requested')
             # Once feedback and the blocker have gone, own implementation outranks waiting.
             rows[:]=rows[2:];d=self.next()

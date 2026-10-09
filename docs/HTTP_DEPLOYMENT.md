@@ -833,6 +833,52 @@ to read it for editing. Owners and superusers, session only.
 - The write goes through the service-only endpoint action `set-onboarding`, which
   re-checks project administration under the authority lock.
 
+### The kit's documents for members: how work is found, and the prompts
+
+Every member of a project, a viewer included, has a page "How work is found"
+(`#/p/PROJECT/how`, in the project's navigation; kittrial-5bb.226). It says where a worker
+looks for work at each run and in what order, where it does not look, how whoever
+coordinates reaches a worker, and it offers the prompts a worker is started and woken
+with, each with a copy button.
+
+**The page retypes nothing.** Its texts are files of the installed kit, the same ones the
+client's `docs NAME` serves, read by the same reader:
+
+| `docs` name | File | What |
+|---|---|---|
+| `finding-work` | `docs/FINDING_WORK.md` | the order of a run, what a worker does not read, the three ways to reach a worker with what the web interface can do today and the command that works today |
+| `worker-prompt` | `templates/WORKER_PROMPT.md` | the first prompt for a new worker over SSH |
+| `poll-prompt` | `templates/WORKER_POLL_PROMPT.md` | the short recurring prompt for a worker over SSH |
+| `poll-prompt-agent` | `templates/AGENT_POLL_PROMPT.md` | the short recurring prompt for an agent with a web credential |
+
+- `GET /v1/docs` lists them (name, title, file, `served_as`, the named values a prompt
+  leaves to replace) and `GET /v1/docs/NAME` returns one: `text` (the whole file),
+  `prompt` (what is pasted: everything between the file's first line that is exactly
+  three backticks and the word text, and its last line that is exactly three backticks;
+  null for a document
+  that is no prompt), `placeholders`, and `server_url` (the address the service is
+  configured with, `--public-url`; never the request's Host header; null when none is
+  configured, and the page then uses the address it was loaded from).
+- Any signed-in member and any agent credential may read them: they hold nothing of a
+  project and no secret. Without a session: `401`. A name that is not one of the four,
+  the rest of the client's catalogue included: `404`. A file that cannot be read from
+  the installed kit: `503`; the page then shows nothing in part, under the application's
+  general words for a failed load (they are not specific to this page yet).
+- The page fills in the values it knows: the server address, the project, and the names
+  of the reader's own agents that work in the project. It names the values that are left
+  ("Replace before use: ..."). A recurring prompt is at most 2,000 characters
+  (`onboarding.POLL_PROMPT_LIMIT`, pinned by a test): it carries no state and no rules.
+- An agent's `.orchestra/AGENT.md` (written by the Agents page) states the same order in
+  the agent's own words. `tests/test_finding_work.py` pins the order the texts state to
+  the order `GET /v1/agents/me/next` gives, on the in-process backend, on the endpoint
+  backend and through a real bd, so neither changes without the other.
+
+**What the text says is not there yet, and is not:** an agent with a web credential
+cannot read the coordinator's standing guidance, and a comment on a task or the
+assignment of a task to somebody else cannot be made over the web. The document names
+the command for each. A test fails when a route for one of them appears, so that the
+text is corrected with it.
+
 ### Requirement proposals
 
 A proposal says what the product should do. It is intake, not a task and not a
@@ -1154,8 +1200,27 @@ begins or ends with `.` or `-`, or that carries an `@` (`im2-coordinator.`,
 other than `im2-coordinator`; the kit refuses them rather than choosing a normal form
 that would silently rename somebody.
 
-A name with the shape of another account's or agent's id was already refused. A
+A name with the shape of another account's or agent's id was already refused, and is now
+refused in any letter case (an id written in capitals is read as that id). A
 credential without `actor` writes under its issuer's own account id, as before.
+
+**One name, one issuer** -- an always-on rule, not part of the setting below. A worker
+credential may not be issued under a name that a working credential of another account in the
+same project already holds: the same name, one holding the other, or the same characters in
+another letter case, and whether or not anything has been written under it yet.
+`POST /v1/projects/{id}/worker-credentials` answers **409**, "The name NAME is held by a
+working credential of this project that another account issued (...). A name has one issuer at
+a time: have that credential revoked first, or choose another name", with the holding
+credential's id in `error.detail`. The same account may issue a name it already holds, which
+is how it replaces a credential without a gap. The comparison folds case over the whole name (the
+tracker's own name rule, `actor_names.head`, folds the first part only), so `IT-A745` and `it-a745` are one name: a second account
+cannot take the other spelling and then write, with no waiver, work that the first account's
+rows also answer to.
+
+An installation upgraded from a kit that issued both spellings to two accounts keeps both
+credentials working, but neither account can replace its own (409 each way) until the
+other's is revoked, and work under either spelling is refused to both: have one of the two
+revoked (the 409 names the credential that holds the name).
 
 **At issue**, `POST /v1/projects/{id}/worker-credentials` answers 422, "A worker
 credential cannot write as NAME: that is a name on the operator list. Choose another
@@ -1503,8 +1568,13 @@ that account made, and every worker credential that account issued. From the nex
   the task page the sentence stays in the review form until the page is left.
 - `recommend`, the review queue, My work and the brief count by the same parties, so the
   agent of the account that issued a worker credential can no longer recommend work
-  delivered under it (with the setting off that work is nobody's, and it can). The
-  refusal of a recommendation names the worker credential as one of its reasons.
+  delivered under it (with the setting off that work is nobody's, and it can). My work's
+  `to_review` holds only work the caller may actually approve: a contribution of the
+  caller's own party is left out of that list, since approving it would be refused
+  (the project's review queue still lists every row for everybody, with no per-caller
+  mark). The refusal of a recommendation names the worker credential as one of its reasons,
+  in both directions: work delivered under a credential the person issued, and a credential
+  the person issued recommending that person's own work.
 
 **Whose party a name is.**
 
@@ -1519,14 +1589,30 @@ that account made, and every worker credential that account issued. From the nex
   credential wrote it, and the tracker's time stamp can be a second later than this
   service's clock, so "the credential alive at that moment" picked the wrong account
   now and then. Counting each of them only ever refuses more.
+- **What "ever held" costs.** Because every issuer of a name is of the work's party, a name
+  an account issued and revoked **unused** still belongs to that account for ever: another
+  account may take the name (no working credential holds it and the tracker holds no row),
+  but work under it is then refused to both and only a third party may approve it. Widen that
+  and a project can be left with nobody who may approve: three owners and a superuser who
+  each once held a name (issued and revoked unused in turn) leave a fourth party's work under
+  it refused to all of them, and only a new account made an owner by a superuser can approve
+  it. **No route deletes a worker credential record**, and a revoked record counts for ever,
+  so no superuser can clear it. Two owners who each once issued a common name (`ci`,
+  `lane-1`), never at the same time, both lose the approval of all work under it. The ways
+  out are a third approver or a new name (the writer stamp described below is not built). Refusing a
+  second issuer for any name an account ever held, unused included, unless a superuser waives
+  it, was considered and is **not** done here: the tracker already refuses (422) a name one of
+  its rows holds, refusing the unused case would stop a project reusing a label whose holder
+  is gone, and it needs a new superuser waiver route. This is the cost of the rule as decided.
 - So that two accounts do not come to share a name without anybody meaning it, **a name
-  has one issuer at a time**: issuing a worker credential whose name is held by a working
-  credential that another account issued in the same project (the same name, or one
-  holding the other) is `409`, "The name NAME is held by a working credential of this
-  project that another account issued (...). A name has one issuer at a time: have that
-  credential revoked first, or choose another name", whether or not anything was written
-  under it yet. The same account may issue a name it already holds: that is how it
-  replaces a credential without a gap.
+  has one issuer at a time** (whether or not this setting is on; the rule is stated in full
+  under "The name a worker credential writes under"): issuing a worker credential whose name
+  is held by a working credential that another account issued in the same project (the same
+  name, or one holding the other, in any letter case) is `409`, "The name NAME is held by a
+  working credential of this project that another account issued (...). A name has one issuer
+  at a time: have that credential revoked first, or choose another name", whether or not
+  anything was written under it yet. The same account may issue a name it already holds: that
+  is how it replaces a credential without a gap.
 - **A writer that is no account, no agent and under no credential record is its own
   party.** That is a name written over the host route (a lane with an SSH key): another
   party than every web account, so whoever may approve here approves its work. This is
@@ -1552,7 +1638,12 @@ service's and not a host switch, and the endpoint's `setup-status` cannot report
 is on. The service writes one line to its log at every start, "approval by another party
 (--approval-by-another-party): on" or "off", and when that differs from the last start
 it says so and writes an audit entry `settings.approval_by_another_party` ("off -> on at
-service start"); the state file keeps what the last start had.
+service start"); the state file keeps what the last start had. A record that is anything
+but a JSON `true` or `false` -- missing, null, a string (`"yes"` and `"false"` included), a
+list, an object or a number -- is **unknown**, not off: the start line says the last start
+was not recorded, and the audit entry says "unknown -> on" or "unknown -> off". So a lost
+ON no longer leaves a later OFF start silent, and a damaged record no longer invents an
+"off -> on" change.
 
 **Going back to an older kit.** Remove `"approval_by_another_party"` from the office
 service configuration first: an office service older than this setting refuses to start
@@ -1661,16 +1752,27 @@ revoked one that was wider then seeded the next renewal once nothing worked).
   was read as its keys). A name given twice counts once; an empty list is no list. A body
   field the route does not take (it takes `label` and `scopes`) is `422`, as when an agent
   is made.
+- Both agent and project worker credentials validate scopes this way. `label` is optional
+  text of at most 64 printable characters; numbers, objects, control characters and longer
+  labels are `422`. A malformed **stored** agent scope value (non-list, unknown name or
+  duplicate) is unknown, never inferred from credentials. Its account can repair it by
+  choosing a valid explicit list; a superuser cannot widen unknown scopes.
 - **An agent made before the record kept its scopes** has none. While its working
-  credentials all allow the same, that is what it has (`scopes_source: "inferred"` on the
-  record; written to the record by its first renewal, never by a read). When none of its
+  credentials all allow the same, that list is **inferred, not confirmed**
+  (`scopes_source: "inferred"`). Expiry or revocation may have left only an unintended
+  credential working: check the list before confirming it. Only the agent's own account
+  may confirm it by plain renewal, storing the list as `set`; a read writes nothing.
+  A non-owner's plain renewal is `409` with `detail.scopes_needed: true` and asks for
+  the owning account to confirm it. Explicit equal, narrower or wider lists from a
+  non-owner are `403` while scopes are inferred or unknown. An older record
+  already carrying `scopes_source: "inferred"` has the same confirmation rule. When none of its
   credentials works, or they do not all allow the same (which is what an agent looks like
   that was renewed from the page before the fix: the credential it was made with, and a
   newer one with the default four), **nothing is guessed**: `scopes` is `null`,
   `scopes_source` is `"unknown"`, and a renewal with no list is refused with `409` and
   `detail.scopes_needed: true` ("Nothing says what this agent may do ... Send the scopes
   it should have"). Never the default four, never a credential that no longer works. A
-  list then counts as a widening of nothing: it is taken from the agent's own account
+  list is taken from the agent's own account
   only. On the agents page the card says so, and "What it may do" offers the choice with
   reading ticked alone.
 - `GET /v1/agents/{id}`, the list, and the agent's own `GET /v1/agents/me` carry `scopes`,
@@ -1684,7 +1786,11 @@ revoked one that was wider then seeded the next renewal once nothing worked).
   there, and the agent's account sets the scopes with tick boxes; saving issues a new
   secret that carries them (a superuser can untick, and cannot tick what the agent has
   not got). A credential the agent already holds keeps what it allows until it is
-  revoked.
+  revoked. For inferred or unknown scopes a superuser sees a sentence asking the owning account to
+  choose, rather than an unusable Save form. Superusers can filter their already-authorized
+  list to agents with inferred or unknown scopes. A new page used with an older service
+  that omits scope metadata says so and asks the user to check the new credential's scopes;
+  it does not promise that a plain renewal preserves scopes the page cannot know.
 - An agent may hold at most 20 credentials **that still work**; revoked and expired ones
   are not counted (counted, an agent could not be renewed a twentieth time). Of those
   that no longer work **the newest 5 are kept** per agent, as the short history the card
@@ -1692,10 +1798,56 @@ revoked one that was wider then seeded the next renewal once nothing worked).
   issued or revoked or the agent is disabled; an agent read never carries more than the
   working ones and those 5. What is lost is the record of an old credential (its label,
   scopes, when it was made and last used). That it was issued and revoked, by whom and
-  when, stays in the audit log (`agents.credentials.issue`, `agents.credentials.revoke`,
-  `agents.disable`). "Newest" is by the host clock at issue, so after a backward clock
+  when, remains in the shared audit tail of the newest 10,000 entries. This is a fixed
+  service-wide cap, with no per-account quota or configurable retention. Committed metadata events
+  `agents.credentials.issued` and `agents.credentials.revoked` name `agent_id`,
+  `target_credential_id`, `credential_scopes`, `scopes_before`/`scopes_after` and their
+  sources, alongside the acting account, request ID and time. Each successful issue
+  or first revocation leaves one event, including scope changes in that event. Revoking
+  an already revoked credential returns success without a second revocation event. These contain no
+  labels, secrets, token hashes or working directories. Pruning credentials does not
+  remove their audit entries; retention eventually does. HTTP disable events
+  (`agents.disable`, `agents.update` with `enabled: false`, `accounts.disable`) include
+  `agent_ids` and `target_credential_ids`, captured before revocation/pruning.
+  These events have no project ID: project-filtered HTTP audit reads do not expose
+  them. They are available only in the private service state; no new audit-read
+  permission or endpoint is implied.
+  "Newest" is by the host clock at issue, so after a backward clock
   step a newer dead record can be deleted before an older one; nothing but that short
   history depends on the order.
+- Issuance saves its state before committing the idempotent replay receipt. A failed
+  state save restores the agent, credentials, token indexes, pruning and committed
+  metadata before returning an error with no secret. Earlier pending state and refusal
+  audit remain. A crash before the state save or between it and receipt commit leaves
+  an in-progress keyed request (`409` on retry), never a successful replay for a
+  nonexistent credential. If state was saved, a later receipt failure keeps that
+  durable credential and the reservation; its one-time secret cannot be recovered.
+  Investigate the outcome before deliberately issuing a replacement with a new key.
+- Revocation saves before its replay receipt too, but a failed state save **keeps the
+  credential revoked in memory**, answers failure, and marks pending state. Immediate
+  authentication with that secret is refused; the next successful save persists the
+  revocation. A service restart before that save can lose the pending revocation, so
+  the failed response does not claim durable revocation.
+  A same-key retry after a failed state save can finish saving that revocation without
+  a second revocation event. A refused revoke leaves only its refusal audit pending
+  if that audit could not be saved; it does not mark already saved state as unsaved.
+- Ordinary mutation routes retain receipt-before-state-save ordering. After a failed
+  save (`500` for a write error or `503` for a lock timeout), a same-key retry replays
+  their recorded answer (agent creation returns `200` without its one-time secret;
+  other routes retain their original success status). This replay records the in-memory
+  operation, and does not by itself prove the state file survived a restart. Credential
+  issuance and revocation use the stricter state-before-receipt boundary described above.
+- The new agents page requests 20 cards at a time with `limit`, `cursor` and
+  `unconfirmed=true|false`. Filtering is applied on the service before building the
+  bounded card response; Previous/Next controls fetch one page at a time. An existing
+  client requesting `/v1/agents` without those parameters retains the full-list response.
+  The owning account's Save form and confirmation, and Set up folder confirmation, say when issuing a
+  secret will confirm inferred scopes as stored scopes.
+- The carried `agents.renewal-keeps-scopes` revision 3 proposal's `expected_sha256`
+  identifies the accepted canonical revision 2 record
+  (`382ef27503f577919935912952151d5b16576db13b44ec1827d183306fa63cd7`),
+  rather than the previous unaccepted revision 3 file. Carrying a proposal does not
+  accept it, integrate it, or verify a live deployment.
 - **Rolling back** to a kit before this one: the older kit ignores `scopes` on the agent
   record and counts every credential record, working or not, toward its limit of 20. An
   agent that holds 20 or more records (possible here: up to 20 that work and 5 that do
@@ -2335,28 +2487,57 @@ line separately and unconfined.
   the `bd list` snapshot, whose rows carry no review state and no checkpoint, so an
   agent with changes requested, a contribution awaiting review or a blocker was told
   there was nothing to do. The agent's own tasks now come from the canonical `work`
-  view. The same unfiltered snapshot supplies own states and claimable suggestions,
-  however many agents the owner displays. `/v1/agents/me/next`, owner lists and
-  owner detail cost one canonical `work` command per page (100 rows), with no
-  additional `bd list` or owner-filtered work command. In-process projects cost one
-  snapshot read. Bounds still report `truncated`; nothing is cached across requests
+  view. Complete unfiltered snapshots supply own states and claimable suggestions
+  with one canonical `work` command per page (100 rows), without `bd list`. On the
+  single-agent route, an incomplete snapshot falls back to paged owner-filtered
+  work so tasks beyond the project snapshot bound are recovered. When the first
+  page's total exceeds the 1,000-row bound, stop once there are enough claimable
+  suggestions to fill the 30-action list. If the first page fills them, 250 own
+  tasks need three owner pages, four work commands in total. A first page filled
+  by other people's review states continues paging for claimable suggestions,
+  up to ten pages (1,000 rows). Owner-filtered recovery also stops at 1,000 rows;
+  its counts are lower bounds when more remain. Owner lists reuse the bounded
+  unfiltered snapshot and can under-count own tasks beyond it. In-process projects cost one
+  snapshot read. `snapshot_truncated` marks incomplete project suggestions/counts;
+  `own_tasks_truncated` marks incomplete own counts; `actions_truncated` marks a
+  suggestion or action cap. `truncated` is their combined signal. Counts over an
+  incomplete source are lower bounds, not project totals: summaries say "at least N".
+  An incomplete read with no observed own work says `unknown`, never `idle`;
+  observed claimable actions are still offered. A failed work read of a still-authorized
+  project says `error`, increments `read_errors`, and marks snapshot and own counts
+  incomplete. Successful projects retain their actions. Projects the principal can
+  no longer read are excluded. Nothing is cached across requests
   by the attention calculation, and live authority is checked before every project.
   - **One action per own task, in this order:** `changes-requested` (priority 1, with
     `requests`, the request-changes record ids), `blocked` (2: the latest checkpoint
-    lists open items; with `open_items`, `blocked_since` and `newer_activity`),
-    `in-progress` (3: claimed, not closed, nothing delivered yet), then review work
-    and `claimable-task` (4, see below), then `awaiting-review` and
-    `awaiting-integration` (5).
-    `review-error` names the malformed state and asks an operator to reconcile it;
+    lists an open `blocker` or `dependency` on undelivered work; with `open_items`,
+    `blocking_items`, `blocked_since` and `newer_activity`),
+    `in-progress` (3: claimed, not closed, nothing delivered yet), then
+    review work and `claimable-task` (4, see below), then `awaiting-review` and `awaiting-integration` (5).
+    `review-error` (priority 2) names the malformed state and asks an operator to reconcile it;
     other own states get `review-state`, naming the state and who acts next. Neither
     silently disappears from the action list. Action **kind names** are the client
     contract. Numeric priorities are relative sorting hints, can change between kit
     revisions, and must not be treated as a stable enum. With both undelivered work
     and a delivered contribution, the state is `working`, while the waiting action
     remains visible after work the agent can do.
-    Explicitly unreadable checkpoint history keeps `open_items: null` and gets
+    Questions, decisions and corrections do not block. If an answer is needed to
+    proceed, record a blocker rather than only a question. Delivered tasks follow
+    their review state regardless of checkpoint items.
+    On an older endpoint that omits `blocking_items`, attention and My work use
+    its validated `open_items` count to preserve that endpoint's blocking policy.
+    An explicit unreadable or malformed blocking count stays unknown.
+    The action's 20-request-id cap is defensive projection of injected oversized
+    rows. Real writes refuse a second request-changes record on the same
+    contribution; this cap is not a verified reachable review sequence.
+    Explicitly unreadable checkpoint history keeps both item counts `null` and gets
     `checkpoint-error`, asking an operator to reconcile it. Unknown does not count
     as zero unresolved items or as undelivered work the agent can safely continue.
+    Native unreadable cases include conflicting valid checkpoint roots or links,
+    cycles and missing predecessor records. A malformed ignored checkpoint comment
+    alone does not trigger this error: the last valid checkpoint still stands.
+    An invalid imported in-process checkpoint pointer can also produce unknown
+    history; it is a separate backend case. Delivered work keeps its review action.
   - **Review work (kittrial-5bb.115).** Two kinds, for an agent that holds the reviews
     capability in the project. They come from the same `work` snapshot: no further
     read.
@@ -2427,23 +2608,29 @@ line separately and unconfined.
     answered (or the reviewer records their disposition).
   - **A blocked task can stay quiet.** `blocked_since` is when the latest checkpoint
     was written; its own subsequent authored records do not make `newer_activity`
-    true. Another native actor's comment does; missing author attribution retains
-    the previous conservative wake signal. On the in-process backend attributed
-    owner edits also count. Native description edits lack reliable editor identity
-    and are awaiting the recorded owner decision; no editor is inferred from the
-    original creator. The brief's separate checkpoint freshness flag still compares
+    true. Another native actor's comment does, comparing with the current assignee
+    even when the checkpoint author held the task before reassignment. On the
+    in-process backend attributed owner edits also count. Unattributed native title
+    and description edits stay quiet; people comment to wake the agent. No editor
+    is inferred from the original creator. The brief's separate checkpoint freshness flag still compares
     the full snapshot for checkpoint reconciliation. An agent can leave a quiet task
     alone instead of
     re-reading it and writing another checkpoint on every wake.
   - **`counts`** are over the agent's own tasks: `claimed` (every task it holds that
     the `work` view lists: open ones, and closed ones whose review is still active),
     `changes_requested`, `blocked`, `in_progress` (not delivered and not blocked),
-    `awaiting_review`, `awaiting_integration`, and `claimable` for the project. A task
-    with changes requested and open checkpoint items counts in both.
-  - **`state`**: `changes-requested`, `blocked`, `working`, `waiting-review`,
-    `waiting-integration` or `idle`, the first that applies.
-  - `GET /v1/me/work` (a person's own queue) still reads its blocked signal from the
-    bounded per-task `brief` reads described above.
+    `awaiting_review`, `awaiting_integration`, `review_errors`, `checkpoint_errors`,
+    and `claimable` for the project. `read_errors` counts failed authorized-project
+    work reads. Delivered work does not count as blocked.
+    `open_items` still counts all open kinds; `blocking_items` counts the two
+    blocking kinds. Unknown counts are preserved rather than treated as zero.
+  - **`state`**: a failed authorized work read takes `error`; otherwise
+    `changes-requested`, `error`, `blocked`, `working`, `waiting-review`,
+    `waiting-integration`, `unknown` (incomplete with no observed own work), or
+    `idle`, the first that applies.
+    An error-only queue names its review/checkpoint error and operator action.
+  - `GET /v1/me/work` (a person's own queue) uses the same kind and delivered-state
+    policy, with its bounded per-task detail reads described above.
 - Administrative audit coverage is partial: login outcomes, authorization
   denials and every successful idempotent mutation are recorded; a per-field
   before/after administrative trail is not implemented.

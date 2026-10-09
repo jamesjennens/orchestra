@@ -507,6 +507,107 @@ def key_principal_refusal(request,path,key_principal):
                          'registered in this project; %s is not one of them'
                          % (key_principal,actor if isinstance(actor,str) and actor else repr(actor)))
 
+#: The acceptance commands a confined coordinator may run through the endpoint (slice 3 of
+#: docs/COORDINATORS_PER_PROJECT_DESIGN.md, kittrial-5bb.195). They are the host commands of
+#: admin.py that rest on the operator allowlist, reachable here only because a bound key makes
+#: the actor the server's fact instead of the caller's own word (rules 1 and 2, kittrial-5bb.193
+#: and .194). Voiding, reverting, reconciling, backups, retiring and the rollout switches are
+#: deliberately absent (James's answer to question 5, 2026-10-07).
+COORDINATOR_COMMANDS=('guidance-set','guidance-clear','guidance-status','reference-apply',
+                      'capability-apply','capability-verify','proposal-review','proposal-decide',
+                      'handoff','set-onboarding')
+#: The coordinator commands that only read (no journal, no server time; the read takes the
+#: project's coordination lock, exactly as the host command does).
+COORDINATOR_READS=('guidance-status',)
+#: The coordinator commands whose attachment is plain text rather than a JSON payload.
+COORDINATOR_TEXTS=('guidance-set','set-onboarding')
+#: The payload ``operation`` values ``reference-apply`` and ``capability-apply`` may carry
+#: through this route (review of 958e883, item 1). The host command's operator route also
+#: allows ``retire`` on a capability, the only route that withdraws an accepted entry, and
+#: ``propose``/``revise`` are the contributor route; both stay off this surface, so a confined
+#: coordinator can accept a reviewed draft or write a direct accepted revision 1 and nothing
+#: that weakens or withdraws what an earlier operator accepted. ``incorporated`` is not an
+#: entry-apply operation at all: it is a proposal disposition state reached through
+#: ``proposal-review``/``proposal-decide``, so it is neither allowed nor needed here.
+COORDINATOR_APPLY_OPERATIONS=('accept','draft')
+
+def coordinator_refusal(request,root,key_principal):
+    """Refuse the coordinator acceptance commands unless the caller is a key bound to a principal
+    whose actor is on this installation's operator list (or, for ``capability-verify``, verifiers).
+
+    Slice 3 of docs/COORDINATORS_PER_PROJECT_DESIGN.md. ``key_principal`` is passed only by the
+    forced command of a bound authorized_keys line (kittrial-5bb.194); the actor has already
+    been checked to be one the project's registry gives to that principal, so the operator
+    allowlist is asked of a name the server chose, not of a name the caller typed. An
+    installation that configures nothing sends no ``--key-principal``: this surface is then
+    unreachable and every other action behaves exactly as it did.
+    """
+    if key_principal is None:
+        raise ValueError('These are the acceptance commands of a confined coordinator: they need an SSH key '
+                         'bound to a principal (--principal on its authorized_keys line), so that the actor is '
+                         'the server\'s fact and not the caller\'s word. This request names no principal, so '
+                         'nothing was changed; run the matching admin.py command on the host instead.')
+    args=request.get('args') if isinstance(request,dict) else None
+    command=args[0] if isinstance(args,list) and args and isinstance(args[0],str) else None
+    actor=request.get('actor') if isinstance(request,dict) else None
+    # The verifiers list may also record a capability check, as the host command allows.
+    if command=='capability-verify' and actor in configured_verifiers(root):return
+    from keyed_records import require_configured_operator
+    require_configured_operator(actor,configured_operators(root),
+                                'run %s through the endpoint'
+                                %(command if command else 'a coordinator command'))
+
+def coordinator_apply_refusal(payload,command):
+    """Refuse a payload operation ``reference-apply``/``capability-apply`` is not meant to carry.
+
+    The check is on the PAYLOAD, before the library is called, for the single form and the
+    ``items`` batch alike, so a payload can never carry an operation the route does not name
+    (review of 958e883, item 1: ``operation: retire`` reached ``apply_native(operator=True)``
+    and superseded an accepted capability). The host commands are unchanged.
+    """
+    operation=payload.get('operation','accept')
+    if operation not in COORDINATOR_APPLY_OPERATIONS:
+        raise ValueError('coordinator %s carries only %s through this surface; %r stays with the '
+                         'installation operator (retiring is admin.py capability-retire, and '
+                         'propose/revise are the contributor route). Nothing was changed.'
+                         %(command,', '.join(COORDINATOR_APPLY_OPERATIONS),operation))
+    items=payload.get('items')
+    if isinstance(items,list):
+        for index,item in enumerate(items):
+            if isinstance(item,dict) and 'operation' in item:
+                raise ValueError('coordinator %s items[%d] carries operation %r; every batch item is an '
+                                 'acceptance (%s). Nothing was changed.'
+                                 %(command,index,item.get('operation'),', '.join(COORDINATOR_APPLY_OPERATIONS)))
+
+def coordinator_payload(args,request):
+    """The text of the one attachment a coordinator command carries, or None.
+
+    The client transports a local file as ONE token ``@attachment:N`` with the flag kept on
+    the attachment (``client.py`` ``_attachments``), exactly as it does for every other write,
+    so the server never reads a path out of the request (review of 958e883, item 2: this used
+    to demand the two tokens ``--file @attachment:N`` the client never sends). The two-token
+    form is still accepted for a hand-built request, and a token that is neither is refused
+    without ever being read as a path. ``args`` is everything after the subcommand.
+    """
+    if not args:return None
+    if len(args)==1:
+        flag=None;token=args[0]
+    elif len(args)==2 and args[0] in ('--file','-f'):
+        flag=args[0];token=args[1]
+    else:
+        raise ValueError('Use --file with a local JSON or text file; the server reads no file path')
+    attachments=request.get('attachments') if isinstance(request,dict) else None
+    item=None
+    if isinstance(attachments,dict) and isinstance(token,str) and token.startswith('@attachment:'):
+        item=attachments.get(token.partition(':')[2])
+    if (not isinstance(item,dict) or not isinstance(item.get('text'),str)
+            or item.get('flag') not in ('--file','-f')):
+        raise ValueError('Invalid attachment: a coordinator command needs --file with one local JSON or '
+                         'text file, carried as a single @attachment token; the server reads no file path')
+    if flag is not None and item.get('flag')!=flag:
+        raise ValueError('Invalid attachment: the flag on the attachment does not match the request')
+    return item['text']
+
 def execute(root,request,authority_config=None,require_authority=False,key_projects=None,key_principal=None):
     key_project_refusal(request,key_projects)
     # Rule 2: a key bound to a principal is refused the web-only actions here, before their
@@ -862,6 +963,143 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             return guarded_write(root,request,journal_path(path),proposal_effect,
                                authority_config=authority_config,
                                require_authority=require_authority,runner=runner)
+    if action=='coordinator':
+        # Slice 3 of docs/COORDINATORS_PER_PROJECT_DESIGN.md (kittrial-5bb.195): the acceptance
+        # commands a confined coordinator runs in its own project. These are the host commands
+        # of admin.py; they are reachable here only because the caller is a bound key
+        # (--key-principal, kittrial-5bb.194), so the actor is the one the project's registry
+        # gives to the key's principal and not the caller's own word. An installation that
+        # configures nothing sends no principal and reaches none of them (coordinator_refusal).
+        args=request.get('args',[])
+        if not isinstance(args,list) or not args or any(not isinstance(a,str) or '\0' in a for a in args):
+            raise ValueError('Use coordinator with one of: %s'%', '.join(COORDINATOR_COMMANDS))
+        command=args[0]
+        if command not in COORDINATOR_COMMANDS:
+            raise ValueError('Unknown coordinator command %r: a confined coordinator may run only %s. Voiding, '
+                             'reverting, reconciling, backups, retiring and the rollout switches stay with the '
+                             'installation operator.'%(command,', '.join(COORDINATOR_COMMANDS)))
+        coordinator_refusal(request,root,key_principal)
+        text=coordinator_payload(args[1:],request)
+        payload=None
+        if command in COORDINATOR_READS or command=='guidance-clear':
+            if args[1:]:raise ValueError('Use coordinator %s without a payload'%command)
+        elif command in COORDINATOR_TEXTS:
+            if text is None:raise ValueError('coordinator %s needs --file with the text to set'%command)
+        else:
+            if text is None:raise ValueError('coordinator %s needs --file with its JSON payload'%command)
+            try:
+                payload=record_json.loads(text)
+            except ValueError as error:
+                # A bare JSONDecodeError is not a sentence a confined coordinator can act on
+                # (review of 958e883, item 3c).
+                raise ValueError('coordinator %s payload is not valid JSON (%s); supply one JSON object '
+                                 'in the --file attachment. Nothing was changed.'%(command,error)) from None
+            if not isinstance(payload,dict):
+                raise ValueError('coordinator %s payload must be a JSON object'%command)
+            if command in ('reference-apply','capability-apply'):
+                coordinator_apply_refusal(payload,command)
+        operators=configured_operators(root)
+        verifiers=configured_verifiers(root)
+        run_warnings=[]
+        def coordinator_run(argv):
+            stdout,warnings=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
+            if warnings:run_warnings.append(warnings)
+            return stdout
+        runner=NativeRunner(coordinator_run)
+        import contextlib
+        @contextlib.contextmanager
+        def held():
+            # One hold of the project's coordination lock; closing the file releases it. A
+            # batch command takes it once per item through this callable and releases it
+            # between items, so the caller holds nothing around the batch (kittrial-5bb.67
+            # review 01a0fc55), exactly as admin.py does for the same commands.
+            with (path/'.coordination.lock').open('a') as lock:
+                fcntl.flock(lock,fcntl.LOCK_EX)
+                yield
+        per_item_lock=(command=='capability-verify'
+                       or (command in ('reference-apply','capability-apply')
+                           and isinstance(payload,dict) and 'items' in payload))
+        if command=='guidance-status':
+            # The host read (`admin.py guidance-status`): a bound, listed actor may see the
+            # text, which the endpoint's self-declared `guidance status` withholds. The host
+            # command takes the project's coordination lock around the read, so this does too
+            # (review of 958e883, item 4d): the answer is one snapshot, not a read racing a set.
+            import guidance
+            with held():
+                result=guidance.status(path,actor,operators,host=True)
+            return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''}
+        def coordinator_effect():
+            if command=='guidance-set':
+                import guidance
+                result=guidance.write_guidance(path,text,actor)
+            elif command=='guidance-clear':
+                import guidance
+                result=guidance.clear(path,actor)
+            elif command=='set-onboarding':
+                from onboarding import write_project
+                from http_authority import server_time as now_stamp
+                target=path/'ONBOARDING.md'
+                previous=(target.read_text(encoding='utf-8-sig')
+                          if target.is_file() and not target.is_symlink() else None)
+                write_project(target,text)
+                # This route does NOT probe the text for endpoint paths (review of 958e883, item 3b):
+                # probe_endpoints resolves and reads every absolute *.py path the text names and
+                # reveals one bit about each plus the resolved symlink target, and the server must
+                # never read a path out of the request. The host `admin.py set-onboarding` keeps its
+                # warning for the operator with a shell. WHO set the text is recorded here, as
+                # guidance records set_by.
+                result={'state':'set','source':'operator','bytes':len(text.encode('utf-8')),
+                        'changed':previous!=text,'set_by':actor,'set_at':now_stamp()}
+            elif command=='handoff':
+                from handoff import execute as handoff_execute
+                result=handoff_execute(path,actor,payload,runner,operator=True)
+            elif command=='reference-apply':
+                import reference_records
+                if isinstance(payload,dict) and 'items' in payload:
+                    result=reference_records.apply_batch(payload,actor,runner,path,operators=operators,lock=held)
+                else:
+                    payload.setdefault('operation','accept')
+                    result=reference_records.apply_native(payload,actor,runner,path,operator=True,
+                                                          operators=operators)
+            elif command=='capability-apply':
+                import capability_records
+                if isinstance(payload,dict) and 'items' in payload:
+                    result=capability_records.apply_batch(payload,actor,runner,path,operators=operators,lock=held)
+                else:
+                    result=capability_records.apply_native(payload,actor,runner,path,operator=True,
+                                                           operators=operators)
+            elif command=='capability-verify':
+                import capability_verification
+                result=capability_verification.verify_batch(payload,actor,runner,operators=operators,
+                                                            verifiers=verifiers,journal=path,lock=held)
+            else:
+                import proposal_records
+                result=proposal_records.dispose(payload,actor,runner,path,operators=operators,
+                                                route='decide' if command=='proposal-decide' else 'review')
+            # The answer carries the server's time when this call wrote: a file set (guidance,
+            # onboarding), a record accepted, a verification, a disposition. A no-op - an
+            # idempotent retry the record module answered `reconciled: true` or `changed: false`,
+            # or an items batch whose every item was already-accepted - wrote nothing and carries
+            # no server_time (review of 958e883, finding 11: the comment used to claim this while
+            # guidance-set, set-onboarding and a batch still carried server_time).
+            no_op=(isinstance(result,dict)
+                   and (result.get('reconciled') is True or result.get('changed') is False
+                        or (command in ('reference-apply','capability-apply') and isinstance(payload,dict)
+                            and isinstance(payload.get('items'),list) and bool(result.get('items'))
+                            and all(isinstance(item,dict) and item.get('result')=='already-accepted'
+                                    for item in result['items']))))
+            if not (isinstance(result,dict) and result.get('reconciled') is True):runner.wrote=True
+            if no_op:runner.wrote=False
+            return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n',
+                    'stderr':''.join(run_warnings)}
+        if per_item_lock:
+            return guarded_write(root,request,journal_path(path),coordinator_effect,
+                                 authority_config=authority_config,
+                                 require_authority=require_authority,runner=runner)
+        with held():
+            return guarded_write(root,request,journal_path(path),coordinator_effect,
+                                 authority_config=authority_config,
+                                 require_authority=require_authority,runner=runner)
     if action in ('brief','history','checkpoint'):
         from briefing import execute as briefing_execute
         args=request.get('args',[])
