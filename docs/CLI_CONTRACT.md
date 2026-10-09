@@ -225,7 +225,12 @@ The additive `blocking_items` counts only its open `blocker` and `dependency`
 items, with the same zero/unknown conventions as `open_items`. Questions,
 decisions and corrections do not block agent work. Delivered tasks follow their
 review state regardless of either count. Native title/description edits without
-an attributed editor stay quiet; comment to wake the agent. `review_state` may be
+an attributed editor stay quiet; comment to wake the agent. When an older endpoint
+omits `blocking_items`, HTTP attention and My work use its validated `open_items`
+count. Explicit null or malformed counts remain unknown. The HTTP action's
+20-request-id projection cap is defended with injected oversized rows; a second
+request-changes write on one contribution is refused, so no real review sequence
+is claimed to reach that cap. `review_state` may be
 `integrated`; `workflow_state` keeps the raw workflow state. See
 [REVIEWS.md](REVIEWS.md) for their meaning.
 

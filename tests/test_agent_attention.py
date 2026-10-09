@@ -209,6 +209,10 @@ class EndpointAttentionTests(fixes.EndpointCase):
             self.assertEqual(calls, [(0,False),(0,True)])
             self.assertEqual(bounded['attention']['counts']['claimed'], 100)
             self.assertTrue(bounded['attention']['truncated'])
+            self.assertTrue(bounded['attention']['snapshot_truncated'])
+            self.assertTrue(bounded['attention']['own_tasks_truncated'])
+            self.assertTrue(bounded['attention']['actions_truncated'])
+            self.assertIn('at least 100 claimed', bounded['attention']['summary'])
 
     def test_conflicting_checkpoint_history_keeps_unknown_and_operator_action(self):
         task=self.tasks[0];self.claim(task)
@@ -309,7 +313,7 @@ class EndpointAttentionTests(fixes.EndpointCase):
         self.assertEqual(([task['id'] for task in read['tasks']], read['complete']), (['mine'], True))
         self.assertEqual(read['tasks'][0], {
             'id': 'mine', 'title': 'm', 'status': 'in_progress', 'assignee': 'me', 'review_state': 'none',
-            'contribution_id': None, 'pending_change_requests': [], 'open_items': 2, 'blocking_items':None,
+            'contribution_id': None, 'pending_change_requests': [], 'open_items': 2, 'blocking_items':2,
             'checkpoint_at': '2026-10-04T10:00:00Z', 'newer_activity': True})
         self.assertEqual(asked, [['--owner', 'me', '--limit', '100', '--offset', '0', '--json'],
                                  ['--owner', 'me', '--limit', '100', '--offset', '100', '--json']])

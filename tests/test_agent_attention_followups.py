@@ -12,6 +12,112 @@ import http_service as h
 
 
 class EndpointFollowups(a.EndpointAttentionTests):
+    def large_work(self, review_rows, free_rows):
+        rows = [dict(task='review-%04d'%i, title='other delivery', owner='other-actor',
+                     status='in_progress', review_state='awaiting-review', contribution_id='delivery',
+                     open_items=0, blocking_items=0) for i in range(review_rows)]
+        rows += [dict(task='free-%04d'%i, title='free', owner=None, status='open',
+                      review_state='none', open_items=0, blocking_items=0) for i in range(free_rows)]
+        calls=[]
+        def run(action, project, reader, args, *rest, **kwargs):
+            self.assertEqual(action, 'work');offset=int(args[args.index('--offset')+1])
+            owned='--owner' in args;calls.append((owned,offset))
+            selected=[] if owned else rows
+            return dict(total=len(selected),items=selected[offset:offset+100],
+                        next_offset=offset+100 if offset+100<len(selected) else None)
+        return run,calls
+
+    def test_review_heavy_first_page_recovers_hidden_claimable_suggestions(self):
+        run,calls=self.large_work(100, 1520)
+        with patch.object(self.backend,'_run',side_effect=run):
+            data=self.next();view=data['attention']
+        self.assertEqual(calls,[(False,0),(False,100),(True,0)])
+        self.assertEqual(view['counts']['claimed'],0)
+        self.assertEqual(view['counts']['claimable'],100)
+        self.assertEqual(view['state'],'unknown')
+        self.assertIn('at least 100 claimable',view['summary'])
+        self.assertTrue(view['snapshot_truncated'])
+        self.assertFalse(view['own_tasks_truncated'])
+        self.assertTrue(view['actions_truncated'])
+        self.assertTrue(any(x['kind']=='claimable-task' for x in data['next_actions']))
+        self.assertFalse(any(x['task'].startswith('review-') and x['kind']=='in-progress'
+                             for x in data['next_actions']))
+
+    def test_bound_without_observed_work_is_unknown_not_idle(self):
+        run,calls=self.large_work(1000,720)
+        with patch.object(self.backend,'_run',side_effect=run):
+            data=self.next();view=data['attention']
+        self.assertEqual(len(calls),11)
+        self.assertEqual(view['state'],'unknown')
+        self.assertIn('at least 0 claimable',view['summary'])
+        self.assertNotIn('Idle:',view['summary'])
+        self.assertTrue(view['snapshot_truncated'])
+        self.assertFalse(view['own_tasks_truncated'])
+        self.assertTrue(view['actions_truncated'])  # Other deliveries exceed the review-action cap.
+
+    def test_legacy_work_fields_keep_blocked_attention_and_my_work(self):
+        task=self.tasks[0];self.claim(task)
+        self.checkpoint(task,[dict(id='waiting',kind='blocker',text='waiting',source='fixture')])
+        human=self.tasks[1];token=self.people['alex']
+        self.assertEqual(200,self.request('POST',self.base(human)+'/claim',{},token=token).status)
+        history=self.request('GET',self.base(human)+'/history?limit=5',token=token).data
+        written=self.request('POST',self.base(human)+'/checkpoints',dict(
+            schema_version=1,previous=None,activity_cursor=history['activity_cursor'],source_commit='',branch='',
+            intent='fixture',acceptance='legacy blocked state preserved',summary='waiting',next_action='wait',
+            open_items=[dict(id='waiting',kind='blocker',text='waiting',source='fixture')],resolved=[]),token=token)
+        self.assertEqual(201,written.status,written.data)
+        original=self.backend._run
+        def legacy(action,*args,**kw):
+            value=original(action,*args,**kw)
+            if action=='work':
+                for row in value.get('items',[]):row.pop('blocking_items',None)
+            return value
+        with patch.object(self.backend,'_run',side_effect=legacy):
+            view=self.next()['attention']
+            self.assertEqual(view['state'],'blocked')
+            self.assertEqual(view['counts']['checkpoint_errors'],0)
+            self.assertEqual(view['counts']['blocked'],1)
+            work=self.request('GET','/v1/me/work',token=self.people['alex'])
+        self.assertEqual(work.status,200,work.data)
+        self.assertTrue(next(x for x in work.data['assigned'] if x['id']==human)['blocked'])
+        # The consumer also accepts a projected legacy queue with the field absent.
+        queue=self.backend.review_queue
+        def legacy_queue(project):
+            value=queue(project)
+            for row in value['items']:row['attention'].pop('blocking_items',None)
+            return value
+        with patch.object(self.backend,'READ_CACHE_SECONDS',0), \
+                patch.object(self.backend,'review_queue',side_effect=legacy_queue):
+            work=self.request('GET','/v1/me/work',token=self.people['alex'])
+        self.assertEqual(work.status,200,work.data)
+        self.assertTrue(next(x for x in work.data['assigned'] if x['id']==human)['blocked'])
+
+    def test_explicit_unreadable_blocking_count_does_not_use_legacy_fallback(self):
+        task=self.tasks[0];self.claim(task);actor=self.next()['agent']['actor']
+        row=dict(id=task,title='unreadable',assignee=actor,status='in_progress',review_state='none',
+                 open_items=1,blocking_items=None)
+        with patch.object(self.backend,'agent_tasks',return_value=dict(tasks=[row],complete=True)):
+            view=self.next()['attention']
+        self.assertEqual(view['state'],'error')
+        self.assertEqual(view['counts']['checkpoint_errors'],1)
+        self.assertEqual(view['counts']['blocked'],0)
+
+    def test_failed_authorized_work_read_is_error_with_incomplete_counts(self):
+        task=self.tasks[0];self.claim(task)
+        original=self.backend._run
+        def failed(action,*args,**kw):
+            if action=='work':raise h.uncertain('synthetic canonical work failure')
+            return original(action,*args,**kw)
+        with patch.object(self.backend,'_run',side_effect=failed):
+            view=self.next()['attention']
+        self.assertEqual(view['state'],'error')
+        self.assertEqual(view['counts']['read_errors'],1)
+        self.assertIn('work read(s) failed',view['summary'])
+        self.assertTrue(view['truncated'])
+        self.assertTrue(view['snapshot_truncated'])
+        self.assertTrue(view['own_tasks_truncated'])
+        self.assertFalse(view['actions_truncated'])
+
     def test_partial_large_snapshot_recovers_all_own_tasks_with_four_reads(self):
         actor=self.next()['agent']['actor']
         rows=[dict(task='free-%04d'%i,title='free',owner=None,status='open',review_state='none',open_items=0)
@@ -121,6 +227,24 @@ for name in unittest.defaultTestLoader.getTestCaseNames(a.EndpointAttentionTests
 
 
 class InProcessFollowups(a.InProcessAttentionTests):
+    def test_failed_project_retains_successful_project_actions(self):
+        second=self.create_project(self.alex,'Beta')
+        self.agent_id,self.secret,_=self.agent_secret(self.alex,name='Two projects',projects=[self.project,second])
+        task=self.task('own successful work')
+        self.assertEqual(200,self.request('POST','/v1/projects/%s/tasks/%s/claim'%(self.project,task),
+                                         token=self.secret).status)
+        original=self.backend.review_queue
+        def failed(project_id):
+            if project_id==second:raise h.uncertain('synthetic unavailable project')
+            return original(project_id)
+        with patch.object(self.backend,'review_queue',side_effect=failed):
+            data=self.next();view=data['attention']
+        self.assertEqual(view['state'],'error')
+        self.assertEqual(view['counts']['claimed'],1)
+        self.assertEqual(view['counts']['read_errors'],1)
+        self.assertIn(('in-progress',task),a.kinds(data))
+        self.assertFalse(any(x['project']==second for x in data['next_actions']))
+
     def test_kinds_and_delivered_precedence_match_endpoint_policy(self):
         task=self.task('policy');base='/v1/projects/%s/tasks/%s'%(self.project,task)
         self.request('POST',base+'/claim',token=self.secret)
@@ -152,6 +276,57 @@ class NativeAttentionFollowups(held_stack.RealStackTests):
     def setUp(self):
         super().setUp()
         self.secret = self.agent('Attention')
+
+    def test_failed_work_read_on_real_tracker_is_error_not_idle(self):
+        task=self.new('owned before failed read');self.own(task)
+        self.assertEqual(self.next()['attention']['counts']['claimed'],1)
+        original=self.backend._run
+        def failed(action,*args,**kw):
+            if action=='work':raise h.uncertain('synthetic failed canonical read')
+            return original(action,*args,**kw)
+        with patch.object(self.backend,'_run',side_effect=failed):
+            view=self.next()['attention']
+        self.assertEqual(view['state'],'error')
+        self.assertEqual(view['counts']['read_errors'],1)
+        self.assertTrue(view['snapshot_truncated'])
+        self.assertTrue(view['own_tasks_truncated'])
+        self.assertIn('counts are incomplete',view['summary'])
+
+    @unittest.skipUnless(os.environ.get('ORCHESTRA_ATTENTION_R4_SCALE'),
+                         'set ORCHESTRA_ATTENTION_R4_SCALE for review-heavy native paging')
+    def test_review_heavy_native_first_page_recovers_unclaimed_work(self):
+        import test_http_review_fixes as fixes
+        other=self.agent('Other deliveries')
+        for index in range(100):
+            task=self.new('other delivered %03d'%index);self.own(task,other)
+            self.review(task,'contribute',token=other,previous=None,**fixes.CONTRIBUTION)
+        for index in range(920):self.new('unclaimed %04d'%index)
+        original=self.backend._run;calls=[];first=[]
+        def recording(action,project,reader,args,*rest,**kwargs):
+            value=original(action,project,reader,args,*rest,**kwargs)
+            if action=='work':
+                calls.append(list(args))
+                if '--owner' not in args and args[args.index('--offset')+1]=='0':
+                    first.extend(value['items'])
+            return value
+        with patch.object(self.backend,'_run',side_effect=recording):
+            data=self.next();view=data['attention']
+        self.assertEqual(len(first),100)
+        self.assertTrue(all(x['review_state']=='awaiting-review' for x in first))
+        self.assertEqual([int(x[x.index('--offset')+1]) for x in calls if '--owner' not in x],[0,100])
+        self.assertEqual(sum('--owner' in x for x in calls),1)
+        self.assertEqual(view['counts']['claimed'],0)
+        self.assertGreaterEqual(view['counts']['claimable'],30)
+        self.assertEqual(view['state'],'unknown')
+        self.assertIn('at least',view['summary'])
+        self.assertTrue(view['snapshot_truncated'])
+        self.assertFalse(view['own_tasks_truncated'])
+        self.assertTrue(view['actions_truncated'])
+        self.assertTrue(all(x['kind']=='claimable-task' for x in data['next_actions']))
+        print('NATIVE_R4_HIDDEN',json.dumps(dict(rows=len(self.export_rows()),work_calls=calls,
+              claimed=view['counts']['claimed'],claimable=view['counts']['claimable'],
+              state=view['state'],summary=view['summary'],snapshot_truncated=view['snapshot_truncated'],
+              own_tasks_truncated=view['own_tasks_truncated'],actions_truncated=view['actions_truncated'])),flush=True)
 
     def agent(self, name):
         made = self.request('POST', '/v1/agents',

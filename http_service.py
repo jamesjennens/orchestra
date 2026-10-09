@@ -1230,6 +1230,16 @@ def queue_item(project_id, task, review_state, contribution, open_requests,
             'contribution_author': contribution_author}
 
 
+def attention_blocking_items(fields):
+    """Validate blocking count; older endpoints supplied only open_items.
+
+    An explicitly unreadable blocking count stays unknown. Only omission uses
+    the older endpoint's open-item policy.
+    """
+    value = fields.get('blocking_items', fields.get('open_items', 0))
+    return value if type(value) is int and value >= 0 else None
+
+
 def own_queue_tasks(queue, actor=None):
     """Split one current review snapshot by assignee, retaining unknown checkpoint state."""
     tasks=[]
@@ -1242,7 +1252,7 @@ def own_queue_tasks(queue, actor=None):
                       'contribution_id':(row.get('contribution') or {}).get('id'),
                       'pending_change_requests':list(fields.get('pending_change_requests') or [])[:20],
                       'open_items':fields.get('open_items',0),
-                      'blocking_items':fields.get('blocking_items',0 if fields.get('open_items',0)==0 else None),
+                      'blocking_items':attention_blocking_items(fields),
                       'checkpoint_at':fields.get('checkpoint_at'),
                       'newer_activity':fields.get('newer_activity')})
     return {'tasks':tasks,'complete':bool(queue.get('complete'))}
@@ -2534,7 +2544,7 @@ class EndpointBackend:
     def _attention_fields(row):
         """The four attention fields of one canonical ``work`` row, type-checked."""
         open_items = row.get('open_items', 0)
-        blocking_items = row.get('blocking_items',0 if open_items==0 else None)
+        blocking_items = attention_blocking_items(row)
         return {'pending_change_requests': [value for value in row.get('pending_change_requests') or []
                                             if isinstance(value, str)][:20],
                 'open_items': open_items if type(open_items) is int and open_items>=0 else None,
@@ -2576,7 +2586,7 @@ class EndpointBackend:
                              'contribution_id': (item.get('contribution') or {}).get('id'),
                              'pending_change_requests': list(attention.get('pending_change_requests') or []),
                              'open_items': attention.get('open_items',0),
-                             'blocking_items':attention.get('blocking_items',0 if attention.get('open_items',0)==0 else None),
+                             'blocking_items':attention_blocking_items(attention),
                              'checkpoint_at': attention.get('checkpoint_at'),
                              'newer_activity': attention.get('newer_activity')})
             return {'tasks': rows, 'complete': bool(queue.get('complete'))}
@@ -2651,10 +2661,14 @@ class EndpointBackend:
             if offset is None:
                 complete = True
                 break
-            # The single-agent route can recover own tasks with the owner filter.
-            # Avoid ten full project exports when the first page proves the
-            # unfiltered snapshot cannot be complete within this bound.
-            if stop_if_over_bound and type(page.get('total')) is int and page['total']>self.QUEUE_MAX_PAGES*MAX_PAGE:
+            # Over-bound single-agent reads recover own tasks separately. Stop
+            # once claimable suggestions fill; a review-heavy first page must
+            # not hide all unclaimed work. Keep the same bounded page walk.
+            claimable = sum(item.get('status') == 'open' and item.get('assignee') is None
+                            for item in items)
+            if (stop_if_over_bound and type(page.get('total')) is int
+                    and page['total'] > self.QUEUE_MAX_PAGES * MAX_PAGE
+                    and claimable >= min(AGENT_CLAIMABLE_LIMIT, AGENT_ACTION_LIMIT)):
                 break
         items.sort(key=queue_order)
         return {'items': items, 'complete': complete, 'warnings': sorted(warnings)}
@@ -5130,7 +5144,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         return ordered[:self.AGENT_REVIEW_LIMIT]
 
     @staticmethod
-    def _agent_review_summary(counts):
+    def _agent_review_summary(counts, snapshot_truncated=False):
         """What to add to an agent's summary when there is review work, whatever its state.
 
         The state values do not change for review work, so without this an agent with
@@ -5138,10 +5152,12 @@ class ApiHandler(BaseHTTPRequestHandler):
         for it or for its owner.
         """
         parts = []
+        prefix = 'at least ' if snapshot_truncated else ''
         if counts.get('review_recommended'):
-            parts.append('%d contribution(s) recommended for approval: tell the owner' % counts['review_recommended'])
+            parts.append('%s%d contribution(s) recommended for approval: tell the owner'
+                         % (prefix, counts['review_recommended']))
         if counts.get('to_review'):
-            parts.append('%d contribution(s) to review' % counts['to_review'])
+            parts.append('%s%d contribution(s) to review' % (prefix, counts['to_review']))
         return (' ' + '; '.join(parts) + '.') if parts else ''
 
     #: The order of the kinds that share a priority. The ORDER of ``next_actions`` is the
@@ -5226,7 +5242,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         actor = agent.get('actor') or agent.get('id')
         counts = {'claimable': 0, 'claimed': 0, 'changes_requested': 0,
                   'awaiting_review': 0, 'blocked': 0, 'in_progress': 0, 'awaiting_integration': 0,
-                  'review_errors': 0, 'checkpoint_errors': 0,
+                  'review_errors': 0, 'checkpoint_errors': 0, 'read_errors': 0,
                   'review_recommended': 0, 'to_review': 0}
         own_actions = []
         claimable_actions = []
@@ -5240,7 +5256,11 @@ class ApiHandler(BaseHTTPRequestHandler):
                 read = self._agent_project_tasks(project_id,many=many)
                 own = self._agent_own_tasks(project_id, actor, many=many)
             except HttpError:
-                # A project the principal can no longer open simply drops out.
+                # Authorization can change during the read. Still-authorized
+                # failed reads are unknown work, never an empty project.
+                if self._agent_may_read(principal, project_id):
+                    counts['read_errors'] += 1
+                    truncated = snapshot_truncated = own_tasks_truncated = True
                 continue
             if not read['complete'] or not own['complete']:
                 truncated = True
@@ -5251,7 +5271,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 review = task.get('review_state')
                 is_open = task.get('status') != 'closed'
                 open_items = task.get('open_items',0)
-                blocking_items = task.get('blocking_items',0 if open_items==0 else None)
+                blocking_items = attention_blocking_items(task)
                 delivered=bool(task.get('contribution_id')) or review not in (None,'none')
                 unreadable = is_open and (open_items is None or blocking_items is None)
                 blocked = is_open and not delivered and type(blocking_items) is int and blocking_items > 0
@@ -5333,7 +5353,9 @@ class ApiHandler(BaseHTTPRequestHandler):
             actions = actions[:AGENT_ACTION_LIMIT]
             truncated = True
             actions_truncated = True
-        if counts['changes_requested']:
+        if counts['read_errors']:
+            state = 'error'
+        elif counts['changes_requested']:
             state = 'changes-requested'
         elif counts['review_errors'] or counts['checkpoint_errors']:
             state = 'error'
@@ -5347,35 +5369,47 @@ class ApiHandler(BaseHTTPRequestHandler):
             state = 'waiting-integration'
         elif counts['claimed']:
             state = 'working'
+        elif snapshot_truncated or own_tasks_truncated:
+            state = 'unknown'
         else:
             state = 'idle'
-        return {'state': state, 'summary': self._agent_summary(state, counts) + self._agent_review_summary(counts),
+        return {'state': state, 'summary': self._agent_summary(
+                    state, counts, snapshot_truncated, own_tasks_truncated)
+                    + self._agent_review_summary(counts, snapshot_truncated),
                 'counts': counts, 'actions': actions, 'truncated': truncated,
                 'snapshot_truncated':snapshot_truncated,'own_tasks_truncated':own_tasks_truncated,
                 'actions_truncated':actions_truncated,
                 'computed_at': now_iso(self.service._now())}
 
     @staticmethod
-    def _agent_summary(state, counts):
+    def _agent_summary(state, counts, snapshot_truncated=False, own_tasks_truncated=False):
+        claimable = ('at least ' if snapshot_truncated else '') + str(counts.get('claimable', 0))
+        def own_count(name):
+            return ('at least ' if own_tasks_truncated else '') + str(counts.get(name, 0))
         if state == 'error':
+            if counts.get('read_errors'):
+                return ('%d project work read(s) failed; counts are incomplete. Retry the work read.'
+                        % counts['read_errors'])
             return ('%d review history error(s), %d unreadable checkpoint history error(s); an operator must reconcile them.'
                     % (counts.get('review_errors',0),counts.get('checkpoint_errors',0)))
         if state == 'changes-requested':
-            return ('%d contribution(s) have changes requested; act on them first.'
-                    % counts['changes_requested'])
+            return ('%s contribution(s) have changes requested; act on them first.'
+                    % own_count('changes_requested'))
         if state == 'blocked':
-            return ('%d task(s) have unresolved blockers or dependencies.'
-                    % counts['blocked'])
+            return ('%s task(s) have unresolved blockers or dependencies.'
+                    % own_count('blocked'))
         if state == 'working':
-            return ('%d claimed task(s) in flight, %d not delivered yet; %d claimable.'
-                    % (counts['claimed'], counts.get('in_progress', 0), counts['claimable']))
+            return ('%s claimed task(s) in flight, %s not delivered yet; %s claimable.'
+                    % (own_count('claimed'), own_count('in_progress'), claimable))
         if state == 'waiting-review':
-            return ('%d contribution(s) waiting for a human review decision.'
-                    % counts['awaiting_review'])
+            return ('%s contribution(s) waiting for a human review decision.'
+                    % own_count('awaiting_review'))
         if state == 'waiting-integration':
-            return ('%d approved contribution(s) waiting for integration; nothing for the agent to do.'
-                    % counts.get('awaiting_integration', 0))
-        return ('Idle: %d claimable task(s), nothing in flight.' % counts['claimable'])
+            return ('%s approved contribution(s) waiting for integration; nothing for the agent to do.'
+                    % own_count('awaiting_integration'))
+        if state == 'unknown':
+            return ('Incomplete work read: %s claimable task(s) observed; check project work for more.' % claimable)
+        return ('Idle: %s claimable task(s), nothing in flight.' % claimable)
 
     @staticmethod
     def _agent_attention_view(agent, attention=None):
@@ -6357,7 +6391,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 continue
             if isinstance(detail, dict):
                 row=attention_rows[(project_id,task_id)]
-                blocking=(row.get('attention') or {}).get('blocking_items')
+                blocking=attention_blocking_items(row.get('attention') or {})
                 detail=dict(detail,blocked=row.get('review_state') in (None,'none')
                             and not row.get('contribution') and type(blocking) is int and blocking>0)
                 details[(project_id, task_id)] = {k: v for k, v in detail.items()

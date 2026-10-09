@@ -2491,13 +2491,22 @@ line separately and unconfined.
   with one canonical `work` command per page (100 rows), without `bd list`. On the
   single-agent route, an incomplete snapshot falls back to paged owner-filtered
   work so tasks beyond the project snapshot bound are recovered. When the first
-  page's total exceeds the 1,000-row bound, stop that snapshot after one page;
-  250 own tasks then need three owner pages, four work commands in total. Owner
-  lists reuse the bounded unfiltered snapshot. In-process projects cost one
+  page's total exceeds the 1,000-row bound, stop once there are enough claimable
+  suggestions to fill the 30-action list. If the first page fills them, 250 own
+  tasks need three owner pages, four work commands in total. A first page filled
+  by other people's review states continues paging for claimable suggestions,
+  up to ten pages (1,000 rows). Owner-filtered recovery also stops at 1,000 rows;
+  its counts are lower bounds when more remain. Owner lists reuse the bounded
+  unfiltered snapshot and can under-count own tasks beyond it. In-process projects cost one
   snapshot read. `snapshot_truncated` marks incomplete project suggestions/counts;
   `own_tasks_truncated` marks incomplete own counts; `actions_truncated` marks a
   suggestion or action cap. `truncated` is their combined signal. Counts over an
-  incomplete source are lower bounds, not project totals. Nothing is cached across requests
+  incomplete source are lower bounds, not project totals: summaries say "at least N".
+  An incomplete read with no observed own work says `unknown`, never `idle`;
+  observed claimable actions are still offered. A failed work read of a still-authorized
+  project says `error`, increments `read_errors`, and marks snapshot and own counts
+  incomplete. Successful projects retain their actions. Projects the principal can
+  no longer read are excluded. Nothing is cached across requests
   by the attention calculation, and live authority is checked before every project.
   - **One action per own task, in this order:** `changes-requested` (priority 1, with
     `requests`, the request-changes record ids), `blocked` (2: the latest checkpoint
@@ -2515,6 +2524,12 @@ line separately and unconfined.
     Questions, decisions and corrections do not block. If an answer is needed to
     proceed, record a blocker rather than only a question. Delivered tasks follow
     their review state regardless of checkpoint items.
+    On an older endpoint that omits `blocking_items`, attention and My work use
+    its validated `open_items` count to preserve that endpoint's blocking policy.
+    An explicit unreadable or malformed blocking count stays unknown.
+    The action's 20-request-id cap is defensive projection of injected oversized
+    rows. Real writes refuse a second request-changes record on the same
+    contribution; this cap is not a verified reachable review sequence.
     Explicitly unreadable checkpoint history keeps both item counts `null` and gets
     `checkpoint-error`, asking an operator to reconcile it. Unknown does not count
     as zero unresolved items or as undelivered work the agent can safely continue.
@@ -2605,11 +2620,14 @@ line separately and unconfined.
     the `work` view lists: open ones, and closed ones whose review is still active),
     `changes_requested`, `blocked`, `in_progress` (not delivered and not blocked),
     `awaiting_review`, `awaiting_integration`, `review_errors`, `checkpoint_errors`,
-    and `claimable` for the project. Delivered work does not count as blocked.
+    and `claimable` for the project. `read_errors` counts failed authorized-project
+    work reads. Delivered work does not count as blocked.
     `open_items` still counts all open kinds; `blocking_items` counts the two
     blocking kinds. Unknown counts are preserved rather than treated as zero.
-  - **`state`**: `changes-requested`, `error`, `blocked`, `working`, `waiting-review`,
-    `waiting-integration` or `idle`, the first that applies.
+  - **`state`**: a failed authorized work read takes `error`; otherwise
+    `changes-requested`, `error`, `blocked`, `working`, `waiting-review`,
+    `waiting-integration`, `unknown` (incomplete with no observed own work), or
+    `idle`, the first that applies.
     An error-only queue names its review/checkpoint error and operator action.
   - `GET /v1/me/work` (a person's own queue) uses the same kind and delivered-state
     policy, with its bounded per-task detail reads described above.
