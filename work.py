@@ -49,9 +49,9 @@ def help_payload(action='work'):
         'handoff': 'handoff TASK --file payload.json',
         'brief': 'brief TASK [--items-offset N] [--items-limit N] [--full] [--json]',
         'history': 'history TASK [--limit N | --recent N | --last N] [--since TIME] '
-                   '[--since-checkpoint] [--kind comment|event] [--cursor TOKEN] '
+                   '[--since-checkpoint | --since-my-checkpoint] [--kind comment|event] [--cursor TOKEN] '
                    '[--body-budget BYTES]',
-        'checkpoint': 'checkpoint TASK --file checkpoint.json [--json] | checkpoint TASK --provenance | checkpoint TASK --verify | checkpoint TASK --latest | checkpoint TASK --directions [--offset N] [--limit N]',
+        'checkpoint': 'checkpoint TASK --file checkpoint.json [--json] | checkpoint TASK --provenance | checkpoint TASK --verify | checkpoint TASK --latest [--provenance] | checkpoint TASK --directions [--offset N] [--limit N]',
     }
     payload = {'schema_version': 1, 'contract': CONTRACT_VERSION, 'command': action,
                'usage': usage.get(action, action),
@@ -196,16 +196,17 @@ def help_options(action):
             {'flag': 'TASK', 'description': 'task to brief'},
             {'flag': '--items-offset N', 'description': 'unresolved-item page offset >= 0 (default 0)'},
             {'flag': '--items-limit N', 'description': 'unresolved items per page 1..10 (default 5)'},
-            {'flag': '--full', 'description': 'add an unclipped full_context block (title, owner, intent, acceptance, position, next action) with the characters the compact read clipped per field'},
+            {'flag': '--full', 'description': 'add a bounded full_context block (title, owner, intent, acceptance, position, next action) with the characters the compact read clipped per field and the characters the block cap removed'},
             *common,
         ]
     if action == 'history':
         return [
             {'flag': 'TASK', 'description': 'task whose snapshot-bound history is paged'},
             {'flag': '--limit N', 'description': 'oldest-first entries per page 1..20 (default 5)'},
-            {'flag': '--recent N / --last N', 'description': 'page the same snapshot newest-first; N 1..20 is the page size for that direction (the same option under two spellings)'},
+            {'flag': '--recent N / --last N', 'description': 'page the same snapshot newest-first; N 1..20 is the page size for that direction (the same option under two spellings); an empty selection answers total_entries 0'},
             {'flag': '--since TIME', 'description': 'only entries at or after this timezone-aware instant (inclusive)'},
-            {'flag': '--since-checkpoint', 'description': 'only entries after the newest valid checkpoint\'s own entry (the activity it did not incorporate)'},
+            {'flag': '--since-checkpoint', 'description': 'only entries after the NEWEST VALID CHECKPOINT, BY ANYONE (the activity it did not incorporate); the answer names its author, time, coverage and unverified count'},
+            {'flag': '--since-my-checkpoint', 'description': 'the same read based on this actor\'s own newest valid checkpoint'},
             {'flag': '--kind comment|event', 'description': 'only entries of this kind'},
             {'flag': '--cursor TOKEN', 'description': 'continue the exact snapshot page, direction, kind and checkpoint boundary'},
             {'flag': '--body-budget N', 'description': 'encoded body bytes per page 256..8000 (default 4000)'},
@@ -215,8 +216,8 @@ def help_options(action):
         return [
             {'flag': 'TASK', 'description': 'task the checkpoints belong to'},
             {'flag': '--file checkpoint.json', 'description': 'transport the checkpoint payload as text'},
-            {'flag': '--provenance', 'description': 'read the current bounded provenance and activity cursor without writing'},
-            {'flag': '--latest', 'description': 'read only the newest valid checkpoint record (identity, commit, branch, text, items and coverage)'},
+            {'flag': '--provenance', 'description': 'read the current bounded provenance and activity cursor without writing; with --latest, return the record\'s retained digest map instead of counts'},
+            {'flag': '--latest', 'description': 'read only the newest valid checkpoint record (identity, commit, branch, text, items, coverage and provenance COUNTS)'},
             {'flag': '--directions', 'description': 'read full digests for outstanding directions, including outside the stored windows'},
             {'flag': '--offset N / --limit N', 'description': '--directions page: offset >= 0, limit 1..100 (default 50)'},
             {'flag': '--verify', 'description': 'classify current entries using newest retained evidence in linked checkpoint order without writing'},

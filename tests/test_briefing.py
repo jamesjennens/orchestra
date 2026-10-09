@@ -915,6 +915,29 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(delivered, [e['entry_id'] for e in snap['entries']])
         self.assertEqual(len(set(delivered)), 23)
 
+    def test_snapshot_tie_break_is_the_stable_entry_id(self):
+        """A released line: equal timestamps order by entry ID (review mutant M2).
+
+        Numeric comment IDs sort numerically while they are being built, so entry-ID
+        order is NOT the order the entries were built in. Dropping the second key of
+        the snapshot sort leaves the build order (9, 10, zed) and is caught here.
+        """
+        data = rows()
+        data[0]['comments'] = [comment('10'), comment('9'), comment('zed')]
+        snap = b.snapshot(data, PROJECT, TASK)
+        self.assertEqual([e['entry_id'] for e in snap['entries']],
+                         [TASK + '-c10', TASK + '-c9', TASK + '-czed'])
+        # Pagination follows the same tie-break, one entry per page.
+        cursor = None
+        delivered = []
+        while True:
+            page = b.history_page(snap, PROJECT, TASK, limit=1, cursor=cursor)
+            delivered.extend(e['entry_id'] for e in page['entries'])
+            cursor = page['next_cursor']
+            if cursor is None:
+                break
+        self.assertEqual(delivered, [e['entry_id'] for e in snap['entries']])
+
     def test_since_requires_timezone_and_is_inclusive_with_offset(self):
         snap = b.snapshot(rows(), PROJECT, TASK)
         for invalid in ('2026-09-15', '2026-09-15T10:00:00', 'yesterday'):
@@ -1095,6 +1118,190 @@ class RecentHistoryTests(unittest.TestCase):
         self.assertIsNone(page['since_checkpoint'])
         self.assertEqual(page['total_entries'], len(snap['entries']))
         self.assertEqual(page['omitted_entries'], 0)
+        self.assertIsNone(page['checkpoint_coverage'])
+        self.assertIsNone(page['checkpoint_note'])
+
+    def _two_checkpoints(self):
+        """Two checkpoints by the holder, then an edit of a comment from BEFORE the
+        first checkpoint, an edit of one between them, a late backdated arrival and a
+        new one (review F1 case I)."""
+        data = rows()
+        data[0]['comments'] = [comment('a1', 'a1 body', author='eve/session')]
+        save_cp(data, 'cp1')
+        data[0]['comments'].append(comment('b1', 'b1 body', '2026-09-15T10:30:00Z', 'eve/session'))
+        save_cp(data, 'cp2')
+        next(c for c in data[0]['comments'] if c['id'] == 'a1')['text'] = 'a1 EDITED after cp2'
+        next(c for c in data[0]['comments'] if c['id'] == 'b1')['text'] = 'b1 EDITED after cp2'
+        data[0]['comments'].append(comment('late', 'late backdated', '2026-09-15T09:00:00Z', 'eve/session'))
+        data[0]['comments'].append(comment('new', 'new after cp2', '2026-09-15T11:00:00Z', 'eve/session'))
+        return data
+
+    def test_since_checkpoint_uses_the_chain_retained_evidence(self):
+        """The newest record holds only a delta once an earlier checkpoint exists, so a
+        record-local map must not be the whole answer (review F1, case I)."""
+        data = self._two_checkpoints()
+        snap = b.snapshot(data, PROJECT, TASK)
+        view = b.latest_checkpoint(snap)
+        # The record's own map is a delta; the read uses the chain's retained evidence.
+        self.assertLess(view['record_provenance']['verifiable'], view['provenance']['verifiable'])
+        # a1, the first checkpoint's own record and b1.
+        self.assertEqual(view['provenance']['covered'], 3)
+        page = b.history_page(snap, PROJECT, TASK, since_checkpoint=True)
+        self.assertEqual(page['since_checkpoint'], 'cp2')
+        self.assertEqual([e['entry_id'] for e in page['entries']],
+                         [TASK + '-clate', TASK + '-ca1', TASK + '-cb1', TASK + '-cnew'])
+        self.assertEqual(page['checkpoint_coverage'], 'snapshot')
+        self.assertEqual(page['unverified_entries'], 0)
+        self.assertIn('re-verifies every entry', page['checkpoint_note'])
+
+    def test_since_checkpoint_legacy_record_states_what_it_cannot_see(self):
+        """A legacy record has no per-entry evidence: the released timestamp rule
+        applies and the answer says plainly what it cannot show (review F1)."""
+        data = rows()
+        append_checkpoint(data, 'cpL', checkpoint(data))
+        # Arrivals at the checkpoint's own second: one whose entry ID sorts BEFORE the
+        # checkpoint entry (order alone would hide it) and one after. The released brief
+        # lists both, so this read must too.
+        data[0]['comments'].append(comment('a1', 'same second, lower id', STAMP, 'eve/session'))
+        data[0]['comments'].append(comment('same', 'same second, higher id', STAMP, 'eve/session'))
+        # An arrival backdated to before the checkpoint, and an edit of an earlier
+        # comment: neither can be seen without per-entry evidence.
+        data[0]['comments'].append(comment('late2', 'late backdated', '2026-09-15T09:00:00Z', 'eve/session'))
+        next(c for c in data[0]['comments'] if c['id'] == 'first')['text'] = 'first EDITED after cpL'
+        snap = b.snapshot(data, PROJECT, TASK)
+        page = b.history_page(snap, PROJECT, TASK, since_checkpoint=True)
+        self.assertEqual([e['entry_id'] for e in page['entries']],
+                         [TASK + '-ca1', TASK + '-cfirst', TASK + '-csame'])
+        self.assertNotIn(TASK + '-clate2', [e['entry_id'] for e in page['entries']])
+        self.assertEqual(page['checkpoint_coverage'], 'unknown')
+        self.assertEqual(page['unverified_entries'], 0)
+        self.assertIn('legacy record', page['checkpoint_note'])
+        self.assertIn('CANNOT be seen', page['checkpoint_note'])
+        self.assertEqual(page['checkpoint_author']['text'], 'alice/session')
+
+    def test_since_checkpoint_beyond_the_provenance_window_reports_coverage(self):
+        """More entries than one record's retained evidence: the read still surfaces
+        every edit it can prove and reports the coverage and unverified count it cannot
+        (review F1, c3b)."""
+        data = rows()
+        data[0]['comments'] = [comment('c%04d' % n, 'body %d' % n,
+                                       '2026-09-15T10:00:%02dZ' % (n % 60)) for n in range(501)]
+        save_cp(data, 'cpB')
+        data[0]['comments'].append(comment('latebig', 'late backdated', '2026-09-14T00:00:00Z', 'eve/session'))
+        # An arrival in the checkpoint's own second whose entry ID sorts AFTER the
+        # checkpoint entry: the ordering baseline retains it even though the bounded
+        # evidence cannot classify it.
+        data[0]['comments'].append(comment('zzsame', 'same second as the checkpoint', STAMP, 'eve/session'))
+        next(c for c in data[0]['comments'] if c['id'] == 'c0400')['text'] = 'c0400 EDITED'
+        next(c for c in data[0]['comments'] if c['id'] == 'c0000')['text'] = 'c0000 EDITED (beyond both windows)'
+        snap = b.snapshot(data, PROJECT, TASK)
+        page = b.history_page(snap, PROJECT, TASK, since_checkpoint=True)
+        delivered = [e['entry_id'] for e in page['entries']]
+        self.assertIn(TASK + '-cc0400', delivered)          # an edit inside the window
+        self.assertIn(TASK + '-czzsame', delivered)         # a same-second arrival after the baseline
+        self.assertNotIn(TASK + '-cc0000', delivered)       # beyond both recorded bounds
+        self.assertEqual(page['checkpoint_coverage'], 'windowed')
+        self.assertGreater(page['unverified_entries'], 0)
+        self.assertIn('no per-entry evidence', page['checkpoint_note'])
+        self.assertIn('--verify', page['checkpoint_note'])
+        # The window that produced the coverage is the documented one.
+        state = b.snapshot_checkpoints(snap)
+        view = b.checkpoint_view(snap, state, len(state['history']) - 1)
+        self.assertEqual(view['provenance']['covered'], 501)
+        self.assertEqual(view['provenance']['verifiable'], b.DIGEST_WINDOW + b.OLDER_MAX)
+        # --recent on the same read must not refuse; it pages it newest-first.
+        newest = b.history_page(snap, PROJECT, TASK, since_checkpoint=True, recent=5)
+        self.assertEqual(newest['checkpoint_coverage'], 'windowed')
+        self.assertEqual(newest['total_entries'], page['total_entries'])
+
+    def test_since_checkpoint_names_whose_checkpoint_and_the_readers_own(self):
+        """The baseline is the newest valid checkpoint BY ANYONE; the answer names it,
+        and --since-my-checkpoint reads from the caller's own newest (review F3)."""
+        data = rows()
+        data[0]['comments'] = [comment('a1')]
+        save_cp(data, 'cpAlice')
+        data[0]['comments'].append(comment('mid', 'between the checkpoints', '2026-09-15T10:30:00Z'))
+        save_cp(data, 'cpEve', previous='cpAlice')
+        # The comment's native author is the actor that wrote the checkpoint.
+        data[0]['comments'][-1]['author'] = 'bob/session'
+        for n in range(6):
+            data[0]['comments'].append(comment('after%d' % n, 'after cpEve', '2026-09-15T11:0%d:00Z' % n))
+        snap = b.snapshot(data, PROJECT, TASK)
+        anyone = b.history_page(snap, PROJECT, TASK, since_checkpoint=True)
+        self.assertEqual(anyone['since_checkpoint'], 'cpEve')
+        self.assertEqual(anyone['checkpoint_author']['text'], 'bob/session')
+        self.assertEqual(anyone['checkpoint_timestamp'], STAMP)
+        self.assertNotIn(TASK + '-cmid', [e['entry_id'] for e in anyone['entries']])
+        mine = b.history_page(snap, PROJECT, TASK, since_checkpoint=True, actor='alice/session',
+                              since_my_checkpoint=True, limit=1)
+        self.assertEqual(mine['since_checkpoint'], 'cpAlice')
+        self.assertEqual(mine['checkpoint_author']['text'], 'alice/session')
+        delivered = [e['entry_id'] for e in mine['entries']]
+        cursor = mine['next_cursor']
+        while cursor:
+            page = b.history_page(snap, PROJECT, TASK, cursor=cursor)
+            self.assertEqual(page['since_checkpoint'], 'cpAlice')
+            delivered.extend(e['entry_id'] for e in page['entries'])
+            cursor = page['next_cursor']
+        # Everything hal has not incorporated, including eve's own checkpoint record.
+        self.assertEqual(delivered, [TASK + '-ccpEve', TASK + '-cmid']
+                         + [TASK + '-cafter%d' % n for n in range(6)])
+        # An actor that never wrote a checkpoint gets no baseline, not another's.
+        self.assertIsNone(b.latest_checkpoint(snap, actor='carol/session'))
+        alone = b.history_page(snap, PROJECT, TASK, actor='carol/session', since_my_checkpoint=True)
+        self.assertIsNone(alone['since_checkpoint'])
+        with self.assertRaisesRegex(ValueError, 'requires a caller actor'):
+            b.history_page(snap, PROJECT, TASK, since_my_checkpoint=True)
+
+    def test_recent_on_an_empty_selection_answers_like_the_plain_read(self):
+        """The ordinary poller case: nothing new answers total_entries 0, not a refusal
+        (review F2)."""
+        empty = rows()
+        empty[0]['comments'] = []
+        empty_snap = b.snapshot(empty, PROJECT, TASK)
+        cases = [dict(recent=5), dict(recent=5, kind='event'),
+                 dict(recent=5, since='2027-01-01T00:00:00Z')]
+        for case in cases:
+            with self.subTest(case=case):
+                page = b.history_page(empty_snap, PROJECT, TASK, **case)
+                self.assertEqual(page['entries'], [])
+                self.assertEqual(page['total_entries'], 0)
+                self.assertEqual(page['omitted_entries'], 0)
+                self.assertIsNone(page['next_cursor'])
+                self.assertEqual(page['order'], 'newest-first')
+        # A checkpoint with nothing new since it is the same answer.
+        data = rows()
+        data[0]['comments'] = [comment('a1')]
+        save_cp(data, 'cp1')
+        settled = b.snapshot(data, PROJECT, TASK)
+        page = b.history_page(settled, PROJECT, TASK, since_checkpoint=True, recent=5)
+        self.assertEqual(page['total_entries'], 0)
+        self.assertIsNone(page['next_cursor'])
+        self.assertEqual(page['since_checkpoint'], 'cp1')
+        # The same read without --recent answers identically, as the review requires.
+        plain = b.history_page(settled, PROJECT, TASK, since_checkpoint=True)
+        self.assertEqual((plain['total_entries'], plain['entries'], page['entries']), (0, [], []))
+
+    def test_recent_above_the_cap_names_recent(self):
+        """The refusal names the option the caller gave, and the cap is documented
+        (review F7)."""
+        data = rows()
+        data[0]['comments'] = [comment(n) for n in range(3)]
+        snap = b.snapshot(data, PROJECT, TASK)
+        for value in (0, 50):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, r'--recent/--last must be 1\.\.20'):
+                b.history_page(snap, PROJECT, TASK, recent=value, limit=value)
+        # parse_args mirrors --recent into the page size, so the limit check must not
+        # fire first and misname the option.
+        parsed = b.parse_args('history', [TASK, '--recent', '50'])
+        self.assertEqual((parsed.recent, parsed.limit), (50, 50))
+        with self.assertRaisesRegex(ValueError, r'--recent/--last must be 1\.\.20'):
+            b.history_page(snap, PROJECT, TASK, parsed.limit, None, None, 4000,
+                           parsed.recent, None, parsed.since_checkpoint)
+        import work
+        history = work.help_payload('history')
+        self.assertIn('1..20', history['limits']['recent/last'])
+        self.assertIn('1..20', ' '.join(history['notes']))
 
     def test_released_oldest_first_cursor_keeps_its_meaning(self):
         data = rows()
@@ -1154,6 +1361,36 @@ class FullContextAndLatestCheckpointTests(unittest.TestCase):
         self.assertIn('T' * 250, b.format_brief(result))
         self.assertTrue(b.parse_args('brief', [TASK, '--full']).full)
 
+    def test_brief_full_is_bounded_and_escapes_control_characters(self):
+        """A hostile description cannot make one --full answer unbounded, and the block
+        adds no raw control character the compact read did not already carry (review F4)."""
+        data = rows()
+        data[0]['description'] = 'A\x1bB\x07C' + 'x' * 100000
+        compact = b.brief(data, PROJECT, TASK)
+        result = b.brief(data, PROJECT, TASK, full=True)
+        block = result['full_context']
+        encoded = json.dumps(result, ensure_ascii=False)
+        self.assertLess(len(encoded.encode()), 3 * b.FULL_CONTEXT_BUDGET)
+        self.assertLessEqual(len(block['intent']), b.FULL_FIELD_BUDGET)
+        self.assertGreater(block['full_omitted_chars']['intent'], 90000)
+        self.assertEqual(block['truncated'], ['intent'])
+        self.assertFalse(block['complete'])
+        self.assertEqual(block['context_budget'], b.FULL_CONTEXT_BUDGET)
+        self.assertIn('show TASK', block['note'])
+        # Control characters are escaped exactly as the JSON form escapes them.
+        self.assertNotIn('\x1b', encoded)
+        self.assertNotIn('\x07', encoded)
+        self.assertIn('\\u001b', encoded)
+        rendered = b.format_brief(result)
+        self.assertEqual(rendered.count('\x1b'), b.format_brief(compact).count('\x1b'))
+        self.assertEqual(rendered.count('\x07'), b.format_brief(compact).count('\x07'))
+        self.assertLess(max(len(line) for line in rendered.split('\n')), b.FULL_CONTEXT_BUDGET + 200)
+        # A small task is still complete: the bound only bites when it has to.
+        modest = b.brief(rows(), PROJECT, TASK, full=True)['full_context']
+        self.assertTrue(modest['complete'])
+        self.assertEqual(modest['truncated'], [])
+        self.assertEqual(modest['full_omitted_chars']['title'], 0)
+
     def test_checkpoint_latest_reads_one_record_and_names_its_coverage(self):
         data = rows()
         run = lambda argv: '\n'.join(json.dumps(row) for row in data)
@@ -1169,6 +1406,7 @@ class FullContextAndLatestCheckpointTests(unittest.TestCase):
         self.assertEqual(latest['checkpoint']['open_items_total'], 0)
         self.assertEqual(latest['coverage'], 'provenance')
         self.assertIsNotNone(latest['provenance'])
+        self.assertIsNone(latest['provenance_digests'])
         # A legacy record (no recorded provenance) is reported as legacy, not guessed.
         data2 = rows()
         append_checkpoint(data2, 'cpL', checkpoint(data2))
@@ -1178,19 +1416,55 @@ class FullContextAndLatestCheckpointTests(unittest.TestCase):
         self.assertEqual(legacy['coverage'], 'legacy')
         self.assertIsNone(legacy['provenance'])
 
+    def test_checkpoint_latest_is_bounded_and_returns_the_map_on_request(self):
+        """A long task's provenance is tens of kilobytes: counts by default, the map on
+        request (review F5)."""
+        data = rows()
+        data[0]['comments'] = [comment('c%04d' % n, 'body %d' % n) for n in range(501)]
+        save_cp(data, 'cpB')
+        run = lambda argv: '\n'.join(json.dumps(row) for row in data)
+        latest = json.loads(b.execute(Path('.'), Path('.'), PROJECT, 'alice/session', 'checkpoint',
+                                      [TASK, '--latest'], {}, run))
+        self.assertEqual(latest['provenance']['covered'], 501)
+        self.assertEqual(latest['provenance']['digests'], b.DIGEST_WINDOW)
+        self.assertEqual(latest['provenance']['older'], b.OLDER_MAX)
+        self.assertEqual(latest['provenance']['verifiable'], b.DIGEST_WINDOW + b.OLDER_MAX)
+        self.assertFalse(latest['provenance']['complete'])
+        self.assertIsNone(latest['provenance_digests'])
+        self.assertLess(len(json.dumps(latest).encode()), 4096)
+        for args in ([TASK, '--latest', '--provenance'], [TASK, '--provenance', '--latest']):
+            with self.subTest(args=args):
+                detailed = json.loads(b.execute(Path('.'), Path('.'), PROJECT, 'alice/session', 'checkpoint',
+                                                args, {}, run))
+                self.assertEqual(len(detailed['provenance_digests']['digests']), b.DIGEST_WINDOW)
+                self.assertEqual(len(detailed['provenance_digests']['older']), b.OLDER_MAX)
+        with self.assertRaises(ValueError):
+            b.execute(Path('.'), Path('.'), PROJECT, 'alice/session', 'checkpoint',
+                      [TASK, '--latest', '--directions'], {}, run)
+
     def test_help_and_examples_show_ordinary_recent_review_retrieval(self):
         import work
         history = work.help_payload('history')
         notes = ' '.join(history['notes'])
         self.assertIn('history TASK --recent 10', notes)
         self.assertIn('--since-checkpoint', notes)
-        self.assertIn('recent/last', history['limits'])
+        self.assertIn('NEWEST VALID CHECKPOINT, BY ANYONE', notes)
+        self.assertIn('1..20', history['limits']['recent/last'])
+        self.assertIn('1..20', notes)
+        self.assertIn('unverified_entries', notes)
         flags = [option['flag'] for option in history['options']]
         self.assertIn('--recent N / --last N', flags)
         self.assertIn('--since-checkpoint', flags)
+        self.assertIn('--since-my-checkpoint', flags)
         self.assertIn('--kind comment|event', flags)
-        self.assertIn('--full', [option['flag'] for option in work.help_payload('brief')['options']])
-        self.assertIn('--latest', [option['flag'] for option in work.help_payload('checkpoint')['options']])
+        brief = work.help_payload('brief')
+        self.assertIn('--full', [option['flag'] for option in brief['options']])
+        self.assertIn('full_context', brief['limits'])
+        self.assertIn('show TASK', ' '.join(brief['notes']))
+        checkpoint = work.help_payload('checkpoint')
+        self.assertIn('--latest', [option['flag'] for option in checkpoint['options']])
+        self.assertIn('--latest', checkpoint['usage'])
+        self.assertIn('--provenance', checkpoint['usage'])
         self.assertIn('--recent', work.VALUE_OPTIONS)
 
 
