@@ -475,25 +475,44 @@ the `verifiers` list is enough), and the project is one the key may name.
 | `coordinator set-onboarding --file FILE` | `admin.py set-onboarding` |
 
 Each runs the same library call with the same payload as its host command, so the payload
-schemas in the table above apply unchanged. `--file` is a local file the client transports
-with the same attachment transport every other write uses; the server never reads a path out
-of the request. `coordinator set-onboarding` writes the document and answers with `set_by`
-(the actor that set it) and `changed`; unlike the host command it does **not** probe the text
-for endpoint paths, because that probe resolves and reads every absolute `*.py` path the text
-names - server files read out of the request - and the host `admin.py set-onboarding` still
-warns the operator with a shell. A clear with nothing set (`guidance-clear`) answers
-`changed: false` and writes nothing, so a retry whose answer was lost is reconcilable without
-a shell.
+schemas in the table above apply unchanged - except where the row below says the route carries
+less. `--file` is a local file the client transports with the same attachment transport every
+other write uses; the server never reads a path out of the request. `coordinator set-onboarding`
+writes the document and answers with `changed` and with `set_by`, which **echoes** the actor the
+server chose for the request: the route stores no attribution of its own (a request field called
+`set_by` is ignored), so the installation's own log is the only trace of who set the text. A
+previous `ONBOARDING.md` that cannot be read as UTF-8 text does not stop the write: it is treated
+as changed, replaced, and the answer says so on stderr - the route used to answer a bare
+`UnicodeDecodeError` with nothing written, so a damaged document could not be replaced from a
+host without a shell (kittrial-5bb.238 item 1). Unlike the host command the route does **not**
+probe the text for endpoint paths, because that probe resolves and reads every absolute `*.py`
+path the text names - server files read out of the request - and the host
+`admin.py set-onboarding` still warns the operator with a shell. A clear with nothing set
+(`guidance-clear`) answers `changed: false` and writes nothing, so a retry whose answer was lost
+is reconcilable without a shell.
 
 **Which payload operations this surface carries.** `coordinator reference-apply` and
-`coordinator capability-apply` carry exactly the payload `operation` values `accept` (the
-reviewed draft) and `draft` (the direct accepted revision 1, the same as the host command).
-They do **not** carry `retire`, the only operation that withdraws an accepted entry - that
-stays with the installation operator (`admin.py capability-retire`, above) - nor the
-contributor operations `propose`/`revise`. `incorporated` is not an entry-apply operation at
-all: it is a proposal disposition state, reached with `coordinator proposal-review` and
+`coordinator capability-apply` carry exactly one payload `operation` value: `accept`, of a
+draft that exists. Through this route a record is accepted only after somebody proposed it as a
+draft (`ref propose` / `capability propose`), so every accepted record has a recorded proposal
+before its acceptance: two steps, both attributed. The route does not check that the proposer and
+the accepter differ; the same actor may do both. They do **not** carry
+`draft`, the library's direct accepted revision 1, which creates a key that did not exist
+already accepted on one party's own word - a per-project coordinator, possibly an agent,
+accepting its own brand-new record in one step; a direct revision 1 is created by the
+installation operator on the host (`admin.py reference-apply` / `admin.py capability-apply`).
+They do **not** carry `retire` either, the only operation that withdraws an accepted entry: that
+stays with the installation operator (`admin.py capability-retire`, above) - nor the contributor
+operations `propose`/`revise`. `incorporated` is not an entry-apply operation at all: it is a
+proposal disposition state, reached with `coordinator proposal-review` and
 `coordinator proposal-decide`. Any other operation, in the single payload or anywhere in an
-`items` batch, is refused before the library is called and nothing is written.
+`items` batch, is refused before the library is called and nothing is written; a `draft`
+anywhere in a batch refuses the whole batch, so a valid item beside it is not applied either. A
+batch item carries no `operation` of its own, whatever the value, `accept` included: the batch
+itself is the acceptance. A payload with no `operation` is the one place the two commands
+differ, exactly as on the host: `reference-apply` defaults to `accept`, and `capability-apply`
+is answered by the library ("operation must be one of ...") - a message that names the
+operations the host carries, `retire` included, not the one this route does.
 
 **What stays with the installation operator.** `proposal-settings`, `capability-retire`,
 `capability-alias-propose`/`-reject`, `void-record`, `revert-record`, every `*-reconcile`,
@@ -1199,6 +1218,8 @@ A row is hidden as a record anchor only when it carries one of the labels `refer
 - **Rolling back below this kit.** An older kit keeps every record, hides them as before and simply reports no `verification`. It never rewrites or removes `views/CAPABILITIES.md`, so after a rollback delete `projects/PROJECT/views/CAPABILITIES.md` by hand; otherwise the last page rendered stays readable through `view` with its old export stamp.
 
 `add-project` initializes the project, provisions its merge slot (idempotently) and performs an initial backup, so a freshly provisioned project can run `merge-create`/`merge-check`/`merge-acquire` without a manual slot setup. A project whose slot is missing refuses `merge-check`/`merge-acquire`/`merge-release` with an error naming the `merge-create` operation, which is the manual repair. `backup` captures both the native backup directory and `backups/PROJECT.coordination.json`. The sidecar preserves pending child-request reservations and merge context outside Dolt. Keep this pair together. A pending marker is written before synchronization and becomes complete only after native sync succeeds; restore refuses an incomplete sidecar.
+
+**A project without a healthy merge slot (kittrial-5bb.202).** Three ways of making a project can leave it without one: a plain `bd init` (a tracker the kit did not provision), a `restore-new` whose source database predates the slot (the native restore replaces the clone's rows), and a project made before the slot was provisioned when `merge-create` was never run. The kit closes the ones it controls: `add-project`, `finish-project` and the web creation path provision the slot, and `restore-new` provisions it idempotently after the native restore and after the coordination sidecar and the operation journal are restored, so a failure of that step leaves only the slot to mend (kittrial-5bb.202 rev-3). For the rest, the read-only `admin.py --root RUNTIME merge-slot-report` lists every initialized project whose slot is missing, damaged or cannot be read, and the web set-up page lists a missing or damaged slot as a step. Both name the `merge-create` coordination operation, which is the repair. What issuing a worker credential answers depends on the case, exactly: a **missing** slot -- rows that came back without the slot row, or a readable tracker with **no rows at all** (a plain `bd init`, whose `bd export --all` exits 0 and prints nothing) -- answers 503 `merge_slot_missing` and names `merge-create`, never the transient sentence; a **damaged** slot is not a refusal at all (the row is there, so issuing a credential still answers 201, as on main, and the report and the set-up step list it so `merge-create` can repair it); and a tracker that **cannot be read** (its database dropped, its Dolt server stopped, `bd` failing, or no server coordinates recorded) keeps the transient 503 `unavailable`, "try again shortly", which a retry can mend.
 
 **A sidecar that exists but cannot be used (kittrial-5bb.152).** `restore-new` decides from the coordination sidecar before it creates anything:
 

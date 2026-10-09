@@ -2054,6 +2054,11 @@ def descriptor_actor_denial(request, authority_config, reserved):
         except actor_names.TrackerUnreadable as unreadable:
             # Not a refusal of the request: the tracker could not be read (item 1).
             return _envelope(2, stderr='%s\n' % unreadable, fault='tracker')
+        except actor_names.TrackerMergeSlotMissing as missing:
+            # The tracker was read but carries no merge slot (rows without it, or no rows at
+            # all): its own mark, so the service says what to do (merge-create) instead of
+            # "try again shortly" (kittrial-5bb.202 item 1; rev-3 item 3(c)).
+            return _envelope(2, stderr='%s\n' % missing, fault='merge-slot')
     if reason is not None:
         return _envelope(126, stderr='%s\n' % actor_names.refusal(namespace, reason), authority_status=403)
     return None
