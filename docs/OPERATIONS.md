@@ -475,25 +475,43 @@ the `verifiers` list is enough), and the project is one the key may name.
 | `coordinator set-onboarding --file FILE` | `admin.py set-onboarding` |
 
 Each runs the same library call with the same payload as its host command, so the payload
-schemas in the table above apply unchanged. `--file` is a local file the client transports
-with the same attachment transport every other write uses; the server never reads a path out
-of the request. `coordinator set-onboarding` writes the document and answers with `set_by`
-(the actor that set it) and `changed`; unlike the host command it does **not** probe the text
-for endpoint paths, because that probe resolves and reads every absolute `*.py` path the text
-names - server files read out of the request - and the host `admin.py set-onboarding` still
-warns the operator with a shell. A clear with nothing set (`guidance-clear`) answers
-`changed: false` and writes nothing, so a retry whose answer was lost is reconcilable without
-a shell.
+schemas in the table above apply unchanged - except where the row below says the route carries
+less. `--file` is a local file the client transports with the same attachment transport every
+other write uses; the server never reads a path out of the request. `coordinator set-onboarding`
+writes the document and answers with `changed` and with `set_by`, which **echoes** the actor the
+server chose for the request: the route stores no attribution of its own (a request field called
+`set_by` is ignored), so the installation's own log is the only trace of who set the text. A
+previous `ONBOARDING.md` that cannot be read as UTF-8 text does not stop the write: it is treated
+as changed, replaced, and the answer says so on stderr - the route used to answer a bare
+`UnicodeDecodeError` with nothing written, so a damaged document could not be replaced from a
+host without a shell (kittrial-5bb.238 item 1). Unlike the host command the route does **not**
+probe the text for endpoint paths, because that probe resolves and reads every absolute `*.py`
+path the text names - server files read out of the request - and the host
+`admin.py set-onboarding` still warns the operator with a shell. A clear with nothing set
+(`guidance-clear`) answers `changed: false` and writes nothing, so a retry whose answer was lost
+is reconcilable without a shell.
 
 **Which payload operations this surface carries.** `coordinator reference-apply` and
-`coordinator capability-apply` carry exactly the payload `operation` values `accept` (the
-reviewed draft) and `draft` (the direct accepted revision 1, the same as the host command).
-They do **not** carry `retire`, the only operation that withdraws an accepted entry - that
-stays with the installation operator (`admin.py capability-retire`, above) - nor the
-contributor operations `propose`/`revise`. `incorporated` is not an entry-apply operation at
-all: it is a proposal disposition state, reached with `coordinator proposal-review` and
+`coordinator capability-apply` carry exactly one payload `operation` value: `accept`, the
+reviewed draft. Through this route a record is accepted only after somebody proposed it as a
+draft (`ref propose` / `capability propose`), and that is the point of an index of accepted
+records: an accepted record was judged by someone other than its author. They do **not** carry
+`draft`, the library's direct accepted revision 1, which creates a key that did not exist
+already accepted on one party's own word - a per-project coordinator, possibly an agent,
+accepting its own brand-new record in one step; a direct revision 1 is created by the
+installation operator on the host (`admin.py reference-apply` / `admin.py capability-apply`).
+They do **not** carry `retire` either, the only operation that withdraws an accepted entry: that
+stays with the installation operator (`admin.py capability-retire`, above) - nor the contributor
+operations `propose`/`revise`. `incorporated` is not an entry-apply operation at all: it is a
+proposal disposition state, reached with `coordinator proposal-review` and
 `coordinator proposal-decide`. Any other operation, in the single payload or anywhere in an
-`items` batch, is refused before the library is called and nothing is written.
+`items` batch, is refused before the library is called and nothing is written; a `draft`
+anywhere in a batch refuses the whole batch, so a valid item beside it is not applied either. A
+batch item carries no `operation` of its own, whatever the value, `accept` included: the batch
+itself is the acceptance. A payload with no `operation` is the one place the two commands
+differ, exactly as on the host: `reference-apply` defaults to `accept`, and `capability-apply`
+is answered by the library ("operation must be one of ...") - a message that names the
+operations the host carries, `retire` included, not the one this route does.
 
 **What stays with the installation operator.** `proposal-settings`, `capability-retire`,
 `capability-alias-propose`/`-reject`, `void-record`, `revert-record`, every `*-reconcile`,

@@ -420,7 +420,11 @@ than refusing a new lane, and the operator can drop stale acks with
 leaves a small local `.guidance-clear.json` record of who cleared it, when and the
 cleared version, which both status reads show; a `GUIDANCE.md` that is a symlink is refused, so that state needs a
 manual delete. A project with no guidance reads as `present: false`, never an
-error. Rolling a project back to an older kit has a documented
+error. Its JSON line now carries `changed` - `true` when text or a clear record was
+removed, `false` when there was nothing to clear, in which case it writes nothing and exits 0
+with `(nothing was set)` instead of the traceback it used to end with (kittrial-5bb.238 item 4);
+`coordinator guidance-clear` has answered that way since kittrial-5bb.195. Rolling a project
+back to an older kit has a documented
 [clear-first step](OPERATIONS.md#standing-guidance).
 
 The `reference-review` items:
@@ -1615,11 +1619,23 @@ installation that configures nothing is unchanged.
 as the same one-token `@attachment:N` attachment every other write uses; the server never reads
 a path out of the request. `guidance-set` and `set-onboarding` take plain text; `guidance-clear`
 and `guidance-status` take no payload; the rest take one JSON object. `reference-apply` and
-`capability-apply` carry only the payload `operation` values `accept` and `draft`; `retire`,
-`propose` and `revise` are refused before the library is called (`incorporated` is a proposal
-disposition reached with `proposal-review`/`proposal-decide`, not an entry-apply operation).
-`set-onboarding` records `set_by` in its answer and does not probe the text for endpoint paths.
-`guidance-status` takes the project's coordination lock, as the host command does.
+`capability-apply` carry only the payload `operation` value `accept`: through this route a record
+is accepted only after somebody proposed it as a draft (`ref propose` / `capability propose`), so
+an accepted record was judged by someone other than its author. `draft` - the direct accepted
+revision 1, which creates a key that did not exist already accepted on one party's own word -
+and `retire`, `propose` and `revise` are refused before the library is called, and nothing is
+written; a `draft` anywhere in an `items` batch refuses the whole batch. A batch item carries no
+`operation` of its own, whatever the value: the batch itself is the acceptance. A direct
+accepted revision 1 stays with the installation operator on the host. A payload with no
+`operation` behaves as on the host: `reference-apply` defaults to `accept`, and
+`capability-apply` is answered by the library's message, which names the operations the host
+carries. `set-onboarding` echoes `set_by` in its answer - the actor the server chose for the
+request - and records no attribution of its own (a request field `set_by` is ignored, the
+installation's log is the trace); a previous `ONBOARDING.md` that is not readable UTF-8 text is
+treated as changed, replaced, and reported in a sentence on stderr instead of a bare decoder
+error. It does not probe the text for endpoint paths. `guidance-status` takes the project's
+coordination lock, as the host command does. A `capability-verify` whose every item is already
+recorded wrote nothing and carries no `server_time`.
 
 **Refusals.** An unknown subcommand, or a host-only command named here, is refused with
 "Unknown coordinator command" and the list of the ten. A refused operation changes nothing.
