@@ -986,6 +986,214 @@ class HistoryTests(unittest.TestCase):
                 b.execute(path, path, PROJECT, 'alice/session', 'history', [TASK, '--cursor', first['next_cursor']], {}, run)
 
 
+class RecentHistoryTests(unittest.TestCase):
+    """Newest-first, kind-filtered and checkpoint-relative reads (kittrial-5bb.8)."""
+
+    def _event(self, data, cid, stamp=STAMP):
+        data.append(dict(id=cid, issue_type='event', title='State change', description='Event body',
+                         created_at=stamp, created_by='bob/session',
+                         dependencies=[dict(type='parent-child', depends_on_id=TASK)]))
+
+    def test_recent_pages_newest_first_without_gaps_or_duplicates(self):
+        data = rows()
+        data[0]['comments'] = [comment(n) for n in range(23)]
+        snap = b.snapshot(data, PROJECT, TASK)
+        cursor = None
+        delivered = []
+        while True:
+            page = b.history_page(snap, PROJECT, TASK, recent=3, cursor=cursor)
+            self.assertEqual(page['order'], 'newest-first')
+            self.assertEqual(len(page['entries']) <= 3, True)
+            delivered.extend(e['entry_id'] for e in page['entries'])
+            cursor = page['next_cursor']
+            if cursor is None:
+                break
+        self.assertEqual(delivered, list(reversed([e['entry_id'] for e in snap['entries']])))
+        self.assertEqual(len(set(delivered)), len(snap['entries']))
+
+    def test_last_is_an_alias_of_recent_and_limit_is_refused_beside_it(self):
+        data = rows()
+        data[0]['comments'] = [comment(n) for n in range(4)]
+        snap = b.snapshot(data, PROJECT, TASK)
+        recent = b.parse_args('history', [TASK, '--recent', '3'])
+        last = b.parse_args('history', [TASK, '--last', '3'])
+        self.assertEqual((recent.recent, recent.limit), (3, 3))
+        self.assertEqual((last.recent, last.limit), (3, 3))
+        self.assertEqual(b.parse_args('history', [TASK]).limit, 5)
+        for args in ([TASK, '--limit', '2', '--recent', '3'], [TASK, '--recent', '2', '--last', '3']):
+            with self.subTest(args=args), self.assertRaises(ValueError):
+                b.parse_args('history', args)
+        page = b.history_page(snap, PROJECT, TASK, recent=2)
+        self.assertEqual([e['entry_id'] for e in page['entries']],
+                         [snap['entries'][-1]['entry_id'], snap['entries'][-2]['entry_id']])
+        self.assertEqual((page['snapshot_entries'], page['total_entries'], page['omitted_entries']),
+                         (4, 4, 0))
+
+    def test_kind_filter_and_cursor_binding(self):
+        data = rows()
+        data[0]['comments'] = [comment(n) for n in range(3)]
+        self._event(data, TASK + '.e1')
+        self._event(data, TASK + '.e2')
+        snap = b.snapshot(data, PROJECT, TASK)
+        comments = b.history_page(snap, PROJECT, TASK, kind='comment', limit=1)
+        events = b.history_page(snap, PROJECT, TASK, kind='event')
+        self.assertEqual(comments['kind'], 'comment')
+        self.assertEqual(events['kind'], 'event')
+        self.assertTrue(all(e['kind'] == 'comment' for e in comments['entries']))
+        self.assertTrue(all(e['kind'] == 'event' for e in events['entries']))
+        self.assertEqual(len(events['entries']), 2)
+        self.assertEqual(events['omitted_entries'], events['snapshot_entries'] - events['total_entries'])
+        with self.assertRaises(ValueError):
+            b.history_page(snap, PROJECT, TASK, kind='bogus')
+        # A cursor written under one kind filter cannot silently continue another.
+        with self.assertRaisesRegex(ValueError, 'Cursor --kind mismatch'):
+            b.history_page(snap, PROJECT, TASK, kind='event', cursor=comments['next_cursor'])
+        following = b.history_page(snap, PROJECT, TASK, cursor=comments['next_cursor'])
+        self.assertEqual(following['kind'], 'comment')
+        self.assertTrue(all(e['kind'] == 'comment' for e in following['entries']))
+
+    def test_since_checkpoint_is_the_activity_the_checkpoint_did_not_incorporate(self):
+        data = rows()
+        # A comment tied with the checkpoint timestamp and ordered after its entry, but
+        # written BEFORE the checkpoint: recorded provenance proves it is incorporated.
+        data[0]['comments'].append(comment('cp1x', 'Tied but incorporated'))
+        save_cp(data, 'cp1')
+        data[0]['comments'].append(comment('after', 'After the checkpoint',
+                                           stamp='2026-09-15T11:00:00Z'))
+        # A late backdated arrival and an edit since the checkpoint are activity the
+        # checkpoint did not incorporate, even though they sort before its entry.
+        data[0]['comments'].append(comment('late', 'Late backdated arrival',
+                                           stamp='2026-09-15T09:00:00Z'))
+        next(c for c in data[0]['comments'] if c['id'] == 'first')['text'] = 'Edited after the checkpoint'
+        snap = b.snapshot(data, PROJECT, TASK)
+        page = b.history_page(snap, PROJECT, TASK, since_checkpoint=True)
+        self.assertEqual(page['since_checkpoint'], 'cp1')
+        self.assertEqual([e['entry_id'] for e in page['entries']],
+                         [TASK + '-clate', TASK + '-cfirst', TASK + '-cafter'])
+        self.assertEqual(page['omitted_entries'], page['snapshot_entries'] - page['total_entries'])
+        # The boundary binds a continuation: a plain cursor cannot start applying it.
+        plain = b.history_page(snap, PROJECT, TASK, limit=1)
+        with self.assertRaisesRegex(ValueError, 'Cursor --since-checkpoint mismatch'):
+            b.history_page(snap, PROJECT, TASK, since_checkpoint=True, cursor=plain['next_cursor'])
+        continued = b.history_page(snap, PROJECT, TASK, cursor=page['next_cursor']) \
+            if page['next_cursor'] else page
+        self.assertEqual(continued['since_checkpoint'], 'cp1')
+        # A legacy checkpoint records no provenance, so the same tie rule as the
+        # direction read applies: an entry ordered after the checkpoint entry and not
+        # provably incorporated is retained rather than hidden.
+        legacy = rows()
+        append_checkpoint(legacy, 'cpL', checkpoint(legacy))
+        legacy[0]['comments'].append(comment('after2', 'After legacy', stamp='2026-09-15T11:00:00Z'))
+        legacy_snap = b.snapshot(legacy, PROJECT, TASK)
+        legacy_page = b.history_page(legacy_snap, PROJECT, TASK, since_checkpoint=True)
+        self.assertEqual([e['entry_id'] for e in legacy_page['entries']],
+                         [TASK + '-cfirst', TASK + '-cafter2'])
+
+    def test_since_checkpoint_without_a_checkpoint_reads_everything_and_says_so(self):
+        snap = b.snapshot(rows(), PROJECT, TASK)
+        page = b.history_page(snap, PROJECT, TASK, since_checkpoint=True)
+        self.assertIsNone(page['since_checkpoint'])
+        self.assertEqual(page['total_entries'], len(snap['entries']))
+        self.assertEqual(page['omitted_entries'], 0)
+
+    def test_released_oldest_first_cursor_keeps_its_meaning(self):
+        data = rows()
+        data[0]['comments'] = [comment(n) for n in range(3)]
+        snap = b.snapshot(data, PROJECT, TASK)
+        legacy = b.token({'v': 1, 'kind': 'history', 'project': PROJECT, 'task': TASK,
+                          'snapshot': b.content_hash(snap), 'since': None, 'index': 1, 'offset': 0})
+        page = b.history_page(snap, PROJECT, TASK, cursor=legacy)
+        self.assertEqual(page['order'], 'oldest-first')
+        self.assertEqual([e['entry_id'] for e in page['entries']],
+                         [e['entry_id'] for e in snap['entries'][1:]])
+        # A plain page still emits the released token shape.
+        plain = b.history_page(snap, PROJECT, TASK, limit=1)
+        self.assertEqual(set(b.untoken(plain['next_cursor'])),
+                         {'v', 'kind', 'project', 'task', 'snapshot', 'since', 'index', 'offset'})
+        # The direction binds the cursor: --recent cannot continue an oldest-first page.
+        with self.assertRaisesRegex(ValueError, 'Cursor direction mismatch'):
+            b.history_page(snap, PROJECT, TASK, recent=2, cursor=plain['next_cursor'])
+
+    def test_newest_first_long_unicode_body_reconstructs_exactly(self):
+        data = rows()
+        body = ('😀漢字\n\t"\\' * 300) + 'tail'
+        data[0]['comments'] = [comment('huge', body), comment('last', 'following entry')]
+        snap = b.snapshot(data, PROJECT, TASK)
+        cursor = None
+        reconstructed = {}
+        for _ in range(200):
+            page = b.history_page(snap, PROJECT, TASK, recent=1, cursor=cursor, body_budget=256)
+            self.assertTrue(page['entries'])
+            for entry in page['entries']:
+                previous = reconstructed.get(entry['entry_id'], '')
+                self.assertEqual(entry['body_offset'], len(previous))
+                reconstructed[entry['entry_id']] = previous + entry['body']
+            cursor = page['next_cursor']
+            if cursor is None:
+                break
+        self.assertIsNone(cursor)
+        self.assertEqual(reconstructed, {TASK + '-chuge': body, TASK + '-clast': 'following entry'})
+
+
+class FullContextAndLatestCheckpointTests(unittest.TestCase):
+    def test_brief_full_reports_unclipped_context_and_omission_counts(self):
+        data = rows()
+        data[0]['title'] = 'T' * 250
+        data[0]['description'] = 'I' * 700
+        compact = b.brief(data, PROJECT, TASK)
+        result = b.brief(data, PROJECT, TASK, full=True)
+        self.assertNotIn('full_context', compact)
+        full = result['full_context']
+        self.assertEqual(full['title'], 'T' * 250)
+        self.assertEqual(full['intent'], 'I' * 700)
+        self.assertEqual(full['omission_counts']['title'], compact['title']['omitted_chars'])
+        self.assertEqual(full['omission_counts']['title'], 50)
+        self.assertEqual(full['omission_counts']['intent'], 100)
+        # The compact fields themselves are unchanged: the full read is additive.
+        self.assertEqual(result['title'], compact['title'])
+        self.assertIn('T' * 250, b.format_brief(result))
+        self.assertTrue(b.parse_args('brief', [TASK, '--full']).full)
+
+    def test_checkpoint_latest_reads_one_record_and_names_its_coverage(self):
+        data = rows()
+        run = lambda argv: '\n'.join(json.dumps(row) for row in data)
+        empty = json.loads(b.execute(Path('.'), Path('.'), PROJECT, 'alice/session', 'checkpoint',
+                                     [TASK, '--latest'], {}, run))
+        self.assertIsNone(empty['checkpoint'])
+        self.assertIn('unknown, not zero', empty['note'])
+        save_cp(data, 'cp1')
+        latest = json.loads(b.execute(Path('.'), Path('.'), PROJECT, 'alice/session', 'checkpoint',
+                                      [TASK, '--latest'], {}, run))
+        self.assertEqual(latest['checkpoint']['comment_id'], 'cp1')
+        self.assertEqual(latest['checkpoint']['source_commit'], 'abc123')
+        self.assertEqual(latest['checkpoint']['open_items_total'], 0)
+        self.assertEqual(latest['coverage'], 'provenance')
+        self.assertIsNotNone(latest['provenance'])
+        # A legacy record (no recorded provenance) is reported as legacy, not guessed.
+        data2 = rows()
+        append_checkpoint(data2, 'cpL', checkpoint(data2))
+        legacy = json.loads(b.execute(Path('.'), Path('.'), PROJECT, 'alice/session', 'checkpoint',
+                                      [TASK, '--latest'], {}, lambda argv: '\n'.join(json.dumps(r) for r in data2)))
+        self.assertEqual(legacy['checkpoint']['comment_id'], 'cpL')
+        self.assertEqual(legacy['coverage'], 'legacy')
+        self.assertIsNone(legacy['provenance'])
+
+    def test_help_and_examples_show_ordinary_recent_review_retrieval(self):
+        import work
+        history = work.help_payload('history')
+        notes = ' '.join(history['notes'])
+        self.assertIn('history TASK --recent 10', notes)
+        self.assertIn('--since-checkpoint', notes)
+        self.assertIn('recent/last', history['limits'])
+        flags = [option['flag'] for option in history['options']]
+        self.assertIn('--recent N / --last N', flags)
+        self.assertIn('--since-checkpoint', flags)
+        self.assertIn('--kind comment|event', flags)
+        self.assertIn('--full', [option['flag'] for option in work.help_payload('brief')['options']])
+        self.assertIn('--latest', [option['flag'] for option in work.help_payload('checkpoint')['options']])
+        self.assertIn('--recent', work.VALUE_OPTIONS)
+
+
 class ClientBriefingTests(unittest.TestCase):
     def test_cli_routes_brief_history_and_checkpoint_as_endpoint_actions(self):
         with tempfile.TemporaryDirectory() as temp:

@@ -1680,6 +1680,9 @@ it by failing.
 | `brief` | `--items-offset` | >= 0 |
 | `brief` | `--items-limit` | 1..100 (default 5; a checkpoint holds at most 100 open items) |
 | `history` | `--limit` | 1..20 |
+| `history` | `--recent` / `--last` | 1..20 (newest-first page size; the same option under two spellings, not combined with `--limit`) |
+| `history` | `--kind` | `comment` or `event` |
+| `history` | `--since-checkpoint` | entries after the newest valid checkpoint's own entry (no value) |
 | `history` | `--body-budget` | 256..8000 encoded bytes |
 | `review` | `items`/`resolutions` | 1..20 entries |
 | `review` | `summary` (contribute, approve, request-changes, request-review) | <= 1200 characters |
