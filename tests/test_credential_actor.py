@@ -40,6 +40,10 @@ import test_http_review_fixes as fixes
 SESSION_A = 'session-11111111-2222-3333-4444-555555555555'
 SESSION_FREE = 'session-99999999-8888-7777-6666-555555555555'
 HOST = {'sessions': [SESSION_A], 'operators': ['ops-lead', 'team/alice'], 'verifiers': ['verity']}
+#: The four keys `admin.project_merge_slot_state` (and now `endpoint.tracker_actors`) require
+#: before bd is run at all: without them bd falls back to an embedded database (rev-3 item 2).
+SERVER_COORDINATES = {'dolt_server_host': '127.0.0.1', 'dolt_server_port': 13317,
+                      'dolt_server_user': 'root', 'dolt_database': 'probe'}
 #: (what it is, the namespace asked for, the rule it breaks)
 TAKEN = (
     ('a registered session actor', SESSION_A, actor_names.SESSION),
@@ -284,6 +288,10 @@ class DenialTests(unittest.TestCase):
             # Issued before the rule: no mark, and it was issued at this instant.
             'cred_old': {'user_id': 'usr_a', 'project_id': 'probe', 'actor': 'opus-worker-lane', 'revoked': False,
                          'created_at': '2026-10-07T00:00:00Z'},
+            # The same shape under a neutral name, for the tests added after the review of
+            # revision 2 that do not need the legacy name (kittrial-5bb.202 rev-3 item 5).
+            'cred_plain': {'user_id': 'usr_a', 'project_id': 'probe', 'actor': 'held-name', 'revoked': False,
+                           'created_at': '2026-10-07T00:00:00Z'},
         }
         (self.tmp / 'authority.json').write_text(json.dumps(state), encoding='utf-8')
         self.config = http_authority.AuthorityConfig(str(self.tmp / 'authority.json'))
@@ -402,6 +410,22 @@ class DenialTests(unittest.TestCase):
                            'session_hash': 'sess_a', 'project': 'probe', 'capability': 'tasks.write'}},
             self.config, unreadable)
         self.assertEqual((2, 'tracker'), (answer['returncode'], answer.get('fault')), answer)
+        self.assertNotEqual(126, answer['returncode'])
+
+    def test_a_tracker_without_the_merge_slot_is_its_own_fault_naming_merge_create(self):
+        """kittrial-5bb.202 item 1: rows without the slot are not the transient no-rows fault."""
+        def slotless(rows=False, own=()):
+            if rows:
+                raise actor_names.TrackerMergeSlotMissing()
+            return dict(HOST)
+        answer = http_authority.descriptor_actor_denial(
+            {'project': 'probe', 'actor': 'held-name', 'action': 'bd', 'args': ['create', 'x'],
+             'authority': {'via': 'credential', 'user_id': 'usr_a', 'credential_id': 'cred_plain',
+                           'session_hash': 'sess_a', 'project': 'probe', 'capability': 'tasks.write'}},
+            self.config, slotless)
+        self.assertEqual((2, 'merge-slot'), (answer['returncode'], answer.get('fault')), answer)
+        self.assertIn('merge-create', answer['stderr'])
+        self.assertNotIn('try again shortly', answer['stderr'])
         self.assertNotEqual(126, answer['returncode'])
 
     def test_a_settled_credential_is_not_read_against_the_tracker_again(self):
@@ -989,7 +1013,7 @@ class UseCase(HostNames, fixes.EndpointCase):
             self.assertEqual(201, self.request('POST', self.tasks, {'title': 'again'}, token=legacy['secret']).status)
             self.assertEqual([False, True], seen)
 
-    def test_an_unmarked_credential_is_not_let_through_when_the_export_answers_nothing(self):
+    def test_an_unmarked_credential_is_not_let_through_when_the_tracker_cannot_be_read(self):
         """kittrial-5bb.188 item 1 at use: a host fault, nothing written, no mark kept."""
         self.project()
         legacy = self.old_credential('lane-empty', checked=False)
@@ -1002,17 +1026,26 @@ class UseCase(HostNames, fixes.EndpointCase):
         self.assertNotIn('actor_rows_refused', record)
 
     def test_every_broken_tracker_answer_is_unavailable_and_changes_nothing(self):
-        """kittrial-5bb.188 revision-3 item 3(1): a cut line, a nonzero bd, words that are not
-        rows and a tracker without its merge slot are host faults answered 503, not 422, at
-        issue and at use."""
+        """kittrial-5bb.188 revision-3 item 3(1): a cut line, a nonzero bd and words that are not
+        rows are host faults answered 503, not 422, at issue and at use. A tracker without its
+        merge slot is 503 too, but its own, non-transient sentence naming merge-create
+        (kittrial-5bb.202 item 1); a readable tracker with NO rows at all (a plain `bd init`) is
+        the same non-transient answer since rev-2, not the transient one."""
         self.project()
-        for mode in ('unreadable', 'cut', 'exit1', 'words', 'no-slot'):
+        for mode in ('unreadable', 'cut', 'exit1', 'words', 'no-slot', 'empty'):
             with self.subTest(tracker=mode):
                 self.host(tracker=mode)
                 refused = self.request('POST', self.credentials, {'actor': 'lane-%s' % mode},
                                        token=self.alex, key='bad-tracker-%s' % mode)
                 self.assertEqual(503, refused.status, refused.data)
-                self.assertIn('Nothing was changed', message(refused))
+                said = message(refused)
+                if mode in ('no-slot', 'empty'):
+                    self.assertIn('merge-create', said)
+                    self.assertNotIn('try again shortly', said)
+                    self.assertEqual('merge_slot_missing', refused.data['error']['code'])
+                else:
+                    self.assertIn('Nothing was changed', said)
+                    self.assertEqual('unavailable', refused.data['error']['code'])
         self.assertEqual([], self.listed_without_asking())
         # At use, an unjudged credential's first write is the same host fault, with no mark.
         legacy = self.old_credential('lane-old', checked=False)
@@ -1110,7 +1143,11 @@ class RealEndpointCase(unittest.TestCase):
         self.project = self.root / 'projects' / 'probe'
         (self.root / 'bin').mkdir(parents=True)
         (self.project / '.beads').mkdir(parents=True)
-        (self.project / '.beads' / 'metadata.json').write_text('{}', encoding='utf-8')
+        # Real server coordinates: `endpoint.tracker_actors` refuses to run bd without them
+        # (kittrial-5bb.202 rev-3 item 2, F2: bd would fall back to an embedded database), and
+        # this fixture's `bd` is a stub, so any coordinates that satisfy the guard do.
+        (self.project / '.beads' / 'metadata.json').write_text(json.dumps(SERVER_COORDINATES),
+                                                               encoding='utf-8')
         (self.root / 'deployment.private.json').write_text(json.dumps(
             {'password': 'probe', 'operators': ['ops-lead'], 'verifiers': HOST['verifiers']}), encoding='utf-8')
         record = {'request_id': '11111111-2222-3333-4444-555555555555', 'actor': SESSION_A, 'name': 'Coordinator',
@@ -1255,41 +1292,121 @@ class RealEndpointCase(unittest.TestCase):
                          json.loads(asked['stdout'])['names'])
         self.assertTrue(self.marker.exists())
 
-    def test_an_export_that_answers_no_rows_is_a_tracker_fault_not_empty(self):
-        """kittrial-5bb.188 item 1 on the endpoint: zero rows is a host fault, at use and at issue."""
+    def test_an_empty_tracker_answers_the_missing_slot_not_the_transient_fault(self):
+        """kittrial-5bb.202 rev-2, the empty-project decision: a readable tracker with NO rows at
+        all (a plain `bd init`, whose `bd export --all` exits 0 and prints nothing) is not "the
+        tracker holds no names" and not the transient host fault either. The read succeeded and
+        what is absent is the merge-slot row, so the answer is the non-transient merge-slot
+        fault naming merge-create, at use and through the endpoint CLI. A tracker that cannot be
+        read keeps the transient answer (the cut/exit1/words shapes in the test below)."""
         self.set_bd([], slot=False)
-        with self.assertRaises(actor_names.TrackerUnreadable):
+        with self.assertRaises(actor_names.TrackerMergeSlotMissing):
             self.endpoint.tracker_actors(self.root, self.project)
-        # At use, the descriptor path answers the host fault, not "nothing is taken".
+        # At use, the descriptor path answers the non-transient fault, not "nothing is taken".
         answer = self.write('opus-worker-lane', self.credential('opus-worker-lane', rows_checked=False,
                                                                 created_at='2026-10-07T00:00:00Z'), 'empty')
-        self.assertEqual((2, 'tracker'), (answer['returncode'], answer.get('fault')), answer)
+        self.assertEqual((2, 'merge-slot'), (answer['returncode'], answer.get('fault')), answer)
+        self.assertIn('merge-create', answer['stderr'])
+        self.assertNotIn('try again shortly', answer['stderr'])
         self.assertFalse((self.project / '.http-operations.sqlite3').exists(), 'an operation identity was reserved')
-        # The service's own read of the rows answers the same marked host fault.
+        # The service's own read of the rows answers the same marked fault, through the endpoint CLI.
         told = self.run_main({'project': 'probe', 'actor': 'http/read', 'action': 'actor-standing',
                               'args': ['opus-worker-lane'], 'tracker': True},
                              ['--authority-store', str(self.config_path)])
+        self.assertEqual((2, 'merge-slot'), (told['returncode'], told.get('fault')), told)
+
+    def test_a_project_with_no_server_coordinates_is_the_transient_fault(self):
+        """kittrial-5bb.202 rev-3 item 2 (F2): `tracker_actors` now applies the same guard
+        `admin.project_merge_slot_state` does.
+
+        Without the Dolt server coordinates bd falls back to an embedded database, exits 0 and
+        prints nothing, which revision 2 read as the empty-project answer, `merge_slot_missing`,
+        and advised a merge-create that then fails (the reviewer's g4/g5). It is the host fault:
+        `TrackerUnreadable`, answered 503 `unavailable` with the transient sentence, as on main.
+        """
+        (self.project / '.beads' / 'metadata.json').write_text(json.dumps(
+            {'dolt_server_host': '127.0.0.1', 'dolt_server_port': 13317, 'dolt_server_user': 'root'}),
+            encoding='utf-8')                      # the database name is not recorded
+        with self.assertRaises(actor_names.TrackerUnreadable):
+            self.endpoint.tracker_actors(self.root, self.project)
+        answer = self.write('worker-a', self.credential('worker-a', rows_checked=False,
+                                                        created_at='2026-10-07T00:00:00Z'), 'coords')
+        self.assertEqual((2, 'tracker'), (answer['returncode'], answer.get('fault')), answer)
+        self.assertNotEqual('merge-slot', answer.get('fault'))
+        self.assertFalse(self.marker.exists(), 'bd ran without the server coordinates')
+        # And through the endpoint's own CLI, the same mark (the service answers fault 'tracker'
+        # with its 503 `unavailable` sentence, exactly as on main; the merge-slot mark, which
+        # revision 2 gave this shape, is the one that must not appear).
+        told = self.run_main({'project': 'probe', 'actor': 'http/read', 'action': 'actor-standing',
+                              'args': ['worker-a'], 'tracker': True},
+                             ['--authority-store', str(self.config_path)])
         self.assertEqual((2, 'tracker'), (told['returncode'], told.get('fault')), told)
+        self.assertNotEqual('merge-slot', told.get('fault'))
+
+    def test_the_real_endpoint_marks_the_missing_slot_on_its_own_cli(self):
+        """kittrial-5bb.202 review `one-test-through-the-real-route`: mutant M2, endpoint.py's
+        `main` marking the missing slot as `tracker` instead of `merge-slot`, must fail here.
+
+        The stub-backed HTTP tests cannot catch it: ``tools/strict_canonical_endpoint.py``
+        carries its own copy of the mark. This drives the endpoint the service really launches,
+        ``endpoint.py main()``, for the shape the reviewer's M2 attacks (rows that came back
+        without the merge-slot row) and for the empty tracker.
+        """
+        self.set_bd([{'id': 'probe-1', 'created_by': 'held-name',
+                      'created_at': '2026-01-01T00:00:00Z'}], slot=False)
+        answered = self.run_main({'project': 'probe', 'actor': 'http/read', 'action': 'actor-standing',
+                                  'args': ['held-name'], 'tracker': True},
+                                 ['--authority-store', str(self.config_path)])
+        self.assertEqual((2, 'merge-slot'), (answered['returncode'], answered.get('fault')), answered)
+        self.assertIn('merge-create', answered['stderr'])
+        self.assertNotIn('try again shortly', answered['stderr'])
+        # And the use path through the CLI: the same mark, not UNREAD's.
+        descriptor = self.credential('worker-a', rows_checked=False, created_at='2026-10-07T00:00:00Z')
+        self.set_bd([], slot=False)
+        written = self.run_main({'project': 'probe', 'actor': 'worker-a', 'action': 'bd',
+                                 'args': ['create', 'x'], 'operation_id': 'op-cli-merge-slot',
+                                 'authority': descriptor},
+                                ['--authority-store', str(self.config_path), '--require-authority'])
+        self.assertEqual((2, 'merge-slot'), (written['returncode'], written.get('fault')), written)
 
     def test_an_answer_without_the_merge_slot_or_not_rows_at_all_is_a_host_fault(self):
         """kittrial-5bb.188 revision-3 item 3(1): a whole read requires the merge slot, and an
-        answer that is a cut line, a nonzero bd or words that are not rows is a host fault."""
-        row = json.dumps(json.dumps({'id': 'probe-1', 'created_by': 'opus-worker-lane',
+        answer that is a cut line, a nonzero bd or words that are not rows is a host fault.
+        kittrial-5bb.202 item 1: rows that came back without the slot row are their own,
+        non-transient fault naming the merge-create repair."""
+        row = json.dumps(json.dumps({'id': 'probe-1', 'created_by': 'held-name',
                                      'created_at': '2026-01-01T00:00:00Z'}))
         shapes = (
-            ('rows but no merge slot', '#!/bin/sh\necho %s\nexit 0\n' % row),
-            ('the last line cut short', '#!/bin/sh\necho %s\necho \'{"id": "probe-2", "created_\'\nexit 0\n' % row),
-            ('exit 1 with an error line', '#!/bin/sh\necho "bd: the database is locked" >&2\nexit 1\n'),
-            ('words that are not rows', '#!/bin/sh\necho "not a row at all"\nexit 0\n'),
+            ('rows but no merge slot', '#!/bin/sh\necho %s\nexit 0\n' % row,
+             actor_names.TrackerMergeSlotMissing, 'merge-slot'),
+            ('the last line cut short', '#!/bin/sh\necho %s\necho \'{"id": "probe-2", "created_\'\nexit 0\n' % row,
+             actor_names.TrackerUnreadable, 'tracker'),
+            ('exit 1 with an error line', '#!/bin/sh\necho "bd: the database is locked" >&2\nexit 1\n',
+             actor_names.TrackerUnreadable, 'tracker'),
+            ('words that are not rows', '#!/bin/sh\necho "not a row at all"\nexit 0\n',
+             actor_names.TrackerUnreadable, 'tracker'),
+            # kittrial-5bb.202 rev-3 item 4 (F5): JSON that PARSES but is not rows at all. The
+            # export succeeded and said nothing about this project's tracker, so it is the
+            # transient host fault, never the missing-slot answer. Mutant N8 (`if False:` in
+            # place of the guard) answers merge_slot_missing for these and must fail here.
+            ('JSON null, not rows', '#!/bin/sh\necho null\nexit 0\n',
+             actor_names.TrackerUnreadable, 'tracker'),
+            ('JSON number, not rows', '#!/bin/sh\necho 1\nexit 0\n',
+             actor_names.TrackerUnreadable, 'tracker'),
+            ('JSON array of non-rows', '#!/bin/sh\necho \'[1, 2]\'\nexit 0\n',
+             actor_names.TrackerUnreadable, 'tracker'),
         )
-        for number, (label, script) in enumerate(shapes):
+        for number, (label, script, fault_class, fault) in enumerate(shapes):
             with self.subTest(answer=label):
                 self.set_bd_raw(script)
-                with self.assertRaises(actor_names.TrackerUnreadable):
+                with self.assertRaises(fault_class):
                     self.endpoint.tracker_actors(self.root, self.project)
                 answer = self.write('worker-a', self.credential('worker-a', rows_checked=False,
                                                                 created_at='2026-10-07T00:00:00Z'), 'bad-%d' % number)
-                self.assertEqual((2, 'tracker'), (answer['returncode'], answer.get('fault')), answer)
+                self.assertEqual((2, fault), (answer['returncode'], answer.get('fault')), answer)
+                if fault == 'merge-slot':
+                    self.assertIn('merge-create', answer['stderr'])
+                    self.assertNotIn('try again shortly', answer['stderr'])
                 self.assertFalse((self.project / '.http-operations.sqlite3').exists(),
                                  'an operation identity was reserved')
 
@@ -1412,6 +1529,35 @@ class RealEndpointCase(unittest.TestCase):
         with self.assertRaises(ValueError):
             admin.credential_actors(self.root, path)
 
+    def test_an_empty_export_is_tracker_rows_null_and_not_false(self):
+        """kittrial-5bb.202 rev-3 item 3(a) (review F3): main's answer, restored.
+
+        ``credential-actors`` is a read-only listing, and an operator reading
+        ``tracker_rows: false`` would take the tracker as read and the name as free. Revision 2
+        made an empty export mean "no names"; the docstring always said null ("the tracker was
+        not read"), and this read does not run the merge-slot decision
+        ``endpoint.tracker_actors`` runs. This test holds the answer so mutant N3's shape (an
+        empty export read as a whole tracker) can never come back unnoticed.
+        """
+        import admin
+        path = self.tmp / 'empty-export-state.json'
+        path.write_text(json.dumps({'users': {}, 'credentials': {
+            'cred_e': {'user_id': 'usr_a', 'project_id': 'probe', 'label': 'empty', 'actor': 'worker-el',
+                       'revoked': False, 'created_at': '2026-10-01T00:00:00Z'}}}), encoding='utf-8')
+        for answer in ('', '\n', 'null', '1'):
+            with self.subTest(export=repr(answer)):
+                with mock.patch.object(admin, 'run_bd', return_value=answer):
+                    report = admin.credential_actors(self.root, path)
+                item = [c for c in report['credentials'] if c['credential'] == 'cred_e'][0]
+                self.assertIsNone(item['tracker_rows'], (answer, item))
+                self.assertIsNone(item['collides'], (answer, item))
+        # A whole tracker that holds no row under the name is the other answer: false, a read.
+        with mock.patch.object(admin, 'run_bd', return_value=json.dumps(
+                {'id': 'probe-merge-slot', 'issue_type': 'merge-slot'})):
+            report = admin.credential_actors(self.root, path)
+        item = [c for c in report['credentials'] if c['credential'] == 'cred_e'][0]
+        self.assertIs(item['tracker_rows'], False, item)
+
     def test_the_host_command_shows_a_waived_name_as_allowed(self):
         """kittrial-5bb.188 item 4: a waived credential is allowed, not colliding/refused."""
         import admin
@@ -1462,6 +1608,22 @@ class TrackerFaultTests(unittest.TestCase):
                 self.assertEqual((503, 'unavailable', http_service.EndpointBackend.UNREAD, True),
                                  (error.status, error.code, error.message,
                                   getattr(error, 'nothing_done', False)))
+
+    def test_the_missing_slot_is_its_own_error_and_says_merge_create(self):
+        """kittrial-5bb.202 item 1: not UNREAD's transient sentence, and its own code."""
+        for reading in (True, False):
+            with self.subTest(reading=reading):
+                with self.assertRaises(http_service.HttpError) as failed:
+                    http_service.EndpointBackend._checked(
+                        {'returncode': 2, 'stdout': '', 'stderr': 'ValueError: no slot\n', 'fault': 'merge-slot'},
+                        'actor-standing', reading=reading)
+                error = failed.exception
+                self.assertEqual((503, 'merge_slot_missing', http_service.EndpointBackend.MERGE_SLOT_MISSING, True),
+                                 (error.status, error.code, error.message,
+                                  getattr(error, 'nothing_done', False)))
+                self.assertIn('merge-create', error.message)
+                self.assertNotEqual(http_service.EndpointBackend.UNREAD, error.message)
+                self.assertNotEqual('unavailable', error.code)
 
     def test_an_ordinary_code_two_reading_refusal_is_still_422(self):
         """The endpoint's own guard refusals stay 422 on the reading path (main's rule)."""

@@ -188,10 +188,12 @@ class NoUnguardedParseTests(unittest.TestCase):
 
     ALLOWED = {
         'activity.py': (2, "the tracker export, and a cursor file on the caller's own machine"),
-        'admin.py': (25, 'bd output and files on the coordination host, in operator commands; credential-actors '
+        'admin.py': (27, 'bd output and files on the coordination host, in operator commands; credential-actors '
                          '(kittrial-5bb.184) reads the web state and an export and catches RecursionError itself; '
                          'adopt-actor (kittrial-5bb.194 revision 2) reads one export to check that the actor '
-                         'appears in the project and catches RecursionError itself'),
+                         'appears in the project and catches RecursionError itself; two more (kittrial-5bb.202) '
+                         'read a project\'s .beads/metadata.json and one bd merge-slot check answer in '
+                         'project_merge_slot_state, whose caller catches OSError/ValueError itself'),
         'artifacts.py': (1, 'the artifact index the kit writes'),
         'bootstrap.py': (2, 'bd output on the host'),
         'bd_refusals.py': (1, "bd's own answer to one command; it catches RecursionError itself"),
@@ -200,7 +202,8 @@ class NoUnguardedParseTests(unittest.TestCase):
         'capability_misses.py': (1, 'the telemetry file the kit writes; any failure starts a new log'),
         'client.py': (10, "the endpoint's own answer, on the caller's machine"),
         'coordination.py': (7, 'bd output'),
-        'endpoint.py': (4, 'bd output'),
+        'endpoint.py': (5, 'bd output, and the project\'s .beads/metadata.json whose Dolt server coordinates '
+                           'guard bd (kittrial-5bb.202 rev-3 item 2; the file is the host\'s own)'),
         'handoff.py': (15, 'bd output and the request, receipt and recovery files the kit writes'),
         'http_auth.py': (3, "the service's own store"),
         'http_authority.py': (3, "the service's own store and journal"),

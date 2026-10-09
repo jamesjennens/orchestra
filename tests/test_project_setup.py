@@ -1,4 +1,6 @@
 """The project setup page's data, the repository field and the host's setup status (kittrial-5bb.118)."""
+import contextlib
+import io
 import json
 import os
 import subprocess
@@ -12,13 +14,14 @@ KIT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(KIT))
 sys.path.insert(0, str(KIT / 'tests'))
 import admin
+import coordination
 import guidance
 import http_auth
 import project_setup
 import test_http_agents
 import test_http_review_fixes as fixes
 
-STEP_IDS = ['members', 'repository', 'first-task', 'agent', 'guidance', 'onboarding', 'backup']
+STEP_IDS = ['members', 'repository', 'first-task', 'agent', 'merge-slot', 'guidance', 'onboarding', 'backup']
 
 
 def by_id(body):
@@ -167,7 +170,7 @@ class InProcessSetupTests(test_http_agents.AgentHarness):
     def patch(self, token, body, key=None):
         return self.request('PATCH', '/v1/projects/%s' % self.project, body, token=token, key=key)
 
-    def test_the_seven_steps_and_their_states_on_a_new_project(self):
+    def test_the_eight_steps_and_their_states_on_a_new_project(self):
         answer = self.setup(self.token('olive'))
         self.assertEqual(200, answer.status, answer.data)
         self.assertEqual([item['id'] for item in answer.data['steps']], STEP_IDS)
@@ -183,7 +186,7 @@ class InProcessSetupTests(test_http_agents.AgentHarness):
         self.assertEqual((steps['members']['state'], steps['repository']['state'], steps['first-task']['state'],
                           steps['agent']['state']), ('done', 'todo', 'todo', 'todo'))
         # No host behind the in-process backend.
-        for name in ('guidance', 'onboarding', 'backup'):
+        for name in ('merge-slot', 'guidance', 'onboarding', 'backup'):
             self.assertEqual((steps[name]['state'], steps[name]['who']), ('not-applicable', 'operator'))
         self.assertEqual((answer.data['remaining'], answer.data['host']), (3, 'not-applicable'))
         # Nobody said how this server's commands begin, so those words are named as words to replace too.
@@ -375,8 +378,12 @@ class HostStatusTests(unittest.TestCase):
 
     def test_a_bare_project(self):
         status = self.status()
-        self.assertEqual(sorted(status), ['admin', 'backup', 'creation_record', 'guidance', 'onboarding', 'project',
-                                          'project_databases', 'schema_version'])
+        self.assertEqual(sorted(status), ['admin', 'backup', 'coordination', 'creation_record', 'guidance',
+                                          'merge_slot', 'onboarding',
+                                          'project', 'project_databases', 'schema_version'])
+        # The metadata records no Dolt server coordinates, so bd was not run (it would create
+        # an embedded database) and the slot is unknown, never guessed (kittrial-5bb.202 item 2).
+        self.assertEqual(status['merge_slot'], {'state': 'unknown', 'detail': None})
         self.assertEqual(status['project_databases'], {'used': 1, 'limit': 20})
         self.assertIsNone(status['creation_record'])                    # nothing against registering it
         self.assertEqual(status['guidance'], {'state': 'not-set', 'version': None, 'set_at': None})
@@ -393,6 +400,10 @@ class HostStatusTests(unittest.TestCase):
         self.assertEqual(status['backup']['check'], status['admin'] + ' backup-status --require-complete')
         self.assertEqual(status['backup']['unit_directory'], str(self.units))
         self.assertEqual(shlex.split(status['admin'])[-2:], ['--root', str(self.root)])
+        # The same beginning for a coordination command, but with coordination.py and no
+        # --root (kittrial-5bb.202 rev-2: the merge-slot step shows a merge-create command).
+        self.assertIn('coordination.py', status['coordination'])
+        self.assertNotIn('--root', status['coordination'])
 
     def test_a_damaged_creation_record_is_said_as_a_sentence_without_a_path(self):
         """kittrial-5bb.149: the register route asks here, since the endpoint serves such a project."""
@@ -681,6 +692,47 @@ class EndpointSetupTests(fixes.EndpointCase):
         step, _ = host('something-new')
         self.assertEqual(step['state'], 'unknown')
 
+    def test_the_merge_slot_step_follows_what_the_host_says(self):
+        """kittrial-5bb.202 item 2: a missing or damaged slot is a step that names merge-create."""
+        base = {'schema_version': 1, 'project': self.project,
+                'guidance': {'state': 'not-set', 'version': None, 'set_at': None},
+                'onboarding': {'state': 'not-set', 'updated_at': None},
+                'backup': {'scheduled': 'not-covered', 'line': None, 'last_run': None,
+                           'run_now': None, 'check': None}}
+
+        def host(block):
+            self.backend.setup_status = lambda project_id: dict(base, merge_slot=block)
+            body = self.setup()
+            return by_id(body)['merge-slot'], body
+
+        step, body = host({'state': 'healthy', 'detail': None})
+        self.assertEqual((step['state'], step['commands'], step['command']), ('done', [], None))
+        self.assertNotIn('merge-slot', [item['id'] for item in body['steps'] if item['state'] == 'todo'])
+        for block, word in (({'state': 'missing', 'detail': 'Merge slot does not exist for this project; run the '
+                                                             'merge-create operation to create it.'}, 'create'),
+                            ({'state': 'damaged', 'detail': coordination.SLOT_DAMAGED}, 'repairs'),
+                            ({'state': 'missing', 'detail': None}, 'creates or repairs')):
+            with self.subTest(state=block['state'], word=word):
+                step, body = host(block)
+                self.assertEqual((step['state'], step['who']), ('todo', 'operator'))
+                self.assertIn('merge-create', step['detail'])
+                self.assertIn(word, step['detail'])
+                self.assertIn('merge-slot', [item['id'] for item in body['steps'] if item['state'] == 'todo'])
+                self.assertIn('cannot do this step', step['note'])
+                # The page says host steps show a command (kittrial-5bb.202 review item 4): the
+                # merge-create operation, as a coordination.py invocation, with the payload named.
+                self.assertEqual(step['command'], step['commands'][0]['text'])
+                self.assertIn('coordination.py', step['command'])
+                self.assertIn('--config CLIENT_CONFIG --project %s --actor OPERATOR --file MERGE_JSON'
+                              % self.project, step['command'])
+                self.assertIn('{"operation":"merge-create"}', step['commands'][0]['note'])
+                self.assertEqual(step['commands'][0]['kind'], 'shell-fill')
+                self.assertIn('CLIENT_CONFIG', step['commands'][0]['replace'])
+        # A host value this kit does not know is never "done" and never "to do".
+        step, body = host({'state': 'something-new'})
+        self.assertEqual(step['state'], 'unknown')
+        self.assertIn('could not say', step['detail'])
+
     def test_a_host_read_that_fails_reads_unknown(self):
         def failing(project_id):
             raise http_auth.HttpError(503, 'uncertain', 'Canonical command failed; outcome may be unknown')
@@ -832,7 +884,7 @@ class RemainingCountTests(fixes.EndpointCase):
         self.backend.setup_status = failing
         body = self.request('GET', '/v1/projects/%s/setup' % project, token=admin).data
         states = [item['state'] for item in body['steps']]
-        self.assertEqual((body['unchecked'], states.count('unknown')), (3, 3))
+        self.assertEqual((body['unchecked'], states.count('unknown')), (4, 4))
         self.assertEqual(body['remaining'], states.count('todo'))
 
 
@@ -868,6 +920,7 @@ class SetupScreenTests(test_http_agents.AgentHarness):
         self.assertEqual(list(steps), STEP_IDS)
         self.assertEqual({name: steps[name]['chip'] for name in STEP_IDS}, {
             'members': 'Done', 'repository': 'To do', 'first-task': 'To do', 'agent': 'To do',
+            'merge-slot': 'Not applicable here',
             'guidance': 'Not applicable here', 'onboarding': 'Not applicable here', 'backup': 'Not applicable here'})
         self.assertIn('3 steps are left.', seen['first']['head'])
         self.assertIn('this page does not run anything there', seen['first']['head'])
@@ -939,6 +992,89 @@ class SetupScreenTests(test_http_agents.AgentHarness):
             [['true'], ['On this server nobody approves or recomm'], 3],
             [['false'], ['On this server an owner may approve work'], 3],
             [[], [], 2]])
+
+
+class MergeSlotReportTests(unittest.TestCase):
+    """kittrial-5bb.202 item 4: a read-only report of projects without a healthy merge slot."""
+
+    SERVER = {'dolt_server_host': '127.0.0.1', 'dolt_server_port': 13317,
+              'dolt_server_user': 'root', 'dolt_database': 'x'}
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        for name in ('alpha', 'beta', 'gamma'):
+            (self.root / 'projects' / name / '.beads').mkdir(parents=True)
+            (self.root / 'projects' / name / '.beads' / 'metadata.json').write_text(json.dumps(self.SERVER),
+                                                                                   encoding='utf-8')
+        (self.root / 'projects' / 'delta' / '.beads').mkdir(parents=True)
+        (self.root / 'projects' / 'delta' / '.beads' / 'metadata.json').write_text('{}', encoding='utf-8')
+        self.states = {
+            'alpha': {'available': False, 'error': 'not found', 'id': 'alpha-merge-slot'},          # missing
+            'beta': {'available': False, 'holder': None, 'id': 'beta-merge-slot', 'waiters': None},  # damaged
+            'gamma': {'available': True, 'holder': None, 'id': 'gamma-merge-slot', 'waiters': None},  # healthy
+        }
+        self.calls = []
+
+    def run_bd(self, root, name, argv):
+        self.calls.append((name, list(argv)))
+        return json.dumps(self.states[name])
+
+    def report(self, *projects):
+        out, err = io.StringIO(), io.StringIO()
+        argv = ['admin.py', '--root', str(self.root), 'merge-slot-report', *projects]
+        with patch.object(sys, 'argv', argv), \
+                patch.object(admin, 'root_path', Path), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                admin.main()
+                code = 0
+            except SystemExit as error:
+                code = error.code
+        return code, json.loads(out.getvalue()), err.getvalue()
+
+    def test_it_names_the_projects_without_a_healthy_slot_and_the_repair(self):
+        with patch.object(admin, 'run_bd', side_effect=self.run_bd):
+            code, report, said = self.report()
+        self.assertEqual(code, 1)
+        self.assertEqual((report['missing'], report['damaged'], report['healthy'], report['unreadable']),
+                         (['alpha'], ['beta'], ['gamma'], ['delta']))
+        self.assertEqual(report['not_healthy'], ['alpha', 'beta', 'delta'])
+        self.assertIn('merge-create', report['projects']['alpha']['detail'])
+        self.assertIn('merge-create', report['projects']['beta']['detail'])
+        self.assertIsNone(report['projects']['gamma']['detail'])
+        self.assertIsNone(report['projects']['delta']['detail'])
+        self.assertIn('merge-create', said)
+        # The repair is named for the missing and damaged projects only: the unreadable one
+        # (here `delta`) is told what is true instead (kittrial-5bb.202 review item 4, F5).
+        repair = [line for line in said.splitlines() if line.startswith('An operator runs the merge-create')]
+        self.assertEqual(len(repair), 1, said)
+        self.assertIn('alpha', repair[0])
+        self.assertIn('beta', repair[0])
+        self.assertNotIn('delta', repair[0])
+        unreadable = [line for line in said.splitlines() if line.startswith('The merge slot of')]
+        self.assertEqual(len(unreadable), 1, said)
+        self.assertIn('delta', unreadable[0])
+        # Read only: one check per project whose metadata records the server, and nothing else.
+        self.assertEqual(sorted(name for name, _ in self.calls), ['alpha', 'beta', 'gamma'])
+        self.assertTrue(all(argv == ['merge-slot', 'check', '--json'] for _, argv in self.calls))
+
+    def test_all_healthy_exits_zero(self):
+        self.states['alpha'] = {'available': True, 'holder': None, 'id': 'alpha-merge-slot', 'waiters': None}
+        self.states['beta'] = {'available': False, 'holder': 'alice', 'id': 'beta-merge-slot', 'waiters': None}
+        with patch.object(admin, 'run_bd', side_effect=self.run_bd):
+            code, report, said = self.report('alpha', 'beta', 'gamma')
+        self.assertEqual((code, report['not_healthy'], said), (0, [], ''))
+        self.assertEqual(report['healthy'], ['alpha', 'beta', 'gamma'])
+
+    def test_a_project_whose_slot_cannot_be_read_is_named_and_not_healthy(self):
+        def failing(root, name, argv):
+            raise admin.subprocess.CalledProcessError(1, 'bd')
+        with patch.object(admin, 'run_bd', side_effect=failing):
+            code, report, said = self.report('alpha')
+        self.assertEqual(code, 1)
+        self.assertEqual((report['unreadable'], report['not_healthy']), (['alpha'], ['alpha']))
+        self.assertIn('alpha', said)
 
 
 if __name__ == '__main__':
