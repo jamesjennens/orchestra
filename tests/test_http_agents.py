@@ -1276,8 +1276,8 @@ class RenewalScopeTests(AgentHarness):
         self.assertNotIn(credential_id, self.service.state['credentials'])
         self.assertNotIn(original_hash, self.service.state['credential_tokens'])
         events = [e for e in self.service.state['audit'] if e.get('agent_id') == agent_id]
-        self.assertTrue(any(e['action'] == 'agents.scopes' for e in events), events)
-        changed = next(e for e in events if e['action'] == 'agents.scopes')
+        changed = next(e for e in events if e['action'] == 'agents.credentials.issued'
+                       and e['target_credential_id'] == renewed.data['credential']['id'])
         self.assertEqual((['read'], ['read', 'tasks']), (changed['scopes_before'], changed['scopes_after']))
         self.assertEqual(self.alex_id, changed['user_id'])
         self.assertTrue(changed['time'])
@@ -1314,7 +1314,7 @@ class RenewalScopeTests(AgentHarness):
         self.assertEqual(before['agents'][agent_id], self.service.state['agents'][agent_id])
         self.assertEqual(before['credentials'], self.service.state['credentials'])
         self.assertEqual(before['credential_tokens'], self.service.state['credential_tokens'])
-        self.assertFalse(any(e.get('agent_id') == agent_id and e['action'] == 'agents.scopes'
+        self.assertFalse(any(e.get('agent_id') == agent_id and e.get('scopes_after') == ['read', 'tasks']
                              for e in self.service.state['audit']))
         self.service.store.save()  # an unrelated write must not publish the failed renewal
         disk = json.loads(self.service.store.path.read_text())
@@ -1327,7 +1327,7 @@ class RenewalScopeTests(AgentHarness):
         before = json.loads(json.dumps(self.service.state))
         write = self.service.store._write
         def fail_route_save():
-            if any(e['action'] == 'agents.credentials.issue' and e['outcome'] == 'committed'
+            if any(e['action'] == 'agents.credentials.issued' and e.get('scopes_after') == ['read', 'tasks']
                    for e in self.service.state['audit']):
                 raise OSError('synthetic route audit save failure')
             return write()
@@ -1348,7 +1348,7 @@ class RenewalScopeTests(AgentHarness):
         self.assertEqual(200, replay.status, replay.data)
         self.assertNotIn('secret', replay.data['credential'])
 
-    def test_failed_revocation_restores_the_credential_and_its_token_index(self):
+    def test_failed_revocation_keeps_the_credential_revoked_in_memory(self):
         agent_id, secret, made = self.agent(['read'])
         cid = made['credential']['id']
         write = self.service.store._write
@@ -1360,9 +1360,11 @@ class RenewalScopeTests(AgentHarness):
         with mock.patch.object(self.service.store, '_write', side_effect=fail_revocation):
             failed = self.revoke(agent_id, cid)
         self.assertEqual(500, failed.status, failed.data)
-        self.assertEqual(before['credentials'], self.service.state['credentials'])
+        self.assertTrue(self.service.state['credentials'][cid]['revoked'])
         self.assertEqual(before['credential_tokens'], self.service.state['credential_tokens'])
-        self.assertEqual(200, self.request('GET', '/v1/projects/%s/tasks' % self.project, token=secret).status)
+        self.assertEqual(401, self.request('GET', '/v1/projects/%s/tasks' % self.project, token=secret).status)
+        self.service.store.save()
+        self.assertTrue(json.loads(self.service.store.path.read_text())['credentials'][cid]['revoked'])
 
     def test_malformed_stored_scopes_are_unknown_and_never_inferred(self):
         agent_id, _, _ = self.agent(['read'])
@@ -1575,13 +1577,14 @@ class RenewalScopeTests(AgentHarness):
         for token in (self.alex, self.admin):
             refused = self.renew(agent_id, token=token)
             self.assertEqual(409, refused.status, refused.data)
-            self.assertEqual(refused.data['error']['message'], http_auth.Service.SCOPES_NEEDED)
+            expected = http_auth.Service.SCOPES_NEEDED if token == self.alex else http_auth.Service.SCOPES_OWNER_REQUIRED
+            self.assertEqual(refused.data['error']['message'], expected)
             self.assertEqual(refused.data['error']['detail'], {'scopes_needed': True})
-        # A superuser's list is a widening of nothing; the narrowest one too.
+        # A superuser cannot choose unconfirmed scopes, including the narrowest list.
         refused = self.renew(agent_id, {'scopes': ['read']}, token=self.admin)
         self.assertEqual(403, refused.status, refused.data)
-        self.assertEqual(refused.data['error']['message'],
-                         'This agent has no scopes on record. Only its own account may give it more (asked for beyond that: read)')
+        self.assertIn('Only this agent\'s own account may choose or confirm its scopes',
+                      refused.data['error']['message'])
         self.assertEqual((len(self.read(agent_id)['credentials']), self.stored(agent_id)), (before, (None, None)))
         # Its own account says what it may do.
         chosen = self.renew(agent_id, {'scopes': ['read']})
@@ -1830,6 +1833,10 @@ class AgentsPageTests(RenewalScopeTests):
         self.assertEqual(0, done.returncode, done.stderr[-3000:])
         seen = json.loads(done.stdout.strip().splitlines()[-1])
         first = seen['first']
+        self.assertIn('inferred', seen['ownerInferredAsked'])
+        self.assertIn('not confirmed', seen['ownerInferredAsked'])
+        self.assertIn('stored scopes: read', seen['ownerInferredAsked'])
+        self.assertEqual({'boxes': {}, 'ownerChoice': 1, 'save': False}, seen['adminInferred'])
         # 1. What the card says, and what "What it may do" shows.
         self.assertEqual((first['Kestrel']['scopes'], first['Kestrel']['source'], first['Kestrel']['differ']), ('read', 'set', None))
         self.assertEqual(first['Kestrel']['line'], 'May: read.')

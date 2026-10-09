@@ -29,12 +29,15 @@
     "http_auth.py::Service._agent_credential_transaction",
     "http_auth.py::Service._audit_agent_credential",
     "http_auth.py::Service.revoke_agent_credential",
-    "http_auth.py::Service._credential_label"
+    "http_auth.py::Service._credential_label",
+    "http_auth.py::Service.agent_page",
+    "http_service.py::ApiHandler._revocation_metadata"
   ],
   "tests": [
     "tests/test_http_agents.py",
     "tests/web_agents_screen.mjs",
-    "tests/test_http_web.py"
+    "tests/test_http_web.py",
+    "tests/test_agent_scope_followups.py"
   ],
   "owner": "person:orchestra-coordinator",
   "tags": [
@@ -43,10 +46,10 @@
     "identity"
   ],
   "schema_version": 1,
-  "operation_id": "sol1-224-scopes-fd0c19687e2646859d98ab916226868b",
+  "operation_id": "130f4fb6-0d34-4bcd-a858-a72039909577",
   "key": "agents.renewal-keeps-scopes",
   "name": "An agent's scopes are kept on the agent; a new credential carries exactly them",
   "revision": 3,
   "expected_sha256": "382ef27503f577919935912952151d5b16576db13b44ec1827d183306fa63cd7",
-  "summary": "Stored agent scopes govern plain renewal; dead or wider old credentials never reset them. Legacy equal working credentials give uncertain inferred scopes: expiry/revocation may leave one unintended credential. Only the owning account confirms by plain renewal; a superuser gets409 scopes_needed and must send a list. Unknown or malformed stored scopes never infer authority; an explicit owner list repairs them. Widening is owner-only403; other authorized lists may narrow. Requests require known scope names, duplicates count once, empty means no list; malformed stored duplicates are unknown. Labels are at most64 printable characters. Reads do not confirm. At most20 working credentials/newest5 dead; pruning removes token indexes. Issue/revoke audit actor/time/request, agent/credential IDs, credential scopes and scopes/source before/after; changes add agents.scopes, within retention, without secrets/labels/hashes. Failed persistence rolls back scopes, credentials, pruning, indexes and committed audit; no secret is returned. The page explains unknown/inferred/old-service uncertainty, permits owner repair and an authorized superuser filter."
+  "summary": "Stored scopes govern renewal; no dead or wider credential resets them. Only the owning account confirms inferred or unknown scopes, including explicit equal/narrow/wider lists; non-owner lists refuse403 and plain inferred renewal409 asks for that account. Confirmed scopes may be narrowed by another authorized account, widened only by the owner. Scope names and printable labels(max64, stripped) are validated. Reads do not confirm. At most20 working/newest5 dead credentials; pruning removes token indexes. One renewal/revoke audit event holds agent/credential IDs, actor/account/request/time and scopes/source before/after; disable events name affected IDs. No labels/secrets/hashes/paths. Audit is a shared fixed10000-entry service-state tail, not project HTTP audit. Issuance state saves before its replay receipt; failed state save rolls back issuance, retaining refusal audit and prior pending state. Crash or receipt failure may leave409 in-progress; no successful replay names a nonexistent credential. Failed revocation save keeps access revoked in memory/pending until the next successful save, but is not durable across restart. The page warns that owner setup confirms inference, hides non-owner confirmation forms and uses bounded20-card filtered pages. This revision remains a proposal until separately accepted/integrated/verified."
 }

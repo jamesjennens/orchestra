@@ -122,17 +122,25 @@ export function agentCard(ctx, raw, { compact = false } = {}) {
 export async function list(ctx) {
   const host = h('div', { class: 'stack' });
   let unconfirmedOnly = false;
+  let cursor = null;
+  const previous = [];
   const filter = ctx.me && ctx.me.superuser ? h('label', { class: 'check' },
     h('input', { type: 'checkbox', 'data-filter': 'unconfirmed-scopes', onchange: (event) => {
       unconfirmedOnly = event.target.checked;
+      cursor = null;
+      previous.length = 0;
       load();
     } }), 'Show agents with inferred or unknown scopes') : null;
   async function load() {
     let data;
-    try { data = await ctx.api.agents(); } catch (error) { host.replaceChildren(errorState(error, load)); return; }
-    const items = unconfirmedOnly ? data.items.filter((a) => a.scopes_source === 'inferred' || !Array.isArray(a.scopes)) : data.items;
+    try { data = await ctx.api.agents({ limit: 20, cursor, unconfirmed: unconfirmedOnly ? 'true' : 'false' }); } catch (error) { host.replaceChildren(errorState(error, load)); return; }
+    const items = data.items;
     host.replaceChildren(items.length ? h('div', { class: 'agent-grid' }, items.map((a) => h('div', { class: 'stack', 'data-agent': a.id }, agentCard(ctx, a), editFolder(a), manages(ctx, a) ? editProjects(a) : null, manages(ctx, a) ? editScopes(a) : null))) :
       h('div', { class: 'panel' }, empty('No agents yet', 'Add an agent for each assistant you run — for example a GitHub Copilot chat working in its own folder.')));
+    host.append(h('div', { class: 'copy-row', 'data-agent-pages': '' },
+      h('span', { class: 'small muted' }, `${items.length} shown of ${data.total} agents`),
+      previous.length ? h('button', { type: 'button', onclick: () => { cursor = previous.pop(); load(); } }, 'Previous agents') : null,
+      data.next_cursor ? h('button', { type: 'button', onclick: () => { previous.push(cursor); cursor = data.next_cursor; load(); } }, 'Next agents') : null));
   }
   function editFolder(agent) {
     const details = h('details', { class: 'deliver' });
@@ -224,8 +232,8 @@ export async function list(ctx) {
     details.append(h('summary', null, known ? 'What it may do' : 'What it may do (choose)'),
       rows.length ? h('ul', { class: 'open-items' }, rows) : h('p', { class: 'small muted' }, 'It has no credential on record.'),
       agent.enabled === false ? h('p', { class: 'small muted' }, 'This agent is disabled: enable it before it gets a new secret.') :
-        !known && !own ? h('p', { class: 'small muted', 'data-owner-choice': 'true' },
-          'Only this agent’s own account may choose its scopes when nothing is known. Ask that account to choose before issuing a new secret.') : form);
+        (!known || agent.scopes_source === 'inferred') && !own ? h('p', { class: 'small muted', 'data-owner-choice': 'true' },
+          'Only this agent’s own account may choose or confirm its scopes when they are unknown or inferred. Ask that account before issuing a new secret.') : form);
     return details;
   }
   load();
@@ -407,7 +415,7 @@ function reissueSection(ctx, agent, payload) {
   const issue = h('button', { type: 'button', onclick: async () => {
     const ok = await confirmDialog({
       title: 'Issue a new secret?',
-      body: `A new credential is created for ${agent.name || agent.display_name} and its secret is shown once. ${Array.isArray(agent.scopes) ? `It carries what the agent has now${scopeList(agent.scopes)}.` : 'This older service does not report the agent’s scopes. Check the new credential’s scopes before using it.'} The agent's current credential keeps working until you revoke it.`,
+      body: `A new credential is created for ${agent.name || agent.display_name} and its secret is shown once. ${agent.scopes_source === 'inferred' ? `These scopes are inferred from working credentials and are not confirmed. Issuing this secret confirms them as this agent’s stored scopes${scopeList(agent.scopes)}.` : Array.isArray(agent.scopes) ? `It carries what the agent has now${scopeList(agent.scopes)}.` : 'This older service does not report the agent’s scopes. Check the new credential’s scopes before using it.'} The agent's current credential keeps working until you revoke it.`,
       confirmLabel: 'Issue new secret',
     });
     if (!ok) return;

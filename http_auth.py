@@ -100,7 +100,7 @@ AGENT_MAX_PER_OWNER = 100
 AGENT_MAX_CREDENTIALS = 20
 #: How many credentials that no longer work (revoked or expired) are kept per agent, the newest
 #: ones, as the short history its card shows. Older ones are deleted from the state: the issue and
-#: the revocation of every credential stay in the audit log (kittrial-5bb.208).
+#: revocation metadata remain in the shared audit tail, capped by AUDIT_LIMIT.
 AGENT_DEAD_CREDENTIALS_KEPT = 5
 AGENT_DEFAULT_SCOPES = ('tasks', 'checkpoints', 'reviews', 'feedback')
 AGENT_CONFIG_PATH = '.orchestra/agent.json'
@@ -871,7 +871,12 @@ class Store:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_name(
             '%s.%d.%s.tmp' % (self.path.name, os.getpid(), secrets.token_hex(4)))
-        text = json.dumps(self.state, ensure_ascii=False, indent=2) + '\n'
+        # Credential rollback holds the old audit prefix until saving succeeds.
+        # Serialize its bounded tail without dropping that rollback evidence in memory.
+        state = self.state
+        if len(state['audit']) > AUDIT_LIMIT:
+            state = dict(state, audit=state['audit'][-AUDIT_LIMIT:])
+        text = json.dumps(state, ensure_ascii=False, indent=2) + '\n'
         try:
             with open(temporary, 'w', encoding='utf-8') as handle:
                 handle.write(text)
@@ -922,6 +927,7 @@ class Service:
         #: setup/resume snippets. It is deployment configuration, never request data.
         self.public_url = (public_url or '').rstrip('/') or None
         self._failures = {}
+        self._audit_defer_trim = 0
         self._logins_guard = threading.Lock()
         self._logins_room = threading.Condition(self._logins_guard)   # told whenever a log-in ends
         self._logins_waiting = {}        # address group -> its log-ins waiting for one of its places
@@ -1030,9 +1036,10 @@ class Service:
             'outcome': outcome,
             'reason': (str(reason)[:200] if reason else None),
         }
-        self.state['audit'].append(event)
-        if len(self.state['audit']) > AUDIT_LIMIT:
-            del self.state['audit'][:len(self.state['audit']) - AUDIT_LIMIT]
+        with self.store.lock:
+            self.state['audit'].append(event)
+            if not self._audit_defer_trim and len(self.state['audit']) > AUDIT_LIMIT:
+                del self.state['audit'][:len(self.state['audit']) - AUDIT_LIMIT]
         return event
 
     def _username(self, username):
@@ -2570,7 +2577,8 @@ class Service:
         Caller holds ``store.lock`` and saves. Without it the state grew by a record for every
         renewal for good, and every read of the agent carried them all (kittrial-5bb.208
         review). What goes is the record (label, scopes, when made and last used); that it was
-        issued and revoked, by whom and when, stays in the audit log.
+        issued and revoked, by whom and when, remains until the shared audit tail's
+        fixed AUDIT_LIMIT retention evicts it.
         """
         moment = self._expiry_now()
         dead = sorted((c for c in self._agent_credentials(agent) if not self._credential_live(c, moment)),
@@ -2798,6 +2806,8 @@ class Service:
     SCOPES_NEEDED = ('Nothing says what this agent may do: its record holds no scopes, and its credentials '
                      'that still work do not say (there is none, or they do not all allow the same). Send the '
                      'scopes it should have, for example "scopes": ["read"] for an agent that only reads')
+    SCOPES_OWNER_REQUIRED = ('Only this agent\'s own account may choose or confirm its scopes '
+                             'when they are unknown or inferred. Ask that account before issuing a new secret.')
 
     @staticmethod
     def _credential_label(label):
@@ -2809,41 +2819,58 @@ class Service:
         return label.strip() or None
 
     @contextmanager
-    def _agent_credential_transaction(self, agent, *, persist=True):
-        """Roll back the agent mutation if its atomic state-file save fails.
+    def _agent_credential_transaction(self, agent, *, rollback=True):
+        """Hold the HTTP credential boundary through state save and receipt commit.
 
-        Caller holds store.lock. Preserve unrelated pending writes and object identity;
-        restore pruning, token indexes and audit retention as well as the agent record.
+        Caller holds store.lock. Snapshot only this agent's records and the audit's
+        append position; retention waits until the boundary exits. The yielded callback
+        marks a successful state save, after which a receipt failure must not undo it.
+        Revocation deliberately keeps its effect if saving fails.
         """
         previous_agent = copy.deepcopy(agent)
         credentials = copy.deepcopy({key: value for key, value in self.state['credentials'].items()
                                      if value.get('agent_id') == agent['id']})
-        tokens = dict(self.state['credential_tokens'])
-        audit = copy.deepcopy(self.state['audit'])
+        tokens = {value['token_hash']: key for key, value in credentials.items()}
+        audit_start = len(self.state['audit'])
         unsaved = self.store.unsaved_since
+        saved = [False]
+        def state_saved():
+            saved[0] = True
+        self._audit_defer_trim += 1
         try:
-            yield
-            if persist:
-                self.store.save()
-        except BaseException:
-            # The HTTP boundary may also have recorded a refusal; retain that audit
-            # outcome while removing rolled-back committed mutation events.
-            refusals = [event for event in self.state['audit']
-                        if event not in audit and event.get('outcome') in ('denied', 'rejected')]
-            for key, value in list(self.state['credentials'].items()):
-                if value.get('agent_id') == agent['id']:
-                    del self.state['credentials'][key]
-            self.state['credentials'].update(credentials)
-            self.state['credential_tokens'].clear()
-            self.state['credential_tokens'].update(tokens)
-            self.state['audit'][:] = (audit + refusals)[-AUDIT_LIMIT:]
-            agent.clear()
-            agent.update(previous_agent)
-            self.store.unsaved_since = unsaved
+            yield state_saved
+        except BaseException as error:
+            if not saved[0] and rollback:
+                # Inspect only this operation's appended entries, never the old audit.
+                refusals = [event for event in self.state['audit'][audit_start:]
+                            if event.get('outcome') in ('denied', 'rejected')]
+                for key, value in list(self.state['credentials'].items()):
+                    if value.get('agent_id') == agent['id']:
+                        self.state['credential_tokens'].pop(value.get('token_hash'), None)
+                        del self.state['credentials'][key]
+                self.state['credentials'].update(credentials)
+                self.state['credential_tokens'].update(tokens)
+                del self.state['audit'][audit_start:]
+                self.state['audit'].extend(refusals)
+                agent.clear()
+                agent.update(previous_agent)
+                if refusals:
+                    # A refusal save may have flushed earlier pending state, or may
+                    # itself be pending. Keep its actual result through rollback.
+                    if not isinstance(error, HttpError) and self.store.unsaved_since is None:
+                        self.store.unsaved_since = self.store.clock()
+                else:
+                    self.store.unsaved_since = unsaved
+            elif not saved[0] and self.store.unsaved_since is None:
+                self.store.unsaved_since = self.store.clock()
             raise
+        finally:
+            self._audit_defer_trim -= 1
+            if not self._audit_defer_trim and len(self.state['audit']) > AUDIT_LIMIT:
+                del self.state['audit'][:len(self.state['audit']) - AUDIT_LIMIT]
 
     def _audit_agent_credential(self, principal, agent, credential, action, before, request_id):
-        """Durable metadata that survives credential pruning. No labels, secrets or hashes."""
+        """Metadata independent of credential pruning, within fixed audit retention."""
         after = self.agent_scopes(agent)
         event = self.audit(request_id, principal, action, 'committed', actor=self.agent_actor(agent))
         event.update(agent_id=agent['id'], target_credential_id=credential['id'],
@@ -2851,33 +2878,28 @@ class Service:
                      scopes_before=None if before[0] is None else list(before[0]),
                      scopes_after=None if after[0] is None else list(after[0]),
                      scopes_source_before=before[1], scopes_source_after=after[1])
-        if before != after:
-            change = self.audit(request_id, principal, 'agents.scopes', 'committed', actor=self.agent_actor(agent))
-            change.update({key: value for key, value in event.items()
-                           if key in ('agent_id', 'target_credential_id', 'scopes_before', 'scopes_after',
-                                      'scopes_source_before', 'scopes_source_after')})
 
     def _issue_agent_credential_locked(self, principal, agent, scopes=None, label=None):
         """Create one agent credential. Caller holds ``store.lock`` and has authorized.
 
         With no list it carries exactly what the agent has (:meth:`agent_scopes`), and where
         nothing says what that is, it is refused with a sentence that asks for the list. A
-        list sets what the agent has from now on: taken from anybody who may renew the agent
-        when it asks for nothing more, and from the agent's own account alone when it widens
-        (the one caller who could have made the agent with those scopes). Nothing is changed
-        by a request that is refused. Only its own account may confirm inferred scopes
-        without choosing a list. That confirmation stores them as set.
+        list sets what the agent has from now on. Only its own account may confirm
+        inferred or unknown scopes, with or without a list. Once confirmed, another
+        authorized account may narrow them, but widening remains owner-only.
         """
         requested = self._scope_names(scopes)
         label = self._credential_label(label)
         has, source = self.agent_scopes(agent)
+        if requested is not None and source in ('inferred', 'unknown') and principal.user_id != agent['owner']:
+            raise forbidden(self.SCOPES_OWNER_REQUIRED)
         if requested is None:
             if has is None:
-                raise conflict(self.SCOPES_NEEDED, {'scopes_needed': True})
+                message = self.SCOPES_NEEDED if principal.user_id == agent['owner'] else self.SCOPES_OWNER_REQUIRED
+                raise conflict(message, {'scopes_needed': True})
             if source == 'inferred' and principal.user_id != agent['owner']:
                 raise conflict('These scopes are inferred from working credentials, not confirmed. '
-                               'Only the agent\'s own account may confirm them by plain renewal. '
-                               'Send an explicit scopes list, for example "scopes": ["read"].',
+                               'Only the agent\'s own account may confirm them.',
                                {'scopes_needed': True})
         else:
             more = [scope for scope in CREDENTIAL_SCOPES if scope in requested and scope not in (has or ())]
@@ -2975,6 +2997,17 @@ class Service:
             agents.sort(key=lambda a: a['id'])
             return [self.agent_view(a, principal) for a in agents]
 
+    def agent_page(self, principal, offset, limit, *, unconfirmed=False):
+        """Select a bounded owner-visible page before building credential/card views."""
+        with self.store.lock:
+            self._refresh_authority(principal)
+            agents = [a for a in self.state['agents'].values()
+                      if principal.superuser or a['owner'] == principal.user_id]
+            if unconfirmed:
+                agents = [a for a in agents if self.agent_scopes(a)[1] != 'set']
+            agents.sort(key=lambda a: a['id'])
+            return [self.agent_view(a, principal) for a in agents[offset:offset + limit]], len(agents)
+
     def get_agent(self, principal, agent_id):
         with self.store.lock:
             self._refresh_authority(principal)
@@ -3045,7 +3078,8 @@ class Service:
             return self.agent_view(agent, principal)
 
     def issue_agent_credential(self, principal, agent_id, *, scopes=None, label=None,
-                               request_id=None, persist=True):
+                               request_id=None):
+        """Mutate under the HTTP boundary, which owns saving and rollback."""
         if principal is None or principal.via == 'credential':
             raise forbidden('Session authority required to issue an agent credential')
         with self.store.lock:
@@ -3054,11 +3088,10 @@ class Service:
             if not agent.get('enabled'):
                 raise conflict('A disabled agent cannot receive a credential')
             before = self.agent_scopes(agent)
-            with self._agent_credential_transaction(agent, persist=persist):
-                credential, secret = self._issue_agent_credential_locked(
-                    principal, agent, scopes=scopes, label=label)
-                self._audit_agent_credential(principal, agent, credential, 'agents.credentials.issued',
-                                             before, request_id)
+            credential, secret = self._issue_agent_credential_locked(
+                principal, agent, scopes=scopes, label=label)
+            self._audit_agent_credential(principal, agent, credential, 'agents.credentials.issued',
+                                         before, request_id)
             return {
                 'operation': 'agents.credentials.issue',
                 'agent': agent['id'],
@@ -3069,7 +3102,8 @@ class Service:
             }
 
     def revoke_agent_credential(self, principal, agent_id, credential_id,
-                                request_id=None, *, persist=True):
+                                request_id=None):
+        """Revoke in memory; the HTTP boundary saves without resurrecting access."""
         if principal is None or principal.via == 'credential':
             raise forbidden('Session authority required to revoke an agent credential')
         with self.store.lock:
@@ -3080,11 +3114,10 @@ class Service:
                     credential.get('agent_id') != agent['id']:
                 raise not_found('Credential not found')
             before = self.agent_scopes(agent)
-            with self._agent_credential_transaction(agent, persist=persist):
-                credential['revoked'] = True
-                self._prune_agent_credentials(agent)
-                self._audit_agent_credential(principal, agent, credential, 'agents.credentials.revoked',
-                                             before, request_id)
+            credential['revoked'] = True
+            self._prune_agent_credentials(agent)
+            self._audit_agent_credential(principal, agent, credential, 'agents.credentials.revoked',
+                                         before, request_id)
         return {'id': credential_id, 'agent': agent['id'], 'revoked': True}
 
     # -- idempotency -----------------------------------------------------------

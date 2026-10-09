@@ -101,6 +101,10 @@ async function open(ctx) { const page = await view.list(ctx); await settle(); re
   const wrong = block(page, 'Wren').all((e) => e.tagName === 'LI' && e.attributes['data-credential']).find((li) => li.textContent.includes('tasks'));
   out.revokeAsked = await pressAndConfirm(button(wrong, 'Revoke'), 'click', 'Revoke');
   out.afterRevoke = seen(page, 'Wren');
+  await button(block(page, 'Wren'), 'Set up folder').dispatch('click');
+  await settle();
+  out.ownerInferredAsked = await pressAndConfirm(button(dialogs().slice(-1)[0], 'Issue a new secret'), 'click', 'Cancel');
+  await closeDialogs();
 
   // 3. Nothing ticked: said, and nothing is sent.
   const before = sent.length;
@@ -130,6 +134,9 @@ async function open(ctx) { const page = await view.list(ctx); await settle(); re
 {
   const page = await open(who.admin);
   out.admin = seen(page, 'Kestrel');
+  out.adminInferred = { boxes: seen(page, 'Wren').boxes,
+    ownerChoice: block(page, 'Wren').all((e) => e.attributes['data-owner-choice']).length,
+    save: Boolean(button(block(page, 'Wren'), 'Save and issue a new secret')) };
   boxes(page, 'Kestrel').tasks.checked = false;
   // Ticked by hand all the same: a disabled box is not sent.
   boxes(page, 'Kestrel').reviews.checked = true;
