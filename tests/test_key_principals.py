@@ -876,8 +876,23 @@ class PrintAndAdoptCommandTests(unittest.TestCase):
         notes = ' '.join(bound['notes'])
         self.assertIn('first kit call must be session register', notes)
         self.assertIn('No other command (such as docs or ready) can precede registration', notes)
-        self.assertIn('admin.py authorized-keys-list', notes)
+        self.assertIn('admin.py --root RUNTIME authorized-keys-list', notes)
         self.assertIn('ssh HOST exit or ssh -T HOST', notes)
+        self.assertIn('without registering (or without making an actor)', notes)
+
+        # Pin the exact refusal sentences quoted in docs/OPERATIONS.md against ssh_forced_command
+        # With no command (tokens = []):
+        _, reason_no_cmd = forced.select_endpoint([], ['/path/to/endpoint.py'])
+        no_cmd_sentence = forced.REFUSAL + reason_no_cmd
+        self.assertEqual(
+            no_cmd_sentence,
+            'ssh_forced_command: no endpoint selected: this key runs only the configured endpoint; '
+            'a client with "forced_command": true sends its path')
+
+        # With a command other than configured endpoint (e.g. 'exit'):
+        _, reason_exit = forced.select_endpoint(['exit'], ['/path/to/endpoint.py'])
+        exit_sentence = forced.REFUSAL + reason_exit
+        self.assertEqual(exit_sentence, "ssh_forced_command: this key may not run 'exit'")
 
     def test_a_repeated_principal_is_refused(self):
         # Finding 3: `authorized-keys --principal A --principal B` used to print B silently.

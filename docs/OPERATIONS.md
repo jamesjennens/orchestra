@@ -177,7 +177,8 @@ only when the first argument is exactly `register`; a `session resume`, `session
 principal the actor belongs to (`principal`); on an installation that has never written an
 owners map the key is omitted, so the answer is the one this kit gave before rule 2.
 
-**First call and pre-registration checks**:
+#### First call and pre-registration checks
+
 Because a new lane owns no registered actors in the project initially, a bound key's
 **first kit call must be `session register`**. No other call can precede registration or
 be used as a pre-registration check:
@@ -187,24 +188,34 @@ be used as a pre-registration check:
    (`This key is bound to principal lane:NAME and may act only as actors that principal registered in this project`).
 Consequently, a newly set-up lane cannot read served documentation (such as `docs sessions`
 or `docs start`) through the kit client until *after* registration. The worker must read startup
-instructions and registration guidelines directly from its local repository clone (or through the
-web documentation endpoint `/v1/docs` where available).
+instructions and registration guidelines directly from its local repository clone.
 
-**Checking a bound key without spending the lane's registration**:
-To verify that an authorized_keys entry is installed and working without spending the lane's
-single registration:
-- **On the server**: Run `python3 admin.py authorized-keys-list` (or with `--file ~/.ssh/authorized_keys`).
-  The command checks each line, verifies the wrapper and endpoint paths, confirms the bound projects
-  and principal, and flags any syntax errors or repeated parameters under `attention`.
-- **On the client**: Test network and SSH authentication using plain SSH without the client wrapper:
+#### Checking a bound key without registering
+
+To verify that an authorized_keys entry is installed and working without registering (or without making an actor):
+- **On the server**: Run:
   ```sh
-  ssh -T USER@HOST
-  # or:
-  ssh USER@HOST exit
+  python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime authorized-keys-list
   ```
-  The forced-command wrapper expects an endpoint path token in `SSH_ORIGINAL_COMMAND`, so it refuses
-  the bare command on stderr with exit status 2 (`Refusing forced command: expected exactly one token...`).
-  This non-zero refusal confirms that SSH authentication succeeded and the key is properly confined.
+  (pass `--file` only to inspect an authorized_keys file other than the account's own `~/.ssh/authorized_keys`). The command shows what each line is bound to (`projects` and `principal`) and puts under `attention` any lines that do not point at the installed kit (`other_kit`, `names_release`), or have a repeated or ill-formed binding (`principal_repeated`, `principal_ill_formed`, `project_repeated`), missing files, or unreadable lines.
+- **On the client**: Test network and SSH authentication using plain SSH without the client wrapper:
+  - With no command:
+    ```sh
+    ssh -T USER@HOST
+    ```
+    The forced-command wrapper answers on stderr with exit status 2:
+    ```text
+    ssh_forced_command: no endpoint selected: this key runs only the configured endpoint; a client with "forced_command": true sends its path
+    ```
+  - With a command:
+    ```sh
+    ssh USER@HOST exit
+    ```
+    The forced-command wrapper answers on stderr with exit status 2:
+    ```text
+    ssh_forced_command: this key may not run 'exit'
+    ```
+  Both exit status 2 refusals confirm that SSH authentication succeeded and the key is properly confined to the forced-command wrapper.
 
 An actor that existed before the key was bound (an older coordinator, a legacy name with no
 registration) keeps its name and its history if it is given to the principal once by the
