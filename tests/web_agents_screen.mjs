@@ -90,6 +90,7 @@ async function open(ctx) { const page = await view.list(ctx); await settle(); re
 //    (two working credentials that differ, nothing on record) and one with nothing that says.
 {
   const page = await open(who.alex);
+  out.ownerFilter = page.all((e) => e.attributes['data-filter'] === 'unconfirmed-scopes').length > 0;
   out.first = { Kestrel: seen(page, 'Kestrel'), Wren: seen(page, 'Wren'), Lone: seen(page, 'Lone') };
 
   // 2. The harmed one: the credential that allows the four is revoked there, without a new secret first.
@@ -100,6 +101,13 @@ async function open(ctx) { const page = await view.list(ctx); await settle(); re
   const wrong = block(page, 'Wren').all((e) => e.tagName === 'LI' && e.attributes['data-credential']).find((li) => li.textContent.includes('tasks'));
   out.revokeAsked = await pressAndConfirm(button(wrong, 'Revoke'), 'click', 'Revoke');
   out.afterRevoke = seen(page, 'Wren');
+  await button(block(page, 'Wren'), 'Set up folder').dispatch('click');
+  await settle();
+  out.ownerInferredAsked = await pressAndConfirm(button(dialogs().slice(-1)[0], 'Issue a new secret'), 'click', 'Cancel');
+  await closeDialogs();
+  out.ownerInferredSaveText = form(page, 'Wren').textContent;
+  out.ownerInferredSaveAsked = await pressAndConfirm(form(page, 'Wren'), 'submit', 'Cancel');
+  await closeDialogs();
 
   // 3. Nothing ticked: said, and nothing is sent.
   const before = sent.length;
@@ -129,12 +137,32 @@ async function open(ctx) { const page = await view.list(ctx); await settle(); re
 {
   const page = await open(who.admin);
   out.admin = seen(page, 'Kestrel');
+  out.adminInferred = { boxes: seen(page, 'Wren').boxes,
+    ownerChoice: block(page, 'Wren').all((e) => e.attributes['data-owner-choice']).length,
+    save: Boolean(button(block(page, 'Wren'), 'Save and issue a new secret')) };
   boxes(page, 'Kestrel').tasks.checked = false;
   // Ticked by hand all the same: a disabled box is not sent.
   boxes(page, 'Kestrel').reviews.checked = true;
   await pressAndConfirm(form(page, 'Kestrel'), 'submit', 'Issue new secret');
   await closeDialogs();
   out.afterNarrow = seen(page, 'Kestrel');
+  const unknown = block(page, 'Dove');
+  out.adminUnknown = { boxes: seen(page, 'Dove').boxes,
+    ownerChoice: unknown.all((e) => e.attributes['data-owner-choice']).length,
+    save: Boolean(button(unknown, 'Save and issue a new secret')) };
+  await button(block(page, 'Wren'), 'Set up folder').dispatch('click');
+  await settle();
+  const inferredDialog = dialogs().slice(-1)[0];
+  out.adminInferredSetup = {
+    needed: inferredDialog.all((e) => e.attributes['data-scopes-needed']).length,
+    issue: Boolean(button(inferredDialog, 'Issue a new secret')),
+  };
+  await closeDialogs();
+  const filter = page.all((e) => e.attributes['data-filter'] === 'unconfirmed-scopes')[0];
+  filter.checked = true;
+  await filter.dispatch('change');
+  await settle();
+  out.adminUnconfirmed = page.all((e) => e.tagName === 'H3').map((e) => e.textContent).sort();
 }
 // 7. "Set up folder": a plain new secret says what it carries; where nothing says, it sends to the card.
 {
@@ -153,6 +181,20 @@ async function open(ctx) { const page = await view.list(ctx); await settle(); re
     out['setup' + name] = entry;
     await closeDialogs();
   }
+}
+// An older service omits scope metadata. Exercise the actual dialog and confirmation,
+// cancel without issuing anything: the page must not promise scopes it cannot know.
+{
+  const legacy = { ...who.alex, api: { ...who.alex.api, agent: async (id) => {
+    const current = await who.alex.api.agent(id);
+    for (const key of ['scopes', 'scopes_source', 'scopes_differ']) delete current[key];
+    return current;
+  } } };
+  const page = await open(legacy);
+  await button(block(page, 'Kestrel'), 'Set up folder').dispatch('click');
+  await settle();
+  out.olderAsked = await pressAndConfirm(button(dialogs().slice(-1)[0], 'Issue a new secret'), 'click', 'Cancel');
+  await closeDialogs();
 }
 // 8. Records the page must not fall over: no lists, lists of the wrong things, an older service.
 out.odd = [
