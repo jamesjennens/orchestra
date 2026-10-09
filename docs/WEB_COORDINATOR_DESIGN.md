@@ -399,13 +399,13 @@ coordinator can do in a browser is said.
 - **1a. Nobody approves their own party's work** (this is kittrial-5bb.199).
   The party rule for approval, a worker credential counted with the account
   that issued it, the superuser bound for their own party, the sentence.
-  **This changes behaviour on every installation, whether or not it has a
-  coordinator**: an owner who approves their own contribution today is refused
-  after the upgrade, and a project with one account that both delivers and
-  approves needs a second owner, or a superuser who is not that account. That
-  is what James answered for the SSH design's question 4; the alternative is
-  to tie the rule to a setting that is off until an installation turns it on,
-  as kittrial-5bb.106 does. It is a question below.
+  **As built, it is behind an installation setting that is off by default**
+  (`approval_by_another_party`; decided after this note, question 7 below): an
+  installation that turns nothing on behaves as before. Where it is turned on,
+  an owner who approves their own contribution is refused from the next start,
+  and a project with one account that both delivers and approves needs a
+  second owner, or a superuser who is not that account. What changes on that
+  day is in HTTP_DEPLOYMENT.md, "Nobody approves work of their own party".
   *In the browser:* the Approve button answers with the sentence when it is the
   person's own party's work.
 - **1b. The coordinator role and the grant.** The role with its capability;
@@ -548,13 +548,13 @@ Each has a recommendation; none needs the code.
    can pass their own work. *Recommendation: bound. With your agents under
    lane accounts it costs you nothing, and the rule then has no exception to
    explain.*
-7. **May the approval rule change behaviour where no coordinator exists?** The
-   rule of slice 1a applies to every project the day the kit is upgraded: an
-   owner who approves their own contribution is refused from then on. The
-   alternative is a setting that is off until you turn it on. *Recommendation:
-   everywhere, at once, with the sentence that says what to do; it is what you
-   answered for the same question on the SSH route, and a rule that is off by
-   default protects nobody who did not think of it.*
+7. **May the approval rule change behaviour where no coordinator exists?** As
+   first written, the rule of slice 1a applied to every project the day the
+   kit is upgraded. *Recommendation then: everywhere, at once.* **Decided
+   otherwise, and built so (kittrial-5bb.199): a setting of the installation,
+   off until it is turned on.** No installation changes by upgrading. An
+   agent that holds the coordinator grant of slice 1b is the exception: it
+   never approves its own party's work, whatever the setting says.
 8. **Who renews credentials, and how long should one last?** Today 30 days,
    renewed by the agent's account or a superuser: nine renewals a month for
    three projects, and an expired coordinator stops its project.

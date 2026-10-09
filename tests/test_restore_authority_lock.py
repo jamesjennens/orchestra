@@ -136,13 +136,21 @@ class RefusedAuthorityMergeTests(RuntimeCase):
         self.assertIn('Do not repeat the restore', stderr)
         self.assertNotIn('Run the command again', stderr)
         commands = self.regrant_commands(stderr)
+        flags = ['--actor', 'OPERATOR', '--reason', 'TEXT']
         self.assertEqual(commands, [
-            ['admin.py', '--root', str(self.root), 'operators', 'add', 'ops-recorded'],
-            ['admin.py', '--root', str(self.root), 'operators', 'add', 'ops-second'],
-            ['admin.py', '--root', str(self.root), 'verifiers', 'add', 'verifier-recorded']])
-        # The printed commands are the whole remedy once the holder is gone.
+            ['admin.py', '--root', str(self.root), 'operators', 'add', 'ops-recorded'] + flags,
+            ['admin.py', '--root', str(self.root), 'operators', 'add', 'ops-second'] + flags,
+            ['admin.py', '--root', str(self.root), 'verifiers', 'add', 'verifier-recorded'] + flags])
+        self.assertIn('Replace OPERATOR in --actor and TEXT in --reason', stderr)
         self.release(holder)
-        for command in commands:
+        # kittrial-5bb.229 finding 3: a command copied as printed is REFUSED - the placeholders
+        # must be replaced, so the audit never records an operator named OPERATOR with the entry
+        # counted as attributed.
+        with self.assertRaisesRegex(ValueError, 'placeholder'):
+            self.run_admin(*commands[0][3:])
+        replaced = [command[:6] + ['--actor', 'james', '--reason', 'after a rollback']
+                    for command in commands]
+        for command in replaced:
             _, err, rc = self.run_admin(*command[3:])
             self.assertEqual(rc, 0, err)
         self.assertEqual(admin.operators(self.root), frozenset({'ops-recorded', 'ops-second'}))
@@ -370,15 +378,27 @@ class RefusedAuthorityMergeTests(RuntimeCase):
 
 class RegrantCommandQuotingTests(unittest.TestCase):
     """Every printed command is shell-quoted. Identities and root paths cannot hold a space or
-    a quote today (recovery.identity, admin.root_path), so this pins the notice itself."""
+    a quote today (recovery.identity, admin.root_path), so this pins the notice itself. Since
+    kittrial-5bb.192 revision 3 the commands carry --actor/--reason, with the placeholders the
+    list commands' own refusals use when the restore named nobody: following a printed command
+    must not leave the unattributed entry the notice exists to avoid."""
 
     def test_an_actor_with_a_space_and_a_quote_round_trips_through_the_shell(self):
         root = '/srv/run time'            # a string: a Path would print with backslashes on Windows
         warning = admin.authority_not_regranted(root, 'alpha', ["o'brien x"], ['v "q"'])
         commands = [shlex.split(line.strip()) for line in warning.splitlines()
                     if line.strip().startswith('admin.py --root ')]
-        self.assertEqual(commands, [['admin.py', '--root', '/srv/run time', 'operators', 'add', "o'brien x"],
-                                    ['admin.py', '--root', '/srv/run time', 'verifiers', 'add', 'v "q"'],
+        flags = ['--actor', 'OPERATOR', '--reason', 'TEXT']
+        self.assertEqual(commands, [['admin.py', '--root', '/srv/run time', 'operators', 'add', "o'brien x"] + flags,
+                                    ['admin.py', '--root', '/srv/run time', 'verifiers', 'add', 'v "q"'] + flags,
+                                    ['admin.py', '--root', '/srv/run time', 'backup-authority', 'alpha']])
+        # What the restore was GIVEN is used where it had it, shell-quoted like the rest.
+        warning = admin.authority_not_regranted(root, 'alpha', ["o'brien x"], [], actor='james',
+                                                reason='after a rollback')
+        commands = [shlex.split(line.strip()) for line in warning.splitlines()
+                    if line.strip().startswith('admin.py --root ')]
+        self.assertEqual(commands, [['admin.py', '--root', '/srv/run time', 'operators', 'add', "o'brien x",
+                                     '--actor', 'james', '--reason', 'after a rollback'],
                                     ['admin.py', '--root', '/srv/run time', 'backup-authority', 'alpha']])
 
 

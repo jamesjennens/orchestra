@@ -160,6 +160,12 @@ After delivery, use only the mode authorized for this worker:
 - **Office / person-started mode:** do not poll or run a loop. Complete one bounded
   turn, checkpoint it, and end with a one-line status for the person.
 
+This is a FIRST prompt. For every later run use the short recurring prompt the kit
+serves as docs poll-prompt, unchanged from run to run: it carries no state. What you
+need to continue goes into the task's checkpoint, the review record and your own
+notes file, never into a prompt. docs finding-work says where a worker looks for
+work and where it does not.
+
 Use server docs workflow, worker-guide, sessions, reviews, briefings and operations.
 Route feedback through the current project feedback stream or an explicitly agreed
 interim parent/job target on older services; keep private feedback out of public

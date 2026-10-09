@@ -1,0 +1,2270 @@
+[
+  {
+    "operation": "create",
+    "databases": 1,
+    "rep": 1,
+    "bd_version": "1.2.2",
+    "logging": "debug",
+    "seconds": 0.3121327920816839,
+    "outcome": "passed",
+    "load": [
+      7.6396484375,
+      8.130859375,
+      7.3896484375
+    ],
+    "available_GiB": 115.82970809936523,
+    "trace": "1.2.2-1-1-create.json",
+    "trace_sha256": "7712a37a0879cface43beb12492aa42881e82d9dd2f1a4812e495611b88cc7f1",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 48,
+    "show_columns_count": 0
+  },
+  {
+    "operation": "claim",
+    "databases": 1,
+    "rep": 1,
+    "bd_version": "1.2.2",
+    "logging": "debug",
+    "seconds": 0.3148666580673307,
+    "outcome": "passed",
+    "load": [
+      7.6396484375,
+      8.130859375,
+      7.3896484375
+    ],
+    "available_GiB": 115.84332656860352,
+    "trace": "1.2.2-1-1-claim.json",
+    "trace_sha256": "319c0fc55fc724f744c62bc11dba9d1008466af9ff2db905b5b0aaad154cbbb9",
+    "query_count": 48,
+    "catalog_query_count": 2,
+    "catalog_ms": 48,
+    "show_columns_count": 0
+  },
+  {
+    "operation": "add-project",
+    "databases": 1,
+    "rep": 1,
+    "bd_version": "1.2.2",
+    "logging": "debug",
+    "seconds": 6.895601619966328,
+    "outcome": "passed",
+    "load": [
+      7.6396484375,
+      8.130859375,
+      7.3896484375
+    ],
+    "available_GiB": 115.84397888183594,
+    "trace": "1.2.2-1-1-add-project.json",
+    "trace_sha256": "b25fcd1a2226d1743400913831cb6a0b2b89c71eed730616a61ac397bb3435cb",
+    "query_count": 1552,
+    "catalog_query_count": 73,
+    "catalog_ms": 2488,
+    "show_columns_count": 0
+  },
+  {
+    "operation": "create",
+    "databases": 1,
+    "rep": 2,
+    "bd_version": "1.2.2",
+    "logging": "debug",
+    "seconds": 0.37041517812758684,
+    "outcome": "passed",
+    "load": [
+      7.9091796875,
+      8.1787109375,
+      7.4091796875
+    ],
+    "available_GiB": 115.85440444946289,
+    "trace": "1.2.2-1-2-create.json",
+    "trace_sha256": "67f3bbe1729d0fb5985b315652a77daab7c8dd56d94b76e8faaa8dd0a129c3f9",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 68,
+    "show_columns_count": 0
+  },
+  {
+    "operation": "claim",
+    "databases": 1,
+    "rep": 2,
+    "bd_version": "1.2.2",
+    "logging": "debug",
+    "seconds": 0.3385053521487862,
+    "outcome": "passed",
+    "load": [
+      7.9091796875,
+      8.1787109375,
+      7.4091796875
+    ],
+    "available_GiB": 115.84432220458984,
+    "trace": "1.2.2-1-2-claim.json",
+    "trace_sha256": "4fa95a84b05890c1c8c40fd4aa08e1972a3909bdc47cc26d319ce2aa94b31098",
+    "query_count": 48,
+    "catalog_query_count": 2,
+    "catalog_ms": 59,
+    "show_columns_count": 0
+  },
+  {
+    "operation": "add-project",
+    "databases": 1,
+    "rep": 2,
+    "bd_version": "1.2.2",
+    "logging": "debug",
+    "seconds": 6.7441376321949065,
+    "outcome": "passed",
+    "load": [
+      7.91650390625,
+      8.17529296875,
+      7.41259765625
+    ],
+    "available_GiB": 115.84677124023438,
+    "trace": "1.2.2-1-2-add-project.json",
+    "trace_sha256": "ca36128e27466db67f4a42aed63f16120ff28e5a42c945190a5319cd72053ec2",
+    "query_count": 1552,
+    "catalog_query_count": 73,
+    "catalog_ms": 2427,
+    "show_columns_count": 0
+  },
+  {
+    "operation": "create",
+    "databases": 1,
+    "rep": 3,
+    "bd_version": "1.2.2",
+    "logging": "debug",
+    "seconds": 0.3361849708016962,
+    "outcome": "passed",
+    "load": [
+      7.8427734375,
+      8.15576171875,
+      7.41015625
+    ],
+    "available_GiB": 115.858154296875,
+    "trace": "1.2.2-1-3-create.json",
+    "trace_sha256": "62bb48e5d99ea922f9d959a0ac0754f5fd24acb89b4b19845ed085f40315ed1d",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 50,
+    "show_columns_count": 0
+  },
+  {
+    "operation": "claim",
+    "databases": 1,
+    "rep": 3,
+    "bd_version": "1.2.2",
+    "logging": "debug",
+    "seconds": 0.30224187998101115,
+    "outcome": "passed",
+    "load": [
+      7.8427734375,
+      8.15576171875,
+      7.41015625
+    ],
+    "available_GiB": 115.84781646728516,
+    "trace": "1.2.2-1-3-claim.json",
+    "trace_sha256": "0c4ee536cc94898a8b3be85fa18adb222e65cf1343d07ccbef0e08e5eca03c55",
+    "query_count": 48,
+    "catalog_query_count": 2,
+    "catalog_ms": 55,
+    "show_columns_count": 0
+  },
+  {
+    "operation": "add-project",
+    "databases": 1,
+    "rep": 3,
+    "bd_version": "1.2.2",
+    "logging": "debug",
+    "seconds": 6.748012290103361,
+    "outcome": "passed",
+    "load": [
+      7.8427734375,
+      8.15576171875,
+      7.41015625
+    ],
+    "available_GiB": 115.84331512451172,
+    "trace": "1.2.2-1-3-add-project.json",
+    "trace_sha256": "911d9d5230303293cd5c167a9a823dd713537f5a1ca020ef1c6f17f19317d99e",
+    "query_count": 1552,
+    "catalog_query_count": 73,
+    "catalog_ms": 2475,
+    "show_columns_count": 0
+  },
+  {
+    "operation": "create",
+    "databases": 1,
+    "rep": 1,
+    "bd_version": "1.2.2",
+    "logging": "warning",
+    "seconds": 0.3563514440320432,
+    "outcome": "passed",
+    "load": [
+      7.47900390625,
+      8.0673828125,
+      7.38916015625
+    ],
+    "available_GiB": 115.8651237487793
+  },
+  {
+    "operation": "claim",
+    "databases": 1,
+    "rep": 1,
+    "bd_version": "1.2.2",
+    "logging": "warning",
+    "seconds": 0.3148210479412228,
+    "outcome": "passed",
+    "load": [
+      7.47900390625,
+      8.0673828125,
+      7.38916015625
+    ],
+    "available_GiB": 115.84242248535156
+  },
+  {
+    "operation": "add-project",
+    "databases": 1,
+    "rep": 1,
+    "bd_version": "1.2.2",
+    "logging": "warning",
+    "seconds": 6.820851707132533,
+    "outcome": "passed",
+    "load": [
+      7.47900390625,
+      8.0673828125,
+      7.38916015625
+    ],
+    "available_GiB": 115.8453140258789
+  },
+  {
+    "operation": "create",
+    "databases": 1,
+    "rep": 2,
+    "bd_version": "1.2.2",
+    "logging": "warning",
+    "seconds": 0.3705388349480927,
+    "outcome": "passed",
+    "load": [
+      7.09765625,
+      7.9658203125,
+      7.36279296875
+    ],
+    "available_GiB": 115.87959289550781
+  },
+  {
+    "operation": "claim",
+    "databases": 1,
+    "rep": 2,
+    "bd_version": "1.2.2",
+    "logging": "warning",
+    "seconds": 0.28611423587426543,
+    "outcome": "passed",
+    "load": [
+      7.09765625,
+      7.9658203125,
+      7.36279296875
+    ],
+    "available_GiB": 115.88481903076172
+  },
+  {
+    "operation": "add-project",
+    "databases": 1,
+    "rep": 2,
+    "bd_version": "1.2.2",
+    "logging": "warning",
+    "seconds": 6.79921834403649,
+    "outcome": "passed",
+    "load": [
+      7.09765625,
+      7.9658203125,
+      7.36279296875
+    ],
+    "available_GiB": 115.84440994262695
+  },
+  {
+    "operation": "create",
+    "databases": 1,
+    "rep": 3,
+    "bd_version": "1.2.2",
+    "logging": "warning",
+    "seconds": 0.3643749800976366,
+    "outcome": "passed",
+    "load": [
+      7.25,
+      7.9833984375,
+      7.3720703125
+    ],
+    "available_GiB": 115.83869552612305
+  },
+  {
+    "operation": "claim",
+    "databases": 1,
+    "rep": 3,
+    "bd_version": "1.2.2",
+    "logging": "warning",
+    "seconds": 0.3437554279807955,
+    "outcome": "passed",
+    "load": [
+      7.25,
+      7.9833984375,
+      7.3720703125
+    ],
+    "available_GiB": 115.8226432800293
+  },
+  {
+    "operation": "add-project",
+    "databases": 1,
+    "rep": 3,
+    "bd_version": "1.2.2",
+    "logging": "warning",
+    "seconds": 7.017756899120286,
+    "outcome": "passed",
+    "load": [
+      7.06982421875,
+      7.93359375,
+      7.35888671875
+    ],
+    "available_GiB": 115.81202697753906
+  },
+  {
+    "operation": "migration",
+    "databases": 1,
+    "rep": 1,
+    "bd_version": "1.3.1",
+    "logging": "debug",
+    "seconds": 3.1719417630229145,
+    "outcome": "passed",
+    "load": [
+      8.10546875,
+      8.13427734375,
+      7.42724609375
+    ],
+    "available_GiB": 115.91839599609375,
+    "trace": "1.3.1-1-1-migration.json",
+    "trace_sha256": "047732adc40b2e79e14bac9aa70ffdb843ed3f462eb214112cc7502ec1a9c004",
+    "query_count": 614,
+    "catalog_query_count": 44,
+    "catalog_ms": 1172,
+    "show_columns_count": 6
+  },
+  {
+    "operation": "create",
+    "databases": 1,
+    "rep": 1,
+    "bd_version": "1.3.1",
+    "logging": "debug",
+    "seconds": 0.4720184779725969,
+    "outcome": "passed",
+    "load": [
+      7.8564453125,
+      8.08203125,
+      7.4140625
+    ],
+    "available_GiB": 115.81591415405273,
+    "trace": "1.3.1-1-1-create.json",
+    "trace_sha256": "57ac57901ccf6b2613427c406dff4caee0c47ca51ac707272e79d007c2a30bbb",
+    "query_count": 99,
+    "catalog_query_count": 1,
+    "catalog_ms": 32,
+    "show_columns_count": 2
+  },
+  {
+    "operation": "claim",
+    "databases": 1,
+    "rep": 1,
+    "bd_version": "1.3.1",
+    "logging": "debug",
+    "seconds": 0.5085447991732508,
+    "outcome": "passed",
+    "load": [
+      7.8564453125,
+      8.08203125,
+      7.4140625
+    ],
+    "available_GiB": 115.8145980834961,
+    "trace": "1.3.1-1-1-claim.json",
+    "trace_sha256": "91f94201fb41e7a027ec9ae54483c4c946144f6e5f6ec55526cbb0640969b3f5",
+    "query_count": 77,
+    "catalog_query_count": 1,
+    "catalog_ms": 35,
+    "show_columns_count": 2
+  },
+  {
+    "operation": "add-project",
+    "databases": 1,
+    "rep": 1,
+    "bd_version": "1.3.1",
+    "logging": "debug",
+    "seconds": 10.655896656913683,
+    "outcome": "passed",
+    "load": [
+      7.8564453125,
+      8.08203125,
+      7.4140625
+    ],
+    "available_GiB": 115.79517364501953,
+    "trace": "1.3.1-1-1-add-project.json",
+    "trace_sha256": "a90b3d50324115435e645e826dc12d0b1cb142f94fe2e3ae829e9ef3f1a20b2f",
+    "query_count": 2343,
+    "catalog_query_count": 107,
+    "catalog_ms": 3934,
+    "show_columns_count": 16
+  },
+  {
+    "operation": "migration",
+    "databases": 1,
+    "rep": 2,
+    "bd_version": "1.3.1",
+    "logging": "debug",
+    "seconds": 3.1054154310841113,
+    "outcome": "passed",
+    "load": [
+      7.41015625,
+      7.97998046875,
+      7.3876953125
+    ],
+    "available_GiB": 115.858154296875,
+    "trace": "1.3.1-1-2-migration.json",
+    "trace_sha256": "262c74c0ff0f5102fd8e4de07a153885330294dd23befd40ebd7dcd94d66714b",
+    "query_count": 614,
+    "catalog_query_count": 44,
+    "catalog_ms": 1162,
+    "show_columns_count": 6
+  },
+  {
+    "operation": "create",
+    "databases": 1,
+    "rep": 2,
+    "bd_version": "1.3.1",
+    "logging": "debug",
+    "seconds": 0.46679361001588404,
+    "outcome": "passed",
+    "load": [
+      7.376953125,
+      7.96337890625,
+      7.38525390625
+    ],
+    "available_GiB": 115.80733489990234,
+    "trace": "1.3.1-1-2-create.json",
+    "trace_sha256": "56478501eb94f36d00f9ab3b4e8a43862fa88702a9f620ab4b6dc5374cc63276",
+    "query_count": 99,
+    "catalog_query_count": 1,
+    "catalog_ms": 22,
+    "show_columns_count": 2
+  },
+  {
+    "operation": "claim",
+    "databases": 1,
+    "rep": 2,
+    "bd_version": "1.3.1",
+    "logging": "debug",
+    "seconds": 0.38450757786631584,
+    "outcome": "passed",
+    "load": [
+      7.376953125,
+      7.96337890625,
+      7.38525390625
+    ],
+    "available_GiB": 115.80891799926758,
+    "trace": "1.3.1-1-2-claim.json",
+    "trace_sha256": "0bd80f0ede99aabaffc2f6b16d686f2bb939cde9be6a3b78ef51bdf872cfad17",
+    "query_count": 77,
+    "catalog_query_count": 1,
+    "catalog_ms": 33,
+    "show_columns_count": 2
+  },
+  {
+    "operation": "add-project",
+    "databases": 1,
+    "rep": 2,
+    "bd_version": "1.3.1",
+    "logging": "debug",
+    "seconds": 10.702792858937755,
+    "outcome": "passed",
+    "load": [
+      7.376953125,
+      7.96337890625,
+      7.38525390625
+    ],
+    "available_GiB": 115.80136489868164,
+    "trace": "1.3.1-1-2-add-project.json",
+    "trace_sha256": "6d29b2fca5bfd494802d5e566d6bcf60db921235d117901af9413a38ddb2aaae",
+    "query_count": 2343,
+    "catalog_query_count": 107,
+    "catalog_ms": 4041,
+    "show_columns_count": 16
+  },
+  {
+    "operation": "migration",
+    "databases": 1,
+    "rep": 3,
+    "bd_version": "1.3.1",
+    "logging": "debug",
+    "seconds": 3.047408931190148,
+    "outcome": "passed",
+    "load": [
+      7.02294921875,
+      7.85205078125,
+      7.357421875
+    ],
+    "available_GiB": 115.71641540527344,
+    "trace": "1.3.1-1-3-migration.json",
+    "trace_sha256": "7f687d52f04c8f98a327d7c684b6b333e05c1891998b2997973a69b13fe36c66",
+    "query_count": 614,
+    "catalog_query_count": 44,
+    "catalog_ms": 1109,
+    "show_columns_count": 6
+  },
+  {
+    "operation": "create",
+    "databases": 1,
+    "rep": 3,
+    "bd_version": "1.3.1",
+    "logging": "debug",
+    "seconds": 0.49088232312351465,
+    "outcome": "passed",
+    "load": [
+      7.02294921875,
+      7.85205078125,
+      7.357421875
+    ],
+    "available_GiB": 115.75848770141602,
+    "trace": "1.3.1-1-3-create.json",
+    "trace_sha256": "d82c200ec74cd2566eb28c863ad6da2526dee9e27f7bde740a62a395719b0a6b",
+    "query_count": 99,
+    "catalog_query_count": 1,
+    "catalog_ms": 33,
+    "show_columns_count": 2
+  },
+  {
+    "operation": "claim",
+    "databases": 1,
+    "rep": 3,
+    "bd_version": "1.3.1",
+    "logging": "debug",
+    "seconds": 0.34207966597750783,
+    "outcome": "passed",
+    "load": [
+      7.02294921875,
+      7.85205078125,
+      7.357421875
+    ],
+    "available_GiB": 115.85938262939453,
+    "trace": "1.3.1-1-3-claim.json",
+    "trace_sha256": "94bb2dd25df2ce62d85d6e2c9f2ac9a006b3311e69db80435290761a47fa1086",
+    "query_count": 77,
+    "catalog_query_count": 1,
+    "catalog_ms": 30,
+    "show_columns_count": 2
+  },
+  {
+    "operation": "add-project",
+    "databases": 1,
+    "rep": 3,
+    "bd_version": "1.3.1",
+    "logging": "debug",
+    "seconds": 10.70879670092836,
+    "outcome": "passed",
+    "load": [
+      7.02294921875,
+      7.85205078125,
+      7.357421875
+    ],
+    "available_GiB": 115.84674835205078,
+    "trace": "1.3.1-1-3-add-project.json",
+    "trace_sha256": "6fc523d1de8b16cdc4f5092e6e9f839b5285fbf7013cb4add44dce8bd53516f3",
+    "query_count": 2343,
+    "catalog_query_count": 107,
+    "catalog_ms": 3873,
+    "show_columns_count": 16
+  },
+  {
+    "operation": "migration",
+    "databases": 1,
+    "rep": 1,
+    "bd_version": "1.3.1",
+    "logging": "warning",
+    "seconds": 3.233890392119065,
+    "outcome": "passed",
+    "load": [
+      6.70458984375,
+      7.744140625,
+      7.33056640625
+    ],
+    "available_GiB": 115.89424896240234
+  },
+  {
+    "operation": "create",
+    "databases": 1,
+    "rep": 1,
+    "bd_version": "1.3.1",
+    "logging": "warning",
+    "seconds": 0.4351911360863596,
+    "outcome": "passed",
+    "load": [
+      6.70458984375,
+      7.744140625,
+      7.33056640625
+    ],
+    "available_GiB": 115.84627532958984
+  },
+  {
+    "operation": "claim",
+    "databases": 1,
+    "rep": 1,
+    "bd_version": "1.3.1",
+    "logging": "warning",
+    "seconds": 0.3392167859710753,
+    "outcome": "passed",
+    "load": [
+      6.728515625,
+      7.7314453125,
+      7.32861328125
+    ],
+    "available_GiB": 115.77005767822266
+  },
+  {
+    "operation": "add-project",
+    "databases": 1,
+    "rep": 1,
+    "bd_version": "1.3.1",
+    "logging": "warning",
+    "seconds": 10.921672408934683,
+    "outcome": "passed",
+    "load": [
+      6.728515625,
+      7.7314453125,
+      7.32861328125
+    ],
+    "available_GiB": 115.86056900024414
+  },
+  {
+    "operation": "migration",
+    "databases": 1,
+    "rep": 2,
+    "bd_version": "1.3.1",
+    "logging": "warning",
+    "seconds": 3.1211632369086146,
+    "outcome": "passed",
+    "load": [
+      6.69677734375,
+      7.69091796875,
+      7.3193359375
+    ],
+    "available_GiB": 115.86119079589844
+  },
+  {
+    "operation": "create",
+    "databases": 1,
+    "rep": 2,
+    "bd_version": "1.3.1",
+    "logging": "warning",
+    "seconds": 0.4788760608062148,
+    "outcome": "passed",
+    "load": [
+      6.80126953125,
+      7.6962890625,
+      7.3232421875
+    ],
+    "available_GiB": 115.8042221069336
+  },
+  {
+    "operation": "claim",
+    "databases": 1,
+    "rep": 2,
+    "bd_version": "1.3.1",
+    "logging": "warning",
+    "seconds": 0.35298295598477125,
+    "outcome": "passed",
+    "load": [
+      6.80126953125,
+      7.6962890625,
+      7.3232421875
+    ],
+    "available_GiB": 115.80977249145508
+  },
+  {
+    "operation": "add-project",
+    "databases": 1,
+    "rep": 2,
+    "bd_version": "1.3.1",
+    "logging": "warning",
+    "seconds": 10.811188224935904,
+    "outcome": "passed",
+    "load": [
+      6.80126953125,
+      7.6962890625,
+      7.3232421875
+    ],
+    "available_GiB": 115.80703735351562
+  },
+  {
+    "operation": "migration",
+    "databases": 1,
+    "rep": 3,
+    "bd_version": "1.3.1",
+    "logging": "warning",
+    "seconds": 3.102185823954642,
+    "outcome": "passed",
+    "load": [
+      6.6845703125,
+      7.64013671875,
+      7.30859375
+    ],
+    "available_GiB": 115.82862091064453
+  },
+  {
+    "operation": "create",
+    "databases": 1,
+    "rep": 3,
+    "bd_version": "1.3.1",
+    "logging": "warning",
+    "seconds": 0.4498453480191529,
+    "outcome": "passed",
+    "load": [
+      8.7119140625,
+      8.044921875,
+      7.44140625
+    ],
+    "available_GiB": 115.73946762084961
+  },
+  {
+    "operation": "claim",
+    "databases": 1,
+    "rep": 3,
+    "bd_version": "1.3.1",
+    "logging": "warning",
+    "seconds": 0.3690548208542168,
+    "outcome": "passed",
+    "load": [
+      8.7119140625,
+      8.044921875,
+      7.44140625
+    ],
+    "available_GiB": 115.72833633422852
+  },
+  {
+    "operation": "add-project",
+    "databases": 1,
+    "rep": 3,
+    "bd_version": "1.3.1",
+    "logging": "warning",
+    "seconds": 10.734691780991852,
+    "outcome": "passed",
+    "load": [
+      8.7119140625,
+      8.044921875,
+      7.44140625
+    ],
+    "available_GiB": 115.72654342651367
+  },
+  {
+    "operation": "create",
+    "databases": 20,
+    "rep": 1,
+    "bd_version": "1.2.2",
+    "logging": "debug",
+    "seconds": 0.9639315530657768,
+    "outcome": "passed",
+    "load": [
+      7.828125,
+      7.87939453125,
+      7.396484375
+    ],
+    "available_GiB": 115.7580337524414,
+    "trace": "1.2.2-20-1-create.json",
+    "trace_sha256": "cc3e91d445b709782e0f2aca3a33ada16b6fc19d5edc134f4b67d156e1fa2c7b",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 513,
+    "show_columns_count": 0
+  },
+  {
+    "operation": "claim",
+    "databases": 20,
+    "rep": 1,
+    "bd_version": "1.2.2",
+    "logging": "debug",
+    "seconds": 3.7632805230095983,
+    "outcome": "passed",
+    "load": [
+      7.828125,
+      7.87939453125,
+      7.396484375
+    ],
+    "available_GiB": 115.63825607299805,
+    "trace": "1.2.2-20-1-claim.json",
+    "trace_sha256": "6c34940a687bb34626da2aa1f31532731785e20ab06f7e7618b860f88839e5f7",
+    "query_count": 48,
+    "catalog_query_count": 2,
+    "catalog_ms": 544,
+    "show_columns_count": 0
+  },
+  {
+    "operation": "add-project",
+    "databases": 20,
+    "rep": 1,
+    "bd_version": "1.2.2",
+    "logging": "debug",
+    "seconds": 27.14068408496678,
+    "outcome": "passed",
+    "load": [
+      7.6015625,
+      7.83154296875,
+      7.38330078125
+    ],
+    "available_GiB": 115.5892219543457,
+    "trace": "1.2.2-20-1-add-project.json",
+    "trace_sha256": "0c87e4596be712deba0c73a962a9918df23c4f99bc52e274556eb07c8c7cadf3",
+    "query_count": 1552,
+    "catalog_query_count": 73,
+    "catalog_ms": 18031,
+    "show_columns_count": 0
+  },
+  {
+    "operation": "create",
+    "databases": 20,
+    "rep": 2,
+    "bd_version": "1.2.2",
+    "logging": "debug",
+    "seconds": 0.9408956149127334,
+    "outcome": "passed",
+    "load": [
+      8.52734375,
+      8.08837890625,
+      7.4853515625
+    ],
+    "available_GiB": 115.64928436279297,
+    "trace": "1.2.2-20-2-create.json",
+    "trace_sha256": "2a221aebeb951a872adaf26b4d2c38868210607279a5e69e5c15a56c3bd6d932",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 542,
+    "show_columns_count": 0
+  },
+  {
+    "operation": "claim",
+    "databases": 20,
+    "rep": 2,
+    "bd_version": "1.2.2",
+    "logging": "debug",
+    "seconds": 0.928892893018201,
+    "outcome": "passed",
+    "load": [
+      8.52734375,
+      8.08837890625,
+      7.4853515625
+    ],
+    "available_GiB": 115.50612258911133,
+    "trace": "1.2.2-20-2-claim.json",
+    "trace_sha256": "e8a59cf68ccb1b2320578988d747b4a0baa6a9759901991fde7631a0e164ec0d",
+    "query_count": 48,
+    "catalog_query_count": 2,
+    "catalog_ms": 509,
+    "show_columns_count": 0
+  },
+  {
+    "operation": "add-project",
+    "databases": 20,
+    "rep": 2,
+    "bd_version": "1.2.2",
+    "logging": "debug",
+    "seconds": 27.981404558056965,
+    "outcome": "passed",
+    "load": [
+      8.52734375,
+      8.08837890625,
+      7.4853515625
+    ],
+    "available_GiB": 115.3890266418457,
+    "trace": "1.2.2-20-2-add-project.json",
+    "trace_sha256": "41541a770e61967d06d76c9eaf7b445eaf2041af8c182f0adb14ca74e8028d3d",
+    "query_count": 1552,
+    "catalog_query_count": 73,
+    "catalog_ms": 17942,
+    "show_columns_count": 0
+  },
+  {
+    "operation": "create",
+    "databases": 20,
+    "rep": 3,
+    "bd_version": "1.2.2",
+    "logging": "debug",
+    "seconds": 1.0232174410484731,
+    "outcome": "passed",
+    "load": [
+      7.357421875,
+      7.853515625,
+      7.42529296875
+    ],
+    "available_GiB": 115.69034576416016,
+    "trace": "1.2.2-20-3-create.json",
+    "trace_sha256": "bc7d634d4a6cd526565339c0391fc01054e8e519b6cc777f27e8192599ba494b",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 628,
+    "show_columns_count": 0
+  },
+  {
+    "operation": "claim",
+    "databases": 20,
+    "rep": 3,
+    "bd_version": "1.2.2",
+    "logging": "debug",
+    "seconds": 0.8022345609497279,
+    "outcome": "passed",
+    "load": [
+      7.357421875,
+      7.853515625,
+      7.42529296875
+    ],
+    "available_GiB": 115.49344253540039,
+    "trace": "1.2.2-20-3-claim.json",
+    "trace_sha256": "41baab45ded004a625a83abbc29dea388c38536c05372ee98fce143bd3d22519",
+    "query_count": 48,
+    "catalog_query_count": 2,
+    "catalog_ms": 443,
+    "show_columns_count": 0
+  },
+  {
+    "operation": "add-project",
+    "databases": 20,
+    "rep": 3,
+    "bd_version": "1.2.2",
+    "logging": "debug",
+    "seconds": 24.191357663832605,
+    "outcome": "passed",
+    "load": [
+      7.357421875,
+      7.853515625,
+      7.42529296875
+    ],
+    "available_GiB": 115.40673828125,
+    "trace": "1.2.2-20-3-add-project.json",
+    "trace_sha256": "6fa21f9f304436df030e8008fdacf0de5d6572373c893334878827a5cddaae48",
+    "query_count": 1552,
+    "catalog_query_count": 73,
+    "catalog_ms": 17466,
+    "show_columns_count": 0
+  },
+  {
+    "operation": "create",
+    "databases": 20,
+    "rep": 1,
+    "bd_version": "1.2.2",
+    "logging": "warning",
+    "seconds": 1.0395828587934375,
+    "outcome": "passed",
+    "load": [
+      11.09033203125,
+      8.69921875,
+      7.71630859375
+    ],
+    "available_GiB": 115.60768127441406
+  },
+  {
+    "operation": "claim",
+    "databases": 20,
+    "rep": 1,
+    "bd_version": "1.2.2",
+    "logging": "warning",
+    "seconds": 0.864681530976668,
+    "outcome": "passed",
+    "load": [
+      10.6826171875,
+      8.654296875,
+      7.70703125
+    ],
+    "available_GiB": 115.63159942626953
+  },
+  {
+    "operation": "add-project",
+    "databases": 20,
+    "rep": 1,
+    "bd_version": "1.2.2",
+    "logging": "warning",
+    "seconds": 24.43647810211405,
+    "outcome": "passed",
+    "load": [
+      10.6826171875,
+      8.654296875,
+      7.70703125
+    ],
+    "available_GiB": 115.55452346801758
+  },
+  {
+    "operation": "create",
+    "databases": 20,
+    "rep": 2,
+    "bd_version": "1.2.2",
+    "logging": "warning",
+    "seconds": 1.0641700690612197,
+    "outcome": "passed",
+    "load": [
+      8.6572265625,
+      8.330078125,
+      7.62353515625
+    ],
+    "available_GiB": 115.71693420410156
+  },
+  {
+    "operation": "claim",
+    "databases": 20,
+    "rep": 2,
+    "bd_version": "1.2.2",
+    "logging": "warning",
+    "seconds": 0.8576412261463702,
+    "outcome": "passed",
+    "load": [
+      8.6572265625,
+      8.330078125,
+      7.62353515625
+    ],
+    "available_GiB": 115.56863784790039
+  },
+  {
+    "operation": "add-project",
+    "databases": 20,
+    "rep": 2,
+    "bd_version": "1.2.2",
+    "logging": "warning",
+    "seconds": 27.518143275985494,
+    "outcome": "passed",
+    "load": [
+      8.6572265625,
+      8.330078125,
+      7.62353515625
+    ],
+    "available_GiB": 115.50061416625977
+  },
+  {
+    "operation": "create",
+    "databases": 20,
+    "rep": 3,
+    "bd_version": "1.2.2",
+    "logging": "warning",
+    "seconds": 2.2474771740380675,
+    "outcome": "passed",
+    "load": [
+      11.478515625,
+      8.95751953125,
+      7.84912109375
+    ],
+    "available_GiB": 115.71287536621094
+  },
+  {
+    "operation": "claim",
+    "databases": 20,
+    "rep": 3,
+    "bd_version": "1.2.2",
+    "logging": "warning",
+    "seconds": 1.6074342550709844,
+    "outcome": "passed",
+    "load": [
+      10.95947265625,
+      8.8916015625,
+      7.83349609375
+    ],
+    "available_GiB": 115.62201690673828
+  },
+  {
+    "operation": "add-project",
+    "databases": 20,
+    "rep": 3,
+    "bd_version": "1.2.2",
+    "logging": "warning",
+    "seconds": 26.370442155050114,
+    "outcome": "passed",
+    "load": [
+      10.95947265625,
+      8.8916015625,
+      7.83349609375
+    ],
+    "available_GiB": 115.51389694213867
+  },
+  {
+    "operation": "migration",
+    "databases": 20,
+    "rep": 1,
+    "bd_version": "1.3.1",
+    "logging": "debug",
+    "seconds": 15.61742133111693,
+    "outcome": "passed",
+    "load": [
+      9.33935546875,
+      8.662109375,
+      7.7841796875
+    ],
+    "available_GiB": 115.739501953125,
+    "trace": "1.3.1-20-1-migration.json",
+    "trace_sha256": "6382e5c2da1327286f3bb4eddb1ec856dbb0078d95f41abae6330a0fc1ea9969",
+    "query_count": 614,
+    "catalog_query_count": 44,
+    "catalog_ms": 10812,
+    "show_columns_count": 6
+  },
+  {
+    "operation": "create",
+    "databases": 20,
+    "rep": 1,
+    "bd_version": "1.3.1",
+    "logging": "debug",
+    "seconds": 1.0440962701104581,
+    "outcome": "passed",
+    "load": [
+      8.431640625,
+      8.49072265625,
+      7.74560546875
+    ],
+    "available_GiB": 116.6121826171875,
+    "trace": "1.3.1-20-1-create.json",
+    "trace_sha256": "3e4025904dd6298d3a5fb80e8eaa52bdd605fcae22c05fc5e51e38c08ce0ec10",
+    "query_count": 99,
+    "catalog_query_count": 1,
+    "catalog_ms": 270,
+    "show_columns_count": 2
+  },
+  {
+    "operation": "claim",
+    "databases": 20,
+    "rep": 1,
+    "bd_version": "1.3.1",
+    "logging": "debug",
+    "seconds": 1.0434453811030835,
+    "outcome": "passed",
+    "load": [
+      8.431640625,
+      8.49072265625,
+      7.74560546875
+    ],
+    "available_GiB": 116.54589462280273,
+    "trace": "1.3.1-20-1-claim.json",
+    "trace_sha256": "cb5eeb0d6468a8e3c7575559cc895a9afc5cfd3b74383869f9c2e6325bd4363a",
+    "query_count": 77,
+    "catalog_query_count": 1,
+    "catalog_ms": 356,
+    "show_columns_count": 2
+  },
+  {
+    "operation": "add-project",
+    "databases": 20,
+    "rep": 1,
+    "bd_version": "1.3.1",
+    "logging": "debug",
+    "seconds": 39.870931833051145,
+    "outcome": "passed",
+    "load": [
+      8.431640625,
+      8.49072265625,
+      7.74560546875
+    ],
+    "available_GiB": 116.52216339111328,
+    "trace": "1.3.1-20-1-add-project.json",
+    "trace_sha256": "f65edde249435a202595e00d2d2a909d7387eb8bc061cf0785a477e2b6b25894",
+    "query_count": 2343,
+    "catalog_query_count": 107,
+    "catalog_ms": 27485,
+    "show_columns_count": 16
+  },
+  {
+    "operation": "migration",
+    "databases": 20,
+    "rep": 2,
+    "bd_version": "1.3.1",
+    "logging": "debug",
+    "seconds": 15.063432095106691,
+    "outcome": "passed",
+    "load": [
+      10.12646484375,
+      8.94140625,
+      7.92919921875
+    ],
+    "available_GiB": 116.82594299316406,
+    "trace": "1.3.1-20-2-migration.json",
+    "trace_sha256": "55c53b5bbae15983ea3328b04067d94f94007ad0376ac784abcc4dccf374a6fb",
+    "query_count": 614,
+    "catalog_query_count": 44,
+    "catalog_ms": 10423,
+    "show_columns_count": 6
+  },
+  {
+    "operation": "create",
+    "databases": 20,
+    "rep": 2,
+    "bd_version": "1.3.1",
+    "logging": "debug",
+    "seconds": 1.109882164048031,
+    "outcome": "passed",
+    "load": [
+      9.05810546875,
+      8.76318359375,
+      7.88671875
+    ],
+    "available_GiB": 116.61491012573242,
+    "trace": "1.3.1-20-2-create.json",
+    "trace_sha256": "b95c32b557dc9ba5c5b495067661767e3ddf0079e18661a0029e0f6450149f09",
+    "query_count": 99,
+    "catalog_query_count": 1,
+    "catalog_ms": 296,
+    "show_columns_count": 2
+  },
+  {
+    "operation": "claim",
+    "databases": 20,
+    "rep": 2,
+    "bd_version": "1.3.1",
+    "logging": "debug",
+    "seconds": 1.0404963770415634,
+    "outcome": "passed",
+    "load": [
+      8.73291015625,
+      8.70068359375,
+      7.87109375
+    ],
+    "available_GiB": 116.61637878417969,
+    "trace": "1.3.1-20-2-claim.json",
+    "trace_sha256": "84768533523fd0b56a4f630fe8661dbcf5d29c47ac7896d7faf80a045e0f30fb",
+    "query_count": 77,
+    "catalog_query_count": 1,
+    "catalog_ms": 305,
+    "show_columns_count": 2
+  },
+  {
+    "operation": "add-project",
+    "databases": 20,
+    "rep": 2,
+    "bd_version": "1.3.1",
+    "logging": "debug",
+    "seconds": 39.511510357959196,
+    "outcome": "passed",
+    "load": [
+      8.73291015625,
+      8.70068359375,
+      7.87109375
+    ],
+    "available_GiB": 116.6099853515625,
+    "trace": "1.3.1-20-2-add-project.json",
+    "trace_sha256": "754d0d49eb057f09f1a1f85c55d6a97ffa2199b859e56fd70171d67a2b7869e5",
+    "query_count": 2343,
+    "catalog_query_count": 107,
+    "catalog_ms": 27358,
+    "show_columns_count": 16
+  },
+  {
+    "operation": "migration",
+    "databases": 20,
+    "rep": 3,
+    "bd_version": "1.3.1",
+    "logging": "debug",
+    "seconds": 15.853020037990063,
+    "outcome": "passed",
+    "load": [
+      6.66748046875,
+      8.17236328125,
+      7.72705078125
+    ],
+    "available_GiB": 116.82038497924805,
+    "trace": "1.3.1-20-3-migration.json",
+    "trace_sha256": "4804afff0a99aae11f67b1daa8f8948e9f864946d56abe32756390cdfbae5dde",
+    "query_count": 614,
+    "catalog_query_count": 44,
+    "catalog_ms": 11007,
+    "show_columns_count": 6
+  },
+  {
+    "operation": "create",
+    "databases": 20,
+    "rep": 3,
+    "bd_version": "1.3.1",
+    "logging": "debug",
+    "seconds": 1.0853121948894113,
+    "outcome": "passed",
+    "load": [
+      6.51318359375,
+      8.0654296875,
+      7.69921875
+    ],
+    "available_GiB": 116.58412551879883,
+    "trace": "1.3.1-20-3-create.json",
+    "trace_sha256": "616c89b47f3c27ded186a9537c9292c21afe56c12adf7dd2fc76a3d4a87b589d",
+    "query_count": 99,
+    "catalog_query_count": 1,
+    "catalog_ms": 290,
+    "show_columns_count": 2
+  },
+  {
+    "operation": "claim",
+    "databases": 20,
+    "rep": 3,
+    "bd_version": "1.3.1",
+    "logging": "debug",
+    "seconds": 0.9354045011568815,
+    "outcome": "passed",
+    "load": [
+      6.51318359375,
+      8.0654296875,
+      7.69921875
+    ],
+    "available_GiB": 116.59064102172852,
+    "trace": "1.3.1-20-3-claim.json",
+    "trace_sha256": "d6d9f6738cbf90151b22d8926ce0456852aba2f797ee10f544a05e2413e56082",
+    "query_count": 77,
+    "catalog_query_count": 1,
+    "catalog_ms": 269,
+    "show_columns_count": 2
+  },
+  {
+    "operation": "add-project",
+    "databases": 20,
+    "rep": 3,
+    "bd_version": "1.3.1",
+    "logging": "debug",
+    "seconds": 38.769062211038545,
+    "outcome": "passed",
+    "load": [
+      6.3115234375,
+      7.99755859375,
+      7.67919921875
+    ],
+    "available_GiB": 116.5903091430664,
+    "trace": "1.3.1-20-3-add-project.json",
+    "trace_sha256": "889bcd614b4a318543183aec74f3eceb752c2cb0a30d1e40efa45b867cd4e567",
+    "query_count": 2343,
+    "catalog_query_count": 107,
+    "catalog_ms": 26631,
+    "show_columns_count": 16
+  },
+  {
+    "operation": "migration",
+    "databases": 20,
+    "rep": 1,
+    "bd_version": "1.3.1",
+    "logging": "warning",
+    "seconds": 15.218922775937244,
+    "outcome": "passed",
+    "load": [
+      5.6806640625,
+      7.62109375,
+      7.564453125
+    ],
+    "available_GiB": 117.07121658325195
+  },
+  {
+    "operation": "create",
+    "databases": 20,
+    "rep": 1,
+    "bd_version": "1.3.1",
+    "logging": "warning",
+    "seconds": 1.0740529680624604,
+    "outcome": "passed",
+    "load": [
+      5.4375,
+      7.474609375,
+      7.51708984375
+    ],
+    "available_GiB": 116.86568832397461
+  },
+  {
+    "operation": "claim",
+    "databases": 20,
+    "rep": 1,
+    "bd_version": "1.3.1",
+    "logging": "warning",
+    "seconds": 0.9004363720305264,
+    "outcome": "passed",
+    "load": [
+      5.4375,
+      7.474609375,
+      7.51708984375
+    ],
+    "available_GiB": 116.8745002746582
+  },
+  {
+    "operation": "add-project",
+    "databases": 20,
+    "rep": 1,
+    "bd_version": "1.3.1",
+    "logging": "warning",
+    "seconds": 38.732660255162045,
+    "outcome": "passed",
+    "load": [
+      5.4375,
+      7.474609375,
+      7.51708984375
+    ],
+    "available_GiB": 116.83305358886719
+  },
+  {
+    "operation": "migration",
+    "databases": 20,
+    "rep": 2,
+    "bd_version": "1.3.1",
+    "logging": "warning",
+    "seconds": 15.40902923210524,
+    "outcome": "passed",
+    "load": [
+      5.27001953125,
+      7.2021484375,
+      7.42529296875
+    ],
+    "available_GiB": 117.02630233764648
+  },
+  {
+    "operation": "create",
+    "databases": 20,
+    "rep": 2,
+    "bd_version": "1.3.1",
+    "logging": "warning",
+    "seconds": 1.0748742558062077,
+    "outcome": "passed",
+    "load": [
+      4.90869140625,
+      7.0283203125,
+      7.3642578125
+    ],
+    "available_GiB": 116.65033721923828
+  },
+  {
+    "operation": "claim",
+    "databases": 20,
+    "rep": 2,
+    "bd_version": "1.3.1",
+    "logging": "warning",
+    "seconds": 0.9064267301000655,
+    "outcome": "passed",
+    "load": [
+      4.90869140625,
+      7.0283203125,
+      7.3642578125
+    ],
+    "available_GiB": 116.74567794799805
+  },
+  {
+    "operation": "add-project",
+    "databases": 20,
+    "rep": 2,
+    "bd_version": "1.3.1",
+    "logging": "warning",
+    "seconds": 38.69606726500206,
+    "outcome": "passed",
+    "load": [
+      4.83544921875,
+      6.97802734375,
+      7.345703125
+    ],
+    "available_GiB": 116.77609634399414
+  },
+  {
+    "operation": "migration",
+    "databases": 20,
+    "rep": 3,
+    "bd_version": "1.3.1",
+    "logging": "warning",
+    "seconds": 16.21171237109229,
+    "outcome": "passed",
+    "load": [
+      4.27099609375,
+      6.5693359375,
+      7.19189453125
+    ],
+    "available_GiB": 116.77222442626953
+  },
+  {
+    "operation": "create",
+    "databases": 20,
+    "rep": 3,
+    "bd_version": "1.3.1",
+    "logging": "warning",
+    "seconds": 1.0821014938410372,
+    "outcome": "passed",
+    "load": [
+      6.44677734375,
+      6.97314453125,
+      7.31591796875
+    ],
+    "available_GiB": 116.58195495605469
+  },
+  {
+    "operation": "claim",
+    "databases": 20,
+    "rep": 3,
+    "bd_version": "1.3.1",
+    "logging": "warning",
+    "seconds": 1.0835651049856097,
+    "outcome": "passed",
+    "load": [
+      6.44677734375,
+      6.97314453125,
+      7.31591796875
+    ],
+    "available_GiB": 116.6485366821289
+  },
+  {
+    "operation": "add-project",
+    "databases": 20,
+    "rep": 3,
+    "bd_version": "1.3.1",
+    "logging": "warning",
+    "seconds": 39.22572845313698,
+    "outcome": "passed",
+    "load": [
+      6.44677734375,
+      6.97314453125,
+      7.31591796875
+    ],
+    "available_GiB": 116.63627624511719
+  },
+  {
+    "operation": "create",
+    "databases": 50,
+    "rep": 1,
+    "bd_version": "1.2.2",
+    "logging": "debug",
+    "seconds": 2.4204705969896168,
+    "outcome": "passed",
+    "load": [
+      9.20361328125,
+      7.58154296875,
+      7.5029296875
+    ],
+    "available_GiB": 116.61957550048828,
+    "trace": "1.2.2-50-1-create.json",
+    "trace_sha256": "de182e073dd1d036b16333bbc13bb74cc367d8ddac0809ef01bf9d0bd1b7cfe9",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 1582,
+    "show_columns_count": 0
+  },
+  {
+    "operation": "claim",
+    "databases": 50,
+    "rep": 1,
+    "bd_version": "1.2.2",
+    "logging": "debug",
+    "seconds": 2.2086783370468765,
+    "outcome": "passed",
+    "load": [
+      8.78662109375,
+      7.52197265625,
+      7.48388671875
+    ],
+    "available_GiB": 116.30803298950195,
+    "trace": "1.2.2-50-1-claim.json",
+    "trace_sha256": "e012b6c9524d0a07949a8ab022c9758424df8c0e449f46bd83e379c3f43b7e34",
+    "query_count": 48,
+    "catalog_query_count": 2,
+    "catalog_ms": 1758,
+    "show_columns_count": 0
+  },
+  {
+    "operation": "add-project",
+    "databases": 50,
+    "rep": 1,
+    "bd_version": "1.2.2",
+    "logging": "debug",
+    "seconds": 65.64850022108294,
+    "outcome": "passed",
+    "load": [
+      8.78662109375,
+      7.52197265625,
+      7.48388671875
+    ],
+    "available_GiB": 115.80304718017578,
+    "trace": "1.2.2-50-1-add-project.json",
+    "trace_sha256": "4804654dbedaef563756e4610371338447f97d03afb646a471f4a097f7c3742a",
+    "query_count": 1553,
+    "catalog_query_count": 73,
+    "catalog_ms": 55274,
+    "show_columns_count": 0
+  },
+  {
+    "operation": "create",
+    "databases": 50,
+    "rep": 2,
+    "bd_version": "1.2.2",
+    "logging": "debug",
+    "seconds": 2.139900556067005,
+    "outcome": "passed",
+    "load": [
+      5.9248046875,
+      6.9423828125,
+      7.28466796875
+    ],
+    "available_GiB": 116.33561706542969,
+    "trace": "1.2.2-50-2-create.json",
+    "trace_sha256": "a268a5e35ba2a565d8c8f6c217ef429917de1cffa1b77ed07a4cfb2dbd1b074f",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 1679,
+    "show_columns_count": 0
+  },
+  {
+    "operation": "claim",
+    "databases": 50,
+    "rep": 2,
+    "bd_version": "1.2.2",
+    "logging": "debug",
+    "seconds": 2.0287362940143794,
+    "outcome": "passed",
+    "load": [
+      5.9248046875,
+      6.9423828125,
+      7.28466796875
+    ],
+    "available_GiB": 116.05089569091797,
+    "trace": "1.2.2-50-2-claim.json",
+    "trace_sha256": "99dc296c802c177f9a634c1402bb8258c2d8a2109daeb2817f789af1639caff7",
+    "query_count": 48,
+    "catalog_query_count": 2,
+    "catalog_ms": 1539,
+    "show_columns_count": 0
+  },
+  {
+    "operation": "add-project",
+    "databases": 50,
+    "rep": 2,
+    "bd_version": "1.2.2",
+    "logging": "debug",
+    "seconds": 66.4493023159448,
+    "outcome": "passed",
+    "load": [
+      5.7705078125,
+      6.89306640625,
+      7.2666015625
+    ],
+    "available_GiB": 116.34109115600586,
+    "trace": "1.2.2-50-2-add-project.json",
+    "trace_sha256": "d5976d19a94baacdff86b34b1a5f69cba3ec2bb48c3487fed876341e3fef0ca6",
+    "query_count": 1553,
+    "catalog_query_count": 73,
+    "catalog_ms": 55428,
+    "show_columns_count": 0
+  },
+  {
+    "operation": "create",
+    "databases": 50,
+    "rep": 3,
+    "bd_version": "1.2.2",
+    "logging": "debug",
+    "seconds": 2.0990421399474144,
+    "outcome": "passed",
+    "load": [
+      8.17236328125,
+      7.43994140625,
+      7.43115234375
+    ],
+    "available_GiB": 116.90919494628906,
+    "trace": "1.2.2-50-3-create.json",
+    "trace_sha256": "c5966b1c6fc12821534fd18fca0afe1cf5485c885cb2fb117035ed6579f85f08",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 1587,
+    "show_columns_count": 0
+  },
+  {
+    "operation": "claim",
+    "databases": 50,
+    "rep": 3,
+    "bd_version": "1.2.2",
+    "logging": "debug",
+    "seconds": 2.0644735919777304,
+    "outcome": "passed",
+    "load": [
+      8.17236328125,
+      7.43994140625,
+      7.43115234375
+    ],
+    "available_GiB": 116.70267105102539,
+    "trace": "1.2.2-50-3-claim.json",
+    "trace_sha256": "79a57d370f48555d4b18f2a810cc894025b157961854513ffe8aacaa9150205d",
+    "query_count": 48,
+    "catalog_query_count": 2,
+    "catalog_ms": 1593,
+    "show_columns_count": 0
+  },
+  {
+    "operation": "add-project",
+    "databases": 50,
+    "rep": 3,
+    "bd_version": "1.2.2",
+    "logging": "debug",
+    "seconds": 64.0265782258939,
+    "outcome": "passed",
+    "load": [
+      8.17236328125,
+      7.43994140625,
+      7.43115234375
+    ],
+    "available_GiB": 116.4804916381836,
+    "trace": "1.2.2-50-3-add-project.json",
+    "trace_sha256": "f9b626aad5a1703cdcdb8d7613952a2c52c3bdbceca8b26318f3595c11c9ae7c",
+    "query_count": 1553,
+    "catalog_query_count": 73,
+    "catalog_ms": 53823,
+    "show_columns_count": 0
+  },
+  {
+    "operation": "create",
+    "databases": 50,
+    "rep": 1,
+    "bd_version": "1.2.2",
+    "logging": "warning",
+    "seconds": 2.22948184190318,
+    "outcome": "passed",
+    "load": [
+      9.541015625,
+      7.72216796875,
+      7.513671875
+    ],
+    "available_GiB": 116.69502258300781
+  },
+  {
+    "operation": "claim",
+    "databases": 50,
+    "rep": 1,
+    "bd_version": "1.2.2",
+    "logging": "warning",
+    "seconds": 2.1025490269530565,
+    "outcome": "passed",
+    "load": [
+      9.541015625,
+      7.72216796875,
+      7.513671875
+    ],
+    "available_GiB": 116.37807846069336
+  },
+  {
+    "operation": "add-project",
+    "databases": 50,
+    "rep": 1,
+    "bd_version": "1.2.2",
+    "logging": "warning",
+    "seconds": 61.90173776494339,
+    "outcome": "passed",
+    "load": [
+      9.541015625,
+      7.72216796875,
+      7.513671875
+    ],
+    "available_GiB": 116.38531494140625
+  },
+  {
+    "operation": "create",
+    "databases": 50,
+    "rep": 2,
+    "bd_version": "1.2.2",
+    "logging": "warning",
+    "seconds": 2.2271785160992295,
+    "outcome": "passed",
+    "load": [
+      7.24755859375,
+      7.3984375,
+      7.41455078125
+    ],
+    "available_GiB": 116.69293212890625
+  },
+  {
+    "operation": "claim",
+    "databases": 50,
+    "rep": 2,
+    "bd_version": "1.2.2",
+    "logging": "warning",
+    "seconds": 2.0086220279335976,
+    "outcome": "passed",
+    "load": [
+      10.35107421875,
+      8.03955078125,
+      7.6220703125
+    ],
+    "available_GiB": 116.45378875732422
+  },
+  {
+    "operation": "add-project",
+    "databases": 50,
+    "rep": 2,
+    "bd_version": "1.2.2",
+    "logging": "warning",
+    "seconds": 63.95861478499137,
+    "outcome": "passed",
+    "load": [
+      10.35107421875,
+      8.03955078125,
+      7.6220703125
+    ],
+    "available_GiB": 116.29179763793945
+  },
+  {
+    "operation": "create",
+    "databases": 50,
+    "rep": 3,
+    "bd_version": "1.2.2",
+    "logging": "warning",
+    "seconds": 2.0060621311422437,
+    "outcome": "passed",
+    "load": [
+      10.025390625,
+      8.46923828125,
+      7.80029296875
+    ],
+    "available_GiB": 116.90483093261719
+  },
+  {
+    "operation": "claim",
+    "databases": 50,
+    "rep": 3,
+    "bd_version": "1.2.2",
+    "logging": "warning",
+    "seconds": 1.8151298470329493,
+    "outcome": "passed",
+    "load": [
+      9.54248046875,
+      8.39501953125,
+      7.77978515625
+    ],
+    "available_GiB": 116.6419563293457
+  },
+  {
+    "operation": "add-project",
+    "databases": 50,
+    "rep": 3,
+    "bd_version": "1.2.2",
+    "logging": "warning",
+    "seconds": 61.652352835051715,
+    "outcome": "passed",
+    "load": [
+      9.54248046875,
+      8.39501953125,
+      7.77978515625
+    ],
+    "available_GiB": 116.50765991210938
+  },
+  {
+    "operation": "migration",
+    "databases": 50,
+    "rep": 1,
+    "bd_version": "1.3.1",
+    "logging": "debug",
+    "seconds": 40.893912993138656,
+    "outcome": "passed",
+    "load": [
+      11.47705078125,
+      8.76904296875,
+      7.92724609375
+    ],
+    "available_GiB": 116.9627571105957,
+    "trace": "1.3.1-50-1-migration.json",
+    "trace_sha256": "29cddd12cd33d240c018f1176925fb8d38a8a297a59bec7455850b53f94671f1",
+    "query_count": 614,
+    "catalog_query_count": 44,
+    "catalog_ms": 31082,
+    "show_columns_count": 6
+  },
+  {
+    "operation": "create",
+    "databases": 50,
+    "rep": 1,
+    "bd_version": "1.3.1",
+    "logging": "debug",
+    "seconds": 1.9927137230988592,
+    "outcome": "passed",
+    "load": [
+      8.70556640625,
+      8.41455078125,
+      7.84375
+    ],
+    "available_GiB": 115.76824188232422,
+    "trace": "1.3.1-50-1-create.json",
+    "trace_sha256": "3441a9ecaa72d1f1505ff04fb5febcc503234c07fb2df0a314fe9ca2b4090837",
+    "query_count": 99,
+    "catalog_query_count": 1,
+    "catalog_ms": 773,
+    "show_columns_count": 2
+  },
+  {
+    "operation": "claim",
+    "databases": 50,
+    "rep": 1,
+    "bd_version": "1.3.1",
+    "logging": "debug",
+    "seconds": 1.9409462199546397,
+    "outcome": "passed",
+    "load": [
+      8.70556640625,
+      8.41455078125,
+      7.84375
+    ],
+    "available_GiB": 115.72597885131836,
+    "trace": "1.3.1-50-1-claim.json",
+    "trace_sha256": "1b8c6faa10dd2dbb3af82a504b8e719863955c27873c4d59210334df6fb26bc9",
+    "query_count": 77,
+    "catalog_query_count": 1,
+    "catalog_ms": 749,
+    "show_columns_count": 2
+  },
+  {
+    "operation": "add-project",
+    "databases": 50,
+    "rep": 1,
+    "bd_version": "1.3.1",
+    "logging": "debug",
+    "seconds": 97.72756553487852,
+    "outcome": "passed",
+    "load": [
+      8.48876953125,
+      8.3740234375,
+      7.83349609375
+    ],
+    "available_GiB": 115.62176513671875,
+    "trace": "1.3.1-50-1-add-project.json",
+    "trace_sha256": "2bc7350dc4656d8ab6ab50494a903c2fbad0d184af27eccd18e5e769f14fa8ff",
+    "query_count": 2343,
+    "catalog_query_count": 107,
+    "catalog_ms": 78766,
+    "show_columns_count": 16
+  },
+  {
+    "operation": "migration",
+    "databases": 50,
+    "rep": 2,
+    "bd_version": "1.3.1",
+    "logging": "debug",
+    "seconds": 41.67790884990245,
+    "outcome": "passed",
+    "load": [
+      6.6376953125,
+      7.73193359375,
+      7.65478515625
+    ],
+    "available_GiB": 116.20954132080078,
+    "trace": "1.3.1-50-2-migration.json",
+    "trace_sha256": "116f9dc0ecdce3754db5352072ee5d4fd6e814e75097796f346794f9a04bcd8b",
+    "query_count": 614,
+    "catalog_query_count": 44,
+    "catalog_ms": 33288,
+    "show_columns_count": 6
+  },
+  {
+    "operation": "create",
+    "databases": 50,
+    "rep": 2,
+    "bd_version": "1.3.1",
+    "logging": "debug",
+    "seconds": 2.1049660281278193,
+    "outcome": "passed",
+    "load": [
+      7.13037109375,
+      7.732421875,
+      7.658203125
+    ],
+    "available_GiB": 115.40581893920898,
+    "trace": "1.3.1-50-2-create.json",
+    "trace_sha256": "60513f325dfe776c10f44289c5de7a46e6edcd71d8caca4e8abb3efbb2d74bc2",
+    "query_count": 99,
+    "catalog_query_count": 1,
+    "catalog_ms": 873,
+    "show_columns_count": 2
+  },
+  {
+    "operation": "claim",
+    "databases": 50,
+    "rep": 2,
+    "bd_version": "1.3.1",
+    "logging": "debug",
+    "seconds": 2.124770904891193,
+    "outcome": "passed",
+    "load": [
+      7.11962890625,
+      7.72021484375,
+      7.654296875
+    ],
+    "available_GiB": 115.53936004638672,
+    "trace": "1.3.1-50-2-claim.json",
+    "trace_sha256": "59d02c808998e05f6ad87e80d4010aa650a41d6b6678774c8d2eaec254893185",
+    "query_count": 77,
+    "catalog_query_count": 1,
+    "catalog_ms": 861,
+    "show_columns_count": 2
+  },
+  {
+    "operation": "add-project",
+    "databases": 50,
+    "rep": 2,
+    "bd_version": "1.3.1",
+    "logging": "debug",
+    "seconds": 99.36393487500027,
+    "outcome": "passed",
+    "load": [
+      7.11962890625,
+      7.72021484375,
+      7.654296875
+    ],
+    "available_GiB": 115.51598739624023,
+    "trace": "1.3.1-50-2-add-project.json",
+    "trace_sha256": "20ff855a4a478eaec0b5c70e67bd8f001d629244933ccfc98a404d87a7533c9f",
+    "query_count": 2343,
+    "catalog_query_count": 107,
+    "catalog_ms": 80801,
+    "show_columns_count": 16
+  },
+  {
+    "operation": "migration",
+    "databases": 50,
+    "rep": 3,
+    "bd_version": "1.3.1",
+    "logging": "debug",
+    "seconds": 42.53725061821751,
+    "outcome": "passed",
+    "load": [
+      11.1923828125,
+      8.900390625,
+      8.076171875
+    ],
+    "available_GiB": 115.74414443969727,
+    "trace": "1.3.1-50-3-migration.json",
+    "trace_sha256": "8e9ff8ca53cb810879e49eff9e7f3423537b00ffb3a627a178a4808fe1e01b8f",
+    "query_count": 614,
+    "catalog_query_count": 44,
+    "catalog_ms": 34274,
+    "show_columns_count": 6
+  },
+  {
+    "operation": "create",
+    "databases": 50,
+    "rep": 3,
+    "bd_version": "1.3.1",
+    "logging": "debug",
+    "seconds": 1.8901735879480839,
+    "outcome": "passed",
+    "load": [
+      9.904296875,
+      8.8828125,
+      8.1083984375
+    ],
+    "available_GiB": 115.09623718261719,
+    "trace": "1.3.1-50-3-create.json",
+    "trace_sha256": "f6d4af091a0c0127cd887f4bf8a8cc3f46538fc4f9315f7bb629fac025f94ed1",
+    "query_count": 99,
+    "catalog_query_count": 1,
+    "catalog_ms": 780,
+    "show_columns_count": 2
+  },
+  {
+    "operation": "claim",
+    "databases": 50,
+    "rep": 3,
+    "bd_version": "1.3.1",
+    "logging": "debug",
+    "seconds": 1.8033427249174565,
+    "outcome": "passed",
+    "load": [
+      9.904296875,
+      8.8828125,
+      8.1083984375
+    ],
+    "available_GiB": 115.12429809570312,
+    "trace": "1.3.1-50-3-claim.json",
+    "trace_sha256": "cd092da75c5c1dd15692bd67f3ec3597d1cc0eee35108ec6c6cb06ab06842a7d",
+    "query_count": 77,
+    "catalog_query_count": 1,
+    "catalog_ms": 790,
+    "show_columns_count": 2
+  },
+  {
+    "operation": "add-project",
+    "databases": 50,
+    "rep": 3,
+    "bd_version": "1.3.1",
+    "logging": "debug",
+    "seconds": 102.14117719302885,
+    "outcome": "passed",
+    "load": [
+      9.9921875,
+      8.91796875,
+      8.1240234375
+    ],
+    "available_GiB": 115.1749382019043,
+    "trace": "1.3.1-50-3-add-project.json",
+    "trace_sha256": "950b7f91dc1ced5eba8f5026cad4633468fda68b47ee2a32fe8ebb8647944ac3",
+    "query_count": 2343,
+    "catalog_query_count": 107,
+    "catalog_ms": 83496,
+    "show_columns_count": 16
+  },
+  {
+    "operation": "migration",
+    "databases": 50,
+    "rep": 1,
+    "bd_version": "1.3.1",
+    "logging": "warning",
+    "seconds": 42.699239935027435,
+    "outcome": "passed",
+    "load": [
+      10.1572265625,
+      9.64990234375,
+      8.4951171875
+    ],
+    "available_GiB": 115.37715911865234
+  },
+  {
+    "operation": "create",
+    "databases": 50,
+    "rep": 1,
+    "bd_version": "1.3.1",
+    "logging": "warning",
+    "seconds": 2.0872120279818773,
+    "outcome": "passed",
+    "load": [
+      9.86181640625,
+      9.6826171875,
+      8.55712890625
+    ],
+    "available_GiB": 114.42474746704102
+  },
+  {
+    "operation": "claim",
+    "databases": 50,
+    "rep": 1,
+    "bd_version": "1.3.1",
+    "logging": "warning",
+    "seconds": 1.8482062581460923,
+    "outcome": "passed",
+    "load": [
+      9.71240234375,
+      9.654296875,
+      8.5537109375
+    ],
+    "available_GiB": 114.421142578125
+  },
+  {
+    "operation": "add-project",
+    "databases": 50,
+    "rep": 1,
+    "bd_version": "1.3.1",
+    "logging": "warning",
+    "seconds": 100.7738940899726,
+    "outcome": "passed",
+    "load": [
+      9.71240234375,
+      9.654296875,
+      8.5537109375
+    ],
+    "available_GiB": 114.35234451293945
+  },
+  {
+    "operation": "migration",
+    "databases": 50,
+    "rep": 2,
+    "bd_version": "1.3.1",
+    "logging": "warning",
+    "seconds": 42.20911922585219,
+    "outcome": "passed",
+    "load": [
+      7.7265625,
+      9.232421875,
+      8.52734375
+    ],
+    "available_GiB": 115.25306701660156
+  },
+  {
+    "operation": "create",
+    "databases": 50,
+    "rep": 2,
+    "bd_version": "1.3.1",
+    "logging": "warning",
+    "seconds": 1.8701616488397121,
+    "outcome": "passed",
+    "load": [
+      10.6015625,
+      9.72802734375,
+      8.724609375
+    ],
+    "available_GiB": 114.83075714111328
+  },
+  {
+    "operation": "claim",
+    "databases": 50,
+    "rep": 2,
+    "bd_version": "1.3.1",
+    "logging": "warning",
+    "seconds": 1.9025070741772652,
+    "outcome": "passed",
+    "load": [
+      10.6015625,
+      9.72802734375,
+      8.724609375
+    ],
+    "available_GiB": 114.87541198730469
+  },
+  {
+    "operation": "add-project",
+    "databases": 50,
+    "rep": 2,
+    "bd_version": "1.3.1",
+    "logging": "warning",
+    "seconds": 99.38986644800752,
+    "outcome": "passed",
+    "load": [
+      10.15283203125,
+      9.6494140625,
+      8.70458984375
+    ],
+    "available_GiB": 114.8333740234375
+  },
+  {
+    "operation": "migration",
+    "databases": 50,
+    "rep": 3,
+    "bd_version": "1.3.1",
+    "logging": "warning",
+    "seconds": 42.557365105021745,
+    "outcome": "passed",
+    "load": [
+      7.12939453125,
+      8.7939453125,
+      8.49609375
+    ],
+    "available_GiB": 115.47275924682617
+  },
+  {
+    "operation": "create",
+    "databases": 50,
+    "rep": 3,
+    "bd_version": "1.3.1",
+    "logging": "warning",
+    "seconds": 2.076687344815582,
+    "outcome": "passed",
+    "load": [
+      10.384765625,
+      9.517578125,
+      8.75634765625
+    ],
+    "available_GiB": 114.6119384765625
+  },
+  {
+    "operation": "claim",
+    "databases": 50,
+    "rep": 3,
+    "bd_version": "1.3.1",
+    "logging": "warning",
+    "seconds": 2.001769848866388,
+    "outcome": "passed",
+    "load": [
+      9.953125,
+      9.4423828125,
+      8.73583984375
+    ],
+    "available_GiB": 114.83567810058594
+  },
+  {
+    "operation": "add-project",
+    "databases": 50,
+    "rep": 3,
+    "bd_version": "1.3.1",
+    "logging": "warning",
+    "seconds": 102.06840105098672,
+    "outcome": "passed",
+    "load": [
+      9.953125,
+      9.4423828125,
+      8.73583984375
+    ],
+    "available_GiB": 115.07401275634766
+  }
+]
