@@ -5,6 +5,7 @@ No native adapter is mocked. ORCHESTRA_BD_BIN selects the pinned test binaries.
 """
 import json
 import shutil
+import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -140,6 +141,24 @@ class NativeOwnerTests(fixture.RealBdLabelAliasTests):
             enabled = harness.request('PUT', base+'/requirements/governance',
                 dict(expected(governed.data), mode='simple'), token=token, key='native-page-simple')
             self.assertEqual(enabled.status, 200, enabled.data)
+            # Two distinct owner clicks on one immutable draft serialize at the
+            # actual endpoint lock. Only one creates acceptance evidence.
+            from concurrent.futures import ThreadPoolExecutor
+            race = harness.request('POST', base+'/requirements', {
+                'kind':'requirement', 'parent':job, 'title':'One accepted version',
+                'description':'Concurrent clicks do not create two decisions.'},
+                token=token, key='native-race-create')
+            self.assertEqual(race.status, 201, race.data)
+            race_route = base+'/requirements/'+race.data['id']+'/accept'
+            def accept_click(number):
+                return harness.request('POST', race_route, expected(race.data),
+                    token=token, key='native-race-accept-'+str(number))
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                answers = list(pool.map(accept_click, (1, 2)))
+            self.assertEqual(sorted(a.status for a in answers), [200,409], [a.data for a in answers])
+            raced = next(r for r in self.rows() if r['id']==race.data['id'])
+            self.assertEqual(set(records.existing_revisions(raced)), {1,2})
+            self.assertEqual(len(owner.existing_acceptances(raced)), 1)
             partial = harness.request('POST', base+'/requirements', {
                 'kind':'requirement', 'parent':job, 'title':'Recoverable owner content',
                 'description':'The evidence survives an interrupted revision.'},
@@ -185,6 +204,37 @@ class NativeOwnerTests(fixture.RealBdLabelAliasTests):
                 'http://127.0.0.1:'+str(harness.port), 'pp', token, viewer)
             self.assertEqual(page.returncode, 0, page.stderr)
             self.assertTrue(all(json.loads(page.stdout).values()), page.stdout)
+            # Real native backup plus the shipped restore-new order: restore
+            # governance, inner receipts and outer journal before the merge slot.
+            (root/'backups').mkdir(exist_ok=True)
+            initialized = self.bd('backup', 'init', str(root/'backups'/'pp'))
+            self.assertEqual(initialized.returncode, 0, initialized.stderr)
+            before_restore = self.rows()
+            governance_bytes = (self.project/governance.FILE).read_bytes()
+            import requirement_http
+            inner = {p.name:p.read_bytes() for p in (self.project/requirement_http.JOURNAL).glob('*.json')}
+            for command in (['backup','pp'], ['restore-new','pp','cloned']):
+                done = subprocess.run([sys.executable, str(KIT/'admin.py'), '--root', str(root), *command],
+                    env=fixture.admin.environment(root), capture_output=True, text=True, timeout=120)
+                self.assertEqual(done.returncode, 0, done.stdout+'\n'+done.stderr)
+            cloned = root/'projects'/'cloned'
+            self.assertEqual((cloned/governance.FILE).read_bytes(), governance_bytes)
+            self.assertEqual({p.name:p.read_bytes() for p in (cloned/requirement_http.JOURNAL).glob('*.json')}, inner)
+            restored = fixture.endpoint.execute(root, {'project':'cloned','actor':'reader',
+                'action':'requirements','args':['get',partial.data['id']]})
+            self.assertEqual(restored['returncode'], 0, restored)
+            restored_record = json.loads(restored['stdout'])
+            self.assertEqual(restored_record['current']['sha256'], recovered.data['sha256'])
+            self.assertEqual(restored_record['acceptance']['project'], 'pp')
+            from http_authority import OperationJournal, journal_path
+            original_journal = OperationJournal(journal_path(self.project))
+            copied_journal = OperationJournal(journal_path(cloned))
+            operation = owner.existing_acceptances(finished)[2]['operation_id']
+            original_receipt = original_journal.lookup(operation)
+            self.assertEqual(original_receipt['state'], 'committed')
+            self.assertEqual(copied_journal.lookup(operation), original_receipt)
+            # Source native evidence remains byte-for-byte unchanged by restore.
+            self.assertEqual(self.rows(), before_restore)
         finally:
             harness._stop_server(); harness.doCleanups()
 
