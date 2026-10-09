@@ -136,11 +136,11 @@ class ReaderRouteTests(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory(); self.addCleanup(temp.cleanup)
         self.root = Path(temp.name)
-        self.project = self.root / 'projects' / 'p'
+        self.project = self.root / 'projects' / 'pp'
         (self.project / '.beads').mkdir(parents=True)
         (self.project / '.beads' / 'metadata.json').write_text(json.dumps({
             'dolt_server_host': '127.0.0.1', 'dolt_server_port': 12345,
-            'dolt_server_user': 'root', 'dolt_database': 'p'}), encoding='utf-8')
+            'dolt_server_user': 'root', 'dolt_database': 'pp'}), encoding='utf-8')
 
     def test_tracker_names_survive_unicode_and_truly_unreadable_rows_still_refuse(self):
         import actor_names
@@ -177,7 +177,7 @@ class ReaderRouteTests(unittest.TestCase):
         import sessions
         state = self.root / 'synthetic-service.json'
         state.write_text(json.dumps({'users': {}, 'credentials': {'credential-one': {
-            'user_id': 'usr_a', 'project_id': 'p', 'actor': 'commenter', 'revoked': False}}}), encoding='utf-8')
+            'user_id': 'usr_a', 'project_id': 'pp', 'actor': 'commenter', 'revoked': False}}}), encoding='utf-8')
         healthy = wire([row('\u0085')])
         with patch.object(sessions, 'registered_actors', return_value=[]):
             with patch.object(admin, 'run_bd', return_value=healthy):
