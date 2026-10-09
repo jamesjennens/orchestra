@@ -188,6 +188,7 @@ class ReaderRouteTests(unittest.TestCase):
             with patch.object(admin, 'run_bd', return_value=healthy+'{"id":"cut",'):
                 item = admin.credential_actors(self.root, state)['credentials'][0]
             self.assertIsNone(item['tracker_rows'], item)
+            self.assertEqual(item['unreadable_rows'], ['cut'], item)
 
     def test_adoption_reader_keeps_names_from_unicode_rows(self):
         import admin
