@@ -6213,7 +6213,10 @@ def credential_actors(root,state_path,service_namespace=None):
     holds ANY unreadable row is one the tracker could not be read from -- ``tracker_rows``
     null for every credential of that project, with the unreadable row ids named beside it
     (``unreadable_rows``), so an operator sees there is something unread rather than "no
-    such rows" (kittrial-5bb.221 revision 2).
+    such rows" (kittrial-5bb.221 revision 2). Beside such a null, ``refused_when_it_writes``
+    is null too -- not read, never a False that reads as "it may write" -- and the command's
+    closing sentence counts those credentials and names the unreadable rows
+    (kittrial-5bb.243 item N5).
     ``service_namespace`` is the namespace the web service was started with (its
     ``--actor-namespace``), when the operator says so: a credential named under it is refused
     at use too (kittrial-5bb.188 item 3).
@@ -6290,7 +6293,10 @@ def credential_actors(root,state_path,service_namespace=None):
             reason=None
         item={'credential':identifier,'project':name,'project_on_host':host['on_host'],'label':credential.get('label'),
               'actor':namespace,'collides':reason,'revoked':bool(credential.get('revoked')),
-              'refused_when_it_writes':reason is not None,
+              # kittrial-5bb.243 item N5: beside a tracker that could not be read, "not read"
+              # is the answer, never a False that reads as "it may write": the name may be
+              # anybody's (null, like tracker_rows), boolean only when the tracker was read.
+              'refused_when_it_writes':None if host['marks'] is None else reason is not None,
               'tracker_rows':None if host['marks'] is None else actor_names.head(namespace) in {n for n,_ in host['marks']},
               'issued_by':credential.get('user_id'),'issued_by_username':issuer.get('username'),
               'created_at':moment(credential.get('created_at')),'last_used':moment(credential.get('last_used')),
@@ -6720,6 +6726,21 @@ def main():
             print('%d worker credential(s) write under a name that is somebody else\'s on this host. Each is refused '
                   'when it writes; its owner revokes it in the web interface and issues one under another name. '
                   'Nothing was changed by this command.'%report['colliding_and_not_revoked'],file=sys.stderr)
+        # kittrial-5bb.243 item N5: the count of credentials that could not be judged at all --
+        # their project's tracker could not be read -- beside the colliding count, with the
+        # unreadable row ids named where the cause is an unreadable row, so an operator sees
+        # there is something unread rather than "no such rows".
+        not_read=[item for item in report['credentials']
+                  if item.get('tracker_rows') is None and item.get('project_on_host')]
+        if not_read:
+            unreadable={item['project']:item['unreadable_rows'] for item in not_read
+                        if item.get('unreadable_rows') is not None}
+            said=('; '.join('%s: unreadable row(s) %s' % (project, ', '.join(str(i) or '(no readable id)' for i in ids))
+                            for project, ids in sorted(unreadable.items())))
+            print('%d worker credential(s) could not be judged: the tracker of their project could not be read, '
+                  'so their names may be anybody\'s%s. An operator repairs the tracker (for deeply nested metadata: '
+                  'bd update ID --unset-metadata KEY); nothing was changed by this command.'
+                  % (len(not_read), ' (%s)' % said if said else ' (bd did not answer)'),file=sys.stderr)
     elif args.command=='record-store':
         try:
             report=record_store_reset(args.state) if args.reset_high_water \

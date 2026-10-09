@@ -42,7 +42,10 @@ failed, a line cut short, text that is not rows -- is a failure, never "the trac
 nothing": it is :class:`TrackerUnreadable`. A read that came back without the project's
 merge slot is :class:`TrackerMergeSlotMissing`, which names the merge-create repair; that
 covers rows that carry no slot row and a readable tracker with no rows at all, the plain
-``bd init`` shape (kittrial-5bb.188 item 1; kittrial-5bb.202 item 1 and rev-2).
+``bd init`` shape (kittrial-5bb.188 item 1; kittrial-5bb.202 item 1 and rev-2). A read
+that holds one unreadable row -- marked by the row bound's parser, or not a JSON object at
+all -- is :class:`TrackerRowsUnreadable`, which names the row ids and the operator repair
+(kittrial-5bb.221 r2, kittrial-5bb.243).
 
 Pure and without imports of the kit, so the web service uses it on every platform.
 """
@@ -89,6 +92,41 @@ class TrackerMergeSlotMissing(ValueError):
         # show the exception's text, and a bare `raise TrackerMergeSlotMissing()` must still
         # name the repair.
         super().__init__(message or self.MESSAGE)
+
+
+class TrackerRowsUnreadable(TrackerUnreadable):
+    """The export was read, but it holds a row that cannot be (kittrial-5bb.221 r2, .243).
+
+    One row of the export is marked malformed -- nested deeper than the row bound,
+    unparseable, a line cut short, a 5,000-digit number -- or is not a JSON object at all
+    (a number, a string, a list holding a row). For the worker-credential name rule that
+    refuses the WHOLE read, exactly as a tracker that could not be read: the unreadable
+    row may be the row that holds the name, and a name the tracker might hold must not
+    become issuable or writable through a credential (the .221 r2 review's security item:
+    a comment holding U+0085, or 751-level metadata, hid a row's author and a credential
+    under that name was issued and wrote).
+
+    Like :class:`TrackerMergeSlotMissing`, this is NOT the transient fault
+    :class:`TrackerUnreadable` answers with "try again shortly": an unreadable row stays
+    unreadable until an operator repairs it, so it carries its own sentence naming the row
+    ids and the repair. Rows nested up to 750 levels parse normally and their names count;
+    only what cannot be read lands here (kittrial-5bb.239 owns the line framing that a
+    U+0085 inside a string still trips on; until it lands, such a row lands here too).
+    """
+
+    MESSAGE = ("The project's tracker holds a row that cannot be read, so it was not read as a "
+               "whole tracker: the unreadable row may be the row that holds a name. An operator "
+               "must repair the row (for deeply nested metadata: bd update ID --unset-metadata "
+               "KEY; for a row split by its own text: re-enter the text), then try again.")
+
+    def __init__(self, ids=(), message=None):
+        # The sentence travels with the exception, naming the unreadable rows when their ids
+        # could be recovered; a bare `raise TrackerRowsUnreadable()` still names the repair.
+        self.ids = tuple(i for i in ids if isinstance(i, str) and i) or None
+        if message is None and self.ids:
+            message = self.MESSAGE.replace('a row that cannot be read',
+                                           'unreadable row(s) %s' % ', '.join(self.ids), 1)
+        super(TrackerUnreadable, self).__init__(message or self.MESSAGE)
 
 
 #: The shape of the actors ``sessions.py`` makes.

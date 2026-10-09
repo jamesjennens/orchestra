@@ -1233,7 +1233,7 @@ project's rows is one `bd export --all` for that project (one bd process against
 running database), paid once per issue attempt and never by an ordinary write: see
 "Credentials that already have such a name" below. **An answer that is not a whole
 tracker is a host fault, not a tracker with no names** (kittrial-5bb.188 review of item 1;
-revision-3 item 3(1)), and the two shapes of it are told apart:
+revision-3 item 3(1)), and the three shapes of it are told apart:
 - **The read came back without the project's merge-slot row** -- rows **but no
   `PROJECT-merge-slot` row**, or a readable tracker with **no rows at all** (a plain
   `bd init`, whose `bd export --all` exits 0 and prints nothing) -- answers **503
@@ -1243,8 +1243,22 @@ revision-3 item 3(1)), and the two shapes of it are told apart:
   not help until an operator has run the coordination `merge-create` operation, the same
   repair `admin.py --root RUNTIME merge-slot-report` names. Nothing is kept: the
   idempotency key stays free.
-- **The tracker could not be read at all** -- a nonzero `bd` exit, a line cut short, text
-  that is present but is not rows, or a project whose metadata records no Dolt server
+- **The read came back holding a row that cannot be read** -- nested past the row bound
+  (750 levels), unparseable, a line cut short mid-row, a 5,000-digit number, or a line
+  that is not a JSON object beside real rows -- answers **503 `unreadable_rows`**
+  (kittrial-5bb.221 r2; kittrial-5bb.243 item N7) with its own sentence naming the row
+  ids and the repair: "The project's tracker holds unreadable row(s) ID..., so it was not
+  read as a whole tracker: the unreadable row may be the row that holds a name. An
+  operator must repair the row (for deeply nested metadata: bd update ID
+  --unset-metadata KEY; for a row split by its own text: re-enter the text), then try
+  again." Not transient either -- the row stays unreadable until an operator repairs it,
+  so the answer never says "try again shortly" -- and nothing is kept: the idempotency
+  key stays free. Why the whole read refuses: rows nested up to 750 levels parse
+  normally and their names count, but an UNREADABLE row may be the row that holds the
+  name, and a name the tracker might hold must not become issuable or writable through a
+  worker credential; hiding the row must not free the name.
+- **The tracker could not be read at all** -- a nonzero `bd` exit, text that is present
+  but is not rows at all, or a project whose metadata records no Dolt server
   coordinates -- is the host fault: **503 `unavailable`**, "The tracker could not be read
   just now. Nothing was changed; try again shortly.", and the idempotency key is free.
 A transient fault that makes `bd` print nothing with exit 0 is indistinguishable from the
@@ -1298,11 +1312,14 @@ written by the service, which owns the state; there is no route that changes a c
 reached from a request. A **concurrent first write** may run the export twice; both
 answer the same way and write the same mark, so the outcome is idempotent. An export that
 answers no rows at all is the **missing-slot** answer above, not the host fault: 503
-`merge_slot_missing`, nothing written, and no mark kept. The transient `unavailable` answer
-is the other shape -- a nonzero `bd` exit, a line cut short, or text that is not rows -- and
-a project whose metadata records no Dolt server coordinates is that shape too, because bd
-would fall back to an embedded database there (kittrial-5bb.202 rev-3 item 3(b): this line
-said "the host fault above", which the empty-project decision of revision 2 had changed). A
+`merge_slot_missing`, nothing written, and no mark kept. An export that holds a row that
+cannot be read is the **unreadable-rows** answer above, at use exactly as at issue: 503
+`unreadable_rows`, nothing written, and no mark kept -- the settle reads the same export.
+The transient `unavailable` answer is the last shape -- a nonzero `bd` exit, or text that is
+not rows at all -- and a project whose metadata records no Dolt server coordinates is that
+shape too, because bd would fall back to an embedded database there (kittrial-5bb.202
+rev-3 item 3(b): this line said "the host fault above", which the empty-project decision of
+revision 2 had changed). A
 credential the settle marked refused is shown as refused in the owner's list even though
 that list reads no rows from the host: it reads the stored `actor_rows_refused` mark
 (revision-3 item 3(3)).
@@ -1374,7 +1391,15 @@ an earlier kit under a plain name the project was already using is listed as ref
 while the rows a credential wrote itself are not held against it. For a name that does
 not collide, `tracker_rows` still says whether the tracker holds rows under it: what a
 credential under that name wrote, or an actor from before sessions were registered. That
-is worth a look when nobody remembers issuing it.
+is worth a look when nobody remembers issuing it. An export that holds a row that cannot
+be read (nested past 750 levels, unparseable, a line cut short, a line that is not a
+JSON object) makes `tracker_rows` null for EVERY credential of that project -- the whole
+tracker was not read, because the unreadable row may be the row that holds a name
+(kittrial-5bb.221 r2) -- and each such item carries `unreadable_rows` naming the row ids
+(kittrial-5bb.243 item N5). Beside that null, `refused_when_it_writes` is null too -- not
+read, never a false that reads as "it may write" -- and the command's closing sentence
+counts how many credentials could not be judged and names the unreadable rows, beside
+the colliding count.
 
 **Who may ask whether a name is taken.** The endpoint's `actor-standing` answers a
 caller with the rule word only (`null`, or which rule) and never the host's names, no
@@ -2364,7 +2389,12 @@ line separately and unconfined.
   (3.10 cannot parse about a thousand levels, 3.13 parses several thousand), and it is
   the rule the endpoint's own readers get with kittrial-5bb.141, from the same
   constant. The service takes an answer of the tracker that holds such a row apart row
-  by row, so one such row does not fail the rest:
+  by row, so one such row does not fail the rest -- EXCEPT for the worker-credential
+  name rule (kittrial-5bb.221 r2, kittrial-5bb.243): its read of the tracker names
+  authors and assignees, and an unreadable row may be the row that holds the name, so
+  for THAT read any unreadable row refuses the whole project's read (503
+  `unreadable_rows` above), and hiding a row must not free a name. Rows nested up to
+  750 levels parse normally and their names count on every reader, that rule included:
   - `GET /v1/projects/{id}/tasks` answers 200 with every readable row. The other is in
     `items` as `{"id", "status": "unknown", "unreadable": true, "malformed": true,
     "error": "Malformed issue row"}`: its id and nothing else of it (not its title,

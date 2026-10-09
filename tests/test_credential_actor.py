@@ -1385,11 +1385,11 @@ class RealEndpointCase(unittest.TestCase):
              actor_names.TrackerMergeSlotMissing, 'merge-slot'),
             ('the last line cut short', '#!/bin/sh\necho %s\necho %s\necho \'{"id": "probe-2", "created_\'\nexit 0\n'
                                         % (row, slot),
-             actor_names.TrackerUnreadable, 'tracker'),
+             actor_names.TrackerRowsUnreadable, 'unreadable-rows'),
             ('exit 1 with an error line', '#!/bin/sh\necho "bd: the database is locked" >&2\nexit 1\n',
              actor_names.TrackerUnreadable, 'tracker'),
             ('words that are not rows', '#!/bin/sh\necho %s\necho "not a row at all"\nexit 0\n' % row,
-             actor_names.TrackerUnreadable, 'tracker'),
+             actor_names.TrackerRowsUnreadable, 'unreadable-rows'),
             # kittrial-5bb.202 rev-3 item 4 (F5): JSON that PARSES but is not rows at all. The
             # export succeeded and said nothing about this project's tracker, so it is the
             # transient host fault, never the missing-slot answer. Mutant N8 (`if False:` in
@@ -1427,6 +1427,31 @@ class RealEndpointCase(unittest.TestCase):
         script = '\n'.join('echo %s' % json.dumps(line) for line in lines)
         self.set_bd_raw('#!/bin/sh\necho ran >> %s\n%s\nexit 0\n' % (self.marker, script))
 
+    def test_a_line_that_is_not_an_object_beside_real_rows_refuses(self):
+        """kittrial-5bb.243 item N4: a JSON line that is a number, a string or a list holding
+        a real row, each beside healthy rows and the merge slot, refuses the whole read. The
+        list is the mutant that mattered: on the release before kittrial-5bb.221 r2, the
+        names inside such a list were silently free (a non-dict row is not a mark to the
+        name reader), so nothing pinned that they refuse."""
+        shapes = (
+            ('a number', '2026'),
+            ('a string', '"just a string"'),
+            ('a list holding a real row',
+             '[{"id": "probe-in-a-list", "created_by": "hidden-name", "created_at": "2026-01-01T00:00:00Z"}]'),
+        )
+        for label, line in shapes:
+            with self.subTest(line=label):
+                self._whole_tracker_script(line)
+                with self.assertRaises(actor_names.TrackerRowsUnreadable):
+                    self.endpoint.tracker_actors(self.root, self.project)
+                answer = self.write('worker-a', self.credential('worker-a', rows_checked=False,
+                                                                created_at='2026-10-07T00:00:00Z'),
+                                    'non-object-%s' % label.split()[0])
+                self.assertEqual((2, 'unreadable-rows'), (answer['returncode'], answer.get('fault')), answer)
+                # The sentence names the repair, never "try again shortly".
+                self.assertNotIn('try again shortly', answer['stderr'])
+                self.assertIn('--unset-metadata', answer['stderr'])
+
     def test_one_row_nested_65_levels_is_read_and_its_names_count(self):
         """kittrial-5bb.221: the 64-level comment guard refused the whole project's read on
         one row nested 65 levels. The row bound of kittrial-5bb.141 (750) applies: this row
@@ -1463,19 +1488,24 @@ class RealEndpointCase(unittest.TestCase):
         self._whole_tracker_script(deeper)
         with self.assertRaises(actor_names.TrackerUnreadable):
             self.endpoint.tracker_actors(self.root, self.project)
-        # The write path answers the host fault for every name: the taken name is not
-        # refused (it cannot be read), and a free name does not pass either.
+        # The write path answers the unreadable-rows fault for every name: the taken name
+        # is not refused (it cannot be read), and a free name does not pass either. Since
+        # kittrial-5bb.243 N7 the answer carries the row id and the operator repair, never
+        # the bare fault's "try again shortly".
         for number, name in enumerate(('opus-worker-lane', 'worker-a/sub', 'deep-author')):
             answer = self.write(name, self.credential(name.split('/')[0], rows_checked=False,
                                                        created_at='2026-10-07T00:00:00Z'), 'deep-751-%d' % number)
-            self.assertEqual((2, 'tracker'), (answer['returncode'], answer.get('fault')), answer)
+            self.assertEqual((2, 'unreadable-rows'), (answer['returncode'], answer.get('fault')), answer)
+            self.assertIn('probe-deeper', answer['stderr'])
+            self.assertIn('--unset-metadata', answer['stderr'])
         self.assertFalse((self.project / '.http-operations.sqlite3').exists(),
                          'an operation identity was reserved')
-        # The issue path (actor-standing with rows) answers the same host fault.
+        # The issue path (actor-standing with rows) answers the same fault, with the row id.
         told = self.run_main({'project': 'probe', 'actor': 'http/read', 'action': 'actor-standing',
                               'args': ['opus-worker-lane'], 'tracker': True},
                              ['--authority-store', str(self.config_path)])
-        self.assertEqual((2, 'tracker'), (told['returncode'], told.get('fault')), told)
+        self.assertEqual((2, 'unreadable-rows'), (told['returncode'], told.get('fault')), told)
+        self.assertIn('probe-deeper', told['stderr'])
 
     def test_non_row_answers_with_exit_zero_refuse_even_with_the_slot(self):
         """kittrial-5bb.221 revision 2, review item 2: with bd exiting 0, answers that are
@@ -1498,15 +1528,17 @@ class RealEndpointCase(unittest.TestCase):
                  '{"id": "probe-merge-slot", "created_by": "forged", "metadata": ' + '[' * 900 + ']' * 900 + '}',
                  slot=False)),
         )
-        for label, make in shapes:
+        for label, make, fault in [(l, m, 'unreadable-rows') for l, m in shapes
+                                   if l != 'every row cut'] + [('every row cut',
+                                   dict(shapes)['every row cut'], 'tracker')]:
             with self.subTest(answer=label):
                 make()
-                with self.assertRaises(actor_names.TrackerUnreadable):
+                with self.assertRaises(actor_names.TrackerUnreadable):   # the bare fault or its subclass
                     self.endpoint.tracker_actors(self.root, self.project)
                 answer = self.write('worker-a', self.credential('worker-a', rows_checked=False,
                                                                 created_at='2026-10-07T00:00:00Z'),
                                     'shape-%s' % label[:8].replace(' ', '-'))
-                self.assertEqual((2, 'tracker'), (answer['returncode'], answer.get('fault')), answer)
+                self.assertEqual((2, fault), (answer['returncode'], answer.get('fault')), answer)
 
     def test_the_endpoint_cli_carries_the_service_namespace_it_was_launched_with(self):
         """kittrial-5bb.188 item 6: mutant U6 (main drops --service-namespace) must fail here."""
@@ -1698,6 +1730,9 @@ class RealEndpointCase(unittest.TestCase):
             with self.subTest(credential=identifier):
                 self.assertIsNone(found[identifier]['tracker_rows'])
                 self.assertEqual(['probe-deeper'], found[identifier]['unreadable_rows'])
+                # kittrial-5bb.243 item N5: beside a null, "not read", never a False that
+                # reads as "it may write" -- the name may be anybody's.
+                self.assertIsNone(found[identifier]['refused_when_it_writes'])
 
     def test_the_host_command_shows_a_waived_name_as_allowed(self):
         """kittrial-5bb.188 item 4: a waived credential is allowed, not colliding/refused."""
@@ -1719,6 +1754,29 @@ class RealEndpointCase(unittest.TestCase):
         self.assertEqual('allowed by root-admin on 2026-10-07T00:00:00Z', item['actor_allowed'])
         self.assertEqual('the lane owns it', item['waived_reason'])
         self.assertEqual(0, report['colliding_and_not_revoked'])
+
+    def test_the_command_line_also_counts_what_could_not_be_judged(self):
+        """kittrial-5bb.243 item N5: the closing sentence names the credentials that could
+        not be judged at all, with the unreadable row ids, beside the colliding count."""
+        import admin
+        path = self.tmp / 'state.json'
+        path.write_text(json.dumps({'users': {}, 'credentials': {
+            'cred_w': {'user_id': 'usr_a', 'project_id': 'probe', 'label': 'one', 'actor': 'worker-a',
+                       'revoked': False, 'created_at': '2026-10-01T00:00:00Z'}}}), encoding='utf-8')
+        healthy = json.dumps({'id': 'probe-1', 'created_by': 'opus-worker-lane',
+                              'created_at': '2026-01-01T00:00:00Z', 'updated_at': '2026-01-01T00:00:00Z'})
+        deeper = ('{"id": "probe-deeper", "created_by": "deep-author", "created_at": "2026-01-01T00:00:00Z",'
+                  ' "updated_at": "2026-01-01T00:00:00Z", "metadata": ' + '{"a":' * 750 + '1' + '}' * 750 + '}')
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(admin, 'run_bd', return_value='\n'.join((healthy, deeper)) + '\n'), \
+                mock.patch.object(sys, 'argv', ['admin.py', '--root', str(self.root), 'credential-actors',
+                                                '--state', str(path)]), \
+                redirect_stdout(out), redirect_stderr(err):
+            admin.main()
+        self.assertIn('1 worker credential(s) could not be judged', err.getvalue())
+        self.assertIn('unreadable row(s) probe-deeper', err.getvalue())
+        self.assertIn('--unset-metadata', err.getvalue())
+        self.assertNotIn('could not be judged', out.getvalue())
 
     def test_the_command_line_prints_the_list_and_says_how_many(self):
         import admin
@@ -1765,6 +1823,37 @@ class TrackerFaultTests(unittest.TestCase):
                 self.assertIn('merge-create', error.message)
                 self.assertNotEqual(http_service.EndpointBackend.UNREAD, error.message)
                 self.assertNotEqual('unavailable', error.code)
+
+    def test_unreadable_rows_are_their_own_error_and_name_the_row(self):
+        """kittrial-5bb.243 item N7: an export read with one unreadable row answers 503 with
+        its own code and the endpoint's sentence naming the row id and the repair, never
+        UNREAD's "try again shortly" -- at issue and at use alike (reading or not)."""
+        sentence = ("TrackerRowsUnreadable: The project's tracker holds unreadable row(s) pp-9, so it was "
+                    "not read as a whole tracker: the unreadable row may be the row that holds a name. "
+                    "An operator must repair the row (for deeply nested metadata: bd update ID "
+                    "--unset-metadata KEY; for a row split by its own text: re-enter the text), "
+                    "then try again.\n")
+        for reading in (True, False):
+            with self.subTest(reading=reading):
+                with self.assertRaises(http_service.HttpError) as failed:
+                    http_service.EndpointBackend._checked(
+                        {'returncode': 2, 'stdout': '', 'stderr': sentence, 'fault': 'unreadable-rows'},
+                        'actor-standing', reading=reading)
+                error = failed.exception
+                self.assertEqual((503, True), (error.status, getattr(error, 'nothing_done', False)))
+                self.assertEqual('unreadable_rows', error.code)
+                self.assertIn('pp-9', error.message)
+                self.assertIn('--unset-metadata', error.message)
+                self.assertNotIn('try again shortly', error.message)
+                self.assertNotEqual(http_service.EndpointBackend.UNREAD, error.message)
+                self.assertNotEqual('unavailable', error.code)
+        # With no sentence to carry, the fixed one answers, still its own code.
+        with self.assertRaises(http_service.HttpError) as failed:
+            http_service.EndpointBackend._checked(
+                {'returncode': 2, 'stdout': '', 'stderr': '', 'fault': 'unreadable-rows'},
+                'actor-standing', reading=True)
+        self.assertEqual((503, 'unreadable_rows', http_service.EndpointBackend.ROWS_UNREADABLE),
+                         (failed.exception.status, failed.exception.code, failed.exception.message))
 
     def test_an_ordinary_code_two_reading_refusal_is_still_422(self):
         """The endpoint's own guard refusals stay 422 on the reading path (main's rule)."""

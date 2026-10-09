@@ -2051,6 +2051,12 @@ def descriptor_actor_denial(request, authority_config, reserved):
             reason = actor_names.collision(namespace, service=service,
                                            **reserved(rows=issued if isinstance(issued, str) and issued else True,
                                                       own=own))
+        except actor_names.TrackerRowsUnreadable as rows_unreadable:
+            # The export was read but holds a row that cannot be parsed: its own mark and its
+            # own sentence naming the row ids and the operator repair, never "try again
+            # shortly" (kittrial-5bb.243 item N7). This arm is BEFORE the bare fault's
+            # because the exception subclasses it.
+            return _envelope(2, stderr='%s\n' % rows_unreadable, fault='unreadable-rows')
         except actor_names.TrackerUnreadable as unreadable:
             # Not a refusal of the request: the tracker could not be read (item 1).
             return _envelope(2, stderr='%s\n' % unreadable, fault='tracker')
