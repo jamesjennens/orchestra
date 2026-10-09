@@ -37,11 +37,12 @@ author. A name with the shape of a web account or agent id is not this module's 
 Rows inside an earlier credential's own lifetime are not held against a renewal under the
 same name by the same owner (kittrial-5bb.188 item 3, :func:`own_intervals`), and a
 credential is judged by the rows once, with the outcome kept on it, not on every write
-(item 5, ``http_service.EndpointBackend``). An export that yields no rows at all -- or a
-result that does not carry the project's merge slot -- is a failure, never "the tracker
-holds nothing": an export with no rows is :class:`TrackerUnreadable`, and one with rows but
-no slot row is :class:`TrackerMergeSlotMissing`, which names the merge-create repair
-(kittrial-5bb.188 item 1; kittrial-5bb.202 item 1).
+(item 5, ``http_service.EndpointBackend``). An export that cannot be read at all -- bd
+failed, a line cut short, text that is not rows -- is a failure, never "the tracker holds
+nothing": it is :class:`TrackerUnreadable`. A read that came back without the project's
+merge slot is :class:`TrackerMergeSlotMissing`, which names the merge-create repair; that
+covers rows that carry no slot row and a readable tracker with no rows at all, the plain
+``bd init`` shape (kittrial-5bb.188 item 1; kittrial-5bb.202 item 1 and rev-2).
 
 Pure and without imports of the kit, so the web service uses it on every platform.
 """
@@ -50,34 +51,38 @@ import re
 
 
 class TrackerUnreadable(ValueError):
-    """An export that yielded no rows at all: not a tracker that was read.
+    """An export that could not be read as a tracker (kittrial-5bb.188 item 1).
 
-    Every project this kit makes holds at least the merge slot, so an export that parses
-    to zero rows did not answer with the tracker (kittrial-5bb.188 item 1: the reviewer
-    made ``bd export`` exit 0 and print nothing, and the empty answer read as "the tracker
-    holds no names", which opened the rule). It is a host fault, not a refusal of the
+    bd exited nonzero, the answer is a line cut short or text that is not rows, or the
+    project's metadata records no Dolt server coordinates. Every project this kit makes
+    holds at least the merge slot, so a read that IS readable but carries no slot row --
+    including a tracker with no rows at all, the plain ``bd init`` shape -- is
+    :class:`TrackerMergeSlotMissing`, not this. It is a host fault, not a refusal of the
     request: the caller answers 503 and nothing was changed.
     """
 
-    MESSAGE = ("The project's tracker answered no rows, and every project this kit makes holds "
+    MESSAGE = ("The project's tracker could not be read, and every project this kit makes holds "
                "at least the merge slot. Nothing was changed; try again shortly.")
 
 
 class TrackerMergeSlotMissing(ValueError):
-    """The tracker answered rows, but not the project's merge slot (kittrial-5bb.202 item 1).
+    """The tracker was read, but it holds no merge slot (kittrial-5bb.202 item 1).
 
-    Every project this kit makes holds the merge-slot row, so an export that parses to real
-    rows but carries no slot row is not a whole tracker either. It is NOT the transient
-    host fault :class:`TrackerUnreadable` describes: the row will not appear by trying
-    again, and only an operator can put it back with the coordination ``merge-create``
+    Every project this kit makes holds the merge-slot row, so a read that came back without
+    it is not a whole tracker. That covers rows that carry no slot row and a tracker with no
+    rows at all: a plain ``bd init`` answers ``bd export --all`` with exit 0 and nothing on
+    stdout, so the read succeeded and what is absent is the slot row (the empty-project
+    decision of the kittrial-5bb.202 rev-2 plan, docs/HTTP_DEPLOYMENT.md). It is NOT the
+    transient host fault :class:`TrackerUnreadable` describes: the row will not appear by
+    trying again, and only an operator can put it back with the coordination ``merge-create``
     operation. Saying so is the point: a project from before the slot was provisioned (or
     one whose slot row was deleted) otherwise answered "try again shortly", which never
     helps.
     """
 
-    MESSAGE = ("The project's tracker answered rows but holds no merge slot row, so it was not "
-               "read as a whole tracker. An operator must run the merge-create operation, which "
-               "creates the slot, then try again.")
+    MESSAGE = ("The project's tracker holds no merge slot row, so it was not read as a whole "
+               "tracker. An operator must run the merge-create operation, which creates the "
+               "slot, then try again.")
 
     def __init__(self, message=None):
         # The sentence travels with the exception: the endpoint's envelope and the SSH path

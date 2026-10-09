@@ -311,6 +311,36 @@ class BackupTests(unittest.TestCase):
         self.assertIn('Restored only into the newly created project', out.getvalue())
         self.assertEqual(json.loads((self.destination / self.request_name).read_text()), self.receipt)
 
+    def test_a_failed_merge_slot_provisioning_does_not_say_its_backup_fails(self):
+        """kittrial-5bb.202 review item 4 (F8): the provisioning step runs AFTER the re-point, so
+        a clone it fails on already has its own backup target and a backup of it succeeds. The
+        notice must name that step and not carry the partial-restore wording "its backup fails"."""
+        (self.root / 'deployment.private.json').write_text(
+            json.dumps({'password': 'x', 'operators': ['operator']}), encoding='utf-8')
+        self.save_bundle()
+        # A destination whose metadata says "not the server shape": restore_destination_state
+        # then reads it as a partial restore, which is the case the reviewer measured.
+        (self.destination / '.beads').mkdir()
+        (self.destination / '.beads' / 'metadata.json').write_text('{}', encoding='utf-8')
+
+        def native(root, name, args):
+            if list(args) == ['merge-slot', 'create', '--json']:
+                raise admin.subprocess.CalledProcessError(1, 'bd', stderr='create refused')
+            return 'restored'
+
+        argv = ['admin.py', '--root', str(self.root), 'restore-new', 'source', 'destination']
+        stderr = io.StringIO()
+        with patch.object(sys, 'argv', argv), patch.object(admin, 'root_path', return_value=self.root), \
+                patch.object(admin, 'add_project'), patch.object(admin, 'run_bd', side_effect=native), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(stderr), \
+                self.assertRaises(admin.subprocess.CalledProcessError):
+            admin.main()
+        notice = stderr.getvalue()
+        self.assertIn('the merge-slot provisioning step failed', notice)
+        self.assertIn('A backup of destination taken now is expected to succeed', notice)
+        self.assertNotIn('its backup fails', notice)
+        self.assertNotIn('the re-point and coordination step failed', notice)
+
     def restore_new_output(self):
         argv = ['admin.py', '--root', str(self.root), 'restore-new', 'source', 'destination']
         with patch.object(sys, 'argv', argv), patch.object(admin, 'root_path', return_value=self.root), \

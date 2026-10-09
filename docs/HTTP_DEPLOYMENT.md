@@ -321,7 +321,7 @@ owner is taken to straight after registering and which stays reachable from the 
 project's owners and for superusers; anyone else gets `403`. Through the API it is
 `GET /v1/projects/{id}/setup`.
 
-Seven steps. Each has a state (`done`, `todo`, `optional`, `unknown`, `unavailable`,
+Eight steps. Each has a state (`done`, `todo`, `optional`, `unknown`, `unavailable`,
 `not-applicable`), who can do it, and either where it is done in the web interface or
 the exact command for the server. `remaining` counts the `todo` ones.
 
@@ -331,6 +331,7 @@ the exact command for the server. `remaining` counts the `todo` ones.
 | Repository location recorded | the project's `repository` field | an owner, on the setup page |
 | A first task defined | the task list (the project's merge slot row is not a task) | any member who may write tasks |
 | A personal agent granted the project | the enabled agents granted this project | each member, for their own agent |
+| A usable merge slot | the host's own read of the project's merge slot | an operator: the `merge-create` coordination operation, through `coordination.py` |
 | Guidance set | the host | an operator: `PYTHON KIT/admin.py --root ROOT set-guidance NAME --actor OPERATOR --file FILE` |
 | Onboarding set | the host | an operator: `PYTHON KIT/admin.py --root ROOT set-onboarding NAME --file FILE` |
 | Covered by a scheduled backup | the host | an operator: a command that runs a backup now, and the `ExecStart` line for a schedule |
@@ -1232,11 +1233,21 @@ project's rows is one `bd export --all` for that project (one bd process against
 running database), paid once per issue attempt and never by an ordinary write: see
 "Credentials that already have such a name" below. **An answer that is not a whole
 tracker is a host fault, not a tracker with no names** (kittrial-5bb.188 review of item 1;
-revision-3 item 3(1)): every project this kit makes holds at least the merge slot, so a
-`bd export --all` that exits 0 and prints nothing, a line cut short, a nonzero exit, text
-that is not rows, or rows **without the merge-slot row** answers **503 `unavailable`**,
-"The tracker could not be read just now. Nothing was changed; try again shortly.", and the
-idempotency key is free. The same broken answer at use is the same 503, never 422. A
+revision-3 item 3(1)), and the two shapes of it are told apart:
+- **The read came back without the project's merge-slot row** -- rows **but no
+  `PROJECT-merge-slot` row**, or a readable tracker with **no rows at all** (a plain
+  `bd init`, whose `bd export --all` exits 0 and prints nothing) -- answers **503
+  `merge_slot_missing`** (kittrial-5bb.202): "The project's tracker holds no merge slot
+  row, so it was not read as a whole tracker. An operator must run the merge-create
+  operation, which creates the slot, then try again." It is not transient: retrying does
+  not help until an operator has run the coordination `merge-create` operation, the same
+  repair `admin.py --root RUNTIME merge-slot-report` names. Nothing is kept: the
+  idempotency key stays free.
+- **The tracker could not be read at all** -- a nonzero `bd` exit, a line cut short, text
+  that is present but is not rows, or a project whose metadata records no Dolt server
+  coordinates -- is the host fault: **503 `unavailable`**, "The tracker could not be read
+  just now. Nothing was changed; try again shortly.", and the idempotency key is free.
+The same answer at use is the same 503, never 422. A
 superuser may pass `"allow_actor": true` together with `"allow_actor_reason"` -- 1 to 500
 characters saying WHY, which must pass the kit's plain-text rule (`guidance`'s: no control,
 bidi, zero-width, C1, tag or variation-selector character; a tab, newline or carriage

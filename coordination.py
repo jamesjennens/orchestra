@@ -283,13 +283,17 @@ def merge_slot_damaged(state):
 
     A real state carries ``holder`` and ``waiters`` (either may be null): a free slot is
     ``available: true`` with no holder, and a held slot is ``available: false`` WITH a
-    holder. The damaged row is ``available: false`` and names no holder (``SLOT_DAMAGED``);
-    a state that is absent, empty or unparseable is NOT damaged, it is missing
-    (``merge_slot_missing``). The two never overlap, so callers can test missing first.
+    holder. The damaged row is ``available: false`` and names no holder (``SLOT_DAMAGED``),
+    whether the ``holder`` key is present and null or absent entirely: an answer that is
+    unavailable with ``waiters`` but NO ``holder`` key was refused as damaged before this
+    task and stayed refused (main's answer; the rev-1 tip let it through, review
+    `damaged-test-looser-than-main`). A state that is absent, empty or unparseable is NOT
+    damaged, it is missing (``merge_slot_missing``); the missing test comes first and a
+    missing shape (no ``holder`` AND no ``waiters``) is never damaged, so the two do not
+    overlap for a caller that tests missing first -- as every caller here does.
     """
-    if not isinstance(state,dict) or state.get('error'):return False
-    if 'available' not in state:return False
-    return state.get('available') is False and 'holder' in state and not state.get('holder')
+    if merge_slot_missing(state):return False
+    return state.get('available') is False and not state.get('holder')
 
 def repair_merge_slot(run,slot):
     """Put a damaged merge slot row back in order; returns what was changed (kittrial-5bb.113 review).

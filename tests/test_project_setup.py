@@ -378,7 +378,8 @@ class HostStatusTests(unittest.TestCase):
 
     def test_a_bare_project(self):
         status = self.status()
-        self.assertEqual(sorted(status), ['admin', 'backup', 'creation_record', 'guidance', 'merge_slot', 'onboarding',
+        self.assertEqual(sorted(status), ['admin', 'backup', 'coordination', 'creation_record', 'guidance',
+                                          'merge_slot', 'onboarding',
                                           'project', 'project_databases', 'schema_version'])
         # The metadata records no Dolt server coordinates, so bd was not run (it would create
         # an embedded database) and the slot is unknown, never guessed (kittrial-5bb.202 item 2).
@@ -399,6 +400,10 @@ class HostStatusTests(unittest.TestCase):
         self.assertEqual(status['backup']['check'], status['admin'] + ' backup-status --require-complete')
         self.assertEqual(status['backup']['unit_directory'], str(self.units))
         self.assertEqual(shlex.split(status['admin'])[-2:], ['--root', str(self.root)])
+        # The same beginning for a coordination command, but with coordination.py and no
+        # --root (kittrial-5bb.202 rev-2: the merge-slot step shows a merge-create command).
+        self.assertIn('coordination.py', status['coordination'])
+        self.assertNotIn('--root', status['coordination'])
 
     def test_a_damaged_creation_record_is_said_as_a_sentence_without_a_path(self):
         """kittrial-5bb.149: the register route asks here, since the endpoint serves such a project."""
@@ -714,6 +719,15 @@ class EndpointSetupTests(fixes.EndpointCase):
                 self.assertIn(word, step['detail'])
                 self.assertIn('merge-slot', [item['id'] for item in body['steps'] if item['state'] == 'todo'])
                 self.assertIn('cannot do this step', step['note'])
+                # The page says host steps show a command (kittrial-5bb.202 review item 4): the
+                # merge-create operation, as a coordination.py invocation, with the payload named.
+                self.assertEqual(step['command'], step['commands'][0]['text'])
+                self.assertIn('coordination.py', step['command'])
+                self.assertIn('--config CLIENT_CONFIG --project %s --actor OPERATOR --file MERGE_JSON'
+                              % self.project, step['command'])
+                self.assertIn('{"operation":"merge-create"}', step['commands'][0]['note'])
+                self.assertEqual(step['commands'][0]['kind'], 'shell-fill')
+                self.assertIn('CLIENT_CONFIG', step['commands'][0]['replace'])
         # A host value this kit does not know is never "done" and never "to do".
         step, body = host({'state': 'something-new'})
         self.assertEqual(step['state'], 'unknown')
@@ -1031,6 +1045,16 @@ class MergeSlotReportTests(unittest.TestCase):
         self.assertIsNone(report['projects']['gamma']['detail'])
         self.assertIsNone(report['projects']['delta']['detail'])
         self.assertIn('merge-create', said)
+        # The repair is named for the missing and damaged projects only: the unreadable one
+        # (here `delta`) is told what is true instead (kittrial-5bb.202 review item 4, F5).
+        repair = [line for line in said.splitlines() if line.startswith('An operator runs the merge-create')]
+        self.assertEqual(len(repair), 1, said)
+        self.assertIn('alpha', repair[0])
+        self.assertIn('beta', repair[0])
+        self.assertNotIn('delta', repair[0])
+        unreadable = [line for line in said.splitlines() if line.startswith('The merge slot of')]
+        self.assertEqual(len(unreadable), 1, said)
+        self.assertIn('delta', unreadable[0])
         # Read only: one check per project whose metadata records the server, and nothing else.
         self.assertEqual(sorted(name for name, _ in self.calls), ['alpha', 'beta', 'gamma'])
         self.assertTrue(all(argv == ['merge-slot', 'check', '--json'] for _, argv in self.calls))

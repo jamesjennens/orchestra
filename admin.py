@@ -1578,6 +1578,10 @@ def restore_destination_state(root,destination):
     slot=destination+'-merge-slot'
     return 'empty' if all(isinstance(row,dict) and row.get('id')==slot for row in rows) else 'partial'
 
+#: The name ``finish_restore`` gives the step that provisions the clone's merge slot, so
+#: ``restore_failure_notice`` can say what is true after it fails (kittrial-5bb.202 rev-2).
+MERGE_SLOT_STEP='merge-slot provisioning'
+
 def restore_failure_notice(destination,error,state='partial',step='native restore'):
     """What an operator must do after the native step of ``restore-new`` did not complete.
 
@@ -1609,6 +1613,17 @@ def restore_failure_notice(destination,error,state='partial',step='native restor
                 'was restored into it (and its coordination sidecar, journals and operation journal were NOT '
                 'restored). Do not use it as a tracker. Retire it (%s) and run restore-new again into another '
                 'unused destination name; the source backup was not modified.'%(cause,destination,retire))
+    if step==MERGE_SLOT_STEP:
+        # This step runs AFTER the re-point, so the clone's own backup target is in place and
+        # a backup of it succeeds: the generic "its backup fails" wording below is not true
+        # here (kittrial-5bb.202 review item 4, review F8).
+        return ('restore-new did not complete: %s. Project %s exists and holds the restored tracker (its data, '
+                'its re-pointed backup target and its journals are in place), but its merge slot was not '
+                'provisioned: merge-check, merge-acquire and merge-release on it refuse and name the merge-create '
+                'operation, and so does issuing a worker credential. Run the merge-create coordination operation '
+                'for %s (the read-only merge-slot-report names it missing), or retire it (%s) and run restore-new '
+                'again into another unused destination name; the source backup was not modified. A backup of %s '
+                'taken now is expected to succeed.'%(cause,destination,destination,retire,destination))
     return ('restore-new did not complete: %s. Project %s exists but holds a partial restore (its '
             'coordination sidecar, journals and operation journal were NOT restored). Preserve it for '
             'inspection, do not use or back it up as a tracker, and run restore-new again into another '
@@ -1903,6 +1918,19 @@ def backup_now_command(root):
     """The command that backs up every project of this runtime now."""
     return host_command(root,'backup','--all')
 
+def coordination_command(root,*words):
+    """A host coordination command as the service user pastes it: interpreter, the installed
+    kit's ``coordination.py``, then ``words``.
+
+    ``coordination.py`` is ``admin.py``'s sibling and takes ``--config`` (the operator's own
+    client configuration), not ``--root``, so it has its own beginning. The set-up page's
+    merge-slot step shows one for the merge-create operation (kittrial-5bb.202 review item 4).
+    """
+    import shlex
+    python=install_current_path(sys.executable)
+    module=install_current_path(Path(__file__).resolve().with_name('coordination.py'))
+    return ' '.join(shlex.quote(str(word)) for word in (python,module,*words))
+
 def schedule_text(root):
     """The two things an operator needs for backups, each under its own label: the command
     that runs one now, and the line a schedule's unit file carries (which is NOT a command)."""
@@ -2095,6 +2123,9 @@ def project_setup_status(root,name,path=None):
     # The words every host command of this runtime begins with, for the steps an operator
     # does on the server.
     result['admin']=host_command(root)
+    # The same for a coordination command (``coordination.py``, which takes ``--config``):
+    # the merge-slot step's merge-create command begins this way (kittrial-5bb.202 rev-2).
+    result['coordination']=coordination_command(root)
     # Why the schedule could not be checked, when it could not: this process runs under
     # the runtime's scoped home and was not told the account's own home (the service was
     # started without a usable HOME), or a unit file could not be read.
@@ -6171,9 +6202,13 @@ def credential_actors(root,state_path,service_namespace=None):
                 found['on_host']=True
                 found['sessions']=registered_actors(path)
                 try:
-                    rows=[json.loads(line) for line in run_bd(root,name,['export','--all']).splitlines() if line.strip()]
-                    if not any(isinstance(row,dict) for row in rows):
-                        raise ValueError('the export answered no rows')
+                    text=run_bd(root,name,['export','--all'])
+                    rows=[json.loads(line) for line in text.splitlines() if line.strip()]
+                    if rows and not any(isinstance(row,dict) for row in rows):
+                        raise ValueError('the export answered something that is not rows')
+                    # Zero rows is a READABLE tracker that holds nothing (a plain `bd init`),
+                    # so it reads as no names, not as an unread tracker (kittrial-5bb.202 rev-2,
+                    # the same empty-project decision endpoint.tracker_actors makes).
                     found['marks']=actor_names.tracker_marks(rows)
                 except (subprocess.CalledProcessError,OSError,ValueError,RecursionError):
                     found['marks']=None                # the tracker could not be read: said as null, not as "no rows"
@@ -7043,11 +7078,22 @@ def main():
         report,healthy=merge_slot_report(root,args.projects)
         print(json.dumps(report,sort_keys=True))
         if not healthy:
-            # stdout stays one JSON document; the plain sentence goes to stderr.
+            # stdout stays one JSON document; the plain sentences go to stderr. The
+            # merge-create repair is named only for the projects that are missing or
+            # damaged: an unreadable one (a dropped database, a stopped server, a name
+            # that is no project) is not mended by it, so it is told what is true
+            # instead (kittrial-5bb.202 review item 4; review F5).
             names=report['not_healthy']
-            print('merge-slot-report: %d project(s) do not have a healthy merge slot: %s. An operator runs the '
-                  'merge-create coordination operation for each, then re-runs this report.'
+            print('merge-slot-report: %d project(s) do not have a healthy merge slot: %s.'
                   %(len(names),', '.join(names)),file=sys.stderr)
+            repairable=report['missing']+report['damaged']
+            if repairable:
+                print('An operator runs the merge-create coordination operation for %s (a missing or damaged '
+                      'slot), then re-runs this report.'%', '.join(repairable),file=sys.stderr)
+            if report['unreadable']:
+                print('The merge slot of %s could not be read at all, and no merge-create run mends that: check '
+                      'the project\'s database, its Dolt server coordinates and the name itself first.'
+                      %', '.join(report['unreadable']),file=sys.stderr)
             raise SystemExit(1)
     elif args.command=='backup-status':
         record=read_backup_status(root)
@@ -7163,7 +7209,10 @@ def main():
             (root/'backups').mkdir(exist_ok=True)
             restoring=restore_lock_path(root,args.destination).open('a')
             fcntl.flock(restoring,fcntl.LOCK_EX)
-            step='add-project'
+            # ``step`` is a one-word holder: ``finish_restore`` names the provisioning step
+            # inside itself, so a failure there prints the provisioning notice and not the
+            # re-point's (kittrial-5bb.202 review item 4, review F8).
+            step=['add-project']
             try:
                 # SIGTERM is an exception for the whole of what follows, not only inside
                 # the native restore: a stop during add-project (or the re-point) used to
@@ -7173,16 +7222,16 @@ def main():
                     # The native restore runs through the Dolt SQL client (no bd ~10 s read
                     # timeout), in its own process group, and adopts the restored project
                     # identity; a destination without server metadata keeps `bd backup restore`.
-                    step='native restore'
+                    step[0]='native restore'
                     print(native_restore(root,args.project,args.destination))
-                    step='re-point and coordination'
-                    warning=finish_restore(root,args,snapshot)
+                    step[0]='re-point and coordination'
+                    warning=finish_restore(root,args,snapshot,step)
             except BaseException as error:
                 # add-project's own refusals (a populated or retired destination) are raised
                 # before it creates anything: they need no notice about a leftover project.
-                if not (step=='add-project' and isinstance(error,ValueError)):
+                if not (step[0]=='add-project' and isinstance(error,ValueError)):
                     print(restore_failure_notice(args.destination,error,
-                                                 restore_destination_state(root,args.destination),step=step),
+                                                 restore_destination_state(root,args.destination),step=step[0]),
                           file=sys.stderr)
                 raise
             finally:
@@ -7219,8 +7268,16 @@ def native_only_note(root,args,damaged):
               'was restored from %s'%journal.relative_to(root).as_posix() if getattr(args,'journal_restored',False)
               else 'was not restored: the backup has no operation-journal snapshot'))
 
-def finish_restore(root,args,snapshot):
-    """What ``restore-new`` does after the native restore: re-point, sidecar, journals."""
+def finish_restore(root,args,snapshot,step=None):
+    """What ``restore-new`` does after the native restore: re-point, slot, sidecar, journals.
+
+    ``step`` is the caller's one-word holder, when it has one: the merge-slot provisioning
+    step names itself in it, so a failure there prints its own notice rather than the
+    re-point's (kittrial-5bb.202 review item 4, review F8). A caller that passes none (the
+    focused tests) gets the same work with no naming.
+    """
+    def at(name):
+        if isinstance(step,list) and step:step[0]=name
     # The native restore brings the SOURCE project's backup configuration with the
     # restored database: `.beads/dolt-backup.json` and the restored `dolt_backups`
     # row both still name `backups/<source>`. Left there, `backup <destination>`
@@ -7235,7 +7292,11 @@ def finish_restore(root,args,snapshot):
     # source made before the slot was provisioned leaves the clone without a merge slot.
     # This is a way of making a project that the kit controls, so close it here: provision
     # the slot idempotently before anything reads the restored project (kittrial-5bb.202 item 3).
+    # It runs AFTER the re-point, so a failure here leaves a clone whose own backup already
+    # succeeds; restore_failure_notice says so for this step (review item 4, F8).
+    at(MERGE_SLOT_STEP)
     provision_merge_slot(root,args.destination)
+    at('re-point and coordination')
     # The deployment authority merges come last (kittrial-5bb.142): they are the only step
     # that waits on the deployment lock, and a refusal there must leave a complete restore.
     # --without-coordination (kittrial-5bb.152): no coordination files, no authority; the
