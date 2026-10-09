@@ -5113,7 +5113,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         key=(project_id,many)
         if key in cache:
             return cache[key]
-        snapshot = (self.backend.agent_snapshot(project_id)
+        snapshot = (self._independent_queue(self.backend.agent_snapshot(project_id), project_id)
                     if not many and hasattr(self.backend,'agent_snapshot') else self._review_queue(project_id))
         rows = [task for task in (snapshot.get('items') or []) if isinstance(task, dict)]
         bound = AGENT_MAX_PAGES * MAX_PAGE

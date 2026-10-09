@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "operation_id": "3187df7e-7f8e-48b9-8381-77d68088a202",
+  "key": "agents.current-attention",
+  "revision": 3,
+  "expected_sha256": "2657e3d7f33f8ee7166931be450d0c5b33806b7df18f65af3d68b2a26c1e5f30",
+  "name": "Personal agent current work and next actions",
+  "aliases": [
+    "agent attention",
+    "agent next actions",
+    "blocked agent wake signal",
+    "agent current attention"
+  ],
+  "requirements": [],
+  "anchors": [
+    "docs/HTTP_DEPLOYMENT.md#personal-agents"
+  ],
+  "code": [
+    "http_service.py::ApiHandler._agent_attention",
+    "http_service.py::ApiHandler._agent_project_tasks",
+    "http_service.py::ApiHandler._agent_own_tasks",
+    "http_service.py::EndpointBackend.agent_snapshot",
+    "http_service.py::own_queue_tasks",
+    "work.py::queue"
+  ],
+  "tests": [
+    "tests/test_agent_attention.py",
+    "tests/test_agent_attention_followups.py",
+    "tests/test_work_queue.py",
+    "tests/test_review_attention.py",
+    "tests/test_finding_work.py"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "agents",
+    "attention",
+    "work"
+  ],
+  "summary": "Current attention uses one bounded work snapshot per project and request. A single agent recovers owned tasks with owner-filtered pages when that snapshot is incomplete; owner lists reuse bounded rows. Snapshot, own-task and action truncation flags are distinct; incomplete snapshot counts are lower bounds. Only latest checkpoint blockers/dependencies mark undelivered work blocked; delivered review state takes precedence. Review/checkpoint errors name an operator action and error summary; request IDs are capped at20. Current-assignee comments stay quiet and other authors wake; unattributed native title/description edits may stay quiet. Setup instructions say to record a blocker when an answer is needed to proceed. Existing independent review recommendations, counts and action order are retained. Action kind names are the contract; numeric priorities are relative hints. This remains an unaccepted proposal; review, integration and verification are separate."
+}
