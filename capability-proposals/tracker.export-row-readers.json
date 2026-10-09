@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "operation_id": "capnew-5bb221-row-readers-0004",
+  "key": "tracker.export-row-readers",
+  "name": "Tracker export row readers: rows to 750 levels read, anything unreadable refuses",
+  "aliases": [
+    "tracker actors export rows",
+    "unreadable export row guard",
+    "record json loads rows",
+    "row nesting bound",
+    "deep tracker row",
+    "one row nested 65 levels",
+    "which bound each reader uses"
+  ],
+  "summary": "The three readers of a project's tracker export rows parse them with the row bound of kittrial-5bb.141 (record_json.loads_rows, ROW_NESTING_MAX 750), not the 64-level comment guard: endpoint.tracker_actors (behind the worker-credential name rule at use and at issue), admin.py credential_actors, and admin.py project_actor_names (adopt-actor). Rows nested up to 750 levels parse normally and their own author, assignee and comment names count; a row nested 65 levels, which the comment guard refused whole, reads. ANY row that cannot be parsed -- unparseable, deeper than 750, a line cut short, a 5,000-digit number -- refuses the read as a whole, exactly as a bd that exits nonzero or an export without the merge slot: an unreadable row may be the row that holds the name, and a name the tracker might hold must not become issuable or writable through a worker credential. A marked row never counts as the merge slot. In the credential-actors listing such a project reads tracker_rows null with the unreadable row ids named; adopt-actor refuses as a tracker that could not be read. An export cut at U+0085 refuses the same way until kittrial-5bb.239 lands.",
+  "requirements": [],
+  "anchors": [],
+  "code": [
+    "endpoint.py::tracker_actors",
+    "admin.py::credential_actors",
+    "admin.py::project_actor_names",
+    "record_json.py::loads_rows",
+    "record_json.py::loads_row"
+  ],
+  "tests": [
+    "tests/test_credential_actor.py",
+    "tests/test_key_principals.py",
+    "tests/test_record_json.py"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "tracker",
+    "rows",
+    "guard"
+  ]
+}

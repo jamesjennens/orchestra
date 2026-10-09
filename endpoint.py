@@ -425,8 +425,31 @@ def tracker_actors(root,path,before=None,own=()):
     One ``bd export --all`` for the project, through the same read ``admin.py
     credential-actors`` makes: a bd process that opens the project's database. That is the
     cost of judging a plain name by the rows it has, and it is paid where the rule is
-    applied, never by every write (docs/HTTP_DEPLOYMENT.md says so). A tracker that cannot
-    be read raises ``actor_names.TrackerUnreadable``, and a read that came back without the
+    applied, never by every write (docs/HTTP_DEPLOYMENT.md says so). What depends on it:
+    ``reserved_actors`` feeds the tracker names to the worker-credential name rule on every
+    HTTP-path write (``descriptor_actor_denial``, kittrial-5bb.184/188) and to the
+    ``actor-standing`` rows read the web service makes when it issues a credential, so a
+    read that fails blocks every write under a plain name and every issue, for the whole
+    project.
+
+    Rows are parsed with the row bound of kittrial-5bb.141 (``record_json.loads_rows``,
+    ``ROW_NESTING_MAX`` 750), not the 64-level record-comment guard that used to refuse
+    this read on one row nested 65 levels (kittrial-5bb.221): a row nested up to 750
+    levels parses normally and its own author, assignee and comment names count. ANY row
+    that cannot be parsed -- unparseable text, deeper than 750, a line cut short -- still
+    refuses the whole read exactly as before: an unreadable row may be the row that holds
+    the name, and a name the tracker might hold must not become issuable or writable
+    through a worker credential (revision-2 review item 1: a comment holding U+0085, or
+    751-level metadata, hid a row's author and a credential under that name was issued and
+    wrote). A marked row never counts as the project's merge slot: its id can be recovered
+    from text nobody has read, and the whole-read proof must rest on a row that was read.
+    (bd's answer being cut at U+0085 inside a string is kittrial-5bb.239's, on
+    record_json.loads_rows itself; until that lands, such a row refuses here exactly as on
+    main.)
+
+    A tracker that cannot be read raises ``actor_names.TrackerUnreadable`` -- a bd that
+    exits nonzero, an export that holds an unreadable row or a line that is not a row, or
+    text that is not rows at all --, and a read that came back without the
     project's merge slot raises ``actor_names.TrackerMergeSlotMissing``: every project this
     kit makes holds that slot, and a missing slot is what the merge-create operation
     repairs, so it must not be answered as the transient fault "try again shortly"
@@ -457,13 +480,17 @@ def tracker_actors(root,path,before=None,own=()):
         raise actor_names.TrackerUnreadable()
     try:
         text=run_bd(root,path.name,['export','--all'])
-        rows=[record_json.loads(line) for line in text.splitlines() if line.strip()]
+        rows=record_json.loads_rows(text)
     except (subprocess.SubprocessError,OSError,ValueError,RecursionError):
         # bd could not answer, or answered something that is not rows: a host fault, never an
         # empty tracker and never a rejection of the caller's request.
         raise actor_names.TrackerUnreadable()
-    if rows and not any(isinstance(row,dict) for row in rows):
-        # Text came back, but it is not rows at all: the same failed read, not an empty tracker.
+    if any(not isinstance(row,dict) or row.get('malformed') for row in rows) \
+            or (not rows and text.strip()):
+        # One unreadable row refuses the whole read (not only its own names): the row may be
+        # the one that holds the name, and an unreadable row's id never proves the slot
+        # (kittrial-5bb.221). Text came back, but it is not rows at all (``null``, which the
+        # row reader drops): the same failed read, not an empty tracker (kittrial-5bb.202).
         raise actor_names.TrackerUnreadable()
     if not any(is_merge_slot(row) for row in rows):
         # Zero rows (a plain `bd init`: the read succeeded and the tracker holds nothing,
