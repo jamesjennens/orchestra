@@ -6,7 +6,7 @@
   "build_id": "unreleased-source",
   "files": {
     "VERSION": "e9dd8507f4bf0c6f42458e41aea833ad0bd3f6127272335eee9bf4d58541ed67",
-    "client.py": "da1ca63f1d18bce3d82e75d5831941c60f0cac12f2dcc9639aca3a7575bdd8f7",
+    "client.py": "4dab12035a55a3c04e59bfd402fb6c82b29ca360b60972f7847d66add2e7ca62",
     "version.py": "39ffd5cf6d7b61b9f5eafb4a5fdbfbe0f688f253e20810f6a37ac41e91b84d65"
   }
 }
