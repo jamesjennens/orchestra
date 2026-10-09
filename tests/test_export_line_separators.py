@@ -114,7 +114,7 @@ class ReaderRouteTests(unittest.TestCase):
         import actor_names
         import admin
         import endpoint
-        slot = {'id': 'p-merge-slot', 'labels': ['gt:slot']}
+        slot = {'id': 'pp-merge-slot', 'labels': ['gt:slot']}
         for character in SEPARATORS:
             good = wire([slot, row(character), row('healthy', 'p-2')])
             with self.subTest(character=repr(character)), patch.object(admin, 'run_bd', return_value=good):
