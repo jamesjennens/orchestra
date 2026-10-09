@@ -38,7 +38,9 @@ ENTRY_POINTS = tuple(ADVICE)
 RUN_UNDER_3_6 = ('ssh_forced_command.py', 'tools/office_release.py')
 STARTED_UNDER_3_6 = ('activity.py', 'bootstrap.py', 'export_requirements.py', 'publish_brd.py', 'requirement_impact.py',
                      'requirements.py')
-#: Library-only modules: imported by programs, never run as one. No shebang, no ``__main__`` block.
+#: Library-only modules: imported by programs, never run as one. No ``__main__`` block.
+#: Four of them carry a shebang anyway (capability_verification.py, http_auth.py, http_authority.py,
+#: proposal_records.py) — a library can be copied beside a program — so only the ``__main__`` block is required.
 MODULES = ('actor_names.py', 'agent_prompts.py', 'artifacts.py', 'bd_refusals.py', 'briefing.py',
            'capability_misses.py', 'capability_records.py', 'capability_verification.py', 'credential_store.py',
            'feedback.py', 'field_limits.py', 'guidance.py', 'handoff.py', 'http_auth.py', 'http_authority.py',
@@ -92,7 +94,9 @@ class TooOldTests(unittest.TestCase):
                         # The others import fcntl, which Windows has not: there they end in that
                         # ImportError, as they did before, and not in the sentence.
                         self.assertEqual(done.returncode, 0, done.stderr)
-                        self.assertIn('usage', done.stdout)        # argparse's "usage:", or the JSON help of capabilities.py
+                        if name != 'tools/demonstrate_review_targeting.py':
+                            # That one has no argument parser; --help just runs its demo body.
+                            self.assertIn('usage', done.stdout)  # argparse's "usage:", or the JSON help of capabilities.py
 
     def test_the_endpoint_says_it_whatever_it_is_sent(self):
         """Over SSH the client reads the endpoint's exit code and shows its stderr: 'SSH failed (2); ...'."""
@@ -139,12 +143,13 @@ class ClientSaysItTests(unittest.TestCase):
         self.assertIn('This key runs a forced command', said)
         self.assertIn('print that line again (admin.py authorized-keys) with an interpreter of 3.10 or newer', said)
         self.assertNotIn('uncertain', said)
-        # The tail (the endpoint's advice) is shown alongside the forced-command note (kittrial-5bb.222).
-        self.assertIn('Set "python" in the client configuration', said)
+        # The endpoint's own advice says to set "python" here, which is wrong under a forced
+        # command: the note replaces it (kittrial-5bb.222, review item two-contradicting-instructions).
+        self.assertNotIn('Set "python" in the client configuration', said)
 
-    def test_with_a_forced_command_the_tail_is_shown(self):
-        """The recogniser stays loose so a reworded advice is still recognised, and the tail is shown
-        with a forced command too (kittrial-5bb.222)."""
+    def test_with_a_forced_command_a_reworded_tail_is_shown(self):
+        """The recogniser stays loose so a reworded advice is still recognised; a tail that is not
+        the endpoint's own advice is shown and then the forced-command note (kittrial-5bb.222)."""
         reworded = ('endpoint.py needs Python 3.10 or newer and was started with Python 3.6.8 (/usr/bin/python3). '
                     'Nothing was carried out. Ask your operator for a newer interpreter.\n')
         said = self.answered(2, '', reworded, dict(self.SSH, forced_command=True))
@@ -152,7 +157,7 @@ class ClientSaysItTests(unittest.TestCase):
         self.assertIn('This key runs a forced command', said)
         self.assertNotIn('uncertain', said)
 
-    def test_the_recogniser_accepts_any_tail(self):
+    def test_the_recogniser_accepts_any_spaced_tail(self):
         """A server whose advice was reworded in another release is still recognised (kittrial-5bb.222)."""
         for tail in ('Set "python" in the client configuration.',
                      'Ask your operator for a newer interpreter.',
@@ -165,6 +170,29 @@ class ClientSaysItTests(unittest.TestCase):
                 self.assertTrue(said.startswith('SSH: endpoint.py needs Python 3.10 or newer'), said)
                 self.assertNotIn('uncertain', said)
                 self.assertNotIn('SSH failed', said)
+
+    def test_glued_text_is_not_the_sentence(self):
+        """No space after the fixed sentences is not a tail: the uncertain warning stays (kittrial-5bb.222)."""
+        glued = ('endpoint.py needs Python 3.10 or newer and was started with Python 3.6.8 (/usr/bin/python3). '
+                 'Nothing was carried out.But kit-1 was written.\n')
+        said = self.answered(2, '', glued)
+        self.assertTrue(said.startswith('SSH failed (2); outcome may be uncertain. '), said)
+        self.assertNotIn('This key runs a forced command', said)
+
+    def test_the_tail_is_recognised_up_to_600_characters(self):
+        """600 characters of tail are shown; 601 are not recognised (kittrial-5bb.222)."""
+        head = ('endpoint.py needs Python 3.10 or newer and was started with Python 3.6.8 (/usr/bin/python3). '
+                'Nothing was carried out. ')
+        for n, recognised in ((600, True), (601, False)):
+            with self.subTest(length=n):
+                stderr = head + ('x' * n) + '\n'
+                said = self.answered(2, '', stderr)
+                if recognised:
+                    self.assertTrue(said.startswith('SSH: endpoint.py needs Python 3.10 or newer'), said)
+                    self.assertIn('x' * n, said)
+                    self.assertNotIn('uncertain', said)
+                else:
+                    self.assertTrue(said.startswith('SSH failed (2); outcome may be uncertain. '), said)
 
     def test_local_transport_with_forced_command_shows_the_sentence(self):
         """A local-transport config with forced_command is still the local label; forced_command is an SSH
@@ -245,6 +273,13 @@ class SourceTests(unittest.TestCase):
         self.assertEqual(sorted(programs), sorted(listed))
         for name in RUN_UNDER_3_6 + STARTED_UNDER_3_6:
             self.assertNotIn('needs Python 3.10 or newer', (ROOT/name).read_text(encoding='utf-8'), name)
+        # A library module grows a __main__ block only if someone starts running it as a program;
+        # that file then needs the check (kittrial-5bb.222, review item the-listing-test-lost-a-guarantee).
+        for name in MODULES:
+            with self.subTest(module=name):
+                self.assertFalse(any(isinstance(node, ast.If) and '__main__' in ast.unparse(node.test)
+                                     and '__name__' in ast.unparse(node.test)
+                                     for node in self.tree(name).body), name)
 
     def test_no_future_import_stands_where_python_3_6_would_stop_at_it(self):
         """``from __future__ import annotations`` is refused by 3.6 when the file is COMPILED, before its first

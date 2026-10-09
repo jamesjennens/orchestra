@@ -13,9 +13,6 @@ if sys.version_info < (3, 10):
                      'Nothing was carried out. Run it with Python 3.10 or newer.\n'
                      % (sys.version_info[0], sys.version_info[1], sys.version_info[2], sys.executable))
     sys.exit(2)
-import argparse
-parser = argparse.ArgumentParser(description='Demonstrate review-operation targeting error messages.')
-parser.parse_args()
 import json
 from pathlib import Path
 
