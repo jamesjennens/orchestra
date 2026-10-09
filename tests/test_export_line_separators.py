@@ -183,7 +183,7 @@ class ReaderRouteTests(unittest.TestCase):
             with patch.object(admin, 'run_bd', return_value=healthy):
                 item = admin.credential_actors(self.root, state)['credentials'][0]
             self.assertIs(item['tracker_rows'], True, item)
-            self.assertIs(item['collides'], True, item)
+            self.assertEqual(item['collides'], "a name this project's tracker already holds", item)
             self.assertIs(item['refused_when_it_writes'], True, item)
             with patch.object(admin, 'run_bd', return_value=healthy+'{"id":"cut",'):
                 item = admin.credential_actors(self.root, state)['credentials'][0]
