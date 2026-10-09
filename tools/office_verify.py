@@ -33,7 +33,7 @@ def bundled_bd(root, kit):
     try:
         done = subprocess.run([str(Path(root)/'bin'/'bd'), '--version'], stdout=subprocess.PIPE,
                               stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, timeout=60)
-        lines = [line.strip() for line in done.stdout.decode('utf-8', 'replace').splitlines() if line.strip()]
+        lines = [line.strip() for line in done.stdout.decode('utf-8', 'replace').split('\n') if line.strip()]
         found['starts'] = done.returncode == 0
         found['says'] = (lines[0] if done.returncode == 0 else lines[-1])[:200] if lines else None
     except (OSError, subprocess.TimeoutExpired) as error:

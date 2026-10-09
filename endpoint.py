@@ -438,7 +438,7 @@ def tracker_actors(root,path,before=None,own=()):
     from admin import run_bd
     try:
         text=run_bd(root,path.name,['export','--all'])
-        rows=[record_json.loads(line) for line in text.splitlines() if line.strip()]
+        rows=[record_json.loads(line) for line in text.split('\n') if line.strip()]
     except (subprocess.SubprocessError,OSError,ValueError,RecursionError):
         # bd could not answer, or answered something that is not rows: a host fault, never an
         # empty tracker and never a rejection of the caller's request.

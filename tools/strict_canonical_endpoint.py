@@ -383,7 +383,7 @@ def dispatch(canonical, request, tmp, run=None):
         if len(args) > ANCHOR_READ_IDS_MAX or len(set(args)) != len(args):
             raise ValueError('anchors takes no arguments, or at most %d distinct task ids'
                              % ANCHOR_READ_IDS_MAX)
-        rows = [json.loads(line) for line in run(['export', '--all']).splitlines() if line.strip()]
+        rows = [json.loads(line) for line in run(['export', '--all']).split('\n') if line.strip()]
         if args:
             rows = [row for row in rows if row.get('id') in args]
         return envelope(0, json.dumps({'schema_version': 1, 'anchors': record_anchor_ids(rows)}) + '\n')
@@ -409,7 +409,7 @@ def dispatch(canonical, request, tmp, run=None):
         writes = reference_records.CONTRIBUTOR_OPERATIONS if action == 'ref' else records.WRITE_COMMANDS
         if args and args[0] in writes:
             raise ValueError('the canonical stub serves %s reads only' % action)
-        rows = [json.loads(line) for line in run(['export', '--all']).splitlines() if line.strip()]
+        rows = [json.loads(line) for line in run(['export', '--all']).split('\n') if line.strip()]
 
         def ref_run(argv):
             if argv[0] == 'export':

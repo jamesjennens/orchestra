@@ -5100,7 +5100,7 @@ def project_actor_names(root,project,path):
     names={record['actor'] for record in data['records'].values()}|set(owner_map(data))
     try:
         text=run_bd(root,project,['export','--all'])
-        rows=[json.loads(line) for line in text.splitlines() if line.strip()]
+        rows=[json.loads(line) for line in text.split('\n') if line.strip()]
     except (subprocess.SubprocessError,OSError,ValueError,RecursionError):
         raise ValueError('Cannot read the tracker of project %s to check whether that actor exists there; '
                          'nothing was changed'%project) from None
@@ -6111,7 +6111,7 @@ def credential_actors(root,state_path,service_namespace=None):
                 found['on_host']=True
                 found['sessions']=registered_actors(path)
                 try:
-                    rows=[json.loads(line) for line in run_bd(root,name,['export','--all']).splitlines() if line.strip()]
+                    rows=[json.loads(line) for line in run_bd(root,name,['export','--all']).split('\n') if line.strip()]
                     if not any(isinstance(row,dict) for row in rows):
                         raise ValueError('the export answered no rows')
                     found['marks']=actor_names.tracker_marks(rows)
