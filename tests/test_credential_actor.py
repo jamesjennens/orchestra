@@ -2016,9 +2016,11 @@ class RealBdTrackerActorTests(unittest.TestCase):
         with self.assertRaises(actor_names.TrackerUnreadable):
             rb.endpoint.tracker_actors(self.root, self.project)
         told = self.standing(['vic'])
-        self.assertEqual((2, 'tracker'), (told['returncode'], told.get('fault')), told)
+        self.assertEqual((2, 'unreadable-rows'), (told['returncode'], told.get('fault')), told)
+        self.assertIn(deep, told['stderr'])              # the sentence names the unreadable row
         fault = self.write('vic', self.credential('vic', rows_checked=False), 'unreadable')
-        self.assertEqual((2, 'tracker'), (fault['returncode'], fault.get('fault')), fault)
+        self.assertEqual((2, 'unreadable-rows'), (fault['returncode'], fault.get('fault')), fault)
+        self.assertNotIn('try again shortly', fault['stderr'])
 
 
 if __name__ == '__main__':
