@@ -231,7 +231,8 @@ class OrderTests(Members):
         self.post(feedback + '/reviews', {'operation': 'contribute', 'commit': COMMIT, 'base_commit': BASE,
                                           'bundle_sha256': BUNDLE, 'summary': 'delivered'}, self.secret)
         self.post(feedback + '/reviews', {'operation': 'request-changes', 'summary': 'please revise'}, self.alex)
-        self.post(blocked + '/checkpoints', {'previous': None, 'summary': 'stuck', 'open_items': [{'text': 'which page size?'}]},
+        self.post(blocked + '/checkpoints', {'previous': None, 'summary': 'stuck',
+                  'open_items': [{'kind': 'blocker', 'text': 'which page size?'}]},
                   self.secret)
         self.post(held + '/claim', {}, self.tokens['casey'])                     # somebody else's
         return feedback, blocked, working, free, held

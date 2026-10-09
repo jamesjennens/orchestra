@@ -48,6 +48,8 @@ class WorkAttentionTests(AttentionCase):
     def test_the_block_is_the_agent_attention_shape(self):
         block = self.block()
         shape = set(http_service.ApiHandler._agent_attention_view({}))
+        # These flags describe the agent task snapshot, not a capability index.
+        shape -= {'snapshot_truncated', 'own_tasks_truncated', 'actions_truncated'}
         self.assertTrue(shape | {'actions'} <= set(block))
         self.assertEqual(set(block) - shape - {'actions'}, {'items', 'next_offset'})
         self.assertEqual(block['counts'], {'conflicted': 0, 'drifted': 0, 'reported_only': 0, 'unverified_stale': 0,

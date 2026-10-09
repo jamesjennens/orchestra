@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "operation_id": "278bce64-4994-411a-9e2a-3576d32b8b71",
+  "key": "agents.current-attention",
+  "revision": 3,
+  "expected_sha256": "2657e3d7f33f8ee7166931be450d0c5b33806b7df18f65af3d68b2a26c1e5f30",
+  "name": "Personal agent current work and next actions",
+  "aliases": [
+    "agent attention",
+    "agent next actions",
+    "blocked agent wake signal",
+    "agent current attention"
+  ],
+  "requirements": [],
+  "anchors": [
+    "docs/HTTP_DEPLOYMENT.md#personal-agents"
+  ],
+  "code": [
+    "http_service.py::ApiHandler._agent_attention",
+    "http_service.py::ApiHandler._agent_project_tasks",
+    "http_service.py::ApiHandler._agent_own_tasks",
+    "http_service.py::EndpointBackend.agent_snapshot",
+    "http_service.py::own_queue_tasks",
+    "work.py::queue"
+  ],
+  "tests": [
+    "tests/test_agent_attention.py",
+    "tests/test_agent_attention_followups.py",
+    "tests/test_work_queue.py",
+    "tests/test_review_attention.py",
+    "tests/test_finding_work.py"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "agents",
+    "attention",
+    "work"
+  ],
+  "summary": "Complete attention uses one work snapshot. Over-bound single-agent reads page until claimable suggestions fill or the 1,000-row bound, then recover own work with up to 1,000 owner-filtered rows. Owner lists reuse bounded rows. Three independent truncation flags distinguish snapshot, own counts and actions; incomplete counts say at least N and cannot imply idle. Failed authorized work reads say error; successful-project actions survive. Absent legacy blocking_items uses open_items; explicit unreadable fields stay unknown. Latest blockers/dependencies block undelivered work; delivery review takes precedence. Request IDs cap at20 only as defensive injected-row projection, not a reachable sequence of real review writes. Current-assignee comments stay quiet, other authors wake; unattributed native edits may stay quiet. Review recommendations/order and live authority are retained. This proposal remains unaccepted; integration and verification are separate."
+}
