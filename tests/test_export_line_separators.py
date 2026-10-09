@@ -107,9 +107,41 @@ class ExportFramingTests(unittest.TestCase):
                 body = wire([{'issue_id': 'p-1', 'depends_on_id': 'p-2', 'note': character}])
                 self.assertEqual(['p-1', 'p-2'], reserved_comments._edge_ids(body))
 
+    def test_non_lf_row_separators_are_not_tracker_jsonl(self):
+        for delimiter in ('\u0085', '\u2028', '\f'):
+            with self.subTest(delimiter=repr(delimiter)):
+                text = delimiter.join(json.dumps(r) for r in [row('one'), row('two', 'p-2')])
+                self.assertTrue(any(r.get('malformed') for r in record_json.loads_rows(text)))
+
+    def test_native_refusal_keeps_unicode_in_its_one_error_line(self):
+        import bd_refusals
+        message = 'cannot find before\u0085after'
+        self.assertEqual(message, bd_refusals.said(1, '', 'notice\nError: '+message+'\n'))
+
+    def test_capability_lifecycle_export_keeps_the_whole_unicode_row(self):
+        import capability_verification as verification
+        expected = dict(row('\u0085'), issue_type='event')
+        def run(args):
+            self.assertEqual(args, ['export', '--all'])
+            return wire([expected])
+        with patch.object(verification, 'integrated_commits', return_value={'a'*40}) as consume:
+            reader = verification.Integrated(run)
+            reader._export()
+            self.assertEqual(reader.everything, {'a'*40})
+            self.assertEqual(consume.call_args.args[0], [expected])
+
 
 @unittest.skipIf(os.name == 'nt', 'endpoint uses the native POSIX lock; Linux route tests cover it')
 class ReaderRouteTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory(); self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.project = self.root / 'projects' / 'p'
+        (self.project / '.beads').mkdir(parents=True)
+        (self.project / '.beads' / 'metadata.json').write_text(json.dumps({
+            'dolt_server_host': '127.0.0.1', 'dolt_server_port': 12345,
+            'dolt_server_user': 'root', 'dolt_database': 'p'}), encoding='utf-8')
+
     def test_tracker_names_survive_unicode_and_truly_unreadable_rows_still_refuse(self):
         import actor_names
         import admin
@@ -118,23 +150,44 @@ class ReaderRouteTests(unittest.TestCase):
         for character in SEPARATORS:
             good = wire([slot, row(character), row('healthy', 'p-2')])
             with self.subTest(character=repr(character)), patch.object(admin, 'run_bd', return_value=good):
-                self.assertEqual({'author', 'assignee', 'commenter'}, set(endpoint.tracker_actors(Path('/unused'), Path('/unused/p'))))
+                self.assertEqual({'author', 'assignee', 'commenter'}, set(endpoint.tracker_actors(self.root, self.project)))
             for bad in ('{"id":"broken",', 'not JSON', '{"id":"p-3","title":"bad\rstring"}'):
                 with self.subTest(character=repr(character), bad=repr(bad)), patch.object(admin, 'run_bd', return_value=good + bad):
                     with self.assertRaises(actor_names.TrackerUnreadable):
-                        endpoint.tracker_actors(Path('/unused'), Path('/unused/p'))
+                        endpoint.tracker_actors(self.root, self.project)
 
     def test_tracker_whole_read_faults_and_fake_slot_stay_refused(self):
         import actor_names
         import admin
         import endpoint
-        for text in ('', wire([row('\u0085')]), '{"id":"p-merge-slot", junk}\n'):
+        for text in ('', wire([row('\u0085')])):
+            with self.subTest(text=repr(text)), patch.object(admin, 'run_bd', return_value=text):
+                with self.assertRaises(actor_names.TrackerMergeSlotMissing):
+                    endpoint.tracker_actors(self.root, self.project)
+        for text in ('{"id":"p-merge-slot", junk}\n',):
             with self.subTest(text=repr(text)), patch.object(admin, 'run_bd', return_value=text):
                 with self.assertRaises(actor_names.TrackerUnreadable):
-                    endpoint.tracker_actors(Path('/unused'), Path('/unused/p'))
+                    endpoint.tracker_actors(self.root, self.project)
         with patch.object(admin, 'run_bd', side_effect=subprocess.CalledProcessError(1, ['bd'])):
             with self.assertRaises(actor_names.TrackerUnreadable):
-                endpoint.tracker_actors(Path('/unused'), Path('/unused/p'))
+                endpoint.tracker_actors(self.root, self.project)
+
+    def test_credential_listing_reads_unicode_collision_and_reports_cut_rows_as_unknown(self):
+        import admin
+        import sessions
+        state = self.root / 'synthetic-service.json'
+        state.write_text(json.dumps({'users': {}, 'credentials': {'credential-one': {
+            'user_id': 'usr_a', 'project_id': 'p', 'actor': 'commenter', 'revoked': False}}}), encoding='utf-8')
+        healthy = wire([row('\u0085')])
+        with patch.object(sessions, 'registered_actors', return_value=[]):
+            with patch.object(admin, 'run_bd', return_value=healthy):
+                item = admin.credential_actors(self.root, state)['credentials'][0]
+            self.assertIs(item['tracker_rows'], True, item)
+            self.assertIs(item['collides'], True, item)
+            self.assertIs(item['refused_when_it_writes'], True, item)
+            with patch.object(admin, 'run_bd', return_value=healthy+'{"id":"cut",'):
+                item = admin.credential_actors(self.root, state)['credentials'][0]
+            self.assertIsNone(item['tracker_rows'], item)
 
     def test_adoption_reader_keeps_names_from_unicode_rows(self):
         import admin

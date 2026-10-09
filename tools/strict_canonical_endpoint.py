@@ -605,12 +605,17 @@ def main():
             found = {key: names.get(key, []) for key in ('sessions', 'operators', 'verifiers')}
             if rows:
                 import actor_names
-                if names.get('tracker') in ('unreadable', 'cut', 'exit1', 'words', 'no-slot'):
-                    # The shapes endpoint.tracker_actors turns into one host fault: an export
-                    # that answered no rows, a cut line, a bd that exited nonzero, words that
-                    # are not rows, or rows without the project's merge slot
-                    # (kittrial-5bb.188 item 1; revision-3 item 3(1)).
+                if names.get('tracker') in ('unreadable', 'cut', 'exit1', 'words'):
+                    # The shapes endpoint.tracker_actors turns into a host fault: a cut line, a
+                    # bd that exited nonzero, or words that are not rows (kittrial-5bb.188 item 1;
+                    # revision-3 item 3(1)).
                     raise actor_names.TrackerUnreadable()
+                if names.get('tracker') in ('no-slot', 'empty'):
+                    # Rows came back without the merge-slot row (`no-slot`), or the readable
+                    # tracker holds no rows at all -- a plain `bd init` (`empty`): both are the
+                    # missing-slot shape naming the merge-create repair, not the transient fault
+                    # (kittrial-5bb.202 item 1 and rev-2).
+                    raise actor_names.TrackerMergeSlotMissing()
                 marks = [(str(item.get('name') or ''), actor_names.instant(item.get('when')))
                          for item in (names.get('author-rows') or names.get('author_rows') or [])
                          if isinstance(item, dict)]
@@ -665,9 +670,13 @@ def main():
         answer = envelope(2, stderr='%s: %s\n' % (type(error).__name__, error))
         import actor_names                    # a local import elsewhere in main() shadows the module name
         if isinstance(error, actor_names.TrackerUnreadable):
-            # As endpoint.main does: an export that answered no rows is a host fault the
+            # As endpoint.main does: an export that could not be read is a host fault the
             # service reads as 503 "nothing was changed" (kittrial-5bb.188 item 1).
             answer['fault'] = 'tracker'
+        if isinstance(error, actor_names.TrackerMergeSlotMissing):
+            # A read without a merge slot is not transient: its own mark, so the service says
+            # what to do (merge-create) rather than "try again shortly" (kittrial-5bb.202 item 1).
+            answer['fault'] = 'merge-slot'
     print(json.dumps(answer, ensure_ascii=False))
 
 

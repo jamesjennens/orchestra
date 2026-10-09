@@ -31,7 +31,7 @@ const steps = (root) => root.all((e) => e.tagName === 'LI').map((li) => ({
   commands: li.all((e) => e.tagName === 'PRE').map((pre) => pre.textContent),
 }));
 
-// 1. The owner's page: seven steps, their states, where each is done.
+// 1. The owner's page: eight steps, their states, where each is done.
 {
   const ctx = who.owner;
   const page = await setup.page(ctx, { pid: project });

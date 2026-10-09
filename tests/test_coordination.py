@@ -34,6 +34,7 @@ class Native:
         self.details = {}
         self.holder = None
         self.slot_exists = True
+        self.check_override = None
         self.create_outcome = 'ok'
         self.acquire_outcome = 'ok'
         self.show_fails = False
@@ -102,6 +103,10 @@ class Native:
             self.slot_exists = True
             return json.dumps({'created': True})
         if args[:2] == ['merge-slot', 'check']:
+            if self.check_override is not None:
+                # A planted check answer, for the shapes bd 1.2.2 does not send today
+                # (kittrial-5bb.202 review `damaged-test-looser-than-main`).
+                return json.dumps(self.check_override)
             if not self.slot_exists:
                 # EXACT real bd 1.2.2 missing-slot JSON: `available` IS present
                 # (false) alongside `error`, and the command exits 0.
@@ -430,6 +435,54 @@ class CoordinationTests(unittest.TestCase):
                       {'available': False, 'holder': None, 'id': 'pp-merge-slot', 'waiters': ['bob']}):
             with self.subTest(state=state):
                 self.assertFalse(coordination.merge_slot_missing(state))
+
+    def test_merge_slot_damaged_predicate_is_the_unavailable_row_without_a_holder(self):
+        """kittrial-5bb.202: the damaged shape is available false and no holder.
+
+        Including the failing shape the review pinned (review `damaged-test-looser-than-main`):
+        an answer that is unavailable and carries ``waiters`` but NO ``holder`` key at all was
+        refused as damaged on main, and the rev-1 tip let it through (``'holder' in state``).
+        """
+        for state in ({'available': False, 'holder': None, 'id': 'pp-merge-slot', 'waiters': None},
+                      {'available': False, 'holder': None, 'id': 'pp-merge-slot'},
+                      {'available': False, 'holder': None, 'waiters': ['bob']},
+                      # The reviewer's f2.py shape: no `holder` key, `waiters` present. Main's answer.
+                      {'available': False, 'id': 'pp-merge-slot', 'waiters': None},
+                      {'available': False, 'id': 'pp-merge-slot', 'waiters': ['bob']}):
+            with self.subTest(state=state):
+                self.assertTrue(coordination.merge_slot_damaged(state))
+        # A free slot, a held slot and every missing shape are not damaged: the two never
+        # overlap for a caller that tests missing first.
+        for state in ({'available': True, 'holder': None, 'id': 'pp-merge-slot', 'waiters': None},
+                      {'available': False, 'holder': 'alice', 'id': 'pp-merge-slot', 'waiters': None},
+                      {'available': False, 'error': 'not found', 'id': 'pp-merge-slot'},
+                      {'error': 'not found'}, {'available': False}, {}, None, 'not JSON'):
+            with self.subTest(state=state):
+                self.assertFalse(coordination.merge_slot_damaged(state))
+        # The damaged shapes are not missing either: a caller tests missing first and then damaged.
+        for state in ({'available': False, 'holder': None, 'id': 'pp-merge-slot', 'waiters': None},
+                      {'available': False, 'holder': None, 'waiters': ['bob']},
+                      {'available': False, 'id': 'pp-merge-slot', 'waiters': None}):
+            with self.subTest(state=state):
+                self.assertFalse(coordination.merge_slot_missing(state))
+
+    def test_an_unavailable_check_without_a_holder_key_is_refused_as_damaged(self):
+        """The reviewer's f2.py run on the rev-1 tip (kittrial-5bb.202 review item 2).
+
+        ``python3 f2.py main`` refused merge-check and merge-release for
+        ``{"available": false, "id": "pp-merge-slot", "waiters": null}``; the rev-1 tip
+        accepted the check and refused the release only for the holder rule. Main's answer
+        is kept: the shape is damaged, nothing is acquired or released and no context is kept.
+        """
+        self.native.check_override = {'available': False, 'id': 'pp-merge-slot', 'waiters': None}
+        for payload in ({'operation': 'merge-check'}, MERGE, {'operation': 'merge-release'}):
+            with self.subTest(operation=payload['operation']):
+                with self.assertRaisesRegex(ValueError, 'damaged'):
+                    self.apply(payload)
+        self.assertEqual(self.native.count('merge-slot', 'acquire'), 0)
+        self.assertEqual(self.native.count('merge-slot', 'release'), 0)
+        self.assertEqual(self.native.count('merge-slot', 'create'), 0)
+        self.assertFalse((self.project / '.merge-context.json').exists())
 
     def test_missing_slot_refuses_check_acquire_and_release_naming_create(self):
         self.native.slot_exists = False
