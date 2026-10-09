@@ -1692,8 +1692,16 @@ class AgentSetupDialogCase(unittest.TestCase):
         # Losing the secret means issuing a NEW credential; only its fresh secret is shown.
         reissue = self.function_body(code, 'reissueSection')
         self.assertIn('ctx.api.issueAgentCredential(agent.id)', reissue)
+        # The confirmation has nested template literals for inferred versus stored
+        # scopes. The simple quoted-text stripper cannot parse those; check the
+        # confirmation separately without treating its prose as a secret variable.
+        confirmation = next(line.strip() for line in reissue.splitlines()
+                            if line.strip().startswith('body:'))
+        self.assertNotIn('.secret', confirmation)
+        self.assertIn('Issuing this secret confirms them as this agent’s stored scopes', confirmation)
         uses = [line.strip() for line in reissue.splitlines()
-                if re.search(r'\bsecret\b', self.unquoted(line))]
+                if not line.strip().startswith('body:')
+                and re.search(r'\bsecret\b', self.unquoted(line))]
         self.assertEqual(['if (!credential.secret) {',
                           "section.replaceChildren(secretSection(credential.secret, 'New secret (shown once)', payload),"],
                          uses)
