@@ -84,7 +84,7 @@ export function scopesLine(raw) {
   const known = Array.isArray(raw.scopes);
   const other = otherCredentials(raw).length;
   return h('div', { class: 'small', 'data-scopes': known ? raw.scopes.join(' ') : 'unknown', 'data-scopes-source': raw.scopes_source || '' },
-    known ? ['May: ', scopeNames(raw.scopes), raw.scopes_source === 'inferred' ? ' (read from its working credentials: nothing recorded what it was made with)' : null, '.'] :
+    known ? ['May: ', scopeNames(raw.scopes), raw.scopes_source === 'inferred' ? ' (inferred from working credentials, not confirmed: revocation or expiry may have left an unintended credential working; its own account should check these)' : null, '.'] :
       'Nothing says what this agent may do. Choose under “What it may do” on the Agents page before it gets a new secret.',
     other ? h('div', { class: 'banner', role: 'status', 'data-scopes-differ': String(other) },
       known ? `${other} working ${other === 1 ? 'credential allows' : 'credentials allow'} something else than that.` : 'Its working credentials do not all allow the same.',
@@ -121,11 +121,26 @@ export function agentCard(ctx, raw, { compact = false } = {}) {
 
 export async function list(ctx) {
   const host = h('div', { class: 'stack' });
+  let unconfirmedOnly = false;
+  let cursor = null;
+  const previous = [];
+  const filter = ctx.me && ctx.me.superuser ? h('label', { class: 'check' },
+    h('input', { type: 'checkbox', 'data-filter': 'unconfirmed-scopes', onchange: (event) => {
+      unconfirmedOnly = event.target.checked;
+      cursor = null;
+      previous.length = 0;
+      load();
+    } }), 'Show agents with inferred or unknown scopes') : null;
   async function load() {
     let data;
-    try { data = await ctx.api.agents(); } catch (error) { host.replaceChildren(errorState(error, load)); return; }
-    host.replaceChildren(data.items.length ? h('div', { class: 'agent-grid' }, data.items.map((a) => h('div', { class: 'stack', 'data-agent': a.id }, agentCard(ctx, a), editFolder(a), manages(ctx, a) ? editProjects(a) : null, manages(ctx, a) ? editScopes(a) : null))) :
+    try { data = await ctx.api.agents({ limit: 20, cursor, unconfirmed: unconfirmedOnly ? 'true' : 'false' }); } catch (error) { host.replaceChildren(errorState(error, load)); return; }
+    const items = data.items;
+    host.replaceChildren(items.length ? h('div', { class: 'agent-grid' }, items.map((a) => h('div', { class: 'stack', 'data-agent': a.id }, agentCard(ctx, a), editFolder(a), manages(ctx, a) ? editProjects(a) : null, manages(ctx, a) ? editScopes(a) : null))) :
       h('div', { class: 'panel' }, empty('No agents yet', 'Add an agent for each assistant you run — for example a GitHub Copilot chat working in its own folder.')));
+    host.append(h('div', { class: 'copy-row', 'data-agent-pages': '' },
+      h('span', { class: 'small muted' }, `${items.length} shown of ${data.total} agents`),
+      previous.length ? h('button', { type: 'button', onclick: () => { cursor = previous.pop(); load(); } }, 'Previous agents') : null,
+      data.next_cursor ? h('button', { type: 'button', onclick: () => { previous.push(cursor); cursor = data.next_cursor; load(); } }, 'Next agents') : null));
   }
   function editFolder(agent) {
     const details = h('details', { class: 'deliver' });
@@ -172,6 +187,7 @@ export async function list(ctx) {
   function editScopes(agent) {
     const own = Boolean(ctx.me && agent.owner === ctx.me.id);
     const known = Array.isArray(agent.scopes);
+    const inferredWarning = agent.scopes_source === 'inferred' ? 'These scopes are inferred. Saving confirms the chosen list as this agent’s stored scopes. ' : '';
     const has = known ? agent.scopes : [];
     const other = otherCredentials(agent);
     const details = h('details', { class: 'deliver', 'data-panel': 'agent-scopes', open: !known || other.length ? true : null });
@@ -195,7 +211,7 @@ export async function list(ctx) {
         SCOPES.map(([scope, label]) => h('label', { class: 'check', for: `sc-${agent.id}-${scope}` },
           h('input', { type: 'checkbox', id: `sc-${agent.id}-${scope}`, name: 'scope', value: scope, checked: ticked.has(scope) ? true : null,
             disabled: !own && !has.includes(scope) ? true : null }), label)),
-        h('p', { class: 'small muted' }, own ? 'Saving issues a new secret that carries exactly these, and a later new secret carries them too. A credential it already has keeps what it allows until you revoke it above.' :
+        h('p', { class: 'small muted' }, own ? inferredWarning + 'Saving issues a new secret that carries exactly these, and a later new secret carries them too. A credential it already has keeps what it allows until you revoke it above.' :
           'Only the agent’s own account may give it more than it has; you may take something away. Saving issues a new secret.')),
       h('p', { class: 'error', role: 'alert', hidden: true }),
       h('div', null, h('button', { type: 'submit' }, 'Save and issue a new secret')));
@@ -207,7 +223,7 @@ export async function list(ctx) {
       problem.textContent = chosen.length ? '' : 'Tick at least one.';
       if (!chosen.length) return;
       if (!(await confirmDialog({ title: 'Set what it may do and issue a new secret?',
-        body: `${agent.name} will have: ${chosen.join(', ')}. A new credential with exactly these is created and its secret is shown once.`, confirmLabel: 'Issue new secret' }))) return;
+        body: inferredWarning + `${agent.name} will have: ${chosen.join(', ')}. A new credential with exactly these is created and its secret is shown once.`, confirmLabel: 'Issue new secret' }))) return;
       let result;
       try { result = await act(form.querySelector('button'), () => ctx.api.issueAgentCredential(agent.id, chosen), { success: 'New secret issued' }); } catch { return; }
       const fresh = await ctx.api.agent(agent.id).catch(() => agent);
@@ -216,7 +232,9 @@ export async function list(ctx) {
     });
     details.append(h('summary', null, known ? 'What it may do' : 'What it may do (choose)'),
       rows.length ? h('ul', { class: 'open-items' }, rows) : h('p', { class: 'small muted' }, 'It has no credential on record.'),
-      agent.enabled === false ? h('p', { class: 'small muted' }, 'This agent is disabled: enable it before it gets a new secret.') : form);
+      agent.enabled === false ? h('p', { class: 'small muted' }, 'This agent is disabled: enable it before it gets a new secret.') :
+        (!known || agent.scopes_source === 'inferred') && !own ? h('p', { class: 'small muted', 'data-owner-choice': 'true' },
+          'Only this agent’s own account may choose or confirm its scopes when they are unknown or inferred. Ask that account before issuing a new secret.') : form);
     return details;
   }
   load();
@@ -256,7 +274,7 @@ export async function list(ctx) {
 
   return h('div', { class: 'stack' },
     pageHead({ title: 'My agents', lede: 'Agents you run on your own computer. Nothing checks in automatically: look here, see which agent has something to do, then open its folder in VS Code and start it.' }),
-    host,
+    filter, host,
     h('section', { class: 'panel' }, h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Add an agent')), h('div', { class: 'panel-body' }, form)));
 }
 
@@ -389,16 +407,16 @@ function scopeList(scopes) {
 }
 function reissueSection(ctx, agent, payload) {
   const section = h('div', { class: 'setup-block' });
-  if (agent.scopes === null) {
+  if (agent.scopes === null || (agent.scopes_source === 'inferred' && agent.owner !== (ctx.me && ctx.me.id))) {
     // Nothing says what the agent may do, so the server refuses a plain renewal: the choice is on its card.
     section.append(h('p', { class: 'small', role: 'status', 'data-scopes-needed': 'true' },
-      'The secret was shown once and cannot be shown again. A new one cannot be issued from here: nothing says what this agent may do. Close this and choose under “What it may do” on its card, which issues the new secret.'));
+      'The secret was shown once and cannot be shown again. A new one cannot be issued from here: its scopes are unknown or inferred and unconfirmed. Close this and choose under “What it may do” on its card; only its own account may give it more or confirm inferred scopes by plain renewal.'));
     return section;
   }
   const issue = h('button', { type: 'button', onclick: async () => {
     const ok = await confirmDialog({
       title: 'Issue a new secret?',
-      body: `A new credential is created for ${agent.name || agent.display_name} and its secret is shown once. It carries what the agent has now${scopeList(agent.scopes)}. The agent's current credential keeps working until you revoke it.`,
+      body: `A new credential is created for ${agent.name || agent.display_name} and its secret is shown once. ${agent.scopes_source === 'inferred' ? `These scopes are inferred from working credentials and are not confirmed. Issuing this secret confirms them as this agent’s stored scopes${scopeList(agent.scopes)}.` : Array.isArray(agent.scopes) ? `It carries what the agent has now${scopeList(agent.scopes)}.` : 'This older service does not report the agent’s scopes. Check the new credential’s scopes before using it.'} The agent's current credential keeps working until you revoke it.`,
       confirmLabel: 'Issue new secret',
     });
     if (!ok) return;
