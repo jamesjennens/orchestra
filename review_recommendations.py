@@ -26,8 +26,11 @@ written after it. Anything else is ignored. So a raw comment posted on a kit tha
 reserve the prefix can never display as a recommendation unless it would have been
 accepted here.
 
-There is no operator void for a recommendation: a wrong one lapses at the next decision
-or revision, and the same reviewer can replace it (the newest by one actor wins).
+There is no operator void and no withdrawal for a recommendation: a wrong one lapses at
+the next decision or revision. While one stands, the same actor's second one for that
+contribution is refused (kittrial-5bb.154); a reviewer who wants changes instead requests
+changes, which makes it lapse. Two standing ones by one actor, stored by an earlier kit,
+are read as the newest.
 """
 import json
 import re
@@ -49,6 +52,8 @@ ITEMS_MAX = 20
 PAYLOAD_MAX_BYTES = 24000
 #: At most this many standing recommendations are read for one contribution (the newest).
 READ_MAX = 20
+#: How many of the standing recommendations are returned with their whole content.
+FULL_MAX = 5
 COMMIT = re.compile(r'(?:[a-fA-F0-9]{40}|[a-fA-F0-9]{64})')
 #: The review states in which a recommendation may be written and stands.
 OPEN_STATES = ('awaiting-review',)
@@ -110,7 +115,7 @@ def validate(payload, task):
 
 
 def check_plain_text(payload):
-    """The plain-text rule of review records, on the write path."""
+    """The plain-text rule of review records, on the write path and again on every read."""
     review_workflow.plain_text(payload['summary'], 'summary')
     for item in payload['items']:
         review_workflow.plain_text(item['text'], 'note text')
@@ -133,6 +138,10 @@ def _records(issue):
             validate(payload, issue.get('id'))
             if raw != PREFIX + canonical_bytes(payload).decode():
                 raise ValueError('not the canonical bytes of the record')
+            # The write path refuses hidden and control characters; a record that reached the
+            # task another way (an older kit's raw path, a native write) is held to the same
+            # rule here, so nothing is displayed that this kit would not have accepted.
+            check_plain_text(payload)
             review_workflow.identity(str(comment['id']))
             if not isinstance(comment.get('author'), str) or not comment['author'].strip():
                 raise ValueError('no native author')
@@ -154,14 +163,31 @@ def _view(payload, comment):
             'summary': payload['summary'], 'items': [dict(item) for item in payload['items']]}
 
 
+#: Said to an actor who has a standing recommendation for the contribution and sends another.
+#: It names the two ways on from there; there is no third.
+ALREADY_RECOMMENDED = ('%s has already recommended this contribution, and that recommendation stands until the '
+                       'contribution is revised or decided. To ask for changes instead, request changes: the '
+                       'recommendation then stops counting. A recommendation cannot be withdrawn.')
+
+
 def standing(issue, state):
-    """The recommendations that stand for the task's current contribution, newest first.
+    """The recommendations a read shows for the task's current contribution: the newest READ_MAX."""
+    return [_view(payload, comment) for _, payload, comment in _standing(issue, state)[:READ_MAX]]
+
+
+def _standing(issue, state):
+    """Every recommendation that stands for the task's current contribution, newest first.
 
     ``state`` is the task's review projection (``review_workflow.project``). A
     recommendation stands when the task is open, its review reads awaiting-review, the
     record names the current contribution and its commit, it was written after that
-    contribution by neither its author nor the task's assignee, and no decision on the
-    contribution was written after it. One per author (the newest), at most READ_MAX.
+    contribution by someone other than its author, and no decision on the contribution
+    was written after it. One per author (the newest: since kittrial-5bb.154 a second one
+    by the same actor is refused when written, and records from before are read this way).
+
+    The task's assignee is refused when the record is WRITTEN, not here: the reader
+    sees only who is assigned now, and a task reassigned to someone who had already
+    recommended must not lose that recommendation (kittrial-5bb.115 review).
     """
     contribution = (state or {}).get('contribution') or {}
     if not contribution.get('comment_id') or (state or {}).get('review_state') not in OPEN_STATES:
@@ -186,8 +212,7 @@ def standing(issue, state):
         if isinstance(record, dict) and record.get('operation') in DECISIONS \
                 and record.get('contribution') == contribution['comment_id']:
             decided = max(decided, position)
-    excluded = {review_workflow.author_key(contribution.get('author')),
-                review_workflow.author_key(issue.get('assignee'))} - {None, ''}
+    excluded = {review_workflow.author_key(contribution.get('author'))} - {None, ''}
     records, _ = _records(issue)
     newest = {}
     for position, payload, comment in records:
@@ -201,16 +226,18 @@ def standing(issue, state):
         if key in excluded:
             continue
         newest[key] = (position, payload, comment)        # native order: a later one replaces an earlier one
-    ordered = sorted(newest.values(), key=lambda entry: entry[0], reverse=True)[:READ_MAX]
-    return [_view(payload, comment) for _, payload, comment in ordered]
+    return sorted(newest.values(), key=lambda entry: entry[0], reverse=True)
 
 
 def block(issue, state):
     """The additive reader fields: the newest standing recommendation and who recommends."""
     views = standing(issue, state)
+    # Every entry names who and when. The newest FULL_MAX also carry their whole content
+    # (additive): the web service leaves out a recommendation by the author's own person,
+    # and then shows the next one, which it could not do from a name and a time.
+    brief = lambda view: {'comment_id': view['comment_id'], 'author': view['author'], 'timestamp': view['timestamp']}
     return {'recommendation': views[0] if views else None,
-            'recommendations': [{'comment_id': view['comment_id'], 'author': view['author'],
-                                 'timestamp': view['timestamp']} for view in views],
+            'recommendations': [dict(view) if index < FULL_MAX else brief(view) for index, view in enumerate(views)],
             'recommended': bool(views)}
 
 
@@ -253,6 +280,11 @@ def execute(rows, task, actor, payload, run, operators=None, journal=None):
             or key == review_workflow.author_key(issue.get('assignee')):
         raise ValueError('Nobody recommends their own contribution: %s is its author or the task\'s assignee'
                          % actor)
+    # One standing recommendation for a contribution from each actor (kittrial-5bb.154). A
+    # second one was stored and replaced the first in every reading, so the history said
+    # more than any reader did. Every standing one is looked at, not only those a read shows.
+    if key in {review_workflow.author_key(comment['author']) for _, _, comment in _standing(issue, state)}:
+        raise ValueError(ALREADY_RECOMMENDED % actor)
     result = json.loads(run(['comments', 'add', task, PREFIX + canonical_bytes(payload).decode(), '--json']))
     comment = {'id': result['id'], 'text': PREFIX + canonical_bytes(payload).decode(), 'author': actor,
                'created_at': result.get('created_at')}

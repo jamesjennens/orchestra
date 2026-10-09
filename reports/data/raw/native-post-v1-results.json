@@ -1,0 +1,1598 @@
+[
+  {
+    "operation": "filtered-columns-explain",
+    "databases": 50,
+    "rep": 0,
+    "seconds": 0.18584713689051569,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.7314453125,
+      7.02001953125,
+      7.14306640625
+    ],
+    "available_GiB": 116.62173843383789,
+    "trace": "native-post-v1-50-0-filtered-columns-explain.jsonl",
+    "query_count": 4,
+    "catalog_query_count": 1,
+    "catalog_ms": 130,
+    "query_ms_sum": 136
+  },
+  {
+    "operation": "filtered-columns",
+    "databases": 50,
+    "rep": 1,
+    "seconds": 0.8835175989661366,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.7314453125,
+      7.02001953125,
+      7.14306640625
+    ],
+    "available_GiB": 116.5583381652832,
+    "trace": "native-post-v1-50-1-filtered-columns.jsonl",
+    "query_count": 4,
+    "catalog_query_count": 1,
+    "catalog_ms": 820,
+    "query_ms_sum": 826
+  },
+  {
+    "operation": "ordinary-query",
+    "databases": 50,
+    "rep": 1,
+    "seconds": 0.07035375200212002,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.7314453125,
+      7.02001953125,
+      7.14306640625
+    ],
+    "available_GiB": 116.51166915893555,
+    "trace": "native-post-v1-50-1-ordinary-query.jsonl",
+    "query_count": 4,
+    "catalog_query_count": 0,
+    "catalog_ms": 0,
+    "query_ms_sum": 11
+  },
+  {
+    "operation": "filtered-columns",
+    "databases": 50,
+    "rep": 2,
+    "seconds": 0.9777676409576088,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.7314453125,
+      7.02001953125,
+      7.14306640625
+    ],
+    "available_GiB": 116.50354766845703,
+    "trace": "native-post-v1-50-2-filtered-columns.jsonl",
+    "query_count": 4,
+    "catalog_query_count": 1,
+    "catalog_ms": 908,
+    "query_ms_sum": 919
+  },
+  {
+    "operation": "ordinary-query",
+    "databases": 50,
+    "rep": 2,
+    "seconds": 0.05755435582250357,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.5927734375,
+      6.9697265625,
+      7.1259765625
+    ],
+    "available_GiB": 116.45767974853516,
+    "trace": "native-post-v1-50-2-ordinary-query.jsonl",
+    "query_count": 4,
+    "catalog_query_count": 0,
+    "catalog_ms": 0,
+    "query_ms_sum": 5
+  },
+  {
+    "operation": "filtered-columns",
+    "databases": 50,
+    "rep": 3,
+    "seconds": 0.8516028299927711,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.5927734375,
+      6.9697265625,
+      7.1259765625
+    ],
+    "available_GiB": 116.45233154296875,
+    "trace": "native-post-v1-50-3-filtered-columns.jsonl",
+    "query_count": 4,
+    "catalog_query_count": 1,
+    "catalog_ms": 792,
+    "query_ms_sum": 798
+  },
+  {
+    "operation": "ordinary-query",
+    "databases": 50,
+    "rep": 3,
+    "seconds": 0.06069173291325569,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.5927734375,
+      6.9697265625,
+      7.1259765625
+    ],
+    "available_GiB": 116.24487686157227,
+    "trace": "native-post-v1-50-3-ordinary-query.jsonl",
+    "query_count": 4,
+    "catalog_query_count": 0,
+    "catalog_ms": 0,
+    "query_ms_sum": 11
+  },
+  {
+    "operation": "release-fixture-create",
+    "databases": 50,
+    "rep": 0,
+    "seconds": 2.207813117885962,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.5927734375,
+      6.9697265625,
+      7.1259765625
+    ],
+    "available_GiB": 116.25302124023438,
+    "trace": "native-post-v1-50-0-release-fixture-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 1659,
+    "query_ms_sum": 1722
+  },
+  {
+    "operation": "release-fixture-scope",
+    "databases": 50,
+    "rep": 0,
+    "seconds": 2.741457808064297,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.5927734375,
+      6.9697265625,
+      7.1259765625
+    ],
+    "available_GiB": 116.19800186157227,
+    "trace": "native-post-v1-50-0-release-fixture-scope.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 1697,
+    "query_ms_sum": 1959
+  },
+  {
+    "operation": "release-fixture-integrated",
+    "databases": 50,
+    "rep": 0,
+    "seconds": 2.511731607140973,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.544921875,
+      6.93701171875,
+      7.1142578125
+    ],
+    "available_GiB": 116.18230056762695,
+    "trace": "native-post-v1-50-0-release-fixture-integrated.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 1556,
+    "query_ms_sum": 1805
+  },
+  {
+    "operation": "release-fixture-create",
+    "databases": 50,
+    "rep": 1,
+    "seconds": 2.109782068990171,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.544921875,
+      6.93701171875,
+      7.1142578125
+    ],
+    "available_GiB": 116.15118026733398,
+    "trace": "native-post-v1-50-1-release-fixture-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 1668,
+    "query_ms_sum": 1728
+  },
+  {
+    "operation": "release-fixture-scope",
+    "databases": 50,
+    "rep": 1,
+    "seconds": 2.5360571700148284,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.5009765625,
+      6.90478515625,
+      7.1025390625
+    ],
+    "available_GiB": 116.10663223266602,
+    "trace": "native-post-v1-50-1-release-fixture-scope.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 1650,
+    "query_ms_sum": 1887
+  },
+  {
+    "operation": "release-fixture-integrated",
+    "databases": 50,
+    "rep": 1,
+    "seconds": 2.5366932798642665,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.5009765625,
+      6.90478515625,
+      7.1025390625
+    ],
+    "available_GiB": 116.14666748046875,
+    "trace": "native-post-v1-50-1-release-fixture-integrated.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 1556,
+    "query_ms_sum": 1814
+  },
+  {
+    "operation": "release-fixture-create",
+    "databases": 50,
+    "rep": 2,
+    "seconds": 2.244249135022983,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.38037109375,
+      6.8564453125,
+      7.08544921875
+    ],
+    "available_GiB": 116.15285873413086,
+    "trace": "native-post-v1-50-2-release-fixture-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 1747,
+    "query_ms_sum": 1799
+  },
+  {
+    "operation": "release-fixture-scope",
+    "databases": 50,
+    "rep": 2,
+    "seconds": 2.611129964934662,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.38037109375,
+      6.8564453125,
+      7.08544921875
+    ],
+    "available_GiB": 116.16084289550781,
+    "trace": "native-post-v1-50-2-release-fixture-scope.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 1661,
+    "query_ms_sum": 1947
+  },
+  {
+    "operation": "release-fixture-integrated",
+    "databases": 50,
+    "rep": 2,
+    "seconds": 2.684176176087931,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.189453125,
+      6.7919921875,
+      7.0634765625
+    ],
+    "available_GiB": 116.15625,
+    "trace": "native-post-v1-50-2-release-fixture-integrated.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 1676,
+    "query_ms_sum": 1939
+  },
+  {
+    "operation": "release-fixture-create",
+    "databases": 50,
+    "rep": 3,
+    "seconds": 2.106090746121481,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.189453125,
+      6.7919921875,
+      7.0634765625
+    ],
+    "available_GiB": 116.14475631713867,
+    "trace": "native-post-v1-50-3-release-fixture-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 1590,
+    "query_ms_sum": 1657
+  },
+  {
+    "operation": "release-fixture-scope",
+    "databases": 50,
+    "rep": 3,
+    "seconds": 2.5095597018953413,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      4.93359375,
+      6.71240234375,
+      7.0361328125
+    ],
+    "available_GiB": 116.14250564575195,
+    "trace": "native-post-v1-50-3-release-fixture-scope.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 1473,
+    "query_ms_sum": 1717
+  },
+  {
+    "operation": "release-fixture-integrated",
+    "databases": 50,
+    "rep": 3,
+    "seconds": 2.7020853881258518,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      4.93359375,
+      6.71240234375,
+      7.0361328125
+    ],
+    "available_GiB": 116.08506774902344,
+    "trace": "native-post-v1-50-3-release-fixture-integrated.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 1684,
+    "query_ms_sum": 1946
+  },
+  {
+    "operation": "release-fixture-create",
+    "databases": 50,
+    "rep": 4,
+    "seconds": 2.0384785120841116,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.09912109375,
+      6.71728515625,
+      7.03564453125
+    ],
+    "available_GiB": 116.12699508666992,
+    "trace": "native-post-v1-50-4-release-fixture-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 1536,
+    "query_ms_sum": 1601
+  },
+  {
+    "operation": "release-fixture-scope",
+    "databases": 50,
+    "rep": 4,
+    "seconds": 2.6697491169907153,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.09912109375,
+      6.71728515625,
+      7.03564453125
+    ],
+    "available_GiB": 116.17314529418945,
+    "trace": "native-post-v1-50-4-release-fixture-scope.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 1723,
+    "query_ms_sum": 1952
+  },
+  {
+    "operation": "release-fixture-integrated",
+    "databases": 50,
+    "rep": 4,
+    "seconds": 2.5285729297902435,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.0908203125,
+      6.6884765625,
+      7.0244140625
+    ],
+    "available_GiB": 116.14286422729492,
+    "trace": "native-post-v1-50-4-release-fixture-integrated.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 1567,
+    "query_ms_sum": 1796
+  },
+  {
+    "operation": "release-fixture-create",
+    "databases": 50,
+    "rep": 5,
+    "seconds": 2.0812271190807223,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.0908203125,
+      6.6884765625,
+      7.0244140625
+    ],
+    "available_GiB": 116.13885116577148,
+    "trace": "native-post-v1-50-5-release-fixture-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 1604,
+    "query_ms_sum": 1662
+  },
+  {
+    "operation": "release-fixture-scope",
+    "databases": 50,
+    "rep": 5,
+    "seconds": 2.714895735029131,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.08349609375,
+      6.66015625,
+      7.01318359375
+    ],
+    "available_GiB": 116.06635284423828,
+    "trace": "native-post-v1-50-5-release-fixture-scope.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 1676,
+    "query_ms_sum": 1994
+  },
+  {
+    "operation": "release-fixture-integrated",
+    "databases": 50,
+    "rep": 5,
+    "seconds": 2.5454233940690756,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.08349609375,
+      6.66015625,
+      7.01318359375
+    ],
+    "available_GiB": 116.1506576538086,
+    "trace": "native-post-v1-50-5-release-fixture-integrated.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 1600,
+    "query_ms_sum": 1832
+  },
+  {
+    "operation": "release-fixture-create",
+    "databases": 50,
+    "rep": 6,
+    "seconds": 2.1197145809419453,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.1572265625,
+      6.64892578125,
+      7.00732421875
+    ],
+    "available_GiB": 116.05913925170898,
+    "trace": "native-post-v1-50-6-release-fixture-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 1652,
+    "query_ms_sum": 1697
+  },
+  {
+    "operation": "release-fixture-scope",
+    "databases": 50,
+    "rep": 6,
+    "seconds": 2.47354131587781,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.1572265625,
+      6.64892578125,
+      7.00732421875
+    ],
+    "available_GiB": 116.13562393188477,
+    "trace": "native-post-v1-50-6-release-fixture-scope.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 1484,
+    "query_ms_sum": 1755
+  },
+  {
+    "operation": "release-fixture-integrated",
+    "databases": 50,
+    "rep": 6,
+    "seconds": 2.551841118140146,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.14453125,
+      6.62109375,
+      6.99609375
+    ],
+    "available_GiB": 116.12398147583008,
+    "trace": "native-post-v1-50-6-release-fixture-integrated.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 1591,
+    "query_ms_sum": 1851
+  },
+  {
+    "operation": "release-fixture-create",
+    "databases": 50,
+    "rep": 7,
+    "seconds": 2.059180043870583,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.14453125,
+      6.62109375,
+      6.99609375
+    ],
+    "available_GiB": 116.1241226196289,
+    "trace": "native-post-v1-50-7-release-fixture-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 1580,
+    "query_ms_sum": 1647
+  },
+  {
+    "operation": "release-fixture-scope",
+    "databases": 50,
+    "rep": 7,
+    "seconds": 2.4979000058956444,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.1328125,
+      6.59375,
+      6.9853515625
+    ],
+    "available_GiB": 116.1131477355957,
+    "trace": "native-post-v1-50-7-release-fixture-scope.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 1576,
+    "query_ms_sum": 1810
+  },
+  {
+    "operation": "release-fixture-integrated",
+    "databases": 50,
+    "rep": 7,
+    "seconds": 2.6543764758389443,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.1328125,
+      6.59375,
+      6.9853515625
+    ],
+    "available_GiB": 116.05280303955078,
+    "trace": "native-post-v1-50-7-release-fixture-integrated.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 1556,
+    "query_ms_sum": 1840
+  },
+  {
+    "operation": "release-fixture-create",
+    "databases": 50,
+    "rep": 8,
+    "seconds": 1.8568799649365246,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.20263671875,
+      6.58349609375,
+      6.97998046875
+    ],
+    "available_GiB": 116.11710357666016,
+    "trace": "native-post-v1-50-8-release-fixture-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 1393,
+    "query_ms_sum": 1446
+  },
+  {
+    "operation": "release-fixture-scope",
+    "databases": 50,
+    "rep": 8,
+    "seconds": 2.684061127016321,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.20263671875,
+      6.58349609375,
+      6.97998046875
+    ],
+    "available_GiB": 116.11533737182617,
+    "trace": "native-post-v1-50-8-release-fixture-scope.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 1740,
+    "query_ms_sum": 1993
+  },
+  {
+    "operation": "release-fixture-integrated",
+    "databases": 50,
+    "rep": 8,
+    "seconds": 2.446501919068396,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.3466796875,
+      6.5908203125,
+      6.98046875
+    ],
+    "available_GiB": 116.11618423461914,
+    "trace": "native-post-v1-50-8-release-fixture-integrated.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 1440,
+    "query_ms_sum": 1718
+  },
+  {
+    "operation": "release-fixture-create",
+    "databases": 50,
+    "rep": 9,
+    "seconds": 2.045674263034016,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.3466796875,
+      6.5908203125,
+      6.98046875
+    ],
+    "available_GiB": 116.11326217651367,
+    "trace": "native-post-v1-50-9-release-fixture-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 1575,
+    "query_ms_sum": 1638
+  },
+  {
+    "operation": "release-fixture-scope",
+    "databases": 50,
+    "rep": 9,
+    "seconds": 2.4353502918966115,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.15869140625,
+      6.53076171875,
+      6.958984375
+    ],
+    "available_GiB": 116.03427124023438,
+    "trace": "native-post-v1-50-9-release-fixture-scope.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 1443,
+    "query_ms_sum": 1707
+  },
+  {
+    "operation": "release-fixture-integrated",
+    "databases": 50,
+    "rep": 9,
+    "seconds": 2.6469197547994554,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.15869140625,
+      6.53076171875,
+      6.958984375
+    ],
+    "available_GiB": 116.11349868774414,
+    "trace": "native-post-v1-50-9-release-fixture-integrated.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 1631,
+    "query_ms_sum": 1903
+  },
+  {
+    "operation": "release-fixture-create",
+    "databases": 50,
+    "rep": 10,
+    "seconds": 2.192263415083289,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.0654296875,
+      6.48828125,
+      6.94287109375
+    ],
+    "available_GiB": 116.09295654296875,
+    "trace": "native-post-v1-50-10-release-fixture-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 1711,
+    "query_ms_sum": 1757
+  },
+  {
+    "operation": "release-fixture-scope",
+    "databases": 50,
+    "rep": 10,
+    "seconds": 2.6086704509798437,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.0654296875,
+      6.48828125,
+      6.94287109375
+    ],
+    "available_GiB": 116.12936782836914,
+    "trace": "native-post-v1-50-10-release-fixture-scope.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 1544,
+    "query_ms_sum": 1854
+  },
+  {
+    "operation": "release-fixture-integrated",
+    "databases": 50,
+    "rep": 10,
+    "seconds": 2.5858152711298317,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.06005859375,
+      6.46337890625,
+      6.93212890625
+    ],
+    "available_GiB": 116.11635971069336,
+    "trace": "native-post-v1-50-10-release-fixture-integrated.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 1580,
+    "query_ms_sum": 1885
+  },
+  {
+    "operation": "release-fixture-create",
+    "databases": 50,
+    "rep": 11,
+    "seconds": 2.0983940619044006,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.06005859375,
+      6.46337890625,
+      6.93212890625
+    ],
+    "available_GiB": 116.13116073608398,
+    "trace": "native-post-v1-50-11-release-fixture-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 1655,
+    "query_ms_sum": 1724
+  },
+  {
+    "operation": "release-fixture-scope",
+    "databases": 50,
+    "rep": 11,
+    "seconds": 2.454527097987011,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.1357421875,
+      6.45556640625,
+      6.9267578125
+    ],
+    "available_GiB": 116.10116195678711,
+    "trace": "native-post-v1-50-11-release-fixture-scope.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 1493,
+    "query_ms_sum": 1758
+  },
+  {
+    "operation": "release-fixture-integrated",
+    "databases": 50,
+    "rep": 11,
+    "seconds": 2.350900847930461,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.1357421875,
+      6.45556640625,
+      6.9267578125
+    ],
+    "available_GiB": 116.04206466674805,
+    "trace": "native-post-v1-50-11-release-fixture-integrated.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 1410,
+    "query_ms_sum": 1647
+  },
+  {
+    "operation": "release-fixture-create",
+    "databases": 50,
+    "rep": 12,
+    "seconds": 1.9359406440053135,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.04443359375,
+      6.41455078125,
+      6.91064453125
+    ],
+    "available_GiB": 116.06832885742188,
+    "trace": "native-post-v1-50-12-release-fixture-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 1459,
+    "query_ms_sum": 1507
+  },
+  {
+    "operation": "release-fixture-scope",
+    "databases": 50,
+    "rep": 12,
+    "seconds": 2.7314514780882746,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.04443359375,
+      6.41455078125,
+      6.91064453125
+    ],
+    "available_GiB": 116.04104995727539,
+    "trace": "native-post-v1-50-12-release-fixture-scope.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 1744,
+    "query_ms_sum": 2014
+  },
+  {
+    "operation": "release-fixture-integrated",
+    "databases": 50,
+    "rep": 12,
+    "seconds": 2.5236025128979236,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.04052734375,
+      6.390625,
+      6.89990234375
+    ],
+    "available_GiB": 116.06216049194336,
+    "trace": "native-post-v1-50-12-release-fixture-integrated.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 1509,
+    "query_ms_sum": 1777
+  },
+  {
+    "operation": "release-fixture-create",
+    "databases": 50,
+    "rep": 13,
+    "seconds": 1.9909961661323905,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.04052734375,
+      6.390625,
+      6.89990234375
+    ],
+    "available_GiB": 115.99999618530273,
+    "trace": "native-post-v1-50-13-release-fixture-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 1556,
+    "query_ms_sum": 1619
+  },
+  {
+    "operation": "release-fixture-scope",
+    "databases": 50,
+    "rep": 13,
+    "seconds": 2.548721731873229,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.19775390625,
+      6.40087890625,
+      6.90087890625
+    ],
+    "available_GiB": 115.80472183227539,
+    "trace": "native-post-v1-50-13-release-fixture-scope.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 1532,
+    "query_ms_sum": 1803
+  },
+  {
+    "operation": "release-fixture-integrated",
+    "databases": 50,
+    "rep": 13,
+    "seconds": 2.49842724413611,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.19775390625,
+      6.40087890625,
+      6.90087890625
+    ],
+    "available_GiB": 115.95896911621094,
+    "trace": "native-post-v1-50-13-release-fixture-integrated.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 1487,
+    "query_ms_sum": 1761
+  },
+  {
+    "operation": "release-fixture-create",
+    "databases": 50,
+    "rep": 14,
+    "seconds": 2.099294933024794,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.26220703125,
+      6.39404296875,
+      6.89599609375
+    ],
+    "available_GiB": 115.97930526733398,
+    "trace": "native-post-v1-50-14-release-fixture-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 1649,
+    "query_ms_sum": 1705
+  },
+  {
+    "operation": "release-fixture-scope",
+    "databases": 50,
+    "rep": 14,
+    "seconds": 2.5398351580370218,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.26220703125,
+      6.39404296875,
+      6.89599609375
+    ],
+    "available_GiB": 115.95648193359375,
+    "trace": "native-post-v1-50-14-release-fixture-scope.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 1427,
+    "query_ms_sum": 1728
+  },
+  {
+    "operation": "release-fixture-integrated",
+    "databases": 50,
+    "rep": 14,
+    "seconds": 2.5982966569717973,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.16064453125,
+      6.35400390625,
+      6.88037109375
+    ],
+    "available_GiB": 115.96249771118164,
+    "trace": "native-post-v1-50-14-release-fixture-integrated.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 1600,
+    "query_ms_sum": 1894
+  },
+  {
+    "operation": "release-fixture-create",
+    "databases": 50,
+    "rep": 15,
+    "seconds": 2.1284445070195943,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.16064453125,
+      6.35400390625,
+      6.88037109375
+    ],
+    "available_GiB": 115.95552825927734,
+    "trace": "native-post-v1-50-15-release-fixture-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 1607,
+    "query_ms_sum": 1676
+  },
+  {
+    "operation": "release-fixture-scope",
+    "databases": 50,
+    "rep": 15,
+    "seconds": 2.57970591285266,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.22802734375,
+      6.34765625,
+      6.87548828125
+    ],
+    "available_GiB": 115.94842910766602,
+    "trace": "native-post-v1-50-15-release-fixture-scope.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 1605,
+    "query_ms_sum": 1853
+  },
+  {
+    "operation": "release-fixture-integrated",
+    "databases": 50,
+    "rep": 15,
+    "seconds": 2.40533310896717,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.22802734375,
+      6.34765625,
+      6.87548828125
+    ],
+    "available_GiB": 115.86628723144531,
+    "trace": "native-post-v1-50-15-release-fixture-integrated.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 1466,
+    "query_ms_sum": 1703
+  },
+  {
+    "operation": "release-fixture-create",
+    "databases": 50,
+    "rep": 16,
+    "seconds": 2.0155626400373876,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.12939453125,
+      6.30859375,
+      6.85986328125
+    ],
+    "available_GiB": 115.93834686279297,
+    "trace": "native-post-v1-50-16-release-fixture-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 1489,
+    "query_ms_sum": 1550
+  },
+  {
+    "operation": "release-fixture-scope",
+    "databases": 50,
+    "rep": 16,
+    "seconds": 2.8365535750053823,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.12939453125,
+      6.30859375,
+      6.85986328125
+    ],
+    "available_GiB": 115.94770050048828,
+    "trace": "native-post-v1-50-16-release-fixture-scope.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 1719,
+    "query_ms_sum": 2045
+  },
+  {
+    "operation": "release-fixture-integrated",
+    "databases": 50,
+    "rep": 16,
+    "seconds": 2.749736445955932,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.279296875,
+      6.3203125,
+      6.86083984375
+    ],
+    "available_GiB": 115.91217422485352,
+    "trace": "native-post-v1-50-16-release-fixture-integrated.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 1607,
+    "query_ms_sum": 1902
+  },
+  {
+    "operation": "release-fixture-create",
+    "databases": 50,
+    "rep": 17,
+    "seconds": 2.1357332391198725,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.279296875,
+      6.3203125,
+      6.86083984375
+    ],
+    "available_GiB": 115.93621063232422,
+    "trace": "native-post-v1-50-17-release-fixture-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 1637,
+    "query_ms_sum": 1700
+  },
+  {
+    "operation": "release-fixture-scope",
+    "databases": 50,
+    "rep": 17,
+    "seconds": 2.537353673018515,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.1767578125,
+      6.28173828125,
+      6.84521484375
+    ],
+    "available_GiB": 115.95979309082031,
+    "trace": "native-post-v1-50-17-release-fixture-scope.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 1521,
+    "query_ms_sum": 1816
+  },
+  {
+    "operation": "release-fixture-integrated",
+    "databases": 50,
+    "rep": 17,
+    "seconds": 2.5541087181773037,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.1767578125,
+      6.28173828125,
+      6.84521484375
+    ],
+    "available_GiB": 115.93099212646484,
+    "trace": "native-post-v1-50-17-release-fixture-integrated.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 1517,
+    "query_ms_sum": 1808
+  },
+  {
+    "operation": "release-fixture-create",
+    "databases": 50,
+    "rep": 18,
+    "seconds": 1.9889173770789057,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.2431640625,
+      6.27685546875,
+      6.84033203125
+    ],
+    "available_GiB": 115.87416076660156,
+    "trace": "native-post-v1-50-18-release-fixture-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 1508,
+    "query_ms_sum": 1563
+  },
+  {
+    "operation": "release-fixture-scope",
+    "databases": 50,
+    "rep": 18,
+    "seconds": 2.5168296771589667,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.2431640625,
+      6.27685546875,
+      6.84033203125
+    ],
+    "available_GiB": 115.93588256835938,
+    "trace": "native-post-v1-50-18-release-fixture-scope.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 1569,
+    "query_ms_sum": 1806
+  },
+  {
+    "operation": "release-fixture-integrated",
+    "databases": 50,
+    "rep": 18,
+    "seconds": 2.8382927160710096,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.2431640625,
+      6.27685546875,
+      6.84033203125
+    ],
+    "available_GiB": 115.93528747558594,
+    "trace": "native-post-v1-50-18-release-fixture-integrated.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 1766,
+    "query_ms_sum": 2076
+  },
+  {
+    "operation": "release-fixture-create",
+    "databases": 50,
+    "rep": 19,
+    "seconds": 2.030335813993588,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.1435546875,
+      6.23876953125,
+      6.82470703125
+    ],
+    "available_GiB": 115.94358444213867,
+    "trace": "native-post-v1-50-19-release-fixture-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 1532,
+    "query_ms_sum": 1586
+  },
+  {
+    "operation": "release-fixture-scope",
+    "databases": 50,
+    "rep": 19,
+    "seconds": 2.4956388738937676,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.1435546875,
+      6.23876953125,
+      6.82470703125
+    ],
+    "available_GiB": 115.94270324707031,
+    "trace": "native-post-v1-50-19-release-fixture-scope.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 1464,
+    "query_ms_sum": 1763
+  },
+  {
+    "operation": "release-fixture-integrated",
+    "databases": 50,
+    "rep": 19,
+    "seconds": 2.553195949876681,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.0517578125,
+      6.201171875,
+      6.80908203125
+    ],
+    "available_GiB": 115.85494995117188,
+    "trace": "native-post-v1-50-19-release-fixture-integrated.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 1482,
+    "query_ms_sum": 1791
+  },
+  {
+    "operation": "release-fixture-create",
+    "databases": 50,
+    "rep": 20,
+    "seconds": 2.0928233040031046,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      4.96728515625,
+      6.16455078125,
+      6.7939453125
+    ],
+    "available_GiB": 115.91990280151367,
+    "trace": "native-post-v1-50-20-release-fixture-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 1663,
+    "query_ms_sum": 1719
+  },
+  {
+    "operation": "release-fixture-scope",
+    "databases": 50,
+    "rep": 20,
+    "seconds": 2.7207437760662287,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      4.96728515625,
+      6.16455078125,
+      6.7939453125
+    ],
+    "available_GiB": 115.82135009765625,
+    "trace": "native-post-v1-50-20-release-fixture-scope.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 1749,
+    "query_ms_sum": 2009
+  },
+  {
+    "operation": "release-fixture-integrated",
+    "databases": 50,
+    "rep": 20,
+    "seconds": 2.6043600200209767,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.05029296875,
+      6.16162109375,
+      6.78955078125
+    ],
+    "available_GiB": 115.83683776855469,
+    "trace": "native-post-v1-50-20-release-fixture-integrated.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 1540,
+    "query_ms_sum": 1865
+  },
+  {
+    "operation": "release-fixture-create",
+    "databases": 50,
+    "rep": 21,
+    "seconds": 2.077908153878525,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.05029296875,
+      6.16162109375,
+      6.78955078125
+    ],
+    "available_GiB": 115.81940460205078,
+    "trace": "native-post-v1-50-21-release-fixture-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 1635,
+    "query_ms_sum": 1693
+  },
+  {
+    "operation": "release-fixture-scope",
+    "databases": 50,
+    "rep": 21,
+    "seconds": 2.7641496730502695,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.05029296875,
+      6.16162109375,
+      6.78955078125
+    ],
+    "available_GiB": 115.74070358276367,
+    "trace": "native-post-v1-50-21-release-fixture-scope.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 1639,
+    "query_ms_sum": 1980
+  },
+  {
+    "operation": "release-fixture-integrated",
+    "databases": 50,
+    "rep": 21,
+    "seconds": 2.890108536928892,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.20654296875,
+      6.17578125,
+      6.791015625
+    ],
+    "available_GiB": 115.7504768371582,
+    "trace": "native-post-v1-50-21-release-fixture-integrated.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 1788,
+    "query_ms_sum": 2112
+  },
+  {
+    "operation": "release-fixture-create",
+    "databases": 50,
+    "rep": 22,
+    "seconds": 2.039380660979077,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.3505859375,
+      6.18994140625,
+      6.79248046875
+    ],
+    "available_GiB": 115.77889633178711,
+    "trace": "native-post-v1-50-22-release-fixture-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 1552,
+    "query_ms_sum": 1618
+  },
+  {
+    "operation": "release-fixture-scope",
+    "databases": 50,
+    "rep": 22,
+    "seconds": 2.606682494049892,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.3505859375,
+      6.18994140625,
+      6.79248046875
+    ],
+    "available_GiB": 115.79061889648438,
+    "trace": "native-post-v1-50-22-release-fixture-scope.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 1509,
+    "query_ms_sum": 1821
+  },
+  {
+    "operation": "release-fixture-integrated",
+    "databases": 50,
+    "rep": 22,
+    "seconds": 2.493637359002605,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.162109375,
+      6.13671875,
+      6.77197265625
+    ],
+    "available_GiB": 115.77730560302734,
+    "trace": "native-post-v1-50-22-release-fixture-integrated.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 1555,
+    "query_ms_sum": 1790
+  },
+  {
+    "operation": "release-fixture-create",
+    "databases": 50,
+    "rep": 23,
+    "seconds": 2.1121114261914045,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      5.162109375,
+      6.13671875,
+      6.77197265625
+    ],
+    "available_GiB": 115.79240417480469,
+    "trace": "native-post-v1-50-23-release-fixture-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 1600,
+    "query_ms_sum": 1671
+  },
+  {
+    "operation": "release-fixture-scope",
+    "databases": 50,
+    "rep": 23,
+    "seconds": 2.6503218170255423,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      4.98876953125,
+      6.08447265625,
+      6.75146484375
+    ],
+    "available_GiB": 115.7940788269043,
+    "trace": "native-post-v1-50-23-release-fixture-scope.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 1664,
+    "query_ms_sum": 1988
+  },
+  {
+    "operation": "release-fixture-integrated",
+    "databases": 50,
+    "rep": 23,
+    "seconds": 2.7002647421322763,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      4.98876953125,
+      6.08447265625,
+      6.75146484375
+    ],
+    "available_GiB": 115.79549407958984,
+    "trace": "native-post-v1-50-23-release-fixture-integrated.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 1700,
+    "query_ms_sum": 1982
+  },
+  {
+    "operation": "release-fixture-create",
+    "databases": 50,
+    "rep": 24,
+    "seconds": 2.34602742199786,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      4.9091796875,
+      6.0498046875,
+      6.736328125
+    ],
+    "available_GiB": 115.77754211425781,
+    "trace": "native-post-v1-50-24-release-fixture-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 1840,
+    "query_ms_sum": 1894
+  },
+  {
+    "operation": "release-fixture-scope",
+    "databases": 50,
+    "rep": 24,
+    "seconds": 2.5576927987858653,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      4.9091796875,
+      6.0498046875,
+      6.736328125
+    ],
+    "available_GiB": 115.68058013916016,
+    "trace": "native-post-v1-50-24-release-fixture-scope.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 1513,
+    "query_ms_sum": 1824
+  },
+  {
+    "operation": "release-fixture-integrated",
+    "databases": 50,
+    "rep": 24,
+    "seconds": 2.6355382739566267,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      4.91650390625,
+      6.0322265625,
+      6.7265625
+    ],
+    "available_GiB": 115.73701858520508,
+    "trace": "native-post-v1-50-24-release-fixture-integrated.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 1520,
+    "query_ms_sum": 1809
+  },
+  {
+    "operation": "endpoint-release25-initial",
+    "databases": 50,
+    "rep": 1,
+    "seconds": 168.93285184004344,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      4.91650390625,
+      6.0322265625,
+      6.7265625
+    ],
+    "available_GiB": 115.68968200683594,
+    "trace": "native-post-v1-50-1-endpoint-release25-initial.jsonl",
+    "query_count": 7336,
+    "catalog_query_count": 150,
+    "catalog_ms": 117887,
+    "query_ms_sum": 132606
+  },
+  {
+    "operation": "backup-all",
+    "databases": 50,
+    "rep": 1,
+    "seconds": 5.764217182993889,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      4.62744140625,
+      5.51025390625,
+      6.4169921875
+    ],
+    "available_GiB": 116.4542465209961,
+    "trace": "native-post-v1-50-1-backup-all.jsonl",
+    "query_count": 150,
+    "catalog_query_count": 0,
+    "catalog_ms": 0,
+    "query_ms_sum": 2508
+  }
+]

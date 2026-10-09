@@ -1,6 +1,7 @@
 """The project setup page's data, the repository field and the host's setup status (kittrial-5bb.118)."""
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -27,9 +28,13 @@ def by_id(body):
 class RepositoryRuleTests(unittest.TestCase):
     def test_accepted_shapes(self):
         for value in ('https://git.example/team/project.git', 'ssh://git@git.example:2222/team/project.git',
-                      'git@git.example:team/project.git', '/srv/git/project.git', '\\\\server\\share\\project.git',
-                      'ssh://git.example/team/project.git', 'HTTPS://Git.Example:8443/team/project.git',
-                      'C:\\git\\project.git', 'C:/git/project.git', '/' + 'x' * 299):
+                      'git@git.example:team/project.git', '/srv/git/project.git',
+                      'ssh://git.example/team/project.git', 'https://Git.Example:8443/team/project.git',
+                      'https://git.example:1/p.git', 'https://git.example:65535/p.git',
+                      'ssh://' + 'u' * 32 + '@git.example/p.git', 'u' * 32 + '@git.example:p.git',
+                      # The kit does not judge where a host points.
+                      'https://localhost/p.git', 'https://10.0.0.7/p.git', 'ssh://git@169.254.1.1/p.git',
+                      '/' + 'x' * 299):
             with self.subTest(value=value[:40]):
                 self.assertEqual(http_auth.Service.validate_repository(value), value)
         self.assertIsNone(http_auth.Service.validate_repository(None))
@@ -79,6 +84,37 @@ class RepositoryRuleTests(unittest.TestCase):
             'an ssh host starting with a dash': 'ssh://-host.example/team/p.git',
             'an scp host starting with a dash': 'git@-host.example:team/p.git',
             'an https host starting with a dash': 'https://-host.example/team/p.git',
+            # kittrial-5bb.123. Letters that are not ASCII and that a case-insensitive match let through.
+            'the Kelvin sign as a host letter': 'https://git.exa\u212aple/p.git',
+            'the long s as a host letter': 'ssh://git@\u017ferver.example/p.git',
+            'the dotless i as a host letter': 'https://g\u0131t.example/p.git',
+            'an upper-case scheme': 'HTTPS://git.example/p.git',
+            'an upper-case ssh scheme': 'SSH://git@git.example/p.git',
+            # Only a path on the reader's own machine that begins with one slash.
+            'a UNC path': '\\\\server\\share\\project.git',
+            'a UNC path with slashes': '//server/share/project.git',
+            'a drive path': 'C:\\git\\project.git',
+            'a drive path with slashes': 'C:/git/project.git',
+            # A user name is a short account name.
+            'a user name of 33 characters': 'ssh://' + 'u' * 33 + '@git.example/p.git',
+            'an scp user name of 33 characters': 'u' * 33 + '@git.example:p.git',
+            'a user name of 300 characters': 'ssh://' + 'u' * 280 + '@h/p',
+            'a user name starting with a dash': 'ssh://-user@git.example/p.git',
+            'an scp user name starting with a dash': '-user@git.example:p.git',
+            'a user name starting with a dot': 'ssh://.user@git.example/p.git',
+            # Ports and hosts.
+            'port 0': 'https://git.example:0/p.git',
+            'port 65536': 'https://git.example:65536/p.git',
+            'port 99999': 'ssh://git@git.example:99999/p.git',
+            'a port that is not a number': 'https://git.example:8a/p.git',
+            'an empty port': 'https://git.example:/p.git',
+            'a host ending with a dot': 'https://git.example./p.git',
+            'a host with two dots together': 'https://git..example/p.git',
+            'a host label ending with a dash': 'https://git-.example/p.git',
+            'a host of 254 characters': 'https://' + '.'.join(['a' * 50] * 5)[:254] + '/p.git',
+            'two dots as a path segment': 'https://git.example/team/../other.git',
+            'two dots in an scp path': 'git@git.example:../other.git',
+            'two dots in an absolute path': '/srv/git/../../etc',
             'not text': 7,
             'a list': ['https://git.example/a.git'],
         }
@@ -95,7 +131,7 @@ class RepositoryRuleTests(unittest.TestCase):
         # mutation of one is caught only through the sentence; both are checked here.
         self.assertFalse(any(form.fullmatch('https://user@git.example/team/p.git')
                              for form in http_auth.Service._REPOSITORY_FORMS))
-        for value in ('https://TOKEN@github.com/t/b.git', 'user:hunter2@host:path'):
+        for value in ('https://TOKEN@github.com/t/b.git', 'user:hunter2@host:path', 'ssh://user:hunter2@host/team/b.git'):
             with self.assertRaises(http_auth.HttpError) as caught:
                 http_auth.Service.validate_repository(value)
             said = caught.exception.message + str(caught.exception.detail or '')
@@ -137,8 +173,11 @@ class InProcessSetupTests(test_http_agents.AgentHarness):
         self.assertEqual([item['id'] for item in answer.data['steps']], STEP_IDS)
         steps = by_id(answer.data)
         for item in answer.data['steps']:
-            self.assertEqual(sorted(item), ['command', 'detail', 'id', 'link', 'note', 'state', 'title', 'who',
+            self.assertEqual(sorted(item), ['command', 'commands', 'detail', 'id', 'link', 'note', 'state', 'title', 'who',
                                             'who_text'])
+            for one in item['commands']:
+                self.assertEqual(sorted(one), ['kind', 'label', 'note', 'replace', 'text'])
+                self.assertIn(one['kind'], project_setup.KINDS)
             self.assertIn(item['state'], project_setup.STATES)
         # The admin who registered it and the owner: two members.
         self.assertEqual((steps['members']['state'], steps['repository']['state'], steps['first-task']['state'],
@@ -147,6 +186,12 @@ class InProcessSetupTests(test_http_agents.AgentHarness):
         for name in ('guidance', 'onboarding', 'backup'):
             self.assertEqual((steps[name]['state'], steps[name]['who']), ('not-applicable', 'operator'))
         self.assertEqual((answer.data['remaining'], answer.data['host']), (3, 'not-applicable'))
+        # Nobody said how this server's commands begin, so those words are named as words to replace too.
+        self.assertEqual([one['replace'] for one in steps['guidance']['commands']],
+                         [['PYTHON', 'KIT', 'RUNTIME_ROOT', 'OPERATOR', 'FILE']])
+        self.assertEqual([one['replace'] for one in steps['onboarding']['commands']], [['PYTHON', 'KIT', 'RUNTIME_ROOT', 'FILE']])
+        self.assertEqual([(one['kind'], one['text']) for one in steps['backup']['commands']],
+                         [('unit-line', 'ExecStart=PYTHON admin.py --root RUNTIME_ROOT backup --all')])
         self.assertEqual(answer.data['project'], {'id': self.project, 'name': 'Alpha', 'repository': None})
         self.assertTrue(answer.data['generated_at'])
 
@@ -239,8 +284,12 @@ class InProcessSetupTests(test_http_agents.AgentHarness):
         # Set, read by every member, idempotent, audited once, and cleared.
         value = 'https://git.example/team/alpha.git'
         first = self.patch(olive, {'repository': value}, key='repo-key-1')
+        # The answer of a write carries the server's time at its top level (kittrial-5bb.97).
+        self.assertRegex(first.data.pop('server_time'), r'^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\+00:00$')
         self.assertEqual((200, {'id': self.project, 'repository': value}), (first.status, first.data))
-        self.assertEqual(self.patch(olive, {'repository': value}, key='repo-key-1').data, first.data)
+        again = self.patch(olive, {'repository': value}, key='repo-key-1').data
+        again.pop('server_time')
+        self.assertEqual(again, first.data)
         self.assertEqual(200, self.patch(olive, {'repository': value}).status)
         for name in ('vera', 'carl', 'olive'):
             self.assertEqual(self.request('GET', '/v1/projects/%s' % self.project,
@@ -326,11 +375,33 @@ class HostStatusTests(unittest.TestCase):
 
     def test_a_bare_project(self):
         status = self.status()
-        self.assertEqual(sorted(status), ['backup', 'guidance', 'onboarding', 'project', 'schema_version'])
+        self.assertEqual(sorted(status), ['admin', 'backup', 'creation_record', 'guidance', 'onboarding', 'project',
+                                          'project_databases', 'schema_version'])
+        self.assertEqual(status['project_databases'], {'used': 1, 'limit': 20})
+        self.assertIsNone(status['creation_record'])                    # nothing against registering it
         self.assertEqual(status['guidance'], {'state': 'not-set', 'version': None, 'set_at': None})
         self.assertEqual(status['onboarding'], {'state': 'not-set', 'updated_at': None})
         self.assertEqual((status['backup']['scheduled'], status['backup']['last_run']), ('not-covered', None))
         self.assertEqual(status['backup']['line'], admin.scheduled_backup_execstart(self.root))
+        # What can be pasted, beside the unit-file line that cannot (kittrial-5bb.200).
+        self.assertTrue(status['backup']['line'].startswith('ExecStart='))
+        import shlex
+        self.assertEqual(shlex.split(status['backup']['run_now'])[-4:], ['--root', str(self.root), 'backup', '--all'])
+        if os.name == 'posix':                 # a unit line is a POSIX command line; nothing needs quoting there
+            self.assertEqual('ExecStart=' + status['backup']['run_now'], status['backup']['line'])
+        self.assertEqual(status['backup']['run_now'], status['admin'] + ' backup --all')
+        self.assertEqual(status['backup']['check'], status['admin'] + ' backup-status --require-complete')
+        self.assertEqual(status['backup']['unit_directory'], str(self.units))
+        self.assertEqual(shlex.split(status['admin'])[-2:], ['--root', str(self.root)])
+
+    def test_a_damaged_creation_record_is_said_as_a_sentence_without_a_path(self):
+        """kittrial-5bb.149: the register route asks here, since the endpoint serves such a project."""
+        records = self.root / 'project-creations'
+        records.mkdir()
+        (records / 'alpha.json').write_text('{not json', encoding='utf-8')
+        said = self.status()['creation_record']
+        self.assertEqual(said, 'The creation record of project alpha is damaged; an operator must look at it first')
+        self.assertNotIn(str(self.root), said)
 
     def test_guidance_states_and_never_its_text(self):
         guidance.write_guidance(self.project, 'A SECRET INSTRUCTION', 'operator-1')
@@ -472,20 +543,36 @@ class EndpointSetupTests(fixes.EndpointCase):
     def test_the_host_steps_follow_the_host(self):
         steps = by_id(self.setup())
         self.assertEqual((steps['guidance']['state'], steps['onboarding']['state']), ('todo', 'todo'))
-        self.assertEqual(steps['guidance']['command'], 'admin.py set-guidance %s --actor OPERATOR --file FILE'
-                         % self.project)
-        self.assertEqual(steps['onboarding']['command'], 'admin.py set-onboarding %s --file FILE' % self.project)
+        # Each is a shell command that begins as the host says its commands begin: `admin.py ...` alone
+        # is not on PATH and, in a release, not executable (kittrial-5bb.200).
+        for name, words, replace in (('guidance', 'set-guidance %s --actor OPERATOR --file FILE', ['OPERATOR', 'FILE']),
+                                     ('onboarding', 'set-onboarding %s --file FILE', ['FILE'])):
+            self.assertEqual(len(steps[name]['commands']), 1)
+            one = steps[name]['commands'][0]
+            self.assertEqual((one['kind'], one['replace']), ('shell-fill', replace))
+            begins, _, rest = one['text'].partition(' --root ')
+            self.assertTrue(begins.endswith('admin.py') or begins.endswith("admin.py'"), one['text'])
+            self.assertGreater(len(begins.split()), 1, one['text'])              # an interpreter, then admin.py
+            self.assertTrue(rest.endswith(' ' + words % self.project), one['text'])
+            self.assertEqual(steps[name]['command'], one['text'])
+            for word in replace:
+                self.assertIn('Replace ', one['note'])
+                self.assertIn(word, one['note'])
         self.assertIn(steps['backup']['state'], ('todo', 'done', 'unknown'))
-        self.assertIn('backup --all', steps['backup']['command'] or 'backup --all')
-        for name in ('guidance', 'onboarding'):
-            self.assertEqual(steps[name]['who'], 'operator')
-            self.assertIn('cannot do this step', steps[name]['note'])
+        self.assertEqual([one['kind'] for one in steps['backup']['commands']] if steps['backup']['state'] != 'done' else
+                         ['shell', 'unit-line', 'shell'], ['shell', 'unit-line', 'shell'])
+        # Guidance is the operator's alone. Onboarding an owner may set on the page, or the operator on the server.
+        self.assertEqual((steps['guidance']['who'], steps['onboarding']['who']), ('operator', 'owner-or-operator'))
+        self.assertIn('cannot do this step', steps['guidance']['note'])
+        self.assertIn('It is not the standing guidance, which only an operator sets', steps['onboarding']['note'])
+        self.assertEqual(steps['onboarding']['link'], '/v1/projects/%s/onboarding' % self.project)
         guidance.write_guidance(self.path, 'A SECRET INSTRUCTION', 'operator-1')
         (self.path / 'ONBOARDING.md').write_text('Read the SECRET runbook first.\n', encoding='utf-8')
         body = self.setup()
         steps = by_id(body)
         self.assertEqual((steps['guidance']['state'], steps['onboarding']['state']), ('done', 'done'))
         self.assertIsNone(steps['guidance']['command'])
+        self.assertEqual((steps['guidance']['commands'], steps['onboarding']['commands']), ([], []))
         self.assertEqual(body['host'], 'available')
         self.assertNotIn('SECRET', json.dumps(body))
         # A guidance file whose record does not match is not "done".
@@ -507,13 +594,17 @@ class EndpointSetupTests(fixes.EndpointCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(state), encoding='utf-8')
         rows = self.request('GET', '/v1/projects/%s/tasks' % self.project, token=self.admin).data
-        self.assertIn('%s-merge-slot' % self.project, [row['id'] for row in rows['items']], rows)
+        # The slot is not in the task list at all (kittrial-5bb.113), so it cannot be counted.
+        self.assertNotIn('%s-merge-slot' % self.project, [row['id'] for row in rows['items']], rows)
         self.assertEqual(by_id(self.setup())['first-task']['state'], 'todo')
         self.assertEqual(201, self.create_task(self.admin, self.project, 'first').status)
         step = by_id(self.setup())['first-task']
         self.assertEqual((step['state'], step['detail']), ('done', '1 task(s) defined.'))
+        # One rule, the kit's: the exact id PROJECT-merge-slot (or the merge-slot type).
+        self.assertTrue(project_setup.is_merge_slot({'id': 'alpha-merge-slot', 'labels': ['gt:slot']}, 'alpha'))
         self.assertTrue(project_setup.is_merge_slot({'id': 'alpha-merge-slot', 'labels': []}, 'alpha'))
-        self.assertTrue(project_setup.is_merge_slot({'id': 'x', 'labels': ['gt:slot']}, 'alpha'))
+        self.assertFalse(project_setup.is_merge_slot({'id': 'alpha-x-merge-slot', 'labels': ['gt:slot']}, 'alpha'))
+        self.assertFalse(project_setup.is_merge_slot({'id': 'x', 'labels': ['gt:slot']}, 'alpha'))
         self.assertFalse(project_setup.is_merge_slot({'id': 'alpha-1', 'labels': ['bug']}, 'alpha'))
 
     def test_an_endpoint_without_the_action_reads_not_available_and_does_not_fail(self):
@@ -539,12 +630,45 @@ class EndpointSetupTests(fixes.EndpointCase):
                 'onboarding': {'state': 'not-set', 'updated_at': None}, 'backup': block}
             body = self.setup()
             return by_id(body)['backup'], body
+        # An endpoint older than this service says the line and nothing that can be pasted: the page is
+        # given the line as a line of a unit file, never as a command.
         step, body = host('not-covered')
         self.assertEqual((step['state'], step['command']), ('todo', line))
-        self.assertIn('No scheduled backup on the server covers this project', step['detail'])
+        self.assertEqual([(one['kind'], one['text']) for one in step['commands']], [('unit-line', line)])
+        self.assertIn('not a shell command', step['commands'][0]['label'])
         self.assertIn('backup', [item['id'] for item in body['steps'] if item['state'] == 'todo'])
+        # This kit's endpoint: what to run now, the line for a schedule, and the check, each labelled.
+        run, check = '/opt/py/bin/python3 /opt/kit/admin.py --root /srv/rt backup --all', \
+            '/opt/py/bin/python3 /opt/kit/admin.py --root /srv/rt backup-status --require-complete'
+        step, _ = host('not-covered', run_now=run, check=check, unit_directory='/home/svc/.config/systemd/user')
+        self.assertEqual([(one['kind'], one['text']) for one in step['commands']],
+                         [('shell', run), ('unit-line', line), ('shell', check)])
+        self.assertEqual(step['command'], run)                     # what an older page shows can be pasted
+        labels = [one['label'] for one in step['commands']]
+        self.assertTrue(labels[0].startswith('Run a backup now (a shell command'))
+        self.assertTrue(labels[1].startswith('The line for a schedule (a line of a systemd unit file, not a shell command)'))
+        self.assertIn('[Service] section of a beads-*backup*.service unit in /home/svc/.config/systemd/user', step['commands'][1]['note'])
+        self.assertIn('To check, reload this page', step['commands'][1]['note'])
+        self.assertIn('It does not schedule anything', step['commands'][0]['note'])
+        self.assertNotIn('with the command shown', step['note'])
+        # The state says WHICH of the two is missing: a backup that was run, a schedule that will run the next.
+        self.assertIn('No backup of this project has been run, and no schedule on the server covers it: both are missing',
+                      step['detail'])
+        ran = {'status': 'complete', 'completed_at': '2026-10-07T09:00:00Z', 'degraded': False, 'scope': 'all'}
+        step, _ = host('not-covered', run_now=run, last_run=ran)
+        self.assertEqual(step['state'], 'todo')
+        self.assertIn('A backup of this project was run on 2026-10-07 and recorded it complete, but no schedule on the '
+                      'server covers it, so it will not be backed up again by itself. What is missing is the schedule.',
+                      step['detail'])
+        self.assertNotIn('The last backup run recorded', step['detail'])
+        self.assertIn('a schedule kept anywhere else is not seen here', step['detail'])
+        step, _ = host('covered', last_run=ran)
+        self.assertEqual((step['state'], step['commands'], step['command']), ('done', [], None))
+        self.assertEqual(step['detail'], 'A scheduled backup on the server covers this project. A backup of this project '
+                                         'was run on 2026-10-07 and recorded it complete.')
         step, body = host('covered')
         self.assertEqual(step['state'], 'done')
+        self.assertIn('It has not run yet: no backup run has recorded this project.', step['detail'])
         self.assertNotIn('backup', [item['id'] for item in body['steps'] if item['state'] == 'todo'])
         step, _ = host('unknown', reason='no-account-home')
         self.assertEqual(step['state'], 'unknown')
@@ -566,6 +690,151 @@ class EndpointSetupTests(fixes.EndpointCase):
                          ['unknown'] * 3)
         self.backend.setup_status = lambda project_id: 'not an object'
         self.assertEqual(self.setup()['host'], 'unknown')
+
+
+class FollowUpTests(test_http_agents.AgentHarness):
+    """kittrial-5bb.123: what the part 1 reviews asked for, on the in-process service."""
+
+    def setUp(self):
+        super().setUp()
+        self.admin = self.admin_token()
+        self.project = self.create_project(self.admin, 'Alpha')
+        self.olive_id = self.create_account(self.admin, 'olive', 'olive-password-1')
+        self.request('PUT', '/v1/projects/%s/members/%s' % (self.project, self.olive_id), {'role': 'owner'},
+                     token=self.admin)
+        self.olive = self.login('olive', 'olive-password-1')[0]
+        self.url = '/v1/projects/%s' % self.project
+
+    def patch_repository(self, value, token=None):
+        return self.request('PATCH', self.url, {'repository': value}, token=token or self.olive)
+
+    def test_the_note_travels_with_the_value_on_the_two_project_routes(self):
+        agent = self.request('POST', '/v1/agents', {'name': 'Kestrel', 'working_directory': '/home/olive/k',
+                                                    'projects': [self.project]}, token=self.olive)
+        secret = agent.data['credential']['secret']
+        for token in (self.olive, secret):
+            one = self.request('GET', self.url, token=token).data
+            self.assertEqual((one['repository'], one['repository_note']), (None, None))
+        self.assertEqual(200, self.patch_repository('git@git.example:team/alpha.git').status)
+        for label, token in (('a member', self.olive), ('an agent credential', secret)):
+            with self.subTest(reader=label):
+                one = self.request('GET', self.url, token=token).data
+                self.assertEqual(one['repository'], 'git@git.example:team/alpha.git')
+                self.assertIn('never run it as a command', one['repository_note'])
+                listed = [p for p in self.request('GET', '/v1/projects', token=token).data['items']
+                          if p['id'] == self.project][0]
+                self.assertEqual((listed['repository'], listed['repository_note']),
+                                 (one['repository'], one['repository_note']))
+
+    def test_a_value_stored_under_an_earlier_rule_is_withheld_and_flagged(self):
+        agent = self.request('POST', '/v1/agents', {'name': 'Kestrel', 'working_directory': '/home/olive/k',
+                                                    'projects': [self.project]}, token=self.olive)
+        secret = agent.data['credential']['secret']
+        task = self.request('POST', self.url + '/tasks', {'title': 'first'}, token=self.olive).data['id']
+        for stored in ('https://TOKEN-abc@git.example/team/alpha.git', 'C:/git/alpha.git', '../alpha'):
+            with self.subTest(stored=stored):
+                self.service.state['projects'][self.project]['repository'] = stored
+                one = self.request('GET', self.url, token=self.olive).data
+                self.assertEqual((one['repository'], one['repository_note'], one['repository_needs_attention']),
+                                 (None, None, True))
+                # Not delivered to an agent anywhere, and never echoed.
+                nxt = self.request('GET', '/v1/agents/me/next', token=secret).data
+                self.assertEqual((nxt['projects'][0]['repository'], nxt['repositories_note']), (None, None))
+                brief = self.request('GET', self.url + '/tasks/%s/brief' % task, token=secret).data
+                self.assertEqual((brief['project_repository'], brief['project_repository_note']), (None, None))
+                made = self.request('POST', '/v1/agents', {'name': 'Second ' + stored[:3].strip('./:'),
+                                                           'working_directory': '/home/olive/s',
+                                                           'projects': [self.project]}, token=self.olive)
+                self.assertEqual(made.data['setup']['repositories'], [])
+                step = by_id(self.request('GET', self.url + '/setup', token=self.olive).data)['repository']
+                self.assertEqual(step['state'], 'todo')
+                self.assertIn('no longer fits', step['detail'])
+                for answer in (one, nxt, brief, step):
+                    self.assertNotIn('TOKEN-abc', json.dumps(answer))
+        # The stored record is not rewritten by a read; an owner records it again.
+        self.assertEqual(self.service.state['projects'][self.project]['repository'], '../alpha')
+        self.assertEqual(200, self.patch_repository('git@git.example:team/alpha.git').status)
+        one = self.request('GET', self.url, token=self.olive).data
+        self.assertEqual((one['repository'], one['repository_needs_attention']),
+                         ('git@git.example:team/alpha.git', False))
+
+    def test_a_user_name_or_path_segment_that_begins_like_a_token_is_accepted_with_a_warning(self):
+        token = '0123456789abcdefghij'
+        for value in ('ssh://ghp_0123456789abcdef@git.example/team/alpha.git', 'glpat-%s@git.example:team/alpha.git' % token,
+                      'https://git.example/team/github_pat_%s/alpha.git' % token, '/srv/git/xoxb-%s/alpha.git' % token,
+                      # Review 01a109cc: upper case, a beginning inside a segment, forty hexadecimal digits.
+                      'https://git.example/team/GHP_%s/alpha.git' % token.upper(), 'https://git.example/x.ghp_%s.git' % token,
+                      'https://git.example/team/' + '0123456789abcdef0123456789abcdef01234567' + '/alpha.git'):
+            with self.subTest(value=value[:24]):
+                self.assertEqual(200, self.patch_repository(value).status)
+                one = self.request('GET', self.url, token=self.olive).data
+                self.assertIn('looks like an access token', one['repository_warning'])
+                self.assertNotIn(value, one['repository_warning'])
+                step = by_id(self.request('GET', self.url + '/setup', token=self.olive).data)['repository']
+                self.assertEqual((step['state'], step['warning']), ('done', one['repository_warning']))
+        # A name that only starts like a token is a name: no warning.
+        for value in ('git@git.example:team/alpha.git', 'ssh://sk-team@git.example/team/alpha.git',
+                      'https://git.example/sk-tools/alpha.git', 'https://git.example/team/' + 'a1' * 21 + '/x.git'):
+            with self.subTest(plain=value[:30]):
+                self.assertEqual(200, self.patch_repository(value).status)
+                one = self.request('GET', self.url, token=self.olive).data
+                self.assertIsNone(one['repository_warning'])
+        # Leftovers of the same review: these are refused, and their well-formed neighbours accepted.
+        for value in ('https://git.example:00080/team/a.git', '/', 'git@c:x.git', 'https://git.example/a/.../b.git'):
+            with self.subTest(refused=value):
+                self.assertEqual(422, self.patch_repository(value).status)
+        for value in ('https://git.example:8080/team/a.git', '/srv/git/a.git', 'git@gh:x.git', 'https://git.example/a/.b/c.git'):
+            with self.subTest(accepted=value):
+                self.assertEqual(200, self.patch_repository(value).status)
+        self.assertEqual(200, self.patch_repository('git@git.example:team/alpha.git').status)
+        one = self.request('GET', self.url, token=self.olive).data
+        self.assertIsNone(one['repository_warning'])
+        self.assertNotIn('warning', by_id(self.request('GET', self.url + '/setup', token=self.olive).data)['repository'])
+
+    def test_each_layer_of_the_repository_route_refuses_on_its_own(self):
+        """Three checks stand behind another check; each is exercised with the other one taken away."""
+        contributor = self.create_account(self.admin, 'carl', 'carl-password-1')
+        self.request('PUT', '/v1/projects/%s/members/%s' % (self.project, contributor), {'role': 'contributor'},
+                     token=self.admin)
+        carl = self.login('carl', 'carl-password-1')[0]
+        agent = self.request('POST', '/v1/agents', {'name': 'Kestrel', 'working_directory': '/home/olive/k',
+                                                    'projects': [self.project]}, token=self.olive)
+        secret = agent.data['credential']['secret']
+        value = 'git@git.example:team/alpha.git'
+        # (A4) The PATCH route's own capability check, with the service method's check taken away.
+        with patch.object(type(self.service), 'set_project_repository',
+                          lambda service, principal, project_id, repository, request_id=None:
+                          {'id': project_id, 'repository': repository}):
+            self.assertEqual(403, self.patch_repository(value, token=carl).status)
+            self.assertEqual(403, self.patch_repository(value, token=secret).status)
+            self.assertEqual(200, self.patch_repository(value).status)          # the stand-in itself answers an owner
+        # (A6) The service method's own refusal of a credential, called directly.
+        with self.assertRaises(http_auth.HttpError) as caught:
+            self.service.set_project_repository(self.service.authenticate(secret), self.project, value)
+        self.assertEqual((caught.exception.status, caught.exception.message),
+                         (403, 'Session authority required to change a project'))
+        # (A3) The setup route's refusal of a credential, with the capability check letting it through.
+        with patch.object(type(self.service), 'check_authority', lambda *args, **kwargs: {'role': 'owner'}):
+            answer = self.request('GET', self.url + '/setup', token=secret)
+        self.assertEqual((403, 'Session authority required'), (answer.status, answer.data['error']['message']))
+        self.assertNotIn('repository', self.service.state['projects'][self.project])
+
+
+class RemainingCountTests(fixes.EndpointCase):
+    """kittrial-5bb.123 item 7: a step the server could not check is counted, not hidden."""
+
+    def test_an_unknown_step_is_counted_as_could_not_be_checked(self):
+        admin = self.admin_token()
+        project = self.create_project(admin, 'Alpha')
+
+        def failing(project_id):
+            raise http_auth.HttpError(503, 'uncertain', 'Canonical command failed; outcome may be unknown')
+        self.backend.setup_status = failing
+        body = self.request('GET', '/v1/projects/%s/setup' % project, token=admin).data
+        states = [item['state'] for item in body['steps']]
+        self.assertEqual((body['unchecked'], states.count('unknown')), (3, 3))
+        self.assertEqual(body['remaining'], states.count('todo'))
+
 
 
 class SetupScreenTests(test_http_agents.AgentHarness):
@@ -611,9 +880,26 @@ class SetupScreenTests(test_http_agents.AgentHarness):
         self.assertEqual(steps['members']['links'], ['#/p/%s/settings' % project])
         # A step still to do leads with the way there; a done one keeps a quiet link.
         self.assertEqual((steps['first-task']['linkTexts'], steps['members']['linkTexts']), (['Go there'], ['Open']))
+        # No host behind this service, so it cannot say how its commands begin: the words to replace are named.
         self.assertEqual(steps['guidance']['commands'],
-                         ['admin.py set-guidance %s --actor OPERATOR --file FILE' % project])
+                         ['PYTHON KIT/admin.py --root RUNTIME_ROOT set-guidance %s --actor OPERATOR --file FILE' % project])
+        self.assertIn('PYTHON is the interpreter the kit runs under', steps['guidance']['text'])
         self.assertIn('The web interface cannot do this step', steps['guidance']['text'])
+        # kittrial-5bb.200: each thing to copy is shown under its label with its own button, and a line of a
+        # unit file is not called a command.
+        shown = seen['labelled']
+        self.assertEqual(shown['kinds'], ['shell', 'unit-line', 'shell'])
+        self.assertEqual(shown['texts'], ['/opt/py/bin/python3 /opt/kit/admin.py --root /srv/rt backup --all',
+                                          'ExecStart=/opt/py/bin/python3 /opt/kit/admin.py --root /srv/rt backup --all',
+                                          '/opt/py/bin/python3 /opt/kit/admin.py --root /srv/rt backup-status --require-complete'])
+        self.assertEqual(shown['labels'], ['Run a backup now (a shell command)', 'The line for a schedule (not a shell command)',
+                                           'Check'])
+        self.assertEqual(shown['buttons'], ['Copy command', 'Copy line', 'Copy command'])
+        self.assertIn('It goes in the [Service] section', shown['text'])
+        # A service older than the page sends one `command`: it is still shown, as before.
+        self.assertEqual(seen['older'], {'kinds': ['shell'], 'texts': ['admin.py set-guidance p1 --actor OPERATOR --file FILE'],
+                                         'buttons': ['Copy command']})
+        self.assertEqual(seen['none'], {'kinds': [], 'texts': [], 'buttons': []})
         self.assertIn('does not check that the repository exists', steps['repository']['text'])
 
         # The repository form.
@@ -638,7 +924,130 @@ class SetupScreenTests(test_http_agents.AgentHarness):
         self.assertEqual(seen['routes'], {'members': '/p/p1/settings', 'task': '/p/p1/new', 'agent': '/agents',
                                           'guidance': None})
         self.assertEqual(seen['summary'], ['Nothing is left to do here.', '1 step is left.', '4 steps are left.'])
+        # kittrial-5bb.123: a step that could not be checked is said; a token-like value is warned about.
+        self.assertEqual(seen['unchecked'], ['1 step could not be checked.', '2 steps could not be checked.',
+                                             '2 steps are left. 1 step could not be checked.'])
+        self.assertEqual(seen['uncheckedHint'], '1 setup step could not be checked. See the setup steps')
+        self.assertIsNone(seen['noHintWhenAllDone'])
+        self.assertEqual(len(seen['warning']), 1)
+        self.assertIn('looks like an access token', seen['warning'][0])
+        self.assertEqual(seen['noWarning'], 0)
+        # The review rule of the installation (kittrial-5bb.199): said when the service says it, and
+        # nothing at all is added to the page when it does not.
+        self.assertEqual(seen['rule'], [
+            [[], [], 2], [[], [], 2],
+            [['true'], ['On this server nobody approves or recomm'], 3],
+            [['false'], ['On this server an owner may approve work'], 3],
+            [[], [], 2]])
 
 
 if __name__ == '__main__':
     unittest.main()
+
+
+@unittest.skipUnless(os.name == 'posix', 'the commands are pasted into a POSIX shell on the server')
+class PastedIntoAShellTests(unittest.TestCase):
+    """kittrial-5bb.200: James pasted what the backup step called "the command" and the shell answered
+    Permission denied, because it was a line of a unit file (``ExecStart=...``). Whatever a step labels
+    as a shell command is run here through ``sh -c`` exactly as shown, by this kit's own admin.py."""
+
+    NOT_A_COMMAND = (126, 127)            # the shell's own: cannot execute, not found
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
+        self.root = Path(os.path.realpath(self.tmp.name)) / 'runtime'
+        (self.root / 'projects' / 'alpha' / '.beads').mkdir(parents=True)
+        (self.root / 'projects' / 'alpha' / '.beads' / 'metadata.json').write_text('{}', encoding='utf-8')
+        self.status = admin.project_setup_status(self.root, 'alpha')
+
+    def pasted(self, text):
+        return subprocess.run(['sh', '-c', text], capture_output=True, text=True, timeout=300, cwd=self.tmp.name,
+                              env=dict(os.environ, HOME=self.tmp.name))
+
+    def ran_admin(self, done):
+        """The shell found and started the program: whatever came back is admin.py's own answer."""
+        said = done.stdout + done.stderr
+        self.assertNotIn(done.returncode, self.NOT_A_COMMAND, said)
+        for words in ('ermission denied', 'command not found'):
+            self.assertNotIn(words, said)
+        return said
+
+    def test_the_unit_line_is_not_a_command_and_that_was_the_fault(self):
+        line = self.status['backup']['line']
+        self.assertTrue(line.startswith('ExecStart='))
+        done = self.pasted(line)
+        self.assertIn(done.returncode, self.NOT_A_COMMAND)
+        self.assertIn('ermission denied', done.stderr)        # sh reads ExecStart=... as a variable and runs admin.py itself
+        self.assertFalse(os.access(str(KIT / 'admin.py'), os.X_OK), 'admin.py is not executable, and should not be made so')
+
+    def test_what_the_backup_step_labels_a_shell_command_runs_as_shown(self):
+        commands = {one['kind'] + ':' + one['label'][:5]: one for one in self.step('backup')['commands']}
+        self.assertEqual(sorted(commands), ['shell:Check', 'shell:Run a', 'unit-line:The l'])
+        for key in ('shell:Run a', 'shell:Check'):
+            with self.subTest(command=key):
+                self.assertEqual(commands[key]['replace'], [])
+                said = self.ran_admin(self.pasted(commands[key]['text']))
+                # A scratch runtime has no database behind it, so admin.py answers in its own words
+                # (a refusal, or its own traceback): the point is that it was admin.py that answered.
+                self.assertTrue('admin.py' in said or 'backup' in said.lower(), said)
+        self.assertEqual(commands['unit-line:The l']['text'], self.status['backup']['line'])
+
+    def test_the_fill_in_commands_run_once_their_words_are_replaced(self):
+        text = Path(self.tmp.name) / 'text.md'
+        text.write_text('Read this first.\n', encoding='utf-8')
+        onboarding = self.step('onboarding')['commands'][0]
+        self.assertEqual((onboarding['kind'], onboarding['replace']), ('shell-fill', ['FILE']))
+        done = self.pasted(onboarding['text'].replace('FILE', str(text)))
+        self.ran_admin(done)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual((self.root / 'projects' / 'alpha' / 'ONBOARDING.md').read_text(encoding='utf-8').strip().splitlines()[-1],
+                         'Read this first.')
+        guidance_step = self.step('guidance')['commands'][0]
+        self.assertEqual((guidance_step['kind'], guidance_step['replace']), ('shell-fill', ['OPERATOR', 'FILE']))
+        done = self.pasted(guidance_step['text'].replace('OPERATOR', 'nobody-listed').replace('FILE', str(text)))
+        said = self.ran_admin(done)
+        self.assertNotEqual(done.returncode, 0)                   # admin.py's own refusal: the name is on no operator list
+        self.assertIn('operator', said.lower())
+        # As it stands, with its words not replaced, it is still a command the shell can start.
+        self.ran_admin(self.pasted(onboarding['text']))
+
+    def test_what_add_project_prints_for_the_schedule_is_labelled_and_its_command_runs(self):
+        """It printed the unit-file line alone, as "A schedule that covers every project ... is:"."""
+        with patch.dict(os.environ, {'HOME': self.tmp.name}):
+            covered, said = admin.scheduled_backup_coverage(self.root, 'alpha')
+        self.assertFalse(covered)
+        lines = said.splitlines()
+        now = lines.index('To run a backup of every project now, as this account (a shell command):')
+        self.assertEqual(lines[now + 1].strip(), self.status['backup']['run_now'])
+        unit = next(index for index, line in enumerate(lines) if line.startswith('The line for a schedule (a line of a systemd unit file, not a shell command;'))
+        self.assertIn('[Service] section of a beads-*backup*.service unit in %s/.config/systemd/user' % self.tmp.name, lines[unit])
+        self.assertEqual(lines[unit + 1].strip(), self.status['backup']['line'])
+        check = lines.index('To check afterwards: `systemctl --user list-timers`, and')
+        self.assertEqual(lines[check + 1].strip(), self.status['backup']['check'])
+        # Every line that begins ExecStart= stands under the label that says it is not a command.
+        self.assertEqual([index for index, line in enumerate(lines) if line.strip().startswith('ExecStart=')], [unit + 1])
+        self.ran_admin(self.pasted(lines[now + 1].strip()))
+        self.ran_admin(self.pasted(lines[check + 1].strip()))
+        self.assertEqual(admin.schedule_text(self.root).count('ExecStart='), 1)
+
+    def step(self, identifier):
+        """The step as the page is given it, from this runtime's own host status."""
+        class Backend:
+            def setup_status(_, project_id):
+                return self.status
+
+            def read_tasks(_, project_id):
+                return {'items': []}
+
+        class Service:
+            def project_view(_, principal, project_id):
+                return {'id': project_id, 'name': 'Alpha', 'repository': None}
+
+            def list_members(_, principal, project_id):
+                return [{}]
+
+            def list_project_agents(_, principal, project_id):
+                return []
+        handler = type('Handler', (), {'service': Service(), 'backend': Backend()})()
+        principal = type('Principal', (), {'user_id': 'u1', 'superuser': True})()
+        return by_id(project_setup.steps(handler, principal, 'alpha'))[identifier]

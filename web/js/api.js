@@ -102,6 +102,16 @@ export function createApi(transport) {
     project: (pid) => call('GET', `/v1/projects/${pid}`),
     createProject: (name) => mutate('POST', '/v1/projects', { name }),
     registerProject: (projectId, name) => mutate('POST', '/v1/projects', name ? { project_id: projectId, name } : { project_id: projectId }),
+    // Create the project on the server as well (an account a superuser granted that, or a superuser).
+    createHostProject: (projectId, name) => mutate('POST', '/v1/projects', name ? { project_id: projectId, name, create: true } : { project_id: projectId, create: true }),
+    // Superuser only: creations that stopped half way, and who may create projects.
+    projectCreations: () => call('GET', '/v1/project-creations'),
+    setProjectGrant: (uid, limit) => mutate('PUT', `/v1/accounts/${uid}/project-grant`, { limit }),
+    clearProjectGrant: (uid) => mutate('DELETE', `/v1/accounts/${uid}/project-grant`),
+    // The project's onboarding text, set by an owner (guidance stays with the operator).
+    onboarding: (pid) => call('GET', `/v1/projects/${pid}/onboarding`),
+    setOnboarding: (pid, text) => mutate('PUT', `/v1/projects/${pid}/onboarding`, { text }),
+    clearOnboarding: (pid) => mutate('DELETE', `/v1/projects/${pid}/onboarding`),
     archiveProject: (pid) => mutate('POST', `/v1/projects/${pid}/archive`, {}),
     // The setup steps of a project (owners and superusers), and where its repository is.
     projectSetup: (pid) => call('GET', `/v1/projects/${pid}/setup`),
@@ -128,11 +138,16 @@ export function createApi(transport) {
     queue: (pid, params) => call('GET', `/v1/projects/${pid}/queue`, { params }),
     myWork: () => call('GET', '/v1/me/work'),
     agents: () => call('GET', '/v1/agents'),
+    // A document of the installed kit, as the client's `docs NAME` serves it (kittrial-5bb.226).
+    docs: () => call('GET', '/v1/docs'),
+    doc: (name) => call('GET', `/v1/docs/${name}`),
     createAgent: (body) => mutate('POST', '/v1/agents', body),
     updateAgent: (aid, body) => mutate('PATCH', `/v1/agents/${aid}`, body),
     agent: (aid) => call('GET', `/v1/agents/${aid}`),
     // A NEW credential for the agent; its secret is in this one response only.
-    issueAgentCredential: (aid) => mutate('POST', `/v1/agents/${aid}/credentials`, { label: 'web: new secret' }),
+    // With no list the new credential carries what the agent has; a list sets what it has from now on
+    // (kittrial-5bb.208). The page sends a list only from "What it may do" on the agent's card.
+    issueAgentCredential: (aid, scopes) => mutate('POST', `/v1/agents/${aid}/credentials`, scopes ? { label: 'web: new secret', scopes } : { label: 'web: new secret' }),
     revokeAgentCredential: (aid, cid) => mutate('POST', `/v1/agents/${aid}/credentials/${cid}/revoke`, {}),
     // requirement proposals (identity is the session's; the submitter is never sent)
     proposals: (pid, params) => call('GET', `/v1/projects/${pid}/proposals`, { params }),

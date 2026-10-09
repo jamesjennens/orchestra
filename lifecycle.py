@@ -1,4 +1,12 @@
 """Evidence-scoped lifecycle facts carried by native Beads state events."""
+import sys
+if sys.version_info < (3, 10):
+    # Before every other import, and in syntax Python 3.6 reads: an older interpreter failed in
+    # an import further down, with a traceback that hid the cause (kittrial-5bb.191).
+    sys.stderr.write('lifecycle.py needs Python 3.10 or newer and was started with Python %d.%d.%d (%s). '
+                     'Nothing was carried out. Run it with Python 3.10 or newer.\n'
+                     % (sys.version_info[0], sys.version_info[1], sys.version_info[2], sys.executable))
+    sys.exit(2)
 import argparse
 import hashlib
 import json
@@ -54,21 +62,60 @@ RELEASE_TARGETS_MAX = 200
 RELEASE_OPERATION_MAX = 110
 # A release is sent as one request per group so the project lock is released
 # between groups and no single request can approach the client's 150 s timeout.
-# A smaller default group keeps one request well inside that timeout: a measured
-# real project paid 1.6 to 1.7 s per target, so the old default of 50 could reach
-# ~86 s and a group of 200 timed out at 150 s. 25 targets is ~45 s at that rate.
+# The default group is DERIVED from the native writes a group costs instead of a
+# fixed target count (kittrial-5bb.139 review item 1): one group may cost
+# RELEASE_GROUP_WRITE_BUDGET native `set-state` processes, which is the client
+# timeout at DRY_RUN_SECONDS_PER_WRITE (15 s + 1.5 s * 90 = 150 s). A first
+# deployment writes three processes per target, so its historical
+# RELEASE_CHUNK_DEFAULT group (75 writes) is kept; a release to a further
+# environment of already-labelled tasks costs five processes per target and a
+# `--live-verified` one six or seven, so the group shrinks instead of the run
+# telling the operator to lower a size the kit itself picked.
 RELEASE_CHUNK_DEFAULT = 25
-# Conservative per-target budget quoted by `release --dry-run`. The measured
-# in-memory harness on the authoritative Linux host is far below it, but a real
-# `bd` binary on a large project paid 1.6 to 1.7 s per target when each target cost
-# ONE write. Rev2 made each target cost THREE writes (scope, deployed, live) and
-# the reviewer then measured 438 s for 201 targets (2.18 s per target), against the
-# old 2.0 s/target figure, so that figure was no longer an upper bound (rev3 item
-# 3.3). The budget is now 3.0 s per target - about 1.0 s per native write - plus
-# 15 s of per-request overhead, so 201 targets estimate 618 s and a 25-target group
-# (the default) 90 s, well inside the client's 150 s timeout.
-DRY_RUN_SECONDS_PER_TARGET = 3.0
+# The native `set-state` processes one request group may cost. 90 writes keep the
+# group estimate at exactly the 150 s client timeout
+# (DRY_RUN_FIXED_SECONDS + DRY_RUN_SECONDS_PER_WRITE * RELEASE_GROUP_WRITE_BUDGET),
+# so a default group the kit picks for itself never trips the timeout warning.
+RELEASE_GROUP_WRITE_BUDGET = 90
+# A single request must stay inside the client's 150 s timeout.
+RELEASE_CLIENT_TIMEOUT_SECONDS = 150.0
+# `release --dry-run` prints `expected_seconds`, a conservative ESTIMATE for the
+# resolved page and not a guaranteed bound (kittrial-5bb.119 item 4). It is
+# computed per NATIVE WRITE, because one `bd set-state` process is what a release
+# really pays for. A new target costs THREE writes (scope, deployed, live) and a
+# `--live-verified` first deployment costs FOUR (the extra live-verified fact); a
+# verify-only target costs ONE. `_apply_fact` pays ONE EXTRA process for a fact
+# whose target value the task already carries, because it rewrites the label
+# through an intermediate `pending` value first; release_planned_native_writes
+# counts those, so a --live-verified release to a second environment of
+# already-labelled tasks is 1.5 native writes per planned fact (six processes for
+# four facts) and 1.75 once the task was verified before (seven), and the estimate
+# is not exceeded in the reviewer's 25-target 179 s worst case (kittrial-5bb.139
+# item 2). A clean re-measurement of the delivered kit on real bd 1.2.2 + Dolt (two
+# runs) measured 0.43 to 0.57 s per `bd` process and up to 0.92 s per planned fact
+# in the slowest case (DRY_RUN_MEASURED_SECONDS_PER_WRITE); the policy keeps 1.5 s
+# per native write, which also covers the reviewer's measured 1.47 s per planned
+# fact, and replaced the per-TARGET figure taken under a concurrent suite
+# (kittrial-5bb.119 review items 3 and 4; kittrial-5bb.139 items 2 and 3).
+DRY_RUN_SECONDS_PER_WRITE = 1.5
 DRY_RUN_FIXED_SECONDS = 15.0
+DRY_RUN_WRITES_PLAIN = 3
+DRY_RUN_WRITES_VERIFIED = 4
+DRY_RUN_WRITES_VERIFY_ONLY = 1
+# The extra `set-state` process `_apply_fact` pays for a fact the task already
+# carries (it rewrites the label through `pending` first). release_planned_native_
+# writes adds it per dimension so the estimate counts processes, not facts
+# (kittrial-5bb.139 item 2).
+DRY_RUN_PENDING_REWRITE_EXTRA = 1
+# The measured floors ReleaseCostEstimateTests hard-codes, so weakening the
+# constants the estimate rests on - or zeroing the fixed part - fails the suite
+# (kittrial-5bb.119 p3 item 3). DRY_RUN_MEASURED_SECONDS_PER_WRITE is this
+# revision's clean re-measurement of the delivered kit on real bd 1.2.2 + Dolt
+# (the slowest measured run, a first --live-verified deployment to a second
+# environment); DRY_RUN_SECONDS_PER_WRITE is kept above it and above the
+# reviewer's 1.47 s per planned fact.
+DRY_RUN_MEASURED_SECONDS_PER_WRITE = 1.0
+DRY_RUN_MEASURED_FIXED_SECONDS = 15.0
 # The writing command asks the endpoint which integrations are reverted; the
 # offline dry run cannot, so it says plainly that its local revert view may list a
 # target the writing run skips (rev3 item 3.4).
@@ -145,7 +192,7 @@ def validate_payload(p):
 
 
 def native_event(row):
-    if row.get('issue_type')!='event':return None
+    if not isinstance(row, dict) or row.get('issue_type')!='event' or row.get('malformed') or not row.get('id'):return None
     match=re.fullmatch(r'(?:Set |Changed )([A-Za-z0-9-]+)(?: from [^\n]+)? to ([^\n]+)(?:\n\nReason: ([\s\S]*))?',row.get('description',''))
     parents=[d.get('depends_on_id') for d in row.get('dependencies',[]) if d.get('type')=='parent-child']
     if len(parents)!=1:return None
@@ -206,6 +253,9 @@ def scoped_event(events,task,dim,scope):
 
 def events_by_dimension(rows):
     """Every exported lifecycle-shaped state event, grouped by (task, dimension)."""
+    # An unreadable event has no trustworthy parent or dimension. An older
+    # readable fact cannot establish current truth for any task in this snapshot.
+    if unreadable_events(rows):return {}
     events={}
     for row in rows:
         event=native_event(row)
@@ -232,7 +282,7 @@ def trusted_payloads(rows,events=None):
     if events is None:events=events_by_dimension(rows)
     trusted={}
     for row in rows:
-        if row.get('issue_type')=='event':continue
+        if not isinstance(row, dict) or row.get('issue_type')=='event' or row.get('malformed') or not row.get('id'):continue
         task=row['id'];labels=row.get('labels') or []
         scope_event=latest_event(events,task,'lifecycle-scope')
         scope=scope_event['payload']['scope'] if label_agrees(labels,scope_event,'lifecycle-scope') and scope_event['payload'] else None
@@ -259,7 +309,7 @@ def project_facts(rows):
     history={entry['id']:entry['scopes'] for entry in scoped_evidence(rows,('deployed',LIVE))}
     result=[]
     for row in rows:
-        if row.get('issue_type')=='event':continue
+        if not isinstance(row, dict) or row.get('issue_type')=='event' or row.get('malformed') or not row.get('id'):continue
         dimensions=trusted[row['id']]
         live=dimensions[LIVE]['value']
         current_scope=dimensions[DIMENSIONS[0]]['scope']
@@ -296,7 +346,7 @@ def enabled_states(rows):
     trusted=trusted_payloads(rows)
     result=[]
     for row in rows:
-        if row.get('issue_type')=='event':continue
+        if not isinstance(row, dict) or row.get('issue_type')=='event' or row.get('malformed') or not row.get('id'):continue
         state=trusted[row['id']][ENABLED];payload=state['payload']
         result.append({'id':row['id'],'value':state['value'],'event_id':state['event_id'],
                        'evidence':payload['evidence'] if payload else [],
@@ -349,13 +399,10 @@ def scoped_evidence(rows,dimensions=('integrated',)):
     token is kept, so a recurring token cannot resurrect an older position.
     """
     dims=tuple(dimensions)
-    events={}
-    for row in rows:
-        event=native_event(row)
-        if event:events.setdefault((event['task'],event['dimension']),[]).append(event)
+    events=events_by_dimension(rows)
     result=[]
     for row in rows:
-        if row.get('issue_type')=='event':continue
+        if not isinstance(row, dict) or row.get('issue_type')=='event' or row.get('malformed') or not row.get('id'):continue
         task=row['id'];labels=row.get('labels') or []
         scope_event=latest_event(events,task,'lifecycle-scope')
         scope_trusted=(scope_event is not None and scope_event['payload'] is not None
@@ -685,7 +732,8 @@ def current_contribution_commits(rows):
     result={}
     for row in rows:
         if not isinstance(row,dict) or not isinstance(row.get('id'),str):continue
-        if row.get('issue_type') in ('event','gate','merge-slot'):continue
+        from coordination import is_merge_slot
+        if row.get('issue_type') in ('event','gate') or is_merge_slot(row):continue
         try:
             state=projection(records(row,None))
         except (ValueError,KeyError,TypeError):continue
@@ -1001,10 +1049,28 @@ def _operation_index(rows):
     """``{operation_id: (payload, event_id)}`` from one pass over the export."""
     index={}
     for row in rows:
+        if record_json.selected(row, types=['event']) and row.get('malformed'):
+            raise ValueError('Event row %s cannot be parsed: %s; operator must reconcile or repair the event'
+                             % (row.get('id') or 'unknown', row.get('error') or 'malformed'))
         event=native_event(row)
         if event and event['payload'] and event['payload']['operation_id'] not in index:
             index[event['payload']['operation_id']]=(event['payload'],event['id'])
     return index
+
+
+def unreadable_events(rows):
+    return [r for r in rows if isinstance(r,dict) and r.get('malformed')
+            and record_json.selected(r,types=['event'])]
+
+
+def read_event_rows(run):
+    """One export; only an unreadable row needs a complete native event-ID read."""
+    rows=record_json.loads_rows(run(['export','--all']))
+    try:
+        return record_json.classify(rows,run,types=['event'])
+    except (ValueError,OSError,subprocess.SubprocessError) as error:
+        raise ValueError('Lifecycle event membership cannot be read: %s; operator must reconcile or repair the event index'
+                         % error) from None
 
 
 def _apply_fact(payload,actor,rows,run,current_scope,op_index,issues,recorded=None):
@@ -1027,10 +1093,18 @@ def _apply_fact(payload,actor,rows,run,current_scope,op_index,issues,recorded=No
         if prior[0]!=payload:raise ValueError('operation ID already used for different content')
         return {'event_id':prior[1],'reconciled':True}
     issue=issues.get(payload['task'])
-    if issue is None or issue.get('issue_type')=='event':raise ValueError('unknown lifecycle task or event is not a task')
+    if issue is None:
+        bad=next((r for r in rows if isinstance(r,dict) and r.get('id')==payload['task'] and r.get('malformed')),None)
+        if bad:raise ValueError('Task %s is malformed: %s' % (payload['task'], bad.get('error') or 'cannot parse row'))
+        raise ValueError('unknown lifecycle task or event is not a task')
+    if issue.get('issue_type')=='event':raise ValueError('unknown lifecycle task or event is not a task')
     if payload['dimension']==ENABLED and payload.get('defect_task') is not None:
         fix=issues.get(payload['defect_task'])
-        if fix is None or fix.get('issue_type')=='event':
+        if fix is None:
+            bad_fix=next((r for r in rows if isinstance(r,dict) and r.get('id')==payload['defect_task'] and r.get('malformed')),None)
+            if bad_fix:raise ValueError('Task %s is malformed: %s' % (payload['defect_task'], bad_fix.get('error') or 'cannot parse row'))
+            raise ValueError('unknown defect_task: '+payload['defect_task'])
+        if fix.get('issue_type')=='event':
             raise ValueError('unknown defect_task: '+payload['defect_task'])
     if payload['dimension']!='lifecycle-scope' and current_scope!=payload['scope']:
         if recorded is None or content_hash(payload['scope']) not in recorded:
@@ -1061,7 +1135,7 @@ def _release_plan(rows,payload,operators=None,journal=None):
     receives a new live fact before verification. Target positives are planned
     after any negative scope writes for the same task.
     """
-    issues={row['id']:row for row in rows if row.get('issue_type')!='event'}
+    issues={row['id']:row for row in rows if row.get('issue_type')!='event' and not row.get('malformed')}
     facts={state['id']:state for state in project_facts(rows)}
     evidence={entry['id']:entry for entry in
               scoped_evidence(rows,('integrated','deployed','live-verified',LIVE))}
@@ -1069,7 +1143,10 @@ def _release_plan(rows,payload,operators=None,journal=None):
     selected=[];plans={}
     for target in sorted(payload['targets'],key=lambda t:t['task']):
         task=target['task']
-        if issues.get(task) is None:raise ValueError('unknown release target: '+task)
+        if issues.get(task) is None:
+            bad=next((r for r in rows if isinstance(r,dict) and r.get('id')==task and r.get('malformed')),None)
+            if bad:raise ValueError('Task %s is malformed: %s' % (task, bad.get('error') or 'cannot parse row'))
+            raise ValueError('unknown release target: '+task)
         scopes=evidence.get(task,{}).get('scopes',[])
         match=next((c for c in scopes
                     if (c.get('integrated') or {}).get('value')=='passed'
@@ -1162,7 +1239,7 @@ def _supersede_plan(rows,payload,issues=None,evidence=None):
     ``(task,planned_payload)``; evidence events are untouched.
     """
     if issues is None:
-        issues={row['id']:row for row in rows if row.get('issue_type')!='event'}
+        issues={row['id']:row for row in rows if row.get('issue_type')!='event' and not row.get('malformed')}
     if evidence is None:
         evidence={entry['id']:entry for entry in
                   scoped_evidence(rows,('integrated','deployed','live-verified',LIVE))}
@@ -1171,7 +1248,11 @@ def _supersede_plan(rows,payload,issues=None,evidence=None):
     planned=[]
     for task in sorted(payload.get('supersede') or []):
         issue=issues.get(task)
-        if issue is None or issue.get('issue_type')=='event':
+        if issue is None:
+            bad=next((r for r in rows if isinstance(r,dict) and r.get('id')==task and r.get('malformed')),None)
+            if bad:raise ValueError('Task %s is malformed: %s' % (task, bad.get('error') or 'cannot parse row'))
+            raise ValueError('unknown release supersede task: '+task)
+        if issue.get('issue_type')=='event':
             raise ValueError('unknown release supersede task: '+task)
         if task in target_tasks:
             raise ValueError('a task cannot be both a release target and superseded: '+task)
@@ -1214,7 +1295,7 @@ def _supersede_scope_plan(rows,payload,issues=None,evidence=None):
     ``(task,planned_payload)``; evidence events are untouched.
     """
     if issues is None:
-        issues={row['id']:row for row in rows if row.get('issue_type')!='event'}
+        issues={row['id']:row for row in rows if row.get('issue_type')!='event' and not row.get('malformed')}
     if evidence is None:
         evidence={entry['id']:entry for entry in
                   scoped_evidence(rows,('integrated','deployed','live-verified',LIVE))}
@@ -1223,7 +1304,11 @@ def _supersede_scope_plan(rows,payload,issues=None,evidence=None):
     for item in payload.get('supersede_scopes') or []:
         task=item['task'];wanted=item['scope']
         issue=issues.get(task)
-        if issue is None or issue.get('issue_type')=='event':
+        if issue is None:
+            bad=next((r for r in rows if isinstance(r,dict) and r.get('id')==task and r.get('malformed')),None)
+            if bad:raise ValueError('Task %s is malformed: %s' % (task, bad.get('error') or 'cannot parse row'))
+            raise ValueError('unknown release supersede scope task: '+task)
+        if issue.get('issue_type')=='event':
             raise ValueError('unknown release supersede scope task: '+task)
         recorded=next((c for c in evidence.get(task,{}).get('scopes',[]) if c['scope']==wanted),None)
         if recorded is None:
@@ -1252,23 +1337,30 @@ def _check_release_identity(payload,op_index):
             raise ValueError('operation ID already used for different content (release/environment); a new operation ID is needed: '+payload['operation_id'])
 
 
-def _check_release_operations(plans,negative,op_index,evidence):
-    """Check every receipt before writing, including historical liveness retries."""
+def _check_release_operations(plans,negative,op_index,evidence,operation_id):
+    """Check every receipt before writing, including historical liveness retries.
+
+    ``operation_id`` is the OPERATOR's base id from the request payload. Every
+    derived per-task id is reported as that base id, because the derived id is
+    not something the operator wrote or can choose (kittrial-5bb.119 added point
+    4). An exact retry whose recorded state is still current is accepted, so an
+    interrupted run completes by retrying the same export with the same id.
+    """
     identities={}
     for planned in [p for plan in plans.values() for _,p in plan]+[p for _,p in negative]:
         earlier=identities.setdefault(planned['operation_id'],planned)
-        if earlier!=planned:raise ValueError('operation ID already used for different content in the same plan; a new operation ID is needed')
+        if earlier!=planned:raise ValueError('operation ID already used for different content in the same plan; a new operation ID is needed: '+operation_id)
         prior=op_index.get(planned['operation_id'])
         if prior is None:continue
         if prior[0]!=planned:
-            raise ValueError('operation ID already used for different content; a new operation ID is needed: '+planned['operation_id'])
+            raise ValueError('operation ID already used for different content; a new operation ID is needed: '+operation_id)
         if planned['dimension']!=LIVE:continue
         current,value=environment_liveness(evidence.get(planned['task'],{}).get('scopes',[]),
                                            planned['scope']['environment'])
         effective=(current is not None and current['scope']==planned['scope'] and value==planned['value'])
         if planned['value']=='live' and any(p['task']==planned['task'] for _,p in negative):effective=False
         if not effective:
-            raise ValueError('operation ID was already used for a state that has since changed; a new operation ID is needed: '+planned['operation_id'])
+            raise ValueError('operation ID was already used for a state that has since changed; a new operation ID is needed: '+operation_id)
 
 
 def apply_release(payload,actor,run,operators=None,journal=None):
@@ -1295,7 +1387,7 @@ def apply_release(payload,actor,run,operators=None,journal=None):
                                            or payload.get('supersede_scopes')):
         raise ValueError('a release needs at least one integrated target')
     if payload['actor']!=actor:raise ValueError('payload actor must match request actor')
-    rows=[json.loads(x) for x in run(['export','--all']).splitlines() if x.strip()]
+    rows=read_event_rows(run)
     if payload.get('rollback'):require_rollback_target_deployed(rows,payload['scope'])
     selected,plans,issues,evidence=_release_plan(rows,payload,operators,journal)
     superseded=_supersede_plan(rows,payload,issues,evidence)
@@ -1303,7 +1395,7 @@ def apply_release(payload,actor,run,operators=None,journal=None):
     current=current_contribution_commits(rows)
     op_index=_operation_index(rows)
     _check_release_identity(payload,op_index)
-    _check_release_operations(plans,superseded+superseded_scopes,op_index,evidence)
+    _check_release_operations(plans,superseded+superseded_scopes,op_index,evidence,payload['operation_id'])
     # Scope tokens already recorded for a task, so a verify-only fact under the
     # release's older scope, and a per-environment supersede under the environment's
     # live scope, are accepted without moving the task's current scope (item 3,
@@ -1400,7 +1492,7 @@ def release_query(payload,actor,run,operators=None,journal=None):
     """
     validate_query_payload(payload)
     if payload['actor']!=actor:raise ValueError('payload actor must match request actor')
-    rows=[json.loads(x) for x in run(['export','--all']).splitlines() if x.strip()]
+    rows=read_event_rows(run)
     environment=payload['scope']['environment']
     reverted=sorted(reverted_integrations(rows,operators,journal))
     live=[]
@@ -1429,8 +1521,8 @@ def apply_native(payload, actor, run, operators=None, journal=None):
         return apply_release(payload,actor,run,operators,journal)
     validate_payload(payload)
     if payload['actor']!=actor:raise ValueError('payload actor must match request actor')
-    rows=[json.loads(x) for x in run(['export','--all']).splitlines() if x.strip()]
-    issues={row['id']:row for row in rows if row.get('issue_type')!='event'}
+    rows=read_event_rows(run)
+    issues={row['id']:row for row in rows if row.get('issue_type')!='event' and not row.get('malformed')}
     state=next((r for r in project_facts(rows) if r['id']==payload['task']),None)
     current_scope=state['scope'] if state else None
     # A SINGLE fact must name the task's CURRENT scope: a fact recorded under an
@@ -1471,6 +1563,99 @@ def _chunks(items,size):
     return [items[index:index+size] for index in range(0,len(items),size)]
 
 
+def release_planned_writes(page,verify_only,live_verified):
+    """Native fact writes the resolved page will cost (kittrial-5bb.119 item 4).
+
+    A verify-only target (already deployed, only the verification is owed) costs
+    ONE write. A new target costs THREE writes (scope, deployed, live) and FOUR
+    with ``--live-verified`` (the extra live-verified fact). The count is what
+    ``expected_seconds`` is computed from, so the estimate follows the writes
+    instead of a fixed per-target figure.
+    """
+    verifying=set(verify_only)
+    return sum(DRY_RUN_WRITES_VERIFY_ONLY if item['task'] in verifying else
+               (DRY_RUN_WRITES_VERIFIED if live_verified else DRY_RUN_WRITES_PLAIN)
+               for item in page)
+
+
+def release_target_native_writes(task,verifying,live_verified,labels):
+    """The native ``set-state`` processes ONE target will cost.
+
+    ``_apply_fact`` pays one extra process for a fact whose target value the task
+    already carries (it rewrites the label through ``pending`` first), so a plain
+    first deployment is three processes for three facts, a verify-only target is
+    one (two when a ``live-verified`` fact already passed somewhere), and a
+    ``--live-verified`` target in a second environment of already-labelled tasks is
+    six or seven for four facts (kittrial-5bb.139 item 2). ``labels`` maps a task
+    id to its native labels read from the same export.
+    """
+    carrying=set(labels.get(task) or ())
+    if task in verifying:
+        return 1+(DRY_RUN_PENDING_REWRITE_EXTRA if 'live-verified:passed' in carrying else 0)
+    # scope is always written for a selected target whose scope differs; the
+    # other dimensions are each one process, plus one when the task already
+    # carries the target value.
+    total=1
+    total+=1+(DRY_RUN_PENDING_REWRITE_EXTRA if 'deployed:passed' in carrying else 0)
+    total+=1+(DRY_RUN_PENDING_REWRITE_EXTRA if 'live:live' in carrying else 0)
+    if live_verified:
+        total+=1+(DRY_RUN_PENDING_REWRITE_EXTRA if 'live-verified:passed' in carrying else 0)
+    return total
+
+
+def release_planned_native_writes(page,verify_only,live_verified,labels):
+    """Native ``set-state`` processes the page will cost (kittrial-5bb.139 item 2).
+
+    ``release_planned_writes`` counts the planned FACTS; this counts the processes
+    they become, which is what ``expected_seconds`` is priced in. It is an UPPER
+    count for a rollback or a ``--live-verified`` roll-forward: a re-lived target
+    may already be at the release scope and already live there, so the endpoint
+    writes fewer facts than a page-level estimate assumes (kittrial-5bb.139 review
+    item 3).
+    """
+    verifying=set(verify_only)
+    return sum(release_target_native_writes(item['task'],verifying,live_verified,labels)
+               for item in page)
+
+
+def release_page_writes_per_target(page,verify_only,live_verified,labels):
+    """The most native processes any ONE target of this page will cost.
+
+    The default group is sized from the WORST target on the page, so no group the
+    kit chooses for itself can exceed the per-group write budget. Zero for an
+    empty page.
+    """
+    if not page:return 0
+    verifying=set(verify_only)
+    return max(release_target_native_writes(item['task'],verifying,live_verified,labels)
+               for item in page)
+
+
+def release_default_chunk(page,verify_only,live_verified,labels=None,reserved=0):
+    """The default group size, derived from the native writes the page costs.
+
+    One request group may cost RELEASE_GROUP_WRITE_BUDGET native ``set-state``
+    processes (90 writes is the client timeout at the policy per-write figure), so
+    the group size is derived from the native-write count of the page rather than a
+    fixed target count (kittrial-5bb.139 review item 1). A plain first deployment
+    writes three processes per target and keeps the historical
+    RELEASE_CHUNK_DEFAULT group (75 writes); a release to a further environment of
+    already-labelled tasks pays five per target and a ``--live-verified`` one six or
+    seven, so those use a smaller group instead of telling the operator to lower a
+    size the kit itself picked. ``reserved`` is the negative (supersede) write count
+    that rides the FIRST group, so it is paid out of the same budget.
+    """
+    if not page:return RELEASE_CHUNK_DEFAULT
+    per_target=release_page_writes_per_target(page,verify_only,live_verified,labels or {})
+    available=RELEASE_GROUP_WRITE_BUDGET-reserved
+    return max(1,min(RELEASE_CHUNK_DEFAULT,available//per_target))
+
+
+def release_group_estimate(writes):
+    """The printed estimate for a group/page with ``writes`` native writes."""
+    return round(DRY_RUN_FIXED_SECONDS+DRY_RUN_SECONDS_PER_WRITE*writes,1)
+
+
 def main():
     parser=argparse.ArgumentParser(description=__doc__);sub=parser.add_subparsers(dest='command',required=True)
     record=sub.add_parser('record')
@@ -1488,7 +1673,11 @@ def main():
     release.add_argument('--previous-release-commit')
     release.add_argument('--page',type=int,default=1)
     release.add_argument('--page-size',type=int)
-    release.add_argument('--chunk-size',type=int,default=RELEASE_CHUNK_DEFAULT)
+    # The group size. Unset means the command derives one from the page's native
+    # write count (a plain first deployment keeps the historical 25; a release to a
+    # further environment of already-labelled tasks uses a smaller group), so the
+    # kit never warns about a default it chose itself (kittrial-5bb.139 review item 1).
+    release.add_argument('--chunk-size',type=int,default=None)
     # The project directory holding the host journal (.integration-reverts/). When
     # given, revert records are read with the SAME operator/journal rule as review;
     # without it (a remote worker usually cannot read the host journal) no revert
@@ -1596,7 +1785,46 @@ def main():
             if a.page_size is not None:
                 start=(a.page-1)*a.page_size
                 page=targets[start:start+a.page_size]
-            chunks=_chunks(page,a.chunk_size)
+            page_verify_only=sorted(set(verify_only)&{item['task'] for item in page})
+            # The negative facts (task-level supersede and per-scope supersede) ride
+            # only the FIRST group of the FIRST page, so they are counted in that
+            # page's estimate and paid out of that page's write budget.
+            negatives_here=bool(supersede or supersede_scopes) and (not a.page_size or a.page==1)
+            negative_writes=(len(supersede)+len(supersede_scopes)) if negatives_here else 0
+            # The native label state from the same export: `_apply_fact` pays an
+            # extra process for a fact the task already carries, so the estimate and
+            # the derived group size count processes, not planned facts
+            # (kittrial-5bb.139 item 2).
+            labels={row['id']:row.get('labels') or [] for row in rows
+                    if row.get('issue_type')!='event' and isinstance(row.get('id'),str)}
+            explicit_chunk=a.chunk_size is not None
+            per_target=release_page_writes_per_target(page,page_verify_only,data['live_verified'],labels)
+            chunk_size=(a.chunk_size if explicit_chunk
+                        else release_default_chunk(page,page_verify_only,data['live_verified'],labels,
+                                                   reserved=negative_writes))
+            chunk_size=max(1,min(int(chunk_size),RELEASE_TARGETS_MAX))
+            chunks=_chunks(page,chunk_size)
+            # The kit derives its own default group from the native-write budget, so
+            # it no longer warns the operator to lower a size the kit picked; say why
+            # the group is smaller than the historical default when it is
+            # (kittrial-5bb.139 review item 1). An explicit --chunk-size is the
+            # caller's choice and may still warn below.
+            if not explicit_chunk and chunk_size<RELEASE_CHUNK_DEFAULT:
+                warnings.append('this page costs up to %d native bd process(es) per target (a fact the task '
+                                'already carries is rewritten through pending first), so the default group '
+                                "is %d target(s), not the plain %d, to keep one request inside the client's "
+                                '%s s limit; pass --chunk-size to override (kittrial-5bb.139 review item 1)'
+                                %(per_target,chunk_size,RELEASE_CHUNK_DEFAULT,RELEASE_CLIENT_TIMEOUT_SECONDS))
+            group_estimates=[]
+            for index,chunk in enumerate(chunks):
+                writes=(release_planned_native_writes(chunk,page_verify_only,data['live_verified'],labels)
+                        +(negative_writes if index==0 else 0))
+                group_estimates.append(release_group_estimate(writes))
+            if max(group_estimates or [0.0])>RELEASE_CLIENT_TIMEOUT_SECONDS:
+                warnings.append('expected_seconds estimates %s s for one group of %d target(s), above the '
+                                'client timeout of %s s; lower --chunk-size so no single request can time '
+                                'out (kittrial-5bb.119 review item 3)'
+                                %(max(group_estimates),chunk_size,RELEASE_CLIENT_TIMEOUT_SECONDS))
             # The supersede list rides the first group payload, so a rollback or a
             # hotfix deploy that drops tasks is one logical operation beside the rest
             # of the release. The field is only present when it is non-empty, so a
@@ -1622,7 +1850,21 @@ def main():
                                          for item in supersede_scopes],
                     'total_targets':len(targets),'page':a.page,'page_size':a.page_size,
                     'chunks':[len(chunk) for chunk in chunks],'total_chunks':len(chunks),
-                    'expected_seconds':round(DRY_RUN_FIXED_SECONDS+DRY_RUN_SECONDS_PER_TARGET*len(page),1),
+                    'chunk_size':chunk_size,
+                    # `planned_writes` and `planned_state_changes` are exact for a
+                    # plain release, but an UPPER count for a rollback or a
+                    # --live-verified roll-forward: a re-lived target may already be
+                    # at the release scope and already live there, so the endpoint
+                    # writes fewer facts than this page-level estimate assumes. The
+                    # error is on the safe side (kittrial-5bb.139 review item 3).
+                    'planned_writes':release_planned_writes(page,page_verify_only,data['live_verified'])
+                                     +negative_writes,
+                    'planned_state_changes':
+                        release_planned_native_writes(page,page_verify_only,data['live_verified'],labels)
+                        +negative_writes,
+                    'expected_seconds':release_group_estimate(
+                        release_planned_native_writes(page,page_verify_only,data['live_verified'],labels)
+                        +negative_writes),
                     'reader_note':SCOPE_ROLL_NOTE,'dry_run':bool(a.dry_run),
                     'rollback':bool(data['rollback'])}
             if a.dry_run:
@@ -1645,7 +1887,7 @@ def main():
                     for chunk_payload in chunk_payloads:
                         _selected,plans,_issues,_evidence=_release_plan(rows,chunk_payload,journal=journal)
                         negative=_supersede_plan(rows,chunk_payload)+_supersede_scope_plan(rows,chunk_payload)
-                        _check_release_operations(plans,negative,op_index,_evidence)
+                        _check_release_operations(plans,negative,op_index,_evidence,data['operation_id'])
                 except ValueError as exc:
                     report['results']=[]
                     report['groups_completed']=0

@@ -13,6 +13,14 @@ a crash after the worker starts can still allow a second execution. The gate
 records and re-checks operator discipline; it is not a sandbox. The actor string
 is a trusted-team attribution declaration, not a verified identity.
 """
+import sys
+if sys.version_info < (3, 10):
+    # Before every other import, and in syntax Python 3.6 reads: an older interpreter failed in
+    # an import further down, with a traceback that hid the cause (kittrial-5bb.191).
+    sys.stderr.write('worker_gate.py needs Python 3.10 or newer and was started with Python %d.%d.%d (%s). '
+                     'Nothing was carried out. Run it with Python 3.10 or newer.\n'
+                     % (sys.version_info[0], sys.version_info[1], sys.version_info[2], sys.executable))
+    sys.exit(2)
 import argparse
 import hashlib
 import json

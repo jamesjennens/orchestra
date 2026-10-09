@@ -317,14 +317,24 @@ def _lock_descriptor(project, which=CAPABILITY):
 
 
 def _try_lock(flock, descriptor, flags):
-    """At most LOCK_ATTEMPTS non-blocking attempts within LOCK_WAIT_SECONDS. True if held."""
-    deadline = time.monotonic() + LOCK_WAIT_SECONDS
+    """At most LOCK_ATTEMPTS non-blocking attempts within LOCK_WAIT_SECONDS. True if held.
+
+    A retry is skipped when its sleep would end past the budget, measured from the first
+    attempt with ``time.perf_counter``, whose resolution does not depend on the platform,
+    so the attempt count does not either. With ``time.monotonic`` (which steps by 15.6 ms
+    on Windows before Python 3.13) the retry test could see one attempt instead of four
+    when the clock stepped right after the start (kittrial-5bb.132). Production was not
+    affected: recording needs ``fcntl``, so on Windows it reports ``unsupported`` before
+    the lock is tried, and on POSIX the clock is fine-grained. A sleep the system stretches
+    can still carry the total past the budget once; no further sleep follows."""
+    started = time.perf_counter()
     for attempt in range(LOCK_ATTEMPTS):
         try:
             flock(descriptor, flags)
             return True
         except OSError:
-            if attempt + 1 == LOCK_ATTEMPTS or time.monotonic() + LOCK_RETRY_SECONDS > deadline:
+            if (attempt + 1 == LOCK_ATTEMPTS
+                    or time.perf_counter() - started + LOCK_RETRY_SECONDS > LOCK_WAIT_SECONDS):
                 return False
             time.sleep(LOCK_RETRY_SECONDS)
     return False

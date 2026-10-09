@@ -20,7 +20,10 @@ export function login(ctx, message) {
       const user = await ctx.api.login(username.trim(), password);
       await ctx.signedIn(user);
     } catch (error) {
-      status.textContent = error.status === 401 ? 'That username and password do not match an active account.' : describe(error);
+      // Too many log-ins at this moment (kittrial-5bb.170): nothing was tried, so the server's own
+      // sentence, not "could not confirm whether this was saved".
+      const busy = error.status === 503 && error.code === 'busy' && error.message;
+      status.textContent = error.status === 401 ? 'That username and password do not match an active account.' : (busy || describe(error));
       status.hidden = false;
       form.querySelector('#password').value = '';
       form.querySelector('#password').focus();

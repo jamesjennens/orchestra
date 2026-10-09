@@ -196,9 +196,11 @@ own machine and pull work over the API without SSH or shared directories.
   reads stay fresh. Live authority is checked before either read. `GET /v1/agents/me` returns the
   agent record; `GET /v1/agents/me/next` returns the stable JSON
   `attention`/`next_actions` contract with task/brief (task-detail) links,
-  prioritised as changes-requested, blocked, in-progress, claimable task, then
-  awaiting review and awaiting integration (see HTTP_DEPLOYMENT.md, "What an agent
-  is told to do next").
+  prioritised as changes-requested, blocked, in-progress, then review work
+  (review-recommended, to-review) and claimable task, then awaiting review and
+  awaiting integration (see HTTP_DEPLOYMENT.md, "What an agent is told to do next").
+  The order of the list is the contract, including the order of kinds that share a
+  priority number.
   Action kind names are the contract; numeric priority values are relative sorting
   hints and may change. Other own review states still receive an action naming
   their state and who acts next, including an operator action for malformed history.
@@ -405,10 +407,14 @@ call; it does not authorize direct database access. Protected mutation rows requ
 | `GET /v1/projects/{id}/tasks/{task}/history` | Project member; audit is separate | Cursor is bound to authorized task/project snapshot | Opaque cursor; `200`, `403/404/409` | Bounded history/activity read |
 | `POST /v1/projects/{id}/feedback`, `GET /v1/projects/{id}/feedback` | Contributor/owner may add; project member may read per default policy | Source task/version and evidence are bounded; membership current | Add key scoped to principal + project + route; `201`; list cursor; `403/409` | Feedback append/list stream |
 | `GET /v1/projects/{id}/setup` | Owner or superuser (project administration), session only; contributors, viewers and credentials `403` | Membership checked before the read | Keyless read of the setup steps; the host steps come from the read-only `setup-status` endpoint action and carry no guidance or onboarding text (kittrial-5bb.118) |
+| `POST /v1/projects` with `"create": true` | A superuser, or an account a superuser granted "may create projects", within its limit; session only; never a credential | The grant and limit are re-checked in the endpoint under the authority lock; the project is registered only after the host reports it created | Key scoped to principal + route; `201`; `403` uniform without the grant; `409` name not available, nothing made, or an incomplete creation that names the project |
+| `PUT`/`DELETE /v1/accounts/{id}/project-grant` | Superuser, session only | `{"limit": 1..100}` (default 5) | Audited as `accounts.project-grant` |
+| `GET /v1/project-creations` | Superuser, session only | Read-only: creations that stopped half way, with the operator commands | Keyless read |
+| `GET`/`PUT`/`DELETE /v1/projects/{id}/onboarding` | Owner or superuser, session only | Plain text, at most 8000 bytes with the kit's first line; guidance is not settable | Audited as `projects.onboarding` with the size |
 | `PATCH /v1/projects/{id}` | Owner or superuser, session only | Exactly `{"repository": value}`; shape-checked, no password, at most 300 characters | Idempotent; audited as `projects.repository` without the value; `null` clears it |
 | `GET /v1/projects/{id}/members` | Project member (any role), superuser, the project's own worker credential; a non-member gets `404` | Membership checked before the read | Keyless read; cursor bound to principal/project/query; `200`, `401/404/409/422`; account `disabled`/`superuser` flags only for project administrators | Membership relation (public account fields only) |
 | `GET /v1/projects/{id}/worker-credentials` | Owner or superuser (project administration); contributors, viewers and credentials `403`, non-members `404` | Membership checked before the read | Keyless read; cursor as above; metadata only, never the secret or its hash; agent credentials are listed on the agent routes | Credential registry |
-| `GET /v1/projects/{id}/tasks/{task}/brief` | Project member; viewer may read | Membership checked before the canonical read | Keyless read; `200`, `401/404`; reading acknowledges nothing | Canonical `bd show` + `brief --json` (checkpoint, review projection, lifecycle, dependencies) |
+| `GET /v1/projects/{id}/tasks/{task}/brief` (additive: `activity_cursor`, `checkpoint_template`; see HTTP_DEPLOYMENT "What an agent needs to write a checkpoint") | Project member; viewer may read | Membership checked before the canonical read | Keyless read; `200`, `401/404`; reading acknowledges nothing | Canonical `bd show` + `brief --json` (checkpoint, review projection, lifecycle, dependencies) |
 | `GET /v1/projects/{id}/queue` | Project member; viewer may read (every row is already visible in the task list) | Membership checked before the canonical read | Keyless read; optional `state`; cursor as above; `complete: false` when the bounded canonical walk stopped early | Canonical `work` queue |
 | `GET /v1/me/work` | Browser/session principal only; credentials `403` | Walks the caller's own memberships (bounded), re-authorizing each project live; `to_review` only where the caller holds approval; `agent_prompts` (one per agent the caller owns) tailored by the caller's live capabilities per project, never containing a secret | Keyless read; `truncated` and `unavailable` report partial reads | Canonical `work` queue per project, personal agent registry |
 | `GET /v1/accounts/lookup?username=&project=` | Session principal with project administration on `project` | Exact, case-insensitive username; missing, partial and disabled accounts give one `404`; at most 20 lookups per principal per 10 minutes | Keyless read; `200` `{id, username, display_name}`, `403/404/422/429`; each authorized lookup is audited on the project with a digest of the name | Account registry |

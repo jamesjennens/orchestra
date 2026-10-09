@@ -72,7 +72,7 @@ class RetireCase(unittest.TestCase):
         self.probes = []
         self.server = '1'                      # what the Dolt server answers the probe, or an exception
         for patcher in (patch.object(admin, 'sql', side_effect=self.sql),
-                        patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=self.flock, LOCK_EX=2)}),
+                        patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=self.flock, LOCK_EX=2, LOCK_NB=4, LOCK_UN=8)}),
                         patch.dict(os.environ, {'ORCHESTRA_OPERATORS': ''}),
                         patch.object(admin, 'root_path', return_value=self.root),
                         patch.object(admin, 'run_bd', side_effect=self.run_bd)):
@@ -316,6 +316,33 @@ class RetireCase(unittest.TestCase):
         self.assertEqual((self.bd, self.journal()), ([], []))
         self.assertEqual(admin.restore_lock_path(self.root, 'gamma'), self.root / 'backups' / 'gamma.restore.lock')
 
+    @unittest.skipUnless(os.name == 'posix', 'the stand-in is for fcntl; on Windows the creation lock is taken with msvcrt')
+    def test_a_retire_is_refused_while_a_project_is_being_created(self):
+        # kittrial-5bb.118 part 2, review 01a109cc: a creation in flight holds project-creations/.lock.
+        creations = self.root / 'project-creations'
+        creations.mkdir()
+        (creations / '.lock').write_bytes(b'')
+        (creations / '.running').write_text('delta\n', encoding='utf-8')
+
+        def flock(handle, flags):
+            if flags & 4:                                           # LOCK_NB: the creation lock is taken
+                raise BlockingIOError()
+        self.flock.side_effect = flock
+        before = tree(self.root)
+        for extra in ((), ('--force',)):
+            stdout, stderr, code = self.retire('gamma', OPERATOR, *extra)
+            self.assertNotEqual(code, 0)
+            self.assertIn('Refusing to retire gamma: a project is being created on this server (delta). Wait for it '
+                          'to finish, then retry. Nothing was changed.', stderr)
+        self.assertEqual(tree(self.root), before)
+        self.assertEqual((self.bd, self.journal()), ([], []))
+
+    @moves
+    def test_where_no_creation_was_ever_started_a_retire_takes_no_creation_lock(self):
+        stdout, stderr, code = self.retire('gamma', OPERATOR)
+        self.assertEqual(code, 0, stderr)
+        self.assertFalse((self.root / 'project-creations').exists())
+
     def test_a_failed_move_is_journaled_and_explained(self):
         # Review 01a10219, P3 (b): retired/ on another filesystem.
         self.nightly()
@@ -516,7 +543,10 @@ class RestoreNoticeCase(unittest.TestCase):
             for read in (admin.config, admin.operators, admin.verifiers):
                 with self.subTest(read=read.__name__), self.assertRaises(ValueError) as refused:
                     read(root)
-                self.assertIs(type(refused.exception), ValueError)
+                # The kit's own refusal, so admin.py answers it in one line; since kittrial-5bb.156 it is
+                # the kit's own class for this file, and no longer exactly ValueError.
+                self.assertIs(type(refused.exception), admin.ConfigurationUnreadable)
+                self.assertTrue(admin.kit_refusal(refused.exception))
                 self.assertIn('Deployment configuration %s is not valid JSON: Expecting' % marker,
                               str(refused.exception))
             marker.write_text(json.dumps({'port': 13317, 'operators': [OPERATOR]}), encoding='utf-8')
@@ -528,7 +558,7 @@ class RestoreNoticeCase(unittest.TestCase):
                 with self.subTest(command=command), patch.object(sys, 'argv', argv), \
                         patch.object(admin, 'root_path', return_value=root), \
                         patch.dict(os.environ, {'ORCHESTRA_OPERATORS': ''}), \
-                        patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=Mock(), LOCK_EX=2)}), \
+                        patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=Mock(), LOCK_EX=2, LOCK_NB=4, LOCK_UN=8)}), \
                         patch.object(admin, 'run_bd') as native, self.assertRaises(SystemExit) as refused:
                     admin.run_main()
                 self.assertEqual(refused.exception.code.count('\n'), 0)
@@ -557,7 +587,7 @@ class RestoreNoticeCase(unittest.TestCase):
             before = signal.getsignal(signal.SIGTERM)
             argv = ['admin.py', '--root', str(root), 'restore-new', 'alpha', 'beta']
             with patch.object(sys, 'argv', argv), patch.object(admin, 'root_path', return_value=root), \
-                    patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=Mock(), LOCK_EX=2)}), \
+                    patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=Mock(), LOCK_EX=2, LOCK_NB=4, LOCK_UN=8)}), \
                     patch.object(admin, 'coordination_backup'), patch.object(admin, 'add_project', add_project), \
                     patch.object(admin, 'run_bd') as native, contextlib.redirect_stderr(stderr), \
                     self.assertRaises(SystemExit) as stopped:
@@ -589,7 +619,7 @@ class ReconcileAllowlistCase(unittest.TestCase):
         self.project = make_project(self.root, 'trial')
         self.flock = Mock()
         self.native = Mock(return_value='[]')
-        for patcher in (patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=self.flock, LOCK_EX=2)}),
+        for patcher in (patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=self.flock, LOCK_EX=2, LOCK_NB=4, LOCK_UN=8)}),
                         patch.dict(os.environ, {'ORCHESTRA_OPERATORS': ''}),
                         patch.object(admin, 'root_path', return_value=self.root),
                         patch.object(admin, 'run_bd', self.native)):

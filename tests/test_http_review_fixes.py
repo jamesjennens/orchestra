@@ -124,6 +124,7 @@ from http_authority import (AuthorityConfig, JOURNAL_COMMITTED_RETENTION_SECONDS
                             is_mutating_invocation, journal_path, principal_key, run_guarded)
 from http_service import (EndpointBackend, InProcessBackend, UncertainOutcome, build_backend,
                           create_server, result_is_stored, MAX_BODY_BYTES)
+from http_client import Client, new_idempotency_key
 
 TMP_ROOT = Path(os.environ.get('ORCHESTRA_TEST_TMP', str(ROOT / '.runtime' / 'test-tmp')))
 ADMIN = 'root-admin'
@@ -842,6 +843,624 @@ class CanonicalProtocolCase(EndpointCase):
             self.assertEqual('task-1', body['task'])
 
 
+class HttpNewReviewOperationsCase(EndpointCase):
+    """kittrial-5bb.110 item 9: the HTTP review path carries the added operations.
+
+    Before the follow-up, ``EndpointBackend.REVIEW_FIELDS`` knew only the pre-.94
+    operations, so ``POST .../reviews`` with withdraw/request-review/resolve-item/
+    decline-review was refused as an unknown operation and a request-changes
+    ``summary`` was silently dropped. The new states were unreachable over HTTP.
+    """
+
+    def canonical_body(self, principal, project, operation, **extra):
+        payload = {'task_id': 'task-1', 'operation': operation, 'schema_version': 1,
+                   'operation_id': 'op-' + operation, 'previous': None}
+        payload.update(extra)
+        _, _, args, attachments = self.backend._command(
+            'reviews.add', principal, project, payload, 'f' * 64)
+        self.assertEqual(['task-1', '@attachment:0'], args)
+        return json.loads(attachments['0']['text'])
+
+    def test_every_new_operation_and_additive_field_builds_a_valid_body(self):
+        from review_workflow import validate
+        alex, project = self.setup_project()
+        principal = self.service.authenticate(alex)
+        cid, rid = 'c' * 20, 'r' * 20
+        cases = [
+            ('withdraw', {'contribution': cid, 'reason': 'Re-scoped'}),
+            ('request-review', {'contribution': cid, 'reviewer': 'blair@host'}),
+            ('resolve-item', {'contribution': cid, 'request': rid, 'item': 'fix',
+                              'reason': 'Handled'}),
+            ('decline-review', {'contribution': cid, 'request': rid, 'reason': 'Out'}),
+        ]
+        for operation, extra in cases:
+            with self.subTest(operation=operation):
+                body = self.canonical_body(principal, project, operation, **extra)
+                validate(body, 'task-1')          # raises if the operation/fields are wrong
+                self.assertEqual(operation, body['operation'])
+        # The additive fields must survive the hop, not only the new operations.
+        body = self.canonical_body(principal, project, 'request-changes', contribution=cid,
+                                   summary='Why', items=[{'id': 'fix', 'text': 'Fix',
+                                                          'severity': 'note'}])
+        validate(body, 'task-1')
+        self.assertEqual('Why', body['summary'])
+        body = self.canonical_body(principal, project, 'request-review', contribution=cid,
+                                   reviewer='blair', summary='Please look')
+        validate(body, 'task-1')
+        self.assertEqual('Please look', body['summary'])
+        body = self.canonical_body(principal, project, 'withdraw', contribution=cid,
+                                   reason='x', disposition='superseded')
+        validate(body, 'task-1')
+        self.assertEqual('superseded', body['disposition'])
+
+    def test_withdraw_round_trips_over_http_when_the_switch_is_on(self):
+        alex, project = self.setup_project()
+        task_id = self.create_task(alex, project, 'withdraw over http').data['id']
+        self.assertEqual(200, self.request('POST', '/v1/projects/%s/tasks/%s/claim'
+                                           % (project, task_id), {}, token=alex).status)
+        review = self.contribute(alex, project, task_id)
+        self.assertEqual(201, review.status, review.data)
+        contribution_id = review.data.get('comment_id') or \
+            (review.data.get('contribution') or {}).get('comment_id')
+        # The per-installation switch is deployment configuration the canonical
+        # endpoint reads; without it the write is refused before the new state exists.
+        (self.canonical_root / 'deployment.private.json').write_text(
+            json.dumps({'operators': [], 'review_workflow_writes': True}), encoding='utf-8')
+        withdrawn = self.request(
+            'POST', '/v1/projects/%s/tasks/%s/reviews' % (project, task_id),
+            {'operation': 'withdraw', 'schema_version': 1, 'previous': contribution_id,
+             'operation_id': 'op-' + secrets.token_hex(6),
+             'contribution': contribution_id, 'reason': 'Re-scoped'}, token=alex)
+        self.assertEqual(201, withdrawn.status, withdrawn.data)
+        self.assertEqual('withdrawn', withdrawn.data.get('review_state'))
+
+    def test_withdraw_is_refused_over_http_when_the_switch_is_off(self):
+        alex, project = self.setup_project()
+        task_id = self.create_task(alex, project, 'switch off over http').data['id']
+        self.assertEqual(200, self.request('POST', '/v1/projects/%s/tasks/%s/claim'
+                                           % (project, task_id), {}, token=alex).status)
+        review = self.contribute(alex, project, task_id)
+        contribution_id = review.data.get('comment_id') or \
+            (review.data.get('contribution') or {}).get('comment_id')
+        denied = self.request(
+            'POST', '/v1/projects/%s/tasks/%s/reviews' % (project, task_id),
+            {'operation': 'withdraw', 'schema_version': 1, 'previous': contribution_id,
+             'operation_id': 'op-' + secrets.token_hex(6),
+             'contribution': contribution_id, 'reason': 'Re-scoped'}, token=alex)
+        self.assertEqual(422, denied.status, denied.data)
+        self.assertIn('review_workflow_writes off', json.dumps(denied.data))
+
+    def test_brief_and_queue_expose_the_withdrawn_state(self):
+        alex, project = self.setup_project()
+        task_id = self.create_task(alex, project, 'withdrawn reads').data['id']
+        self.assertEqual(200, self.request('POST', '/v1/projects/%s/tasks/%s/claim'
+                                           % (project, task_id), {}, token=alex).status)
+        review = self.contribute(alex, project, task_id)
+        contribution_id = review.data.get('comment_id') or \
+            (review.data.get('contribution') or {}).get('comment_id')
+        (self.canonical_root / 'deployment.private.json').write_text(
+            json.dumps({'operators': [], 'review_workflow_writes': True}), encoding='utf-8')
+        withdrawn = self.request(
+            'POST', '/v1/projects/%s/tasks/%s/reviews' % (project, task_id),
+            {'operation': 'withdraw', 'schema_version': 1, 'previous': contribution_id,
+             'operation_id': 'op-' + secrets.token_hex(6),
+             'contribution': contribution_id, 'reason': 'Re-scoped'}, token=alex)
+        self.assertEqual(201, withdrawn.status, withdrawn.data)
+        # The brief carries the withdrawal record, not just the state string.
+        brief = self.request('GET', '/v1/projects/%s/tasks/%s/brief'
+                             % (project, task_id), token=alex)
+        self.assertEqual(200, brief.status, brief.data)
+        self.assertEqual('withdrawn', brief.data['review']['state'])
+        self.assertEqual('withdrawn', brief.data['review']['withdrawal']['disposition'])
+        self.assertEqual('Re-scoped', brief.data['review']['withdrawal']['reason'])
+        # The queue accepts the new state as a filter instead of hiding it.
+        queue = self.request('GET', '/v1/projects/%s/queue?state=withdrawn' % project, token=alex)
+        self.assertEqual(200, queue.status, queue.data)
+        self.assertEqual([task_id], [item['id'] for item in queue.data['items']])
+
+
+class HttpClientEveryReviewOperationCase(EndpointCase):
+    """kittrial-5bb.110 items 1 and 2 end to end through the kit's own HTTP client.
+
+    Every legacy and new review operation is driven through ``http_client.Client``
+    against the running service and the real canonical writer. The pre-fix tip sent
+    every optional field as null, so the service forwarded ``"summary": null`` and the
+    canonical writer refused a legacy request-changes (and a request-review) with
+    "summary: expected text"; a client withdraw sent ``"disposition": null``, which the
+    writer accepted and the task then read ``review_state: None``.
+    """
+
+    def client(self, token):
+        return Client('http://127.0.0.1:%d' % self.port).use_credential(token)
+
+    def members(self):
+        alex, project = self.setup_project()
+        admin = self.admin_token()
+        blair_id = self.create_account(admin, 'blair', 'blair-password-1')
+        self.assertEqual(200, self.request('PUT', '/v1/projects/%s/members/%s'
+                                           % (project, blair_id), {'role': 'owner'},
+                                           token=admin).status)
+        blair = self.login('blair', 'blair-password-1')[0]
+        # A session acts as its stable user id, which is the label the canonical write
+        # records; name the reviewer with it so the named-reviewer rules match.
+        return alex, blair, self.service.authenticate(blair).actor, project
+
+    def switch_on(self):
+        (self.canonical_root / 'deployment.private.json').write_text(
+            json.dumps({'operators': [], 'review_workflow_writes': True}), encoding='utf-8')
+
+    def brief(self, project, task, token):
+        response = self.request('GET', '/v1/projects/%s/tasks/%s/brief' % (project, task),
+                                token=token)
+        self.assertEqual(200, response.status, response.data)
+        return response.data
+
+    def test_every_legacy_and_new_operation_through_the_client(self):
+        alex, blair, blair_actor, project = self.members()
+        task = self.create_task(alex, project, 'client operations').data['id']
+        self.assertEqual(200, self.request('POST', '/v1/projects/%s/tasks/%s/claim'
+                                           % (project, task), {}, token=alex).status)
+        self.switch_on()
+        owner, reviewer = self.client(alex), self.client(blair)
+
+        # 1. contribute (legacy). The client sends supersedes/previous as null, which the
+        #    canonical operation requires to be PRESENT.
+        made = owner.add_review(project, task, 'contribute', commit=COMMIT, base_commit=BASE,
+                                repository='https://example.invalid/repo.git',
+                                summary='delivered',
+                                delivery={'kind': 'bundle', 'path': 'koopa:/tmp/x.bundle',
+                                          'sha256': BUNDLE}, key=new_idempotency_key())
+        contribution = made.get('comment_id') or \
+            (made.get('contribution') or {}).get('comment_id')
+        self.assertTrue(contribution, made)
+        self.assertEqual('awaiting-review', made.get('review_state'))
+
+        # 2. request-changes (legacy) with NO summary: the client sends no summary key at
+        #    all after the fix, and the service no longer forwards a null one.
+        asked = reviewer.add_review(project, task, 'request-changes', previous=contribution,
+                                    contribution=contribution,
+                                    items=[{'id': 'fix-1', 'text': 'Fix the empty page'},
+                                           {'id': 'fix-2', 'text': 'Also cover the error'}],
+                                    key=new_idempotency_key())
+        self.assertEqual('changes-requested', asked.get('review_state'))
+        pending = self.brief(project, task, alex)['review']['requests']
+        by_item = {entry['id']: entry['request'] for entry in pending}
+        self.assertEqual({'fix-1', 'fix-2'}, set(by_item))
+
+        # 3. resolve-item (new) by its requester, disposition unset.
+        resolved = reviewer.add_review(project, task, 'resolve-item',
+                                       previous=asked['comment_id'],
+                                       contribution=contribution,
+                                       request=by_item['fix-1'], item='fix-1', reason='Handled',
+                                       key=new_idempotency_key())
+        self.assertEqual('changes-requested', resolved.get('review_state'))
+
+        # 4. request-review (new) with NO summary.
+        asked_review = owner.add_review(project, task, 'request-review',
+                                        previous=resolved['comment_id'],
+                                        contribution=contribution, reviewer=blair_actor,
+                                        key=new_idempotency_key())
+        self.assertEqual('changes-requested', asked_review.get('review_state'))
+        open_requests = self.brief(project, task, alex)['review']['pending_review_requests']
+        self.assertEqual(1, len(open_requests))
+        self.assertEqual(blair_actor, open_requests[0]['reviewer'])
+
+        # 5. decline-review (new) by the named reviewer.
+        declined = reviewer.add_review(project, task, 'decline-review',
+                                       previous=asked_review['comment_id'],
+                                       contribution=contribution,
+                                       request=open_requests[0]['request'], reason='Out',
+                                       key=new_idempotency_key())
+        self.assertEqual('changes-requested', declined.get('review_state'))
+        self.assertEqual([], self.brief(project, task, alex)['review']['pending_review_requests'])
+
+        # 6. respond (legacy) by the assignee, resolving the remaining item.
+        responded = owner.add_review(project, task, 'respond',
+                                     previous=declined['comment_id'],
+                                     contribution=contribution,
+                                     resolutions=[{'request': by_item['fix-2'], 'item': 'fix-2',
+                                                   'reason': 'Covered', 'evidence': 'revision 1'}],
+                                     key=new_idempotency_key())
+        self.assertEqual('awaiting-review', responded.get('review_state'))
+
+        # 7. recommend (legacy, kittrial-5bb.115) by a reviewer who is neither author nor
+        #    assignee. It is a record BESIDE the chain, so it takes no `previous`.
+        recommended = reviewer.add_review(project, task, 'recommend',
+                                          contribution=contribution, commit=COMMIT,
+                                          verdict='approve', summary='Checked the render path',
+                                          items=[], key=new_idempotency_key())
+        self.assertTrue(recommended)
+
+        # 8. approve (legacy).
+        approved = owner.add_review(project, task, 'approve',
+                                    previous=responded['comment_id'],
+                                    contribution=contribution, summary='Accepted',
+                                    key=new_idempotency_key())
+        self.assertEqual('awaiting-integration', approved.get('review_state'))
+
+        # 9. withdraw (new) with NO disposition. Before the fix the service forwarded
+        #    "disposition": null and the task read review_state None.
+        withdrawn = owner.add_review(project, task, 'withdraw',
+                                     previous=approved['comment_id'],
+                                     contribution=contribution, reason='Re-scoped',
+                                     key=new_idempotency_key())
+        self.assertEqual('withdrawn', withdrawn.get('review_state'))
+        self.assertEqual('withdrawn',
+                         self.brief(project, task, alex)['review']['withdrawal']['disposition'])
+
+    def test_a_null_optional_field_is_treated_as_absent_not_refused(self):
+        alex, project = self.setup_project()
+        task = self.create_task(alex, project, 'null optional').data['id']
+        self.assertEqual(200, self.request('POST', '/v1/projects/%s/tasks/%s/claim'
+                                           % (project, task), {}, token=alex).status)
+        made = self.request('POST', '/v1/projects/%s/tasks/%s/reviews' % (project, task),
+                            dict(CONTRIBUTION, operation='contribute', schema_version=1,
+                                 operation_id='op-null-1', previous=None), token=alex)
+        self.assertEqual(201, made.status, made.data)
+        contribution = made.data.get('comment_id') or \
+            (made.data.get('contribution') or {}).get('comment_id')
+        # The exact legacy payload the kit's client used to send: every optional field
+        # present and null, summary included.
+        body = {'operation': 'request-changes', 'schema_version': 1, 'operation_id': 'op-null-2',
+                'previous': contribution, 'contribution': contribution, 'summary': None,
+                'items': [{'id': 'fix-1', 'text': 'Fix'}]}
+        asked = self.request('POST', '/v1/projects/%s/tasks/%s/reviews' % (project, task),
+                             body, token=alex)
+        self.assertEqual(201, asked.status, asked.data)
+        self.assertEqual('changes-requested', asked.data['review_state'])
+
+    def test_a_null_disposition_over_http_reads_as_withdrawn(self):
+        alex, project = self.setup_project()
+        task = self.create_task(alex, project, 'null disposition').data['id']
+        self.assertEqual(200, self.request('POST', '/v1/projects/%s/tasks/%s/claim'
+                                           % (project, task), {}, token=alex).status)
+        made = self.request('POST', '/v1/projects/%s/tasks/%s/reviews' % (project, task),
+                            dict(CONTRIBUTION, operation='contribute', schema_version=1,
+                                 operation_id='op-nd-1', previous=None), token=alex)
+        contribution = made.data.get('comment_id') or \
+            (made.data.get('contribution') or {}).get('comment_id')
+        (self.canonical_root / 'deployment.private.json').write_text(
+            json.dumps({'operators': [], 'review_workflow_writes': True}), encoding='utf-8')
+        withdrawn = self.request(
+            'POST', '/v1/projects/%s/tasks/%s/reviews' % (project, task),
+            {'operation': 'withdraw', 'schema_version': 1, 'previous': contribution,
+             'operation_id': 'op-nd-2', 'contribution': contribution, 'reason': 'Re-scoped',
+             'disposition': None}, token=alex)
+        self.assertEqual(201, withdrawn.status, withdrawn.data)
+        self.assertEqual('withdrawn', withdrawn.data['review_state'])
+        # A second withdraw on the same task is a clean 422, not a TypeError 500.
+        second = self.request(
+            'POST', '/v1/projects/%s/tasks/%s/reviews' % (project, task),
+            {'operation': 'withdraw', 'schema_version': 1, 'previous': withdrawn.data.get('comment_id'),
+             'operation_id': 'op-nd-3', 'contribution': contribution, 'reason': 'Again'},
+            token=alex)
+        self.assertEqual(422, second.status, second.data)
+
+
+#: The exact review body ``http_client.Client.add_review`` built at cbf6d01 and at
+#: b0a4fbd: one fixed union with EVERY optional field present, null when unset. Those
+#: clients were released, so the service must keep accepting what they send
+#: (kittrial-5bb.110, review 01a10bc4 items 1 and 2). The tip's own client drops nulls,
+#: which is why driving only the tip's client missed this.
+RELEASED_CLIENT_KEYS = ('schema_version', 'operation', 'operation_id', 'previous', 'actor',
+                        'commit', 'base_commit', 'bundle_sha256', 'summary', 'repository',
+                        'delivery', 'supersedes', 'follows', 'contribution', 'items',
+                        'resolutions')
+
+
+def released_client_body(operation, **values):
+    """One review body exactly as the Client at cbf6d01/b0a4fbd built it."""
+    body = {name: None for name in RELEASED_CLIENT_KEYS}
+    body['schema_version'] = 1
+    body['operation'] = operation
+    body.update(values)
+    return body
+
+
+class ReleasedClientBodyCase(EndpointCase):
+    """The bodies the RELEASED clients still send, against the real service.
+
+    ``Client.add_review`` at cbf6d01 and at b0a4fbd put one fixed 16-key union in every
+    review body, every unset field null. The tip counted a null value as a supplied
+    field, so every operation those clients sent answered 422 ("Unsupported review
+    payload field(s) for contribute: contribution, items, resolutions, ..."), including
+    switch off/on and a raw withdraw carrying ``reviewer: null, items: null``. The fix
+    treats a null-valued key as ABSENT for the field-set check and accepts (and ignores)
+    ``previous`` on a recommendation.
+
+    These tests drive the EXACT released bodies through the HTTP route, the strict
+    canonical stub and the real ``review_workflow``/``review_recommendations`` writers,
+    with the review-writes switch OFF and then ON.
+    """
+
+    LEGACY = ('contribute', 'request-changes', 'respond', 'approve')
+    NEWER = ('recommend', 'withdraw', 'request-review', 'resolve-item', 'decline-review')
+
+    def members(self):
+        alex, project = self.setup_project()
+        admin = self.admin_token()
+        blair_id = self.create_account(admin, 'blair', 'blair-password-1')
+        self.assertEqual(200, self.request('PUT', '/v1/projects/%s/members/%s'
+                                           % (project, blair_id), {'role': 'owner'},
+                                           token=admin).status)
+        blair = self.login('blair', 'blair-password-1')[0]
+        return alex, blair, self.service.authenticate(blair).actor, project
+
+    def switch(self, enabled):
+        (self.canonical_root / 'deployment.private.json').write_text(
+            json.dumps({'operators': [], 'review_workflow_writes': enabled}), encoding='utf-8')
+
+    def new_task(self, alex, project, title):
+        task = self.create_task(alex, project, title).data['id']
+        claimed = self.request('POST', '/v1/projects/%s/tasks/%s/claim' % (project, task), {},
+                               token=alex)
+        self.assertEqual(200, claimed.status, claimed.data)
+        return task
+
+    def post_released(self, project, task, token, operation, **values):
+        body = released_client_body(operation, operation_id='rc-' + secrets.token_hex(6),
+                                    **values)
+        return self.request('POST', '/v1/projects/%s/tasks/%s/reviews' % (project, task),
+                            body, token=token)
+
+    def contribution_id(self, response):
+        value = (response.data or {}).get('comment_id') or \
+            ((response.data or {}).get('contribution') or {}).get('comment_id')
+        self.assertTrue(value, response.data)
+        return value
+
+    def not_a_field_refusal(self, response):
+        """The whole response must never be the unsupported-field-set refusal."""
+        text = json.dumps(response.data)
+        self.assertNotIn('Unsupported review payload field', text, response.data)
+        return text
+
+    def brief(self, project, task, token):
+        response = self.request('GET', '/v1/projects/%s/tasks/%s/brief' % (project, task),
+                                token=token)
+        self.assertEqual(200, response.status, response.data)
+        return response.data
+
+    def test_the_four_legacy_released_bodies_work_switch_off_and_on(self):
+        """Item 1: every legacy operation the released clients send must answer 201."""
+        alex, blair, blair_actor, project = self.members()
+        for switch in (False, True):
+            with self.subTest(switch=switch):
+                self.switch(switch)
+                task = self.new_task(alex, project, 'released legacy switch=%s' % switch)
+                made = self.post_released(project, task, alex, 'contribute', previous=None,
+                                          **dict(CONTRIBUTION))
+                self.assertEqual(201, made.status, made.data)
+                self.not_a_field_refusal(made)
+                contribution = self.contribution_id(made)
+                self.assertEqual('awaiting-review', made.data.get('review_state'))
+
+                asked = self.post_released(project, task, blair, 'request-changes',
+                                           previous=contribution, contribution=contribution,
+                                           items=[{'id': 'fix-1', 'text': 'Fix the empty page'}])
+                self.assertEqual(201, asked.status, asked.data)
+                self.assertEqual('changes-requested', asked.data.get('review_state'))
+
+                responded = self.post_released(project, task, alex, 'respond',
+                                               previous=asked.data['comment_id'],
+                                               contribution=contribution,
+                                               resolutions=[{'request': asked.data['comment_id'],
+                                                              'item': 'fix-1',
+                                                              'reason': 'Fixed',
+                                                              'evidence': 'revision 1'}])
+                self.assertEqual(201, responded.status, responded.data)
+                self.assertEqual('awaiting-review', responded.data.get('review_state'))
+
+                approved = self.post_released(project, task, alex, 'approve',
+                                              previous=responded.data['comment_id'],
+                                              contribution=contribution, summary='Accepted')
+                self.assertEqual(201, approved.status, approved.data)
+                self.assertEqual('awaiting-integration', approved.data.get('review_state'))
+
+    def test_the_five_newer_released_bodies_switch_off_refuses_by_the_switch_switch_on_writes(self):
+        """Item 2: the five newer operations, driven by the released body, off and on."""
+        alex, blair, blair_actor, project = self.members()
+        for switch in (False, True):
+            for operation in self.NEWER:
+                with self.subTest(switch=switch, operation=operation):
+                    self.switch(switch)
+                    task = self.new_task(alex, project,
+                                         '%s switch=%s' % (operation, switch))
+                    made = self.post_released(project, task, alex, 'contribute', previous=None,
+                                              **dict(CONTRIBUTION))
+                    self.assertEqual(201, made.status, made.data)
+                    contribution = self.contribution_id(made)
+                    previous = contribution
+                    if operation == 'recommend':
+                        # A recommendation is a record BESIDE the chain and is not a
+                        # new-shaped write, so the switch does not gate it.
+                        token = blair
+                        values = dict(contribution=contribution, commit=COMMIT,
+                                      verdict='approve', summary='Checked the render path')
+                        gated = False
+                    elif operation == 'withdraw':
+                        token = alex
+                        values = dict(previous=previous, contribution=contribution,
+                                      reason='Re-scoped')
+                        gated = True
+                    elif operation == 'request-review':
+                        token = alex
+                        values = dict(previous=previous, contribution=contribution,
+                                      reviewer=blair_actor)
+                        gated = True
+                    elif operation == 'decline-review':
+                        token = blair
+                        if switch:
+                            opened = self.post_released(project, task, alex, 'request-review',
+                                                        previous=previous,
+                                                        contribution=contribution,
+                                                        reviewer=blair_actor)
+                            self.assertEqual(201, opened.status, opened.data)
+                            previous = opened.data['comment_id']
+                        values = dict(previous=previous, contribution=contribution,
+                                      request=previous, reason='Out')
+                        gated = True
+                    else:  # resolve-item needs one pending blocking item first.
+                        asked = self.post_released(project, task, blair, 'request-changes',
+                                                   previous=previous, contribution=contribution,
+                                                   items=[{'id': 'fix-1', 'text': 'Fix'}])
+                        self.assertEqual(201, asked.status, asked.data)
+                        previous = asked.data['comment_id']
+                        token = blair
+                        values = dict(previous=previous, contribution=contribution,
+                                      request=previous, item='fix-1', reason='Handled')
+                        gated = True
+                    response = self.post_released(project, task, token, operation, **values)
+                    message = self.not_a_field_refusal(response)
+                    if gated and not switch:
+                        # Refused because the new shape needs the switch, never because
+                        # the released body carried nulls.
+                        self.assertEqual(422, response.status, response.data)
+                        self.assertIn('review_workflow_writes off', message)
+                    else:
+                        self.assertEqual(201, response.status, response.data)
+
+    def test_a_released_recommend_carrying_previous_is_accepted_and_ignored(self):
+        """The released clients send `previous` for every operation, recommend included."""
+        alex, blair, blair_actor, project = self.members()
+        task = self.new_task(alex, project, 'released recommend previous')
+        made = self.post_released(project, task, alex, 'contribute', previous=None,
+                                  **dict(CONTRIBUTION))
+        contribution = self.contribution_id(made)
+        response = self.post_released(project, task, blair, 'recommend',
+                                      previous=contribution, contribution=contribution,
+                                      commit=COMMIT, verdict='approve', summary='Fine by me',
+                                      items=[])
+        self.assertEqual(201, response.status, response.data)
+        brief = self.brief(project, task, alex)
+        self.assertTrue(brief['review']['recommendation'])
+        # It is a record beside the chain: the chain's own pointer did not move.
+        self.assertEqual(contribution, brief['review']['latest_id'])
+
+    def test_a_raw_withdraw_carrying_null_reviewer_and_items_is_not_a_field_refusal(self):
+        """The reviewer's own reproduction: `reviewer: null, items: null` on a withdraw."""
+        alex, blair, blair_actor, project = self.members()
+        self.switch(True)
+        task = self.new_task(alex, project, 'raw withdraw nulls')
+        made = self.post_released(project, task, alex, 'contribute', previous=None,
+                                  **dict(CONTRIBUTION))
+        contribution = self.contribution_id(made)
+        response = self.post_released(project, task, alex, 'withdraw',
+                                      previous=contribution, contribution=contribution,
+                                      reason='Re-scoped', reviewer=None, items=None)
+        self.assertEqual(201, response.status, response.data)
+        self.assertEqual('withdrawn', response.data.get('review_state'))
+
+    def test_the_union_under_test_is_the_released_one(self):
+        """All 16 keys of the cbf6d01/b0a4fbd body are present; unset ones are null."""
+        body = released_client_body('contribute', **dict(CONTRIBUTION))
+        self.assertEqual(len(RELEASED_CLIENT_KEYS), 16)
+        self.assertEqual(set(body), set(RELEASED_CLIENT_KEYS))
+        self.assertEqual(sorted(name for name, value in body.items() if value is None),
+                         ['actor', 'bundle_sha256', 'contribution', 'follows', 'items',
+                          'operation_id', 'previous', 'resolutions', 'supersedes'])
+
+
+class HttpSmallRefusalsCase(EndpointCase):
+    """kittrial-5bb.110 item 4: the small HTTP refusals.
+
+    The unsupported-operation 422 must not echo the caller's value, an operation sent as
+    a list/object must be 422 (not 500), and unknown or misplaced fields must be refused
+    instead of dropped with a 201.
+    """
+
+    def contribute(self, token, project, task):
+        return self.request('POST', '/v1/projects/%s/tasks/%s/reviews' % (project, task),
+                            dict(CONTRIBUTION, operation='contribute', schema_version=1,
+                                 operation_id='op-' + secrets.token_hex(6), previous=None),
+                            token=token)
+
+    def test_an_unsupported_operation_is_a_fixed_sentence_that_does_not_echo_the_value(self):
+        alex, project = self.setup_project()
+        task = self.create_task(alex, project, 'unsupported operation').data['id']
+        long_name = 'x' * 5000
+        response = self.request('POST', '/v1/projects/%s/tasks/%s/reviews' % (project, task),
+                                {'operation': long_name}, token=alex)
+        self.assertEqual(422, response.status, response.data)
+        message = response.data['error']['message']
+        self.assertNotIn(long_name, message)
+        self.assertLess(len(message), 500)
+        self.assertIn('unsupported review operation', message.lower())
+
+    def test_an_operation_sent_as_a_list_or_object_is_422_not_500(self):
+        alex, project = self.setup_project()
+        task = self.create_task(alex, project, 'bad operation type').data['id']
+        for bad in (['contribute'], {'name': 'contribute'}):
+            with self.subTest(operation=bad):
+                response = self.request('POST', '/v1/projects/%s/tasks/%s/reviews'
+                                        % (project, task), {'operation': bad}, token=alex)
+                self.assertEqual(422, response.status, response.data)
+
+    def test_unknown_and_misplaced_fields_are_refused_not_dropped(self):
+        alex, project = self.setup_project()
+        task = self.create_task(alex, project, 'misplaced fields').data['id']
+        self.assertEqual(200, self.request('POST', '/v1/projects/%s/tasks/%s/claim'
+                                           % (project, task), {}, token=alex).status)
+        made = self.contribute(alex, project, task)
+        self.assertEqual(201, made.status, made.data)
+        contribution = made.data.get('comment_id') or \
+            (made.data.get('contribution') or {}).get('comment_id')
+        base = {'operation': 'request-changes', 'schema_version': 1,
+                'operation_id': 'op-fields-1', 'previous': contribution,
+                'contribution': contribution, 'items': [{'id': 'fix-1', 'text': 'Fix'}]}
+        for extra in ({'bogus': 1}, {'severity': 'blocking'}, {'disposition': 'withdrawn'}):
+            with self.subTest(extra=extra):
+                response = self.request('POST', '/v1/projects/%s/tasks/%s/reviews'
+                                        % (project, task), dict(base, **extra), token=alex)
+                self.assertEqual(422, response.status, response.data)
+                self.assertIn('Unsupported review payload field', response.data['error']['message'])
+        # The documented transport/presentation fields the web page sends stay accepted.
+        allowed = dict(base, operation_id='op-fields-ok', contribution_revision=1,
+                       contribution_commit=COMMIT)
+        response = self.request('POST', '/v1/projects/%s/tasks/%s/reviews' % (project, task),
+                                allowed, token=alex)
+        self.assertEqual(201, response.status, response.data)
+
+    def test_the_field_refusal_is_bounded_and_does_not_echo_non_identifiers(self):
+        """A 300-character name and 400 unknown names must not be echoed (item 4 P3)."""
+        alex, project = self.setup_project()
+        task = self.create_task(alex, project, 'bounded field refusal').data['id']
+        self.assertEqual(200, self.request('POST', '/v1/projects/%s/tasks/%s/claim'
+                                           % (project, task), {}, token=alex).status)
+        made = self.contribute(alex, project, task)
+        contribution = made.data.get('comment_id') or \
+            (made.data.get('contribution') or {}).get('comment_id')
+        base = {'operation': 'request-changes', 'schema_version': 1,
+                'operation_id': 'op-bounded-1', 'previous': contribution,
+                'contribution': contribution, 'items': [{'id': 'fix-1', 'text': 'Fix'}]}
+        # 400 unknown names: the message names five and counts the rest.
+        many = dict(base, **{'x%03d' % index: 1 for index in range(400)})
+        response = self.request('POST', '/v1/projects/%s/tasks/%s/reviews' % (project, task),
+                                many, token=alex)
+        self.assertEqual(422, response.status, response.data)
+        message = response.data['error']['message']
+        self.assertIn('Unsupported review payload field', message)
+        self.assertIn('(+395 more)', message)
+        self.assertLess(len(message), 300, message)
+        # A single 300-character name is not echoed in full ...
+        long_name = 'n' * 300
+        response = self.request('POST', '/v1/projects/%s/tasks/%s/reviews' % (project, task),
+                                dict(base, **{long_name: 1}), token=alex)
+        self.assertEqual(422, response.status, response.data)
+        message = response.data['error']['message']
+        self.assertNotIn(long_name, message)
+        self.assertIn('<non-identifier name>', message)
+        # ... and neither is a name built out of control characters or punctuation.
+        for bad in ('bad\nname', 'a name with spaces', 'name, other'):
+            with self.subTest(name=bad):
+                response = self.request('POST', '/v1/projects/%s/tasks/%s/reviews'
+                                        % (project, task), dict(base, **{bad: 1}), token=alex)
+                self.assertEqual(422, response.status, response.data)
+                message = response.data['error']['message']
+                self.assertNotIn(bad, message)
+                self.assertIn('<non-identifier name>', message)
+
+
 class HttpFollowsForwardingCase(EndpointCase):
     """http-drops-follows: the optional additive ``follows`` relation survives HTTP.
 
@@ -1237,7 +1856,9 @@ class OperationIdentityCase(unittest.TestCase):
         retry = run_guarded(self.request('a', 'usr_a', 'sess_a'), self.journal, effect,
                             authority_config=self.config)
         self.assertEqual(0, first['returncode'], first)
-        self.assertEqual(first, retry)
+        # The committed envelope, whole, and marked as a stored answer (kittrial-5bb.97).
+        self.assertEqual(dict(first, replayed=True), retry)
+        self.assertNotIn('replayed', first)
         self.assertEqual(1, len(records))
 
     def test_replayed_identity_is_bound_to_the_route_body(self):
@@ -1762,7 +2383,7 @@ class RealEndpointAuthorityCase(unittest.TestCase):
         canary_lock = self.tmp / 'http-caller' / 'nested' / 'x.lock'
         canary_store = self.tmp / 'http-canary.json'
         canary_store.write_text('CANARY-NOT-JSON', encoding='utf-8')
-        request = {'project': 'probe', 'actor': 'attacker', 'action': 'bd', 'args': ['create', 'x'],
+        request = {'project': 'probe', 'actor': 'usr_a', 'action': 'bd', 'args': ['create', 'x'],
                    'operation_id': 'op-endpoint-configured',
                    'authority': {'via': 'session', 'user_id': 'usr_a',
                                  'session_hash': 'sess_a', 'project': 'probe',
@@ -1772,6 +2393,10 @@ class RealEndpointAuthorityCase(unittest.TestCase):
                                        require_authority=True)
         self.assertEqual(0, result['returncode'], result)
         self.assertFalse(canary_lock.exists())
+        # The account's descriptor does not carry another name (kittrial-5bb.184): nothing runs.
+        named = dict(request, actor='attacker', operation_id='op-endpoint-named')
+        refused = self.endpoint.execute(self.root, named, authority_config=self.config, require_authority=True)
+        self.assertEqual((126, 403), (refused['returncode'], refused.get('authority_status')), refused)
         # A descriptor-less mutation through the trusted launch is refused.
         bare = {'project': 'probe', 'actor': 'attacker', 'action': 'bd', 'args': ['create', 'x'],
                 'operation_id': 'op-endpoint-bare'}
@@ -1793,7 +2418,7 @@ class RealEndpointAuthorityCase(unittest.TestCase):
 
         self.endpoint.subprocess.run = fake_run
         try:
-            request = {'project': 'probe', 'actor': 'attacker', 'action': 'bd',
+            request = {'project': 'probe', 'actor': 'usr_a', 'action': 'bd',
                        'args': ['create', 'x'], 'operation_id': 'op-endpoint-timeout',
                        'authority': authority_descriptor('usr_a', 'sess_a', project='probe')}
             first = self.endpoint.execute(self.root, request, authority_config=self.config,
@@ -4121,6 +4746,151 @@ class RecordStoreMissingPathCase(unittest.TestCase):
         self.assertAlmostEqual(before['high_water'], after['high_water'], delta=5)
         self.assertAlmostEqual(40 * 86400, after['jump_credit'], delta=5)
         self.assertTrue(after['suspect'])
+
+
+class FollowOnBaseRefusalOverHttpCase(EndpointCase):
+    """kittrial-5bb.158: the follow-on base refusal reaches an HTTP caller whole.
+
+    The service hands a canonical refusal on up to 200 characters. Cut there, this sentence
+    ended "...(a passed integrated fact on": the reason, the recorder's name and what an
+    operator must do never arrived.
+    """
+
+    MERGE_1, MERGE_2, OTHER = 'e1' * 20, 'e2' * 20, 'd' * 40
+
+    def reviews(self, project, task):
+        return '/v1/projects/%s/tasks/%s/reviews' % (project, task)
+
+    def delivered(self, alex, bea, project, title, commit, merge, recorder='old-coordinator'):
+        """A task delivered by alex's account, approved by bea, and integrated at ``merge`` by ``recorder``."""
+        task = self.create_task(alex, project, title).data['id']
+        self.assertEqual(200, self.request('POST', '/v1/projects/%s/tasks/%s/claim' % (project, task), {}, token=alex).status)
+        body = dict(CONTRIBUTION, commit=commit, operation='contribute', schema_version=1,
+                    operation_id='op-' + secrets.token_hex(6), previous=None)
+        made = self.request('POST', self.reviews(project, task), body, token=alex)
+        self.assertEqual(201, made.status, made.data)
+        contribution = made.data['comment_id']
+        approved = self.request('POST', self.reviews(project, task), {
+            'operation': 'approve', 'schema_version': 1, 'operation_id': 'op-' + secrets.token_hex(6),
+            'previous': contribution, 'contribution': contribution, 'summary': 'accepted'}, token=bea)
+        self.assertEqual(201, approved.status, approved.data)
+        self.integrate(task, commit, merge, recorder)
+        return task, contribution
+
+    def integrate(self, task, commit, merge, recorder):
+        """The lifecycle action's own writes (a scope, then integrated=passed), on the stub's store.
+
+        The strict stub has no ``set-state``; the kit's ``lifecycle.apply_native`` runs here
+        against the stub's rows, as tests/test_follow_on_contributions.py runs it in memory.
+        """
+        from lifecycle import apply_native
+        from requirements import content_hash
+        path = self.canonical_root / 'canonical.json'
+        state = json.loads(path.read_text(encoding='utf-8'))
+        rows = state['rows']
+        issue = next(row for row in rows if row['id'] == task)
+        stamp = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+
+        def run(args):
+            if args == ['export', '--all']:
+                return ''.join(json.dumps(row) + '\n' for row in rows)
+            assert args[0] == 'set-state', args
+            dimension, new = args[2].split('=', 1)
+            old = next((label.split(':', 1)[1] for label in issue.get('labels') or [] if label.startswith(dimension + ':')), None)
+            issue['labels'] = [label for label in issue.get('labels') or [] if not label.startswith(dimension + ':')]                 + [dimension + ':' + new]
+            event_id = '%s.%d' % (task, len(rows))
+            description = (('Set ' if old is None else 'Changed ') + dimension
+                           + (' to ' if old is None else ' from ' + old + ' to ') + new
+                           + '\n\nReason: ' + args[args.index('--reason') + 1])
+            rows.append(dict(_type='issue', id=event_id, issue_type='event', title='State change: ' + dimension + ' → ' + new,
+                             description=description, status='closed', created_by=recorder, created_at=stamp,
+                             dependencies=[dict(issue_id=event_id, depends_on_id=task, type='parent-child')]))
+            return json.dumps(dict(changed=True, dimension=dimension, event_id=event_id, new_value=new))
+        scope = {'source_commit': commit, 'integration_commit': merge, 'release_id': '', 'environment': ''}
+        fact = dict(schema_version=1, task=task, scope=scope, evidence=['commit:' + commit], provenance='performed',
+                    actor=recorder)
+        for dimension, value in (('lifecycle-scope', content_hash(scope)), ('integrated', 'passed')):
+            apply_native(dict(fact, operation_id='op-' + secrets.token_hex(6), dimension=dimension, value=value), recorder, run)
+        path.write_text(json.dumps(state), encoding='utf-8')
+
+    def scenario(self):
+        import time
+        admin = self.admin_token()
+        alex, project = self.setup_project()
+        bea_id = self.create_account(admin, 'bea', 'bea-password-1')
+        added = self.request('PUT', '/v1/projects/%s/members/%s' % (project, bea_id), {'role': 'owner'}, token=admin)
+        self.assertIn(added.status, (200, 201), added.data)
+        bea = self.login('bea', 'bea-password-1')[0]
+        first, contribution = self.delivered(alex, bea, project, 'first', COMMIT, self.MERGE_1)
+        time.sleep(1.1)                                    # the tracker stamps whole seconds
+        self.delivered(alex, bea, project, 'second', 'f' * 40, self.MERGE_2)
+        return alex, project, first, contribution
+
+    def follow(self, alex, project, task, contribution, base):
+        latest = self.request('GET', '/v1/projects/%s/tasks/%s/brief' % (project, task), token=alex).data['review']['latest_id']
+        body = dict(CONTRIBUTION, commit=self.OTHER, base_commit=base, operation='contribute', schema_version=1,
+                    operation_id='op-' + secrets.token_hex(6), previous=latest, supersedes=None, follows=contribution)
+        return self.request('POST', self.reviews(project, task), body, token=alex)
+
+    def test_an_accounts_follow_on_is_told_the_reason_the_recorder_and_both_remedies(self):
+        alex, project, task, contribution = self.scenario()
+        refused = self.follow(alex, project, task, contribution, self.MERGE_2)
+        self.assertEqual(422, refused.status, refused.data)
+        sentence = (
+            'Contribution base_commit must be the prior integration commit %s, or an integration commit this project '
+            'recorded after it (a passed integrated fact on any task, recorded by a listed operator, not reverted); none '
+            'is recorded yet. %s is not accepted: it was recorded as an integration commit by "old-coordinator", who is '
+            'not a listed operator of this installation. Integrations must be recorded by a listed operator for a later '
+            'base to count: an operator adds the recorder (admin.py operators add) or records the integration'
+            % (self.MERGE_1, self.MERGE_2))
+        self.assertGreater(len(sentence), 200)
+        error = refused.data['error']
+        # The sentence is the message, as for a refused recommendation, and the detail is the canonical line, whole.
+        self.assertEqual((error['message'], error['detail']), (sentence, 'ValueError: ' + sentence))
+        # The other reasons arrive whole too.
+        never = self.follow(alex, project, task, contribution, '9' * 40)
+        self.assertEqual(422, never.status, never.data)
+        self.assertTrue(never.data['error']['message'].endswith(
+            '%s is not accepted: this project has no passed integrated fact that names it as an integration commit'
+            % ('9' * 40)), never.data)
+        # And the exact prior commit is accepted, whoever recorded it.
+        self.assertEqual(201, self.follow(alex, project, task, contribution, self.MERGE_1).status)
+
+    def test_the_larger_limit_is_for_the_kits_own_sentence_only(self):
+        """Never for text a caller supplied, echoed back at length."""
+        import review_workflow
+        limit = EndpointBackend._detail_limit
+        whole = 'ValueError: ' + review_workflow.BASE_RULE % (
+            self.MERGE_1, review_workflow.BASE_NONE_YET, self.MERGE_2,
+            review_workflow.BASE_WHY_UNLISTED % '"old-coordinator"')
+        self.assertEqual(limit('review', whole), 1500)
+        for label, line in (
+                ('another refusal of the review action', 'ValueError: ' + 'x' * 900),
+                ('the sentence with more after it', whole + ' and then some'),
+                ('the sentence after other text', 'ValueError: see ' + whole[len('ValueError: '):]),
+                ('a commit that is not one', whole.replace(self.MERGE_2, 'not a commit <b>' + 'y' * 300)),
+                ('a recorder that is not a plain name', whole.replace('"old-coordinator"', '"x\x1b[31m y"')),
+                ('a recorder longer than a name may be', whole.replace('"old-coordinator"', '"%s"' % ('n' * 81))),
+                ('the sentence without the error name', whole[len('ValueError: '):]),
+                ('nothing', None)):
+            with self.subTest(line=label):
+                self.assertEqual(limit('review', line), 200)
+        self.assertEqual(limit('review', 'ValueError: ' + 'a' * 2000), 200)
+        # The longest form the sentence can take (the longest ids, a newest commit, the longest name) fits.
+        longest = 'ValueError: ' + review_workflow.BASE_RULE % (
+            'a' * 64, review_workflow.BASE_NEWEST % ('b' * 64), 'c' * 64,
+            review_workflow.BASE_WHY_UNLISTED % ('"%s"' % ('n' * 80)))
+        self.assertLess(len(longest), 1500)
+        self.assertEqual(limit('review', longest), 1500)
+        # The sentence from another action keeps that action's limit.
+        self.assertEqual((limit('bd', whole), limit('checkpoint', whole)), (200, 6000))
+        # What is handed on is cut at the limit that applies: a long line of another kind arrives at 200.
+        with self.assertRaises(HttpError) as cut:
+            EndpointBackend._checked({'returncode': 2, 'stdout': '', 'stderr': 'ValueError: ' + 'x' * 900 + '\n'}, 'review')
+        self.assertEqual(len(cut.exception.detail), 200)
+        with self.assertRaises(HttpError) as kept:
+            EndpointBackend._checked({'returncode': 2, 'stdout': '', 'stderr': whole + '\n'}, 'review')
+        self.assertEqual(kept.exception.detail, whole)
 
 
 if __name__ == '__main__':

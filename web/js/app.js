@@ -11,11 +11,12 @@ import * as admin from './views/admin.js';
 import * as reqs from './views/requirements.js';
 import * as agents from './views/agents.js';
 import * as setup from './views/setup.js';
+import * as how from './views/how.js';
 
 // Route name -> view. Patterns live in routes.js (shared ID pattern, testable).
 const VIEWS = {
   home: work.home, welcome: work.welcome, projects: work.directory, agents: agents.list,
-  project: project.overview, reviews: project.reviews, feedback: project.feedback, settings: project.settings, setup: setup.page,
+  project: project.overview, reviews: project.reviews, feedback: project.feedback, settings: project.settings, setup: setup.page, how: how.page,
   newTask: task.create, task: task.detail,
   requirements: reqs.brd, requirement: reqs.requirement, decisions: reqs.decisions, decision: reqs.decision, record: reqs.record,
   users: admin.users, account: admin.account,
@@ -95,6 +96,7 @@ export async function start(root, options = {}) {
             link('/p/' + pid + '/feedback', 'Feedback'),
             link('/p/' + pid + '/settings', 'Members & settings'),
             ['owner', 'superuser'].includes(current.role) ? link('/p/' + pid + '/setup', 'Set up') : null,
+            link('/p/' + pid + '/how', 'How work is found'),
           ] : null),
         ctx.me.superuser ? h('div', { class: 'rail-section' },
           h('span', { class: 'rail-label' }, 'Administration'),
@@ -137,7 +139,7 @@ export async function start(root, options = {}) {
         if (error && error.status === 401) return ctx.sessionLost();
         if (!ctx.features.requirements && error && [404, 501].includes(error.status) && RECORD_ROUTES.has(match.name)) {
           mount(main, h('div', { class: 'panel' }, h('div', { class: 'empty', role: 'status' }, h('strong', null, 'Not available on this server'),
-            h('p', null, 'Requirements, decisions and records are not served by this Orchestra server yet. Tasks, reviews and feedback work as usual.'))));
+            h('p', null, 'Requirements, decisions and records are not served by this Orchestra server yet. Tasks and reviews work as usual.'))));
           document.title = 'Not available · Orchestra';
           return;
         }

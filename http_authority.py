@@ -326,6 +326,13 @@ CAP_PROPOSALS = 'proposals.write'
 CAP_PROJECT_ADMIN = 'project.admin'
 CAP_PROJECT_CREATE = 'project.create'
 CAP_ACCOUNTS_ADMIN = 'accounts.admin'
+#: Creating a project ON THE HOST from the web interface (kittrial-5bb.118 part 2): a
+#: superuser, or an account a superuser granted it to, within the grant's limit.
+CAP_PROJECT_HOST_CREATE = 'project.host-create'
+#: The canonical project name (``admin.validate_name``); only such ids are host projects.
+CANONICAL_PROJECT_NAME = re.compile(r'[a-z][a-z0-9]{1,23}')
+GRANT_LIMIT_MAX = 100
+GRANT_LIMIT_DEFAULT = 5
 #: Personal agent management. It is deliberately NOT project-scoped: every
 #: authenticated session may manage the agents it owns, while no worker/agent
 #: credential ever holds it (an agent cannot create or widen another identity).
@@ -405,6 +412,35 @@ def credential_capabilities(state, credential, issuer, project_id):
     return frozenset(cap for cap in caps if cap in ROLE_CAPABILITIES.get(role, frozenset()))
 
 
+def project_grant(user):
+    """The account's "may create projects" grant as ``{'limit', 'granted_by', 'granted_at'}``, or None.
+
+    A grant that is not exactly that shape is no grant: the check fails closed.
+    """
+    grant = user.get('project_grant') if isinstance(user, dict) else None
+    if not isinstance(grant, dict) or type(grant.get('limit')) is not int or \
+            not 1 <= grant['limit'] <= GRANT_LIMIT_MAX or not isinstance(grant.get('granted_by'), str):
+        return None
+    return grant
+
+
+def created_projects(state, user_id):
+    """The registered host projects an account created that still count toward its limit.
+
+    Counted: a record this account created whose id is a canonical project name and which
+    is not archived. Handing the project to another owner does not free the place;
+    archiving it does (and an operator retires the host project separately).
+    """
+    return sorted(pid for pid, project in (state.get('projects') or {}).items()
+                  if isinstance(project, dict) and project.get('created_by') == user_id
+                  and not project.get('archived') and isinstance(pid, str)
+                  and CANONICAL_PROJECT_NAME.fullmatch(pid))
+
+
+#: Said to everyone who may not create a project, whatever name they sent.
+HOST_CREATE_REFUSED = 'This account may not create projects. A superuser grants that, or creates the project.'
+
+
 def decide(state, request, *, now=None, allow_self_user=None):
     """Authorize one capability from durable state, or raise :class:`AuthorityDenied`.
 
@@ -432,7 +468,7 @@ def decide(state, request, *, now=None, allow_self_user=None):
         issuer = state.get('users', {}).get(credential.get('user_id'))
         if not isinstance(issuer, dict) or issuer.get('disabled'):
             raise deny(401, 'unauthenticated', 'Authentication is no longer valid')
-        if capability in (CAP_ACCOUNTS_ADMIN, CAP_PROJECT_CREATE, CAP_AGENTS):
+        if capability in (CAP_ACCOUNTS_ADMIN, CAP_PROJECT_CREATE, CAP_AGENTS, CAP_PROJECT_HOST_CREATE):
             raise deny(403, 'forbidden',
                        'A worker credential cannot perform administrative operations')
         if credential.get('agent_id'):
@@ -473,6 +509,19 @@ def decide(state, request, *, now=None, allow_self_user=None):
         return {'role': 'superuser'}
     if capability == CAP_PROJECT_CREATE:
         return {'role': 'session'}
+    if capability == CAP_PROJECT_HOST_CREATE:
+        # Never an agent or worker credential (refused above), always the live record:
+        # a grant taken away, or a limit lowered, is seen by the next decision.
+        if user.get('superuser'):
+            return {'role': 'superuser', 'limit': None, 'used': len(created_projects(state, user_id))}
+        grant = project_grant(user)
+        if grant is None:
+            raise deny(403, 'forbidden', HOST_CREATE_REFUSED)
+        used = len(created_projects(state, user_id))
+        if used >= grant['limit']:
+            raise deny(403, 'forbidden', 'The limit of %d project(s) for this account is reached (%d in use)'
+                       % (grant['limit'], used))
+        return {'role': 'grant', 'limit': grant['limit'], 'used': used}
     if capability == CAP_AGENTS:
         # Personal identity management, not a project operation: every authenticated
         # session may manage the agents it owns, and the service checks ownership of
@@ -570,16 +619,23 @@ class AuthorityConfig:
     The trusted HTTP service passes these to the canonical endpoint as *launch*
     arguments, exactly as it passes ``--root``. They are never read from the request
     body, so an SSH-shaped request cannot redirect the live-authority read or make
-    ``file_lock`` create a lock at a caller-chosen path.
+    ``file_lock`` create a lock at a caller-chosen path. ``service_namespace`` is the
+    service's own actor namespace (``--actor-namespace``, default ``http``), carried for
+    the same reason: at use the endpoint must refuse a name the service was started under,
+    and only its launcher knows it (kittrial-5bb.188 item 3).
     """
 
-    __slots__ = ('store', 'lock')
+    __slots__ = ('store', 'lock', 'service_namespace')
 
-    def __init__(self, store, lock=None):
+    def __init__(self, store, lock=None, service_namespace=None):
         if not isinstance(store, str) or not store:
             raise ValueError('AuthorityConfig.store must be a non-empty path')
         self.store = store
         self.lock = lock or (store + '.lock')
+        if service_namespace is None:
+            import actor_names
+            service_namespace = actor_names.SERVICE_NAMESPACE
+        self.service_namespace = service_namespace
 
 
 def principal_key(request, authority_configured=False):
@@ -643,7 +699,7 @@ class PreEffectFailure(Exception):
 #: allowlist: an unrecognized verb is treated as a write, so an unknown future
 #: mutation can never be mistaken for a read and released.
 READ_ONLY_BD_VERBS = frozenset({'export', 'list', 'show', 'ready', 'search',
-                                'count', 'dep', 'state', 'lint'})
+                                'count', 'state', 'lint'})
 
 #: Exceptions the canonical effect layer raises to refuse a request (bad attachment,
 #: task mismatch, malformed payload, unknown flag). They release the identity only
@@ -666,11 +722,125 @@ def _is_plain_dry_run(argv):
     return '--dry-run' in options
 
 
+def _help_flags(argv):
+    """The value of every help flag of a bd invocation, in order, or None when a flag cannot be resolved.
+
+    A bare ``--help`` or ``-h`` is True; ``--help=VALUE`` and ``-h=VALUE`` are the text of
+    VALUE. A token that is the value of another flag, or stands after ``--``, is not a
+    flag. The inventories are the kit's own tables of bd's flags; a flag none of them
+    knows makes the answer None, because its value could be what looks like the help flag.
+    """
+    import reserved_comments as rc
+    verb = argv[0]
+    value_long = set(rc.BD_GLOBAL_VALUE_FLAGS)
+    bool_long = set(rc.BD_GLOBAL_BOOL_FLAGS)
+    if verb == 'dep':
+        value_long |= rc.BD_DEP_VALUE_LONG_FLAGS
+        bool_long |= rc._DEP_BOOL_FLAGS
+        table = rc._short_flag_table('dep', rc._dep_subcommand(list(argv)))
+    elif verb == 'comments':
+        value_long |= rc.BD_COMMENT_ADD_VALUE_FLAGS
+        bool_long |= rc.BD_COMMENT_ADD_BOOL_FLAGS
+        table = rc._short_flag_table('comments', 'add')
+    else:
+        value_long |= rc.BD_LONG_VALUE_FLAGS.get(verb, set())
+        bool_long |= rc.BD_LONG_BOOL_FLAGS.get(verb, set())
+        table = rc._short_flag_table(verb)
+    found, index = [], 1
+    while index < len(argv):
+        token = argv[index]
+        index += 1
+        if not isinstance(token, str):
+            return None
+        if token == '--':
+            break
+        if len(token) > 1 and token.startswith('--'):
+            name, joined, value = token.partition('=')
+            if name == '--help':
+                found.append(value if joined else True)
+            elif name in value_long:
+                index += 0 if joined else 1
+            elif name not in bool_long:
+                return None
+        elif len(token) > 1 and token.startswith('-'):
+            letters, joined, value = token[1:].partition('=')
+            for position, letter in enumerate(letters):
+                kind = table.get(letter)
+                if kind is None:
+                    return None
+                if kind == 'value':
+                    if position == len(letters) - 1 and not joined:
+                        index += 1                       # its value is the next token
+                    break                                # else the rest of the token is its value
+                if letter == 'h':
+                    found.append(value if joined and position == len(letters) - 1 else True)
+    return found
+
+
+def _asks_for_help(argv):
+    """Whether bd will print help for this invocation and carry nothing out.
+
+    bd prints help only when the flag is on. ``--help=false`` (also ``--help=0``,
+    ``-h=false``) is a flag bd accepts and then carries the command out (review of
+    kittrial-5bb.97, revision 2: every such spelling of a write was taken for a read, so it
+    was not stamped and a failure after it released the operation's identity). So: help only
+    when the help flag is on, bare or with a value bd reads as true; given more than once,
+    the last one decides, as in bd (``--help=false --help`` prints help, ``--help
+    --help=false`` carries the command out). Anything else, and anything that cannot be
+    resolved, is judged as if no help had been asked: a help request taken for a write is
+    stamped needlessly; a write taken for help is the fault.
+    """
+    try:
+        from reserved_comments import _parse_go_bool
+        found = _help_flags(argv)
+        # bd takes the last one where the flag is given more than once.
+        return bool(found) and _parse_go_bool(found[-1]) is True
+    except Exception:  # noqa: BLE001 - what cannot be scanned stays what it was
+        return False
+
+
+def _writes_rows(argv):
+    """Whether the kit's table of writing commands says this invocation writes rows; unknown is a write."""
+    try:
+        from reserved_comments import write_targets
+        return write_targets(list(argv), {}) is not None
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def _comments_writes(argv):
+    """Whether a ``bd comments`` invocation adds a comment: its subcommand is ``add``.
+
+    The subcommand is the first operand, not the second token: bd accepts flags between
+    the two (``comments --json add ID text``, ``comments --help=false add ID text``), and
+    a test of the token right after ``comments`` took each of those writes for a read
+    (review of kittrial-5bb.97, revision 3; the same on main). The kit's own reader of a
+    ``comments`` invocation resolves it, as ``dep`` is resolved; what it cannot resolve
+    (a flag it does not know, which could hide the subcommand) is a write.
+    """
+    try:
+        from reserved_comments import _comments_parts
+        parts = _comments_parts(list(argv))
+    except Exception:  # noqa: BLE001 - ambiguous: never mistaken for a read
+        return True
+    return parts is None or parts[0] == 'add'
+
+
 def is_mutating_invocation(argv):
     """Whether one injected ``bin/bd`` argv can change canonical/native state."""
     if not isinstance(argv, (list, tuple)) or not argv or not isinstance(argv[0], str):
         return True
     verb = argv[0]
+    if _asks_for_help(argv):
+        # `bd VERB ... --help` prints the help of the verb and writes nothing (review of
+        # kittrial-5bb.97: `create --help` was taken for a write and its answer stamped).
+        return False
+    if verb == 'dep':
+        # `dep add`, `remove`, `relate`, `unrelate` and the form without a subcommand store or
+        # remove a dependency; `list`, `tree` and `cycles` read. The kit's own table of the
+        # rows a command writes decides (reserved_comments.write_targets): the whole verb was
+        # listed as read-only here, older than that table.
+        return _writes_rows(argv)
     if verb in READ_ONLY_BD_VERBS:
         return False
     if verb in ('create', 'update') and _is_plain_dry_run(argv):
@@ -678,7 +848,7 @@ def is_mutating_invocation(argv):
         # from it is a clean pre-effect failure, not an uncertain write.
         return False
     if verb == 'comments':
-        return len(argv) > 1 and argv[1] == 'add'
+        return _comments_writes(argv)
     if verb == 'merge-slot':
         return not (len(argv) > 1 and argv[1] == 'check')
     return True
@@ -695,12 +865,16 @@ class NativeRunner:
     it returns whatever the dispatch returns and raises whatever it raises.
     """
 
-    __slots__ = ('_dispatch', 'attempted_write', 'calls')
+    __slots__ = ('_dispatch', 'attempted_write', 'calls', 'wrote')
 
     def __init__(self, dispatch):
         self._dispatch = dispatch
         self.attempted_write = False
         self.calls = 0
+        #: Set by an effect that wrote something that is not a bd row (the kit's handoff
+        #: journal): the answer is then the answer of a write, with the server's time
+        #: (kittrial-5bb.97). It says nothing about refusals, which `attempted_write` decides.
+        self.wrote = False
 
     def __call__(self, argv):
         self.calls += 1
@@ -1717,6 +1891,26 @@ def _envelope(code, stderr='', **extra):
     return payload
 
 
+def server_time(now=None):
+    """The server's clock for a write answer: UTC with its offset, whole seconds (kittrial-5bb.97)."""
+    import datetime
+    moment = datetime.datetime.now(datetime.timezone.utc) if now is None else \
+        datetime.datetime.fromtimestamp(now, datetime.timezone.utc)
+    return moment.replace(microsecond=0).isoformat()
+
+
+def stamp_write(envelope):
+    """Put ``server_time`` on the answer of a write that was carried out; the same answer is returned.
+
+    Only a successful answer (return code 0) that has none yet: a refusal, a busy and an
+    uncertain answer say nothing about when something was written, and an answer that is
+    stamped keeps its time (a replayed write returns the time it was carried out).
+    """
+    if isinstance(envelope, dict) and envelope.get('returncode') in (None, 0) and 'server_time' not in envelope:
+        envelope['server_time'] = server_time()
+    return envelope
+
+
 #: The ids the HTTP service allocates (http_auth: ``usr_``/``agent_`` + 16 hex). As a
 #: declared actor the shape is reserved for that service (``reserved_comments.HTTP_ACTOR``).
 HTTP_ACTOR_ID = re.compile(r'(?:usr|agent)_[0-9a-f]{16}')
@@ -1770,6 +1964,98 @@ def http_actor_denial(request, authority_config):
     if head not in allowed:
         return _envelope(126, stderr='The actor is not the account or agent the live-authority descriptor '
                                      'names\n', authority_status=403)
+    return None
+
+
+def descriptor_actor_denial(request, authority_config, reserved):
+    """Why a request the web service sent under a name that is NOT a web id is refused, or None.
+
+    ``http_actor_denial`` judges an actor with the shape of an account or agent id. Every
+    other name went through unjudged, so the web service could be made to write under a
+    host actor's name: by a member, with an ``actor`` in the body of a task write
+    (kittrial-5bb.181, closed in the routes), and by a project owner, with a worker
+    credential ISSUED under that name (kittrial-5bb.184). The tracker's rows carry the name
+    and nothing else, and "is the caller the assignee, is it the author" is asked of the
+    name, so such a credential was that actor.
+
+    Launched by the service, with the live-authority descriptor, a name without the shape
+    of a web id is written only
+
+    * by a worker credential (the one the descriptor names, read from the live store),
+    * inside that credential's own namespace (``NAME`` or ``NAME/...``),
+    * when the namespace is nobody else's (``actor_names.collision``): not a session actor
+      of the project or a name of that shape, not a name on the operator or verifier
+      list, not the web service's own namespace -- the one it was launched with, which
+      ``AuthorityConfig.service_namespace`` carries (kittrial-5bb.188 item 3), not only
+      ``http`` -- and not a name that reads as another (a leading or trailing dot or
+      dash, an ``@host``).
+
+    A credential issued before kittrial-5bb.188 carries no ``actor_rows_checked`` mark, so
+    it is judged again by the project's own tracker rows (one bd export): a name the
+    tracker was already holding before the credential existed is somebody else's, and the
+    write is refused. Rows inside the lifetime of an earlier credential of the SAME name,
+    issued by the same owner for the same project and not itself refused by the row rule,
+    are not held against it (kittrial-5bb.188 item 3); a credential the kit has since
+    judged (``actor_rows_checked`` or ``actor_rows_refused``) or a superuser waived
+    (``actor_waived``) carries a settled outcome and is not read against the tracker again
+    (items 4 and 5). An export that yields no rows at all is a host fault answered
+    ``fault: "tracker"`` (item 1), never "the tracker holds nothing".
+
+    ``reserved`` is called only when a namespace has to be judged and returns the host's
+    names (``sessions``, ``operators``, ``verifiers``, and ``authors`` from the tracker
+    when asked with ``rows=`` and the earlier credentials' lifetimes with ``own=``). A
+    request without a descriptor is not judged here: on the SSH path there is none, and the
+    service's own reads carry none; a write the service sends without one is refused by
+    ``run_guarded``.
+    """
+    if authority_config is None:
+        return None
+    authority = request.get('authority')
+    actor = request.get('actor')
+    if not isinstance(authority, dict) or http_actor_id(actor) is not None:
+        return None
+    if isinstance(actor, str) and actor and actor == authority.get('user_id'):
+        return None                                  # the account itself, whatever its id looks like
+    import actor_names
+    try:
+        state = read_state(authority_config.store)
+    except AuthorityDenied as denied:
+        return _envelope(126, stderr='%s\n' % denied.message, authority_status=denied.status)
+    credential = (state.get('credentials') or {}).get(authority.get('credential_id')) \
+        if authority.get('via') == 'credential' and authority.get('credential_id') else None
+    if not isinstance(credential, dict) or credential.get('agent_id'):
+        return _envelope(126, stderr='The actor is not the account or agent the live-authority descriptor '
+                                     'names\n', authority_status=403)
+    namespace = credential.get('actor')
+    if not actor_names.inside(actor, namespace):
+        return _envelope(126, stderr='The actor is outside the namespace of the credential the live-authority '
+                                     'descriptor names\n', authority_status=403)
+    service = getattr(authority_config, 'service_namespace', actor_names.SERVICE_NAMESPACE)
+    service = (service, actor_names.SERVICE_NAMESPACE)
+    reason = actor_names.collision(namespace, service=service, **reserved())
+    if reason is None and credential.get('actor_rows_refused'):
+        # Judged by the rows at an earlier write and refused then: refuse again without a
+        # read (kittrial-5bb.188 item 5). The stored reason is the kit's own rule word.
+        stored = credential.get('actor_rows_refused')
+        reason = stored if isinstance(stored, str) and stored else actor_names.ROWS
+    elif reason is None and not (credential.get('actor_rows_checked') or credential.get('actor_waived')):
+        # Issued before the row rule, or never judged: the project's own rows decide
+        # (kittrial-5bb.188 items 1 and 5). Rows inside an earlier same-name credential's own
+        # lifetime that the row rule did not refuse are not held against this one (item 3);
+        # a superuser's waiver (item 4) is its own settled mark and skips this.
+        issued = credential.get('created_at')
+        own = actor_names.own_intervals(state.get('credentials') or {}, namespace,
+                                        credential.get('user_id'), credential.get('project_id'),
+                                        exclude=authority.get('credential_id'))
+        try:
+            reason = actor_names.collision(namespace, service=service,
+                                           **reserved(rows=issued if isinstance(issued, str) and issued else True,
+                                                      own=own))
+        except actor_names.TrackerUnreadable as unreadable:
+            # Not a refusal of the request: the tracker could not be read (item 1).
+            return _envelope(2, stderr='%s\n' % unreadable, fault='tracker')
+    if reason is not None:
+        return _envelope(126, stderr='%s\n' % actor_names.refusal(namespace, reason), authority_status=403)
     return None
 
 
@@ -1856,7 +2142,11 @@ def run_guarded(request, journal_path, effect, authority_config=None,
                         return _envelope(124, stderr='Operation is committed but its response '
                                                      'exceeded the retention bound; reconcile '
                                                      'canonical state before retrying.\n')
-                    return entry.get('envelope')
+                    # The stored answer, marked as one: a caller that would otherwise put its
+                    # own clock on a write answer must not do so for an answer that was
+                    # stored without a time (by a kit from before the time was kept).
+                    stored = entry.get('envelope')
+                    return dict(stored, replayed=True) if isinstance(stored, dict) else stored
                 # The prior attempt reserved the identity and its outcome is unknown:
                 # preserve uncertainty rather than repeating a possibly committed effect.
                 return _envelope(124, stderr='Operation identity reserved; outcome unknown. '
@@ -1891,6 +2181,11 @@ def run_guarded(request, journal_path, effect, authority_config=None,
             return _envelope(124, stderr='Effect raised after the reservation (%s: %s); '
                                          'outcome unknown. Reconcile canonical state before '
                                          'retrying.\n' % (type(error).__name__, error))
+        # The time of the write, on the answer itself and so in what the journal keeps: the
+        # same request sent again is answered with the time the write was carried out. A
+        # guarded action that only read (its runner attempted no write) carries none.
+        if runner is None or runner.attempted_write or runner.wrote:
+            stamp_write(envelope)
         if journal is not None and isinstance(envelope, dict):
             code = envelope.get('returncode')
             if code in (None, 0):

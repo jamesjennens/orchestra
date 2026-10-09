@@ -55,15 +55,23 @@ sudo install -d -m 0700 -o <SERVICE_USER> -g <SERVICE_USER> <RUNTIME_ROOT>/secre
 sudo -u <SERVICE_USER> git clone <KIT_REPO_URL> <RUNTIME_ROOT>/kit
 cd <RUNTIME_ROOT>/kit && git checkout <PINNED_COMMIT>
 
-# 3. one-time superuser bootstrap; there is no default or shared password
+# 3. one-time superuser bootstrap; there is no default or shared password.
+#    Run it while the service is stopped: it takes the runtime lock and refuses
+#    while a service holds that root. --root must name an existing runtime
+#    directory (a path that is not one is refused with one sentence).
 sudo -u <SERVICE_USER> python3 http_service.py \
-  --state <RUNTIME_ROOT>/http-state.json --bootstrap-user <ADMIN_USERNAME>
+  --state <RUNTIME_ROOT>/http-state.json --root <RUNTIME_ROOT> \
+  --bootstrap-user <ADMIN_USERNAME>
 # the operator types the password at the prompt; it is never echoed or logged
 ```
 
 Bootstrap refuses to run once any account exists, so it cannot silently reset a
 live deployment. Create ordinary accounts through the API and hand each user a
 single-use reset value; only redemption changes the verifier.
+
+The guard is only as good as `--root`: it locks the root you name, so naming a
+different root while a service holds the real one gets past the lock and the new
+account is lost as before.
 
 ## 4. Service unit
 
@@ -101,6 +109,25 @@ forwarded headers the service will believe. A reverse proxy on the same host is
 `--trusted-proxy 127.0.0.1`. Enable it **only** for the configured proxy address:
 forwarded headers from any other peer are ignored, so a client cannot spoof the
 throttle key or claim `https`.
+
+`--connections-per-address N` (default 100; 1 to 200) is how many of the
+service's 200 connections one client address may have open at once; one more
+from it is closed at once. An IPv6 address is counted with its /64. A peer named
+by `--trusted-proxy` is not limited as an address, because every client behind
+it arrives from it: for the requests it forwards, N is how many requests of one
+forwarded address are served at once, and one more is answered `503 busy` with
+`Retry-After: 1` and `Connection: close` before its route begins. A forwarded
+header from any other peer does not change which address a connection is
+counted for.
+
+`--logins-per-address N` (default 4; 1 to 16) is how many of the 16 log-ins in
+flight one client address may have. A log-in over it waits up to 2 seconds for
+one of its address's places (at most 12 of one address wait at once) and is then
+answered `503 busy` with `Retry-After: 5`. A log-in that arrives from the
+service's own host, or from a trusted proxy that forwarded no address (an SSH
+tunnel), is not held to a share: everybody arrives from that address. See
+docs/OFFICE_SERVICE.md ("Connections that say nothing" and the paragraphs about
+log-ins) for what the limits stop, what they do not, and the measurements.
 
 That last point is what makes browser cookies safe under the documented TLS
 deployment. TLS terminates at the proxy, so the loopback connection to the
@@ -169,6 +196,14 @@ contribution review and feedback. Requirements, decisions and records are hidden
 from its navigation (the service has no routes for them yet) and a direct link
 shows "not available on this server".
 
+**Feedback is not built on the endpoint backend**, which is the backend of every
+real installation: reading and sending it (`GET` and `POST
+/v1/projects/{id}/feedback`) answer `501 not_implemented`, nothing is kept and no
+idempotency key is held. The Feedback page says so ("Feedback is not available on
+this server") and shows no form. Until it is built, what somebody found goes on the
+task it concerns or to the people who run the project; a worker with the client has
+`feedback` over SSH.
+
 ### Projects on the endpoint backend
 
 With `--backend endpoint`, a project's tasks live in a canonical Beads project under
@@ -188,6 +223,14 @@ The rules:
   second registration is refused with 409, naming the existing record (archived or not).
   An exact retry of a successful registration with the same `Idempotency-Key` replays
   its 201.
+- A few names are reserved for the server's own routes and cannot be registered:
+  `unconfirmed` is the upgrade check below (`GET /v1/projects/unconfirmed`). Registering
+  one is refused with 422 before the host is asked, because the record could never be
+  read back under its own name.
+- Registration writes `registered_by` (the superuser who registered it) on the record.
+  That mark is what makes the mapping count as superuser-backed, so it keeps working even
+  if that superuser is later demoted. A record made by an older kit has no such mark; a
+  confirmation backfills it, and see the limit on that below.
 - If no initialized canonical project `NAME` exists, the request is refused with 422 and
   nothing is stored.
 - Registering makes the superuser the project's only member (owner). Add members
@@ -223,19 +266,47 @@ a `proj_...` record until a superuser decides. After every upgrade to this kit o
      shows the creator and the members first). The canonical project must exist on the
      host. The members keep their access, so review them; the confirmation is recorded
      on the record (`confirmed_by`, `confirmed_at`) and in the audit log
-     (`projects.confirm`); or
+     (`projects.confirm`), and it backfills `registered_by` when the record has no such
+     mark, so the mapping stays superuser-backed if the confirming superuser is later
+     demoted; or
    - **archives** it (`POST /v1/projects/{id}/archive`).
 3. Archive each `no-canonical` entry (a `proj_...` id).
+
+**The backfill's limit (a known exposure, not closed).** A confirmation backfills
+`registered_by` only for a record that has no such mark, and a record can only be
+confirmed while the backend will not serve it. A record whose creator is still a
+superuser is *usable*, so the confirm route refuses it with 409 "This project needs no
+confirmation" and the backfill **cannot** be applied yet. Demote that creator first (or
+wait until nothing else makes the mapping superuser-backed) and the read turns unusable,
+which is exactly when confirm works and stamps `registered_by` beside `confirmed_by`.
+Until then such a record stays usable only for as long as someone is a superuser behind
+it: demoting the creator without confirming first leaves it unusable, and the confirmation
+is then available. There is deliberately no route that stamps the mark on a record the
+service is already serving.
 
 **What an unusable record still allows.** While a record is unconfirmed or has no
 canonical project:
 - Reads of the record, its members and its credentials work. Its task, review and queue
-  routes answer 409 before any endpoint call.
+  routes answer 409 before any endpoint call. Usability is judged live on every read, not
+  from the short read cache, so a record that becomes unusable (for example its creator is
+  demoted) stops being served at once.
 - Nothing that grants or extends access is accepted (409): adding a member or changing a
-  role, issuing a worker credential, a new agent grant.
+  role, issuing a worker credential, a new agent grant, or a new credential for an agent
+  that already holds a grant on the record.
 - Everything that removes access works: removing a member, revoking a worker credential,
   revoking an agent's grant, archiving. Cleaning up a suspicious record never requires
   confirming it first.
+- The refusal is given only to a caller who may touch the thing being changed. On the agent
+  routes an account that may not administer the agent gets the ordinary 404 `Agent not
+  found` (and `Project not found` for a project its owner cannot see), never the
+  unusable-record sentence, so the refusal cannot be used to probe for agent ids, record
+  ids or their owners' memberships.
+- **An archived unusable record** is a special case of the refusal: it cannot be confirmed
+  (the confirm route refuses an archived record), so the 409 says so and names the route
+  that works — removing the access being added (an agent grant, a membership, a
+  credential). An agent that still holds a grant on an archived record therefore gets a new
+  credential as soon as its owner removes that grant, instead of being told to confirm or
+  archive a record that is already archived.
 
 With `--backend inprocess` (disposable local validation) everything is service-local, so
 "New project" still creates the project directly (`project_create: create`), and no record
@@ -260,17 +331,43 @@ the exact command for the server. `remaining` counts the `todo` ones.
 | Repository location recorded | the project's `repository` field | an owner, on the setup page |
 | A first task defined | the task list (the project's merge slot row is not a task) | any member who may write tasks |
 | A personal agent granted the project | the enabled agents granted this project | each member, for their own agent |
-| Guidance set | the host | an operator: `admin.py set-guidance NAME --actor OPERATOR --file FILE` |
-| Onboarding set | the host | an operator: `admin.py set-onboarding NAME --file FILE` |
-| Covered by a scheduled backup | the host | an operator, with the `ExecStart` line shown |
+| Guidance set | the host | an operator: `PYTHON KIT/admin.py --root ROOT set-guidance NAME --actor OPERATOR --file FILE` |
+| Onboarding set | the host | an operator: `PYTHON KIT/admin.py --root ROOT set-onboarding NAME --file FILE` |
+| Covered by a scheduled backup | the host | an operator: a command that runs a backup now, and the `ExecStart` line for a schedule |
 
 - **Who can do it holds for one person and for three.** Each step names a role, not a
   person. On an installation where one person is operator, superuser and owner, they do
   every step; where those are three people, the page tells the owner which steps are
   theirs and gives them the command to send to the operator for the rest.
-- **The page writes nothing on the server.** The three host steps show a command to
-  copy; the web interface does not run it. Setting guidance or onboarding from the web
-  interface is not offered.
+- **What a host step gives to copy says what it is** (kittrial-5bb.200). A step carries
+  `commands`, a list; each entry has a `label`, the `text`, a `note` and a `kind`:
+  `shell` can be pasted into a shell on the server as it stands; `shell-fill` is a shell
+  command with words to replace first, named in `replace` (`OPERATOR`, `FILE`);
+  `unit-line` is a line of a systemd unit file and **not a command**. Every shell
+  command begins as the host says its commands begin: the interpreter the kit runs
+  under, `admin.py` of the installed kit, `--root` and the runtime, each through
+  `install/current` where the installation has one. (`admin.py ...` alone is not on
+  `PATH` and, in a release, deliberately not executable; the backup step used to show
+  the unit-file line `ExecStart=...` as "the command", which a shell answers with
+  `Permission denied`.) The backup step gives three entries: run a backup now, the line
+  for a schedule with where it goes and how to check, and the check
+  (`backup-status --require-complete`). `command` is still sent, with the first entry's
+  text, for a page older than the service. An endpoint older than this answer cannot say
+  how its commands begin: the entries then name `PYTHON`, `KIT` and `RUNTIME_ROOT` as
+  words to replace.
+- **The backup step says which of two things is missing**: a backup that has been run,
+  and a schedule that will run the next. A project that was backed up once and is on no
+  schedule reads `todo` with "What is missing is the schedule"; one with neither says
+  both are missing. The step looks for a systemd unit of the service account
+  (`beads-*backup*.service`) that backs up this runtime, and says so: a schedule kept
+  anywhere else is not seen.
+- **The page runs nothing on the server.** The host steps show a command to copy; the
+  web interface does not run it. One host step can also be done on the page: an owner
+  may write the project's onboarding text there (see "Onboarding text from the setup
+  page" below). Guidance is not settable from the web interface.
+- **A step the server could not check is counted separately.** `remaining` counts the
+  steps that are to do; `unchecked` counts the ones whose state could not be read. The
+  page says "1 step could not be checked" and never "nothing is left" over such a step.
 - **The host steps come through one read-only endpoint action, `setup-status`**, so the
   web service still reaches the host only through `endpoint.py`. It returns states with
   a version or a time and never guidance or onboarding text: guidance `set`, `not-set`,
@@ -310,26 +407,48 @@ commands of that text.
   data: an agent or a person checks it is the repository they expect before cloning,
   and never runs it as a command. The same note travels with the value wherever an
   agent reads it: `repositories_note` in `GET /v1/agents/me/next` and beside the setup
-  text, and `project_repository_note` in the task brief (each null when no repository
-  is recorded).
+  text, `project_repository_note` in the task brief, and `repository_note` on the
+  project itself in `GET /v1/projects` and `GET /v1/projects/{id}`, which an agent
+  credential can read too (each null when no repository is recorded).
 - **What the kit checks: its shape only. Exactly these forms are accepted**, and the
   whole value must match one of them:
   - `https://host[:port]/path`, with **no user name**, so a token or a password cannot
     ride in it (`https://TOKEN@host/...` and `https://user:secret@host/...` are refused);
   - `ssh://[user@]host[:port]/path`, with a plain user name and no password;
   - `user@host:path` (the scp form), with a plain user name and no password;
-  - an absolute path: `/srv/git/x.git`, `C:\git\x.git` or `C:/git/x.git`,
-    `\\server\share\x.git`.
-- In every form: at most 300 characters; a host starts and ends with a letter or digit;
-  a user name is letters, digits and `. _ -`, not starting with `.` or `-`; a path is
-  letters, digits and `. _ ~ + = , / -` (and `\` in a Windows path), and the path of the
-  scp form does not start with `-`. There is no percent-escape, space, quote, control or
-  format character anywhere.
-- So these are refused: any other scheme (`http://`, `file://`, `git://`), a remote-helper
-  form (`ext::...`, `fd::...`), a one-slash scheme (`file:/x`), a host or path that is an
-  option (`ssh://-oProxyCommand=...`, `git@-oProxyCommand=...:x`), a relative path
-  (`../x`, `project`), and `host:path` without a user name. The refusal never repeats
-  the value.
+  - an absolute path that begins with exactly one `/`, for example `/srv/git/x.git`.
+- In every form:
+  - at most 300 characters, ASCII only, and the scheme in lower case;
+  - a host is labels joined by single dots; each label is letters, digits and `-` and
+    starts and ends with a letter or digit; at most 253 characters;
+  - a port is a number from 1 to 65535;
+  - a user name is at most 32 characters: letters, digits and `. _ -`, not starting
+    with `.` or `-`;
+  - a path is letters, digits and `. _ ~ + = , / -`, with no `..` segment, and the path
+    of the scp form does not start with `-`;
+  - there is no percent-escape, space, quote, control or format character anywhere.
+- So these are refused: any other scheme (`http://`, `file://`, `git://`) and an
+  upper-case scheme; a remote-helper form (`ext::...`, `fd::...`); a one-slash scheme
+  (`file:/x`); a host or path that is an option (`ssh://-oProxyCommand=...`,
+  `git@-oProxyCommand=...:x`); a relative path (`../x`, `project`); `host:path` without a
+  user name; a letter that is not ASCII in a host. The refusal never repeats the value.
+- **Windows drive paths and network shares are refused** (`C:\git\x.git`, `C:/git/x.git`,
+  `\\server\share\x.git`, `//server/share/x.git`). Git on another system reads `C:/x`
+  as ssh to a host named `C`, and a share path opens a connection to the named host with
+  the reader's own sign-in. Record a URL instead.
+- **The kit does not judge where a host points.** `localhost`, an IP address and a
+  link-local address are hosts like any other.
+- **A token cannot be told from a name.** A user name or a path segment may be an
+  access token and the rule cannot know. When one begins like a well-known token
+  (`ghp_`, `github_pat_`, `glpat-`, `xoxb-`, `sk-`, `AKIA` and a few more) the value is
+  still accepted, and the project carries `repository_warning`, which the setup page
+  shows to the owner in red: every member and agent can read the value, so replace it
+  and revoke the token. The list of beginnings is short and does not claim to be complete.
+- **A value stored under an earlier rule is checked when it is read.** Nothing is
+  rewritten. A stored value that no longer passes is not shown as the repository and is
+  not delivered to agents: `repository` reads null, `repository_needs_attention` is true,
+  and the setup step reads "to do" and says the recorded location no longer fits. An
+  owner records it again.
 - **What the kit does not check:** that the repository exists, that anyone can reach
   it, or that an agent's clone points at it.
 - **The SSH brief does not carry it.** The field lives in this service's `--state`
@@ -338,6 +457,427 @@ commands of that text.
   covers it. A kit before this one reads a state file that has the field: its project
   routes return the record as it is stored, so the field still appears in them, and
   that kit has no route that changes it and no page that shows it.
+
+### Creating a project from the web interface
+
+An operator creates a project on the host (`admin.py add-project NAME`) and a superuser
+registers it. A named account can also be allowed to do both in one step.
+
+**The grant.** A superuser allows an account to create projects, with a limit on how
+many it may have at one time: `PUT /v1/accounts/{id}/project-grant` with
+`{"limit": N}` (1 to 100; 5 when left out), `DELETE` to take it away. Session authority
+only. Each change is audited as `accounts.project-grant` with the superuser, the account
+and the limit. The People page has a panel "Who may create projects".
+- A superuser may always create, without a limit.
+- **An agent or worker credential never may**, whoever owns it: the capability is
+  refused for every credential.
+- **The limit counts** the projects that account created that are not archived, plus any
+  name it holds on the host through a creation that has not finished. Handing a project
+  to another owner does not free a place. Archiving it does.
+- **The server has a limit of its own**, set by an operator (20 unless changed): the
+  number of project databases it holds. It counts every database, also those of archived
+  and retired projects and of creations that did not finish, because none is ever
+  dropped. So an account that creates, archives and creates again stays within its own
+  limit and still fills the server. At the server's limit a creation is refused with
+  "This server is at its limit of projects, so no new one can be created. Ask an operator
+  of the server to raise the limit or to make room." The answer gives no numbers: they
+  would say how many projects other people have. A superuser sees the numbers on the
+  Projects page, in `GET /v1/project-creations` (`server`) and on a project's setup page.
+  Why there is a limit: see OPERATIONS.md, "The cost of many projects on one server".
+- **What the page is told matches what the endpoint will answer.** `project_host_create`
+  in `GET /v1/sessions/current` counts the names the account holds on the host (`held`),
+  and its `reason` is `limit` (the account's own) or `server-limit`.
+
+**Creating.** `POST /v1/projects` with `{"project_id": NAME, "name": "...", "create": true}`.
+Without `"create": true` the route registers an existing project, as before.
+- The name follows the host rule: 2 to 24 lowercase letters or digits, starting with a
+  letter.
+- The service asks the host through one endpoint action, `create-project`, which runs
+  the same code as `add-project`: database, settings, backup target, merge slot and a
+  first backup.
+- **It takes from a few seconds to a few minutes**: about six seconds on a server with
+  no other project and about one second more for each project database the server
+  already holds (measured; see OPERATIONS.md). The action has its own timeout,
+  `--create-timeout` (900 seconds), separate from `--endpoint-timeout`.
+- **Nothing else waits for it.** The creation is done in three steps: the request is
+  reserved under the service's authority lock (the grant, both limits and the name are
+  checked, and the name is held from that moment), the project is initialized with that
+  lock released, and the result is confirmed under the lock again. While a project is
+  being created every other request is served as usual: reads, task writes in any
+  project, grants, sign-ins.
+- **One creation at a time.** A second creation while one runs answers 503 `busy` at
+  once, with `Retry-After: 60` and "Another project is being created on this server. Try
+  again in a minute." Nothing was done; the same request can be sent again.
+- **If the grant is revoked or the account disabled while the project is being made**,
+  the request is refused (403) and the project stays on the host, complete and not
+  registered. A superuser sees it on the Projects page as "Made, not registered" and
+  either registers it (New project, with that name) or has an operator retire it. The
+  same holds if the server is over its limit when the work ends.
+- **The project appears in the web interface only after the host reports it created**,
+  first backup included. The creator is its only member, as owner, and is sent to the
+  setup page. Only a superuser adds a second owner.
+- The audit record `projects.host-create` names the account, the limit of its grant and
+  the count the creation brings it to.
+- **Refusals.** An account without the grant gets the same 403 as on the register route,
+  whatever name it sends, so the answer cannot be used to learn which names exist. An
+  account with the grant may learn that a name is not available: one sentence, the same
+  for a name that is taken, held by another creation, or retired. A refusal leaves
+  nothing behind: no directory, no database, no record.
+- **Where the backup schedule names projects one by one**, the new project is not
+  covered until an operator adds it. The setup page says so and shows the line.
+
+**Who can call the host action.** `create-project` (and the list and onboarding actions
+below) is accepted by `endpoint.py` only when the process was started with the web
+service's authority arguments and the request carries the live-authority descriptor of a
+signed-in account. The endpoint then checks the grant and the limit itself, against the
+live authority store and under its lock, and the limit once more under the host's own
+creation lock.
+- **Where contributor keys are confined to the forced command** (`ssh_forced_command.py`),
+  an SSH caller cannot reach the action: the forced command drops the authority
+  arguments, and the endpoint refuses the action without them.
+- **Where a key is not confined**, its holder has a shell as the service account and can
+  already run `admin.py add-project`. The action gives such a caller nothing new, and
+  nothing here stops them.
+
+**When a creation stops half way.** The host keeps one record per creation in
+`<root>/project-creations/NAME.json`: the intent is written before the first write and
+the result after the last. `admin.py add-project` keeps the same record, so a creation it
+stopped half way through is finished or removed with the same two commands
+(kittrial-5bb.176).
+- **Nothing was made yet** (no directory, or an empty one): the request answers 409
+  "The project could not be created and nothing was made. Try again; if it fails again,
+  ask an operator of the server." The same request can be sent again. The cause is not
+  in the answer (it may name paths and commands of the host); the operator finds it in
+  `<root>/project-creations/last-failure.txt` (the newest failure, the step it happened
+  at, and the four before it under `earlier`).
+- **No answer to a person carries host text** (kittrial-5bb.143). A creation answers a
+  refusal with one of its own sentences and nothing else, whatever went wrong on the
+  host: a record that cannot be read, a directory that cannot be written, a journal
+  that is not a database. The sentence is chosen by what is on the host, not from the
+  error:
+  - a creation record of that name that cannot be read: "Project name NAME is not
+    available: choose another name". The name is held until an operator has set the
+    record aside (below). No request can adopt or resume such a record, whatever it
+    claims.
+  - the project was made and the last step failed (the operation journal
+    `project-creations/operations.sqlite3` could not be used): "Project NAME was made
+    on the server, but it could not be registered in the web interface. Ask an operator
+    of the server to look at it. When that is repaired, create it again with the same
+    name: nothing is made twice, it is only registered. Do not create it under another
+    name." It is listed for a superuser as made and not registered. After the repair
+    the same person sends the creation again and it is registered.
+  - the project was made and the last step could not get its lock in time: 503 `busy`
+    with `Retry-After`, "Project NAME was made on the server; registering it had to
+    wait for a lock. Send the same request again in a moment: nothing is made twice."
+    (not the endpoint's general "Nothing was done", which would not be true here).
+    Sent again, the request registers it.
+  - The web service applies the same rule on its side: it puts the endpoint's line in
+    its 409 only when the line is, whole, one of those sentences. Anything else
+    becomes "The project could not be created, or was only partly made. Ask an
+    operator of the server to look before you try again.", and the line goes to the
+    service's log (`create-project NAME answered a line that is not a creation
+    sentence: ...`). This also covers an endpoint older than the rule.
+- **A refused follow-on base arrives whole** (kittrial-5bb.158). A canonical refusal's last
+  line is handed on up to 200 characters (6000 for a checkpoint, which lists every
+  problem). The follow-on base refusal of the review action is longer, and cut at 200 it
+  lost its reason, the recorder's name and what an operator must do. When the line is
+  exactly that sentence (`review_workflow.BASE_REFUSAL`: the kit's own words, hexadecimal
+  commit ids, a recorder name of a constrained shape) it is handed on whole, up to 1500
+  characters, and it is the `message` of the 422 as well as the `detail`. No other line
+  gets the larger limit, so a caller's own text is never echoed back at that length.
+- **What a caller without the web service reads** (kittrial-5bb.149, .158). Over SSH the
+  endpoint's own lines arrive as they are: its busy line names the lock file it waited
+  for, and its refusal when `deployment.private.json` cannot be read names that file.
+  That caller is somebody who was given the endpoint. The web service does not pass the
+  busy line on (below). A configuration file that cannot be read is answered 503 with no
+  path from the release that contains kittrial-5bb.156; before it, a member's request is
+  answered 422 with the endpoint's line.
+- **Busy, on every route** (kittrial-5bb.149). When the endpoint could not get a lock in
+  time it answers return code 75 with a line that names the lock file. The service does
+  not pass that line on. A read answers 503 `busy` with `Retry-After` and the service's
+  own sentence, "The server is busy and this request was not completed. Send it again in
+  a moment."; the endpoint's line, which says which lock, is in the service's log
+  (`busy: the endpoint answered return code 75 for ACTION: ...`). A write that the
+  service holds an operation identity for keeps its more careful answer, 503
+  `uncertain` ("reconcile with the same idempotency key"), which names no path either.
+  A creation passes on only its own two busy sentences (another creation is running;
+  the project is made and registering it had to wait).
+- **A write the service cannot answer for: "cannot say"** (kittrial-5bb.149, .156). The
+  service saves its own state under a lock it shares with the endpoint. When a wait for
+  that lock runs out after a route began, a write is answered 503 `uncertain`, with no
+  `Retry-After`: the request may have been carried out (a creation was made and
+  registered, and only the save could not be done). Which sentence depends on the
+  request:
+  - with an `Idempotency-Key`: "The server was busy and cannot say whether this request
+    was carried out. Look before you repeat it, or send it again with the same
+    idempotency key." Sending it again with the same key is safe: it is answered with
+    what happened.
+  - without one: "... Look before you repeat it: sent again without an idempotency key,
+    it may be carried out twice." A task create repeated blindly is a second task. The
+    web interface always sends a key.
+  - the same rule for the other uncertain answer of a write ("The operation may have
+    committed; reconcile with the same idempotency key" or, without a key, "The
+    operation may have committed. Look before you repeat it: ...").
+  - a log-in (`POST /v1/sessions`) is answered 503 `busy` instead ("not completed. Send
+    it again in a moment."): a session that was made and not answered is one nobody
+    holds. So is any write whose wait ran out before its route began.
+- **A refusal is answered as it is while the lock is held** (kittrial-5bb.156). The audit
+  entry of a refused write is saved without a long wait (5 seconds the first time, then
+  no wait at all until a save succeeds). When it cannot be saved it stays in the
+  service's memory and is written with the next save, and the log says `busy: the audit
+  entry of a refusal was not saved ...`. So "Project NAME was made on the server;
+  registering it had to wait for a lock" reaches the creator also when the lock stays
+  held longer than the service's own wait.
+- **A creator who asks again for a project they already have** (kittrial-5bb.156). The
+  web record of a host-created project keeps a digest of the request that registered it
+  (`host_created.operation`). The same request sent again, with the same idempotency
+  key, is sent to the endpoint, whose journal answers what happened, and is answered 201
+  with the project: this is what follows a "cannot say". Any other creation request for
+  that name from its creator (a new key, or none) is answered 409 "You already have
+  project NAME: you created it on this server on DATE. Nothing was made again." with
+  `detail` `{"project": NAME, "state": "yours"}`; the page shows it as a notice with a
+  link, not as an error on the name. The date is the web record's own. Only the account
+  the project is registered to by its own creation, and that is still a member of it,
+  gets that sentence. Every other account gets "Project name NAME is not available:
+  choose another name", with nothing about who has the name or since when. A record
+  written by an earlier kit has no digest, so its creator's repeat with the old key is
+  answered with the 409 sentence, not 201. Three more cases:
+  - The same request from **another session** of the same account (logged in again; the
+    page keeps its key). The endpoint's operation identity belongs to the session that
+    made the project, so it will not answer from its journal; the service answers the
+    409 "You already have project NAME ..." (not "could not be created").
+  - A project an operator has since **retired on the host** (`admin.py retire-project`)
+    keeps its web record. Its creator is told 409 "You created project NAME on this
+    server on DATE, and it has since been retired there, so it is no longer served. The
+    name is not available: choose another name.", `detail` `{"project": NAME, "state":
+    "retired"}`, shown on the name like any other refusal, with no link. The service
+    reads that from the root itself (no endpoint process, no lock).
+  - The digest is the service's own. It is not part of the project view any reader gets.
+- **The last-use stamp of a request does not wait a minute** (kittrial-5bb.156). Every
+  authenticated request stamps the session's (or credential's, and agent's) last use
+  and saves the state, because the endpoint checks a session's idle deadline against
+  the file. That save waits 5 seconds for the lock the first time; when the lock cannot
+  be had the stamp stays in memory, the request goes on, and until a save succeeds every
+  further request tries once without waiting (log: `busy: a last-use stamp was not
+  saved ...`, once, then `The state is saved again ...`). What follows from a stamp that
+  is only in memory, both ways:
+  - If the service stops before the next save, the last use is lost and the session
+    reads as idle sooner after the restart. That is the safe side. Nothing lets a
+    session live past its deadline: the service decides from its own memory first, where
+    a deadline that has passed refuses the request whatever is unsaved.
+  - A live session is not refused as idle by the endpoint because of it. A read does not
+    carry the session to the endpoint. A write that does is not sent until the state is
+    saved: the service saves first (waiting up to the full minute) and, when the lock
+    still cannot be had, answers 503 `busy`, "not completed", having sent nothing (log:
+    `busy: the state could not be saved before ACTION was sent to the endpoint, so it was
+    not sent`). So the longest a stamp stays unsaved is until the next request after the
+    lock is free, and never past a write that reaches the endpoint.
+  What this does NOT change, while the lock is held: only a read the service answers by
+  itself is answered at once. A read that needs the endpoint still waits for the
+  endpoint's own wait (up to 60 seconds) and is then answered 503 `busy`, as before.
+  And a request that arrives while a write or a log-in is itself waiting for the lock
+  queues behind it in the service (a read was seen to wait 54 seconds that way).
+- **The server's configuration file cannot be read** (kittrial-5bb.156). Every failure
+  to read `deployment.private.json` is one fault of the server: the file is not there,
+  is not a regular file (a directory, a dangling link, a FIFO: refused at once, the
+  endpoint does not wait on a FIFO), cannot be opened (closed to the service's user,
+  for example), is not text, is not JSON (cut
+  short), is not a JSON object, has no `password`, or has an `operators` or `verifiers`
+  that is not a list. The endpoint's line names the file with the parser's or the
+  system's words; the endpoint marks that answer (`"fault": "configuration"`), and the
+  service answers 503 `server_configuration`, "The server's configuration cannot be
+  read, so this request was not carried out. Ask an operator of the server to look.",
+  on every route, for reads and writes alike. The line is in the service's log only
+  (`configuration: the endpoint could not read the deployment configuration for
+  ACTION: ...`). What is and is not stopped:
+  - The file is read **only where it is used**. A request that needs nothing from it is
+    answered as if it were whole: reading, setting and clearing a project's onboarding
+    text, for example. Everything that starts bd needs it (the database password is in
+    it), so task reads and every write are refused while it is damaged. Creating a
+    project is refused with the same answer (not "could not be created; try again":
+    trying again does not help).
+  - A write that reserves an operation identity reads the file before it reserves, so
+    it is refused with nothing done and its idempotency key stays usable: the same
+    request works once the file is repaired. (Read for the first time inside the guarded
+    write, it left the operation "outcome unknown" with nothing written, and the same
+    key answered that until the reservation expired.)
+  - Any `admin.py` command on the host names the file, as before. A caller who reaches
+    the endpoint without the web service still reads the endpoint's own line.
+- **Restart the web service in the same step as the files** (kittrial-5bb.156). The
+  service is a long-running process and the endpoint is started anew for every request,
+  so replacing the kit's files changes the endpoint at once and the service only when it
+  is restarted. A service of the previous kit left running over the new endpoint applies
+  the old rules to the new answers: it was seen to register, for a superuser, a
+  half-made project whose creation record is damaged (201), which the new service
+  refuses (409). Replace the files and restart the service together.
+- **A registered project does not depend on its creation record** (kittrial-5bb.149).
+  The endpoint serves a project that is initialized and whose creation record is
+  absent, finished or damaged; it refuses one whose record reads running, incomplete or
+  stalled, and one that was never initialized whatever became of its record. So the
+  members of a working project keep it when that file is damaged. The damaged record
+  still holds the name against a creation, still counts toward the server's limit and
+  still blocks registration: the register route asks the host (`setup-status`,
+  `creation_record`) and answers 409 "The creation record of project NAME is damaged;
+  an operator must look at it first". Both lists flag such a project: "projects/NAME is
+  initialized and is SERVED WITH A DAMAGED CREATION RECORD", with the command to set the
+  record aside. The cost: an unfinished, unregistered creation whose record is then
+  damaged is reachable by a caller who reaches the endpoint without the web service,
+  as a project an operator made is.
+- **A file in `project-creations/` whose name no project can have** (`UPPER.json`,
+  `a.json`) is not a creation: it holds no name, is not counted, and both lists show it
+  as `not-a-record` with one instruction, to move it out of that directory.
+  `remove-creation` takes project names only.
+- **A creation record that cannot be read** (not JSON, the wrong shape, another
+  project's, a directory, a symlink, or a file the service account cannot open, as
+  after a restore under another user) reads `damaged` in both lists. It holds its name, and it counts toward the
+  server's limit of project databases, because it may stand for one. A creation of
+  another name is not held up by it. The operator looks at the file and then runs
+  `admin.py remove-creation NAME --actor OPERATOR --reason REASON`: for a damaged
+  record that command **only sets the record aside**, as
+  `project-creations/NAME.json.damaged-<UTC stamp>`, and touches nothing else, because
+  what the record stood for is not known. If nothing is under `projects/NAME` the name
+  is then free. If something is, it is then a project with no creation record: a
+  superuser registers it if it is complete, or the operator retires it
+  (`admin.py retire-project NAME`).
+- **Something was made** (the database exists; a later step stopped): the request
+  answers 409 with a sentence that names the project and says an operator must finish
+  or remove it. Nothing is registered in the web interface, so no member, list or agent
+  sees the project. The name is held and counts toward the creator's limit. **The kit
+  never removes it**: that would mean dropping a database from a web request.
+- **The process was killed**: the request that was running answers 503 "outcome unknown".
+  The record still says what was started. Sent again, with the same idempotency key or a
+  new one, the request is answered from that record: it resumes when nothing was made, and otherwise answers 409 with the sentence
+  that an operator must finish or remove it. What the record reads as afterwards:
+  - `incomplete`, when something was made;
+  - `stalled`, when nothing was made (the kill came before the first write). It holds
+    the name and a place. The same request resumes it; `remove-creation` clears it and
+    frees the name, because no database exists for it.
+  - A creation killed **during** `bd init` is `incomplete` and cannot be finished: the
+    database may exist half made. `remove-creation` retires it and **the name is lost
+    for good**, as for any retired project. The messages say so.
+- **A creation that is running reads `running`**, not incomplete, and has no command:
+  wait for it.
+- **Nothing is served from a creation that has not finished**, and it cannot be
+  registered. The endpoint answers every request for it "Unknown/uninitialized project:
+  ... is a creation that has not finished", so the plain register route
+  (`POST /v1/projects` without `create`) refuses it too, with 409 and that sentence. It
+  has no backup target, merge slot or first backup yet.
+- **A superuser sees every such creation** on the Projects page ("Projects on the
+  server") and in `GET /v1/project-creations`: `items` (running, incomplete, stalled or
+  damaged, each with who started it, the step it stopped at and the command for that
+  reading), `unregistered` (made and not registered) and `server` (`used`, `limit`).
+- **To finish it**, an operator runs `admin.py finish-project NAME`. It works when the
+  project was initialized (`projects/NAME/.beads/metadata.json` exists): the settings,
+  the backup target, the merge slot and a backup are each done or done again. The
+  creator then creates the project again in the web interface with the same name, which
+  registers it without doing the work twice; or a superuser registers it.
+- **To remove it**, an operator runs
+  `admin.py remove-creation NAME --actor OPERATOR --reason REASON`. It acts only on a
+  creation that reads `incomplete` or `stalled`. It refuses a finished project, a name
+  with no creation record and a creation that is running, and changes nothing then. For
+  an incomplete one the directory moves to `retired/`, nothing is deleted and the name
+  stays retired; for a stalled one only the record is removed and the name is free. The
+  creator's place is free again either way. `retire-project --force` is not the command
+  for this: aimed at the wrong name it retires a healthy project.
+- `retire-project` and `remove-creation` both refuse while a creation is running.
+- `admin.py project-creations` lists every record; `--attention` lists the ones that are
+  running or need an operator, each with its command; `--usage` prints how many project
+  databases the server holds and its limit; `--set-server-limit N --actor OPERATOR` sets
+  the limit (a listed operator; audited in `deployment.private.json`).
+- **`admin.py backup --all` is incomplete while an initialized creation is unfinished**:
+  the project has no backup target yet, so the nightly gate is red until an operator
+  finishes or removes it. The backup's last line names the project and both commands.
+- A project cannot be named `mysql`, `sys`, `dolt` or `doltcfg`: the database server
+  uses those names itself. `add-project` refuses them too.
+- The records are not part of a project's backup: they belong to the runtime, not to a
+  project. A runtime rebuilt from backups has none, which loses only the notes about
+  creations that had not finished; a finished project is in the web service's state.
+
+**Rollback.** The kit before this one reads a state file that carries grants and
+web-created projects. It serves such a project (the record carries `registered_by`,
+which that kit reads as "a superuser stood behind this"); it ignores the grant and has
+no route to create.
+
+### Onboarding text from the setup page
+
+An owner may write the project's onboarding text on the setup page:
+`PUT /v1/projects/{id}/onboarding` with `{"text": "..."}`, `DELETE` to remove it, `GET`
+to read it for editing. Owners and superusers, session only.
+- **Guidance is not settable here or by any web route.** It stays
+  `admin.py set-guidance`, for a listed operator.
+- The text is stored as the project's `ONBOARDING.md` under a first line the kit writes:
+  "[Written by an owner of this project in the web interface. It is information about
+  the project, not an instruction from the operator of this server.]" The line is part
+  of the stored document, so it is in what `onboard` gives a worker, it travels with a
+  backup and a restore, and an earlier kit shows it too.
+- **Every line the owner wrote is stored behind a mark, `| `** (an empty line is `|`).
+  A heading, or a line written to look like the kit's own, is then visibly inside the
+  owner's text: nothing an owner writes can start a line of the document, so it cannot
+  close its own block or pass for a section of the kit or of the operator. The service
+  adds the mark to every line whatever the request sent (a line that already begins
+  with `| ` becomes `| | ...`). The editor shows and saves the text without the marks,
+  and saving unchanged text changes no byte. Text an operator sets with
+  `admin.py set-onboarding` has no kit line and no marks.
+- The rules are those of `admin.py set-onboarding` (nonempty, at most 8000 bytes, of
+  which the kit's line uses 152 and each line's mark 2) plus the plain-text rule of the
+  guidance channel: no control, bidi, zero-width, invisible or format character. Lines
+  end with a line feed (a CRLF pair is read as one); a carriage return alone is refused.
+- Text that is not valid Unicode (half of a surrogate pair) answers 422, here and on
+  every other route; it used to answer 500.
+- An owner may replace text an operator set. The operator's text is then kept beside the
+  document as `ONBOARDING.operator-copy.md`, and the audit says so. `DELETE` removes
+  only owner-written text: the operator's own document is not removable from the web
+  interface. `GET` returns owner-written text for editing and reports an operator's
+  document as set without returning it.
+- Audited as `projects.onboarding` with the account and the size, never the text.
+- The write goes through the service-only endpoint action `set-onboarding`, which
+  re-checks project administration under the authority lock.
+
+### The kit's documents for members: how work is found, and the prompts
+
+Every member of a project, a viewer included, has a page "How work is found"
+(`#/p/PROJECT/how`, in the project's navigation; kittrial-5bb.226). It says where a worker
+looks for work at each run and in what order, where it does not look, how whoever
+coordinates reaches a worker, and it offers the prompts a worker is started and woken
+with, each with a copy button.
+
+**The page retypes nothing.** Its texts are files of the installed kit, the same ones the
+client's `docs NAME` serves, read by the same reader:
+
+| `docs` name | File | What |
+|---|---|---|
+| `finding-work` | `docs/FINDING_WORK.md` | the order of a run, what a worker does not read, the three ways to reach a worker with what the web interface can do today and the command that works today |
+| `worker-prompt` | `templates/WORKER_PROMPT.md` | the first prompt for a new worker over SSH |
+| `poll-prompt` | `templates/WORKER_POLL_PROMPT.md` | the short recurring prompt for a worker over SSH |
+| `poll-prompt-agent` | `templates/AGENT_POLL_PROMPT.md` | the short recurring prompt for an agent with a web credential |
+
+- `GET /v1/docs` lists them (name, title, file, `served_as`, the named values a prompt
+  leaves to replace) and `GET /v1/docs/NAME` returns one: `text` (the whole file),
+  `prompt` (what is pasted: everything between the file's first line that is exactly
+  three backticks and the word text, and its last line that is exactly three backticks;
+  null for a document
+  that is no prompt), `placeholders`, and `server_url` (the address the service is
+  configured with, `--public-url`; never the request's Host header; null when none is
+  configured, and the page then uses the address it was loaded from).
+- Any signed-in member and any agent credential may read them: they hold nothing of a
+  project and no secret. Without a session: `401`. A name that is not one of the four,
+  the rest of the client's catalogue included: `404`. A file that cannot be read from
+  the installed kit: `503`; the page then shows nothing in part, under the application's
+  general words for a failed load (they are not specific to this page yet).
+- The page fills in the values it knows: the server address, the project, and the names
+  of the reader's own agents that work in the project. It names the values that are left
+  ("Replace before use: ..."). A recurring prompt is at most 2,000 characters
+  (`onboarding.POLL_PROMPT_LIMIT`, pinned by a test): it carries no state and no rules.
+- An agent's `.orchestra/AGENT.md` (written by the Agents page) states the same order in
+  the agent's own words. `tests/test_finding_work.py` pins the order the texts state to
+  the order `GET /v1/agents/me/next` gives, on the in-process backend, on the endpoint
+  backend and through a real bd, so neither changes without the other.
+
+**What the text says is not there yet, and is not:** an agent with a web credential
+cannot read the coordinator's standing guidance, and a comment on a task or the
+assignment of a task to somebody else cannot be made over the web. The document names
+the command for each. A test fails when a route for one of them appears, so that the
+text is corrected with it.
 
 ### Requirement proposals
 
@@ -533,6 +1073,42 @@ Mutating calls accept an `Idempotency-Key`. On an uncertain `503` the client
 raises `UncertainOutcome` carrying the key: retry the identical request with that
 key to reconcile. Never retry an uncertain mutation with a new key.
 
+**The server's time of a write.** The JSON body of a write that was carried out has
+`server_time` at its top level, for example `"server_time":
+"2026-10-06T07:50:12+00:00"` (UTC with its offset, whole seconds). On the endpoint
+backend it is the time the endpoint gave for the write; where the service carries the
+write out itself (accounts, members, agents, credentials) it is the service's clock.
+The same request sent again with its `Idempotency-Key` is answered with the stored
+body, so with the time of the write and not of the retry. Reads, refusals and uncertain
+answers carry none. A log-in and a log-out carry none either (they make or end a
+session and record nothing in a project).
+
+The same value is in the response header **`X-Server-Time`** of every write that was
+carried out, whatever the shape of its body: a caller has one place to look. That
+matters for the answers that have no top level for the field: on the endpoint backend
+a task change (`PATCH .../tasks/ID`) and a claim (`POST .../tasks/ID/claim`) answer
+with the list bd prints, and some writes answer 204 with no body. The header is absent
+exactly where the field is absent for an object body: reads, refusals, busy and
+uncertain answers, a log-in and a log-out. A retried request gets the header with the
+time of the write, because the time is kept beside the stored answer; an answer that
+was stored by a kit from before this header has it on a retry only when its body is an
+object with `server_time`. The web pages do not show it.
+
+The service keeps the time in both of its records of a keyed write: with the answer as
+it was sent (the idempotency record) and with the endpoint's result (the result
+record). A retry that finds only the result record (the other gone, or never committed
+because the service stopped between the two) is answered from it without asking the
+endpoint, with the time of the write.
+
+Two edges. During an upgrade, a write that was made through the kit from before this
+field and is sent again through this one, when the service's own stored answer is gone:
+whether the endpoint replays what it stored or the service answers from a result record
+that kept no time, the answer has no `server_time` and no header (no time is known; the
+service never puts the time of the retry there). And the time
+is taken when the write has been carried out and cut to the whole second, while bd
+rounds: a task's `updated_at` can read one second later. It is the wall clock, not
+monotonic across a clock step.
+
 **Retry contract.** An exact retry sent no more than 29 days
 (`JOURNAL_RETRY_HORIZON_SECONDS`, the 30-day tombstone horizon minus the 24 h skew
 allowance) after the original attempt replays the recorded result, reports
@@ -550,6 +1126,560 @@ changes) are not backed by the canonical journal: their exact-retry window is th
 idempotency record's (`IDEMPOTENCY_TTL_SECONDS`, 24 h). That record expires on the same
 confirmed timeline (see the record store in section 8), so a clock jump never shortens
 it; a retry after the window is treated as a new request.
+
+### Claiming a task
+
+`POST /v1/projects/{id}/tasks/{task}/claim` takes a free, open task for the caller: it
+becomes `in_progress` and the caller its assignee. It is bd's own claim (`bd update
+ID --claim`), which checks and writes in one step, so:
+
+- a task that **somebody else holds** is refused: **409 "Task is already claimed by
+  NAME"**, with the holder's id in `error.detail.held_by`. That is so for every caller,
+  **the project's owner included: nobody takes a task over through a claim**;
+- a task that **is not open** (closed, blocked) is refused: **409 "Task is
+  not open (it is closed)"**, with the status in `error.detail.status`. A claim does
+  not reopen anything;
+- the caller's **own** claimed task, claimed again, answers 200 and changes nothing;
+- of **several claims of one free task at the same moment exactly one is carried
+  out**; the others are answered 409 naming the winner. There is no check followed by
+  a write for another claim to get between: bd does both in one transaction, and every
+  write through the endpoint holds the project's lock besides.
+
+A refusal keeps nothing: the idempotency key is free and no audit entry of outcome
+`unknown` is written.
+
+**Taking a task over** is a separate, explicit act and has no web route today. An
+owner who needs a task moved asks the project's coordinator, who reassigns it on the
+host route (`update TASK --assignee ACTOR --status in_progress`); that plain update
+is not a claim and is not refused. How it stands beside the handoff, which leaves a
+trail and should be preferred, is in docs/REVIEWS.md ("Claim, handoff and the
+coordinator's take-over") and docs/OPERATIONAL_WORKFLOW.md.
+
+**A task that is in progress with nobody** (a host update can leave one) cannot be
+claimed: bd answers "issue not claimable: status in_progress" and the route says 409
+"Task is not open (it is in progress)". The coordinator gives it to somebody or sets
+it open again on the host route; then the first claim takes it.
+
+Before kittrial-5bb.187 this route sent bd that plain update of status and assignee,
+and bd carried it out whatever the row was: a second member's claim took the task
+from the first, with no word to either, and a claim of a closed task reopened it.
+Whoever claimed last then passed every rule that asks "is the caller the assignee"
+(contribute, respond, the checkpoint's directions). The host client's own claim
+(`update TASK --claim`) was bd's claim all along and never had the fault. The
+in-process backend (the tests' and the local preview's) refused both cases already;
+it refused a second claim by the SAME member too, and now answers it 200, unchanged,
+as a real installation does.
+
+### The name a worker credential writes under
+
+A worker credential writes under the actor namespace its issuer chose (`actor` when it
+is issued): `NAME`, or a label `NAME/...`. The tracker's rows carry that name and
+nothing else, and the review workflow asks "is the caller the assignee, is it the
+author" of the name. So the name must be nobody else's (kittrial-5bb.184, extended by
+kittrial-5bb.188). A namespace is refused when its head, the part before the first `/`,
+compared without regard to case, is the head of:
+
+- a name the project's tracker already holds as an author or assignee
+  (kittrial-5bb.188): a plain host name is somebody on this host even when it is
+  neither a registered session nor on a list, so a name that already writes rows may
+  not be taken by a credential;
+- a session actor registered in the project;
+- any name with the shape of a session actor (`session-<uuid>`), registered or not: the
+  server makes those;
+- a name on the operator list or the verifier list of the installation;
+- the web service's own namespace (`http`, or what `--actor-namespace` set), at issue
+  and, since kittrial-5bb.188, at use too: the endpoint backend is launched with the
+  namespace the service was started under and refuses it beside `http`, and the
+  in-process backend refuses the namespace it was built with. So a credential issued
+  before this under `NS/...` stops when the service runs `--actor-namespace NS`, and
+  `admin.py credential-actors --service-namespace NS` is the listing that names it.
+
+A name that *reads* as another is refused as well (kittrial-5bb.188): a head that
+begins or ends with `.` or `-`, or that carries an `@` (`im2-coordinator.`,
+`im2-coordinator-`, `im2-coordinator@desk`). The review workflow reads those as authors
+other than `im2-coordinator`; the kit refuses them rather than choosing a normal form
+that would silently rename somebody.
+
+A name with the shape of another account's or agent's id was already refused, and is now
+refused in any letter case (an id written in capitals is read as that id). A
+credential without `actor` writes under its issuer's own account id, as before.
+
+**One name, one issuer** -- an always-on rule, not part of the setting below. A worker
+credential may not be issued under a name that a working credential of another account in the
+same project already holds: the same name, one holding the other, or the same characters in
+another letter case, and whether or not anything has been written under it yet.
+`POST /v1/projects/{id}/worker-credentials` answers **409**, "The name NAME is held by a
+working credential of this project that another account issued (...). A name has one issuer at
+a time: have that credential revoked first, or choose another name", with the holding
+credential's id in `error.detail`. The same account may issue a name it already holds, which
+is how it replaces a credential without a gap. The comparison folds case over the whole name (the
+tracker's own name rule, `actor_names.head`, folds the first part only), so `IT-A745` and `it-a745` are one name: a second account
+cannot take the other spelling and then write, with no waiver, work that the first account's
+rows also answer to.
+
+An installation upgraded from a kit that issued both spellings to two accounts keeps both
+credentials working, but neither account can replace its own (409 each way) until the
+other's is revoked, and work under either spelling is refused to both: have one of the two
+revoked (the 409 names the credential that holds the name).
+
+**At issue**, `POST /v1/projects/{id}/worker-credentials` answers 422, "A worker
+credential cannot write as NAME: that is a name on the operator list. Choose another
+name.", with the rule in `error.detail` and never another name of the host's. Nothing
+is kept, the idempotency key included. Only somebody who may issue a credential is
+told: a contributor is answered 403 and an outsider 404 whatever the name. If the host
+cannot be asked, nothing is issued. **Cost of the row read:** judging a name by the
+project's rows is one `bd export --all` for that project (one bd process against its
+running database), paid once per issue attempt and never by an ordinary write: see
+"Credentials that already have such a name" below. **An answer that is not a whole
+tracker is a host fault, not a tracker with no names** (kittrial-5bb.188 review of item 1;
+revision-3 item 3(1)): every project this kit makes holds at least the merge slot, so a
+`bd export --all` that exits 0 and prints nothing, a line cut short, a nonzero exit, text
+that is not rows, or rows **without the merge-slot row** answers **503 `unavailable`**,
+"The tracker could not be read just now. Nothing was changed; try again shortly.", and the
+idempotency key is free. The same broken answer at use is the same 503, never 422. A
+superuser may pass `"allow_actor": true` together with `"allow_actor_reason"` -- 1 to 500
+characters saying WHY, which must pass the kit's plain-text rule (`guidance`'s: no control,
+bidi, zero-width, C1, tag or variation-selector character; a tab, newline or carriage
+return is allowed) -- to take a name the tracker already holds. Only that rule is waived,
+never a session, an operator, a verifier or the service's own namespace. Anybody else
+sending `allow_actor` is answered 403, a value that is not true or false is 422, a missing,
+empty, longer-than-500 or hidden-character reason is 422, and a reason with no waiver is
+422. The waiver is recorded on the credential as its
+own mark (`actor_waived`, holding `by`, `reason` and `at`) and **not** as
+`actor_rows_checked`; the audit entry is a `credentials.issue` whose reason says a waiver
+was used and why ("waiver used for worker credential actor NAME: WHY"), with the waiving
+account in the same entry; and the owner's credential list carries `actor_waived` and
+`actor_allowed` ("allowed by NAME on DATE"), with `actor_refused` null.
+`admin.py credential-actors` shows the same: `collides` null,
+`refused_when_it_writes` false, `waived` true and the who/why/when fields. A waived
+credential writes.
+
+**At use**, the endpoint itself refuses: a request the web service sends with its
+descriptor under a name that does not have the shape of a web id is written only by a
+worker credential, inside that credential's own namespace, and only when the namespace
+passes the rule above, read from the host at that moment. Otherwise the write answers
+403 with the sentence and what to do ("Revoke it and issue one under another name."),
+and nothing is written or reserved. So a credential issued before this rule stops
+writing with the upgrade, and so does one whose name is put on the operator or verifier
+list afterwards (and it writes again when the name is taken off). It still READS:
+reads carry no name into the tracker. A signed-in account and an agent write under
+their own id as before; over SSH nothing changes.
+
+**A credential's own rows are not held against it.** A credential issued by this code
+records that the tracker was read and the name was free when it was issued (or that a
+superuser waived the row rule): from then on every row under that name is its own, and no
+write of its reads the tracker at all. A credential that carries no such record -- one
+issued by an earlier kit -- is judged by the tracker **once, at its first write after the
+upgrade**, by the rows older than the moment it was issued (a row within five minutes of
+it counts as its own, because the credential's stamp is the web service's clock and a
+row's is the host's). The outcome is then kept ON THE CREDENTIAL: `actor_rows_checked`
+when the name was free, or `actor_rows_refused` (the rule word) when the tracker held it.
+Every later write reads no tracker, and a refused one is refused without one, so an old
+credential pays that one `bd export --all` once and not on every write. The marks are
+written by the service, which owns the state; there is no route that changes a credential
+(`PATCH`/`PUT` are 404) and the issue route takes no such field, so the keeping cannot be
+reached from a request. A **concurrent first write** may run the export twice; both
+answer the same way and write the same mark, so the outcome is idempotent. An export that
+answers no rows at all is the host fault above: 503, nothing written, and no mark kept. A
+credential the settle marked refused is shown as refused in the owner's list even though
+that list reads no rows from the host: it reads the stored `actor_rows_refused` mark
+(revision-3 item 3(3)).
+
+**Renewing a credential under its own name is not a collision** (kittrial-5bb.188 item
+3). The row rule above is about *somebody else's* rows; an owner renewing the name its own
+credential wrote as is not taking somebody else's name. Rows are therefore not held
+against a new credential of the same head, same owner and same project when they lie
+inside an earlier credential's own lifetime. How that is known: the state keeps each
+credential's issuer, namespace, project, issuance (`created_at`/`issued_raw`), revocation
+time (`revoked_at`) and expiry (`expires_at`); an earlier credential lends the window from
+its issuance to the **earlier of its revocation and its expiry**, and only when the row
+rule did not refuse it (`actor_rows_refused` absent). A predecessor that merely EXPIRED
+therefore stops lending its name at the expiry, even though it was never revoked
+(revision-3 item 1), and the five-minute clock allowance is only for the START of the
+life: a row after the lifetime ends is never that credential's own (revision-3 item 1).
+It **fails closed** when any of that cannot be read -- no predecessor, a different owner
+or project, an unreadable issuance, a revoked credential with no revocation time, a
+present-but-unreadable expiry, or a predecessor the rule refused all lend nothing, so the
+rows stay somebody else's and the name is refused. A renewal is still refused when the
+tracker holds rows older than the predecessor (the host actor's own rows), because those
+are outside its lifetime.
+
+**What the rule does not hold, and does not cover.** Not held, by design: a name the
+tracker knows only from a task it **closed** or a task it **changed** (the tracker's
+events are not in `bd export --all`); rows in **another project** of the installation
+(the rule is per project); an old credential whose name the tracker holds only as an
+**assignee** on a row whose `updated_at` is after the credential was issued (an assignee
+is dated by `updated_at`, per `actor_names.tracker_marks`); and a row up to **300 s**
+older than an old credential, which counts as its own (the issuance-stamp allowance).
+These are stated, not closed. **Not covered** are the look-alike names that are still
+issued because they are neither a leading/trailing dot or dash nor an `@host`: a trailing
+underscore (`opus-worker-lane_`), a doubled dash or dot (`opus--worker-lane`,
+`opus..worker-lane`), a dash/underscore/dot swap (`opus_worker_lane`, `opus.worker.lane`),
+an added digit (`opus-worker-lane2`), a `0` for an `o` (`im2-coordinat0r`), and a label
+with a trailing dot under a good head (`night-crew/x.`). They are listed as not covered
+rather than refused, so an operator knows the rule's edge.
+
+**Before this**, a project owner could issue a credential named as the host
+coordinator's session and with it create a task, claim one, contribute, answer the
+changes requested of the coordinator on the coordinator's own task and write its
+checkpoint: every rule decided by "is the caller the assignee or the author". Approval
+was refused, as it is for every credential. The rows such a credential wrote cannot be
+told from the real actor's by the rows; the web audit log names the credential, and
+the operation journal keeps the credential's id beside the actor for about 30 days.
+
+**Credentials that already have such a name.** The list of a project's credentials
+(`GET .../worker-credentials`) carries `actor_refused` for each: `null`, or the
+sentence. The owner revokes it and issues one under another name. That list asks the
+host only for the cheap rules (sessions, the lists, the service's namespace) and does
+NOT read the tracker, so it stays a cheap page: a credential refused for the rows alone
+is named by the host command below, which is an operator's read. For the whole
+installation an operator runs, on the host:
+
+```sh
+python3 admin.py --root /path/to/runtime credential-actors --state /path/to/http-state.json
+```
+
+Add `--service-namespace NS` when the service was started with `--actor-namespace NS`
+(without it the command judges `http` only, and a credential named under `NS` is not
+marked).
+
+It reads and changes nothing. For every worker credential with a name it prints the
+project, the label, the name, who issued it, when it was last used, `collides` (the
+rule, or `null`), and `tracker_rows`: whether the project's tracker already has rows
+under that name. `collides` holds the row rule too, judged the same way the endpoint
+judges it (the rows older than the credential's own issuance), so a credential issued by
+an earlier kit under a plain name the project was already using is listed as refused,
+while the rows a credential wrote itself are not held against it. For a name that does
+not collide, `tracker_rows` still says whether the tracker holds rows under it: what a
+credential under that name wrote, or an actor from before sessions were registered. That
+is worth a look when nobody remembers issuing it.
+
+**Who may ask whether a name is taken.** The endpoint's `actor-standing` answers a
+caller with the rule word only (`null`, or which rule) and never the host's names, no
+session id and no list contents. Asked with `tracker`, it ALSO reads the project's rows
+(one `bd export --all`); the answer is the same rule word either way, never a name from
+the rows. Because that read costs a whole export, **`tracker` is refused unless the
+caller is the web service**: the flag is read only when the endpoint was launched with
+the service's authority store, so a host client over SSH (whose wrapper refuses every
+launch flag) cannot make the endpoint read a tracker by sending it, and it is answered
+422 "actor-standing with rows is for the web service only; nothing was changed". The
+owner's own list and the issue route's row read are the service's, which is why the
+answer exists at all. Over the web only somebody who may administer the project is told:
+a contributor is answered 403 and an outsider 404 whatever the name. kittrial-5bb.188
+item 5 was the owner's question whether the host route should tell everybody; the
+recommendation left with that task is to keep the cheap answer as it is, and, if it is
+narrowed, to gate it on the live-authority descriptor that only the web service presents,
+leaving the SSH path alone. No decision is built here beyond the service-only rule read.
+
+
+### What an agent needs to write a checkpoint
+
+`GET /v1/projects/{id}/tasks/{task}/brief` carries everything a checkpoint needs, so an
+agent can write its first one from the brief alone.
+- `activity_cursor`: the cursor a checkpoint must carry. It is the same value the
+  history route returns. (With `--backend inprocess` it is null and not needed.)
+- `checkpoint_template`: the record to send, for this task at this moment.
+  - `send_to` and `method`: where it goes.
+  - `body`: every field, with `previous` and `activity_cursor` already filled, the four
+    texts empty, and `open_items` already holding **every open item of the previous
+    checkpoint exactly as recorded**, `source` included. Sent as it is, the record
+    carries them all forward. To resolve one, take it out of `open_items` and name its
+    id in `resolved` with a reason and evidence.
+  - `carried_open_items`: how many open items `body` holds. It is null when they could
+    not all be read (the task changed during the read); `body.open_items` is then
+    empty, the note says so, and the brief is read again.
+  - The brief's own `checkpoint.open_items` shows the first ten, each now with its
+    `source`; a task with more costs one further canonical read, which asks for all
+    of them (the canonical `brief --items-limit` now goes up to 100).
+  - `required`: the four texts to fill (`intent`, `acceptance`, `summary`,
+    `next_action`); `optional`: what may be left out and when; `limits`; the shape of an
+    `open_item` (with the allowed `kind` values) and of a `resolved_item`.
+- **Four fields may be left out of the request**: `source_commit`, `branch`,
+  `open_items` and `resolved`. The service sends the empty value for each. The stored
+  canonical record is unchanged and always has every field. Over SSH nothing changes:
+  `checkpoint --file` still takes the whole record.
+- **A refusal names every problem with the record at once.** `error.detail` is the
+  canonical sentence, as before; with two or more problems it is a numbered list of the
+  same sentences. `error.problems` is the list, one sentence each. A stale `previous`
+  and a changed cursor stay separate refusals: read the brief again and send its
+  template.
+  - A required field left out is one of those problems (`Invalid checkpoint: missing
+    fields: summary`), named beside the others. The service no longer refuses it by
+    itself first.
+  - A field name the caller wrote is shown as it is only when it is letters, digits,
+    `_`, `.` and `-`. Any other name is shown as a quoted string with control, bidi and
+    non-ASCII characters and square brackets escaped, so a name cannot break the line
+    or pass for another numbered problem.
+
+### What a task change takes
+
+`PATCH /v1/projects/{id}/tasks/{task}` changes a task's `title`, `description`, `status`
+(`open` or `closed`) and `priority` (an integer 0 to 4), and nothing else. Its body may also
+carry `version` (the in-process backend of the tests and the local preview checks it; the
+endpoint backend does not read it) and `actor` (below). `priority` is taken for real: the
+endpoint is asked for `--priority N`, a value that is not an integer 0 to 4 answers 422
+"Task priority must be an integer 0-4", and a change that carries none keeps the priority the
+task had. Anything else is refused, not dropped:
+
+- a field the route does not take (`assignee`, `labels`, any other name) answers **422
+  `invalid_payload`**, "A task change does not take: assignee. A task change takes: title,
+  description, status, priority", with the names again in `error.detail` (`unsupported`,
+  `takes`). So does a body that takes one field and not another: the whole change is refused,
+  not half of it carried out;
+- a body that would change nothing (no field, only nulls, only `version`) answers
+  422 "Nothing to change";
+- a `status` other than `open` and `closed`, a `title` that is empty or not text
+  and a `description` that is not text answer 422 with one sentence each. A claim
+  is what sets a task in progress (`POST .../tasks/{task}/claim`).
+
+Such a refusal comes before the idempotency key is looked at: nothing is reserved,
+nothing is sent to the endpoint, nothing is audited as uncertain, and **the same
+key serves the corrected request**. An assignee other than the caller and a label
+still have no web route today; a priority now does.
+
+**Task create takes a priority too.** `POST /v1/projects/{id}/tasks` takes `title`,
+`description`, `priority` (an integer 0 to 4; bd's default 2 applies when it is absent) and the
+optional `attachments` and `actor`, which is what the new-task form sends
+(`web/js/views/task.js`). A field outside that set answers 422 "A task creation does not take:
+X. A task creation takes: title, description, priority, attachments, actor". A `priority: null`
+is read as absent on both backends, so it makes the default 2 rather than a refusal.
+
+**Eight more write routes refuse a field they do not take, the same way.** Task create, claim,
+checkpoint, member change, worker credential issue, agent create, agent change and account
+create answer a body that carries a field the route does not take with **422 `invalid_payload`**,
+naming the field and the fields the route does take, with the names again in `error.detail`
+(`unsupported`, `takes`); nothing is written and the idempotency key is not reserved. A field
+the route TAKES whose value is null is treated as absent; a field it does not take is refused
+whatever its value, null included. Every body the released web and Python clients
+send (`web/js/api.js`, `http_client.py`) is inside the route's set. Every one of these routes
+judges the caller's right first, so a caller with no right keeps its 401, 403 or 404 instead of
+being shown the route's field list.
+
+Before this (kittrial-5bb.181) a change that carried none of the three fields was
+sent to bd as an update with nothing in it. bd answers that with the words "No
+updates specified"; the service could not read them and answered **503 "The
+operation may have committed; reconcile with the same idempotency key"** for a
+change that had not been made, kept the key, and answered the same to every retry,
+with an audit entry of outcome `unknown` each time. A field beside one the route
+takes was dropped without a word. A key that was left reserved that way on an
+installation is not held for ever: the same request under it is now answered 422
+like any other, and the key itself lapses a day after it was first used, as every
+key does. Until then a DIFFERENT body under that key answers 409 "Idempotency key
+reused with a different request payload": send the corrected request with a new
+key. An operator has nothing to clean up; the `unknown` audit entries of that time
+record requests that changed nothing.
+
+**A task's title**, on create and on a change, is text, not blank, and at most 500
+characters (bd's own limit). Anything else answers 422 before the key is looked at:
+"Task title must be text and not empty", "Task title must be 500 characters or less
+(it has 600)". A description that is not text is refused the same way.
+
+**When bd itself refuses** (kittrial-5bb.185). bd says no in several forms: a JSON
+object `{"error": ...}` with exit 1, a line `Error: ...` on standard error, and for a
+row it cannot find `Error resolving ID: no issue found matching ...`. The endpoint
+handed bd's exit code on as it came, everything that was not 0 was kept as an
+operation whose outcome is unknown, and the caller was told **503 "The operation may
+have committed; reconcile with the same idempotency key"** for an empty title, a
+title of 600 characters or a task that does not exist, with the key kept and an
+audit entry of outcome `unknown` each time. Now:
+
+- a refusal bd makes before it writes is a refusal: the endpoint answers return code
+  2 with bd's sentence and releases the operation identity; the service answers **404
+  "Task not found"** when bd found no row of that name and **422** with bd's sentence
+  otherwise. Nothing is kept, the key serves the corrected request, and no `unknown`
+  entry is written;
+- a refusal is recognised by its form AND its sentence together (`bd_refusals.py`):
+  "no issue found matching", "validation failed for issue", "... cannot be empty",
+  "invalid priority" and "invalid status", a title that "looks like a flag". A failure that merely has the form of a refusal (a JSON
+  error with another sentence, the database's own sentence) is **still an outcome
+  nobody knows**, as before: that is the side to err on. A bd that changes its
+  sentences falls back to that, and `tests/test_bd_refusals.py` notices it when it
+  runs against a real bd;
+- **a read is never said to "may have committed"**. A task that does not exist is 404
+  on every task route (read, change, claim, checkpoint, review); any other read of
+  the tracker that fails answers **503 `unavailable`**, "The tracker could not be
+  read just now. Nothing was changed; try again shortly.", and a key sent with it
+  is free.
+
+A key that was left reserved by such an answer before this: the same request is now
+answered 422 or 404 before the key is looked at; the key lapses a day after it was
+first used; until then a different body under it answers 409, and the corrected
+request goes with a new key.
+
+**The actor of a task write is the caller's own.** Task create and task change take
+an optional `actor`, the attribution label, under the rule of a claim, a checkpoint
+and a review: a signed-in member may name only their own account; a worker
+credential a label inside its own namespace (`NAME` or `NAME/...`); an agent its
+own id. Any other name answers 403 and nothing is written. Before kittrial-5bb.181
+these two routes handed the name on as it came, so a member could have a task made
+(`created_by`) or changed under any name that does not have the shape of a web
+account, a host session's included; a name with that shape was already refused by
+the endpoint. Such a row cannot be told from a host actor's own by the row alone.
+Two records can tell: the project's audit log has a `tasks.create` or
+`tasks.update` entry with the real account at that second, and, when the request
+carried an idempotency key, the project's operation journal has its row with both
+names (`principal` `user:usr_...` and an `actor` that is not that account).
+
+### Nobody approves work of their own party
+
+An installation setting, **off by default** (kittrial-5bb.199; slice 1a of
+[WEB_COORDINATOR_DESIGN.md](WEB_COORDINATOR_DESIGN.md)): `--approval-by-another-party` on
+`http_service.py` (the flag is taken whole: an abbreviation of it is refused), or
+`"approval_by_another_party": true` in the office service configuration. With it off,
+every review rule is what it was: an owner or a superuser approves any contribution, their
+own included, and a recommendation is judged by person (an account and its agents).
+
+**What changes on the day it is turned on.** One **party** is an account, every agent
+that account made, and every worker credential that account issued. From the next start:
+
+- An owner no longer approves their own contribution, their own agents' work, or work
+  delivered under a worker credential they issued, **to anybody**: the credential is of
+  their party whoever holds its secret.
+- A project with one owner who gave out its worker credentials can approve none of that
+  work. It needs somebody of another party who may approve: a second owner, or a
+  superuser who is not that owner. Where the only owner is also the only superuser (a
+  one-person installation), that second person does not exist until a second account is
+  made and named owner of the project (Accounts, then the project's Members panel). Do
+  that before turning the setting on.
+- A superuser is bound like anybody else for their own party's work, and approves
+  anybody else's as before.
+
+**The rule.**
+
+- `approve` is refused with `403`, and nothing is written, when the approver's party is
+  the party of the contribution's author or of the task's assignee. The sentence says
+  which is true:
+  - the author is of the approver's party: "This contribution was delivered by your own
+    party: you, one of your agents, or a name that a worker credential you issued holds
+    or has held.";
+  - the author's name has been held by worker credentials of more than one account, one
+    of them the approver's: "This contribution was delivered under NAME, a name that
+    worker credentials of more than one account have held. One of those accounts is
+    yours, and nothing on the record says which credential wrote it, so it counts as the
+    work of each of them.";
+  - only the assignee is of the approver's party: "This task is assigned to your own
+    party (...). Another account delivered the contribution, but nobody approves work on
+    a task their own party holds."
+
+  Each ends: "Somebody of another party who may approve here must approve it: another
+  owner of this project, or a superuser. If there is nobody else, a superuser makes a
+  second account an owner of this project (Members) and that person approves; where the
+  only owner is also the only superuser, that second account has to be made first." On
+  the task page the sentence stays in the review form until the page is left.
+- `recommend`, the review queue, My work and the brief count by the same parties, so the
+  agent of the account that issued a worker credential can no longer recommend work
+  delivered under it (with the setting off that work is nobody's, and it can). My work's
+  `to_review` holds only work the caller may actually approve: a contribution of the
+  caller's own party is left out of that list, since approving it would be refused
+  (the project's review queue still lists every row for everybody, with no per-caller
+  mark). The refusal of a recommendation names the worker credential as one of its reasons,
+  in both directions: work delivered under a credential the person issued, and a credential
+  the person issued recommending that person's own work.
+
+**Whose party a name is.**
+
+- An account is itself; an agent is its owner.
+- A name whose first segment is an account or an agent (`ACCOUNT-ID/x`, `AGENT-ID/x`) is
+  that account's, before any credential is looked at. Only that account's own credentials
+  can write such a name: a worker credential issued with **no** name writes under its
+  issuer's account id and any label below it, and an agent's credential under the agent's.
+- Any other name written under a worker credential of the project: **every account that
+  has ever issued a credential whose name holds it** (the name, or `name/...`), working,
+  revoked or expired. No moment decides between them: the record does not say which
+  credential wrote it, and the tracker's time stamp can be a second later than this
+  service's clock, so "the credential alive at that moment" picked the wrong account
+  now and then. Counting each of them only ever refuses more.
+- **What "ever held" costs.** Because every issuer of a name is of the work's party, a name
+  an account issued and revoked **unused** still belongs to that account for ever: another
+  account may take the name (no working credential holds it and the tracker holds no row),
+  but work under it is then refused to both and only a third party may approve it. Widen that
+  and a project can be left with nobody who may approve: three owners and a superuser who
+  each once held a name (issued and revoked unused in turn) leave a fourth party's work under
+  it refused to all of them, and only a new account made an owner by a superuser can approve
+  it. **No route deletes a worker credential record**, and a revoked record counts for ever,
+  so no superuser can clear it. Two owners who each once issued a common name (`ci`,
+  `lane-1`), never at the same time, both lose the approval of all work under it. The ways
+  out are a third approver or a new name (the writer stamp described below is not built). Refusing a
+  second issuer for any name an account ever held, unused included, unless a superuser waives
+  it, was considered and is **not** done here: the tracker already refuses (422) a name one of
+  its rows holds, refusing the unused case would stop a project reusing a label whose holder
+  is gone, and it needs a new superuser waiver route. This is the cost of the rule as decided.
+- So that two accounts do not come to share a name without anybody meaning it, **a name
+  has one issuer at a time** (whether or not this setting is on; the rule is stated in full
+  under "The name a worker credential writes under"): issuing a worker credential whose name
+  is held by a working credential that another account issued in the same project (the same
+  name, or one holding the other, in any letter case) is `409`, "The name NAME is held by a
+  working credential of this project that another account issued (...). A name has one issuer
+  at a time: have that credential revoked first, or choose another name", whether or not
+  anything was written under it yet. The same account may issue a name it already holds: that
+  is how it replaces a credential without a gap.
+- **A writer that is no account, no agent and under no credential record is its own
+  party.** That is a name written over the host route (a lane with an SSH key): another
+  party than every web account, so whoever may approve here approves its work. This is
+  the rule, not an oversight; an installation that wants a host lane counted with a
+  person gives that person a worker credential or an agent instead.
+
+What would make this exact instead of careful: a **writer stamp on the record**, the id
+of the credential that wrote it, kept by the endpoint with the comment. It needs a field
+in the canonical contribution and claim records (a new record version, read by older
+kits as unknown), the web service handing the credential id to the endpoint with every
+write, and the endpoint refusing a stamp from a caller that is not the web service. Then
+a name would be traced to the one credential that wrote it and the "every issuer" rule
+could go. It is not in this slice.
+
+**It is a rule of the web route only.** An approval made on the host route (`endpoint.py`
+over SSH, or run on the server) is not bound by it, on or off: a party is made of web
+accounts, their agents and their worker credentials, and the host route knows none of
+them (a caller there names its own actor). For the same reason the setting is the web
+service's and not a host switch, and the endpoint's `setup-status` cannot report it.
+
+**Where it is said.** `GET /v1/projects/{id}/setup` carries
+`rules.approval_by_another_party`, and the set-up page says in one line whether the rule
+is on. The service writes one line to its log at every start, "approval by another party
+(--approval-by-another-party): on" or "off", and when that differs from the last start
+it says so and writes an audit entry `settings.approval_by_another_party` ("off -> on at
+service start"); the state file keeps what the last start had. A record that is anything
+but a JSON `true` or `false` -- missing, null, a string (`"yes"` and `"false"` included), a
+list, an object or a number -- is **unknown**, not off: the start line says the last start
+was not recorded, and the audit entry says "unknown -> on" or "unknown -> off". So a lost
+ON no longer leaves a later OFF start silent, and a damaged record no longer invents an
+"off -> on" change.
+
+**Going back to an older kit.** Remove `"approval_by_another_party"` from the office
+service configuration first: an office service older than this setting refuses to start
+with a key it does not know. The older web service ignores the state's record of the
+setting, and every rule is what it was.
+
+### The merge slot is not a task
+
+Each project has one merge slot, `PROJECT-merge-slot`, an internal record. On the host it
+is stored as an ordinary row, so earlier kits listed it as open, unclaimed work and
+offered it to agents.
+- It is in no task list, queue, `GET /v1/me/work` or `GET /v1/agents/me/next`, and it
+  is not counted as claimable.
+- Reading it as a task (the task, its brief, its history) answers 404.
+- Claiming it, editing it, or posting a checkpoint or a review on it answers 409 with
+  "PROJECT-merge-slot is the project's merge slot, an internal record, not a task".
+- **The slot is the row with the exact id `PROJECT-merge-slot`** (or the type
+  `merge-slot`), on every path: listings, reads and writes. The label is not part of
+  the rule: a slot whose label was removed on the host is still the slot. A project
+  name holds no hyphen, so a task whose id only ends in `-merge-slot`
+  (`PROJECT-x-merge-slot`), or that only carries the label, is still a task.
+- **No contributor write reaches it over SSH either.** Every `bd` write names the rows
+  it writes, each name is resolved through bd before the write (bd resolves an id
+  from any part of it: `slot`, `merge`, even a lone `-`), and a write that resolves
+  to the slot is refused. See CLI_CONTRACT.md, "Raw bd writes: which rows a command
+  names".
+- **The label `gt:slot` is reserved.** No contributor adds, removes or replaces it on
+  any row, so a task cannot be hidden with it and the slot cannot be exposed by taking
+  it off.
+- **A damaged slot is repaired by `merge-create`** (`coordinate`). It restores the
+  label, clears an assignee, and sets the status from the holder bd recorded: in
+  progress while held, open when free. It names no new holder and releases nobody. The
+  answer lists what was changed in `repaired`. `merge-check`, `merge-acquire` and
+  `merge-release` on a slot that is unavailable with no holder now say to run it.
+- The web service never offers the row with the id `PROJECT-merge-slot`, whatever the
+  endpoint lists (an older endpoint listed it in `work`).
 
 ### Personal agents
 
@@ -596,7 +1726,74 @@ literal `export` would persist in shell history and the process list, and curl r
 header from it with `-K`, so no shell expansion ever puts the secret in the
 process list either. A lost secret is replaced, never re-shown: `POST
 /v1/agents/{id}/credentials` issues a new one (the old credential works until revoked
-with `POST /v1/agents/{id}/credentials/{credential}/revoke`). The
+with `POST /v1/agents/{id}/credentials/{credential}/revoke`).
+
+**What an agent may do is kept on the agent, and a new credential carries exactly that**
+(kittrial-5bb.208). The agent record holds its `scopes`: written when the agent is made
+(the list asked for, or the default four) and changed only by a renewal that sends a
+`scopes` list. With no list in the body, which is what "Issue a new secret" on the agents
+page sends, the new credential carries the record's scopes, in the order they were given.
+Before this a renewal with no list carried the default four whatever the agent had, so a
+read-only agent became a writing one when its owner clicked "new secret", and an agent
+with all six lost `proposals`. **No credential decides anything**: not the newest that
+works, and not a revoked or expired one (an earlier fix read the newest credential, and a
+revoked one that was wider then seeded the next renewal once nothing worked).
+
+- A `scopes` list sets what the agent has from then on. One that asks for nothing the
+  agent has not got is taken from the agent's account or from a superuser (who may so
+  narrow somebody else's agent); one that asks for more is taken only from the agent's
+  own account, the one caller who could have made the agent with those scopes, and is
+  refused with `403` from anybody else ("This agent has read. Only its own account may
+  give it more (asked for beyond that: reviews, tasks)"). Scopes that were widened and
+  the credential revoked afterwards stay widened: revoking a credential does not change
+  what the agent has; a list does.
+- `scopes` must be a list of scope names: anything else, and a name that does not exist,
+  is `422` before any other answer (a number or `true` used to answer `500`, and an object
+  was read as its keys). A name given twice counts once; an empty list is no list. A body
+  field the route does not take (it takes `label` and `scopes`) is `422`, as when an agent
+  is made.
+- **An agent made before the record kept its scopes** has none. While its working
+  credentials all allow the same, that is what it has (`scopes_source: "inferred"` on the
+  record; written to the record by its first renewal, never by a read). When none of its
+  credentials works, or they do not all allow the same (which is what an agent looks like
+  that was renewed from the page before the fix: the credential it was made with, and a
+  newer one with the default four), **nothing is guessed**: `scopes` is `null`,
+  `scopes_source` is `"unknown"`, and a renewal with no list is refused with `409` and
+  `detail.scopes_needed: true` ("Nothing says what this agent may do ... Send the scopes
+  it should have"). Never the default four, never a credential that no longer works. A
+  list then counts as a widening of nothing: it is taken from the agent's own account
+  only. On the agents page the card says so, and "What it may do" offers the choice with
+  reading ticked alone.
+- `GET /v1/agents/{id}`, the list, and the agent's own `GET /v1/agents/me` carry `scopes`,
+  `scopes_source` (`set`, `inferred` or `unknown`) and `scopes_differ`: the different
+  scope lists of the agent's working credentials when they are not all the same, else
+  `[]`. Each entry of `credentials` carries its `scopes` and `working` (an expired
+  credential is not `revoked` and does not work).
+- **The agents page**: the card says what the agent may do and where that is known from
+  when it was inferred, and how many working credentials allow something else. Under
+  "What it may do" each credential is listed with what it allows and can be revoked
+  there, and the agent's account sets the scopes with tick boxes; saving issues a new
+  secret that carries them (a superuser can untick, and cannot tick what the agent has
+  not got). A credential the agent already holds keeps what it allows until it is
+  revoked.
+- An agent may hold at most 20 credentials **that still work**; revoked and expired ones
+  are not counted (counted, an agent could not be renewed a twentieth time). Of those
+  that no longer work **the newest 5 are kept** per agent, as the short history the card
+  shows, and older ones are deleted from the state whenever a credential of the agent is
+  issued or revoked or the agent is disabled; an agent read never carries more than the
+  working ones and those 5. What is lost is the record of an old credential (its label,
+  scopes, when it was made and last used). That it was issued and revoked, by whom and
+  when, stays in the audit log (`agents.credentials.issue`, `agents.credentials.revoke`,
+  `agents.disable`). "Newest" is by the host clock at issue, so after a backward clock
+  step a newer dead record can be deleted before an older one; nothing but that short
+  history depends on the order.
+- **Rolling back** to a kit before this one: the older kit ignores `scopes` on the agent
+  record and counts every credential record, working or not, toward its limit of 20. An
+  agent that holds 20 or more records (possible here: up to 20 that work and 5 that do
+  not) cannot be renewed under the older kit until records are revoked and removed by
+  hand; and the older kit gives the default four to every renewal from the page again.
+
+The
 agent then calls `GET /v1/agents/me` and `GET /v1/agents/me/next` with its credential as a
 bearer token (`Authorization: Bearer <agent-secret>`); every other project route works as
 before, capped at the owner's live role and the agent's granted projects. A grant may
@@ -1078,6 +2275,37 @@ line separately and unconfined.
   a row past its bound, has `review_state: null` and no next action, and the list
   reports `review_states_complete: false`; it never guesses "claim" or "deliver" for
   work that may be under review.
+- **A row that is not read** (kittrial-5bb.169). The kit does not read a tracker row
+  whose JSON nests deeper than 750 levels (`record_json.ROW_NESTING_MAX`; deep
+  metadata is enough). The rule is counted, not tried: it is the same on every Python
+  (3.10 cannot parse about a thousand levels, 3.13 parses several thousand), and it is
+  the rule the endpoint's own readers get with kittrial-5bb.141, from the same
+  constant. The service takes an answer of the tracker that holds such a row apart row
+  by row, so one such row does not fail the rest:
+  - `GET /v1/projects/{id}/tasks` answers 200 with every readable row. The other is in
+    `items` as `{"id", "status": "unknown", "unreadable": true, "malformed": true,
+    "error": "Malformed issue row"}`: its id and nothing else of it (not its title,
+    which is stored text nobody has read). The answer names it in `unreadable: [ids]`,
+    on every page and under every filter. The field is absent when every row is
+    readable. The page marks the row "Cannot be read" and says how many there are.
+  - An answer that holds a deep element and is not a single row or a clean list of
+    rows (text between the rows that JSON does not allow, a deep element that is not
+    an object or has no id of a tracker id's shape, such as a deep error object) is
+    refused as an answer that cannot be read, as a malformed answer always was.
+  - The page, brief and history of that row, and a change or claim of it, answer 409
+    `unreadable_row`: "Task ID exists, but its row cannot be read (it is malformed or
+    nested too deeply). Ask an operator of the server to repair it." Nothing of the
+    row is shown or changed through the service.
+  - The review states come from a second read of the endpoint (`work`). An endpoint
+    that cannot read such a row itself fails that read; the list is then still
+    answered, with `review_states_unavailable: true`, `review_states_complete: false`
+    and no review states. With every row readable a failure of that read is an error,
+    as before.
+  - What still depends on the endpoint: the brief of a READABLE task, the queue and My
+    work ask the endpoint's `brief` and `work`, which must themselves cope with the
+    row (kittrial-5bb.141). Until the endpoint does, those answer 503 while such a row
+    exists; they never answered 500.
+  - Repair is on the host (for deep metadata: `bd update ID --unset-metadata KEY`).
 - **Reference catalog reads.** The routes are `GET /v1/projects/{id}/references` and
   `GET /v1/projects/{id}/references/{key}`, available to any project member
   (`CAP_READ`). They are the .41 slice 1, kittrial-5bb.66.
@@ -1215,7 +2443,7 @@ line separately and unconfined.
     lists an open `blocker` or `dependency` on undelivered work; with `open_items`,
     `blocking_items`, `blocked_since` and `newer_activity`),
     `in-progress` (3: claimed, not closed, nothing delivered yet), then
-    `claimable-task` (4), then `awaiting-review` and `awaiting-integration` (5).
+    review work and `claimable-task` (4, see below), then `awaiting-review` and `awaiting-integration` (5).
     `review-error` (priority 2) names the malformed state and asks an operator to reconcile it;
     other own states get `review-state`, naming the state and who acts next. Neither
     silently disappears from the action list. Action **kind names** are the client
@@ -1234,6 +2462,66 @@ line separately and unconfined.
     alone does not trigger this error: the last valid checkpoint still stands.
     An invalid imported in-process checkpoint pointer can also produce unknown
     history; it is a separate backend case. Delivered work keeps its review action.
+  - **Review work (kittrial-5bb.115).** Two kinds, for an agent that holds the reviews
+    capability in the project. They come from the same `work` snapshot: no further
+    read.
+    - `to-review`: a contribution that awaits review and that this agent has not
+      recommended yet. The agent reviews it and records a recommendation or requests
+      changes. `who` is `agent`.
+    - `review-recommended`: a contribution that awaits review and has a standing
+      recommendation, shown to an agent **whose owner can approve**. An agent cannot
+      approve: the action says to tell the owner it is ready. `who` is `owner`.
+    - An agent is shown a delivery only if it could itself recommend it: not its own
+      task or contribution, not its owner's, not another agent of its owner's, and
+      only in a project it is granted.
+    - Each action carries `recommended_by`, `contribution` and `commit`.
+    - `counts` gains `review_recommended` and `to_review`. At most 20 review actions in
+      all, over every project the agent is granted (recommended ones first), are
+      listed, so claimable work stays on the list. The counts are exact and
+      `truncated` says when more exist.
+    - **The `state` values do not change for review work.** An agent with nothing of
+      its own and something to review still reads `idle`. The `summary` names the
+      review work whenever a count is not zero ("1 contribution(s) recommended for
+      approval: tell the owner; 2 contribution(s) to review."), so an owner looking at
+      the agent list is not told there is nothing to do.
+    - The prompt copied from My work (`GET /v1/me/work`, `agent_prompts`) names the
+      same work. A person who may review but not approve gets "Contributions you could
+      review" with the contributions of other people that nobody of theirs has
+      recommended yet; an approver's review lines add "recommended by N reviewer(s)".
+    - **On a mixed installation** (this service over an endpoint that does not yet put
+      `contribution_author` on a work row, in a staged upgrade or a rollback) no
+      recommendation is counted on such a row: there is no `review-recommended`
+      action, the queue row and My work show none, and every delivery that awaits
+      review reads as not yet recommended, until the endpoint is updated. The service
+      does not guess who delivered from the task's assignee. The task's brief still
+      shows an independent recommendation. A delivery whose task was reassigned or
+      unassigned afterwards is offered as `to-review` to the agent that delivered it;
+      its recommendation is refused with 403 and nothing is written. A reviewer that
+      has already recommended a delivery is not offered it again: the names that are
+      not counted are on the row as `recommended_unchecked` and are used for that one
+      question only. Update the endpoint and the service together and none of this is
+      seen (docs/REVIEWS.md, "A mixed installation").
+    - **"Already recommended?" is asked by person** (kittrial-5bb.154), of an agent's
+      actions and of My work alike: an agent is not offered a delivery that it, its
+      owner or another agent of its owner has recommended, and My work does not list
+      it under "Contributions you could review". (An agent used to be asked whether
+      THIS AGENT had recommended it, so a person's second agent was offered it.)
+      Another person's agent is still offered it. A second recommendation by the same
+      person is refused with 409 and the sentence in docs/REVIEWS.md, which names the
+      ways on: request changes, or wait for a revision or a decision.
+    - The prompt's "delivered by" names the contribution's author when the row gives
+      it, not the task's assignee, so a reassignment does not rename who delivered.
+      When the row does not give it (a mixed installation, above) the prompt reads
+      "delivered by: not stated by this server (the task is assigned to NAME)": the
+      assignee is named as the assignee, and nobody as the one who delivered.
+    - After a reassignment the new assignee's agent lists the task as
+      `awaiting-review` ("Waiting for a human review decision."). That is meant: the
+      task is that agent's now, whoever delivered the contribution on it, and there is
+      nothing for it to do until the review is decided.
+  - **Order within a priority is part of the contract; the numbers are not.**
+    `review-recommended`, `to-review` and `claimable-task` all carry priority 4 and
+    are listed in that order, and within a kind by project and then by task. No kind was renumbered when these two were added. A
+    client relies on the order of `next_actions` and on the kind names.
   - **Why the two waiting kinds are last.** An agent, and anything that wakes it,
     takes the first action. The agent can do nothing about a contribution that waits
     for a reviewer or for integration, so those never sit ahead of work it can do.

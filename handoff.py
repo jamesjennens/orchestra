@@ -169,7 +169,10 @@ def disposition(path, actor, p, run, operator=False):
         raise ValueError('Handoff request already has a disposition')
     if p['disposition']=='accept' and _reconcile_completed_request(path, record, actor, p, run, operator):
         return dict(json.loads(file.read_text(encoding='utf-8')), reconciled=True)
-    rows=json.loads(run(['show',p['task'],'--json']))
+    try:
+        rows=json.loads(run(['show',p['task'],'--json']))
+    except (ValueError, RecursionError):
+        raise ValueError('Task %s is malformed' % p['task']) from None
     if not isinstance(rows,list) or len(rows)!=1 or rows[0].get('id')!=p['task']:raise ValueError('Expected exact task')
     current=rows[0].get('assignee')
     if current!=record['from_actor'] and not operator:
@@ -290,7 +293,10 @@ def execute(path, actor, p, run, operator=False, recovery=None):
     digest=content_hash(identity)
     if record and record.get('digest')!=digest:raise ValueError('Handoff operation ID reused with different content or authority')
     def issue():
-        rows=json.loads(run(['show',p['task'],'--json']))
+        try:
+            rows=json.loads(run(['show',p['task'],'--json']))
+        except (ValueError, RecursionError):
+            raise ValueError('Task %s is malformed' % p['task']) from None
         if isinstance(rows,dict):rows=[rows]
         if not isinstance(rows,list) or len(rows)!=1 or rows[0].get('id')!=p['task']:raise ValueError('Expected exact task')
         return rows[0]

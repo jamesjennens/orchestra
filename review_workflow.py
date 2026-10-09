@@ -63,6 +63,7 @@ import record_json
 import re
 from pathlib import Path
 import recovery
+from coordination import is_merge_slot, merge_slot_sentence
 from field_limits import check_text, describe
 from requirements import canonical_bytes, content_hash
 
@@ -107,12 +108,14 @@ MAX_OPEN_REVIEW_REQUESTS = 10
 REVIEWER = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.@/-]{0,95}')
 #: Plain text for a field another worker reads (the rule ``guidance`` applies):
 #: no C0 control characters other than tab/newline/carriage return and no DEL, no
-#: C1 controls, bidi controls, word joiners, BOM or Unicode tag characters, and a
+#: C1 controls, bidi controls, word joiners, BOM, Unicode tag characters or
+#: variation selectors (U+E0100-U+E01EF, as guidance refuses), and a
 #: ZWNJ/ZWJ only between letters. Applied on the WRITE path, so a record written
 #: before the rule existed still reads.
 PLAIN_CONTROL = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
 PLAIN_INVISIBLE = re.compile('[\u0080-\u009f\u00ad\u200b\u200e\u200f\u2028\u2029\u202a-\u202e'
-                             '\u2060-\u2064\u2066-\u2069\ufeff\U000E0000-\U000E007F]')
+                             '\u2060-\u2064\u2066-\u2069\ufeff\U000E0000-\U000E007F'
+                             '\U000E0100-\U000E01EF]')
 PLAIN_JOINER = re.compile('[\u200c\u200d]')
 #: Item severity on a request-changes item. Absent means ``blocking`` so every
 #: record written before severity existed keeps blocking approval.
@@ -121,6 +124,12 @@ SEVERITIES = ('blocking', 'note')
 WITHDRAW_DISPOSITIONS = ('withdrawn', 'superseded')
 #: How the requester disposes of their own item: resolve it, or leave it as a note.
 RESOLVE_DISPOSITIONS = ('resolved', 'note')
+#: What a resolve-item record with NO disposition means. An older kit could store an
+#: explicit null, and that record still reads: it is the operation's default, which
+#: RESOLVES the item. Named so the default is one greppable token rather than an inline
+#: literal (kittrial-5bb.110 item 3 P3: a mutation that read a stored null as anything
+#: else survived).
+RESOLVE_DEFAULT = 'resolved'
 # Optional additive field on an ``approve`` record: the task assignee at the moment
 # the approval was written. Stamped server-side by ``execute``; approve records
 # written before this field existed keep validating without it, and a null value is
@@ -212,7 +221,8 @@ def plain_text(value, name):
     if PLAIN_CONTROL.search(value):
         raise ValueError(f'{name} must be plain text (no control characters)')
     if PLAIN_INVISIBLE.search(value):
-        raise ValueError(f'{name} must be plain text (no bidi, zero-width, C1 or tag characters)')
+        raise ValueError(f'{name} must be plain text (no bidi, zero-width, C1, tag or '
+                         'variation-selector characters)')
     for match in PLAIN_JOINER.finditer(value):
         before = value[match.start() - 1] if match.start() else ''
         after = value[match.end()] if match.end() < len(value) else ''
@@ -244,6 +254,49 @@ def check_plain_text(payload):
                         plain_text(item[key], 'resolution ' + key)
 
 
+def check_write_fields(payload):
+    """Refuse an explicitly null OPTIONAL field on the WRITE path (kittrial-5bb.110 item 2).
+
+    ``validate`` stays tolerant so a record an older kit stored with ``"disposition":
+    null`` still validates and reads (``projection`` reads it as the operation default,
+    never ``None``). The canonical WRITER refuses a NEW one: null is not a disposition,
+    and storing it made ``review_state`` read None and a second withdraw raise a
+    ``TypeError``. The HTTP service also treats a null optional field as absent and does
+    not forward it, so this refusal only catches a raw payload (``review --file`` with an
+    explicit null) before any native write.
+    """
+    op = payload.get('operation')
+    if op not in ('withdraw', 'resolve-item') or 'disposition' not in payload:
+        return
+    if payload['disposition'] is None:
+        allowed = WITHDRAW_DISPOSITIONS if op == 'withdraw' else RESOLVE_DISPOSITIONS
+        raise ValueError('%s disposition must be %s or absent, not null'
+                         % (op, ' or '.join(allowed)))
+
+
+def new_write_field(payload):
+    """The operation or FIELD a validated payload writes that is new in kittrial-5bb.94.
+
+    Returns ``None`` for a legacy shape. A new operation names the operation; a
+    request-changes carrying the additive ``summary`` or an item ``severity`` names
+    that FIELD, so the switch-off refusal points at the field (item 7) instead of
+    only saying ``operation/field request-changes``. Both are named when both are set.
+    """
+    op = payload.get('operation')
+    if op in NEW_WRITE_OPERATIONS:
+        return 'operation ' + str(op)
+    if op == 'request-changes':
+        named = []
+        if 'summary' in payload:
+            named.append('summary')
+        if any(isinstance(item, dict) and item.get('severity') is not None
+               for item in payload.get('items') or []):
+            named.append('item severity')
+        if named:
+            return 'request-changes ' + ' and '.join(named)
+    return None
+
+
 def new_write_requested(payload):
     """Whether a validated payload writes a new-shaped record (item 3).
 
@@ -252,19 +305,12 @@ def new_write_requested(payload):
     are additive fields. A legacy ``{id, text}`` request-changes item is an OLD
     shape and is not gated.
     """
-    if payload.get('operation') in NEW_WRITE_OPERATIONS:
-        return True
-    if payload.get('operation') == 'request-changes':
-        if 'summary' in payload:
-            return True
-        return any(isinstance(item, dict) and item.get('severity') is not None
-                   for item in payload.get('items') or [])
-    return False
+    return new_write_field(payload) is not None
 
 
 def new_write_refusal(payload):
     """The refusal text for a new-shaped write on an installation with the switch off."""
-    return ('Review workflow operation/field ' + str(payload.get('operation')) +
+    return ('Review workflow ' + (new_write_field(payload) or str(payload.get('operation'))) +
             ' writes a new record shape that a kit built before kittrial-5bb.94 cannot read. '
             'This installation has review_workflow_writes off (the default); the readers here '
             'understand the new operations and fields already, so this is a write switch, not a '
@@ -404,6 +450,10 @@ def validate(p, task):
             limited(p['reason'], 'decline reason')
         elif op == 'withdraw':
             limited(p['reason'], 'withdraw reason')
+            # The READ path stays tolerant: a record an older kit stored with an
+            # explicit null disposition still validates here and reads as the default
+            # (see `projection`). The WRITE path refuses it (`check_write_fields`), so a
+            # new null can never be stored (kittrial-5bb.110 item 2).
             if p.get('disposition') is not None and p['disposition'] not in WITHDRAW_DISPOSITIONS:
                 raise ValueError('withdraw disposition must be withdrawn or superseded')
         elif op == 'resolve-item':
@@ -1354,7 +1404,13 @@ def projection(ordered, voids=None, invalid=None, refused=None, positions=None, 
                     raise ValueError('Resolution must reference an unresolved request/item')
                 if author_key(c['author']) != author_key(entry['author']):
                     raise ValueError('Only the requester may resolve their own review item')
-                if p.get('disposition', 'resolved') == 'note':
+                disposition = p.get('disposition')
+                if disposition is None:
+                    # A stored null is the operation's DEFAULT (RESOLVE_DEFAULT), never a
+                    # downgrade to a note and never the item's own severity: such a record
+                    # RESOLVES the item for a blocking item and for a note item alike.
+                    disposition = RESOLVE_DEFAULT
+                if disposition == 'note':
                     pending.pop(key, None)
                     notes[key] = dict(entry, severity='note')
                 else:
@@ -1386,7 +1442,11 @@ def projection(ordered, voids=None, invalid=None, refused=None, positions=None, 
                     # one is warned about below.
                     ignored_withdrawals.append(cid)
                 else:
-                    withdrawal = dict(request=cid, disposition=p.get('disposition', 'withdrawn'),
+                    # A stored record an older kit wrote with an explicit null
+                    # disposition reads as the operation default, never as None: the
+                    # state, `review`, `brief` and `work` all show `withdrawn`
+                    # (kittrial-5bb.110 item 2).
+                    withdrawal = dict(request=cid, disposition=p.get('disposition') or 'withdrawn',
                                       reason=p['reason'], contribution=current, author=c['author'],
                                       timestamp=c['created_at'])
                     # A withdraw closes the contribution's review requests, exactly
@@ -1556,7 +1616,9 @@ def require_integrated_follow_on(payload, state, ordered, rows, task, assignee=N
     * the shared per-scope integration evidence (kittrial-5bb.24,
       ``review_state.integration`` over ``review_state.scopes_for``) must record a
       passed ``integrated`` fact for the prior contribution's FULL commit, and the
-      follow-on ``base_commit`` must equal that scope's ``integration_commit``.
+      follow-on ``base_commit`` must be that scope's ``integration_commit`` or an
+      integration commit the project recorded after it (kittrial-5bb.148; see
+      ``recorded_integrations`` for what that can and cannot know).
       Any scope order is accepted, so recording a newer scope for other work does
       not make a genuinely integrated prior un-followable -- the older defect that
       read only the task's single current ``lifecycle`` scope.
@@ -1605,9 +1667,165 @@ def require_integrated_follow_on(payload, state, ordered, rows, task, assignee=N
                          'integrated lifecycle fact scoped to the prior contribution commit, read from '
                          'the shared review-state projection (an operator-reverted integration commit '
                          'does not count), before an additive follow-on can use it as its base')
-    if payload['base_commit'].lower() != evidence['integration_commit'].lower():
-        raise ValueError('Contribution base_commit must equal the prior integration commit '
-                         + evidence['integration_commit'])
+    base = payload['base_commit'].lower()
+    if base == evidence['integration_commit'].lower():
+        return
+    # Main usually moves before a follow-on is ready (kittrial-5bb.148). The base may also
+    # be an integration commit this project recorded AFTER the prior one. See
+    # recorded_integrations for what that can and cannot know.
+    recorded, newest = recorded_integrations(rows, task, evidence, operators, journal)
+    found = recorded.get(base)
+    if found == 'later':
+        return
+    if isinstance(found, tuple):
+        # Recorded as an integration, but not under a listed operator's name: say who recorded
+        # it and what to do, so a coordinator who is not on the operator list sees it at once.
+        found, recorder = found
+        unlisted = BASE_WHY_UNLISTED % recorder
+    else:
+        unlisted = None
+    why = {None: BASE_WHY_NEVER, 'unlisted': unlisted, 'earlier': BASE_WHY_EARLIER, 'reverted': BASE_WHY_REVERTED}[found]
+    raise ValueError(BASE_RULE % (evidence['integration_commit'], BASE_NEWEST % newest if newest else BASE_NONE_YET,
+                                  payload['base_commit'], why))
+
+
+#: The follow-on base refusal, in its parts: the rule, the newest acceptable later commit (or
+#: none), the refused base and one of four reasons. The text is unchanged since
+#: kittrial-5bb.155; the parts are named so that :data:`BASE_REFUSAL` is built from them.
+BASE_RULE = ('Contribution base_commit must be the prior integration commit %s, or an integration commit '
+             'this project recorded after it (a passed integrated fact on any task, recorded by a listed '
+             'operator, not reverted)%s. '
+             '%s is not accepted: %s')
+BASE_NEWEST = '; the newest such commit is %s'
+BASE_NONE_YET = '; none is recorded yet'
+BASE_WHY_NEVER = 'this project has no passed integrated fact that names it as an integration commit'
+BASE_WHY_EARLIER = ('this project recorded it as an integration commit before the prior integration, or in the '
+                    'same second, not after it')
+BASE_WHY_REVERTED = 'an operator revert names it'
+BASE_WHY_UNLISTED = ('it was recorded as an integration commit by %s, who is not a listed operator of this '
+                     'installation. Integrations must be recorded by a listed operator for a later base to count: '
+                     'an operator adds the recorder (admin.py operators add) or records the integration')
+#: How the refusal shows a recorder: the name in quotes when it is a plain name, else these words.
+RECORDER_NAME = r'[A-Za-z0-9_.:@/-]{1,80}'
+RECORDER_UNNAMED = 'an actor'
+
+
+def _base_refusal():
+    """The whole refusal as a pattern: the kit's own words around commit ids and a plain recorder name.
+
+    The web service hands a canonical refusal on up to 200 characters, and this sentence is
+    longer (kittrial-5bb.158). It may hand THIS one on whole, because a line that matches
+    holds nothing but the kit's text, hexadecimal commit ids and a recorder name of the
+    shape above. A line with anything else in a commit's place (a scope may name any string
+    as its integration commit) does not match, and is cut as before.
+    """
+    commit = r'[0-9A-Fa-f]{7,64}'
+    recorder = '(?:"%s"|%s)' % (RECORDER_NAME, re.escape(RECORDER_UNNAMED))
+    reasons = '(?:%s)' % '|'.join([re.escape(BASE_WHY_NEVER), re.escape(BASE_WHY_EARLIER), re.escape(BASE_WHY_REVERTED),
+                                   re.escape(BASE_WHY_UNLISTED).replace('%s', recorder)])
+    newest = '(?:%s|%s)' % (re.escape(BASE_NEWEST).replace('%s', commit), re.escape(BASE_NONE_YET))
+    pattern = re.escape(BASE_RULE)
+    for part in (commit, newest, commit, reasons):
+        pattern = pattern.replace('%s', part, 1)
+    return re.compile(pattern)
+
+
+BASE_REFUSAL = _base_refusal()
+
+
+def _recorded_at(value):
+    """A tracker timestamp as an aware datetime, or None when it cannot be read."""
+    import datetime
+    if not isinstance(value, str) or not value:
+        return None
+    # Python 3.10 reads a fraction of exactly three or six digits only. The tracker stamps
+    # comments to the nanosecond; an event stamped that way must not read as "no time"
+    # (kittrial-5bb.155), so the fraction is brought to microseconds first.
+    value = re.sub(r'\.(\d+)', lambda found: '.' + (found.group(1) + '000000')[:6], value, count=1)
+    try:
+        stamp = datetime.datetime.fromisoformat(value[:-1] + '+00:00' if value.endswith('Z') else value)
+    except ValueError:
+        return None
+    return stamp if stamp.tzinfo is not None else stamp.replace(tzinfo=datetime.timezone.utc)
+
+
+def recorded_integrations(rows, task, prior, operators=None, journal=None):
+    """``({commit: 'later' | 'earlier' | 'reverted'}, newest later commit or None)`` for a follow-on's base.
+
+    ``prior`` is the integration evidence of ``task``'s prior revision (``review_state.integration``).
+    A commit reads ``later`` when a passed ``integrated`` fact on ANY task of the project
+    names it as its scope's ``integration_commit``, **that fact was recorded by a listed
+    operator**, the event that recorded it was created after the event that recorded the
+    prior revision's integration, and no operator revert that the host journal confirms
+    names the commit, on any task. Both times are the tracker's own stamps on the event
+    rows, never a caller's. The tracker stamps whole seconds, and two events stamped the
+    same second cannot be ordered (the export lists rows by id, not by time), so "the same
+    second" is not after: a later base recorded in the prior integration's own second is
+    refused, never an earlier one accepted. A time that is missing or cannot be read is
+    not "after".
+
+    **Only an operator's fact counts** (kittrial-5bb.155). Any actor can record an
+    ``integrated`` fact on a task of its own making, so a fact recorded by anybody else
+    names no base: a contributor could otherwise make any commit acceptable with a decoy
+    task. ``operators`` is the installation's allowlist; with none configured no later
+    base is accepted. This is the interim rule until kittrial-5bb.106 settles who may
+    write lifecycle facts. It does not stop a caller who reaches the endpoint over SSH and
+    names itself as an operator: there an actor name is a declared label. Over HTTP the
+    actor is the authenticated account.
+
+    **What this cannot know.** The endpoint has no git repository, so it cannot tell that
+    a recorded integration commit descends from the prior one. It knows only that the
+    project recorded it, later, as an integration. Two release lines in one project, or a
+    fact recorded with the wrong commit, would pass; the reviewer checks the base as for
+    any contribution. A commit of main that no lifecycle fact names is never accepted.
+    """
+    from lifecycle import integration_evidence
+    from review_state import reverts_by_task
+    # When each event was recorded: the tracker's stamp. Two events stamped the same second
+    # cannot be ordered: the export lists rows by id, not by time (measured on real bd,
+    # kittrial-5bb.155), so a position in it says nothing about which came first.
+    created = {row.get('id'): _recorded_at(row.get('created_at')) for row in rows
+               if isinstance(row, dict) and row.get('issue_type') == 'event'}
+    listed = {name for name in (operators or []) if isinstance(name, str) and name}
+    reverted = set()
+    for found in reverts_by_task(rows, operators, journal)[0].values():
+        reverted |= {str(record.get('integration_commit') or '').lower() for record in found}
+    evidence = integration_evidence(rows)
+    # When the prior revision's own integration was recorded: the event of its scope on this task.
+    prior_time = None
+    for scope in next((entry['scopes'] for entry in evidence if entry['id'] == task), []):
+        if scope.get('scope_token') == prior.get('scope_token'):
+            prior_time = created.get((scope.get('integrated') or {}).get('event_id'))
+    recorded, newest, rank = {}, None, {'reverted': 3, 'later': 2, 'unlisted': 1, 'earlier': 0}
+    for entry in evidence:
+        for scope in entry['scopes']:
+            fact = scope.get('integrated') or {}
+            commit = str((scope.get('scope') or {}).get('integration_commit') or '').lower()
+            if fact.get('value') != 'passed' or not commit:
+                continue
+            stamp = created.get(fact.get('event_id'))
+            if commit in reverted:
+                reading = 'reverted'
+            elif prior_time is None or stamp is None or not stamp > prior_time:
+                reading = 'earlier'
+            elif fact.get('actor') in listed:
+                reading = 'later'
+            else:
+                # Later, and recorded by somebody who is not a listed operator: not a base. The
+                # name is shown only when it is a plain actor name; it is caller text.
+                actor = fact.get('actor')
+                shown = '"%s"' % actor if isinstance(actor, str) and re.fullmatch(RECORDER_NAME, actor) \
+                    else RECORDER_UNNAMED
+                reading = ('unlisted', shown)
+            # A commit recorded more than once: a revert wins, then a later recording by a
+            # listed operator, then a later one by anybody else, then an earlier one.
+            key = reading[0] if isinstance(reading, tuple) else reading
+            had = recorded.get(commit)
+            if had is None or rank[key] > rank[had[0] if isinstance(had, tuple) else had]:
+                recorded[commit] = reading
+            if reading == 'later' and (newest is None or stamp > newest[0]):
+                newest = (stamp, commit)
+    return recorded, (newest[1] if newest else None)
 
 
 def _retry_matches(stored, incoming):
@@ -1635,7 +1853,7 @@ def open_review_requests_by(rows, actor, operators=None, journal=None):
     """
     total = 0
     for row in rows or []:
-        if not isinstance(row, dict) or row.get('issue_type') in ('event', 'gate', 'merge-slot'):
+        if not isinstance(row, dict) or row.get('issue_type') in ('event', 'gate') or is_merge_slot(row):
             continue
         if not any(isinstance(c, dict) and isinstance(c.get('text'), str) and c['text'].startswith(PREFIX)
                    for c in row.get('comments') or []):
@@ -1662,6 +1880,9 @@ def execute(rows, task, actor, payload, run, operators=None, journal=None, revie
     ``deployment.private.json``; the default is OFF). The readers understand the
     new operations and fields either way - see the module docstring.
     """
+    for row in rows or []:
+        if isinstance(row, dict) and row.get('id') == task and is_merge_slot(row):
+            raise ValueError(merge_slot_sentence(task) + '; it takes no review record')
     if isinstance(payload, dict) and payload.get('operation') == recovery.OPERATION:
         raise ValueError('Operator void records are not accepted over the contributor review transport; '
                          'an operator must use admin.py void-record on the coordination host')
@@ -1669,10 +1890,15 @@ def execute(rows, task, actor, payload, run, operators=None, journal=None, revie
         raise ValueError('Integration revert records are not accepted over the contributor review '
                          'transport; an operator must use admin.py revert-record on the coordination host')
     validate(payload, task); text(actor, 'actor', 300)
+    # A null optional disposition is refused on the WRITE path before anything else, so
+    # the writer never stores the shape `validate` must keep reading (item 2).
+    check_write_fields(payload)
     matches = [r for r in rows if r.get('id') == task]
     if len(matches) != 1 or matches[0].get('issue_type') == 'event':
         raise ValueError('Task missing, duplicated or is an event')
     issue = matches[0]
+    if issue.get('malformed'):
+        raise ValueError('Task %s is malformed: %s' % (task, issue.get('error') or 'cannot parse row'))
     closed = issue.get('status') == 'closed'
     ordered, voids, invalid, refused, positions, reverts, invalid_reverts = history(issue, operators, journal)
     state = projection(ordered, voids, invalid, refused, positions, reverts, invalid_reverts, closed=closed)

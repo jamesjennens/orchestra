@@ -73,4 +73,60 @@ const steps = (root) => root.all((e) => e.tagName === 'LI').map((li) => ({
 out.routes = { members: setup.stepRoute('members', 'p1'), task: setup.stepRoute('first-task', 'p1'),
   agent: setup.stepRoute('agent', 'p1'), guidance: setup.stepRoute('guidance', 'p1') };
 out.summary = [setup.summary({ remaining: 0 }), setup.summary({ remaining: 1 }), setup.summary({ remaining: 4 })];
+// A step the server could not check is said, never hidden behind "nothing is left".
+out.unchecked = [setup.summary({ remaining: 0, unchecked: 1 }), setup.summary({ remaining: 0, unchecked: 2 }),
+  setup.summary({ remaining: 2, unchecked: 1 })];
+// The hint on the project page appears for an unchecked step too. The API is a stand-in here.
+{
+  const fake = (data) => ({ api: { projectSetup: async () => data }, href: (path) => '#' + path });
+  const hint = await setup.setupHint(fake({ remaining: 0, unchecked: 1 }), { id: 'p1', role: 'owner' });
+  out.uncheckedHint = hint ? hint.textContent : null;
+  out.noHintWhenAllDone = await setup.setupHint(fake({ remaining: 0, unchecked: 0 }), { id: 'p1', role: 'owner' });
+}
+// A value that begins like a token is shown with its warning, on the repository step.
+{
+  const ctx = who.owner;
+  await ctx.api.setRepository(project, 'ssh://ghp_0123456789abcdef@git.example/team/alpha.git');
+  const page = await setup.page(ctx, { pid: project });
+  const step = page.all((e) => e.tagName === 'LI').find((li) => li.attributes['data-step'] === 'repository');
+  out.warning = step.all((e) => e.tagName === 'DIV' && e.attributes['data-warning'] === 'repository').map((e) => e.textContent);
+  await ctx.api.setRepository(project, 'git@git.example:team/alpha.git');
+  const again = await setup.page(ctx, { pid: project });
+  out.noWarning = again.all((e) => e.tagName === 'DIV' && e.attributes['data-warning']).length;
+}
+// kittrial-5bb.200: what a step gives to copy, each entry under its own label. The API is a stand-in.
+{
+  const data = (step) => ({ project: { id: 'p1', name: 'P', repository: null }, remaining: 1, unchecked: 0, host: 'available',
+    steps: [{ id: 'backup', title: 'Backup', state: 'todo', detail: 'd', who: 'operator', who_text: 'An operator', link: null,
+      note: 'n', ...step }] });
+  const fake = (step) => ({ api: { projectSetup: async () => data(step) }, href: (path) => '#' + path, go() {} });
+  const shown = async (step) => {
+    const page = await setup.page(fake(step), { pid: 'p1' });
+    const li = page.all((e) => e.tagName === 'LI')[0];
+    const blocks = li.all((e) => e.tagName === 'DIV' && e.attributes['data-command']);
+    return { kinds: blocks.map((b) => b.attributes['data-command']),
+      texts: li.all((e) => e.tagName === 'PRE').map((pre) => pre.textContent),
+      labels: blocks.map((b) => b.all((e) => e.tagName === 'STRONG')[0].textContent),
+      buttons: blocks.map((b) => b.all((e) => e.tagName === 'BUTTON')[0].textContent), text: li.textContent };
+  };
+  const run = '/opt/py/bin/python3 /opt/kit/admin.py --root /srv/rt backup --all';
+  out.labelled = await shown({ command: run, commands: [
+    { kind: 'shell', label: 'Run a backup now (a shell command)', text: run, note: 'It does not schedule anything.', replace: [] },
+    { kind: 'unit-line', label: 'The line for a schedule (not a shell command)', text: 'ExecStart=' + run,
+      note: 'It goes in the [Service] section of a unit.', replace: [] },
+    { kind: 'shell', label: 'Check', text: '/opt/py/bin/python3 /opt/kit/admin.py --root /srv/rt backup-status --require-complete', note: null, replace: [] }] });
+  const older = await shown({ command: 'admin.py set-guidance p1 --actor OPERATOR --file FILE' });
+  out.older = { kinds: older.kinds, texts: older.texts, buttons: older.buttons };
+  const none = await shown({ command: null, commands: [] });
+  out.none = { kinds: none.kinds, texts: none.texts, buttons: none.buttons };
+  // kittrial-5bb.199: the installation's review rule under the steps. A service older than the rule
+  // sends none: then nothing is added (a null handed to replaceChildren would be the word "null").
+  out.rule = [];
+  for (const rules of [undefined, null, { approval_by_another_party: true }, { approval_by_another_party: false }, { approval_by_another_party: 'yes' }]) {
+    const ctx = { api: { projectSetup: async () => ({ ...data({}), rules }) }, href: (path) => '#' + path, go() {} };
+    const page = await setup.page(ctx, { pid: 'p1' });
+    const notes = page.all((e) => e.attributes['data-rule'] === 'approval_by_another_party');
+    out.rule.push([notes.map((n) => n.attributes['data-on']), notes.map((n) => n.textContent.slice(0, 40)), page.childNodes.length]);
+  }
+}
 console.log(JSON.stringify(out));

@@ -218,7 +218,23 @@ export function createMock(options = {}) {
     const user = Object.values(db.users).find((u) => u.username === String(q.get('username') || '').toLowerCase() && !u.disabled);
     return user ? ok({ id: user.id, username: user.username, display_name: user.display_name }) : err(404, 'not_found', 'No active account with that username');
   });
-  on('GET', '/v1/accounts', () => (me().superuser ? ok({ items: Object.values(db.users) }) : err(403, 'forbidden', 'Superuser authority required')));
+  const accountView = (u) => ({ ...u, project_grant: u.project_grant || null, projects_created: Object.values(db.projects).filter((p) => p.created_by === u.id && !p.archived).length });
+  on('GET', '/v1/accounts', () => (me().superuser ? ok({ items: Object.values(db.users).map(accountView) }) : err(403, 'forbidden', 'Superuser authority required')));
+  // Who may create projects (the real service enforces it on the server; the prototype only records it).
+  on('PUT', '/v1/accounts/(?<uid>[\\w-]+)/project-grant', (b, p) => {
+    if (!me().superuser) return err(403, 'forbidden', 'Superuser authority required');
+    const u = db.users[p.uid]; if (!u) return err(404, 'not_found', 'Account not found');
+    const limit = b && b.limit === undefined ? 5 : b && b.limit;
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) return err(422, 'invalid_payload', 'limit must be a whole number from 1 to 100');
+    u.project_grant = { limit, granted_by: db.session, granted_at: new Date().toISOString() };
+    return ok(accountView(u));
+  });
+  on('DELETE', '/v1/accounts/(?<uid>[\\w-]+)/project-grant', (b, p) => {
+    if (!me().superuser) return err(403, 'forbidden', 'Superuser authority required');
+    const u = db.users[p.uid]; if (!u) return err(404, 'not_found', 'Account not found');
+    delete u.project_grant;
+    return ok(accountView(u));
+  });
   on('POST', '/v1/accounts', (b) => {
     if (!me().superuser) return err(403, 'forbidden', 'Superuser authority required');
     const username = String(b.username || '').trim().toLowerCase();

@@ -49,7 +49,7 @@ def help_payload(action='work'):
         'brief': 'brief TASK [--items-offset N] [--items-limit N] [--json]',
         'history': 'history TASK [--limit N] [--since TIME] [--cursor TOKEN] '
                    '[--body-budget BYTES]',
-        'checkpoint': 'checkpoint TASK --file checkpoint.json [--json]',
+        'checkpoint': 'checkpoint TASK --file checkpoint.json [--json] | checkpoint TASK --provenance | checkpoint TASK --verify | checkpoint TASK --directions [--offset N] [--limit N]',
     }
     payload = {'schema_version': 1, 'contract': CONTRACT_VERSION, 'command': action,
                'usage': usage.get(action, action),
@@ -106,7 +106,10 @@ def help_payload(action='work'):
                             'lifecycle_scope', 'lifecycle_matches_contribution', 'error',
                             'deployed_delivery', 'deployed_delivery_is_current_contribution',
                             'workflow_state', 'integration', 'integration_disagreements',
-                            'integration_warnings', 'review_request', 'review_requests'],
+                            'integration_warnings', 'review_request', 'review_requests',
+                            'newer_activity_by_others', 'newer_activity_own',
+                            'newer_activity_coverage', 'unresolved_directions',
+                            'recommended', 'recommended_by', 'contribution_author'],
         }
     elif action == 'review':
         payload['operations'] = ['read (review TASK)', 'contribute', 'request-changes',
@@ -159,8 +162,8 @@ def help_options(action):
     ]
     if action == 'work':
         return [
-            {'flag': '--mine', 'description': 'show only tasks owned by the requesting actor'},
-            {'flag': '--owner ACTOR', 'description': 'show only tasks owned by ACTOR (mutually exclusive with --mine)'},
+            {'flag': '--mine', 'description': 'show only tasks owned by the requesting actor (malformed rows remain visible)'},
+            {'flag': '--owner ACTOR', 'description': 'show only tasks owned by ACTOR (mutually exclusive with --mine; malformed rows remain visible)'},
             {'flag': '--state STATE', 'description': 'filter by review state: ' + ', '.join(WORK_STATES)},
             {'flag': '--limit N', 'description': 'page size %d..%d (default 20)' % (WORK_LIMIT_MIN, WORK_LIMIT_MAX)},
             {'flag': '--offset N', 'description': 'page offset >= %d (default 0)' % WORK_OFFSET_MIN},
@@ -206,6 +209,10 @@ def help_options(action):
         return [
             {'flag': 'TASK', 'description': 'task the checkpoints belong to'},
             {'flag': '--file checkpoint.json', 'description': 'transport the checkpoint payload as text'},
+            {'flag': '--provenance', 'description': 'read the current bounded provenance and activity cursor without writing'},
+            {'flag': '--directions', 'description': 'read full digests for outstanding directions, including outside the stored windows'},
+            {'flag': '--offset N / --limit N', 'description': '--directions page: offset >= 0, limit 1..100 (default 50)'},
+            {'flag': '--verify', 'description': 'classify current entries using newest retained evidence in linked checkpoint order without writing'},
             {'flag': '--json', 'description': 'accepted in any position; the saved checkpoint is always returned as JSON'},
             {'flag': '-h, --help', 'description': 'return this help as JSON on stdout with exit code 0'},
         ]
@@ -284,6 +291,7 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
             except (OSError,json.JSONDecodeError,ValueError) as exc:
                 journal_errors.append({'path':request_file.name,'error':str(exc)[:300]})
     facts={r['id']:r for r in project_facts(rows)};evidence={r['id']:r['scopes'] for r in integration_evidence(rows)};items=[]
+    checkpoint_states={}
     from review_state import is_integration_warning, reverts_by_task
     if reverts is None:
         revert_map,revert_problems=reverts_by_task(rows,operators,journal)
@@ -291,10 +299,51 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
         revert_map,revert_problems=reverts,{}
     from reserved_comments import is_record_anchor
     from review_workflow import author_key
+    from coordination import is_merge_slot
+    malformed_named=[]
+    unparseable_count=0
     for row in rows:
-        if row.get('issue_type') in ('event','gate','merge-slot'):continue
+        if not isinstance(row,dict):
+            unparseable_count+=1
+            continue
+        if row.get('malformed'):
+            rid=row.get('id')
+            if rid:
+                if rid not in malformed_named:malformed_named.append(rid)
+            else:
+                unparseable_count+=1
+                continue
+            if record_json.selected(row, ['gt:slot'], ['event','gate']):continue
+            if is_record_anchor(row):continue
+            if a.state and a.state!='error':continue
+            items.append({'open_items':None,'checkpoint_at':None,'newer_activity':None,
+                          'pending_change_requests':[],
+                          'task':rid,'title':str(row.get('title',''))[:200],'owner':None,
+                          'status':'unknown','review_state':'error',
+                          'contribution_id':None,'commit':None,'pending_review_items':0,
+                          'pending_handoff_requests':[],
+                          'pending_handoff_total':0,
+                          'pending_handoff_next_offset':None,
+                          'lifecycle':{},'lifecycle_scope':{},
+                          'lifecycle_matches_contribution':None,
+                          'deployed_delivery':None,
+                          'deployed_delivery_is_current_contribution':None,
+                          'deployed_live':'unknown',
+                          'integration':None,'workflow_state':None,'error':row.get('error') or 'Malformed issue row',
+                          'review_request':False,'review_requests':[],
+                          'recommended':False,'recommended_by':[],
+                          'integration_disagreements':[],'integration_warnings':[],
+                          'newer_activity_by_others':None,'newer_activity_own':None,
+                          'newer_activity_coverage':None,'unresolved_directions':None})
+            continue
+        # The merge slot is an internal record (kittrial-5bb.113): on real bd it is a
+        # row of type task, so the type alone never excluded it.
+        if row.get('issue_type') in ('event','gate') or is_merge_slot(row):continue
         # Record anchors (kittrial-5bb.64) are never work, whatever their status.
         if is_record_anchor(row):continue
+        if not row.get('id'):
+            unparseable_count+=1
+            continue
         task_reverts=revert_map.get(row['id'],[])
         task_scopes=evidence.get(row['id']) if scopes is None else scopes.get(row['id'])
         try:review=workflow(row,task_scopes,operators=operators,reverts=task_reverts,journal=journal,
@@ -326,8 +375,15 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
         # but a closed task is no longer offered to a reviewer. Outstanding
         # requested changes, an approved-but-unintegrated revision and a malformed
         # history stay visible: closure is not acceptance, and a broken chain must
-        # still be surfaced.
-        if row.get('status')=='closed' and state not in ('changes-requested','awaiting-integration','error'):continue
+        # still be surfaced. A WITHDRAWN (or superseded) contribution with a
+        # blocking item still open stays visible for the same reason as
+        # changes-requested: the item is actionable work although the revision is
+        # final (kittrial-5bb.110 item 4).
+        closed_open_item = bool(review.get('pending_requests'))
+        if (row.get('status')=='closed'
+                and state not in ('changes-requested','awaiting-integration','error')
+                and not (state in ('withdrawn','superseded') and closed_open_item)):
+            continue
         if a.state and a.state!=state:continue
         contribution=review.get('contribution') or {}
         scope=facts.get(row['id'],{}).get('scope') or {}
@@ -362,8 +418,9 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
         # request-changes records still unresolved.
         checkpoint_at=None;newer_activity=None
         try:
-            from briefing import checkpoints
-            latest_checkpoint,_=checkpoints(row)
+            from briefing import checkpoint_state
+            checkpoint_states[row['id']]=checkpoint_state(row,normalize=False)
+            latest_checkpoint=checkpoint_states[row['id']]['current']
             open_items=len(latest_checkpoint[0]['open_items']) if latest_checkpoint else 0
             blocking_items=sum(item['kind'] in ('blocker','dependency')
                                for item in latest_checkpoint[0]['open_items']) if latest_checkpoint else 0
@@ -404,13 +461,28 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
                       # contribution and nobody has decided yet; and who recommends it.
                       'recommended':bool(review.get('recommended')),
                       'recommended_by':[entry['author'] for entry in review.get('recommendations') or []],
+                      # Additive (kittrial-5bb.115 review): who delivered the current contribution, so a
+                      # reader that knows people (the web service) can apply its person rule to a row.
+                      'contribution_author':(review.get('contribution') or {}).get('author'),
                       # Additive (kittrial-5bb.52): the integration disagreement entries
                       # naming both facts and both scopes, and their rendered warnings.
                       'integration_disagreements':disagreements,'integration_warnings':integration_warnings})
     priority={'changes-requested':0,'error':1,'awaiting-review':2,'legacy-review-ready':2,'awaiting-integration':3}
     items.sort(key=lambda r:(priority.get(r['review_state'],4),r['task']))
+    coverage='Fresh current view; structured review takes precedence over legacy review-ready labels. Lifecycle facts remain independent; malformed handoff journals are surfaced as errors.'
+    if malformed_named:
+        coverage+=' Malformed issue rows: %s.'%(', '.join(malformed_named))
+    if unparseable_count:
+        coverage+=' %d unparseable issue row(s).'%unparseable_count
     result={'owner':owner,'total':len(items),'items':items[a.offset:a.offset+a.limit],'next_offset':a.offset+a.limit if a.offset+a.limit<len(items) else None,
-            'coverage':'Fresh current view; structured review takes precedence over legacy review-ready labels. Lifecycle facts remain independent; malformed handoff journals are surfaced as errors.'}
+            'coverage':coverage}
+    # .1 adds checkpoint attention after constructing the page. This is separate
+    # from the review/handoff/HTTP queue fields and parses only displayed tasks.
+    from briefing import checkpoint_queue_fields
+    task_rows={row['id']:row for row in rows if isinstance(row,dict) and row.get('id')}
+    for item in result['items']:
+        if item['task'] in task_rows:
+            item.update(checkpoint_queue_fields(rows,task_rows[item['task']],checkpoint_states.get(item['task'])))
     if journal is not None:
         # The standing guidance channel (kittrial-5bb.99): every work queue page
         # carries the current guidance version, so a worker that only runs `work`
@@ -462,14 +534,17 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
         # Structured output is already JSON; accept the flag consistently with brief/show/work.
         args=[token for token in args if token!='--json']
     if action=='work':
-        rows=[json.loads(line) for line in run(['export','--all']).splitlines() if line.strip()]
+        rows=record_json.loads_rows(run(['export','--all']))
+        from reserved_comments import RECORD_ANCHOR_LABELS
+        rows=record_json.classify(rows,run,sorted(RECORD_ANCHOR_LABELS)+['gt:slot'], ['event','gate'])
         return queue(rows,actor,args,path/'.handoff-requests', operators=operators, journal=path,
                      reference_attention=True, verifiers=verifiers)
     if len(args) not in (1,2):raise ValueError('Use review TASK [--file payload.json] or handoff TASK --file payload.json')
     task=args[0]
     if action=='review' and len(args)==1:
         from briefing import task_row
-        rows=[json.loads(line) for line in run(['export','--all']).splitlines() if line.strip()]
+        from lifecycle import read_event_rows
+        rows=read_event_rows(run)
         issue=task_row(rows,task)
         from review_state import scopes_for
         return workflow(issue,scopes_for(rows,task),operators=operators,journal=path)
@@ -487,7 +562,8 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
             from handoff import disposition as handoff_disposition
             return handoff_disposition(path,actor,payload,run)
         return handoff(path,actor,payload,run)
-    rows=[json.loads(line) for line in run(['export','--all']).splitlines() if line.strip()]
+    from lifecycle import read_event_rows
+    rows=read_event_rows(run)
     if payload.get('operation')=='recommend':
         # A reviewer's recommendation (kittrial-5bb.115) is a record beside the review
         # chain: it has its own writer and never passes through the chain's.

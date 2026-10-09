@@ -10,6 +10,7 @@ mention "Kind:" mid-text -- remains valid.
 This module is import-safe on all platforms (no fcntl). endpoint.py enforces
 it on the contributor `bd` path before any native mutation.
 """
+import json
 import re
 
 from briefing import PREFIX as CHECKPOINT_PREFIX
@@ -191,6 +192,14 @@ CAPABILITY_ENTRY_PREFIX = 'Kind: capability-entry-v1\n'
 CAPABILITY_ACCEPTANCE_PREFIX = 'Kind: capability-acceptance-v1\n'
 CAPABILITY_VERIFICATION_PREFIX = 'Kind: capability-verification-v1\n'
 CAPABILITY_ALIAS_PREFIX = 'Kind: capability-alias-v1\n'
+# kittrial-5bb.126, slice 0 of docs/OPEN_ITEMS_DECISIONS_DESIGN.md (open items, owner
+# questions and coordinator decisions). Names only: no writer and no reader exists yet.
+# The four prefixes are reserved before any record can be written, so a rollback to
+# this kit can never let a raw path plant one (design 11.2).
+OPEN_ITEM_PREFIX = 'Kind: open-item-v1\n'
+ITEM_RESOLUTION_PREFIX = 'Kind: item-resolution-v1\n'
+OWNER_ANSWER_PREFIX = 'Kind: owner-answer-v1\n'
+COORDINATOR_DECISION_PREFIX = 'Kind: coordinator-decision-v1\n'
 
 RESERVED = (
     (REVIEW_PREFIX, 'contribution/review record', 'review TASK --file payload.json'),
@@ -213,11 +222,16 @@ RESERVED = (
     (CAPABILITY_ACCEPTANCE_PREFIX, 'capability acceptance evidence', 'admin.py capability-apply'),
     (CAPABILITY_VERIFICATION_PREFIX, 'capability verification', 'capability check --record (capability verify)'),
     (CAPABILITY_ALIAS_PREFIX, 'capability alias', 'capability propose-alias|alias-reject'),
+    (OPEN_ITEM_PREFIX, 'open item', 'items add|revise|block|unblock|resolve|reopen or questions ask'),
+    (ITEM_RESOLUTION_PREFIX, 'open item resolution', 'items resolve|reopen or questions answer'),
+    (OWNER_ANSWER_PREFIX, 'owner answer', 'questions answer on the coordination host or in the web interface'),
+    (COORDINATOR_DECISION_PREFIX, 'coordinator decision',
+     'decisions record on the coordination host or in the web interface'),
 )
 
 PREFIXES = tuple(prefix for prefix, _, _ in RESERVED)
 
-# Every version of the nine record kinds is reserved, not only v1 (kittrial-5bb.64
+# Every version of the record kinds is reserved, not only v1 (kittrial-5bb.64
 # review item `smaller` b): otherwise a raw `Kind: capability-entry-v7` would be
 # writable and then hidden. A later writer of vN ships its own tolerant-reader step.
 _RECORD_KIND_RESERVATIONS = {
@@ -231,6 +245,11 @@ _RECORD_KIND_RESERVATIONS = {
     'capability-verification': ('capability verification', 'capability check --record (capability verify)'),
     'capability-alias': ('capability alias', 'capability propose-alias|alias-reject'),
     'review-recommendation': ('review recommendation', 'review TASK --file payload.json (operation recommend)'),
+    'open-item': ('open item', 'items add|revise|block|unblock|resolve|reopen or questions ask'),
+    'item-resolution': ('open item resolution', 'items resolve|reopen or questions answer'),
+    'owner-answer': ('owner answer', 'questions answer on the coordination host or in the web interface'),
+    'coordinator-decision': ('coordinator decision',
+                             'decisions record on the coordination host or in the web interface'),
 }
 _RECORD_KIND_ANY_VERSION = re.compile(
     r'Kind: (%s)-v[0-9]+\n' % '|'.join(re.escape(kind) for kind in _RECORD_KIND_RESERVATIONS))
@@ -719,10 +738,19 @@ def raw_file_flag_in_args(args):
 # a real record anchor - a row that also carries a v1 record comment of the same
 # family (see is_record_anchor) - where endpoint._guard_reserved_labels refuses
 # replacing or removing its labels.
+# kittrial-5bb.126 adds `open-item:`, the item anchor's state labels (open items design
+# 5); the family label `open-item` itself is exact and not value-reserved, for the
+# reason above. `admin.py open-item-label-check` lists the projects already using
+# either before a later slice turns writes on.
 RESERVED_LABEL_PREFIXES = ('request:', 'request-content:', 'requirement:',
                            'reference:', 'reference-key:', 'proposal:', 'proposal-key:',
-                           'capability:', 'capability-key:')
-RESERVED_EXACT_LABELS = frozenset({'requirement', 'brd-section'})
+                           'capability:', 'capability-key:', 'open-item:')
+# `gt:slot` marks a project's merge slot (coordination.MERGE_SLOT_LABEL). One
+# `--remove-label gt:slot` by a contributor put the slot back among claimable work
+# and a claim then jammed it (kittrial-5bb.113 review), so no contributor adds,
+# removes or replaces it on any row.
+MERGE_SLOT_LABEL = 'gt:slot'
+RESERVED_EXACT_LABELS = frozenset({'requirement', 'brd-section', MERGE_SLOT_LABEL})
 # Every label-writing spelling accepted by the pinned bd 1.2.2, verified by
 # driving the binary (`bd create --help` / `bd update --help` plus a behaviour
 # probe of each candidate). `create` accepts the UNDOCUMENTED `--label` alias of
@@ -839,11 +867,15 @@ RECORD_ANCHOR_FAMILIES = {
     'contribution-settings': (CONTRIBUTION_SETTINGS_PREFIX,),
     'capability': (CAPABILITY_ENTRY_PREFIX, CAPABILITY_ACCEPTANCE_PREFIX,
                    CAPABILITY_VERIFICATION_PREFIX, CAPABILITY_ALIAS_PREFIX),
+    # kittrial-5bb.126. There is deliberately no family for coordinator-decision: its
+    # native decision issue is a real work item and stays visible; only the comment hides.
+    'open-item': (OPEN_ITEM_PREFIX, ITEM_RESOLUTION_PREFIX, OWNER_ANSWER_PREFIX),
 }
 RECORD_ANCHOR_LABELS = frozenset(RECORD_ANCHOR_FAMILIES)
 RECORD_COMMENT_FAMILIES = ('Kind: reference-', 'Kind: requirement-proposal-',
                            'Kind: proposal-disposition-', 'Kind: contribution-settings-',
-                           'Kind: capability-')
+                           'Kind: capability-', 'Kind: open-item-', 'Kind: item-resolution-',
+                           'Kind: owner-answer-', 'Kind: coordinator-decision-')
 _RECORD_KIND = re.compile(r'Kind: ([a-z][a-z-]*?)-v([1-9][0-9]{0,5})\n')
 # Versions after 1 that this kit reads, as (kind, version).
 SUPPORTED_LATER_VERSIONS = frozenset({('reference-entry', 2), ('reference-entry', 3)})
@@ -877,6 +909,9 @@ def is_record_anchor(row):
     """
     if not isinstance(row, dict):
         return False
+    if row.get('malformed'):
+        import record_json
+        return record_json.selected(row, RECORD_ANCHOR_LABELS)
     labels = row.get('labels')
     comments = row.get('comments')
     if not isinstance(labels, (list, tuple)) or not isinstance(comments, list):
@@ -894,7 +929,9 @@ def is_record_anchor(row):
 
 
 def is_record_comment(text):
-    """True for a reference/proposal/settings/capability record comment, any version.
+    """True for a reference/proposal/settings/capability record comment, any version, and
+    (kittrial-5bb.126) for an open-item, item-resolution, owner-answer or
+    coordinator-decision record comment, which no kit writes yet.
 
     The view drops a leading BOM and folds CRLF, as the reserved-prefix guard
     does, so a lookalike is hidden too.
@@ -908,7 +945,7 @@ def is_record_comment(text):
 def record_comment_kind(text):
     """(kind, version, state) for a record comment, else None.
 
-    `state` is `supported` for a v1 record of one of the nine designed kinds, and for
+    `state` is `supported` for a v1 record of one of the designed kinds, and for
     the later versions in SUPPORTED_LATER_VERSIONS (reference-entry-v2, kittrial-5bb.98, and
     reference-entry-v3, kittrial-5bb.104),
     and `unsupported` for anything else (an unknown version or kind), so a later slice's
@@ -1306,6 +1343,519 @@ def status_change_targets(args):
         return (command, None)
     targets = [token for token in operands if not token.startswith('@attachment:')]
     return (command, targets or None)
+
+
+def title_change_targets(args):
+    """The ids an `update` that changes a title names, for the record-anchor guard (kittrial-5bb.97).
+
+    ``None`` when the invocation is not an `update` with `--title` (bd 1.2.2 has no short
+    flag for it). Otherwise the positional ids; or the string ``'unnamed'`` when the scan
+    is ambiguous (an unknown flag) or names no row: bd would then act on the row it touched
+    last, which the guard cannot check, so the caller fails closed.
+    """
+    if not isinstance(args, list) or not args or args[0] != 'update':
+        return None
+    flags, operands, unknown = _bd_scan(args, 'update')
+    if not any(name == '--title' for name, _ in flags):
+        return None
+    targets = [token for token in operands if not token.startswith('@attachment:')]
+    return 'unnamed' if unknown or not targets else targets
+
+
+# ---------------------------------------------------------------------------
+# The rows a contributor write names (kittrial-5bb.113, reviews 01a109cc and 01a10c0b).
+#
+# A bd write reaches rows in more ways than an id on the command line: with no id it
+# acts on the row bd touched last; `close --claim-next` claims a row bd chooses;
+# `create --id` replaces the row that has that id; `dep add --file` takes ids from a
+# file; and bd resolves an id from any substring of the part after the project
+# prefix (`slot`, `e-s` and the single character `-` all reach `P-merge-slot`).
+# Guessing which token could reach which row failed twice, so nothing is guessed:
+# `write_targets` says, for every command a contributor may run, exactly which
+# tokens name rows, and refuses the forms whose rows are not named at all. The
+# endpoint then resolves every named token through bd before the write.
+#
+#   command            rows it writes                                   how they are named
+#   create             a new row; the row with the same id if --id      --id (must not exist); --parent,
+#                      names one that exists (bd replaces it)           --deps, --waits-for
+#   create -f/--file,  rows described in a file                         not named: refused
+#     --graph
+#   update             each positional id; --parent                     positional ids; none: refused
+#                                                                       (bd would use the last touched row)
+#   close              each positional id                               positional ids; none: refused
+#   close --claim-next the next ready row, chosen by bd                 not named: refused
+#   close --continue   the next step of a molecule, chosen by bd        not named: refused
+#   reopen             each positional id                               positional ids; none: refused
+#   comments add       the first positional                             that operand; none: refused
+#   dep add/remove/    both ends                                        positional ids, --blocked-by,
+#     relate/unrelate                                                   --depends-on
+#   dep ID --blocks    both ends                                        the positional id and -b/--blocks
+#   dep add --file     the ends of every edge in the file               from/to/issue_id/depends_on_id of
+#                                                                       each line; unreadable: refused
+#   list, show, ready, search, count, state, lint, comments ID,
+#   dep list/tree/cycles                                                reads: READ_FLAGS decides; a read flag
+#                                                                       that claims a row is refused
+#
+# `external:PROJECT:CAPABILITY` in a dependency is not a row and is not resolved.
+# ---------------------------------------------------------------------------
+#: Every flag of every WRITING bd 1.2.2 command a contributor may run, and how it bears on rows:
+#:   'row'     its value names existing rows; they are resolved before the write
+#:   'new'     the explicit id of a new row; it must not exist
+#:   'chosen'  bd chooses the row it writes: refused
+#:   'file'    rows come from a file: refused, except `dep add --file`, whose edges are read
+#:   'label'   a label write; the reserved-label guard decides
+#:   'plain'   names no row
+#: Taken from `bd COMMAND --help` of the pinned binary plus the hidden `create --label`.
+#: tests/test_bd_write_flags.py compares it with the help of a real bd when one is
+#: available, so a new bd version's flags are noticed before they are trusted.
+WRITE_FLAGS = {
+    'create': {
+        '--acceptance': 'plain', '--append-notes': 'plain', '--assignee': 'plain', '--body-file': 'plain',
+        '--context': 'plain', '--defer': 'plain', '--deps': 'row', '--description': 'plain', '--design': 'plain',
+        '--design-file': 'plain', '--dry-run': 'plain', '--due': 'plain', '--ephemeral': 'plain', '--estimate': 'plain',
+        '--event-actor': 'plain', '--event-category': 'plain', '--event-payload': 'plain', '--event-target': 'plain',
+        '--external-ref': 'plain', '--file': 'file', '--force': 'plain', '--graph': 'file', '--id': 'new',
+        '--label': 'label', '--labels': 'label', '--metadata': 'plain', '--mol-type': 'plain', '--no-history': 'plain',
+        '--no-inherit-labels': 'plain', '--notes': 'plain', '--parent': 'row', '--priority': 'plain', '--repo': 'plain',
+        '--silent': 'plain', '--skills': 'plain', '--spec-id': 'plain', '--stdin': 'plain', '--title': 'plain',
+        '--type': 'plain', '--validate': 'plain', '--waits-for': 'row', '--waits-for-gate': 'plain', '--wisp-type': 'plain'},
+    'update': {
+        '--acceptance': 'plain', '--add-label': 'label', '--allow-empty-description': 'plain', '--append-notes': 'plain',
+        '--assignee': 'plain', '--await-id': 'plain', '--body-file': 'plain', '--claim': 'plain', '--defer': 'plain',
+        '--description': 'plain', '--design': 'plain', '--design-file': 'plain', '--due': 'plain', '--ephemeral': 'plain',
+        '--estimate': 'plain', '--external-ref': 'plain', '--history': 'plain', '--metadata': 'plain',
+        '--no-history': 'plain', '--notes': 'plain', '--parent': 'row', '--persistent': 'plain', '--priority': 'plain',
+        '--remove-label': 'label', '--session': 'plain', '--set-labels': 'label', '--set-metadata': 'plain',
+        '--spec-id': 'plain', '--status': 'plain', '--stdin': 'plain', '--title': 'plain', '--type': 'plain',
+        '--unset-metadata': 'plain'},
+    'close': {'--claim-next': 'chosen', '--continue': 'chosen', '--force': 'plain', '--no-auto': 'plain',
+              '--reason': 'plain', '--reason-file': 'plain', '--session': 'plain', '--suggest-next': 'plain'},
+    'reopen': {'--reason': 'plain'},
+    'comments add': {'--author': 'plain', '--file': 'plain'},
+    'dep': {'--blocks': 'row', '--no-cycle-check': 'plain'},
+    'dep add': {'--blocked-by': 'row', '--depends-on': 'row', '--file': 'file', '--no-cycle-check': 'plain',
+                '--type': 'plain'},
+    'dep remove': {}, 'dep relate': {}, 'dep unrelate': {},
+}
+#: Every flag of every READING bd 1.2.2 command a contributor may run, and how it bears on rows:
+#:   'plain'   the invocation only reads
+#:   'write'   the flag makes bd move a row it chooses: refused before any native write
+#:   'hold'    the flag makes bd wait and hold the whole project: refused before any native write
+#: The reviewer of kittrial-5bb.113 revision 3 ran `bd ready --claim` as a contributor and
+#: bd answered "Claimed issue: PROJECT-merge-slot": `ready` was on the read side of the table
+#: above, so nothing looked at its flags, and bd claimed the priority-0 slot by itself. Every
+#: read is now here, and every flag of every read is named, so a flag that makes a read write
+#: is either refused (this table) or noticed when the pinned bd changes (the help comparison
+#: in tests/test_bd_write_flags.py, which covers reads as well as writes).
+#: kittrial-5bb.138 added `list --watch` and `show ID --watch`: they never return until the
+#: endpoint's 120 second timeout and hold the whole project meanwhile (a measured 117 second
+#: wait for another actor on the same project), so they are classed 'hold' and refused like
+#: `ready --claim`. bd prints the short `-w`, which reaches the same pump and is refused
+#: through READ_SHORT_FLAGS.
+#: `comments TASK` uses the `comments` inventory (bd's shorthand for `comments list`).
+READ_FLAGS = {
+    'list': {
+        '--all': 'plain', '--assignee': 'plain', '--closed-after': 'plain', '--closed-before': 'plain',
+        '--created-after': 'plain', '--created-before': 'plain', '--defer-after': 'plain', '--defer-before': 'plain',
+        '--deferred': 'plain', '--desc-contains': 'plain', '--due-after': 'plain', '--due-before': 'plain',
+        '--empty-description': 'plain', '--exclude-label': 'plain', '--exclude-type': 'plain', '--flat': 'plain',
+        '--format': 'plain', '--has-metadata-key': 'plain', '--id': 'plain', '--include-gates': 'plain',
+        '--include-infra': 'plain', '--include-templates': 'plain', '--label': 'plain', '--label-any': 'plain',
+        '--label-pattern': 'plain', '--label-regex': 'plain', '--limit': 'plain', '--long': 'plain',
+        '--metadata-field': 'plain', '--mol-type': 'plain', '--no-assignee': 'plain', '--no-labels': 'plain',
+        '--no-pager': 'plain', '--no-parent': 'plain', '--no-pinned': 'plain', '--notes-contains': 'plain',
+        '--offset': 'plain', '--overdue': 'plain', '--parent': 'plain', '--pinned': 'plain', '--pretty': 'plain',
+        '--priority': 'plain', '--priority-max': 'plain', '--priority-min': 'plain', '--ready': 'plain',
+        '--reverse': 'plain', '--skip-labels': 'plain', '--sort': 'plain', '--spec': 'plain', '--status': 'plain',
+        '--title': 'plain', '--title-contains': 'plain', '--tree': 'plain', '--type': 'plain',
+        '--updated-after': 'plain', '--updated-before': 'plain', '--watch': 'hold', '--wisp-type': 'plain',
+    },
+    'show': {
+        '--as-of': 'plain', '--children': 'plain', '--current': 'plain', '--id': 'plain',
+        '--include-comments': 'plain', '--include-dependents': 'plain', '--local-time': 'plain', '--long': 'plain',
+        '--refs': 'plain', '--short': 'plain', '--thread': 'plain', '--watch': 'hold',
+    },
+    'ready': {
+        '--assignee': 'plain', '--claim': 'write', '--exclude-label': 'plain', '--exclude-type': 'plain',
+        '--explain': 'plain', '--gated': 'plain', '--has-metadata-key': 'plain', '--include-deferred': 'plain',
+        '--include-ephemeral': 'plain', '--label': 'plain', '--label-any': 'plain', '--limit': 'plain',
+        '--metadata-field': 'plain', '--mol': 'plain', '--mol-type': 'plain', '--offset': 'plain',
+        '--parent': 'plain', '--plain': 'plain', '--pretty': 'plain', '--priority': 'plain', '--sort': 'plain',
+        '--type': 'plain', '--unassigned': 'plain',
+    },
+    'search': {
+        '--assignee': 'plain', '--closed-after': 'plain', '--closed-before': 'plain', '--created-after': 'plain',
+        '--created-before': 'plain', '--desc-contains': 'plain', '--empty-description': 'plain',
+        '--external-contains': 'plain', '--has-metadata-key': 'plain', '--label': 'plain', '--label-any': 'plain',
+        '--limit': 'plain', '--long': 'plain', '--metadata-field': 'plain', '--no-assignee': 'plain',
+        '--no-labels': 'plain', '--notes-contains': 'plain', '--priority-max': 'plain', '--priority-min': 'plain',
+        '--query': 'plain', '--reverse': 'plain', '--sort': 'plain', '--status': 'plain', '--type': 'plain',
+        '--updated-after': 'plain', '--updated-before': 'plain',
+    },
+    'count': {
+        '--assignee': 'plain', '--by-assignee': 'plain', '--by-label': 'plain', '--by-priority': 'plain',
+        '--by-status': 'plain', '--by-type': 'plain', '--closed-after': 'plain', '--closed-before': 'plain',
+        '--created-after': 'plain', '--created-before': 'plain', '--desc-contains': 'plain',
+        '--empty-description': 'plain', '--id': 'plain', '--include-infra': 'plain', '--label': 'plain',
+        '--label-any': 'plain', '--no-assignee': 'plain', '--no-labels': 'plain', '--notes-contains': 'plain',
+        '--priority': 'plain', '--priority-max': 'plain', '--priority-min': 'plain', '--status': 'plain',
+        '--title': 'plain', '--title-contains': 'plain', '--type': 'plain', '--updated-after': 'plain',
+        '--updated-before': 'plain',
+    },
+    'state': {},
+    'lint': {
+        '--status': 'plain', '--type': 'plain',
+    },
+    'comments': {
+        '--local-time': 'plain',
+    },
+    'comments list': {},
+    'dep': {
+        '--blocks': 'plain', '--no-cycle-check': 'plain',
+    },
+    'dep list': {
+        '--direction': 'plain', '--type': 'plain',
+    },
+    'dep tree': {
+        '--direction': 'plain', '--format': 'plain', '--max-depth': 'plain', '--reverse': 'plain',
+        '--show-all-paths': 'plain', '--status': 'plain',
+    },
+    'dep cycles': {},
+}
+#: The read flags that take a value, so the read scan consumes the value instead of reading
+#: it as a flag (`bd ready -a --claim` names the actor `--claim`; it does not claim).
+#: From `bd COMMAND --help` of the pinned bd, which prints a type after a value flag.
+READ_VALUE_FLAGS = {
+    'list': frozenset(['--assignee', '--closed-after', '--closed-before', '--created-after', '--created-before',
+                       '--defer-after', '--defer-before', '--desc-contains', '--due-after', '--due-before',
+                       '--exclude-label', '--exclude-type', '--format', '--has-metadata-key', '--id', '--label',
+                       '--label-any', '--label-pattern', '--label-regex', '--limit', '--metadata-field', '--mol-type',
+                       '--notes-contains', '--offset', '--parent', '--priority', '--priority-max', '--priority-min',
+                       '--sort', '--spec', '--status', '--title', '--title-contains', '--type', '--updated-after',
+                       '--updated-before', '--wisp-type']),
+    'show': frozenset(['--as-of', '--id']),
+    'ready': frozenset(['--assignee', '--exclude-label', '--exclude-type', '--has-metadata-key', '--label',
+                        '--label-any', '--limit', '--metadata-field', '--mol', '--mol-type', '--offset', '--parent',
+                        '--priority', '--sort', '--type']),
+    'search': frozenset(['--assignee', '--closed-after', '--closed-before', '--created-after', '--created-before',
+                         '--desc-contains', '--external-contains', '--has-metadata-key', '--label', '--label-any',
+                         '--limit', '--metadata-field', '--notes-contains', '--priority-max', '--priority-min',
+                         '--query', '--sort', '--status', '--type', '--updated-after', '--updated-before']),
+    'count': frozenset(['--assignee', '--closed-after', '--closed-before', '--created-after', '--created-before',
+                        '--desc-contains', '--id', '--label', '--label-any', '--notes-contains', '--priority',
+                        '--priority-max', '--priority-min', '--status', '--title', '--title-contains', '--type',
+                        '--updated-after', '--updated-before']),
+    'state': frozenset(),
+    'lint': frozenset(['--status', '--type']),
+    'comments': frozenset(),
+    'comments list': frozenset(),
+    'dep': frozenset(['--blocks']),
+    'dep list': frozenset(['--direction', '--type']),
+    'dep tree': frozenset(['--direction', '--format', '--max-depth', '--status']),
+    'dep cycles': frozenset(),
+}
+#: The short spellings of READ_FLAGS entries whose class is not 'plain'. bd 1.2.2 prints
+#: `-w, --watch` for `list` and `show`; the short spelling reaches the same pump, so it is
+#: refused with the long one (kittrial-5bb.138). The guarded spelling may sit anywhere in a
+#: short cluster before the first value-taking letter (`-qw`, `-vw`), which `_read_writes`
+#: scans letter by letter. A short flag's value is not resolved, so this can only refuse
+#: more, never less.
+READ_SHORT_FLAGS = {
+    'list': {'-w': '--watch'},
+    'show': {'-w': '--watch'},
+}
+MERGE_SLOT_SUFFIX = '-merge-slot'
+#: A project name holds no hyphen (admin.validate_name), so the slot's id has this exact shape.
+MERGE_SLOT_ID = re.compile(r'[a-z][a-z0-9]{1,23}-merge-slot')
+#: Flags whose value is, or holds, an issue id on create/update.
+_ID_VALUE_FLAGS = ('--parent', '--deps', '--waits-for')
+_DEP_READS = ('list', 'tree', 'cycles')
+_DEP_VALUE_FLAGS = {'--blocks': True, '--blocked-by': True, '--depends-on': True, '--type': False, '--file': None}
+_DEP_BOOL_FLAGS = {'--no-cycle-check', '--help'}
+_EDGE_FIELDS = ('from', 'to', 'issue_id', 'depends_on_id')
+EDGE_LINES_MAX = 1000
+
+
+def is_merge_slot_id(value):
+    """Whether ``value`` is the id bd gives a project's merge slot: exactly ``PROJECT-merge-slot``."""
+    return isinstance(value, str) and MERGE_SLOT_ID.fullmatch(value) is not None
+
+
+def _id_pieces(value):
+    """The ids in a flag value such as ``blocks:a,b`` (a list, each perhaps ``type:id``)."""
+    pieces = []
+    for part in str(value).split(','):
+        part = part.strip()
+        if part.startswith('external:'):
+            continue
+        # An id holds no colon: in `blocks:pp-1` the id is what follows it.
+        pieces.append(part.rpartition(':')[2].strip())
+    return pieces
+
+
+def _true_flag(flags, name):
+    """Whether a boolean flag is on: pflag takes the last occurrence; an unparseable value counts."""
+    on = False
+    for flag, value in flags:
+        if flag == name:
+            parsed = _parse_go_bool(value)
+            on = True if parsed is None else parsed
+    return on
+
+
+def _edge_ids(text):
+    """The ids named by a ``dep add --file`` JSONL body, or raise ValueError."""
+    import record_json
+    lines = [line for line in str(text).splitlines() if line.strip()]
+    if len(lines) > EDGE_LINES_MAX:
+        raise ValueError('more than %d edges' % EDGE_LINES_MAX)
+    found = []
+    for number, line in enumerate(lines, 1):
+        edge = record_json.loads(line)
+        if not isinstance(edge, dict):
+            raise ValueError('line %d is not an object' % number)
+        ends = [edge[field] for field in _EDGE_FIELDS if field in edge]
+        if len(ends) < 2 or any(not isinstance(end, str) or not end.strip() for end in ends):
+            raise ValueError('line %d does not name both ends as text' % number)
+        found += [piece for end in ends for piece in _id_pieces(end)]
+    return found
+
+
+def _dep_targets(args, attachments):
+    """(targets, refusal) of a writing ``bd dep`` invocation."""
+    targets, index, tokens = [], 1, args
+    subcommand_seen = False
+    while index < len(tokens):
+        token = tokens[index]
+        index += 1
+        if not isinstance(token, str):
+            return [], 'an argument is not text'
+        if token.startswith('@attachment:'):
+            item = (attachments or {}).get(token.partition(':')[2])
+            if not isinstance(item, dict) or item.get('flag') != '--file' or not isinstance(item.get('text'), str):
+                return [], 'a file given to `dep` must be the --file list of edges'
+            try:
+                targets += _edge_ids(item['text'])
+            except ValueError as error:
+                return [], 'the --file list of edges could not be read (%s), so its tasks are not named' % error
+            continue
+        if token == '--':
+            targets += [piece for rest in tokens[index:] if isinstance(rest, str) for piece in _id_pieces(rest)]
+            break
+        if len(token) > 1 and token.startswith('--'):
+            name, joined, value = token.partition('=')
+            if name in _DEP_VALUE_FLAGS:
+                if not joined:
+                    value = tokens[index] if index < len(tokens) and isinstance(tokens[index], str) else ''
+                    index += 1
+                if _DEP_VALUE_FLAGS[name] is None:
+                    return [], 'a raw --file path is not accepted; send the list of edges as an attachment'
+                if _DEP_VALUE_FLAGS[name]:
+                    targets += _id_pieces(value)
+            elif name in _DEP_BOOL_FLAGS or name in BD_GLOBAL_BOOL_FLAGS:
+                pass
+            elif name in BD_GLOBAL_VALUE_FLAGS:
+                index += 0 if joined else 1
+            else:
+                return [], 'the flag %s is not one this interface can resolve to tasks' % shown_token(name)
+            continue
+        if len(token) > 1 and token.startswith('-'):
+            # `-b ID`, `-bID`, `-b=ID` (the parent form's --blocks) and `-t TYPE`; nothing else names a row.
+            letter, rest = token[1], token[2:].lstrip('=')
+            if letter == 'b':
+                if not rest:
+                    rest = tokens[index] if index < len(tokens) and isinstance(tokens[index], str) else ''
+                    index += 1
+                targets += _id_pieces(rest)
+            elif letter == 't':
+                index += 0 if rest else 1
+            elif token not in ('-h', '-q', '-v'):
+                return [], 'the flag %s is not one this interface can resolve to tasks' % shown_token(token)
+            continue
+        if not subcommand_seen and token in BD_DEP_SUBCOMMAND_ALIASES:
+            subcommand_seen = True
+            continue
+        subcommand_seen = True
+        targets += _id_pieces(token)
+    return targets, None
+
+
+def shown_token(token):
+    """A caller-written token for a refusal: bounded, and quoted when it is not a plain word."""
+    text = str(token)[:60]
+    return text if re.fullmatch(r'[A-Za-z0-9_.:=-]+', text) else json.dumps(text, ensure_ascii=True)
+
+
+def read_invocation_label(args):
+    """The READ_FLAGS key of a READ invocation, or None when this is not one of those reads.
+
+    ``comments TASK`` (bd's shorthand for ``comments list``) is a read of the bare
+    ``comments`` inventory; ``comments add`` is a write and answers None, as does every
+    command whose writes are resolved by name (create/update/close/reopen/dep forms).
+    """
+    if not isinstance(args, list) or not args or not isinstance(args[0], str):
+        return None
+    command = args[0]
+    if command == 'comments':
+        parts = _comments_parts(args)
+        if parts is None or parts[0] == 'add':
+            return None
+        return 'comments list' if parts[0] == 'list' else 'comments'
+    if command == 'dep':
+        subcommand = _dep_subcommand(args)
+        return 'dep %s' % subcommand if subcommand in _DEP_READS else None
+    return command if command in READ_FLAGS else None
+
+
+def _read_flag_refusal(label, flag, value, joined):
+    """The sentence refusing a READ flag whose class is not 'plain', or None.
+
+    ``bd ready --claim`` "atomically claim[s] the first ready issue" (bd 1.2.2 ``ready
+    --help``) -- that is the row bd chooses, and on a real project the first ready issue
+    is the priority-0 merge slot the reviewer saw claimed (kittrial-5bb.113 review).
+    ``bd list --watch`` and ``bd show ID --watch`` "Watch for changes and auto-refresh
+    display": they never return until the endpoint's 120 second timeout and hold the whole
+    project meanwhile (a real measurement saw another actor's work wait 117 seconds;
+    kittrial-5bb.138). Both classes are refused before bd is started. A joined value bd
+    parses as false leaves the flag off, so it stays a read, exactly as for ``--claim``.
+    """
+    kind = READ_FLAGS[label].get(flag)
+    if kind not in ('write', 'hold'):
+        return None
+    parsed = _parse_go_bool(value) if joined else True
+    if parsed is not None and not parsed:
+        return None
+    if kind == 'write':
+        return ('%s lets bd choose the row it writes, which is not named in this request; '
+                'read the rows, then name the one you mean' % shown_token(flag))
+    return ('%s waits for changes and does not return until this endpoint times out, holding the '
+            'whole project while it waits; read the rows once instead' % shown_token(flag))
+
+
+def _read_writes(args, label):
+    """The sentence refusing a READ invoked with a write-shaped or holding flag, or None.
+
+    The value of a value-taking read flag is consumed, so ``ready -a --claim`` names the
+    actor ``--claim`` and stays a read; a short flag's value is not resolved, which can
+    only refuse more, never less.
+
+    A short *cluster* is scanned letter by letter: bd's global booleans ``-q``/``-v`` may
+    precede a guarded ``-w``, so ``list -qw`` and ``show ID -qw`` are ``--watch`` and must
+    be refused (kittrial-5bb.138). Every letter is looked up in this label's guarded short
+    flags, and the scan stops at the first letter whose shorthand takes a value, because the
+    rest of that token is that value and not flags (``list -nw`` limits by the value ``w``).
+    A joined value belongs to the last letter of the cluster, exactly as for a lone ``-w``.
+    """
+    values = READ_VALUE_FLAGS[label]
+    guarded = READ_SHORT_FLAGS.get(label, {})
+    parts = label.split()
+    short_table = _short_flag_table(parts[0], parts[1] if len(parts) > 1 else None) or {}
+    index = len(parts)
+    while index < len(args):
+        token = args[index]
+        if not isinstance(token, str):
+            return 'an argument is not text'
+        if token == '--':
+            return None
+        if token.startswith('--'):
+            name, joined, value = token.partition('=')
+            refusal = _read_flag_refusal(label, name, value, joined)
+            if refusal is not None:
+                return refusal
+            if name in values and not joined:
+                index += 1
+        elif len(token) > 1 and token.startswith('-'):
+            # A short spelling of a classified read flag (`-w` is --watch on list and show),
+            # alone or anywhere in a cluster before the first value-taking letter.
+            body = token[1:]
+            cut = body.find('=')
+            letters = body if cut == -1 else body[:cut]
+            value = '' if cut == -1 else body[cut + 1:]
+            for position, letter in enumerate(letters):
+                name = guarded.get('-'+letter)
+                if name is not None:
+                    joined = cut != -1 and position == len(letters) - 1
+                    refusal = _read_flag_refusal(label, name, value if joined else '', joined)
+                    if refusal is not None:
+                        return refusal
+                if short_table.get(letter) == 'value':
+                    break
+        index += 1
+    return None
+
+
+def write_targets(args, attachments=None):
+    """What a bd invocation writes, or None for a read (the table above).
+
+    ``{'command': label, 'targets': [token, ...], 'new_id': id or None, 'refusal':
+    sentence or None}``. ``targets`` are the tokens that name existing rows, in order,
+    without duplicates; ``new_id`` is the explicit id of a ``create``. ``refusal`` is set
+    when the write reaches rows that are not named, or cannot be read reliably.
+    """
+    if not isinstance(args, list) or not args or not isinstance(args[0], str):
+        return None
+    command = args[0]
+    read = read_invocation_label(args)
+    if read is not None:
+        refusal = _read_writes(args, read)
+        return None if refusal is None else {'command': read, 'targets': [], 'new_id': None,
+                                             'refusal': refusal}
+    label, targets, new_id, refusal = command, [], None, None
+    if command in ('create', 'update', 'close', 'reopen'):
+        flags, operands, unknown = _bd_scan(args, command)
+        operands = [token for token in operands if not token.startswith('@attachment:')]
+        files = [token for token in args[1:] if isinstance(token, str) and token.startswith('@attachment:')]
+        if unknown:
+            refusal = 'the flag %s is not one this interface can resolve to tasks' % shown_token(unknown[0])
+        for name, value in flags:
+            if name in _ID_VALUE_FLAGS and isinstance(value, str) and value.strip():
+                targets += _id_pieces(value)
+        if command == 'create':
+            ids = [value for name, value in flags if name == '--id']
+            if len(ids) > 1 or (ids and not isinstance(ids[0], str)):
+                refusal = refusal or 'give --id once'
+            elif ids:
+                new_id = ids[0]
+            named = {name for name, _ in flags}
+            batch = named & {'--file', '-f', '--graph'} or any(
+                (attachments or {}).get(token.partition(':')[2], {}).get('flag') in ('--file', '-f') for token in files)
+            if batch:
+                refusal = refusal or ('creating several tasks from a file names no task here; create them one by one')
+        else:
+            targets = operands + targets
+            if not operands:
+                refusal = refusal or ('name the task: with no id bd acts on the task it touched last, which is not '
+                                      'named in this request')
+            if command == 'close':
+                for flag in ('--claim-next', '--continue'):
+                    if _true_flag(flags, flag):
+                        refusal = refusal or ('%s lets bd choose the next task, which is not named in this request; '
+                                              'close the task, then claim the next one by its id' % flag)
+    elif command == 'comments':
+        parts = _comments_parts(args)
+        if parts is None or parts[0] != 'add':
+            return None
+        label = 'comments add'
+        target = comment_target(args)
+        if target is None:
+            refusal = 'name the task the comment is for'
+        else:
+            targets.append(target)
+    elif command == 'dep':
+        subcommand = _dep_subcommand(args)
+        if subcommand in _DEP_READS:
+            return None
+        label = 'dep %s' % subcommand if subcommand else 'dep'
+        targets, refusal = _dep_targets(args, attachments)
+        if refusal is None and not targets:
+            return None                      # `bd dep` alone prints its help
+    else:
+        return None
+    ordered = []
+    for token in targets:
+        if token not in ordered:
+            ordered.append(token)
+    return {'command': label, 'targets': ordered, 'new_id': new_id, 'refusal': refusal}
 
 
 # Machine records are canonical UTF-8 with `\n` line endings. A client that

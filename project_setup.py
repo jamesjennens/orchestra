@@ -23,20 +23,51 @@ REMAINING = ('todo',)
 WHO = {'owner': 'A project owner', 'member': 'Any member who may write tasks',
        'each-member': 'Each member, for their own agent',
        'operator': 'An operator, on the server that runs Orchestra'}
-OPERATOR_NOTE = ('The web interface cannot do this step. It is done on the server, by an operator, with the command '
-                 'shown. If you are also the operator, run it there; otherwise send the command to whoever is.')
+OPERATOR_NOTE = ('The web interface cannot do this step. It is done on the server, by an operator. If you are also '
+                 'the operator, do it there with what is shown; otherwise send it to whoever is.')
+#: What an entry of a step's ``commands`` is: ``shell`` can be pasted into a shell on the server as it
+#: stands; ``shell-fill`` is a shell command with words to replace first, which the entry names;
+#: ``unit-line`` is a line of a systemd unit file and NOT a command (kittrial-5bb.200: the page showed one
+#: as "the command" and it answered Permission denied).
+KINDS = ('shell', 'shell-fill', 'unit-line')
 
 
-def is_merge_slot(row, project_id):
-    """The project's merge slot row: an internal record, not a task (see kittrial-5bb.113)."""
-    return isinstance(row, dict) and (row.get('id') == '%s-merge-slot' % project_id
-                                      or 'gt:slot' in (row.get('labels') or []))
+def entry(kind, label, text, note=None, replace=()):
+    return {'kind': kind, 'label': label, 'text': text, 'note': note, 'replace': list(replace)}
+
+
+def fill(status, label, words, note, replace):
+    """A host command with words to replace: the host's own beginning of a command (interpreter,
+    admin.py, --root) and then ``words``. An endpoint older than that answer, or no host at all,
+    cannot say how its commands begin; the entry then names those words as words to replace too."""
+    prefix = status.get('admin') if isinstance(status, dict) else None
+    if isinstance(prefix, str) and prefix.strip():
+        return entry('shell-fill', label, prefix + ' ' + words, note, replace)
+    return entry('shell-fill', label, 'PYTHON KIT/admin.py --root RUNTIME_ROOT ' + words,
+                 note + ' This server did not say how its commands begin: PYTHON is the interpreter the kit runs '
+                        'under, KIT the installed kit and RUNTIME_ROOT the runtime.',
+                 ('PYTHON', 'KIT', 'RUNTIME_ROOT') + tuple(replace))
+
+
+def is_merge_slot(row, project_id=None):
+    """The project's merge slot row: an internal record, not a task.
+
+    One rule for the whole kit (``coordination.is_merge_slot``, kittrial-5bb.113). The
+    web service's task list no longer carries the slot at all; this stays so that a
+    backend that still returned it would not count it as a first task.
+    """
+    from coordination import is_merge_slot as shared
+    return shared(row)
 
 
 def step(identifier, title, state, detail, who, **where):
     result = {'id': identifier, 'title': title, 'state': state, 'detail': detail, 'who': who,
-              'who_text': WHO[who], 'link': None, 'command': None, 'note': None}
+              'who_text': WHO[who], 'link': None, 'command': None, 'commands': [], 'note': None}
     result.update(where)
+    # ``command`` stays for a page older than this service: the first thing that can be pasted.
+    commands = result['commands'] = list(result.get('commands') or [])
+    if commands and result.get('command') is None:
+        result['command'] = commands[0]['text']
     return result
 
 
@@ -54,18 +85,18 @@ def host_status(backend, project_id):
     return (status, None) if isinstance(status, dict) else (None, 'unknown')
 
 
-def host_step(identifier, title, status, reason, done, detail, command, when_missing):
+def host_step(identifier, title, status, reason, done, detail, commands, when_missing):
     """One operator step from the host status block ``status[identifier]``."""
     if status is None:
         text = {'not-applicable': 'This server has no host project behind it, so there is nothing to set.',
                 'unavailable': 'Not available on this server: it runs a version that cannot report this step. '
                                'Ask an operator whether it is done.',
                 'unknown': 'The server could not be asked just now. Reload the page to try again.'}[reason]
-        return step(identifier, title, reason, text, 'operator', command=command, note=OPERATOR_NOTE)
+        return step(identifier, title, reason, text, 'operator', commands=commands, note=OPERATOR_NOTE)
     block = status.get(identifier) if isinstance(status.get(identifier), dict) else {}
     state, text = done(block)
     return step(identifier, title, state, text or (detail if state == 'done' else when_missing), 'operator',
-                command=None if state == 'done' else command, note=None if state == 'done' else OPERATOR_NOTE)
+                commands=[] if state == 'done' else commands, note=None if state == 'done' else OPERATOR_NOTE)
 
 
 def steps(handler, principal, project_id):
@@ -85,10 +116,15 @@ def steps(handler, principal, project_id):
         note='An owner adds contributors and viewers. Only a superuser can make someone an owner.'))
 
     repository = project.get('repository')
+    # A value stored under an earlier rule that no longer passes is withheld by the
+    # project view (kittrial-5bb.123): the step is to do again, and says why.
+    stale = bool(project.get('repository_needs_attention'))
     result.append(step(
         'repository', 'Record where the project\'s repository is',
         'done' if repository else 'todo',
         ('Recorded: %s' % repository) if repository else
+        ('A location was recorded before the rule for this field changed, and it no longer fits. It is not shown '
+         'and not given to agents. Record the location again.') if stale else
         'Not recorded. An agent needs a clone of the repository with a remote it can push to; this tells it '
         'which repository that is.',
         'owner', link=base,
@@ -129,7 +165,10 @@ def steps(handler, principal, project_id):
                         'unreadable': ('todo', 'A guidance file is there but cannot be read as guidance, so '
                                                'workers are not given it. Setting clean text repairs it.')}
                        .get(block.get('state'), ('unknown', 'The server could not say whether guidance is set.'))),
-        'Set.', 'admin.py set-guidance %s --actor OPERATOR --file FILE' % name,
+        'Set.', [fill(status, 'Set the guidance (a shell command, on the server)',
+                      'set-guidance %s --actor OPERATOR --file FILE' % name,
+                      'Replace OPERATOR with your name on the operator list and FILE with the path of the text.',
+                      ('OPERATOR', 'FILE'))],
         'Not set. Guidance is the short standing instruction every worker and agent reads at the start of a run.'))
     result.append(host_step(
         'onboarding', 'Set the project\'s onboarding entry point', status, reason,
@@ -137,35 +176,79 @@ def steps(handler, principal, project_id):
                                                     if block.get('updated_at') else '')),
                         'not-set': ('todo', None)}
                        .get(block.get('state'), ('unknown', 'The server could not say whether onboarding is set.'))),
-        'Set.', 'admin.py set-onboarding %s --file FILE' % name,
+        'Set.', [fill(status, 'Set the onboarding text (a shell command, on the server)',
+                      'set-onboarding %s --file FILE' % name, 'Replace FILE with the path of the text.', ('FILE',))],
         'Not set. The onboarding entry point is what a new worker reads first about this project.'))
+    # An owner may set the onboarding text on this page (kittrial-5bb.118 part 2); an
+    # operator may still set it on the server. Guidance stays with the operator.
+    onboarding = result[-1]
+    if onboarding['state'] not in ('unavailable', 'not-applicable'):
+        onboarding.update(who='owner-or-operator',
+                          who_text='A project owner, on this page; or an operator, on the server.',
+                          link='/v1/projects/%s/onboarding' % project_id,
+                          note='Text an owner sets here is shown to workers as information written by a project '
+                               'owner. It is not the standing guidance, which only an operator sets.')
 
     def backup(block):
+        # Two different things, and the step says which is missing (kittrial-5bb.200: "todo" beside
+        # "the last backup run recorded this project complete" read as a contradiction): a backup that
+        # has been RUN, and a SCHEDULE that will run the next one.
         last = block.get('last_run') if isinstance(block.get('last_run'), dict) else None
-        ran = ''
         if last:
-            ran = ' The last backup run recorded this project %s%s%s.' % (
-                last.get('status'), ' on %s' % last['completed_at'][:10] if last.get('completed_at') else '',
-                ', degraded' if last.get('degraded') else '')
-        else:
-            ran = ' No backup run has recorded this project yet.'
+            when = ' on %s' % last['completed_at'][:10] if last.get('completed_at') else ''
+            run = 'A backup of this project was run%s and recorded it %s%s' % (
+                when, last.get('status'), ', degraded' if last.get('degraded') else '')
         scheduled = block.get('scheduled')
         if scheduled == 'covered':
-            return 'done', 'A scheduled backup on the server covers this project.' + ran
+            return 'done', ('A scheduled backup on the server covers this project. ' + (run + '.' if last else
+                            'It has not run yet: no backup run has recorded this project.'))
         if scheduled == 'not-covered':
-            return 'todo', ('No scheduled backup on the server covers this project. An operator adds the line '
-                            'shown to the backup schedule, or names this project in the existing one.' + ran)
+            looked = ('The step looks for a systemd unit of the service account (beads-*backup*.service) that backs '
+                      'up this runtime; a schedule kept anywhere else is not seen here.')
+            if last:
+                return 'todo', (run + ', but no schedule on the server covers it, so it will not be backed up again '
+                                'by itself. What is missing is the schedule. ' + looked)
+            return 'todo', ('No backup of this project has been run, and no schedule on the server covers it: both '
+                            'are missing. Run one now, then add the schedule. ' + looked)
+        ran = (' ' + run + '.') if last else ' No backup run has recorded this project yet.'
         if block.get('reason') == 'no-account-home':
             return 'unknown', ('The server could not check its backup schedule: the web service was started without '
                                'the account\'s home directory, so it cannot see the installed schedule. Ask an '
                                'operator to check on the server.' + ran)
         return 'unknown', 'The server could not read its backup schedule, so ask an operator.' + ran
-    line = (status or {}).get('backup', {}).get('line') if isinstance((status or {}).get('backup'), dict) else None
+    block = (status or {}).get('backup') if isinstance((status or {}).get('backup'), dict) else {}
+    line, run_now, check = (block.get(key) if isinstance(block.get(key), str) else None for key in ('line', 'run_now', 'check'))
+    where = block.get('unit_directory') if isinstance(block.get('unit_directory'), str) else None
+    commands = []
+    if run_now:
+        commands.append(entry('shell', 'Run a backup now (a shell command, on the server, as the service account)', run_now,
+                              'It backs up every project of this server once. It does not schedule anything.'))
+    commands.append(entry(
+        'unit-line', 'The line for a schedule (a line of a systemd unit file, not a shell command)',
+        line or 'ExecStart=PYTHON admin.py --root RUNTIME_ROOT backup --all',
+        'It goes in the [Service] section of a beads-*backup*.service unit%s, which a timer runs. To check, reload this '
+        'page: the step reads the installed units.%s' % (
+            ' in %s' % where if where else ' in the service account\'s systemd user directory',
+            ' On the server: systemctl --user list-timers, and the check below.' if check else '')))
+    if check:
+        commands.append(entry('shell', 'Check that every project has a complete backup (a shell command, on the server)', check))
     result.append(host_step('backup', 'Make sure a scheduled backup covers this project', status, reason, backup,
-                            None, line or 'admin.py backup --all (on a schedule)', None))
+                            None, commands, None))
 
+    if project.get('repository_warning'):
+        result[1]['warning'] = project['repository_warning']
     return {'project': {'id': project_id, 'name': project.get('name'), 'repository': repository},
             'steps': result,
             'remaining': sum(1 for item in result if item['state'] in REMAINING),
+            # Steps whose state the server could not read (kittrial-5bb.123): they are not
+            # "left to do" and they are not done, so the page says how many there are.
+            'unchecked': sum(1 for item in result if item['state'] == 'unknown'),
             'host': 'available' if status is not None else reason,
+            # The installation's review rules an owner should know of (kittrial-5bb.199). A setting of
+            # the web service, so it is the service that says it; the host is not asked.
+            'rules': {'approval_by_another_party': bool(getattr(service, 'approval_by_another_party', False))},
+            # How many project databases the server holds and its limit: for a superuser only,
+            # because it counts other people's projects (kittrial-5bb.118 part 2 revision).
+            'server': (status.get('project_databases') if isinstance(status, dict) and principal.superuser
+                       and isinstance(status.get('project_databases'), dict) else None),
             'generated_at': None}

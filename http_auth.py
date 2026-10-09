@@ -31,18 +31,21 @@ that.
 """
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import re
 import secrets
 import sqlite3
+import sys
 import threading
 import time
 from pathlib import Path
 
 from http_authority import (ALL_CAPABILITIES, CAP_ACCOUNTS_ADMIN, CAP_AGENTS, CAP_APPROVE,
                             CAP_CHECKPOINTS, CAP_FEEDBACK, CAP_PROJECT_ADMIN, CAP_PROPOSALS,
-                            CAP_PROJECT_CREATE, CAP_READ, CAP_REVIEWS, CAP_TASKS,
+                            CAP_PROJECT_CREATE, CAP_PROJECT_HOST_CREATE, CAP_READ, CAP_REVIEWS, CAP_TASKS,
+                            GRANT_LIMIT_DEFAULT, GRANT_LIMIT_MAX, created_projects, project_grant,
                             CREDENTIAL_FORBIDDEN_CAPABILITIES, CREDENTIAL_SCOPES, RANK,
                             ROLE_CAPABILITIES, ROLES, SCOPE_CAPABILITIES, SCHEMA_VERSION,
                             JOURNAL_MAX_SKEW_SECONDS, JOURNAL_SUSPECT_SETTLE_SECONDS,
@@ -93,6 +96,10 @@ AGENT_DIRECTORY_MAX = 512
 AGENT_PROJECTS_MAX = 64
 AGENT_MAX_PER_OWNER = 100
 AGENT_MAX_CREDENTIALS = 20
+#: How many credentials that no longer work (revoked or expired) are kept per agent, the newest
+#: ones, as the short history its card shows. Older ones are deleted from the state: the issue and
+#: the revocation of every credential stay in the audit log (kittrial-5bb.208).
+AGENT_DEAD_CREDENTIALS_KEPT = 5
 AGENT_DEFAULT_SCOPES = ('tasks', 'checkpoints', 'reviews', 'feedback')
 AGENT_CONFIG_PATH = '.orchestra/agent.json'
 AGENT_SECRET_ENV = 'ORCHESTRA_AGENT_SECRET'
@@ -142,10 +149,16 @@ class HttpError(Exception):
         self.message = message
         self.detail = detail
 
+    #: Optional: every problem a refusal found, one sentence each (kittrial-5bb.113). It is
+    #: beside ``detail``, which keeps its text, so a client that reads ``detail`` is unaffected.
+    problems = None
+
     def body(self, request_id):
         error = {'code': self.code, 'message': self.message}
         if self.detail is not None:
             error['detail'] = self.detail
+        if self.problems:
+            error['problems'] = list(self.problems)
         return {'error': error, 'request_id': request_id}
 
 
@@ -189,6 +202,23 @@ def uncertain(message='Outcome unknown'):
     return HttpError(503, 'uncertain', message)
 
 
+#: Said on every route when the server was occupied (kittrial-5bb.149). It names no lock and no
+#: path, and it does not say that nothing was done: that is true for almost every route, and
+#: was exactly what was untrue for a creation whose project was already made.
+BUSY = 'The server is busy and this request was not completed. Send it again in a moment.'
+
+
+def busy(message=BUSY, retry_after=30):
+    """503 for a request that was not completed because the server was occupied: safe to send again.
+
+    Unlike ``uncertain`` there is no outcome to reconcile. ``retry_after`` becomes the
+    ``Retry-After`` header.
+    """
+    error = HttpError(503, 'busy', message)
+    error.retry_after = retry_after
+    return error
+
+
 # --------------------------------------------------------------------- token helpers
 def new_token():
     return secrets.token_urlsafe(32)
@@ -213,12 +243,84 @@ def now_iso(timestamp):
     return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(timestamp))
 
 
+def address_group(address):
+    """What the limit per address counts as one client.
+
+    An IPv4 address is itself; an IPv6 address is its /64, because one line is given a whole
+    /64 and its holder can use any address in it; an IPv4 address written as IPv6
+    (``::ffff:a.b.c.d``) is that IPv4 address. Anything that is not an address is itself.
+    """
+    text = str(address)
+    try:
+        parsed = ipaddress.ip_address(text.split('%', 1)[0])
+    except ValueError:
+        return text
+    if parsed.version == 6:
+        if parsed.ipv4_mapped is not None:
+            return str(parsed.ipv4_mapped)
+        return str(ipaddress.ip_network((int(parsed) >> 64 << 64, 64)))
+    return str(parsed)
+
+
 # ------------------------------------------------------------------- password verifier
+class _PasswordWorker:
+    """Every scrypt computation of the process runs in this one long-lived thread (kittrial-5bb.170).
+
+    One computation takes 16 MiB. The web service serves each connection in a thread of
+    its own, and the C allocator keeps a freed block of that size in the arena of the
+    thread that asked for it: 190 log-in attempts on 190 connections left 3 GB resident
+    (measured; with one arena, 71 MB), although the checks ran one after another. With
+    one thread asking, one arena holds it: what stays is one computation's worth, however
+    many connections ask and whatever the allocator's settings are.
+
+    The caller waits for its own result; an error of the computation is raised in the
+    caller, as if it had computed there. A process that forks gets a new worker.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._jobs = None
+        self._thread = None
+        self._pid = None
+
+    def _start(self):
+        import queue
+        self._jobs = queue.Queue()
+        self._pid = os.getpid()
+        self._thread = threading.Thread(target=self._run, args=(self._jobs,), name='password-worker', daemon=True)
+        self._thread.start()
+
+    @staticmethod
+    def _run(jobs):
+        while True:
+            arguments, done = jobs.get()
+            try:
+                done['result'] = hashlib.scrypt(arguments[0], **arguments[1])
+            except BaseException as error:  # noqa: BLE001 - handed to the caller, which raises it
+                done['error'] = error
+            done['event'].set()
+
+    def scrypt(self, password, **parameters):
+        with self._lock:
+            if self._thread is None or self._pid != os.getpid() or not self._thread.is_alive():
+                self._start()
+            jobs = self._jobs
+        done = {'event': threading.Event()}
+        jobs.put(((password, parameters), done))
+        done['event'].wait()
+        if 'error' in done:
+            raise done['error']
+        return done['result']
+
+
+_PASSWORD_WORKER = _PasswordWorker()
+
+
 def hash_password(password, *, n=SCRYPT_N, r=SCRYPT_R, p=SCRYPT_P):
     _validate_password(password)
     salt = os.urandom(SCRYPT_SALT)
-    derived = hashlib.scrypt(password.encode('utf-8'), salt=salt, n=n, r=r, p=p,
-                             dklen=SCRYPT_DKLEN)
+    derived = _PASSWORD_WORKER.scrypt(password.encode('utf-8'), salt=salt, n=n, r=r, p=p,
+                                      dklen=SCRYPT_DKLEN)
     return 'scrypt$%d$%d$%d$%s$%s' % (n, r, p, salt.hex(), derived.hex())
 
 
@@ -230,8 +332,8 @@ def verify_password(verifier, password):
         if scheme != 'scrypt':
             return False
         salt_bytes, expected = bytes.fromhex(salt), bytes.fromhex(digest)
-        derived = hashlib.scrypt(password.encode('utf-8'), salt=salt_bytes, n=int(n),
-                                 r=int(r), p=int(p), dklen=len(expected))
+        derived = _PASSWORD_WORKER.scrypt(password.encode('utf-8'), salt=salt_bytes, n=int(n),
+                                          r=int(r), p=int(p), dklen=len(expected))
     except (ValueError, TypeError, MemoryError, OverflowError):
         return False
     return hmac.compare_digest(derived, expected)
@@ -657,6 +759,9 @@ class Store:
         self.path = Path(path)
         self.clock = clock
         self.lock = threading.RLock()
+        #: Since when the state in memory holds something the file does not, on this store's
+        #: clock: a save could not have the state lock. None when the file is current.
+        self.unsaved_since = None
         self.state = self._load()
         self.records = RecordStore(
             self.path.with_name(self.path.name + RECORD_STORE_SUFFIX),
@@ -707,7 +812,38 @@ class Store:
         if moved:
             self.save()
 
-    def save(self):
+    #: How long :meth:`save_soon` waits for the state lock the first time (kittrial-5bb.156).
+    SOON_WAIT = 5.0
+
+    def save_soon(self, what='a last-use stamp'):
+        """Save, without making the caller wait a minute for it. Returns whether it was saved.
+
+        For what a request's answer does not depend on: the last-use stamp every
+        authenticated request leaves, and the audit entry of a refusal. The first time the
+        state lock cannot be had within :attr:`SOON_WAIT` seconds the change stays in
+        memory, and until a save succeeds every further call tries once without waiting,
+        so requests sent together do not queue behind one another. The whole state is
+        written by every save, so the next save that succeeds writes what was left; a
+        write that goes to the endpoint saves first (``EndpointBackend._endpoint``),
+        because the endpoint reads a session's idle deadline from the file.
+
+        What follows from a stamp that is not saved, both ways: if the service stops
+        before the next save the last use is lost and the session reads as idle sooner
+        (the safe side); nothing lets a session live past its deadline.
+        """
+        with self.lock:
+            first = self.unsaved_since is None
+            try:
+                self.save(wait=self.SOON_WAIT if first else 0.0)
+                return True
+            except TimeoutError as waited:
+                if first:
+                    print('busy: %s was not saved, the state lock could not be had; it is kept in memory and '
+                          'written with the next save: %s' % (what, ascii(str(waited)[:400])),
+                          file=sys.stderr, flush=True)
+                return False
+
+    def save(self, wait=60.0):
         # One unique temporary per write, then an atomic replace. A fixed
         # ``<name>.tmp`` would let a second writer (or a stale process) clobber an
         # in-flight snapshot before it is renamed, so the name carries the pid and a
@@ -718,23 +854,37 @@ class Store:
         # same file around live-authority re-validation plus its effect, so an
         # authority change persisted here (revocation, membership, disable) is either
         # committed before the endpoint's check or serialized after the effect.
-        with self.lock, file_lock(str(self.path) + '.lock'):
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = self.path.with_name(
-                '%s.%d.%s.tmp' % (self.path.name, os.getpid(), secrets.token_hex(4)))
-            text = json.dumps(self.state, ensure_ascii=False, indent=2) + '\n'
+        with self.lock:
             try:
-                with open(temporary, 'w', encoding='utf-8') as handle:
-                    handle.write(text)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                os.replace(temporary, self.path)
-            except BaseException:
-                try:
-                    os.unlink(temporary)
-                except OSError:
-                    pass
+                with file_lock(str(self.path) + '.lock', timeout=wait):
+                    self._write()
+            except TimeoutError:
+                # Whatever this save was to write is in memory only, until a save succeeds.
+                if self.unsaved_since is None:
+                    self.unsaved_since = self.clock()
                 raise
+
+    def _write(self):
+        """Write the whole state to the file. The caller holds both locks."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_name(
+            '%s.%d.%s.tmp' % (self.path.name, os.getpid(), secrets.token_hex(4)))
+        text = json.dumps(self.state, ensure_ascii=False, indent=2) + '\n'
+        try:
+            with open(temporary, 'w', encoding='utf-8') as handle:
+                handle.write(text)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, self.path)
+            if self.unsaved_since is not None:
+                self.unsaved_since = None
+                print('The state is saved again; what was kept in memory is written.', file=sys.stderr, flush=True)
+        except BaseException:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+            raise
 
 
 # --------------------------------------------------------------------------- service
@@ -752,8 +902,13 @@ class Service:
                  idempotency_ttl=IDEMPOTENCY_TTL_SECONDS,
                  result_retention=RESULT_RETENTION_SECONDS,
                  login_max_attempts=LOGIN_MAX_ATTEMPTS, public_url=None,
-                 lookup_max=LOOKUP_MAX_PER_WINDOW, lookup_window=LOOKUP_WINDOW_SECONDS):
+                 lookup_max=LOOKUP_MAX_PER_WINDOW, lookup_window=LOOKUP_WINDOW_SECONDS,
+                 approval_by_another_party=False):
         self.store = store
+        #: The installation's setting "nobody approves work of their own party" (slice 1a of
+        #: docs/WEB_COORDINATOR_DESIGN.md, kittrial-5bb.199). OFF unless the operator turns it
+        #: on: with it off every review rule is exactly what it was.
+        self.approval_by_another_party = approval_by_another_party is True
         self.session_idle = session_idle
         self.session_absolute = session_absolute
         self.credential_ttl = credential_ttl
@@ -765,6 +920,13 @@ class Service:
         #: setup/resume snippets. It is deployment configuration, never request data.
         self.public_url = (public_url or '').rstrip('/') or None
         self._failures = {}
+        self._logins_guard = threading.Lock()
+        self._logins_room = threading.Condition(self._logins_guard)   # told whenever a log-in ends
+        self._logins_waiting = {}        # address group -> its log-ins waiting for one of its places
+        self._logins = 0
+        self._logins_by_address = {}     # address group -> its log-ins in flight
+        self.logins_turned_away = 0
+        self.logins_turned_away_for_address = 0
         self.lookup_max = lookup_max
         self.lookup_window = lookup_window
         self._lookups = {}
@@ -932,11 +1094,118 @@ class Service:
         self._require_superuser(principal)
         return [self._public_user(u) for u in self.state['users'].values()]
 
-    @staticmethod
-    def _public_user(user):
-        return {'id': user['id'], 'username': user['username'],
+    def _public_user(self, user):
+        view = {'id': user['id'], 'username': user['username'],
                 'display_name': user['display_name'], 'disabled': user['disabled'],
                 'superuser': user['superuser'], 'created_at': user['created_at']}
+        # Additive (kittrial-5bb.118 part 2): the "may create projects" grant, and how
+        # many of this account's projects count toward it. This view is what a superuser's
+        # account list returns and what an account is told about itself at sign-in.
+        grant = project_grant(user)
+        view['project_grant'] = ({'limit': grant['limit'], 'granted_by': grant['granted_by'],
+                                  'granted_at': grant.get('granted_at')} if grant else None)
+        view['projects_created'] = len(created_projects(self.state, user['id']))
+        return view
+
+    # -- "may create projects" (kittrial-5bb.118 part 2) -------------------------
+    def set_project_grant(self, principal, user_id, limit=None, request_id=None):
+        """A superuser lets a named account create projects, up to ``limit`` at a time.
+
+        Session authority only. The grant is per account, revocable, and audited with
+        who granted it; an agent or worker credential never has it (``decide`` refuses
+        the capability for every credential, whoever issued it).
+        """
+        if principal is None or principal.via == 'credential':
+            raise forbidden('Session authority required to change who may create projects')
+        if limit is None:
+            limit = GRANT_LIMIT_DEFAULT
+        if type(limit) is not int or not 1 <= limit <= GRANT_LIMIT_MAX:
+            raise invalid('limit must be a whole number from 1 to %d' % GRANT_LIMIT_MAX)
+        with self.store.lock:
+            self._refresh_authority(principal)
+            if not principal.superuser:
+                raise forbidden('Superuser authority required')
+            user = self._user(user_id)
+            if user.get('disabled'):
+                raise conflict('That account is disabled')
+            before = project_grant(user)
+            user['project_grant'] = {'limit': limit, 'granted_by': principal.user_id,
+                                     'granted_at': now_iso(self._now())}
+            self.audit(request_id, principal, 'accounts.project-grant', 'committed',
+                       reason='account=%s %s limit=%d%s' % (
+                           user_id, 'changed' if before else 'granted', limit,
+                           ' (was %d)' % before['limit'] if before else ''))
+            self.store.save()
+            return self._public_user(user)
+
+    def clear_project_grant(self, principal, user_id, request_id=None):
+        """Take the grant away. Projects the account already created are untouched."""
+        if principal is None or principal.via == 'credential':
+            raise forbidden('Session authority required to change who may create projects')
+        with self.store.lock:
+            self._refresh_authority(principal)
+            if not principal.superuser:
+                raise forbidden('Superuser authority required')
+            user = self._user(user_id)
+            had = project_grant(user)
+            user.pop('project_grant', None)
+            self.audit(request_id, principal, 'accounts.project-grant', 'committed',
+                       reason='account=%s %s' % (user_id, 'revoked (limit was %d)' % had['limit'] if had
+                                                 else 'revoked (none held)'))
+            self.store.save()
+            return self._public_user(user)
+
+    def host_creation(self, principal):
+        """Whether this principal may create a project on the host now, and its numbers.
+
+        ``{'allowed', 'limit', 'used', 'reason'}``; ``limit`` is None for a superuser.
+        Never raises: the page uses it to decide what to show.
+        """
+        if principal is None or principal.via == 'credential':
+            return {'allowed': False, 'limit': None, 'used': 0, 'reason': 'credential'}
+        with self.store.lock:
+            user = self.state['users'].get(principal.user_id) or {}
+            used = len(created_projects(self.state, principal.user_id))
+            if user.get('superuser'):
+                return {'allowed': True, 'limit': None, 'used': used, 'reason': None}
+            grant = project_grant(user)
+            if grant is None:
+                return {'allowed': False, 'limit': None, 'used': used, 'reason': 'no-grant'}
+            return {'allowed': used < grant['limit'], 'limit': grant['limit'], 'used': used,
+                    'reason': None if used < grant['limit'] else 'limit'}
+
+    def register_host_created(self, principal, project_id, name, creation, operation=None):
+        """Write the web record of a project the host has just finished creating.
+
+        The creator is the only member, as owner. ``registered_by`` is set so that this
+        kit and the one before it serve the record (the earlier kit reads that mark as
+        "a superuser stood behind this mapping"; here a superuser stood behind the
+        grant). ``host_created`` says how the record came to be; its ``operation`` is the
+        digest of the request's identity, by which the creator's exact repeat of that
+        request is known again (kittrial-5bb.156).
+        """
+        with self.store.lock:
+            self._refresh_authority(principal)
+            existing = self.state['projects'].get(project_id)
+            if existing is not None:
+                if existing.get('created_by') == principal.user_id and existing.get('host_created'):
+                    return self.project_view(principal, project_id)      # the same creation, written already
+                raise conflict('A project with that identifier is already registered')
+            self._validate_project_name(name)
+            user = self.state['users'].get(principal.user_id) or {}
+            grant = project_grant(user)
+            self.state['projects'][project_id] = {
+                'id': project_id, 'name': name, 'created_by': principal.user_id,
+                'created_at': now_iso(self._now()), 'archived': False,
+                'registered_by': principal.user_id,
+                'host_created': {'by': principal.user_id, 'at': now_iso(self._now()),
+                                 'adopted': bool(creation.get('adopted')), 'operation': operation,
+                                 'grant_limit': None if user.get('superuser') else (grant or {}).get('limit'),
+                                 'granted_by': None if user.get('superuser') else (grant or {}).get('granted_by')},
+            }
+            self.state['memberships'][project_id] = {principal.user_id: 'owner'}
+            self.store.save()
+            return self.project_view(principal, project_id)
 
     def change_password(self, principal, user_id, current_password, new_password):
         if principal is None or principal.via == 'credential':
@@ -1070,8 +1339,98 @@ class Service:
         key = self._throttle_key(username, source)
         self._failures.setdefault(key, []).append(self._now())
 
-    def login(self, username, password, source='local', request_id=None):
-        """Uniform failure response; never reveals whether the account exists."""
+    #: Log-in attempts in flight at once: one being checked and the rest waiting their turn
+    #: (the check is made under the state lock, one at a time, about 0.1 s each). One more is
+    #: answered busy at once, before any check, so that a flood of attempts costs neither
+    #: memory nor a queue without end (kittrial-5bb.170).
+    LOGINS_AT_ONCE = 16
+    LOGIN_BUSY = 'Too many people are logging in at this moment. Try again in a few seconds.'
+    #: Of those places, how many one client address may hold (its ``address_group``; the
+    #: address is the forwarded one only when a trusted proxy sent it). Without it about 20
+    #: looping connections from one address, with no credentials, held all 16 places and
+    #: kept every log-in out for as long as they ran (review of kittrial-5bb.170). A quarter:
+    #: whatever one address sends, twelve places are left to the others, somebody with a
+    #: place waits behind at most fifteen checks, and it takes four addresses acting
+    #: together to fill them all. (Half was tried and measured: two addresses were then
+    #: enough, and a person at another address waited several seconds to not at all behind
+    #: one flooding address with a full audit log.) 0: no share per address (the service's
+    #: own settings do not offer it: they take 1 to LOGINS_AT_ONCE).
+    LOGINS_PER_ADDRESS = 4
+    #: A log-in over its address's share is not turned away at once: it waits this long for
+    #: one of its address's places. An office behind one router is one address, and its
+    #: people logging in together at nine in the morning are each checked in a tenth of a
+    #: second: the fifth to the tenth wait a moment and get in, where an instant refusal sent
+    #: six of ten away. A flooding address gains nothing: it still holds four places and no
+    #: more. After the wait the answer is the refusal it always was.
+    LOGIN_WAIT_SECONDS = 2.0
+    #: How many log-ins of one address may wait like that at once; one more is refused at
+    #: once. Each waiter holds its connection's thread, so this bounds what a flooding
+    #: address can park: 4 in flight and 12 waiting, however many connections it has.
+    LOGIN_WAITERS_PER_ADDRESS = 12
+    LOGIN_BUSY_ADDRESS = ('Too many log-ins from your address are being checked at this moment. '
+                          'Try again in a few seconds.')
+
+    def login(self, username, password, source='local', request_id=None, shared_source=False):
+        """Uniform failure response; never reveals whether the account exists.
+
+        ``shared_source``: the source is not one client's address but the address everybody
+        arrives from (a trusted proxy that forwarded no address: the SSH tunnel of the
+        first install). Such a log-in has no share per address to be held to, as its
+        connection has no limit per address; the places in all still bound it.
+        """
+        group = None if shared_source else address_group(source or 'local')
+        with self._logins_room:
+            until, waiting = None, False
+            while True:
+                mine = self._logins_by_address.get(group, 0)
+                if group is not None and self.LOGINS_PER_ADDRESS and mine >= self.LOGINS_PER_ADDRESS:
+                    # Over its address's share: a short wait for one of that address's places.
+                    if until is None:
+                        until = time.monotonic() + self.LOGIN_WAIT_SECONDS
+                        waiting = self._logins_waiting.get(group, 0) < self.LOGIN_WAITERS_PER_ADDRESS
+                        if waiting:
+                            self._logins_waiting[group] = self._logins_waiting.get(group, 0) + 1
+                    left = until - time.monotonic()
+                    if waiting and left > 0:
+                        self._logins_room.wait(left)
+                        continue
+                    refused = self.LOGIN_BUSY_ADDRESS
+                    self.logins_turned_away_for_address += 1
+                elif self._logins >= self.LOGINS_AT_ONCE:
+                    refused = self.LOGIN_BUSY
+                else:
+                    refused = None
+                    self._logins += 1
+                    if group is not None:
+                        self._logins_by_address[group] = mine + 1
+                break
+            if waiting:
+                parked = self._logins_waiting.get(group, 0) - 1
+                if parked > 0:
+                    self._logins_waiting[group] = parked
+                else:
+                    self._logins_waiting.pop(group, None)
+            if refused:
+                self.logins_turned_away += 1
+        if refused:
+            # Nothing was checked and nothing is counted against the name or the address, and
+            # no count is cleared either. Not audited per attempt: a flood must not fill the
+            # audit log.
+            raise busy(refused, retry_after=5)
+        try:
+            return self._login(username, password, source, request_id)
+        finally:
+            with self._logins_room:
+                self._logins -= 1
+                if group is not None:
+                    left = self._logins_by_address.get(group, 0) - 1
+                    if left > 0:
+                        self._logins_by_address[group] = left
+                    else:
+                        self._logins_by_address.pop(group, None)
+                self._logins_room.notify_all()            # a place is free: whoever waits for one of this address's looks again
+
+    def _login(self, username, password, source, request_id):
         try:
             self._check_throttle(username, source)
         except HttpError:
@@ -1146,7 +1505,8 @@ class Service:
                 session['last_used'] = moment
                 session['last_used_raw'] = self._raw_now()
                 session['idle_expires'] = moment + self.session_idle
-                self.store.save()
+                # The answer of a request does not wait a minute for this stamp (kittrial-5bb.156).
+                self.store.save_soon()
                 return Principal(user['id'], user['display_name'], user['superuser'],
                                  'session', user['id'], csrf=session['csrf'],
                                  session_hash=digest)
@@ -1176,7 +1536,7 @@ class Service:
                     if not isinstance(agent, dict) or not agent.get('enabled'):
                         raise unauthenticated('Agent is disabled')
                     agent['last_seen_at'] = now_iso(self._now())
-                self.store.save()
+                self.store.save_soon()
                 # A credential carries ONLY the authority granted by its type, project
                 # and scopes. It never inherits the issuing account's global superuser
                 # authority: ``superuser`` is always False here, and scopes are the
@@ -1397,25 +1757,73 @@ class Service:
     #: The four accepted forms of a repository location, each matched in full. Nothing
     #: else is accepted, so a remote-helper form (``ext::``, ``fd::``), a one-slash
     #: scheme, a relative path, an option and a host that starts with ``-`` all fail.
-    _REPO_HOST = r'[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?'
-    _REPO_USER = r'[A-Za-z0-9_][A-Za-z0-9._-]{0,63}'
-    _REPO_PATH = r'[A-Za-z0-9._~+=,/-]+'
+    #: Every pattern is ASCII-only and case-sensitive (kittrial-5bb.123): a case-insensitive
+    #: match let the Kelvin sign, the long s and the dotless i through as host letters.
+    _REPO_LABEL = r'[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?'
+    _REPO_HOST = r'(?P<host>%s(?:\.%s)*)' % (_REPO_LABEL, _REPO_LABEL)
+    #: A plain account name. Short on purpose: an opaque token does not fit as a user name.
+    REPOSITORY_USER_MAX = 32
+    _REPO_USER = r'(?P<user>[A-Za-z0-9_][A-Za-z0-9._-]{0,%d})' % (REPOSITORY_USER_MAX - 1)
+    #: No leading zero: ``:00080`` is not how anyone writes a port.
+    _REPO_PORT = r'(?::(?P<port>[1-9][0-9]{0,4}))?'
+    _REPO_PATH = r'(?P<path>[A-Za-z0-9._~+=,/-]+)'
     _REPOSITORY_FORMS = (
         # https://host[:port]/path - no user name at all, so no token can ride in it.
-        re.compile(r'https://%s(?::[0-9]{1,5})?/%s' % (_REPO_HOST, _REPO_PATH), re.I),
+        re.compile(r'https://%s%s/%s' % (_REPO_HOST, _REPO_PORT, _REPO_PATH), re.ASCII),
         # ssh://[user@]host[:port]/path - a plain user name only.
-        re.compile(r'ssh://(?:%s@)?%s(?::[0-9]{1,5})?/%s' % (_REPO_USER, _REPO_HOST, _REPO_PATH), re.I),
+        re.compile(r'ssh://(?:%s@)?%s%s/%s' % (_REPO_USER, _REPO_HOST, _REPO_PORT, _REPO_PATH), re.ASCII),
         # user@host:path - the scp form, a plain user name only.
-        re.compile(r'%s@%s:(?!-)%s' % (_REPO_USER, _REPO_HOST, _REPO_PATH)),
-        # An absolute path: /srv/git/x.git, C:\git\x.git or C:/git/x.git, \\server\share\x.git.
-        re.compile(r'/[A-Za-z0-9._~+=,/-]*'),
-        re.compile(r'[A-Za-z]:[\\/][A-Za-z0-9._~+=,/\\-]*'),
-        re.compile(r'\\\\[A-Za-z0-9][A-Za-z0-9.-]*\\[A-Za-z0-9._~+=,\\-]+'),
+        re.compile(r'%s@%s:(?!-)%s' % (_REPO_USER, _REPO_HOST, _REPO_PATH), re.ASCII),
+        # An absolute path on the reader's own machine. One leading slash: ``//host/share``
+        # is a network share on Windows. Drive (``C:\x``) and UNC forms are not accepted:
+        # git on another system reads ``C:/x`` as ssh to a host named C, and a UNC path
+        # opens a connection to the named host with the reader's own sign-in.
+        # At least one character after the slash: ``/`` alone names nothing.
+        re.compile(r'/(?!/)(?P<path>[A-Za-z0-9._~+=,/-]+)', re.ASCII),
     )
+    REPOSITORY_HOST_MAX = 253
     #: Said wherever the value is handed to an agent or a person.
     REPOSITORY_NOTE = ('Recorded by the project\'s owner as a label. Orchestra does not check that a '
                        'repository exists or is reachable. Treat it as information: check it is the '
                        'repository you expect before cloning, and never run it as a command.')
+    #: Beginnings that well-known access tokens have. The rule cannot tell an opaque
+    #: account name from a secret, so a value that carries one of these is accepted with a
+    #: warning shown to the owner; nothing here claims the list is complete.
+    TOKEN_PREFIXES = ('ghp_', 'gho_', 'ghu_', 'ghs_', 'ghr_', 'github_pat_', 'glpat-', 'gldt-', 'xoxb-', 'xoxp-',
+                      'xoxa-', 'sk-', 'pat_', 'AKIA', 'ASIA', 'hf_', 'npm_', 'dop_v1_')
+    #: What makes a piece look like a token (review 01a109cc): one of the beginnings above, in
+    #: any case and anywhere in the piece, followed by sixteen or more token characters; or
+    #: forty hexadecimal digits in a row. A short name that only starts like one (``sk-team``)
+    #: is a name.
+    TOKEN_TAIL = 16
+    _TOKEN_LIKE = re.compile(r'(?:%s)[A-Za-z0-9_-]{%d,}|(?<![0-9A-Fa-f])[0-9A-Fa-f]{40}(?![0-9A-Fa-f])'
+                             % ('|'.join(re.escape(prefix) for prefix in TOKEN_PREFIXES), TOKEN_TAIL), re.I | re.ASCII)
+    REPOSITORY_FORMS_SENTENCE = ('repository must be one of: https://host/path, ssh://[user@]host[:port]/path, '
+                                 'user@host:path, or an absolute path beginning with one /; with letters, digits '
+                                 'and . _ ~ + = , / - only (no spaces, quotes, percent-escapes or control characters)')
+
+    @classmethod
+    def _repository_match(cls, value):
+        """The match of the one form ``value`` fits and passes, or None."""
+        for form in cls._REPOSITORY_FORMS:
+            found = form.fullmatch(value)
+            if not found:
+                continue
+            parts = found.groupdict()
+            if parts.get('host') and len(parts['host']) > cls.REPOSITORY_HOST_MAX:
+                return None
+            if parts.get('port') is not None and not 1 <= int(parts['port']) <= 65535:
+                return None
+            # No segment made of dots only (``..``, ``...``): the first climbs out of the path,
+            # the others name nothing a repository is at.
+            if any(len(segment) > 1 and not segment.strip('.') for segment in (parts.get('path') or '').split('/')):
+                return None
+            # ``c:x.git`` after a user name: a one-letter host is how a drive is written, and
+            # git on another system reads it as one.
+            if form is cls._REPOSITORY_FORMS[2] and len(parts['host']) < 2:
+                return None
+            return found
+        return None
 
     @classmethod
     def validate_repository(cls, value):
@@ -1424,12 +1832,17 @@ class Service:
         Accepted, and nothing else (the whole value must match one form):
 
         * ``https://host[:port]/path`` - with no user name, so no token or password;
-        * ``ssh://[user@]host[:port]/path`` and ``user@host:path`` - a plain user name;
-        * an absolute path (``/...``, ``C:\\...`` or ``C:/...``, ``\\\\server\\share\\...``).
+        * ``ssh://[user@]host[:port]/path`` and ``user@host:path`` - a plain user name of
+          at most REPOSITORY_USER_MAX characters;
+        * an absolute path beginning with exactly one ``/``.
 
-        A host starts and ends with a letter or digit. There is no percent-escape, space,
-        quote, control or format character in any form, and at most REPOSITORY_MAX
-        characters. The refusal never repeats the value: it may hold a secret.
+        ASCII only; the scheme in lower case; a host is dot-separated labels that each
+        start and end with a letter or digit (two characters at least in the
+        ``user@host:path`` form); a port is 1 to 65535 with no leading zero; no path
+        segment made of dots only; no percent-escape, space, quote, control or format character; at most
+        REPOSITORY_MAX characters. The kit does not judge where a host points
+        (``localhost`` and an address are hosts like any other). The refusal never
+        repeats the value: it may hold a secret.
         """
         if value is None or value == '':
             return None
@@ -1439,11 +1852,42 @@ class Service:
                 or re.match(r'[^/@:]*:[^/@]*@', value):
             raise invalid('repository must not contain a user name, token or password on an https URL, or a '
                           'password anywhere; give the location only')
-        if not any(form.fullmatch(value) for form in cls._REPOSITORY_FORMS):
-            raise invalid('repository must be one of: https://host/path, ssh://[user@]host[:port]/path, '
-                          'user@host:path, or an absolute path; with letters, digits and . _ ~ + = , / - only '
-                          '(no spaces, quotes, percent-escapes or control characters)')
+        if cls._repository_match(value) is None:
+            raise invalid(cls.REPOSITORY_FORMS_SENTENCE)
         return value
+
+    @classmethod
+    def repository_warning(cls, value):
+        """A sentence for the owner when an accepted value looks as if it carries a token, else None.
+
+        The value is accepted either way: a user name or a path segment that begins like
+        a well-known access token may be an ordinary name. The sentence never repeats it.
+        """
+        found = cls._repository_match(value) if isinstance(value, str) else None
+        if found is None:
+            return None
+        parts = found.groupdict()
+        pieces = [parts.get('user') or ''] + (parts.get('path') or '').split('/')
+        if any(cls._TOKEN_LIKE.search(piece) for piece in pieces if piece):
+            return ('Part of this value looks like an access token. Every member and agent of the project can '
+                    'read it. If it is a token, replace the value with the location only and revoke the token.')
+        return None
+
+    @classmethod
+    def stored_repository(cls, project):
+        """``(value, needs_attention)`` for what a project record holds (kittrial-5bb.123).
+
+        The rule has changed since some values were stored. A stored value that no longer
+        passes is not shown as the repository and is not delivered to agents: the record
+        needs an owner's attention instead. Nothing is rewritten on read.
+        """
+        value = project.get('repository') if isinstance(project, dict) else None
+        if not value:
+            return None, False
+        try:
+            return cls.validate_repository(value), False
+        except HttpError:
+            return None, True
 
     def set_project_repository(self, principal, project_id, repository, request_id=None):
         """Record (or clear) where the project's repository is. Owners only."""
@@ -1466,7 +1910,19 @@ class Service:
     def project_view(self, principal, project_id):
         project, role = self.require_project(principal, project_id)
         view = dict(project)
-        view.setdefault('repository', None)
+        made = view.get('host_created')
+        if isinstance(made, dict) and 'operation' in made:
+            # The digest that recognises the creator's own repeat is the service's own: no other
+            # account or body can match it, and no reader needs it (kittrial-5bb.156 review).
+            view['host_created'] = {key: value for key, value in made.items() if key != 'operation'}
+        # The repository as today's rule reads it (kittrial-5bb.123): a stored value that
+        # no longer passes is withheld and flagged; a passing one carries the note that it
+        # is information, wherever a member or an agent credential reads the project.
+        value, attention = self.stored_repository(project)
+        view['repository'] = value
+        view['repository_note'] = self.REPOSITORY_NOTE if value else None
+        view['repository_needs_attention'] = attention
+        view['repository_warning'] = self.repository_warning(value) if value else None
         view['role'] = role
         view['members'] = sorted(self.state['memberships'].get(project_id, {}))
         return view
@@ -1538,7 +1994,7 @@ class Service:
 
     # -- worker credentials ----------------------------------------------------
     def issue_credential(self, principal, project_id, *, label=None, scopes=None,
-                         actor=None, request_id=None):
+                         actor=None, request_id=None, actor_checked=False, actor_waived=None):
         if principal is None or principal.via == 'credential':
             raise forbidden('A worker credential cannot issue another credential')
         with self.store.lock:
@@ -1553,12 +2009,31 @@ class Service:
                 raise invalid('Invalid credential actor namespace')
             # The id shapes are what make a record read as written by that account or
             # agent (kittrial-5bb.70 review 01a10262): the only one an owner may name is
-            # their own account id.
+            # their own account id. Compared case-folded (kittrial-5bb.199 round 2, N8), so
+            # an id in capitals is the same id rather than a name that only looks like it.
             claimed = actor.split('/', 1)[0] if actor is not None else None
-            if claimed is not None and re.fullmatch(r'(?:usr|agent)_[0-9a-f]{16}', claimed) \
-                    and claimed != principal.user_id:
+            if claimed is not None and re.fullmatch(r'(?:usr|agent)_[0-9a-f]{16}', claimed.casefold()) \
+                    and claimed.casefold() != str(principal.user_id).casefold():
                 raise invalid('A credential actor namespace cannot have the shape of an account or agent id '
                               'other than your own account id')
+            if actor is not None:
+                # One name has one issuer at a time (kittrial-5bb.199 review): with the party
+                # rule on, work under a name is of every account that ever issued it, so a
+                # second account must not be able to take a name that is in use, written
+                # under yet or not. The same account may: that is how it replaces a lane's
+                # credential without a gap, and both are its own party.
+                moment = self._expiry_now()
+                for other in self.state['credentials'].values():
+                    if not isinstance(other, dict) or other.get('agent_id') or other.get('project_id') != project_id \
+                            or other.get('user_id') == principal.user_id or not self._credential_live(other, moment):
+                        continue
+                    theirs = other.get('actor')
+                    if self._holds(theirs, actor) or self._holds(actor, theirs):
+                        raise conflict('The name %s is held by a working credential of this project that another account '
+                                       'issued (%s, issued by %s). A name has one issuer at a time: have that credential '
+                                       'revoked first, or choose another name'
+                                       % (actor, theirs, self._owner_name(other.get('user_id'))),
+                                       {'held_by_credential': other.get('id')})
             secret = new_token()
             # ``created_at`` is informational and stays on the raw clock; the credential's
             # expiry is stamped on the monotone clock, so a credential issued during a
@@ -1573,6 +2048,12 @@ class Service:
                 'label': label or 'worker',
                 'scopes': list(requested),
                 'actor': actor,
+                # The backend read the project's tracker rows and this name was free when it
+                # was issued: every row under it from now on is this credential's own, so no
+                # later write needs to read the tracker again (kittrial-5bb.188 item 1). A
+                # credential issued before that rule has no mark and is judged against the
+                # tracker ONCE, at its first write (item 5).
+                'actor_rows_checked': bool(actor_checked),
                 'token_hash': token_hash(secret),
                 'created_at': now_iso(self._now()),
                 'issued_raw': self._raw_now(),
@@ -1580,20 +2061,36 @@ class Service:
                 'expires_at': moment + self.credential_ttl,
                 'revoked': False,
             }
+            if isinstance(actor_waived, dict):
+                # A superuser allowed a name the tracker already holds (kittrial-5bb.188 item
+                # 4). Its own mark, NOT actor_rows_checked: who used the waiver, why, and when.
+                credential['actor_waived'] = {
+                    'by': actor_waived.get('by'),
+                    'reason': actor_waived.get('reason'),
+                    'at': now_iso(self._now()),
+                }
             self.state['credentials'][credential['id']] = credential
             self.state['credential_tokens'][token_hash(secret)] = credential['id']
             self.store.save()
-        return {'id': credential['id'], 'project': project_id, 'label': credential['label'],
-                'scopes': list(requested), 'actor': actor, 'secret': secret,
-                'expires_at': now_iso(credential['expires_at']), 'secret_available': True}
+        answer = {'id': credential['id'], 'project': project_id, 'label': credential['label'],
+                  'scopes': list(requested), 'actor': actor, 'secret': secret,
+                  'expires_at': now_iso(credential['expires_at']), 'secret_available': True}
+        if 'actor_waived' in credential:
+            answer['actor_waived'] = dict(credential['actor_waived'])
+        return answer
 
     def credential_view(self, credential):
-        return {'id': credential['id'], 'project': credential['project_id'],
+        view = {'id': credential['id'], 'project': credential['project_id'],
                 'agent': credential.get('agent_id'),
                 'label': credential['label'], 'scopes': list(credential['scopes']),
                 'actor': credential.get('actor'), 'revoked': credential['revoked'],
                 'created_at': credential['created_at'], 'last_used': credential.get('last_used'),
                 'expires_at': now_iso(credential['expires_at'])}
+        # A waived name is shown as allowed, by whom and when (kittrial-5bb.188 item 4): it is
+        # not colliding and it does write. Never actor_rows_checked: the two are distinct.
+        if isinstance(credential.get('actor_waived'), dict):
+            view['actor_waived'] = dict(credential['actor_waived'])
+        return view
 
     def revoke_credential(self, principal, project_id, credential_id, request_id=None):
         if principal is None or principal.via == 'credential':
@@ -1610,6 +2107,10 @@ class Service:
             if credential['revoked']:
                 return {'id': credential_id, 'revoked': True}
             credential['revoked'] = True
+            # The revocation instant bounds a later renewal's claim to this credential's rows
+            # (kittrial-5bb.188 item 3). A record revoked before this field existed carries no
+            # time and lends nothing, which is the fail-closed reading.
+            credential['revoked_at'] = now_iso(self._now())
             self.store.save()
         return {'id': credential_id, 'revoked': True}
 
@@ -1663,6 +2164,10 @@ class Service:
                 view = self.credential_view(credential)
                 view['user_id'] = credential.get('user_id')
                 view['user_name'] = self._owner_name(credential.get('user_id'))
+                if isinstance(view.get('actor_waived'), dict):
+                    # The owner list names the person who allowed the name, not only their id
+                    # (kittrial-5bb.188 item 4).
+                    view['actor_waived']['by_name'] = self._owner_name(view['actor_waived'].get('by'))
                 items.append(view)
         items.sort(key=lambda c: (c['created_at'] or '', c['id']))
         return items
@@ -1761,6 +2266,86 @@ class Service:
                 return agent['owner']
         return actor
 
+    def actor_parties(self, actor, project_id=None):
+        """The accounts a task actor's work belongs to: its PARTY, as a set.
+
+        With the setting off this is ``{actor_person(actor)}`` and nothing else, so every rule
+        that asks it answers as before. With it on, one party is an account, every agent that
+        account made, and every worker credential that account issued (kittrial-5bb.199):
+
+        * an agent: its owner; an account: itself;
+        * a name whose FIRST SEGMENT is an account or an agent (``ACCOUNT/x``, ``AGENT/x``):
+          that account, before any credential is looked at. Only that account's own
+          credentials can write such a name: one issued with no name writes under its
+          issuer's account id and any label below it, and an agent's under the agent's;
+        * any other name written under a WORKER CREDENTIAL of ``project_id``: every account
+          that has ever issued a credential whose actor namespace holds the name (the name
+          itself, or ``name/...``), working, revoked or expired. Nothing on a record says
+          which credential wrote it, and a moment cannot say it either (the tracker's stamp
+          is up to a second later than this service's clock), so where more than one account
+          has held a name, the work is of each of them: that only ever refuses more;
+        * anything else: the name itself. A writer that is no account, no agent and under no
+          credential record (a name of the host route) is its own party.
+        """
+        person = self.actor_person(actor)
+        if not self.approval_by_another_party or not isinstance(actor, str) or not actor:
+            return {person}
+        with self.store.lock:
+            head = actor.split('/', 1)[0]
+            agent = self.state['agents'].get(head)
+            if isinstance(agent, dict) and agent.get('owner'):
+                return {agent['owner']}
+            if head in self.state['users']:
+                return {head}
+            issuers = {credential['user_id'] for credential in self.state['credentials'].values()
+                       if isinstance(credential, dict) and not credential.get('agent_id')
+                       and project_id is not None and credential.get('project_id') == project_id
+                       and self._holds(credential.get('actor'), actor)}
+            return issuers or {person}
+
+    @staticmethod
+    def _holds(namespace, name):
+        """Whether a credential issued with ``namespace`` may write under ``name``."""
+        # A credential issued with NO name has ``actor`` None and holds no name: it writes under its
+        # issuer's account id, which no other account can be issued (review of kittrial-5bb.199, round 2:
+        # a None here raised AttributeError and answered 500 to every other account's named credential).
+        #
+        # The head is compared CASE-FOLDED, as the tracker's own name rule folds it (kittrial-5bb.199
+        # round 2, N2: actor_names.head). ``IT-A745`` and ``it-a745`` are one name: a second account may
+        # not take the other spelling, and work under either spelling belongs to everyone who held it.
+        # Without this, the first holder's credentials could be revoked and the other account issued the
+        # lower-case name with no waiver, after which old work belonged to both and neither could approve.
+        if not (isinstance(namespace, str) and namespace and isinstance(name, str) and name):
+            return False
+        namespace = namespace.casefold()
+        name = name.casefold()
+        return name == namespace or name.startswith(namespace.rstrip('/') + '/')
+
+    def note_settings(self):
+        """Record what the installation's settings are at this start; answers ``(was, is)``.
+
+        Turning ``approval_by_another_party`` on or off is done outside the service (a flag,
+        or the office configuration) and used to leave no trace. The state keeps what the
+        last start had, and a start whose rule differs from a readable record writes one
+        audit entry. A record that is anything but a JSON ``true`` or ``false`` -- absent,
+        null, a string such as ``"yes"`` or ``"false"``, a list, an object or a number -- is
+        UNKNOWN, not off (kittrial-5bb.199 round 2, N5): the entry and the start line say so
+        rather than inventing an ``off -> on`` change or staying silent after a lost ON.
+        """
+        with self.store.lock:
+            seen = self.state.get('settings_seen')
+            raw = seen.get('approval_by_another_party') if isinstance(seen, dict) else None
+            was = raw if isinstance(raw, bool) else None
+            now = bool(self.approval_by_another_party)
+            if was != now:
+                self.audit(None, None, 'settings.approval_by_another_party', 'committed',
+                           reason='%s -> %s at service start'
+                                  % ('unknown' if was is None else ('on' if was else 'off'),
+                                     'on' if now else 'off'))
+                self.state['settings_seen'] = {'approval_by_another_party': now}
+                self.store.save()
+            return was, now
+
     def username_of(self, user_id):
         """The account's username, read under the store lock (``None`` if unknown)."""
         with self.store.lock:
@@ -1777,6 +2362,37 @@ class Service:
     # agent on its next request. ``working_directory`` is a free-text hint for the
     # owner's own machine; the server stores it and never reads it, and only the owner
     # (or a superuser) ever receives it in a response.
+    def agent_review_standing(self, agent_id, project_id):
+        """``(may_review, owner_approves)`` for one agent in one project, from live state.
+
+        ``may_review``: a live credential of the agent holds the reviews capability there
+        (its scope, capped by its owner's current role). ``owner_approves``: the agent's
+        owner can approve in that project. Used to decide which review work an agent is
+        shown (kittrial-5bb.115); it grants nothing.
+        """
+        from http_authority import credential_capabilities
+        with self.store.lock:
+            agent = self.state['agents'].get(agent_id)
+            if not isinstance(agent, dict) or not agent.get('enabled') or \
+                    project_id not in (agent.get('projects') or []):
+                return False, False
+            owner = self.state['users'].get(agent.get('owner'))
+            if not isinstance(owner, dict) or owner.get('disabled'):
+                return False, False
+            role = self.state.get('memberships', {}).get(project_id, {}).get(owner['id'])
+            approves = bool(owner.get('superuser')) or CAP_APPROVE in ROLE_CAPABILITIES.get(role, frozenset())
+            moment = self._expiry_now()
+            for credential in self.state.get('credentials', {}).values():
+                if not isinstance(credential, dict) or credential.get('agent_id') != agent_id or \
+                        credential.get('revoked') or credential.get('expires_at', 0) <= moment:
+                    continue
+                try:
+                    if CAP_REVIEWS in credential_capabilities(self.state, credential, owner, project_id):
+                        return True, approves
+                except AuthorityDenied:
+                    continue
+            return False, approves
+
     def agent_actor(self, agent):
         """The stable attribution label an agent's API writes carry."""
         return agent['id']
@@ -1860,6 +2476,18 @@ class Service:
                 raise not_found('Project not found')
         return granted
 
+    def check_agent_grant(self, principal, projects, owner_id=None):
+        """Judge an agent grant without writing anything (kittrial-5bb.183 review item 1).
+
+        ``create_agent`` calls :meth:`_agent_projects` on the way in; the route calls this
+        first so that a caller with no right over a named project keeps the service's own
+        404 (a project the owner cannot see, or one that does not exist) instead of being
+        answered the route's unknown-field refusal and its field list.
+        """
+        with self.store.lock:
+            self._refresh_authority(principal)
+            return self._agent_projects(principal, projects, owner_id=owner_id)
+
     def _agent(self, agent_id):
         agent = self.state['agents'].get(agent_id)
         if not isinstance(agent, dict):
@@ -1885,14 +2513,96 @@ class Service:
         return [c for c in self.state['credentials'].values()
                 if c.get('agent_id') == agent['id']]
 
+    def _credential_live(self, credential, moment=None):
+        """Whether a credential still works: not revoked, and not expired on either clock."""
+        moment = self._expiry_now() if moment is None else moment
+        return not credential.get('revoked') and not self._expired(
+            moment, expires_at=credential.get('expires_at'), issued_raw=credential.get('issued_raw'),
+            lifetime=self.credential_ttl)
+
+    def _scope_names(self, scopes):
+        """A caller's list of scopes as a tuple in the order given, or None when none was sent.
+
+        Anything that is not a list of known scope names is refused: a number or ``true`` used
+        to answer 500, an object was read as its keys. A name given twice counts once.
+        """
+        if scopes is None or (isinstance(scopes, (list, tuple)) and not scopes):
+            return None
+        if not isinstance(scopes, (list, tuple)):
+            raise invalid('scopes must be a list of scope names')
+        names = []
+        for scope in scopes:
+            if not isinstance(scope, str) or scope not in CREDENTIAL_SCOPES:
+                raise invalid('Unknown credential scope %r' % (scope,))
+            if scope not in names:
+                names.append(scope)
+        return tuple(names)
+
+    def agent_scopes(self, agent):
+        """What an agent may do, and where that is known from: ``(scopes, source)``.
+
+        ``set``: the list on the agent record, written when the agent is made and by a renewal
+        that sends a list. Once it is there no credential decides anything, working or dead
+        (kittrial-5bb.208 review: a revoked credential that was wider used to seed the next
+        renewal, so two requests got round the refusal to widen).
+
+        An agent made before the record kept them has none. ``inferred``: its working
+        credentials all carry the same list, and that is it; it is written to the record by
+        the first renewal, not by a read. ``unknown`` (scopes None): none of its credentials
+        works, or they do not carry the same, which is what an agent looks like that was
+        renewed from the page before this was fixed. Nothing is guessed then: never the
+        default four, never a credential that no longer works.
+        """
+        stored = agent.get('scopes')
+        if isinstance(stored, list):
+            return (tuple(scope for scope in stored if scope in CREDENTIAL_SCOPES),
+                    'inferred' if agent.get('scopes_source') == 'inferred' else 'set')
+        moment = self._expiry_now()
+        lists = {tuple(scope for scope in CREDENTIAL_SCOPES if scope in (credential.get('scopes') or ()))
+                 for credential in self._agent_credentials(agent) if self._credential_live(credential, moment)}
+        if len(lists) == 1:
+            return next(iter(lists)), 'inferred'
+        return None, 'unknown'
+
     def _revoke_agent_credentials(self, agent):
         for credential in self._agent_credentials(agent):
             credential['revoked'] = True
+        self._prune_agent_credentials(agent)
+
+    @staticmethod
+    def _credential_age(credential):
+        return (credential.get('issued_raw') or 0, credential.get('created_at') or '', credential.get('id') or '')
+
+    def _prune_agent_credentials(self, agent):
+        """Delete all but the newest few credentials of the agent that no longer work.
+
+        Caller holds ``store.lock`` and saves. Without it the state grew by a record for every
+        renewal for good, and every read of the agent carried them all (kittrial-5bb.208
+        review). What goes is the record (label, scopes, when made and last used); that it was
+        issued and revoked, by whom and when, stays in the audit log.
+        """
+        moment = self._expiry_now()
+        dead = sorted((c for c in self._agent_credentials(agent) if not self._credential_live(c, moment)),
+                      key=self._credential_age)
+        for credential in dead[:max(0, len(dead) - AGENT_DEAD_CREDENTIALS_KEPT)]:
+            self.state['credentials'].pop(credential['id'], None)
+            self.state['credential_tokens'].pop(credential.get('token_hash'), None)
+
+    def _agent_credentials_shown(self, agent):
+        """What an agent read carries: bounded whether or not anything was pruned yet (a
+        credential also stops working by expiry, with no write)."""
+        moment = self._expiry_now()
+        rows = sorted(self._agent_credentials(agent), key=self._credential_age)
+        live = [c for c in rows if self._credential_live(c, moment)]
+        dead = [c for c in rows if not self._credential_live(c, moment)][-AGENT_DEAD_CREDENTIALS_KEPT:]
+        shown = sorted(live + dead, key=self._credential_age)
+        return [dict(self.credential_view(c), working=self._credential_live(c, moment)) for c in shown]
 
     def agent_view(self, agent, principal):
         """The owner-visible agent record. The path never leaks to anyone else."""
         owner_sees_path = bool(principal.superuser or
                                principal.user_id == agent['owner'])
+        scopes, source = self.agent_scopes(agent)
         view = {
             'id': agent['id'], 'name': agent['name'], 'owner': agent['owner'],
             'owner_display_name': self._owner_name(agent['owner']),
@@ -1902,7 +2612,21 @@ class Service:
             'projects': list(agent.get('projects') or []),
             'created_at': agent.get('created_at'),
             'last_seen_at': agent.get('last_seen_at'),
-            'credentials': [self.credential_view(c) for c in self._agent_credentials(agent)],
+            # Every credential that works (at most AGENT_MAX_CREDENTIALS) and the newest few that
+            # do not; ``working`` says which is which (an expired one is not ``revoked``).
+            'credentials': self._agent_credentials_shown(agent),
+            # What the agent may do, which is what a new credential for it carries when no list
+            # is sent (kittrial-5bb.208); null when nothing says. ``scopes_source``: ``set`` (kept on
+            # the agent record: given when it was made or by a renewal that sent a list),
+            # ``inferred`` (an agent made before the record kept them: read from its working
+            # credentials, which all carry the same) or ``unknown``.
+            'scopes': None if scopes is None else list(scopes),
+            'scopes_source': source,
+            # The different scope lists its WORKING credentials carry, when they do not all carry
+            # the same; else []. A read for whoever reads the agent record: its account, a
+            # superuser, and the agent itself on /v1/agents/me. It says only that they differ:
+            # an account may have narrowed its agent on purpose and left the older credential.
+            'scopes_differ': self.agent_scope_differences(agent),
         }
         if owner_sees_path:
             view['working_directory'] = agent.get('working_directory')
@@ -2049,9 +2773,10 @@ class Service:
         # Where each granted project's repository is, as its owner recorded it
         # (kittrial-5bb.118). A label for the person setting the agent up: it is listed
         # beside the setup text, never inside the commands, and nothing runs it.
-        repositories = [{'project': pid, 'repository': self.state['projects'][pid]['repository']}
-                        for pid in config['projects']
-                        if self.state['projects'].get(pid, {}).get('repository')]
+        # Read once per project, as today's rule reads it: a stored value that no longer
+        # passes is left out (kittrial-5bb.123).
+        readable = ((pid, self.stored_repository(self.state['projects'].get(pid))[0]) for pid in config['projects'])
+        repositories = [{'project': pid, 'repository': value} for pid, value in readable if value]
         return {
             'config_path': AGENT_CONFIG_PATH,
             'config': config,
@@ -2071,15 +2796,50 @@ class Service:
                         % (secret_file['windows'], secret_file['posix'], AGENT_SECRET_ENV),
         }
 
+    def agent_scope_differences(self, agent):
+        """The distinct scope lists of an agent's working credentials, when there is more than one."""
+        moment = self._expiry_now()
+        lists = {tuple(scope for scope in CREDENTIAL_SCOPES if scope in (credential.get('scopes') or ()))
+                 for credential in self._agent_credentials(agent) if self._credential_live(credential, moment)}
+        return [list(item) for item in sorted(lists)] if len(lists) > 1 else []
+
+    #: Said when nothing says what the agent may do. The page then asks its account to choose.
+    SCOPES_NEEDED = ('Nothing says what this agent may do: its record holds no scopes, and its credentials '
+                     'that still work do not say (there is none, or they do not all allow the same). Send the '
+                     'scopes it should have, for example "scopes": ["read"] for an agent that only reads')
+
     def _issue_agent_credential_locked(self, principal, agent, scopes=None, label=None):
-        """Create one agent credential. Caller holds ``store.lock`` and has authorized."""
-        requested = tuple(scopes or AGENT_DEFAULT_SCOPES)
-        for scope in requested:
-            if scope not in CREDENTIAL_SCOPES:
-                raise invalid('Unknown credential scope %r' % (scope,))
-        if len(self._agent_credentials(agent)) >= AGENT_MAX_CREDENTIALS:
-            raise conflict('An agent may hold at most %d credentials'
+        """Create one agent credential. Caller holds ``store.lock`` and has authorized.
+
+        With no list it carries exactly what the agent has (:meth:`agent_scopes`), and where
+        nothing says what that is, it is refused with a sentence that asks for the list. A
+        list sets what the agent has from now on: taken from anybody who may renew the agent
+        when it asks for nothing more, and from the agent's own account alone when it widens
+        (the one caller who could have made the agent with those scopes). Nothing is changed
+        by a request that is refused.
+        """
+        requested = self._scope_names(scopes)
+        has, _ = self.agent_scopes(agent)
+        if requested is None:
+            if has is None:
+                raise conflict(self.SCOPES_NEEDED, {'scopes_needed': True})
+        else:
+            more = [scope for scope in CREDENTIAL_SCOPES if scope in requested and scope not in (has or ())]
+            if more and principal.user_id != agent['owner']:
+                raise forbidden('This agent has %s. Only its own account may give it more (asked for beyond that: %s)'
+                                % (', '.join(has) if has else 'no scopes on record', ', '.join(more)))
+        # Twenty that still work. A revoked or expired credential is not counted: counted,
+        # the twentieth renewal of an agent was refused for good.
+        moment = self._expiry_now()
+        if sum(1 for credential in self._agent_credentials(agent)
+               if self._credential_live(credential, moment)) >= AGENT_MAX_CREDENTIALS:
+            raise conflict('An agent may hold at most %d credentials that still work; revoke one first'
                            % AGENT_MAX_CREDENTIALS)
+        if requested is not None:
+            agent['scopes'], agent['scopes_source'] = list(requested), 'set'
+        elif not isinstance(agent.get('scopes'), list):
+            agent['scopes'], agent['scopes_source'] = list(has), 'inferred'
+        requested = tuple(agent['scopes'])
         secret = new_token()
         moment = self._expiry_now()
         credential = {
@@ -2099,6 +2859,7 @@ class Service:
         }
         self.state['credentials'][credential['id']] = credential
         self.state['credential_tokens'][token_hash(secret)] = credential['id']
+        self._prune_agent_credentials(agent)
         return credential, secret
 
     def create_agent(self, principal, *, name, tool=None, working_directory=None,
@@ -2121,6 +2882,9 @@ class Service:
                 raise conflict('At most %d agents per account' % AGENT_MAX_PER_OWNER)
             self._check_agent_file_name(principal.user_id, clean_name)
             granted = self._agent_projects(principal, projects)
+            # What the agent may do is kept on its record from here on (kittrial-5bb.208): the
+            # list asked for, or the default. Judged before anything is written.
+            made_with = self._scope_names(scopes) or tuple(AGENT_DEFAULT_SCOPES)
             agent_id = 'agent_' + secrets.token_hex(8)
             agent = {
                 'id': agent_id, 'name': clean_name, 'owner': principal.user_id,
@@ -2128,10 +2892,10 @@ class Service:
                 'machine': machine, 'notes': notes, 'enabled': True,
                 'projects': granted, 'created_at': now_iso(self._now()),
                 'last_seen_at': None,
+                'scopes': list(made_with), 'scopes_source': 'set',
             }
             self.state['agents'][agent_id] = agent
-            credential, secret = self._issue_agent_credential_locked(principal, agent,
-                                                                     scopes=scopes)
+            credential, secret = self._issue_agent_credential_locked(principal, agent)
             self.store.save()
             # The one-time secret travels only in this response.
             public = {
@@ -2255,6 +3019,7 @@ class Service:
                     credential.get('agent_id') != agent['id']:
                 raise not_found('Credential not found')
             credential['revoked'] = True
+            self._prune_agent_credentials(agent)
             self.store.save()
         return {'id': credential_id, 'agent': agent['id'], 'revoked': True}
 
@@ -2336,14 +3101,42 @@ class Service:
             })
         return digest
 
-    def idempotency_commit(self, digest, status, response):
+    def idempotency_commit(self, digest, status, response, written_at=None):
+        """Keep the answer of a committed write for a retry; ``written_at`` is the server's time of the write.
+
+        The time is kept beside the answer and not only in it, because an answer that is a
+        JSON list or empty has no field for it and its retry must carry the same header
+        (kittrial-5bb.97).
+        """
         if digest is None:
             return
         with self.store.lock:
             record = self.store.records.get('idempotency', digest)
             if record is not None:
                 record.update(state='committed', status=status, response=response)
+                if written_at is not None:
+                    record['written_at'] = written_at
                 self.store.records.put('idempotency', digest, record)
+
+    def idempotency_written_at(self, principal, project_id, route, key):
+        """The server's time kept with the committed answer of this request, or None.
+
+        An answer stored before the time was kept beside it has it only in its body, when
+        that is an object with ``server_time``.
+        """
+        if key is None:
+            return None
+        digest = self._idempotency_key(principal, project_id, route, key)
+        with self.store.lock:
+            record = self.store.records.get('idempotency', digest)
+        if not isinstance(record, dict) or record.get('state') != 'committed':
+            return None
+        kept = record.get('written_at')
+        if isinstance(kept, str):
+            return kept
+        body = record.get('response')
+        inside = body.get('server_time') if isinstance(body, dict) else None
+        return inside if isinstance(inside, str) else None
 
     def idempotency_unknown(self, digest):
         if digest is None:
@@ -2372,10 +3165,23 @@ class Service:
         """Whether the record store holds a result for ``key`` (a stored ``None`` counts)."""
         return self.store.records.get('result', key) is not None
 
-    def result_put(self, key, value):
-        """Record one committed canonical result with time-only retention."""
-        self.store.records.put('result', key, {'result': value},
-                              ttl=self.result_retention)
+    def result_put(self, key, value, written_at=None):
+        """Record one committed canonical result with time-only retention.
+
+        ``written_at`` is the server's time of the write, kept with the result: a retry
+        that is answered from this row (its idempotency row gone, or never committed) must
+        carry the time of the write and not the time of the retry (kittrial-5bb.97).
+        """
+        record = {'result': value}
+        if isinstance(written_at, str):
+            record['written_at'] = written_at
+        self.store.records.put('result', key, record, ttl=self.result_retention)
+
+    def result_written_at(self, key):
+        """The server's time kept with the result for ``key``; None when there is no row or it kept none."""
+        record = self.store.records.get('result', key)
+        kept = record.get('written_at') if isinstance(record, dict) else None
+        return kept if isinstance(kept, str) else None
 
     # -- HTTP-facing copies (never expose secrets) -----------------------------
     def export_state(self):

@@ -128,7 +128,10 @@ class RuntimeCase(unittest.TestCase):
         (self.root / 'deployment.private.json').write_text(json.dumps(
             {'port': 13317, 'unit': 'beads-example.service', 'password': 'test-only-password',
              'schema': 1}), encoding='utf-8')
-        fake = types.SimpleNamespace(flock=Mock(), LOCK_EX=2)
+        # ``restore-new`` runs ``add-project``, which takes the creation lock too
+        # (kittrial-5bb.176), so the stand-in needs the whole fcntl surface
+        # ``http_authority.file_lock`` uses.
+        fake = types.SimpleNamespace(flock=Mock(), LOCK_EX=2, LOCK_NB=4, LOCK_UN=8)
         self.fcntl = fake
         patcher = patch.dict(sys.modules, {'fcntl': fake})
         patcher.start()
@@ -481,13 +484,17 @@ class SyncClientHandleCase(RuntimeCase):
                           encoding='utf-8')
         script.chmod(0o755)
 
+        never_started = []
+
         def terminate_when_running():
-            for _ in range(200):
-                if pids.is_file():
+            for _ in range(600):
+                if pids.is_file() and pids.read_text().strip():
                     break
                 time.sleep(0.05)
             else:
-                return
+                # Stop anyway, so the test fails at once and says why, rather than waiting
+                # for the client's 30 s sleep (kittrial-5bb.132).
+                never_started.append(True)
             time.sleep(0.3)
             os.kill(os.getpid(), signal.SIGTERM)
 
@@ -498,7 +505,8 @@ class SyncClientHandleCase(RuntimeCase):
             with self.assertRaises(admin.TerminatedBySignal):
                 admin.backup_project(self.root, 'alpha')
         finally:
-            killer.join(15)
+            killer.join(40)
+        self.assertEqual(never_started, [], 'the fake client did not start within 30 s')
         self.assertTrue(pids.is_file(), 'the fake sync client never started')
         client_pid, child_pid = (int(value) for value in pids.read_text().split())
         self.assertNotEqual(client_pid, os.getpid())
@@ -1014,6 +1022,214 @@ class TerminationGuardRealSignalCase(unittest.TestCase):
         self.assertEqual(outcome, ['raised'])
         self.assertFalse(inner.held)
         self.assert_restored()
+
+    def abandon(self, held=False, cycle=False):
+        """A guard entered through an ExitStack whose callbacks are then dropped, so its
+        exit never runs; returned in a one-item list the caller empties."""
+        import contextlib
+        stack = contextlib.ExitStack()
+        guard = stack.enter_context(admin.signal_termination_guard())
+        stack.pop_all()
+        guard.held = held
+        if cycle:
+            guard.cycle = guard               # only the cycle collector frees it
+        return [guard]
+
+    def drop_on_another_thread(self, box):
+        errors = []
+        old_hook = threading.excepthook
+        threading.excepthook = errors.append
+        try:
+            worker = threading.Thread(target=box.pop)
+            worker.start()
+            worker.join()
+        finally:
+            threading.excepthook = old_hook
+        self.assertEqual(errors, [])
+
+    def test_a_guard_dropped_on_another_thread_leaves_a_record_the_next_stop_releases(self):
+        # kittrial-5bb.125: its finaliser ran off the main thread, could not restore the
+        # handler, and the next stop raised TerminatedBySignal outside any guard and left
+        # SIG_IGN. Now the finaliser does nothing there; the dead record it leaves is
+        # released by the next stop, which then reaches the previous handler, once.
+        box = self.abandon()
+        unraisable = []
+        old_hook = sys.unraisablehook
+        sys.unraisablehook = unraisable.append
+        try:
+            self.drop_on_another_thread(box)
+        finally:
+            sys.unraisablehook = old_hook
+        self.assertEqual(unraisable, [])
+        self.assertIs(signal.getsignal(signal.SIGTERM), admin.raise_termination)
+        self.assertEqual([record.ref() for record in admin._termination_guards], [None])
+        signal.pthread_kill(threading.main_thread().ident, signal.SIGTERM)   # a real stop, no guard around it
+        self.settle()
+        self.assertEqual(self.received, [signal.SIGTERM])
+        self.assert_restored()
+
+    def test_a_stop_owed_by_a_guard_dropped_on_another_thread_reaches_the_previous_handler_at_the_next_guard(self):
+        box = self.abandon(held=True)
+        self.drop_on_another_thread(box)
+        self.assertEqual(self.received, [])           # nothing was sent from that thread
+        with admin.signal_termination_guard():
+            self.assertEqual(self.received, [signal.SIGTERM])   # sent on as the next guard begins
+            self.assertEqual(len(admin._termination_guards), 1)
+        self.settle()
+        self.assertEqual(self.received, [signal.SIGTERM])
+        self.assert_restored()
+
+    def test_a_stop_owed_by_a_guard_dropped_on_another_thread_goes_before_the_next_stop(self):
+        box = self.abandon(held=True)
+        self.drop_on_another_thread(box)
+        signal.pthread_kill(threading.main_thread().ident, signal.SIGTERM)
+        self.settle()
+        self.assertEqual(self.received, [signal.SIGTERM, signal.SIGTERM])   # the owed stop, then this one
+        self.assert_restored()
+
+    def test_a_previous_handler_that_raises_does_not_escape_the_finaliser(self):
+        # The finaliser sends an owed stop on to the previous handler; a handler that raises
+        # (here a BaseException, as KeyboardInterrupt or SystemExit would be) cannot raise
+        # out of a finaliser usefully, and must not print "Exception ignored".
+        class Stopped(BaseException):
+            pass
+
+        def previous(signum, frame):
+            self.received.append(signum)
+            raise Stopped()
+
+        signal.signal(signal.SIGTERM, previous)
+        unraisable = []
+        old_hook = sys.unraisablehook
+        sys.unraisablehook = unraisable.append
+        try:
+            box = self.abandon(held=True)
+            box.pop()                         # collected here, on the main thread
+        finally:
+            sys.unraisablehook = old_hook
+        self.assertEqual(unraisable, [])
+        self.assertEqual(self.received, [signal.SIGTERM])
+        self.assertIs(signal.getsignal(signal.SIGTERM), previous)
+        self.assertEqual(admin._termination_guards, [])
+        signal.signal(signal.SIGTERM, self.previous)
+
+    def test_nested_guards_dropped_on_another_thread_give_back_the_outermost_previous_handler(self):
+        outer = self.abandon()
+        inner = self.abandon()                # its previous handler is raise_termination
+        self.drop_on_another_thread(inner)
+        self.drop_on_another_thread(outer)
+        self.assertEqual(len(admin._termination_guards), 2)
+        signal.pthread_kill(threading.main_thread().ident, signal.SIGTERM)
+        self.settle()
+        self.assertEqual(self.received, [signal.SIGTERM])
+        self.assert_restored()
+
+    def test_a_dead_record_outside_a_live_guard_waits_for_that_guard(self):
+        # Only dead records inside every live one are released: an abandoned OUTER guard's
+        # record stays while a guard it encloses is active, so the live guard keeps its
+        # rules, and is released once that guard has exited.
+        outer = self.abandon()
+        with self.assertRaises(admin.TerminatedBySignal):
+            with admin.signal_termination_guard():
+                self.drop_on_another_thread(outer)
+                signal.pthread_kill(threading.main_thread().ident, signal.SIGTERM)
+                sum(range(10))
+        self.assertEqual(len(admin._termination_guards), 1)
+        self.assertIs(signal.getsignal(signal.SIGTERM), admin.raise_termination)
+        signal.pthread_kill(threading.main_thread().ident, signal.SIGTERM)
+        self.settle()
+        self.assertEqual(self.received, [signal.SIGTERM])
+        self.assert_restored()
+
+    def test_a_stop_owed_by_a_guard_collected_inside_a_live_one_is_raised_by_that_one(self):
+        # Sent on from the finaliser, it would be raised by the live guard's handler inside
+        # the finaliser and swallowed there; the live guard raises it at its exit instead.
+        unraisable = []
+        old_hook = sys.unraisablehook
+        sys.unraisablehook = unraisable.append
+        try:
+            with self.assertRaises(admin.TerminatedBySignal):
+                with admin.signal_termination_guard():
+                    box = self.abandon(held=True)
+                    box.pop()                 # collected here, on the main thread
+                    self.assertEqual(len(admin._termination_guards), 1)
+        finally:
+            sys.unraisablehook = old_hook
+        self.assertEqual(unraisable, [])
+        self.settle()
+        self.assertEqual(self.received, [])
+        self.assert_restored()
+
+    def test_a_real_stop_while_the_collector_releases_a_guard_is_not_lost(self):
+        # kittrial-5bb.125: the finaliser of a cycle-collected guard runs after its weak
+        # reference is cleared; a stop during its release printed "Exception ignored in
+        # __del__", was lost and left SIG_IGN and a dead record. A real SIGTERM is sent at
+        # each call into Lib/signal.py the finaliser makes, one per trial.
+        import gc
+        index = 0
+        while True:
+            del self.received[:]
+            box = self.abandon(cycle=True)
+            box.pop()
+            seen = []
+
+            def profile(frame, event, arg):
+                if (event == 'call' and frame.f_code.co_filename == signal.__file__
+                        and self.under(frame, admin.signal_termination_guard.__del__.__code__)):
+                    if len(seen) == index:
+                        signal.pthread_kill(threading.main_thread().ident, signal.SIGTERM)
+                    seen.append(frame.f_code.co_name)
+
+            unraisable = []
+            old_hook = sys.unraisablehook
+            sys.unraisablehook = unraisable.append
+            sys.setprofile(profile)
+            try:
+                gc.collect()
+            finally:
+                sys.setprofile(None)
+                sys.unraisablehook = old_hook
+            self.settle()
+            if len(seen) <= index:
+                del self.received[:]
+                break
+            with self.subTest(call=index, wrapper=seen[index]):
+                self.assertEqual(unraisable, [])
+                self.assertEqual(self.received, [signal.SIGTERM])
+                self.assert_restored()
+            index += 1
+        self.assertGreaterEqual(index, 3)
+
+    @staticmethod
+    def under(frame, code):
+        while frame is not None:
+            if frame.f_code is code:
+                return True
+            frame = frame.f_back
+        return False
+
+    def test_at_interpreter_exit_an_abandoned_guard_keeps_the_exit_status(self):
+        # kittrial-5bb.125: with a stop recorded and SIG_DFL before it, the finaliser at
+        # exit sent the stop on and the process died by SIGTERM (-15) instead of exiting
+        # with the status it was asked for. The process is already ending; the status is
+        # kept, with or without a recorded stop.
+        script = (
+            'import contextlib, signal, sys\n'
+            'sys.path.insert(0, %r)\n'
+            'import admin\n'
+            'signal.signal(signal.SIGTERM, signal.SIG_DFL)\n'
+            'stack = contextlib.ExitStack()\n'
+            'GUARD = stack.enter_context(admin.signal_termination_guard())\n'
+            'stack.pop_all()\n'
+            'GUARD.held = %r\n'
+            'sys.exit(3)\n')
+        repo = str(Path(admin.__file__).resolve().parent)
+        for held in (False, True):
+            with self.subTest(held=held):
+                result = subprocess.run([sys.executable, '-c', script % (repo, held)],
+                                        capture_output=True, text=True, timeout=60)
+                self.assertEqual(result.returncode, 3, result.stderr)
+                self.assertNotIn('Exception ignored', result.stderr)
 
     @staticmethod
     def in_inner_exit(frame, inner):

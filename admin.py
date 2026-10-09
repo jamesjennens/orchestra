@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
 """Operator commands for an isolated, user-systemd Beads/Dolt deployment."""
+import sys
+if sys.version_info < (3, 10):
+    # Before every other import, and in syntax Python 3.6 reads: an older interpreter failed in
+    # an import further down, with a traceback that hid the cause (kittrial-5bb.191).
+    sys.stderr.write('admin.py needs Python 3.10 or newer and was started with Python %d.%d.%d (%s). '
+                     'Nothing was carried out. Run it with Python 3.10 or newer; on an office installation that is the bundled interpreter, INSTALL_ROOT/current/python-runtime/....\n'
+                     % (sys.version_info[0], sys.version_info[1], sys.version_info[2], sys.executable))
+    sys.exit(2)
 import argparse
 import base64
 import contextlib
@@ -13,6 +21,7 @@ import secrets
 import signal
 import socket
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -22,6 +31,7 @@ import weakref
 from pathlib import Path
 from contextlib import contextmanager
 from bootstrap import install as install_binaries
+import record_json
 from requirements import content_hash
 from urllib.parse import unquote, urlsplit
 from urllib.request import url2pathname
@@ -78,15 +88,59 @@ class TerminatedBySignal(BaseException):
 # The active termination guards, innermost last (kittrial-5bb.122). raise_termination
 # consults them, so a stop that the interpreter runs late - at whatever bytecode
 # boundary follows the signal - still lands on the guard's rules. Only the main thread
-# installs a handler, so only main-thread guards are listed. The list holds weak
-# references (kittrial-5bb.124): a guard whose exit never runs - left behind by
+# installs a handler, so only main-thread guards are listed. A record holds the guard
+# weakly (kittrial-5bb.124): a guard whose exit never runs - left behind by
 # contextlib.ExitStack when a stop lands between the block and the exit - is not kept
-# alive by its record, so its finaliser can release it.
+# alive by its record, so its finaliser can release it. The record also keeps what a
+# release needs (kittrial-5bb.125): a guard collected where its finaliser cannot
+# release it - on another thread, where signal.signal is refused - leaves a dead
+# record that the main thread releases at its next chance (_reap_abandoned).
 _termination_guards=[]
+
+class _GuardRecord:
+    """One listed guard: a weak reference to it, the handler it replaced, and whether a
+    stop it recorded is still owed to that handler once the guard is gone."""
+    __slots__=('ref','previous','held')
+
+    def __init__(self,guard,previous):
+        self.ref=weakref.ref(guard)
+        self.previous=previous
+        self.held=False
 
 def _listed_guards():
     """The listed guards still alive, innermost last."""
-    return [guard for guard in (ref() for ref in _termination_guards) if guard is not None]
+    return [guard for guard in (record.ref() for record in _termination_guards) if guard is not None]
+
+def _reap_abandoned():
+    """Release the records of guards that were collected without being released: dead
+    records after the last live one (kittrial-5bb.125).
+
+    Runs only on the main thread, where the handler can be restored: in the handler
+    itself and at the start of every guard's ``__enter__``. The outermost of those
+    records names the handler that was installed before them; it is put back if
+    ``raise_termination`` is still installed. Returns whether one of them had recorded
+    a stop, which the caller then sends to the handler now installed."""
+    if threading.current_thread() is not threading.main_thread():
+        return False
+    live=[index for index,record in enumerate(_termination_guards) if record.ref() is not None]
+    first=live[-1]+1 if live else 0
+    dead=_termination_guards[first:]
+    if not dead:
+        return False
+    del _termination_guards[first:]
+    try:
+        if signal.getsignal(signal.SIGTERM) is raise_termination:
+            signal.signal(signal.SIGTERM,dead[0].previous)
+    except _TERMINATION_ERRORS:
+        pass
+    return any(record.held for record in dead)
+
+def _resend_sigterm():
+    """Send a stop to whatever handler is installed now (it runs at once)."""
+    try: signal.raise_signal(signal.SIGTERM)
+    except _TERMINATION_ERRORS:
+        try: os.kill(os.getpid(),signal.SIGTERM)
+        except _TERMINATION_ERRORS: pass
 
 _TERMINATION_ERRORS=(ValueError,OSError,RuntimeError,AttributeError,TypeError)
 
@@ -102,7 +156,9 @@ def _running_guard(frame):
     caller's frame, never under ``__enter__`` or ``__exit__``, so a stop in the block is
     not mistaken for one in the guard's code. A guard that is no longer listed (its
     exit has unlisted it) does not count: a stop handled in its last lines belongs to
-    the guards still listed, or to the previous handler."""
+    the guards still listed, or to the previous handler. A guard the collector is
+    finalising has lost its weak reference and does not count either: the handler first
+    releases its dead record (``_reap_abandoned``) and passes the stop on."""
     listed=_listed_guards()
     while frame is not None:
         if frame.f_code in _GUARD_CODES:
@@ -138,7 +194,16 @@ def raise_termination(signum,frame):
     raised, so the block does not run (kittrial-5bb.124). ``raise_signal`` or
     ``interrupt_main`` cannot defer it to the block: the interpreter runs the handler
     again at its next check, which is still inside this handler.
+
+    Guards that were collected without being released are released first
+    (``_reap_abandoned``). If that puts the previous handler back, this stop is that
+    handler's: it is sent on to it, after any stop those guards had recorded.
     """
+    if _reap_abandoned():
+        _resend_sigterm()
+    if signal.getsignal(signum) is not raise_termination:
+        _resend_sigterm()
+        return
     listed=_listed_guards()
     if listed:
         guard,code=_running_guard(frame)
@@ -234,6 +299,8 @@ class signal_termination_guard:
     def __enter__(self):
         if threading.current_thread() is not threading.main_thread():
             return self
+        if _reap_abandoned():
+            _resend_sigterm()   # owed to the handler the abandoned guards replaced
         try:
             previous=signal.getsignal(signal.SIGTERM)
         except _TERMINATION_ERRORS:
@@ -241,7 +308,8 @@ class signal_termination_guard:
         if previous is None:
             return self   # installed outside Python: it could not be restored
         self.previous=previous
-        _termination_guards.append(weakref.ref(self))
+        self._record=_GuardRecord(self,previous)
+        _termination_guards.append(self._record)
         self.listed=True
         try:
             signal.signal(signal.SIGTERM,raise_termination)
@@ -268,12 +336,35 @@ class signal_termination_guard:
         ``contextlib.ExitStack`` can drop it when a stop lands in its own code between the
         block and the guard's exit. Release it here, so the previous handler is back and
         no stopped record outlives it; a stop it had recorded goes to the previous
-        handler, as for an abandoned block. The kit itself uses plain ``with``."""
+        handler, as for an abandoned block, or, while an outer guard is still active, to
+        the innermost of those, which raises it at its exit. The kit itself uses plain
+        ``with``.
+
+        Only on the main thread (kittrial-5bb.125): elsewhere ``signal.signal`` is refused,
+        and a stop sent from there would be raised in the main thread wherever it happens
+        to be. There the guard only notes a stop it owes; its record stays, dead, until
+        the main thread's next stop or next guard releases it (``_reap_abandoned``). At
+        interpreter exit the guard is released but a stop it recorded is not sent on: the
+        process is already ending, and the exit status it was asked to end with is kept
+        rather than replaced by death by ``SIGTERM``. Nothing raised here can escape a
+        finaliser usefully, so every exception, ``BaseException`` included, stops here."""
         try:
-            if self.listed:
-                self._release()
+            if not self.listed:
+                return
+            if threading.current_thread() is not threading.main_thread():
+                self._record.held=self.held and not self.stopped
+                return
+            self._release()
+            live=_listed_guards()
+            if live:
+                # Sent on now, the stop would be raised by an outer guard's handler inside
+                # this finaliser, where nothing can catch it: the innermost live guard
+                # takes it instead and raises it at its exit.
+                if self.held and not self.stopped and not any(guard.stopped for guard in live):
+                    live[-1].held=True
+            elif not sys.is_finalizing():
                 self._raise_held(True)
-        except Exception:
+        except BaseException:
             pass
 
     def _release(self):
@@ -299,7 +390,8 @@ class signal_termination_guard:
                     except _TERMINATION_ERRORS: pass
             finally:
                 self.listed=False
-                _termination_guards[:]=[ref for ref in _termination_guards if ref() is not None and ref() is not self]
+                record=getattr(self,'_record',None)
+                _termination_guards[:]=[listed for listed in _termination_guards if listed is not record]
 
     def _raise_held(self,abandoned):
         """Raise a stop recorded in the guard's own code, once for all guards."""
@@ -307,10 +399,7 @@ class signal_termination_guard:
             return
         self.stopped=True
         if abandoned:
-            try: signal.raise_signal(signal.SIGTERM)
-            except _TERMINATION_ERRORS:
-                try: os.kill(os.getpid(),signal.SIGTERM)
-                except _TERMINATION_ERRORS: pass
+            _resend_sigterm()
             return
         _stop_guards()
         raise TerminatedBySignal(signal.SIGTERM)
@@ -471,8 +560,49 @@ def read_json_file(path,what,encoding=None):
     except ValueError as error:
         raise ValueError('%s %s is not valid JSON: %s'%(what,path,error)) from None
 
+class ConfigurationUnreadable(ValueError):
+    """``deployment.private.json`` cannot be used as it is. The message names the file, for the operator.
+
+    Not JSON, not text, not a JSON object, or a setting in it of the wrong kind. A
+    ``ValueError`` with the words it always had where it had any, so every host command
+    says what it said. Its own class so that the endpoint can mark the answer as a fault of
+    the server and the web service can keep the path from the people it serves
+    (kittrial-5bb.156). A file that cannot be OPENED keeps its ``OSError`` here (it names the
+    path already); the endpoint marks that one too (``endpoint.configuration_fault``).
+    """
+
+def deployment_document(marker):
+    """The parsed ``deployment.private.json`` at ``marker``, a JSON object; anything else is :class:`ConfigurationUnreadable`.
+
+    Only a regular file is read. A FIFO in its place would block the reader until somebody
+    wrote to it, and a directory has nothing to parse: both are refused at once, by opening
+    without waiting and looking at what was opened (review of kittrial-5bb.156). A file that
+    is not there, or cannot be opened, keeps its ``OSError``.
+    """
+    descriptor=os.open(str(marker),os.O_RDONLY|getattr(os,'O_NONBLOCK',0))
+    try:
+        import stat
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ConfigurationUnreadable('Deployment configuration %s is not a regular file'%marker)
+    finally:
+        os.close(descriptor)
+    try:
+        document=read_json_file(marker,'Deployment configuration')
+    except ValueError as error:
+        raise ConfigurationUnreadable(str(error)) from None
+    if not isinstance(document,dict):
+        raise ConfigurationUnreadable('Deployment configuration %s is not a JSON object'%marker)
+    return document
+
+def deployment_password(root):
+    """The database password in the deployment configuration; a file without one is :class:`ConfigurationUnreadable`."""
+    password=config(root).get('password')
+    if not isinstance(password,str):
+        raise ConfigurationUnreadable('Deployment configuration %s has no password'%(root/'deployment.private.json'))
+    return password
+
 def config(root):
-    return read_json_file(root/'deployment.private.json','Deployment configuration')
+    return deployment_document(root/'deployment.private.json')
 
 def operators(root, strict=False):
     """Server-side operator allowlist for void records.
@@ -494,10 +624,10 @@ def operators(root, strict=False):
     found=[]
     marker=root/'deployment.private.json'
     if marker.is_file():
-        value=read_json_file(marker,'Deployment configuration').get('operators')
+        value=deployment_document(marker).get('operators')
         if isinstance(value,list):found.extend(value)
         elif isinstance(value,str):found.append(value)
-        elif value is not None:raise ValueError('deployment operators must be a list of actor identities')
+        elif value is not None:raise ConfigurationUnreadable('deployment operators must be a list of actor identities')
     from recovery import configured_operators
     allowed=configured_operators(found)
     if strict:
@@ -508,7 +638,7 @@ def operators(root, strict=False):
                              'or unset ORCHESTRA_OPERATORS before this command.')
     return allowed
 
-def review_workflow_writes(root, strict=False):
+def review_workflow_writes(root, strict=False, warnings=None):
     """The per-installation switch for WRITING the new review-workflow shapes.
 
     kittrial-5bb.94 item 3 asked for a two-step ship: this kit's READERS understand
@@ -522,16 +652,424 @@ def review_workflow_writes(root, strict=False):
     it is a deployment capability, and the endpoint supplies it to the review write
     path. The coordinator turns it on (`admin.py review-writes on --actor OPERATOR`)
     once the rollback target is a kit that reads the new shapes.
+
+    A value that is neither true/false nor absent is read as OFF with a warning
+    (kittrial-5bb.110 item 2): raising made `work` and `review TASK` fail for every
+    actor on the installation while `brief` still answered. When `warnings` is a
+    list the warning is appended to it (the endpoint surfaces it on stderr);
+    otherwise it is printed to stderr here.
     """
     enabled = False
     marker = root/'deployment.private.json'
     if marker.is_file():
-        value = read_json_file(marker,'Deployment configuration').get('review_workflow_writes')
+        value = deployment_document(marker).get('review_workflow_writes')
         if isinstance(value,bool):
             enabled = value
         elif value is not None:
-            raise ValueError('deployment review_workflow_writes must be true or false')
+            message = ('deployment review_workflow_writes is %r, not true or false; reading it as off '
+                       '(no new-shaped review write is allowed)' % (value,))
+            if warnings is not None:
+                warnings.append('WARNING: ' + message)
+            else:
+                print('WARNING: ' + message,file=sys.stderr)
     return enabled
+
+#: The key of the checkpoint switch's audit list inside deployment.private.json, and the
+#: prefix a damaged value is kept aside under (kittrial-5bb.131).
+CHECKPOINT_AUDIT_KEY='checkpoint_provenance_audit'
+
+#: The fields of one audit entry, exactly as every kit since kittrial-5bb.1 writes them.
+CHECKPOINT_AUDIT_FIELDS=frozenset({'actor','at','action','previous','enabled'})
+
+def checkpoint_audit_entry(item):
+    """Whether one audit entry has the shape ``checkpoint-provenance-writes`` writes."""
+    return (isinstance(item,dict) and set(item)==CHECKPOINT_AUDIT_FIELDS
+            and isinstance(item['actor'],str) and isinstance(item['at'],str)
+            and item['action'] in ('on','off') and isinstance(item['previous'],bool)
+            and isinstance(item['enabled'],bool))
+
+def checkpoint_provenance_audit(cfg):
+    """``(entries, damage)`` for the checkpoint switch audit in a deployment config.
+
+    A list of entries of the written shape reads as the history; anything else is
+    ``([], reason)``: not a list (kittrial-5bb.131), or an entry that is not a record of
+    exactly the fields the switch writes (kittrial-5bb.136; a list of arbitrary objects
+    used to count as a readable history). The reason names what is there, never its
+    content."""
+    value=cfg.get(CHECKPOINT_AUDIT_KEY,[])
+    if not isinstance(value,list):
+        return [],'%s is a %s, not a list of records'%(CHECKPOINT_AUDIT_KEY,type(value).__name__)
+    for index,item in enumerate(value):
+        if not checkpoint_audit_entry(item):
+            return [],'entry %d of %s is not a record of the shape the switch writes'%(index,CHECKPOINT_AUDIT_KEY)
+    return value,None
+
+def checkpoint_provenance_switch(root,action,actor):
+    """Read or flip ``checkpoint_provenance_writes`` with its operator audit.
+
+    A flip holds the deployment switch lock (``review_writes_lock``) across the whole
+    read-modify-write of deployment.private.json, as ``review-writes`` does: without it
+    two simultaneous flips each rewrote the file from the same read and one audit entry
+    was lost (kittrial-5bb.131: 18 of 24 recorded). The one lock serialises both switches,
+    which rewrite the same file.
+
+    A damaged audit (``checkpoint_provenance_audit`` not a list of records, a hand edit)
+    no longer blocks the switch. ``status`` reads it as an empty history and warns; the
+    next flip keeps the damaged value aside in the same file under
+    ``checkpoint_provenance_audit_damaged_<UTC stamp>`` and starts a fresh list, as
+    ``review-writes`` keeps a damaged audit file aside under a dated name. Warnings go to
+    stderr; the result says whether the audit read."""
+    from briefing import checkpoint_writes_enabled
+    from recovery import identity
+    marker=root/'deployment.private.json'
+    if not marker.is_file():raise ValueError('Deployment is not installed; run install first')
+    actor=identity(actor,'Invalid actor identity')
+    if actor not in operators(root,strict=True):
+        raise ValueError('checkpoint-provenance-writes requires an actor on the deployment operator allowlist')
+    if action not in ('status','on','off'):raise ValueError('Invalid checkpoint provenance switch action')
+    if action=='status':
+        current=checkpoint_writes_enabled(root)
+        audit,damage=checkpoint_provenance_audit(config(root))
+        if damage is not None:
+            print('WARNING: the checkpoint provenance switch audit is damaged (%s); it reads as an empty history. '
+                  'The next on/off keeps it aside in deployment.private.json under %s_damaged_<UTC stamp> and '
+                  'starts a fresh list.'%(damage,CHECKPOINT_AUDIT_KEY),file=sys.stderr)
+        return dict(checkpoint_provenance_writes=current,audit_records=len(audit),audit_readable=damage is None)
+    enabled=action=='on'
+    with review_writes_lock(root):
+        current=checkpoint_writes_enabled(root)
+        cfg=config(root)
+        audit,damage=checkpoint_provenance_audit(cfg)
+        if enabled==current:
+            # A flip that changes nothing writes nothing, as `review-writes` does
+            # (kittrial-5bb.136): the history records changes, and a repeated `on` cannot
+            # rewrite the file or set a damaged audit aside.
+            return dict(checkpoint_provenance_writes=current,audit_records=len(audit),
+                        audit_readable=damage is None,changed=False)
+        if damage is not None:
+            kept='%s_damaged_%s'%(CHECKPOINT_AUDIT_KEY,utc_stamp().replace(':','').replace('-',''))
+            suffix=1
+            while kept+('' if suffix==1 else '_%d'%suffix) in cfg:suffix+=1
+            kept+=('' if suffix==1 else '_%d'%suffix)
+            cfg[kept]=cfg.pop(CHECKPOINT_AUDIT_KEY)
+            print('WARNING: the checkpoint provenance switch audit was damaged (%s); it is kept aside in '
+                  'deployment.private.json as %s and this flip starts a fresh list.'%(damage,kept),file=sys.stderr)
+        if enabled:cfg['checkpoint_provenance_writes']=True
+        else:cfg.pop('checkpoint_provenance_writes',None)
+        cfg[CHECKPOINT_AUDIT_KEY]=audit+[dict(actor=actor,at=utc_stamp(),action=action,
+                                              previous=current,enabled=enabled)]
+        atomic_private_write(marker,json.dumps(cfg))
+    if not enabled:
+        print('Warning: existing provenance tasks refuse new legacy checkpoints; disabling does not make their history readable by older kits.',file=sys.stderr)
+    return dict(checkpoint_provenance_writes=enabled,audit_records=len(audit)+1,audit_readable=True,changed=True)
+
+#: Audit record of the switch flips, beside deployment.private.json. It is
+#: deployment-level (there is one switch per installation, not per project), so it
+#: is not part of any project's coordination backup. `review-writes` writes it under
+#: ``REVIEW_WRITES_LOCK`` so a flip records the value it replaced.
+REVIEW_WRITES_AUDIT = 'review-writes.audit.json'
+REVIEW_WRITES_LOCK = '.review-writes.lock'
+#: The append-only audit history's schema. Version 1 was the single-record form an
+#: earlier kit wrote; it is still READ as its one entry so an upgrade keeps the record.
+REVIEW_WRITES_AUDIT_SCHEMA = 2
+#: How many flips the short history keeps. The audit exists to answer "who turned it
+#: on, when, and who turned it off", not to be an unbounded log.
+REVIEW_WRITES_AUDIT_MAX = 20
+
+
+def _review_writes_entry(record):
+    """Whether one audit entry is the shape `review-writes` writes."""
+    return (isinstance(record,dict) and record.get('schema_version')==1
+            and isinstance(record.get('review_workflow_writes'),bool)
+            and isinstance(record.get('set_by'),str) and isinstance(record.get('set_at'),str)
+            and isinstance(record.get('previous'),bool))
+
+
+def _review_writes_history(record):
+    """``(entries, damage)`` for a decoded audit file; ``damage`` is None when it reads.
+
+    One place decides what a readable audit history is, so the reader and the flip that
+    keeps a DAMAGED file aside cannot disagree (kittrial-5bb.110 item 3 P3). ``not JSON``
+    never reaches here: the caller reports the parse failure itself.
+    """
+    if not isinstance(record,dict):
+        return [],'not a JSON object'
+    if record.get('schema_version')==1:
+        return ([record],None) if _review_writes_entry(record) else ([],'malformed entry')
+    if record.get('schema_version')!=REVIEW_WRITES_AUDIT_SCHEMA:
+        return [],'schema %r is not 1 or %d'%(record.get('schema_version'),REVIEW_WRITES_AUDIT_SCHEMA)
+    entries=record.get('entries')
+    if not isinstance(entries,list):
+        return [],'entries is not a list'
+    kept=[entry for entry in entries if _review_writes_entry(entry)]
+    if len(kept)!=len(entries):
+        return kept,'malformed entr%s'%('y' if len(entries)-len(kept)==1 else 'ies')
+    return kept,None
+
+
+def _read_review_writes_audit(root):
+    """``(entries, damage)`` for the audit file; ``(None, None)`` when it is absent.
+
+    The ONE place the audit file is parsed, so the reader, the damage report and the flip
+    that keeps a damaged file aside cannot disagree (kittrial-5bb.110 item 3 P3).
+    ``damage`` is None when the file is absent or reads cleanly.
+    """
+    path=root/REVIEW_WRITES_AUDIT
+    if not path.is_file():
+        return None,None
+    try:
+        record=record_json.loads(path.read_text(encoding='utf-8'))
+    except (OSError,UnicodeError,ValueError):
+        return [],'unreadable or not valid JSON'
+    return _review_writes_history(record)
+
+
+def _review_writes_audit_damage(root):
+    """Why the audit file is not a readable history, or None when it is absent/readable."""
+    return _read_review_writes_audit(root)[1]
+
+
+def keep_damaged_review_writes_audit(root,stamp=None):
+    """Rename a DAMAGED audit file aside under a dated name; None when it reads cleanly.
+
+    The next flip REPLACES the history with a fresh readable one, so a file this kit
+    cannot read used to be destroyed silently and `status` then reported
+    ``audit_agrees: true`` beside an empty history (kittrial-5bb.110 item 3 P3). The
+    damaged bytes are kept beside the deployment file instead, under
+    ``review-writes.audit.json.damaged-<UTC date-time>`` (``.N`` on collision), and the
+    caller says so. Returns the path kept aside.
+    """
+    if _review_writes_audit_damage(root) is None:
+        return None
+    from datetime import datetime,timezone
+    path=root/REVIEW_WRITES_AUDIT
+    stamp=stamp or datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+    aside=root/('%s.damaged-%s'%(REVIEW_WRITES_AUDIT,stamp))
+    number=1
+    while aside.exists():
+        aside=root/('%s.damaged-%s.%d'%(REVIEW_WRITES_AUDIT,stamp,number));number+=1
+    os.replace(path,aside)
+    return aside
+
+
+def review_writes_audit(root,warnings=None):
+    """The switch-flip history this kit recorded, oldest first; ``[]`` when unreadable.
+
+    A SHORT APPEND-ONLY HISTORY, not the last flip (kittrial-5bb.110 item 3): after one
+    operator turns the switch on and another turns it off, both entries stay, each naming
+    WHO, WHEN and the value replaced, so the audit says how the switch got where it is.
+    Schema 2 is ``{schema_version, entries: [...]}``, bounded to the last
+    ``REVIEW_WRITES_AUDIT_MAX`` flips. The pre-history schema-1 single-record form an
+    older kit wrote is read as its one entry.
+
+    Read through ``record_json.loads``: a deeply nested file raises ``NestingError`` (a
+    ``ValueError``) instead of ``RecursionError``, so `review-writes status` can never
+    die with a traceback. A file that exists but is not a readable history -- not JSON, a
+    list, schema 3, malformed entries -- is reported in `warnings` and the entries that
+    ARE readable are returned, rather than silently reading as "no history"
+    (kittrial-5bb.110 item 3 P3).
+    """
+    entries,damage = _read_review_writes_audit(root)
+    if entries is None:
+        return []
+    if damage is not None and warnings is not None:
+        warnings.append('WARNING: the review-writes audit file %s is damaged (%s); the switch history '
+                        'shown is incomplete, and the next flip keeps the file aside under a dated name '
+                        'before writing a fresh history' % (root/REVIEW_WRITES_AUDIT,damage))
+    return entries
+
+
+def write_review_writes_audit(root, enabled, actor, previous, entries=None):
+    """APPEND who flipped ``review_workflow_writes``, when, and the value replaced.
+
+    The history passed in (`entries`, oldest first) plus the new entry is written as one
+    atomic 0600 record, trimmed to the last ``REVIEW_WRITES_AUDIT_MAX`` flips. The caller
+    holds ``REVIEW_WRITES_LOCK`` for the whole read-modify-write so two concurrent flips
+    cannot lose one another (kittrial-5bb.110 item 3).
+    """
+    from datetime import datetime,timezone
+    entry = {'schema_version':1,'review_workflow_writes':bool(enabled),'set_by':actor,
+             'set_at':datetime.now(timezone.utc).isoformat(),'previous':bool(previous)}
+    history = [item for item in (entries or []) if _review_writes_entry(item)]
+    history.append(entry)
+    history = history[-REVIEW_WRITES_AUDIT_MAX:]
+    atomic_private_write(root/REVIEW_WRITES_AUDIT,
+                         json.dumps({'schema_version':REVIEW_WRITES_AUDIT_SCHEMA,
+                                     'entries':history}))
+    return entry
+
+
+#: How long a change to deployment.private.json waits for another one to finish before it
+#: refuses (kittrial-5bb.136). Every such change takes milliseconds, so a holder that keeps
+#: the lock this long is stuck; refusing says so instead of hanging the command for good.
+DEPLOYMENT_LOCK_WAIT_SECONDS = 10
+DEPLOYMENT_LOCK_POLL_SECONDS = 0.05
+
+
+class DeploymentLockBusy(ValueError):
+    """``deployment_config_lock`` gave up on a lock another change still holds; nothing was changed."""
+
+
+@contextmanager
+def deployment_config_lock(root):
+    """Serialise one read-modify-write of deployment.private.json with an exclusive flock.
+
+    EVERY writer of that file takes it: both deployment switches (``review-writes``,
+    ``checkpoint-provenance-writes``), ``operators add|remove``, ``verifiers add|remove``,
+    ``project-creations --set-server-limit`` (``project_creation.set_server_limit``) and
+    the restore merges of operators and verifiers (kittrial-5bb.136). Each re-reads the
+    file under the lock, so no change is lost to another made at the same instant. The
+    file keeps the name ``.review-writes.lock`` (REVIEW_WRITES_LOCK), so a flip on an older
+    kit still excludes a change here.
+
+    A holder that does not finish within ``DEPLOYMENT_LOCK_WAIT_SECONDS`` makes the change
+    refuse with nothing changed, rather than wait for good; reads never take the lock, and
+    a killed holder releases it with its process. Once it is held, temporary copies an
+    interrupted write left beside the file are removed (``remove_private_write_leftovers``).
+    POSIX-only, like every other
+    coordination lock in the kit: on a host without ``fcntl`` the atomic file writes still
+    stand. The lock file holds no state and is never backed up.
+    """
+    handle=(root/REVIEW_WRITES_LOCK).open('a')
+    try:
+        try:
+            import fcntl
+        except ImportError:
+            fcntl=None
+        if fcntl is not None and not hasattr(fcntl,'LOCK_NB'):
+            fcntl.flock(handle,fcntl.LOCK_EX)   # a platform without non-blocking flock waits
+        elif fcntl is not None:
+            deadline=time.monotonic()+DEPLOYMENT_LOCK_WAIT_SECONDS
+            while True:
+                try:
+                    fcntl.flock(handle,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic()>=deadline:
+                        raise DeploymentLockBusy('Nothing was changed: another change to deployment.private.json still holds '
+                                         'its lock (%s) after %d s. Run the command again; if this repeats, find '
+                                         'the process holding it (for example `fuser %s`).'
+                                         %(REVIEW_WRITES_LOCK,DEPLOYMENT_LOCK_WAIT_SECONDS,REVIEW_WRITES_LOCK)) from None
+                    time.sleep(DEPLOYMENT_LOCK_POLL_SECONDS)
+        if fcntl is not None:
+            # Only while the lock is held: no writer of this kit is mid-write now, so a
+            # temporary copy beside the file is a leftover, never another writer's.
+            remove_private_write_leftovers(root)
+        yield handle
+    finally:
+        handle.close()
+
+def remove_private_write_leftovers(root):
+    """Remove temporary copies the private files' interrupted writes left behind.
+
+    ``atomic_private_write`` writes a sibling ``.NAME.XXXXXXXX`` (the ``mkstemp`` name) and
+    renames it over the file; a writer killed between the two leaves that copy behind. For
+    ``deployment.private.json`` that copy holds the full configuration with the Dolt password
+    (kittrial-5bb.142). The audits this kit appends to are written exactly the same way, under
+    the same deployment lock, so their leftovers are removed too (kittrial-5bb.192 review item
+    4): a kill inside the audit's own write used to leave
+    ``.authority-changes.audit.json.XXXXXXXX`` for good. The next locked write removes them,
+    which is the only moment no writer of this kit can be mid-write. Returns the names removed.
+
+    The authority-changes audit has a SECOND leftover shape: the copy of a damaged audit goes
+    through ``.authority-changes.audit.json.damaged-<STAMP>[.N].tmp-<16 hex>`` and a kill inside
+    that copy leaves the temporary name behind, which the 8-character pattern never matched
+    (kittrial-5bb.229 rev-2 item 4). ``AUTHORITY_CHANGE_COPY_LEFTOVER`` is that alternation,
+    added for this audit alone.
+    """
+    removed=[]
+    try:
+        names=os.listdir(root)
+    except OSError:
+        return removed
+    for target in ('deployment.private.json',AUTHORITY_CHANGES_AUDIT,ACTOR_ADOPTIONS_AUDIT,REVIEW_WRITES_AUDIT):
+        alternatives=[r'\.[A-Za-z0-9_]{8}']
+        if target==AUTHORITY_CHANGES_AUDIT:alternatives.append(AUTHORITY_CHANGE_COPY_LEFTOVER)
+        pattern=re.compile(r'\.'+re.escape(target)+r'(?:'+'|'.join(alternatives)+r')')
+        found=[]
+        for name in sorted(names):
+            if not pattern.fullmatch(name):continue
+            try:
+                os.unlink(os.path.join(str(root),name))
+            except OSError:
+                continue
+            found.append(name)
+        if not found:continue
+        removed.extend(found)
+        print('Removed %d temporary cop%s of %s left by an interrupted write: %s'
+              %(len(found),'y' if len(found)==1 else 'ies',target,', '.join(found)),file=sys.stderr)
+    return removed
+
+#: The name the switch code and kittrial-5bb.110's tests use.
+review_writes_lock=deployment_config_lock
+
+
+def review_writes_command(root, actor, action):
+    """Read or flip ``review_workflow_writes``; returns ``(result, warnings)``.
+
+    The actor must be on the deployment operator allowlist, so a contributor that
+    reaches the host command line cannot turn the switch on or off
+    (kittrial-5bb.110 item 1 / review mutation M15). A flip then APPENDS who set it and
+    when to the audit history under the deployment lock (item 3). An action that does not
+    change the value writes nothing at all, so an on-that-changes-nothing cannot
+    overwrite the history. `status` reports ``audit_agrees`` and warns when the switch
+    value and the last recorded flip disagree (an older kit, or a hand edit, changed one
+    without the other). Extracted from the CLI so the allowlist and audit behaviour are
+    unit-testable without a subprocess.
+    """
+    marker=root/'deployment.private.json'
+    if not marker.is_file():raise ValueError('Deployment is not installed; run install first')
+    from recovery import identity
+    actor=identity(actor,'Invalid actor identity')
+    authority=operators(root, strict=True)
+    if actor not in authority:
+        raise ValueError('review-writes requires an actor on the deployment operator allowlist '
+                         '(deployment.private.json operators); ' + actor + ' is not on it')
+    if action=='status':
+        warnings=[]
+        enabled=review_workflow_writes(root,warnings=warnings)
+        history=review_writes_audit(root,warnings=warnings)
+        last=history[-1] if history else None
+        # The switch and the audit are written together by a flip, so they disagree only
+        # when something else changed one of them: an older kit (which does not know the
+        # audit file at all) or a hand edit. A DAMAGED audit file is a disagreement too:
+        # it must not read as "no history, everything agrees" (kittrial-5bb.110 item 3).
+        damage=_review_writes_audit_damage(root)
+        agrees=damage is None and (last is None or last['review_workflow_writes']==enabled)
+        if last is not None and not agrees:
+            warnings.append('WARNING: deployment review_workflow_writes is %s but the recorded audit '
+                            'history last says %s (set by %s at %s); the switch was changed without '
+                            'recording it here (an older kit or a hand edit), so the audit is stale'
+                            % ('on' if enabled else 'off',
+                               'on' if last['review_workflow_writes'] else 'off',
+                               last['set_by'],last['set_at']))
+        return {'review_workflow_writes':enabled,'audit':last,'audit_history':history,
+                'audit_agrees':agrees},warnings
+    # One hold of the deployment lock for the whole read-modify-write, so the audit
+    # history records the value that was actually replaced (item 3).
+    with review_writes_lock(root):
+        cfg=config(root)
+        previous=review_workflow_writes(root)
+        enabled=action=='on'
+        if enabled==previous:
+            # An on that changes nothing is not a flip: it must not add an entry or
+            # overwrite the history (item 3).
+            return {'review_workflow_writes':previous,'changed':False},[]
+        # A DAMAGED history is kept aside under a dated name before it is replaced, and
+        # the caller is told; it used to be silently destroyed (kittrial-5bb.110 item 3).
+        warnings=[]
+        aside=keep_damaged_review_writes_audit(root)
+        if aside is not None:
+            warnings.append('WARNING: the review-writes audit file was damaged and has been kept aside '
+                            'as %s; this flip starts a fresh history' % aside)
+        # OFF is the absent key, so a deployment that never turned it on and one
+        # that turned it back off read identically.
+        if enabled:cfg['review_workflow_writes']=True
+        else:cfg.pop('review_workflow_writes',None)
+        atomic_private_write(marker,json.dumps(cfg))
+        write_review_writes_audit(root,enabled,actor,previous,entries=review_writes_audit(root))
+    return {'review_workflow_writes':review_workflow_writes(root),'changed':True},warnings
+
 
 def stored_operators(cfg):
     """The deployment allowlist as a list of identity strings.
@@ -564,10 +1102,10 @@ def verifiers(root, strict=False):
     found=[]
     marker=root/'deployment.private.json'
     if marker.is_file():
-        value=read_json_file(marker,'Deployment configuration').get('verifiers')
+        value=deployment_document(marker).get('verifiers')
         if isinstance(value,list):found.extend(value)
         elif isinstance(value,str):found.append(value)
-        elif value is not None:raise ValueError('deployment verifiers must be a list of actor identities')
+        elif value is not None:raise ConfigurationUnreadable('deployment verifiers must be a list of actor identities')
     from recovery import configured_operators
     allowed=configured_operators(found)
     if strict:
@@ -604,7 +1142,7 @@ def revoked_verifications(root,actor,limit=5):
     for name in initialized_projects(root):
         path=project_dir(root,name)
         try:
-            rows=[json.loads(line) for line in run_bd(root,name,['export','--all']).splitlines() if line.strip()]
+            rows=record_json.loads_rows(run_bd(root,name,['export','--all']))
             entries,_=capability_records.catalog(rows,authority)
             before=capability_records.Trust(None,authority,listed,path,export_rows=rows)
             after=capability_records.Trust(None,authority,remaining,path,export_rows=rows)
@@ -676,6 +1214,7 @@ def environment(root):
     prepared the old way metrics-off without touching anything outside ``root``.
     """
     env=os.environ.copy()
+    password=deployment_password(root)
     # The account's own home, recorded before HOME is scoped into the runtime below: the
     # scheduled-backup units are installed there, and the web service and the endpoint
     # it starts run under this environment and must still find them (kittrial-5bb.118).
@@ -689,7 +1228,7 @@ def environment(root):
     env.update({'HOME':str(root/'home'),
                 'PATH':str(root/'bin')+os.pathsep+env.get('PATH',''),
                 'DOLT_ROOT_PATH':str(root/'dolt-home'),'XDG_CONFIG_HOME':str(root/'config'),
-                'BEADS_DOLT_PASSWORD':config(root)['password'],'DOLT_CLI_PASSWORD':config(root)['password'],
+                'BEADS_DOLT_PASSWORD':password,'DOLT_CLI_PASSWORD':password,
                 'BD_NON_INTERACTIVE':'1','BEADS_NO_DAEMON':'1','BD_DISABLE_METRICS':'1'})
     return env
 
@@ -1033,7 +1572,7 @@ def restore_destination_state(root,destination):
     if metadata!='server':return 'partial'
     try:
         rows=json.loads(run_bd(root,destination,['list','--all','--limit','0','--json']) or '[]')
-    except (subprocess.CalledProcessError,subprocess.TimeoutExpired,OSError,ValueError,TypeError):
+    except (subprocess.CalledProcessError,subprocess.TimeoutExpired,OSError,ValueError,TypeError,RecursionError):
         return 'partial'
     if not isinstance(rows,list):return 'partial'
     slot=destination+'-merge-slot'
@@ -1093,7 +1632,7 @@ def provision_merge_slot(root,name):
     from coordination import merge_slot_missing
     try:
         state=json.loads(run_bd(root,name,['merge-slot','check','--json']))
-    except (TypeError,ValueError):
+    except (TypeError,ValueError,RecursionError):
         state=None
     if not merge_slot_missing(state):return
     try:
@@ -1177,6 +1716,70 @@ WantedBy=default.target
         raise RuntimeError('Initialization failed; service stopped. Preserve runtime and inspect journal; do not overwrite the deployment.') from None
     print(f'Installed {unit}, authenticated loopback port {port}')
 
+def install_current_link(path):
+    """The ``current`` link that exposes ``path``, or None when this install has none.
+
+    A release is a folder under a folder literally named ``releases`` whose sibling
+    ``current`` link resolves to it. Both the path itself and every parent are tested:
+    with the kit at a release root (``X/releases/R1`` plus ``X/current -> releases/R1``)
+    the path IS the release directory, and a scan of ``Path.parents`` alone never tests
+    it, so add-project and authorized-keys would disagree on that layout
+    (kittrial-5bb.182 items 1 and 3). Only a folder named ``releases`` counts, so a
+    folder that merely has a sibling ``current`` link is never rewritten.
+    """
+    resolved=Path(os.path.realpath(str(path)))
+    for release in (resolved,*resolved.parents):
+        install=release.parent
+        if install.name!='releases':continue
+        link=install.parent/'current'
+        if link.is_symlink() and Path(os.path.realpath(str(link)))==release:
+            return link
+    return None
+
+def install_current_path(path):
+    """``path`` as this installation's ``current`` link exposes it, or unchanged.
+
+    An office installation keeps every release under ``releases/<ID>`` and points
+    ``current`` at the one in use. ``__file__`` and ``sys.executable`` resolve that
+    link, so a client config printed from them pins the worker to the release that
+    printed it: after an upgrade the old ``releases/<ID>`` folder remains, and
+    ``endpoint.py`` run from it is the OLD kit against the new runtime
+    (kittrial-5bb.182). Print the ``current`` spelling whenever the path lies inside
+    a release this installation's ``current`` link names, so an upgrade moves the
+    printed line with the service. A path that is not such a release (a plain
+    checkout, ``/usr/bin/python3``) comes back exactly as it was given.
+    """
+    link=install_current_link(path)
+    if link is None:return Path(str(path))
+    resolved=Path(os.path.realpath(str(path)))
+    return link/resolved.relative_to(Path(os.path.realpath(str(link))))
+
+def office_bundled_python():
+    """The bundled interpreter of the office installation this kit belongs to, or None.
+
+    The release manifest names the interpreter's path inside ``python-runtime``
+    (``office_release`` writes it at build and verifies it at install). Returning it
+    through :func:`install_current_path` means a printed client config or forced
+    command follows an upgrade instead of naming the release that printed it. None
+    outside an office installation, where there is no manifest and no bundled
+    interpreter. Read through ``record_json.loads``: a manifest made unreadable or
+    nested too deeply is a reason to fall back, not a traceback from add-project.
+    """
+    release=Path(os.path.realpath(__file__)).parent.parent
+    manifest=release/'manifest.json'
+    if not manifest.is_file():return None
+    try:
+        document=record_json.loads(manifest.read_text(encoding='utf-8'))
+    except (OSError,UnicodeError,ValueError):
+        return None
+    relative=document.get('python_executable') if isinstance(document,dict) else None
+    if not isinstance(relative,str) or not relative:return None
+    inside=Path(relative)
+    if inside.is_absolute() or '..' in inside.parts:return None
+    executable=release/'python-runtime'/inside
+    if not executable.is_file():return None
+    return install_current_path(executable)
+
 def worker_client_setup(root,name):
     """Exact worker client configuration and bootstrap command for one project.
 
@@ -1184,14 +1787,51 @@ def worker_client_setup(root,name):
     module), which serves every project of the deployment. The host is a
     placeholder because the kit is public and each worker supplies its own SSH
     alias; never point a new project at a project-specific wrapper endpoint.
+
+    The endpoint and the interpreter are printed through the installation's
+    ``current`` link where it has one, and ``python`` names the interpreter that
+    runs the endpoint on the server: a bare ``python3`` is platform-python 3.6 on
+    RHEL 8, which cannot run the endpoint, and a host with no python3 on PATH fails
+    outright (kittrial-5bb.182). A second example uses the local transport, for an
+    agent that runs on the server itself.
+
+    The sentence that introduces each example says what was ACTUALLY printed: on an
+    installation with no ``current`` link (the live kits keep
+    ``<base>/kit -> <base>/releases/<ID>``) the printed paths name the release, so the
+    text says they must be printed again after an upgrade instead of claiming an
+    upgrade moves them (kittrial-5bb.182 item 1).
     """
-    endpoint=Path(__file__).resolve().with_name('endpoint.py')
-    config=json.dumps({'host':'WORKER_SSH_HOST','endpoint':str(endpoint),'root':str(root)},indent=2)
+    source=Path(__file__).resolve().with_name('endpoint.py')
+    endpoint=install_current_path(source)
+    python=str(office_bundled_python() or default_authorized_key_python())
+    config=json.dumps({'host':'WORKER_SSH_HOST','endpoint':str(endpoint),'root':str(root),
+                       'python':python},indent=2)
+    local=json.dumps({'transport':'local','python':python,'endpoint':str(endpoint),
+                      'root':str(root)},indent=2)
+    if install_current_link(source) is not None:
+        endpoint_note=('The endpoint and the interpreter go through install/current, so an upgrade '
+                       'moves them with the service')
+        local_note='the same install/current paths, so it also follows an upgrade'
+    else:
+        endpoint_note=('This installation has no install/current link, so the endpoint and the '
+                       'interpreter below name the release that printed them and must be printed '
+                       'again after an upgrade')
+        local_note=('the same paths, which name this release, so print them again after an upgrade')
+    # The server's own host name is what an operator types first, and it need not resolve from
+    # the worker's network (kittrial-5bb.191: the first use of this route from another machine).
+    host_note=('WORKER_SSH_HOST must lead to a name or address the worker\'s machine can reach; this\n'
+               'server\'s own host name may not resolve from the worker\'s network.')
     return (f'Worker client configuration for {name} (save as client.local.json in the worker\'s own\n'
             f'directory and replace WORKER_SSH_HOST with that worker\'s SSH alias; this kit endpoint serves\n'
-            f'every project, so do not point it at a project-specific wrapper):\n{config}\n'
+            f'every project, so do not point it at a project-specific wrapper). {endpoint_note}:\n{config}\n'
+            f'{host_note}\n'
             f'Bootstrap command (replace ACTOR with the actor returned by worker.py start or session\n'
-            f'register):\n  python client.py --config client.local.json --project {name} --actor ACTOR -- onboard')
+            f'register):\n  python client.py --config client.local.json --project {name} --actor ACTOR -- onboard\n'
+            f'An agent that runs on the server itself uses the local transport instead (no SSH and no\n'
+            f'host; {local_note}):\n{local}\n'
+            f'Host project not on the web yet: nothing of {name} appears in the web interface until a\n'
+            f'superuser registers it there (New project, with this name, or POST /v1/projects without\n'
+            f'"create").')
 
 #: Set by ``environment`` to the account's home when it scopes HOME into the runtime.
 ACCOUNT_HOME_ENV='ORCHESTRA_ACCOUNT_HOME'
@@ -1231,9 +1871,47 @@ def scheduled_backup_unit_paths():
         return []
 
 def scheduled_backup_execstart(root):
-    """The exact ``ExecStart`` line that covers every project of this runtime."""
-    return (f'ExecStart={sys.executable} {Path(__file__).resolve()} '
+    """The exact ``ExecStart`` line that covers every project of this runtime.
+
+    The interpreter and this module are both printed through the installation's
+    ``install/current`` link where it has one, so an upgrade moves the schedule with the
+    service. A line whose interpreter came through ``current`` but whose ``admin.py``
+    named ``releases/<ID>`` kept running the release that printed it after the next
+    upgrade (kittrial-5bb.182 item 2).
+    """
+    python=install_current_path(sys.executable)
+    module=install_current_path(Path(__file__).resolve())
+    return (f'ExecStart={python} {module} '
             f'--root {root} backup --all')
+
+def host_command(root,*words):
+    """A host command as the service user pastes it into a shell: interpreter, this module,
+    ``--root``, then ``words``; every word quoted for a shell.
+
+    ``admin.py`` alone is not a command: it is not on PATH and, in a release, not executable,
+    and a set-up step that showed ``admin.py set-guidance ...`` or the unit-file line
+    ``ExecStart=...`` could not be pasted (kittrial-5bb.200: "Permission denied"). The
+    interpreter and the module go through ``install/current`` where there is one, as the
+    schedule line does.
+    """
+    import shlex
+    python=install_current_path(sys.executable)
+    module=install_current_path(Path(__file__).resolve())
+    return ' '.join(shlex.quote(str(word)) for word in (python,module,'--root',root,*words))
+
+def backup_now_command(root):
+    """The command that backs up every project of this runtime now."""
+    return host_command(root,'backup','--all')
+
+def schedule_text(root):
+    """The two things an operator needs for backups, each under its own label: the command
+    that runs one now, and the line a schedule's unit file carries (which is NOT a command)."""
+    return (f'To run a backup of every project now, as this account (a shell command):\n  {backup_now_command(root)}\n'
+            f'The line for a schedule (a line of a systemd unit file, not a shell command; it goes in the '
+            f'[Service] section of a beads-*backup*.service unit in {scheduled_backup_unit_dir()}, run by its '
+            f'timer):\n  {scheduled_backup_execstart(root)}\n'
+            f'To check afterwards: `systemctl --user list-timers`, and\n  '
+            f'{host_command(root,"backup-status","--require-complete")}')
 
 def _execstart_values(text):
     """The command of each ``ExecStart=`` line in a unit file, systemd prefix stripped.
@@ -1371,7 +2049,18 @@ def project_setup_status(root,name,path=None):
     except OSError:
         covers=None
     backup={'scheduled':'covered' if covers else 'unknown' if covers is None else 'not-covered',
-            'line':scheduled_backup_execstart(root),'last_run':None}
+            'line':scheduled_backup_execstart(root),'last_run':None,
+            # What can be pasted into a shell, beside the unit-file line that cannot (kittrial-5bb.200).
+            'run_now':backup_now_command(root),
+            'check':host_command(root,'backup-status','--require-complete')}
+    try:
+        directory=account_unit_dir(root)
+        backup['unit_directory']=None if directory is None else str(directory)
+    except OSError:
+        backup['unit_directory']=None
+    # The words every host command of this runtime begins with, for the steps an operator
+    # does on the server.
+    result['admin']=host_command(root)
     # Why the schedule could not be checked, when it could not: this process runs under
     # the runtime's scoped home and was not told the account's own home (the service was
     # started without a usable HOME), or a unit file could not be read.
@@ -1386,6 +2075,22 @@ def project_setup_status(root,name,path=None):
     except (ValueError,OSError):
         pass
     result['backup']=backup
+    # How full the server is (kittrial-5bb.118 part 2 revision): every project database on it
+    # counts, and every bd write gets slower as they grow. The web service shows it to a
+    # superuser only.
+    try:
+        import project_creation
+        result['project_databases']=project_creation.server_usage(root)
+    except (ValueError,OSError):
+        result['project_databases']=None
+    # Why the web service may NOT register this project, or None (kittrial-5bb.149). The
+    # endpoint serves a project whose creation record is damaged, so the register route no
+    # longer learns of one from a refused read: it asks here. A sentence, never a path.
+    try:
+        import project_creation
+        result['creation_record']=project_creation.registrable(root,name)
+    except (ValueError,OSError):
+        result['creation_record']='The creation record of project %s could not be checked; an operator must look at it first'%name
     return result
 
 def scheduled_backup_coverage(root,name):
@@ -1408,13 +2113,14 @@ def scheduled_backup_coverage(root,name):
     """
     directory=scheduled_backup_unit_dir()
     line=scheduled_backup_execstart(root)
+    both=schedule_text(root)
     dropins=(f'Systemd drop-ins ({directory}/*.service.d/*.conf) are not inspected, so this reports the unit '
              f'files themselves.')
     paths=scheduled_backup_unit_paths()
     if not paths:
         return False,(f'No installed scheduled backup unit matching beads-*backup*.service was found in '
                       f'{directory}, so no project of this runtime is on a schedule. A schedule that covers '
-                      f'every project, including {name}, is:\n  {line}')
+                      f'every project, including {name}, needs the line below.\n{both}')
     read=[];unreadable=[];durable=[];wrappers=[];named={};wrapper_projects={};foreign=[]
     for path in paths:
         try:text=path.read_text(encoding='utf-8')
@@ -1454,7 +2160,7 @@ def scheduled_backup_coverage(root,name):
                           f'named projects with --all in one command.')
             else:
                 message+=(f' Replace that project list with the durable form (do not combine named projects with '
-                          f'--all in one command):\n  {line}')
+                          f'--all in one command); it is a line of the unit file, not a shell command:\n  {line}')
             return False,message+note+' '+dropins
         message=(f'The installed scheduled backup unit(s) read for this runtime cover only '
                  f'{", ".join(covered) if covered else "no project"}, so they do not include {name}.')
@@ -1469,7 +2175,7 @@ def scheduled_backup_coverage(root,name):
                           f'projects with --all in one command.')
         else:
             message+=(f' Add {name} there, or replace the project list with the durable form (do not combine named '
-                      f'projects with --all in one command):\n  {line}')
+                      f'projects with --all in one command); it is a line of the unit file, not a shell command:\n  {line}')
         return False,message+note+' '+dropins
     details=[]
     if foreign:details.append('these units do not back up this runtime: '+', '.join(foreign))
@@ -1477,17 +2183,18 @@ def scheduled_backup_coverage(root,name):
     if not read:
         return False,(f'The installed scheduled backup unit(s) found in {directory} could not be read ('
                       +'; '.join(unreadable)+f'), so schedule coverage of {name} cannot be confirmed. Use a '
-                      f'schedule that covers every project:\n  {line}')
+                      f'schedule that covers every project.\n{both}')
     return False,(f'The installed scheduled backup unit(s) read ('+', '.join(read)+f') do not cover {name}'
                   +(' ('+'; '.join(details)+')' if details else '')
-                  +f'. A schedule that covers every project is:\n  {line} '+dropins)
+                  +f'. A schedule that covers every project needs the line below. '+dropins+f'\n{both}')
 
 #: Where ``retire-project`` moves a project directory, and its append-only journal.
 RETIRED_DIR='retired'
 RETIRE_JOURNAL='journal.jsonl'
 #: The receipt journals whose ``pending`` entries are reservations still in flight.
 RESERVATION_JOURNALS=('.coordination-requests','.requirement-requests','.handoff-requests',
-                      '.reference-requests','.proposal-requests','.capability-requests')
+                      '.reference-requests','.proposal-requests','.capability-requests',
+                      '.open-item-requests')
 
 def retired_entries(root):
     """``[(project name, entry directory name)]`` for every retired project, sorted.
@@ -1576,7 +2283,7 @@ def retire_findings(root,name):
             rows=json.loads(run_bd(root,name,['list','--all','--limit','0','--json']) or '[]')
             if not isinstance(rows,list):raise ValueError('unexpected list output')
             bd='reads';issues=sum(1 for row in rows if not (isinstance(row,dict) and row.get('id')==name+'-merge-slot'))
-        except (subprocess.CalledProcessError,ValueError,TypeError):
+        except (subprocess.CalledProcessError,ValueError,TypeError,RecursionError):
             bd='rejects';slot='not-applicable'
         except (subprocess.TimeoutExpired,OSError):
             bd='unreachable'
@@ -1586,7 +2293,7 @@ def retire_findings(root,name):
             if isinstance(state,dict) and 'available' in state and not state.get('error'):
                 holder=state.get('holder');slot='held' if holder else 'free'
             elif isinstance(state,dict):slot='missing'
-        except (subprocess.CalledProcessError,subprocess.TimeoutExpired,OSError,ValueError,TypeError):pass
+        except (subprocess.CalledProcessError,subprocess.TimeoutExpired,OSError,ValueError,TypeError,RecursionError):pass
     pending={};unreadable={}
     for journal in RESERVATION_JOURNALS:
         directory=path/journal
@@ -1631,7 +2338,7 @@ def retire_blockers(findings):
                         %counts(findings['unreadable_reservations']))
     return blockers
 
-def retire_project(root,name,actor,reason,force=False):
+def retire_project(root,name,actor,reason,force=False,creation_locked=False):
     """Retire one project: move its directory aside. Nothing is deleted.
 
     For a project a stopped ``restore-new`` left behind, or a drill project. One rename
@@ -1647,10 +2354,26 @@ def retire_project(root,name,actor,reason,force=False):
     not be read. Refused even with ``force`` while a ``restore-new`` into the name is
     running. The operator allowlist is checked first, strictly. Both steps are journaled in
     ``retired/journal.jsonl`` (intent before the move, the result after it).
+
+    It holds the project creation lock (kittrial-5bb.118 part 2, review 01a109cc), without
+    waiting: retiring under a creation in flight pulled the directory away from it, and the
+    creation then deleted the record this had just marked. ``creation_locked`` is for
+    ``remove-creation``, which holds that lock already.
     """
     import fcntl
     from keyed_records import require_configured_operator
     require_configured_operator(actor,operators(root,strict=True),'retire a project')
+    import project_creation
+    # Where no creation was ever started there is no lock to take, and a refusal must leave
+    # nothing behind, not even the lock file.
+    if not creation_locked and project_creation.records_dir(root).is_dir():
+        try:
+            with project_creation.creation_lock(root,wait=0):
+                return retire_project(root,name,actor,reason,force=force,creation_locked=True)
+        except project_creation.Busy:
+            raise ValueError('Refusing to retire %s: a project is being created on this server (%s). Wait for it '
+                             'to finish, then retry. Nothing was changed.'
+                             %(name,project_creation.running_name(root) or 'unknown')) from None
     path=project_dir(root,name)
     if not path.is_dir():raise ValueError('Unknown project: there is no projects/%s'%name)
     if not isinstance(reason,str) or not reason.strip():raise ValueError('A reason is required')
@@ -1690,6 +2413,13 @@ def retire_project(root,name,actor,reason,force=False):
                                      'directory on the same filesystem as projects/.'
                                      %(name,RETIRED_DIR,entry,error.strerror or error.__class__.__name__,RETIRED_DIR)) from None
             append_retire_journal(root,dict(record,event='retired',at=utc_stamp()))
+    # A web-started creation that stopped half way and is retired here holds its
+    # creator's place no longer (kittrial-5bb.118 part 2). The name stays retired.
+    import project_creation
+    try:
+        if project_creation.mark_removed(root,name,actor):record['creation']='removed'
+    except (ValueError,OSError):
+        pass
     return record
 
 def append_retire_journal(root,record):
@@ -1701,8 +2431,118 @@ def append_retire_journal(root,record):
         handle.write(json.dumps(record,sort_keys=True,ensure_ascii=False)+'\n')
         handle.flush();os.fsync(handle.fileno())
 
+PROJECT_SETTINGS=[('no-git-ops','true'),('dolt.auto-push','false'),('dolt.auto-commit','on'),('backup.git-push','false')]
+
+#: What ``bd init`` runs while it makes a project. ``bd init`` creates the project's
+#: git repository, so a host without git fails part way through and used to leave a
+#: half-made ``projects/NAME`` that the next ``add-project`` reads as "already exists"
+#: and that ``backup --all`` cannot see. The list is deliberately small: each entry is
+#: a program the kit has watched a plain install need, and the check runs before
+#: anything is created.
+BD_INIT_TOOLS=('git',)
+
+def missing_bd_init_tools(root):
+    """The programs ``bd init`` needs that are not on the runtime's PATH, in order.
+
+    The PATH is composed as ``environment`` composes it - the runtime's own ``bin``
+    first, then the caller's PATH - without reading the runtime's private config, so
+    the check works before a runtime exists.
+    """
+    from shutil import which
+    path=str(Path(root)/'bin')+os.pathsep+os.environ.get('PATH','')
+    return [name for name in BD_INIT_TOOLS if which(name,path=path) is None]
+
+def require_bd_init_tools(root):
+    """Refuse, before anything is created, when a program ``bd init`` needs is missing.
+
+    The sentence names what is missing so an operator can install it; the caller has
+    not created the project directory yet, so a refusal leaves nothing behind.
+    """
+    missing=missing_bd_init_tools(root)
+    if missing:
+        names=' and '.join(missing)
+        raise ValueError('This host has no %s on PATH, which bd init needs to create a project. '
+                         'Install %s and run this command again; nothing was created.'%(names,names))
+
+def require_creatable_project(root,name):
+    """The checks a creation needs before anything is made; returns the project directory.
+
+    ``add-project`` runs this before it writes its creation record, and
+    ``initialize_project`` runs it again: every refusal here must leave no directory, no
+    database and no record, so the operator's route never has to take a record back
+    (kittrial-5bb.176). The order is the order ``add-project`` has always used.
+    """
+    import project_creation
+    path=project_dir(root,name)
+    if name in project_creation.RESERVED_NAMES:
+        raise ValueError('Project name %s is used by the database server itself: choose another name'%name)
+    refuse_retired_name(root,name)
+    if path.exists() and any(path.iterdir()): raise ValueError('Project already exists; use it rather than initializing again')
+    require_bd_init_tools(root)
+    return path
+
+def initialize_project(root,name,stage=None):
+    """The work of ``add-project``: database, settings, backup target, merge slot, first backup.
+
+    ``add-project`` calls this and then prints its advice. The web service's project
+    creation calls it through ``project_creation.create`` (kittrial-5bb.118 part 2), which
+    passes ``stage`` to record which step was running if the work stops.
+    """
+    at=stage or (lambda label:None)
+    path=require_creatable_project(root,name)
+    # Deliberately NO clean-up of a failed creation here. An earlier revision removed
+    # ``projects/NAME`` whenever ``.beads/metadata.json`` was not there yet, so that a
+    # failed creation would "leave nothing". The review (kittrial-5bb.162 items
+    # cleanup-deletes-concurrent-creation and cleanup-hides-half-made-database) showed
+    # that was worse than main in two ways: it deleted a directory a concurrent
+    # ``add-project NAME`` was still filling (both calls then failed and the database
+    # stayed on the server), and when ``bd init`` was killed part way it hid a
+    # half-made database - the directory went while the database stayed, so the web
+    # route answered "nothing was made" and every retry then failed on the half-made
+    # database. A failure here now leaves the directory exactly as the failure left it,
+    # which is how main behaves and what docs/HTTP_DEPLOYMENT.md describes.
+    # ``project_creation.work`` is the web path's own, older clean-up and is unchanged:
+    # under the creation lock it ``rmdir``s only a genuinely empty directory (and
+    # tolerates failure), so it cannot remove another creation's work.
+    path.mkdir(exist_ok=True)
+    cfg=config(root)
+    at('init')
+    run_bd(root,name,['init','--server','--external','--server-host','127.0.0.1','--server-port',str(cfg['port']),
+                      '--server-user','root','--prefix',name,'--database',name,'--skip-agents','--skip-hooks','--non-interactive'])
+    at('configure')
+    for key,value in PROJECT_SETTINGS:
+        run_bd(root,name,['config','set',key,value])
+    at('backup-target')
+    run_bd(root,name,['backup','init',str(root/'backups'/name)])
+    at('merge-slot')
+    provision_merge_slot(root,name)
+    at('first-backup')
+    backup_project(root,name)
+
+def finish_project_steps(root,name):
+    """Complete an initialized project whose creation stopped: every step is safe to repeat.
+
+    The settings are set again, the backup target is initialized only if it is not there
+    yet, the merge slot is created only if missing, and a backup is taken.
+    """
+    path=project_dir(root,name)
+    if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
+    for key,value in PROJECT_SETTINGS:
+        run_bd(root,name,['config','set',key,value])
+    target=root/'backups'/name
+    if not (target.is_dir() and any(target.iterdir())):
+        run_bd(root,name,['backup','init',str(target)])
+    provision_merge_slot(root,name)
+    backup_project(root,name)
+
 def add_project(root,name):
     """Initialize one project, provision its merge slot and back it up once.
+
+    The operator's route keeps the same creation record the web route keeps
+    (``project_creation``, kittrial-5bb.176): a run that stops after ``bd init`` leaves an
+    ``incomplete`` record, so ``finish-project`` and ``remove-creation`` act on it instead
+    of refusing with "no project creation record", and a re-run that meets one is told
+    those two commands rather than only "Project already exists".
 
     The schedule guidance this prints (``scheduled_backup_coverage``) is deliberately
     CONSERVATIVE about a unit whose ``ExecStart`` runs the backup through ``sh -c``: such a
@@ -1714,18 +2554,15 @@ def add_project(root,name):
     direction: it can only prompt an operator to double-check, never hide a gap. This is a
     deliberate choice, not a missed case, and it never edits, installs or enables a unit.
     """
-    path=project_dir(root,name)
-    refuse_retired_name(root,name)
-    if path.exists() and any(path.iterdir()): raise ValueError('Project already exists; use it rather than initializing again')
-    path.mkdir(exist_ok=True)
-    cfg=config(root)
-    run_bd(root,name,['init','--server','--external','--server-host','127.0.0.1','--server-port',str(cfg['port']),
-                      '--server-user','root','--prefix',name,'--database',name,'--skip-agents','--skip-hooks','--non-interactive'])
-    for key,value in [('no-git-ops','true'),('dolt.auto-push','false'),('dolt.auto-commit','on'),('backup.git-push','false')]:
-        run_bd(root,name,['config','set',key,value])
-    run_bd(root,name,['backup','init',str(root/'backups'/name)])
-    provision_merge_slot(root,name)
-    backup_project(root,name)
+    import project_creation
+    try:
+        project_creation.host_create(root,name,initialize_project,require_creatable_project)
+    except ValueError as error:
+        # A name held by a creation that stopped is not a dead end: the record names the
+        # commands that act on it (kittrial-5bb.176).
+        hint=project_creation.unfinished_sentence(root,name) if 'Project already exists' in str(error) else ''
+        if hint:raise ValueError('%s %s'%(error,hint)) from None
+        raise
     print(f'Created project {name}')
     print(scheduled_backup_coverage(root,name)[1])
     print(worker_client_setup(root,name))
@@ -1743,7 +2580,15 @@ def backup_lock(root,name):
 # `.capability-requests`. No writer exists in this kit, but a backup taken by a
 # later slice must restore here (a rollback target), so each is whitelisted,
 # backed up, and validated with its frozen receipt schema before any write.
-RECORD_JOURNALS=('.reference-requests','.proposal-requests','.capability-requests')
+# kittrial-5bb.126 (open items design, slice 0) adds `.open-item-requests`, which no
+# kit writes yet either. The host-issued `.owner-answers` journal is not a receipt
+# journal: see OWNER_ANSWERS_JOURNAL.
+RECORD_JOURNALS=('.reference-requests','.proposal-requests','.capability-requests','.open-item-requests')
+#: The host-issued owner answer and owner decision journal of the open items design
+#: (kittrial-5bb.126, slice 0). Nothing writes it yet. It is backed up when present and
+#: validated by its reader's own validator, open_items.validate_owner_entry, exactly
+#: like `.integration-reverts`.
+OWNER_ANSWERS_JOURNAL='.owner-answers'
 
 def validate_record_receipt(name,record):
     """Frozen slice-0 receipt schema for one record-journal entry.
@@ -1766,7 +2611,7 @@ def validate_coordination_files(files):
     if not isinstance(files,dict):raise ValueError('Invalid coordination files map')
     for name,record in files.items():
         quarantine = isinstance(name,str) and re.fullmatch(r'\.feedback\.jsonl\.(?:[a-f0-9]{16}|[a-f0-9]{64})\.incomplete',name)
-        journal = isinstance(name,str) and re.fullmatch(r'(?:\.coordination-requests|\.handoffs|\.handoff-requests|\.handoff-recoveries|\.requirement-requests|\.requirement-backfills|\.integration-reverts|\.reference-requests|\.proposal-requests|\.capability-requests)/[a-f0-9]{64}\.json',name)
+        journal = isinstance(name,str) and re.fullmatch(r'(?:\.coordination-requests|\.handoffs|\.handoff-requests|\.handoff-recoveries|\.requirement-requests|\.requirement-backfills|\.integration-reverts|\.reference-requests|\.proposal-requests|\.capability-requests|\.open-item-requests|\.owner-answers)/[a-f0-9]{64}\.json',name)
         if name not in ('.merge-context.json','ONBOARDING.md','GUIDANCE.md','.guidance.json','.guidance-clear.json','.sessions.json','.feedback.jsonl') and not quarantine and not journal:raise ValueError('Invalid coordination backup path')
         if not isinstance(record,dict):raise ValueError('Invalid coordination record')
         if name=='.sessions.json':
@@ -1801,6 +2646,9 @@ def validate_coordination_files(files):
             from review_workflow import JOURNAL_DIR, validate_revert_journal_entry
             validate_revert_journal_entry(record,name.partition('/')[2])
             if not name.startswith(JOURNAL_DIR+'/'):raise ValueError('Invalid coordination backup path')
+        if name.startswith(OWNER_ANSWERS_JOURNAL+'/'):
+            from open_items import validate_owner_entry
+            validate_owner_entry(record,name.partition('/')[2])
         if name=='ONBOARDING.md' and (set(record)!={'text'} or not isinstance(record['text'],str) or not record['text'].strip() or len(record['text'].encode('utf-8'))>8000):raise ValueError('Invalid onboarding backup')
         if name=='GUIDANCE.md':
             from guidance import validate_text
@@ -2007,13 +2855,48 @@ def complete_sidecar(path):
     return None: every caller treats "not proven complete" as unusable rather than
     guessing, so a half-written or still-``pending`` marker is never restored from.
     """
-    path=Path(path)
-    if path.is_symlink() or not path.is_file():return None
-    try:data=json.loads(path.read_text(encoding='utf-8'))
-    except (OSError,ValueError):return None
-    if not isinstance(data,dict) or data.get('schema_version')!=1 or data.get('status')!='complete':
-        return None
+    data,_=read_sidecar(path)
     return data
+
+def read_sidecar(path):
+    """``(record, None)`` for a complete coordination sidecar, else ``(None, problem)``.
+
+    ``problem`` is None when the copy is absent and otherwise says why it cannot be used,
+    for ``backup-authority`` (kittrial-5bb.145); ``complete_sidecar`` keeps only the record.
+    """
+    data,problem=read_sidecar_json(path)
+    if problem is not None or data is None:return None,problem
+    if not isinstance(data,dict) or data.get('schema_version')!=1:return None,'it is not a coordination sidecar of schema 1'
+    if data.get('status')!='complete':return None,'its status is %s, not complete'%json.dumps(data.get('status'))
+    return data,None
+
+def read_sidecar_json(path):
+    """``(parsed JSON, None)`` for a sidecar copy, ``(None, None)`` when it is absent, else
+    ``(None, problem)``. The one place a sidecar is opened: never through a symlink, never
+    blocking on a FIFO or device, and only a regular file is read (kittrial-5bb.150/152)."""
+    path=Path(path)
+    if path.is_symlink():return None,'it is a symlink'
+    if not path.exists():return None,None
+    if not path.is_file():return None,'it is not a regular file'
+    # Opened without following a symlink and without blocking, then checked to be a regular
+    # file on the open descriptor: a FIFO or device put in place between the checks above
+    # and the open answers at once instead of hanging the read (kittrial-5bb.150).
+    flags=os.O_RDONLY|getattr(os,'O_NONBLOCK',0)|getattr(os,'O_NOFOLLOW',0)|getattr(os,'O_BINARY',0)
+    try:
+        fd=os.open(str(path),flags)
+    except OSError as error:
+        return None,'it cannot be read (%s)'%error.__class__.__name__
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):return None,'it is not a regular file'
+        with os.fdopen(fd,'rb') as handle:
+            fd=None
+            raw=handle.read()
+    except OSError as error:
+        return None,'it cannot be read (%s)'%error.__class__.__name__
+    finally:
+        if fd is not None:os.close(fd)
+    try:return json.loads(raw.decode('utf-8')),None
+    except ValueError:return None,'it is not valid JSON'
 
 def native_backup_manifest(directory):
     """``(manifest, None)`` for a native backup directory, or ``(None, reason)``.
@@ -2131,6 +3014,15 @@ def last_complete_guard(root,name):
     """
     bundle=root/'backups'/(name+'.coordination.json')
     last_complete=last_complete_sidecar_path(root,name)
+    # A directory where a sidecar copy belongs is not something this kit wrote, so it is
+    # neither replaced nor deleted: the run refuses before writing anything, naming it and
+    # what to do (kittrial-5bb.157). It used to end in a raw "Is a directory" error.
+    for copy in (bundle,last_complete):
+        if copy.is_dir() and not copy.is_symlink():
+            raise ValueError('%s is a directory where the coordination sidecar copy belongs, so this backup '
+                             'cannot keep its pair restorable; the pair was not touched. It is not a file this kit '
+                             'writes: look at what it holds, move it out of backups/, then run backup again.'
+                             %copy.relative_to(root).as_posix())
     state={'promoted':False}
     if complete_sidecar(bundle) is not None:
         _atomic_copy(bundle,last_complete)
@@ -2237,6 +3129,14 @@ def backup_project(root,name):
         for record in revert_journal.glob('*.json'):
             if record.is_symlink():raise ValueError('Integration revert journal entry must not be a symlink')
             files['.integration-reverts/'+record.name]=json.loads(record.read_text(encoding='utf-8'))
+        # The owner answers journal (kittrial-5bb.126): written by no kit yet, collected
+        # only when present, so a backup of a runtime with open-item writes off is
+        # byte-for-byte what the previous kit takes.
+        owner_answers=path/OWNER_ANSWERS_JOURNAL
+        if owner_answers.is_symlink():raise ValueError('Owner answers journal must not be a symlink')
+        for record in owner_answers.glob('*.json'):
+            if record.is_symlink():raise ValueError('Owner answers journal entry must not be a symlink')
+            files[OWNER_ANSWERS_JOURNAL+'/'+record.name]=record_json.loads(record.read_text(encoding='utf-8'))
         # The record journals (kittrial-5bb.64). This kit writes none, but after a
         # rollback from a later slice they exist and must round-trip.
         for journal in RECORD_JOURNALS:
@@ -2350,6 +3250,51 @@ def utc_timestamp(value):
     """True for the exact second-precision UTC form this file writes."""
     return isinstance(value,str) and bool(re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z',value))
 
+def open_item_labelled(labels):
+    """The open items family or state labels among ``labels``: ``open-item`` and ``open-item:*``."""
+    return sorted(label for label in labels or [] if isinstance(label,str)
+                  and (label=='open-item' or label.startswith('open-item:')))
+
+def open_item_label_check(root,names=None):
+    """Read-only deploy-time check of the open items design (kittrial-5bb.126, slice 0).
+
+    The family label ``open-item`` is an exact label that a project may already use; a
+    later slice would read such a row as a record anchor once it also carries an
+    open-item record. ``open-item:`` became a reserved prefix in this slice, so a row
+    already carrying one can no longer have it changed by a contributor. This lists,
+    for every initialized project (or the ones named), the rows carrying either, so the
+    operator knows before open-item writes are turned on. No lock, no write: bd runs
+    only for a project whose metadata records the server coordinates
+    (``project_metadata_state`` is ``server``); any other project is reported unreadable.
+    Returns ``(report, clean)``; ``clean`` is false when a project uses a label or
+    could not be read.
+    """
+    report={}
+    for name in (names or initialized_projects(root)):
+        try:
+            state=project_metadata_state(root,name)
+        except (ValueError,OSError):state='absent'
+        if state=='absent':
+            report[name]={'error':'unknown or uninitialized project'};continue
+        if state!='server':
+            # bd would fall back to an embedded database here: it would CREATE
+            # .beads/embeddeddolt inside the project and list nothing, which would read
+            # as clean (kittrial-5bb.126 review). Nothing is run for such a project.
+            report[name]={'error':'.beads/metadata.json does not record the Dolt server coordinates, so bd '
+                                   'was not run (it would create an embedded database here and list nothing)'}
+            continue
+        try:
+            rows=json.loads(run_bd(root,name,['list','--all','--limit','0','--json']) or '[]')
+            if not isinstance(rows,list):raise ValueError('unexpected list output')
+        except (subprocess.CalledProcessError,subprocess.TimeoutExpired,OSError,ValueError,TypeError) as error:
+            report[name]={'error':'could not list the project: %s'%type(error).__name__};continue
+        found=[{'id':row.get('id'),'labels':open_item_labelled(row.get('labels'))} for row in rows
+               if isinstance(row,dict) and open_item_labelled(row.get('labels'))]
+        report[name]={'rows':found}
+    using=sorted(name for name,entry in report.items() if entry.get('rows'))
+    unreadable=sorted(name for name,entry in report.items() if 'error' in entry)
+    return {'projects':report,'using':using,'unreadable':unreadable},not using and not unreadable
+
 def initialized_projects(root):
     """Every initialized project name in this runtime, sorted.
 
@@ -2395,7 +3340,7 @@ def revoked_proposal_records(root,actor,limit=5):
     for name in initialized_projects(root):
         path=project_dir(root,name)
         try:
-            rows=[json.loads(line) for line in run_bd(root,name,['export','--all']).splitlines() if line.strip()]
+            rows=record_json.loads_rows(run_bd(root,name,['export','--all']))
             moved,setting=proposal_records.revocation_effects(rows,authority,actor,path)
             changed+=['%s/%s'%(name,item) for item in moved]
             if setting:settings.append('%s: %s'%(name,setting))
@@ -2426,7 +3371,7 @@ def revoked_keyed_voids(root,actor,limit=5):
     count=0;changed=[];unreadable=0
     for name in initialized_projects(root):
         try:
-            rows=[json.loads(line) for line in run_bd(root,name,['export','--all']).splitlines() if line.strip()]
+            rows=record_json.loads_rows(run_bd(root,name,['export','--all']))
         except (OSError,ValueError,TypeError,KeyError,subprocess.CalledProcessError):
             unreadable+=1
             continue
@@ -2479,7 +3424,7 @@ def revoked_revert_records(root,actor,limit=5):
     for name in initialized_projects(root):
         path=project_dir(root,name)
         try:
-            rows=[json.loads(line) for line in run_bd(root,name,['export','--all']).splitlines() if line.strip()]
+            rows=record_json.loads_rows(run_bd(root,name,['export','--all']))
         except (OSError,ValueError,TypeError,KeyError):
             unreadable+=1
             continue
@@ -2521,10 +3466,13 @@ def backup_pair_state(root,name):
     native=root/'backups'/name
     sidecar=root/'backups'/(name+'.coordination.json')
     if not native.is_dir():return False,'native backup directory is missing'
-    if sidecar.is_symlink():return False,'coordination sidecar must not be a symlink'
-    try:data=json.loads(sidecar.read_text(encoding='utf-8'))
-    except FileNotFoundError:return False,'coordination sidecar is missing'
-    except (OSError,ValueError):return False,'coordination sidecar is not readable JSON'
+    # Through read_sidecar_json, never a plain open: a FIFO in place of the sidecar made
+    # `backup-status --require-complete` wait until it was killed (kittrial-5bb.152).
+    data,problem=read_sidecar_json(sidecar)
+    if problem=='it is a symlink':return False,'coordination sidecar must not be a symlink'
+    if problem=='it is not a regular file':return False,'coordination sidecar is not a regular file'
+    if problem is not None:return False,'coordination sidecar is not readable JSON'
+    if data is None:return False,'coordination sidecar is missing'
     if not isinstance(data,dict) or data.get('schema_version')!=1:
         return False,'coordination sidecar has an unexpected schema'
     if data.get('status')!='complete':
@@ -3027,7 +3975,25 @@ def backup_projects(root,names,all_projects=False):
         print('Backup of %s is complete but degraded: %s'%degraded[0])
     if incomplete:
         raise SystemExit('backup incomplete for: '+' '.join(incomplete)+
-                         ' (see %s)'%(root/'backups'/BACKUP_STATUS_NAME))
+                         ' (see %s)'%(root/'backups'/BACKUP_STATUS_NAME)+unfinished_creation_hint(root,incomplete))
+
+def unfinished_creation_hint(root,names):
+    """What to do when a project that failed its backup is a web creation that did not finish.
+
+    Such a project is initialized (so ``backup --all`` covers it) and has no backup target
+    yet, so the run is incomplete and the nightly gate is red until an operator finishes
+    or removes it (kittrial-5bb.118 part 2, review 01a109cc). Never raises.
+    """
+    try:
+        import project_creation
+        waiting=[record['project'] for record in project_creation.records(root)
+                 if record['project'] in names and record['effective'] in ('incomplete',project_creation.STALLED)]
+    except (ValueError,OSError):
+        return ''
+    if not waiting:return ''
+    return ('. '+'; '.join('%s is a project creation from the web interface that did not finish: finish it (admin.py '
+                           'finish-project %s) or remove it (admin.py remove-creation %s --actor OPERATOR --reason REASON)'
+                           %(name,name,name) for name in waiting)+'. Until then every backup --all is incomplete.')
 
 def validate_coordination_operators(value,noun='operators'):
     """Validate the optional operator (or verifier) snapshot carried by a backup sidecar."""
@@ -3061,6 +4027,35 @@ def coordination_sidecar_source(root,source):
     if data is not None:return fallback,data
     return None,None
 
+def sidecar_outcome(root,source):
+    """What a backup's coordination sidecar allows: ``(outcome, path, record, damaged)``.
+
+    ``outcome`` is ``'answer'`` (``path``/``record`` are the copy ``coordination_sidecar_source``
+    chooses), ``'refuse'`` (no copy is usable but at least one exists: ``damaged`` lists each
+    with why), or ``'legacy'`` (no copy at all). ``restore-new``, ``coordination_backup`` and
+    ``backup-authority`` all decide from this, so they cannot disagree (kittrial-5bb.152).
+    ``damaged`` also lists a damaged copy the answer passed over.
+    """
+    validate_name(source)
+    copies=[root/'backups'/(source+'.coordination.json'),last_complete_sidecar_path(root,source)]
+    damaged=[(copy,problem) for copy,problem in ((copy,read_sidecar(copy)[1]) for copy in copies) if problem]
+    try:
+        path,data=coordination_sidecar_source(root,source)
+    except ValueError:      # a symlink the restore reaches: no usable copy
+        path,data=None,None
+    if path is not None:return 'answer',path,data,damaged
+    return ('refuse' if damaged else 'legacy'),None,None,damaged
+
+def unusable_sidecar_message(root,source,damaged):
+    """The refusal for a backup whose sidecar copies exist but none can be used."""
+    named='; '.join('%s: %s'%(copy.relative_to(root).as_posix(),problem) for copy,problem in damaged)
+    symlink=' A coordination backup must not be a symlink.' if any(problem=='it is a symlink' for _,problem in damaged) else ''
+    return ('Incomplete coordination backup: no copy of the coordination sidecar of backup %s can be used (%s).%s '
+            'Recover or reconcile the source first, or restore the native tracker data alone with '
+            '`restore-new %s DEST --without-coordination`: its sessions, handoffs, requests, merge context and the '
+            'other coordination records, and the operators and verifiers it records, are then not restored.'
+            %(source,named,symlink,source))
+
 def resolved_coordination_sidecar(root,source):
     """The complete coordination sidecar for a project, or None when there is none.
 
@@ -3070,12 +4065,13 @@ def resolved_coordination_sidecar(root,source):
     return coordination_sidecar_source(root,source)[1]
 
 def coordination_backup(root,source):
-    data=resolved_coordination_sidecar(root,source)
-    if data is None:
-        bundle=root/'backups'/(source+'.coordination.json')
-        if not bundle.exists():
-            return None
-        raise ValueError('Incomplete coordination backup; recover/reconcile source first')
+    # None only for a truly legacy backup (no sidecar copy at all). A copy that exists but
+    # cannot be used refuses, the last-complete copy included: with the canonical copy
+    # absent and that copy damaged, the backup used to restore as legacy, silently without
+    # any coordination data (kittrial-5bb.152).
+    outcome,_,data,damaged=sidecar_outcome(root,source)
+    if outcome=='legacy':return None
+    if outcome=='refuse':raise ValueError(unusable_sidecar_message(root,source,damaged))
     validate_coordination_files(data.get('files'))
     validate_coordination_operators(data.get('operators'))
     validate_coordination_operators(data.get('verifiers'),'verifiers')
@@ -3106,24 +4102,104 @@ def coordination_verifiers(root,source):
     if data is None:return []
     return validate_coordination_operators(data.get('verifiers'),'verifiers')
 
-def merge_verifiers(root,actors):
+def authority_change_restore_reason(source,reason):
+    """The reason recorded for a name ``restore-new`` re-grants (kittrial-5bb.192 review item 2).
+
+    It always names ``restore-new`` and the source project, so a reader of the trail can tell a
+    re-grant from a listing done with ``operators add``; the operator's own sentence follows it.
+    The 400-character ceiling is on ``--reason``; the recorded reason also carries this prefix.
+    """
+    base='restore-new %s'%source
+    return ('%s: %s'%(base,reason) if reason else
+            '%s re-granted this name from the backup (--restore-operators/--restore-verifiers)'%base)
+
+def _restore_authority_reason(source,reason):
+    """Validate ``restore-new --reason`` before anything is restored; ``None`` when it was not given.
+
+    The audit holds the COMPOSED reason (``authority_change_restore_reason``), so the 400-character
+    ceiling is checked on that, before the destination exists: the re-grant runs last, and a value
+    refused there would fail a restore that had already happened.
+    """
+    if reason is None:return None
+    reason=reason.strip()
+    if not reason:raise ValueError('--reason must be a sentence, not blank')
+    room=AUTHORITY_CHANGES_REASON_MAX-len('restore-new %s: '%source)
+    if len(reason)>room:
+        raise ValueError('--reason must be at most %d characters here: the recorded reason also carries '
+                         '"restore-new %s: ", so a reader of the authority-changes audit can tell a re-grant '
+                         'from an `operators add`'%(room,source))
+    return reason
+
+def merge_authority(root,operators=(),verifiers=(),actor=None,reason=None,source=None):
+    """Add missing operators and verifiers under ONE wait for the deployment lock.
+
+    Returns ``(added_operators, added_verifiers)``. Additive only; ``restore_authority``
+    calls it with exactly the lists the explicit restore flags asked for, so a busy lock
+    refuses both at once with nothing changed (kittrial-5bb.144). Every name it re-grants is
+    RECORDED in the authority-changes audit, one entry per name, under the same lock and before
+    the configuration (kittrial-5bb.192 review item 2): this is the one route in the kit that
+    undoes a revocation, so the trail must carry its last word on the name. ``actor`` is the
+    ``--actor`` the restore was given (null when it was not) and the reason names ``restore-new``
+    and the source. A damaged audit refuses the re-grant because it is an ADD; nothing is changed
+    and the caller reports what was not re-granted. A re-grant nobody was named for prints the same
+    one stderr sentence the four list commands print (round-2 review item 3), so a bare re-grant is
+    never silently unattributed.
+    """
+    marker=root/'deployment.private.json'
+    if not marker.is_file():raise ValueError('Deployment is not installed; run install first')
+    from recovery import identity
+    if isinstance(operators,str):operators=[operators]
+    if isinstance(verifiers,str):verifiers=[verifiers]
+    wanted_operators=[identity(item,'Invalid operator identity') for item in operators]
+    wanted_verifiers=[identity(item,'Invalid verifier identity') for item in verifiers]
+    with deployment_config_lock(root):
+        cfg=config(root)
+        current_operators=stored_operators(cfg)
+        current_verifiers=stored_verifiers(cfg)
+        added_operators=[item for item in wanted_operators if item not in current_operators]
+        added_verifiers=[item for item in wanted_verifiers if item not in current_verifiers]
+        if not added_operators and not added_verifiers:return [],[]
+        for noun,added in (('operators',added_operators),('verifiers',added_verifiers)):
+            for name in added:
+                record_authority_change(root,noun,'add',name,actor,
+                                        authority_change_restore_reason(source,reason))
+        if added_operators:cfg['operators']=current_operators+added_operators
+        if added_verifiers:cfg['verifiers']=current_verifiers+added_verifiers
+        atomic_private_write(marker,json.dumps(cfg))
+    if actor is None or reason is None:
+        print(authority_change_notice('restore-new','re-grant',actor,reason),file=sys.stderr)
+    return added_operators,added_verifiers
+
+def merge_verifiers(root,actors,actor=None,reason=None):
     """Add missing verifiers to the deployment list; return the added names.
 
     Additive only, and only ever called by `restore_coordination` when the operator
     explicitly passed `--restore-verifiers`: the list is deployment-wide authority, so
     a backup taken before `verifiers remove ACTOR --confirm-revoke` must not silently
-    undo that revocation.
+    undo that revocation. Every name it adds is recorded in the authority-changes audit,
+    one entry per name, under the same lock and before the configuration, so no route in
+    this kit changes a list without an entry (kittrial-5bb.192 review item 2). ``restore-new``
+    itself uses ``merge_authority``, because kittrial-5bb.144 requires both lists under ONE wait
+    for the lock; this single-list helper stays because it is the writer the lock matrix
+    (``tests/test_deployment_config_lock.py``) and the recovery tests (``tests/test_recovery.py``)
+    hold directly, and it is what an operator script that merges ONE list uses (round-2 review
+    item 4 asks why it stays: that is why).
     """
     marker=root/'deployment.private.json'
     if not marker.is_file():raise ValueError('Deployment is not installed; run install first')
     from recovery import identity
     wanted=[identity(item,'Invalid verifier identity') for item in actors]
-    cfg=config(root)
-    current=stored_verifiers(cfg)
-    added=[item for item in wanted if item not in current]
-    if not added:return []
-    cfg['verifiers']=current+added
-    atomic_private_write(marker,json.dumps(cfg))
+    with deployment_config_lock(root):
+        cfg=config(root)
+        current=stored_verifiers(cfg)
+        added=[item for item in wanted if item not in current]
+        if not added:return []
+        for name in added:
+            record_authority_change(root,'verifiers','add',name,actor,
+                                    reason or 'admin.py merge_verifiers added this name to the capability '
+                                              'verifiers list')
+        cfg['verifiers']=current+added
+        atomic_private_write(marker,json.dumps(cfg))
     return added
 
 def missing_verifiers(root,source):
@@ -3131,7 +4207,7 @@ def missing_verifiers(root,source):
     listed=verifiers(root)
     return [item for item in coordination_verifiers(root,source) if item not in listed]
 
-def merge_operators(root,actors):
+def merge_operators(root,actors,actor=None,reason=None):
     """Add missing operators to the deployment allowlist; return the added names.
 
     Additive only, and only ever called by `restore_coordination` when the
@@ -3139,19 +4215,30 @@ def merge_operators(root,actors):
     authority for EVERY project, so re-adding an entry from a backup is a
     deployment-wide grant: a backup taken before `operators remove ACTOR
     --confirm-revoke` must not silently undo that revocation. The added names are
-    returned so the caller can report exactly what was re-granted.
+    returned so the caller can report exactly what was re-granted, and every one of
+    them is recorded in the authority-changes audit, one entry per name, under the
+    same lock and before the configuration (kittrial-5bb.192 review item 2). ``restore-new``
+    itself uses ``merge_authority``, because kittrial-5bb.144 requires both lists under ONE wait
+    for the lock; this single-list helper stays because it is the writer the lock matrix
+    (``tests/test_deployment_config_lock.py``) and the recovery tests (``tests/test_recovery.py``)
+    hold directly, and it is what an operator script that merges ONE list uses (round-2 review
+    item 4 asks why it stays: that is why).
     """
     marker=root/'deployment.private.json'
     if not marker.is_file():raise ValueError('Deployment is not installed; run install first')
     from recovery import identity
     if isinstance(actors,str):actors=[actors]
     wanted=[identity(item,'Invalid operator identity') for item in actors]
-    cfg=config(root)
-    current=stored_operators(cfg)
-    added=[item for item in wanted if item not in current]
-    if not added:return []
-    cfg['operators']=current+added
-    atomic_private_write(marker,json.dumps(cfg))
+    with deployment_config_lock(root):
+        cfg=config(root)
+        current=stored_operators(cfg)
+        added=[item for item in wanted if item not in current]
+        if not added:return []
+        for name in added:
+            record_authority_change(root,'operators','add',name,actor,
+                                    reason or 'admin.py merge_operators added this name to the operator allowlist')
+        cfg['operators']=current+added
+        atomic_private_write(marker,json.dumps(cfg))
     return added
 
 
@@ -3174,13 +4261,14 @@ def using_last_complete_sidecar(root,source):
     fallback=last_complete_sidecar_path(root,source)
     return complete_sidecar(bundle) is None and complete_sidecar(fallback) is not None
 
-def restore_coordination(root,source,destination,restore_operators=False,restore_verifiers=False):
+def restore_coordination(root,source,destination,restore_operators=False,restore_verifiers=False,authority=True,
+                         actor=None,reason=None):
     from coordination import atomic
     path=project_dir(root,destination)
     files=coordination_backup(root,source)
     if files is None:
         print('Legacy backup has no coordination journal. Reconcile outstanding child requests and merge ownership before accepting writes.')
-        return
+        return False
     if using_last_complete_sidecar(root,source):
         print('The canonical coordination sidecar backups/%s.coordination.json is not complete, so this restore '
               'uses the durable last-complete copy %s (the previous complete generation, restored with the '
@@ -3207,6 +4295,9 @@ def restore_coordination(root,source,destination,restore_operators=False,restore
         elif name.startswith('.integration-reverts/'):
             from review_workflow import validate_revert_journal_entry
             validate_revert_journal_entry(record,name.partition('/')[2])
+        elif name.startswith(OWNER_ANSWERS_JOURNAL+'/'):
+            from open_items import validate_owner_entry
+            validate_owner_entry(record,name.partition('/')[2])
         elif name.startswith(tuple(journal+'/' for journal in RECORD_JOURNALS)):
             validate_record_receipt(name,record)
         elif name=='GUIDANCE.md':
@@ -3252,6 +4343,28 @@ def restore_coordination(root,source,destination,restore_operators=False,restore
             from feedback import validate_quarantine_record
             _atomic_write_bytes(target,validate_quarantine_record(name,record))
         else:atomic(target,record)
+    if authority:
+        warning=restore_authority(root,source,restore_operators,restore_verifiers,actor,reason)
+        if warning:print(warning,file=sys.stderr)
+    return True
+
+#: ``restore-new`` exit status when the restore is complete but ``--restore-operators`` or
+#: ``--restore-verifiers`` could not re-grant what the backup records (kittrial-5bb.144).
+RESTORE_AUTHORITY_NOT_REGRANTED=3
+
+def restore_authority(root,source,restore_operators=False,restore_verifiers=False,actor=None,reason=None):
+    """Report, and with the explicit flags re-grant, the deployment authority a backup records.
+
+    ``restore-new`` runs this LAST, after the coordination files and the operation journal
+    are in place (kittrial-5bb.142). Both requested lists are merged under ONE wait for the
+    deployment lock (kittrial-5bb.144), so a busy lock costs one wait, not one per list, and
+    every name the merge re-grants is recorded in the authority-changes audit (kittrial-5bb.192
+    review item 2), with ``actor``/``reason`` from the new ``restore-new --actor``/``--reason``.
+    A merge refused because another change still holds the lock, or because the audit is damaged
+    and a re-grant is an ADD, leaves a completed restore: the warning naming what was not
+    re-granted, with the exact commands to re-grant it, is RETURNED (``None`` when there is
+    nothing to say) so the caller prints it last and exits ``RESTORE_AUTHORITY_NOT_REGRANTED``.
+    """
     # The native and coordination records (original comment plus its void
     # disposition) are restored by the writes above. Operator AUTHORITY is not:
     # the deployment allowlist is authority for every project, so a stale backup
@@ -3265,10 +4378,6 @@ def restore_coordination(root,source,destination,restore_operators=False,restore
               'so they stay revoked here and void records they authored stay inert. Re-grant one deliberately with '
               '`admin.py --root ROOT operators add ACTOR`, or re-run this restore with --restore-operators to '
               're-establish the whole recorded allowlist.')
-    elif missing:
-        added=merge_operators(root,missing)
-        if added:
-            print('Re-granted operator allowlist entries from the backup (--restore-operators): ' + ', '.join(added))
     # The verifiers list is the second deployment-wide authority (.60 section 5.2) and
     # follows the same rule: never re-granted by a restore on its own.
     unlisted=missing_verifiers(root,source)
@@ -3278,10 +4387,140 @@ def restore_coordination(root,source,destination,restore_operators=False,restore
               '`reported`, not `verified`, and drift only their passes had cleared reappears. Re-grant one '
               'deliberately with `admin.py --root ROOT verifiers add ACTOR`, or re-run this restore with '
               '--restore-verifiers to re-establish the whole recorded list.')
-    elif unlisted:
-        added=merge_verifiers(root,unlisted)
-        if added:
-            print('Re-granted capability verifiers from the backup (--restore-verifiers): ' + ', '.join(added))
+    wanted_operators=missing if restore_operators else []
+    wanted_verifiers=unlisted if restore_verifiers else []
+    if not wanted_operators and not wanted_verifiers:return None
+    try:
+        added_operators,added_verifiers=merge_authority(root,wanted_operators,wanted_verifiers,actor,reason,source)
+    except DeploymentLockBusy:
+        return authority_not_regranted(root,source,wanted_operators,wanted_verifiers,actor,reason)
+    except AuthorityAuditDamaged as error:
+        # The re-grant is an ADD, and an ADD is refused on a damaged audit. The restore itself
+        # is complete, so this is the same shape as a busy lock: report what was not re-granted
+        # and exit 3 rather than fail the whole restore at its last step.
+        return authority_not_regranted_damaged_audit(root,source,wanted_operators,wanted_verifiers,error,actor,reason)
+    if added_operators:
+        print('Re-granted operator allowlist entries from the backup (--restore-operators): ' + ', '.join(added_operators))
+    if added_verifiers:
+        print('Re-granted capability verifiers from the backup (--restore-verifiers): ' + ', '.join(added_verifiers))
+    return None
+
+def authority_regrant_commands(root,operators,verifiers,actor=None,reason=None):
+    """The exact commands that re-grant what a refused restore could not, with the recording flags.
+
+    A printed ``operators add NAME`` without ``--actor``/``--reason`` would record a null operator
+    and print the warning saying so: the remedy would leave the audit less complete than the
+    restore tried to (round-2 review item 3). The operator and reason the restore was GIVEN are
+    used where it had them, and the literal placeholders ``OPERATOR``/``TEXT`` where it had none;
+    every word is shell-quoted as printed. The placeholders are refused when they are run
+    unchanged (kittrial-5bb.229 finding 3): these commands are ADDs, and
+    ``authority_change_arguments`` raises for ``--actor OPERATOR``/``--reason TEXT`` on an add, so a
+    command copied from a warning cannot record an operator named OPERATOR with the entry counted
+    as attributed. (On a REMOVAL the same placeholders are not a refusal: the entry is recorded
+    without them and a sentence says so - rev-2 item 3.) The warnings that print these commands say
+    so.
+    """
+    import shlex
+    flags=' --actor %s'%(shlex.quote(actor) if actor else AUTHORITY_CHANGE_PLACEHOLDER_ACTOR)
+    flags+=' --reason %s'%(shlex.quote(reason) if reason else AUTHORITY_CHANGE_PLACEHOLDER_REASON)
+    return ['admin.py --root %s %s add %s%s'%(shlex.quote(str(root)),kind,shlex.quote(name),flags)
+            for kind,actors in (('operators',operators),('verifiers',verifiers)) for name in actors]
+
+def authority_regrant_replace_note(actor=None,reason=None):
+    """The line beside printed re-grant commands whose flags are placeholders (finding 3).
+
+    Empty when the restore was given both flags. It is placed between the commands and the
+    ``backup-authority`` line, so the warning still ends with its exit-status sentence.
+    """
+    missing=[]
+    if actor is None:missing.append('%s in --actor'%AUTHORITY_CHANGE_PLACEHOLDER_ACTOR)
+    if reason is None:missing.append('%s in --reason'%AUTHORITY_CHANGE_PLACEHOLDER_REASON)
+    if not missing:return ''
+    return ('Replace %s in the command(s) above before running them: these are ADDs, and a literal placeholder is '
+            'refused on an add, so the audit does not count an operator named OPERATOR.\n'%' and '.join(missing))
+
+def authority_not_regranted_damaged_audit(root,source,operators,verifiers,error,actor=None,reason=None):
+    """The warning for a restore whose re-grant a DAMAGED authority-changes audit refused.
+
+    The restore is complete; nothing was re-granted and nothing was written to the audit. The
+    recovery is the one the audit's own refusal names (move the file aside, then re-grant), so
+    this says that instead of the busy-lock remedy of retrying the command.
+    """
+    import shlex
+    named=[]
+    if operators:named.append('operators (--restore-operators): '+', '.join(operators))
+    if verifiers:named.append('verifiers (--restore-verifiers): '+', '.join(verifiers))
+    commands=authority_regrant_commands(root,operators,verifiers,actor,reason)
+    return ('WARNING: the restore is complete, but deployment authority the backup records was NOT re-granted: '
+            '%s. The authority-changes audit refuses an ADD while it is damaged: %s Do not repeat the restore; '
+            'move the damaged file aside, then re-grant them with:\n  %s\n%sCompare what the backup records with '
+            'this installation:\n  admin.py --root %s backup-authority %s\nrestore-new exits %d: the restore is '
+            'complete, but the authority above was NOT re-granted.'
+            %('; '.join(named),error,'\n  '.join(commands),authority_regrant_replace_note(actor,reason),
+              shlex.quote(str(root)),shlex.quote(source),RESTORE_AUTHORITY_NOT_REGRANTED))
+
+def authority_not_regranted(root,source,operators,verifiers,actor=None,reason=None):
+    """The warning for a restore whose authority merge was refused by a busy lock.
+
+    One block for both lists, ending with the exit status, so it can be printed as the last
+    thing the restore says. Every command is shell-quoted as printed.
+    """
+    import shlex
+    named=[]
+    if operators:named.append('operators (--restore-operators): '+', '.join(operators))
+    if verifiers:named.append('verifiers (--restore-verifiers): '+', '.join(verifiers))
+    commands=authority_regrant_commands(root,operators,verifiers,actor,reason)
+    # Not the refusal's own text: it says to run the command again, and a second
+    # restore-new into this destination is refused because the destination now exists.
+    return ('WARNING: the restore is complete, but deployment authority the backup records was NOT re-granted: '
+            '%s. Another change to deployment.private.json held its lock (%s) for more than %d s. Do not repeat '
+            'the restore; re-grant them with:\n  %s\n%sCompare what the backup records with this installation:\n'
+            '  admin.py --root %s backup-authority %s\nrestore-new exits %d: the restore is complete, but the authority '
+            'above was NOT re-granted.'
+            %('; '.join(named),REVIEW_WRITES_LOCK,DEPLOYMENT_LOCK_WAIT_SECONDS,'\n  '.join(commands),
+              authority_regrant_replace_note(actor,reason),shlex.quote(str(root)),shlex.quote(source),
+              RESTORE_AUTHORITY_NOT_REGRANTED))
+
+def backup_authority(root,source):
+    """Read only: the deployment authority a project backup records against this installation.
+
+    The same complete sidecar ``restore-new`` would use (the canonical one, else the durable
+    last-complete copy). For each list: what the backup records, what this installation
+    lists now, and the recorded entries it does not list, which ``--restore-operators`` /
+    ``--restore-verifiers`` (or ``operators add`` / ``verifiers add``) would re-grant.
+
+    Three cases that once all read as empty lists are told apart (kittrial-5bb.145): a name
+    with no backup is refused; a backup whose sidecar copies exist but none is usable is
+    refused, naming each copy and why; a backup with no sidecar at all says so in ``note``.
+    A copy passed over for the fallback is listed in ``unusable``.
+    """
+    validate_name(source)
+    if not (root/'backups'/source).is_dir():
+        raise ValueError('No such backup: backups/%s does not exist. Check the project name '
+                         '(`backup-status` lists the backups this installation has).'%source)
+    # Exactly what restore-new decides (kittrial-5bb.150/152): the same outcome, from the
+    # same copy. A symlinked copy the restore never reaches (the last-complete copy behind a
+    # good canonical one) is only listed as unusable.
+    outcome,path,data,damaged=sidecar_outcome(root,source)
+    if outcome=='refuse':
+        raise ValueError('The coordination sidecar of backup %s is damaged: %s. What this backup records '
+                         'cannot be read, so no operator or verifier list from it can be trusted.'
+                         %(source,'; '.join('%s: %s'%(copy.relative_to(root).as_posix(),problem) for copy,problem in damaged)))
+    def compare(recorded,listed):
+        return {'recorded':recorded,'listed_here':sorted(listed),
+                'not_listed_here':[item for item in recorded if item not in listed]}
+    result={'project':source,
+            'sidecar':None if path is None else path.relative_to(root).as_posix(),
+            'operators':compare([] if data is None else validate_coordination_operators(data.get('operators')),
+                                operators(root)),
+            'verifiers':compare([] if data is None else validate_coordination_operators(data.get('verifiers'),'verifiers'),
+                                verifiers(root))}
+    if damaged:
+        result['unusable']=[{'copy':copy.relative_to(root).as_posix(),'problem':problem} for copy,problem in damaged]
+    if path is None:
+        result['note']=('This backup has no coordination sidecar (a legacy backup): it records no operators '
+                        'or verifiers.')
+    return result
 
 def record_store_path(state):
     """The HTTP record store beside the service state document (``http_auth.Store``)."""
@@ -3433,11 +4672,14 @@ def default_authorized_key_python():
 
     Absolute on purpose. A bare `python3` is resolved by the account shell through PATH,
     which PermitUserEnvironment or an AcceptEnv forwarding the caller's PATH can move, so
-    the printed line names the interpreter the deployment actually tested.
+    the printed line names the interpreter the deployment actually tested. Inside an
+    office installation the path goes through `install/current`, so an upgrade moves the
+    line with the service instead of leaving it on the release that printed it
+    (kittrial-5bb.182).
     """
     executable=getattr(sys,'executable','') or ''
     if executable.startswith('/') and AUTHORIZED_KEY_PYTHON.fullmatch(executable):
-        return executable
+        return str(install_current_path(executable))
     return '/usr/bin/python3'
 
 def _authorized_key_python(value):
@@ -3460,7 +4702,45 @@ def _authorized_key_comment(comment):
         raise ValueError('--comment must be one line without control characters')
     return text.strip()
 
-def authorized_key_lines(root,kit,key_type,key_body,key_comment='',comment=None,python=None):
+#: What a bound line's comment carries, so that authorized_keys can be read by eye.
+KEY_PROJECTS_COMMENT='orchestra-projects='
+#: The principal a bound line names, in the same comment (kittrial-5bb.194).
+KEY_PRINCIPAL_COMMENT='orchestra-principal='
+
+def key_projects(root,names):
+    """The projects a key is to be bound to, checked: names of this runtime's projects, none twice.
+
+    A name that is no project would bind the key to nothing, and a typo is the likely
+    reason, so it is refused here and not printed (kittrial-5bb.193).
+    """
+    projects=[]
+    for name in names or []:
+        validate_name(name)
+        if name in projects:raise ValueError('--project names %s twice'%name)
+        if not (project_dir(Path(root),name)/'.beads/metadata.json').is_file():
+            raise ValueError('--project %s: no such project in this runtime. A key bound to a name that is not '
+                             'a project reaches nothing; create the project first, or check the name'%name)
+        projects.append(name)
+    return projects
+
+def key_principal(value):
+    """The principal a key is to name, checked (kittrial-5bb.194, rule 2).
+
+    A lane, spelled `lane:NAME` or `person:NAME` (the coordinator decision of 2026-10-08:
+    the two prefixes are different principals). One token with no space because the value is
+    an argument of the authorized_keys command line. ``--principal`` is an append argument,
+    so a value given twice is refused rather than silently taking the last.
+    """
+    if isinstance(value,list):
+        if len(value)>1:
+            raise ValueError('--principal names %s twice; a key may name at most one principal'
+                             %', '.join(str(item) for item in value))
+        value=value[0] if value else None
+    if value is None:return None
+    from sessions import valid_principal
+    return valid_principal(value,'--principal')
+
+def authorized_key_lines(root,kit,key_type,key_body,key_comment='',comment=None,python=None,projects=(),principal=None):
     """The exact contributor (confined) and operator (unrestricted) authorized_keys lines.
 
     The contributor line runs `ssh_forced_command.py` - under an absolute interpreter with
@@ -3478,23 +4758,209 @@ def authorized_key_lines(root,kit,key_type,key_body,key_comment='',comment=None,
     if any(character in text for character in '\0\r\n'):
         raise ValueError('the key comment must be one line without control characters')
     key=' '.join(part for part in (key_type,key_body,text) if part)
+    bound=tuple(part for name in projects for part in ('--project',name))
+    if principal is not None:
+        bound=bound+('--principal',principal)
     command=' '.join((python,)+AUTHORIZED_KEY_PYTHON_FLAGS+(wrapper,'--root',root,
-                                                           '--endpoint',endpoint))
-    contributor='command="%s",%s %s'%(command,','.join(CONTRIBUTOR_KEY_OPTIONS),key)
+                                                           '--endpoint',endpoint)+bound)
+    # The bound line says in its comment what it is bound to; the operator line stays the bare key.
+    marks=[]
+    if projects:marks.append(KEY_PROJECTS_COMMENT+','.join(projects))
+    if principal is not None:marks.append(KEY_PRINCIPAL_COMMENT+principal)
+    bound_key=' '.join(part for part in (key_type,key_body,text,*marks) if part) if marks else key
+    contributor='command="%s",%s %s'%(command,','.join(CONTRIBUTOR_KEY_OPTIONS),bound_key)
     return {'root':root,'kit':kit,'endpoint':endpoint,'wrapper':wrapper,'python':python,
             'python_flags':list(AUTHORIZED_KEY_PYTHON_FLAGS),
             'contributor_options':list(CONTRIBUTOR_KEY_OPTIONS),
             'contributor':contributor,'operator':key}
 
-def authorized_keys(root,key_file,role='both',python=None,comment=None):
-    """Print the installable lines for one public key as JSON (see authorized_key_lines)."""
+def _key_line_options(line):
+    """Split one authorized_keys line into (options text, the rest), as sshd reads it.
+
+    Options end at the first blank outside double quotes; inside quotes a backslash keeps
+    the next quote. A line that begins with a key type has no options.
+    """
+    first=line.split(None,1)[0]
+    if first in AUTHORIZED_KEY_TYPES:return '',line
+    quoted=False;index=0
+    while index<len(line):
+        character=line[index]
+        if character=='\\' and quoted and index+1<len(line) and line[index+1]=='"':index+=2;continue
+        if character=='"':quoted=not quoted
+        elif character in ' \t' and not quoted:break
+        index+=1
+    if quoted:raise ValueError('a quote is not closed')
+    return line[:index],line[index:].strip()
+
+def _key_line_command(options):
+    """The value of ``command=`` among a line's options, or None."""
+    parts=[];current='';quoted=False;index=0
+    while index<len(options):
+        character=options[index]
+        if character=='\\' and quoted and index+1<len(options) and options[index+1]=='"':
+            current+='"';index+=2;continue
+        if character=='"':quoted=not quoted
+        elif character==',' and not quoted:parts.append(current);current='';index+=1;continue
+        else:current+=character
+        index+=1
+    parts.append(current)
+    for part in parts:
+        name,equals,value=part.partition('=')
+        if equals and name.strip().lower()=='command':return value
+    return None
+
+def key_line(line,root,kit):
+    """What one line of authorized_keys is, for this runtime and this kit; None for a blank or # line.
+
+    Read only. ``kind`` is ``bound`` (this kit's forced command with projects), ``confined``
+    (the forced command with none: any project), ``unrestricted`` (no command: the account's
+    shell), ``other-command`` (a command that is not the kit's wrapper; said, not judged) or
+    ``unreadable``.
+    """
+    import shlex
+    text=line.strip()
+    if not text or text.startswith('#'):return None
+    try:
+        options,rest=_key_line_options(text)
+        parts=rest.split(None,2)
+        if len(parts)<2 or parts[0] not in AUTHORIZED_KEY_TYPES:raise ValueError('no public key after the options')
+        body=base64.b64decode(parts[1],validate=True)
+        if not body:raise ValueError('the key body is empty')
+    except Exception as error:
+        return {'kind':'unreadable','reason':str(error)[:120]}
+    entry={'key_type':parts[0],
+           'fingerprint':'SHA256:'+base64.b64encode(hashlib.sha256(body).digest()).decode('ascii').rstrip('='),
+           'comment':parts[2] if len(parts)>2 else ''}
+    command=_key_line_command(options)
+    if command is None:
+        entry['kind']='unrestricted'
+        return entry
+    try:tokens=shlex.split(command)
+    except ValueError:tokens=[]
+    at=next((index for index,token in enumerate(tokens) if token.rsplit('/',1)[-1]=='ssh_forced_command.py'),None)
+    if at is None:
+        entry['kind']='other-command'
+        return entry
+    wrapper=tokens[at];values={'--root':[],'--endpoint':[],'--python':[],'--project':[],'--principal':[]};unknown=[]
+    arguments=tokens[at+1:];index=0
+    while index<len(arguments):
+        flag,equals,joined=arguments[index].partition('=')
+        if flag in values and equals:values[flag].append(joined)
+        elif flag in values and index+1<len(arguments) and not arguments[index+1].startswith('-'):
+            index+=1;values[flag].append(arguments[index])
+        else:unknown.append(arguments[index])
+        index+=1
+    here=Path(os.path.realpath(str(kit)))
+    endpoints=values['--endpoint'] or [wrapper.rsplit('/',1)[0]+'/endpoint.py']
+    line_root=values['--root'][0] if values['--root'] else None
+    principals=values['--principal']
+    entry.update({
+        # A line bound to a principal is bound, not merely confined (kittrial-5bb.194 review,
+        # finding 3): the summary counts the binding and the notes name both kinds.
+        'kind':'bound' if (values['--project'] or principals) else 'confined',
+        'projects':values['--project'],
+        # Slice 2 of the design adds --principal; the field is here so that the shape of the
+        # listing does not change with it.
+        'principal':principals[0] if principals else None,
+        'root':line_root,'wrapper':wrapper,'endpoints':endpoints,
+        # A line names its wrapper and endpoint by path. One printed by an earlier release of an
+        # office installation still runs THAT release's kit, which knows none of the rules of
+        # this one, for as long as its folder is there (the design, Migration, step 6).
+        'other_kit':(Path(os.path.realpath(wrapper))!=here/'ssh_forced_command.py'
+                     or any(Path(os.path.realpath(endpoint))!=here/'endpoint.py' for endpoint in endpoints)),
+        'other_root':line_root is None or Path(os.path.realpath(line_root))!=Path(os.path.realpath(str(root))),
+        'missing':not Path(wrapper).is_file(),
+        'unknown_arguments':unknown})
+    # It is this kit today and names its release folder: after the next upgrade it is another kit.
+    link=install_current_link(here)
+    entry['names_release']=bool(link is not None and not entry['other_kit']
+                                and not all(str(path).startswith(str(link)+'/') for path in [wrapper,*endpoints]))
+    if not entry['other_root']:
+        entry['unknown_projects']=[name for name in values['--project']
+                                   if not re.fullmatch(r'[a-z][a-z0-9]{1,23}',name)
+                                   or not (Path(root)/'projects'/name/'.beads/metadata.json').is_file()]
+    if principals:
+        # A repeated principal would be served as the last one while the listing showed the
+        # first; an ill-formed one refuses every request of that key. Both go under attention.
+        from sessions import PRINCIPAL as PRINCIPAL_FORM
+        entry['principal_repeated']=len(principals)>1
+        entry['principal_ill_formed']=any(not isinstance(item,str) or not PRINCIPAL_FORM.fullmatch(item)
+                                          for item in principals)
+    if values['--project'] and len(values['--project'])!=len(set(values['--project'])):
+        # A project named twice (``--project pa --project pa``) is refused by the wrapper, as
+        # a repeated principal is; the listing must say so too (kittrial-5bb.223, finding 6).
+        entry['project_repeated']=True
+    return entry
+
+def authorized_keys_listing(root,file=None):
+    """Every line of an authorized_keys file and what it may do here. Reads; never writes.
+
+    The kit cannot audit sshd's file, only read it (kittrial-5bb.193): which keys have the
+    account's shell, which are confined to the endpoint, which are bound to projects, and
+    which point at a kit other than the installed one.
+    """
+    path=Path(file) if file else Path.home()/'.ssh'/'authorized_keys'
     kit=Path(__file__).resolve().parent
+    try:text=path.read_text(encoding='utf-8',errors='replace')
+    except OSError as error:
+        raise ValueError('Cannot read %s: %s'%(path,error.strerror or error)) from None
+    lines=[];summary={}
+    for number,raw in enumerate(text.splitlines(),1):
+        entry=key_line(raw,root,kit)
+        if entry is None:continue
+        lines.append({'line':number,**entry})
+        summary[entry['kind']]=summary.get(entry['kind'],0)+1
+        # Both kinds of binding are counted and named (kittrial-5bb.194 review, finding 3):
+        # `bound` counts every bound line, and `principal-bound` names the principal binding
+        # on its own. The key appears only when such a line exists.
+        if entry.get('principal') and not str(entry['principal']).startswith('-'):
+            summary['principal-bound']=summary.get('principal-bound',0)+1
+    attention=[entry['line'] for entry in lines
+               if entry.get('other_kit') or entry.get('missing') or entry.get('unknown_arguments')
+               or entry.get('unknown_projects') or entry.get('names_release') or entry['kind']=='unreadable'
+               or entry.get('principal_repeated') or entry.get('principal_ill_formed')
+               or entry.get('project_repeated')]
+    return {'schema_version':1,'file':str(path),'root':str(root),'kit':str(kit),'lines':lines,'summary':summary,
+            'attention':attention,
+            'notes':['unrestricted: the key has this account\'s shell and is outside every rule of the kit, on every project.',
+                     'confined: the key runs only the endpoint and may name any project and any actor.',
+                     'bound: the key runs only the endpoint and only for its projects and/or its principal - the '
+                     '`projects` and `principal` fields say which. A principal-bound line is `bound`, not `confined`.',
+                     'principal-bound: counted separately for the lines that name a principal, so a line bound only to '
+                     'a principal is not read as merely confined.',
+                     'principal_ill_formed: the line names a principal that is not `lane:NAME` or `person:NAME`; the '
+                     'wrapper refuses every request of that key. principal_repeated: the line names more than one '
+                     'principal (the wrapper refuses it). Both are under attention and must be reprinted.',
+                     'project_repeated: the line names the same project twice (`--project pa --project pa`); the '
+                     'wrapper refuses the line. It is under attention and must be reprinted.',
+                     'other_kit: the line runs a wrapper or an endpoint that is not this kit\'s file. Such a line is '
+                     'served by that other kit, whatever its text says: a kit older than this one binds nothing. '
+                     'Print the line again with this kit (authorized-keys) and replace it.',
+                     'names_release: the line is this kit today but names its release folder, so after the next '
+                     'upgrade it is other_kit. Print it again; it then goes through install/current.',
+                     'other_root: the line serves another runtime than --root (or names none); its projects were not looked up here.',
+                     'This command reads the file and changes nothing.']}
+
+def authorized_keys(root,key_file,role='both',python=None,comment=None,projects=None,principal=None):
+    """Print the installable lines for one public key as JSON (see authorized_key_lines).
+
+    The kit directory is taken through the installation's `install/current` link where it
+    has one: a forced command that names `releases/<ID>` keeps running the old kit after an
+    upgrade while the service runs the new one, and its exact `--endpoint` string is what
+    the wrapper compares the caller's config against (kittrial-5bb.182).
+    """
+    kit=install_current_path(Path(__file__).resolve().parent)
     for name in ('ssh_forced_command.py','endpoint.py'):
         if not (kit/name).is_file():
             raise ValueError('This kit copy has no %s; run the helper from the installed kit directory'%name)
+    projects=key_projects(root,projects)
+    principal=key_principal(principal)
+    if (projects or principal is not None) and role=='operator':
+        raise ValueError('--project and --principal bind the confined contributor line; an unrestricted operator '
+                         'key has a shell and cannot be bound to projects or to a principal')
     path=Path(key_file)
     lines=authorized_key_lines(root,kit,*public_key_line(path.read_text(encoding='utf-8-sig'),str(path)),
-                               comment=comment,python=python)
+                               comment=comment,python=python,projects=projects,principal=principal)
     payload={'schema_version':1,'root':lines['root'],'kit':lines['kit'],'endpoint':lines['endpoint'],
              'wrapper':lines['wrapper'],'python':lines['python'],
              'contributor_options':lines['contributor_options'],
@@ -3510,7 +4976,45 @@ def authorized_keys(root,key_file,role='both',python=None,comment=None):
                       'still self-declares its actor on every request, and what it protects is the '
                       'operator-gated and reserved operations, not the actor name.',
                       'Install one entry per key: both lines are alternatives for different keys, '
-                      'never two entries for the same key.']}
+                      'never two entries for the same key.',
+                      'The endpoint in the contributor line goes through the installation\'s '
+                      'install/current link where it has one. Put that exact path in the contributor\'s '
+                      'client config: the wrapper compares it as one token, and a releases/<ID> spelling '
+                      'would keep that key on the release that printed it.']}
+    if projects or principal is not None:
+        # Rules 1 and 2 of docs/COORDINATORS_PER_PROJECT_DESIGN.md. Only the bound line is
+        # printed: the operator line is a shell, and a shell is every project.
+        role='contributor'
+        if projects:
+            payload['projects']=projects
+            payload['notes'].append(
+                'This line is bound to the projects above: the endpoint refuses every request of this key '
+                'that names another project, with the answer it gives for a project that does not exist. '
+                'The binding is the --project arguments of the line; the comment only repeats them.')
+        if principal is not None:
+            payload['principal']=principal
+            payload['notes'].append(
+                'This line is bound to the principal above (a lane): the endpoint refuses every request of '
+                'this key whose actor the project\'s registry does not give to that principal. Registering '
+                'a new session under this key makes the new actor that principal\'s. The binding is the '
+                '--principal argument of the line; the comment only repeats it. A lane is spelled lane:NAME '
+                '(or person:NAME, which is a different principal).')
+            payload['notes'].append(
+                'A bound key owns no actors in the project before its first registration, so its first kit '
+                'call must be session register. No other command (such as docs or ready) can precede '
+                'registration or be used as a check of the key: client.py requires --actor, and the '
+                'endpoint\'s principal gate refuses any actor until registered. To verify the key without '
+                'registering (or without making an actor), check the line on the server with admin.py '
+                '--root RUNTIME authorized-keys-list, or test client SSH access with plain ssh HOST exit or '
+                'ssh -T HOST (refused on stderr with status 2 by the forced command wrapper, confirming '
+                'connection and confinement).')
+        bound_note='--project or --principal' if principal is not None else '--project'
+        payload['notes'].extend([
+            'The operator line is not printed with %s: an unrestricted key has the account\'s shell and '
+            'cannot be bound. A key that already has an unrestricted or an unbound line in authorized_keys '
+            'is not bound by adding this one: replace that line.'%bound_note,
+            'admin.py --root RUNTIME authorized-keys-list shows every line of authorized_keys, what it is '
+            'bound to and whether it still points at the installed kit.'])
     if role in ('contributor','both'):payload['contributor']=lines['contributor']
     if role in ('operator','both'):payload['operator']=lines['operator']
     print(json.dumps(payload,ensure_ascii=True,indent=2))
@@ -3518,11 +5022,1189 @@ def authorized_keys(root,key_file,role='both',python=None,comment=None):
         print('warning: the operator line is unrestricted service-account shell access; '+OPERATOR_KEY_NOTE,
               file=sys.stderr)
 
+#: The adoption audit (kittrial-5bb.194, rule 2): every give-an-actor-to-a-principal a host
+#: command made. The registry's owners map is written by the server (session register under a
+#: bound key) and by this host command; this audit says who ran the host command, when and
+#: why. Runtime-level, beside deployment.private.json, and never part of a project's
+#: coordination backup.
+ACTOR_ADOPTIONS_AUDIT='actor-adoptions.audit.json'
+ACTOR_ADOPTIONS_SCHEMA=1
+#: A short history, like review-writes.audit.json: the audit answers "who adopted whom, when,
+#: and why", not "every adoption since the installation was made".
+ACTOR_ADOPTIONS_MAX=200
+ACTOR_ADOPTIONS_FIELDS=frozenset({'at','operator','project','actor','principal','previous','reason'})
+#: A MOVE (the actor already belonged to another principal, named with --from) is marked in
+#: the entry. Entries written before the marker existed are still read, so the audit stays
+#: forward-compatible with this kit's own history.
+ACTOR_ADOPTIONS_MOVE='moved'
+ACTOR_ADOPTIONS_FIELDS_WITH_MOVE=ACTOR_ADOPTIONS_FIELDS|{ACTOR_ADOPTIONS_MOVE}
+
+def adoption_entry(item):
+    """Whether one entry has the shape ``adopt-actor`` writes (with or without the move marker)."""
+    return (isinstance(item,dict) and set(item) in (ACTOR_ADOPTIONS_FIELDS,ACTOR_ADOPTIONS_FIELDS_WITH_MOVE)
+            and all(isinstance(item[field],str) and item[field] for field in
+                    ('at','operator','project','actor','principal','reason'))
+            and (item['previous'] is None or isinstance(item['previous'],str))
+            and (ACTOR_ADOPTIONS_MOVE not in item or isinstance(item[ACTOR_ADOPTIONS_MOVE],bool)))
+
+def actor_adoptions(root,project=None):
+    """The recorded adoptions, oldest first, for one project or all of them. Reads only.
+
+    An absent file is an empty history. A file this kit cannot read as its own history is a
+    refusal, not an empty history: a caller must not be told "nobody was adopted" by a
+    damaged audit.
+    """
+    path=root/ACTOR_ADOPTIONS_AUDIT
+    if not path.is_file():return []
+    try:record=record_json.loads(path.read_text(encoding='utf-8'))
+    except (OSError,UnicodeError,ValueError) as error:
+        raise ValueError('The actor-adoptions audit %s cannot be read: %s'%(path,error)) from None
+    entries=record.get('entries') if isinstance(record,dict) and record.get('schema_version')==ACTOR_ADOPTIONS_SCHEMA else None
+    if not isinstance(entries,list) or any(not adoption_entry(item) for item in entries):
+        raise ValueError('The actor-adoptions audit %s is not the history this kit writes; nothing was changed'%path)
+    return [item for item in entries if project is None or item['project']==project]
+
+def principal_conflicts(root,actor,principal,exclude):
+    """Other projects' owners maps that give ``actor`` to a principal other than ``principal``.
+
+    Read before an adoption. The design (rule 2) keeps one operator list for the whole
+    installation, so a name on that list must mean the same principal everywhere; a name not
+    on the list may differ from project to project. A registry that cannot be read is a whole
+    refusal, never "no conflict".
+    """
+    from sessions import owners
+    found=[]
+    projects=root/'projects'
+    if not projects.is_dir():return found
+    for entry in sorted(projects.iterdir()):
+        if not entry.is_dir() or entry.name==exclude or not (entry/'.sessions.json').is_file():continue
+        try:other=owners(entry).get(actor)
+        except ValueError as error:
+            raise ValueError('Cannot read the session registry of project %s while adopting %s: %s'
+                             %(entry.name,actor,error)) from None
+        if other is not None and other!=principal:found.append((entry.name,other))
+    return found
+
+def project_actor_names(root,project,path):
+    """The actor names the project already holds: session registrations, owners-map keys and
+    the names its tracker rows use.
+
+    Read before an adoption so that a name that appears nowhere in the project is refused
+    rather than adopted into a fictitious owner (kittrial-5bb.194 review, finding 10). The
+    tracker is read because the actors this command exists for are the legacy ones: they
+    predate the registry and are visible only in the rows they wrote. A tracker that cannot
+    be read is a refusal, never "the name is unknown".
+    """
+    from sessions import read_registry, owner_map, used_actors
+    data=read_registry(path)
+    names={record['actor'] for record in data['records'].values()}|set(owner_map(data))
+    try:
+        text=run_bd(root,project,['export','--all'])
+        rows=[json.loads(line) for line in text.splitlines() if line.strip()]
+    except (subprocess.SubprocessError,OSError,ValueError,RecursionError):
+        raise ValueError('Cannot read the tracker of project %s to check whether that actor exists there; '
+                         'nothing was changed'%project) from None
+    names|=used_actors(rows)
+    return names
+
+def adopt_actor(root,project,actor,principal,operator,reason,from_principal=None):
+    """Give an existing actor to a principal in one project, and record it in the audit.
+
+    Rule 2 of docs/COORDINATORS_PER_PROJECT_DESIGN.md: actors that existed before a key was
+    bound are given to a principal once, by a host command, so they keep their names and
+    their history. The name must appear somewhere in the project the kit can read (a session
+    registration, an owner entry or a tracker row): a name that appears nowhere is refused.
+    It refuses a name on the operator allowlist that another principal owns in another
+    project: the one operator list must mean one lane everywhere.
+
+    An actor this project already gives to ANOTHER principal is not moved by the same plain
+    command: ``from_principal`` (``--from``) must name the owner it has now, and the audit
+    entry is marked ``moved``. Writing nothing when it already gives it to this one.
+
+    The same-operator-name check, the existence check and both writes run under the
+    deployment lock (kittrial-5bb.223, finding 1): two ``adopt-actor`` commands for one
+    operator-listed name in two projects serialize there, so the second reads the first's
+    owner entry and refuses instead of both exiting 0. Within that lock the registry is
+    written under the project's coordination lock. A damaged audit refuses the whole command
+    before the registry is touched. The audit is appended BEFORE the registry mutation, so a
+    host crash between the two leaves an audit entry with no adoption - the safer mistake
+    (review, item 6).
+    """
+    path=project_dir(root,project)
+    if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
+    from sessions import validate as validate_sessions, read_registry, owner_map, valid_actor, valid_principal
+    from recovery import identity
+    actor=valid_actor(actor,'actor')
+    principal=valid_principal(principal,'--principal')
+    if from_principal is not None:from_principal=valid_principal(from_principal,'--from')
+    operator=identity(operator,'Invalid operator identity')
+    from keyed_records import require_configured_operator
+    require_configured_operator(operator,operators(root,strict=True),'adopt an actor')
+    if not isinstance(reason,str) or not reason.strip():raise ValueError('A reason is required (--reason)')
+    reason=reason.strip()
+    if len(reason)>400:raise ValueError('--reason must be at most 400 characters')
+    with deployment_config_lock(root):
+        if actor in operators(root):
+            conflicts=principal_conflicts(root,actor,principal,project)
+            if conflicts:
+                raise ValueError('Refusing to adopt %s for %s: it is on the operator allowlist and project %s '
+                                 'already gives it to %s. One operator name must mean one principal on this '
+                                 'installation; adopt it there first, or take it off the operator list.'
+                                 %(actor,principal,conflicts[0][0],conflicts[0][1]))
+        actor_adoptions(root)                   # a damaged audit refuses before anything is written
+        if actor not in project_actor_names(root,project,path):
+            raise ValueError('Refusing to adopt %s: no session registration, owner entry or tracker row in project %s '
+                             'names that actor, so this project holds nothing to give to %s. Check the name '
+                             '(session show ACTOR, or the project rows); nothing was changed.'%(actor,project,principal))
+        try:
+            import fcntl
+        except ImportError:                     # a platform without flock: the atomic write still stands
+            fcntl=None
+        with (path/'.coordination.lock').open('a') as lock:
+            if fcntl is not None:fcntl.flock(lock,fcntl.LOCK_EX)
+            from coordination import atomic
+            data=read_registry(path)
+            current=dict(owner_map(data))
+            previous=current.get(actor)
+            if previous is not None and previous!=principal:
+                # An actor belongs to one principal: moving it out of another's hands is not the
+                # same plain command that gives a legacy actor its first owner (review, item 2).
+                if from_principal is None:
+                    raise ValueError('Refusing to move %s: project %s already gives it to %s. One actor belongs to one '
+                                     'principal; to move it, name the owner it has now with --from %s. Nothing was changed.'
+                                     %(actor,project,previous,previous))
+                if from_principal!=previous:
+                    raise ValueError('--from names %s, but project %s gives %s to %s; nothing was changed.'
+                                     %(from_principal,project,actor,previous))
+            elif from_principal is not None and from_principal!=previous:
+                raise ValueError('--from names %s, but project %s does not give %s to it; nothing was changed.'
+                                 %(from_principal,project,actor))
+            changed=previous!=principal
+            if changed:
+                entry={'at':utc_stamp(),'operator':operator,'project':project,'actor':actor,'principal':principal,
+                       'previous':previous,'reason':reason,'moved':previous is not None}
+                history=actor_adoptions(root)
+                history.append(entry)
+                atomic_private_write(root/ACTOR_ADOPTIONS_AUDIT,
+                                     json.dumps({'schema_version':ACTOR_ADOPTIONS_SCHEMA,
+                                                 'entries':history[-ACTOR_ADOPTIONS_MAX:]}))
+                current[actor]=principal
+                data['owners']=current
+                validate_sessions(data)
+                atomic(path/'.sessions.json',data)
+    if not changed:
+        return {'schema_version':1,'project':project,'actor':actor,'principal':principal,
+                'previous':previous,'changed':False,'moved':False,'audit_records':len(actor_adoptions(root))}
+    return {'schema_version':1,'project':project,'actor':actor,'principal':principal,
+            'previous':previous,'changed':True,'moved':entry['moved'],
+            'audit_records':len(actor_adoptions(root))}
+
+#: The deployment-authority audit (kittrial-5bb.192, slice 5 of
+#: docs/COORDINATORS_PER_PROJECT_DESIGN.md): every change of the operator and verifier lists
+#: made by ``operators add|remove`` and ``verifiers add|remove``. Where the adoption audit
+#: above records who gave an actor to a principal, this one records who changed the
+#: installation's authority and why. It is runtime-level, beside ``deployment.private.json``
+#: and ``actor-adoptions.audit.json``, and never part of a project's coordination backup.
+AUTHORITY_CHANGES_AUDIT='authority-changes.audit.json'
+AUTHORITY_CHANGES_SCHEMA=1
+#: A short history, like actor-adoptions.audit.json: the audit answers "who changed the
+#: lists, when and why", not "every change since the installation was made".
+AUTHORITY_CHANGES_MAX=200
+AUTHORITY_CHANGES_FIELDS=frozenset({'at','operator','list','actor','change','reason'})
+AUTHORITY_CHANGES_LISTS=('operators','verifiers')
+AUTHORITY_CHANGES_ACTIONS=('add','remove')
+#: The ceiling on a recorded ``--reason``, the same one ``adopt-actor`` uses.
+AUTHORITY_CHANGES_REASON_MAX=400
+#: What a damaged audit file is KEPT BESIDE the runtime as before a fresh history starts, the shape
+#: ``review-writes.audit.json`` already uses (kittrial-5bb.192 review item 1).
+AUTHORITY_CHANGES_DAMAGED='.damaged-'
+#: How many free names or temporary names one set-aside tries before it gives up. A name is only
+#: taken when ``os.path.lexists`` says it is free, so this is reached only on a race.
+AUTHORITY_CHANGE_ASIDE_ATTEMPTS=64
+#: The name a copy of a damaged audit leaves behind when the process is killed inside the copy:
+#: ``.authority-changes.audit.json.damaged-<STAMP>[.N].tmp-<16 hex>``. It is the alternation
+#: ``remove_private_write_leftovers`` adds for this audit alone, so the leftover of a kill inside
+#: the copy is cleaned by the next locked write like any other (kittrial-5bb.229 rev-2 item 4).
+AUTHORITY_CHANGE_COPY_LEFTOVER=r'\.damaged-[0-9A-Za-z]+(?:\.[0-9]+)?\.tmp-[0-9a-f]{16}'
+#: The literal words the printed re-grant commands carry when the restore was given no
+#: ``--actor``/``--reason``. ``authority_change_arguments`` refuses them on an ADD, so a command
+#: copied from a warning and run unchanged is refused instead of recording an operator named
+#: OPERATOR (kittrial-5bb.229 findings 3 and rev-2 item 3). A REMOVAL is never made harder for
+#: them: the placeholder is dropped, the entry is recorded unattributed, and one sentence says so.
+#: ``OPERATOR`` is a placeholder only while no listed operator carries that name, so a real listed
+#: operator named OPERATOR is not locked out of attributing a change (rev-2 item 3).
+AUTHORITY_CHANGE_PLACEHOLDER_ACTOR='OPERATOR'
+AUTHORITY_CHANGE_PLACEHOLDER_REASON='TEXT'
+#: The baseline a NEW history begins with: the operator and verifier lists as they stood when the
+#: trail began (round-2 review item 1, the coordinator's decision). It is one record beside the
+#: capped ``entries``, not one entry per name: the cap is 200 ENTRIES, and a per-name baseline
+#: costs one entry for every name it folds, so a history that lists ~200 names could never be
+#: replayed within the cap (baseline plus kept would stay at 201 for ever). ``at`` is the moment
+#: it was written, ``operator`` the operator of the change that started the history (null when
+#: that change named nobody) and ``reason`` says why it was written.
+AUTHORITY_CHANGES_BASELINE_FIELDS=frozenset({'at','operator','reason','lists'})
+
+class AuthorityAuditDamaged(ValueError):
+    """A list change or a read was refused because the authority-changes audit is unusable."""
+
+def authority_change_entry(item):
+    """Whether one entry has the shape ``operators``/``verifiers`` add|remove writes.
+
+    ``operator`` and ``reason`` are null when the caller did not say them. A call without
+    the new flags keeps working - the office wrapper ``coord.sh`` runs the bare
+    ``admin.py --root RT operators add ACTOR`` - and the entry then says plainly that the
+    change was not attributed instead of pretending somebody was named. The other fields
+    are always present, so the reader can always show what changed. ``at`` must be the exact
+    UTC stamp ``utc_stamp`` writes: a hand-written entry whose ``at`` is any other text is not
+    this kit's history, and neither is one that carries a field this kit does not write
+    (kittrial-5bb.192 review item 4).
+    """
+    return (isinstance(item,dict) and set(item)==AUTHORITY_CHANGES_FIELDS
+            and utc_timestamp(item['at'])
+            and isinstance(item['actor'],str) and bool(item['actor'])
+            and item['list'] in AUTHORITY_CHANGES_LISTS
+            and item['change'] in AUTHORITY_CHANGES_ACTIONS
+            and all(item[field] is None or (isinstance(item[field],str) and bool(item[field]))
+                    for field in ('operator','reason')))
+
+def authority_change_baseline(lists, operator, reason, at=None):
+    """The baseline a NEW history begins with: the operator and verifier lists as they stand now.
+
+    It is written (a) by the first change on an installation whose audit holds no baseline, which
+    includes an installation from before this kit and a file a hand edit started, (b) by the first
+    change after a damaged audit was set aside, and (c) carried forward by
+    ``record_authority_change`` when a change would push the trail past its cap, where the entries
+    dropped for room are folded into the fresh one. ``lists`` is either the
+    ``{noun: [names]}`` mapping ``authority_changes_current_lists`` answers or the same mapping
+    ``authority_change_fold`` answers. Reads nothing and writes nothing.
+
+    A list that could not be read is recorded as ``None`` (UNKNOWN), never as an empty list
+    (kittrial-5bb.229 rev-2 item 1, the coordinator's decision): a baseline holding ``[]`` for a
+    list nobody could read would read every name that list really holds as one the trail never
+    mentions, for good. A REMOVAL is never refused to avoid that: it starts the trail and records
+    the list it could not read as ``None``, and the reader then says the trail is incomplete for
+    that list. Only an ADD may be refused while a list cannot be read.
+    """
+    return {'at':at or utc_stamp(),'operator':operator,'reason':reason,
+            'lists':{noun:(None if (lists or {}).get(noun) is None else sorted(lists[noun]))
+                     for noun in AUTHORITY_CHANGES_LISTS}}
+
+def authority_change_baseline_record(item):
+    """Whether ``item`` is a baseline this kit writes.
+
+    ``lists`` must carry both lists and nothing else, each a list of non-empty names or ``null``
+    (UNKNOWN: the list could not be read when that history began, kittrial-5bb.229 rev-2 item 1);
+    the same strictness ``authority_change_entry`` applies to an entry, so a hand-written baseline
+    this kit does not write is "not the history this kit writes" rather than something silently
+    obeyed.
+    """
+    if not isinstance(item,dict) or set(item)!=AUTHORITY_CHANGES_BASELINE_FIELDS:return False
+    if not utc_timestamp(item['at']):return False
+    if item['operator'] is not None and not (isinstance(item['operator'],str) and item['operator']):return False
+    if not (isinstance(item['reason'],str) and item['reason']) or len(item['reason'])>AUTHORITY_CHANGES_REASON_MAX:
+        return False
+    lists=item['lists']
+    if not isinstance(lists,dict) or set(lists)!=set(AUTHORITY_CHANGES_LISTS):return False
+    return all(lists[noun] is None or (isinstance(lists[noun],list)
+               and all(isinstance(name,str) and bool(name) for name in lists[noun]))
+               for noun in AUTHORITY_CHANGES_LISTS)
+
+def authority_changes_document(record):
+    """``(entries, baseline, damage)`` for a parsed audit document; ``([], None, (kind, phrase))`` when it is not ours.
+
+    The ONE place the document's shape is judged, so the reader, the set-aside and the four
+    commands cannot disagree. ``schema_version`` is compared strictly: JSON ``true`` equals 1 in
+    Python and a hand-set ``1.0`` reads as 1, and neither is this kit's history (kittrial-5bb.192
+    review item 4). An unknown top-level key is a refusal, not something quietly dropped at the
+    next write, and every entry must carry exactly ``AUTHORITY_CHANGES_FIELDS``. The optional
+    ``baseline`` (round-2 review item 1) must be one this kit writes; a document without it is
+    still this kit's history - an older revision wrote none, and a hand-written file may have
+    none - and the reader then says the trail does not begin with a baseline.
+    """
+    if (not isinstance(record,dict) or not {'schema_version','entries'}<=set(record)
+            or set(record)-{'schema_version','entries','baseline'}):
+        return [],None,('not-this-history','is not the history this kit writes')
+    if type(record['schema_version']) is not int or record['schema_version']!=AUTHORITY_CHANGES_SCHEMA:
+        return [],None,('not-this-history','is not the history this kit writes: its schema_version is %r, not %d'
+                        %(record['schema_version'],AUTHORITY_CHANGES_SCHEMA))
+    entries=record['entries']
+    if not isinstance(entries,list) or any(not authority_change_entry(item) for item in entries):
+        return [],None,('not-this-history','is not the history this kit writes')
+    baseline=record.get('baseline')
+    if baseline is not None and not authority_change_baseline_record(baseline):
+        return [],None,('not-this-history','is not the history this kit writes: its baseline is not one this kit writes')
+    return entries,baseline,None
+
+def read_authority_changes(root):
+    """``(entries, baseline, damage)`` for the audit file; ``damage`` is None when it is absent or readable.
+
+    ``damage`` is ``(kind, phrase)``. ``not-a-regular-file``: the path is a directory, a fifo or a
+    symlink - a dangling symlink is not a file at all, so it used to read as an empty history and
+    then be replaced by a regular file. ``unreadable``: the bytes cannot be read as this kit's
+    JSON (not JSON, empty, a BOM, non-UTF-8, a bare list or ``null``, nested past the guard, a
+    ``NaN``, unreadable mode ``000``). ``not-this-history``: the document is JSON but is not the
+    history this kit writes (another schema, an unknown top-level key, an entry or a baseline with
+    an unknown or missing field, an ``at`` that is not this kit's stamp). An absent file is an
+    empty history with no baseline, never damage.
+    """
+    path=root/AUTHORITY_CHANGES_AUDIT
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        return [],None,('not-a-regular-file','is not a regular file (a directory, a fifo or a symlink)')
+    if not path.exists():return [],None,None
+    try:record=record_json.loads(path.read_text(encoding='utf-8'))
+    except (OSError,UnicodeError,ValueError) as error:
+        return [],None,('unreadable','cannot be read: %s'%error)
+    return authority_changes_document(record)
+
+def authority_change_damaged_files(root):
+    """The ``.damaged-*`` audit files kept beside this runtime, oldest name first. Reads only.
+
+    The kit never removes one (round-2 review item 2), so the reader lists them: nothing else
+    would tell an operator that the history they are reading was restarted beside a kept file.
+    Only a REGULAR, NON-SYMLINK file is one kept here (kittrial-5bb.229 finding 1): ``is_file``
+    follows a symlink, so a ``.damaged-*`` link to any outside file used to read as bytes the
+    kit had kept inside the runtime.
+    """
+    prefix=AUTHORITY_CHANGES_AUDIT+AUTHORITY_CHANGES_DAMAGED
+    try:names=sorted(os.listdir(str(root)))
+    except OSError:return []
+    kept=[]
+    for name in names:
+        if not name.startswith(prefix):continue
+        try:mode=os.lstat(str(root/name)).st_mode
+        except OSError:continue
+        if stat.S_ISREG(mode):kept.append(name)
+    return kept
+
+def authority_change_aside_name(root):
+    """The name a damaged audit would be kept under right now: a real stamp, free at this moment.
+
+    "Free" is ``os.path.lexists``, not ``Path.exists`` (kittrial-5bb.229 finding 1): a DANGLING
+    symlink at the name is taken, where ``exists`` read it as free and the fallback copy then
+    followed the link and wrote the damaged bytes outside the runtime.
+    """
+    from datetime import datetime,timezone
+    stamp=datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+    aside=root/('%s%s%s'%(AUTHORITY_CHANGES_AUDIT,AUTHORITY_CHANGES_DAMAGED,stamp))
+    number=1
+    while os.path.lexists(str(aside)):
+        aside=root/('%s%s%s.%d'%(AUTHORITY_CHANGES_AUDIT,AUTHORITY_CHANGES_DAMAGED,stamp,number));number+=1
+    return aside
+
+def authority_change_aside_hint(root):
+    """The ``mv`` command that gets a damaged audit out of the way, as the refusals print it.
+
+    The name is a real, current UTC stamp, not the literal word ``STAMP``: a template two
+    different set-asides both follow overwrites the first kept file (round-2 review item 4).
+    """
+    path=root/AUTHORITY_CHANGES_AUDIT
+    return 'mv %s %s'%(path,authority_change_aside_name(root))
+
+def authority_audit_refusal(root,damage,mode):
+    """The sentence for an unusable audit; ``mode`` is ``read``, ``add`` or ``remove``.
+
+    Every refusal names the path, what is wrong with it and the recovery, so an operator is never
+    told only that the command was refused (kittrial-5bb.192 review items 1 and 4).
+    """
+    kind,phrase=damage
+    path=root/AUTHORITY_CHANGES_AUDIT
+    hint=authority_change_aside_hint(root)
+    head='The authority-changes audit %s %s'%(path,phrase)
+    # A read changes nothing at all, so it says that rather than "nothing was changed".
+    tail='; nothing was read' if mode=='read' else '; nothing was changed'
+    if kind=='not-a-regular-file':
+        return (head+tail+'. The kit only sets a damaged regular FILE aside by itself. Move it aside by hand (%s) '
+                'and run the command again.'%hint)
+    if mode=='add':
+        return (head+tail+'. This command ADDS to the deployment authority, and the kit does not start a fresh history '
+                'for a grant. Move the file aside by hand (%s) and run the command again: the change is then '
+                'recorded in a fresh history.'%hint)
+    if mode=='read':
+        return (head+tail+'. Move the file aside by hand (%s) and read it again; a REMOVAL made with this kit keeps a '
+                'damaged file beside the runtime by itself and starts a fresh history.'%hint)
+    return head+tail+'. Move it aside by hand (%s) and run the command again.'%hint
+
+def authority_change_baseline_problem_refusal(problem):
+    """The sentence for an ADD that would start a new history while a list cannot be read.
+
+    A new history begins with a baseline of the lists as they stand, so a baseline that held an
+    empty list for a list nobody could read would read every name that list really holds as one the
+    trail never mentions, for good. That is why an ADD is refused here - and ONLY an add: a REMOVAL
+    is never refused for the audit (kittrial-5bb.192 review item 1). A removal starts the trail and
+    records the list it could not read as ``null`` (UNKNOWN) instead (kittrial-5bb.229 rev-2 item
+    1). The change is refused BEFORE the configuration is written, so nothing changed.
+    """
+    return ('The authority-changes audit would start a new history with a baseline of the current operator and '
+            'verifier lists, but they cannot both be read: %s. Nothing was changed: a baseline never holds an empty '
+            'list for a list that could not be read, and this command ADDS to the deployment authority, so the ADD '
+            'is the one refused. Repair deployment.private.json and run the command again; a REMOVAL is not refused '
+            'for it - it starts the trail and records the unreadable list as null (UNKNOWN).'%problem)
+
+def authority_changes(root):
+    """The recorded operator/verifier list changes, oldest first. Reads only.
+
+    An absent file is an empty history. A file this kit cannot read as its own history is a
+    refusal, not an empty history, exactly as ``actor_adoptions``: a caller must not be told
+    "nobody changed the lists" by a damaged audit.
+    """
+    entries,_,damage=read_authority_changes(root)
+    if damage is not None:raise AuthorityAuditDamaged(authority_audit_refusal(root,damage,'read'))
+    return entries
+
+def authority_change_same_bytes(first,second):
+    """Whether two regular files hold exactly the same bytes, never following a symlink. Reads only."""
+    try:
+        if os.lstat(str(first)).st_size!=os.lstat(str(second)).st_size:return False
+        with open(first,'rb') as left,open(second,'rb') as right:
+            while True:
+                chunk=left.read(131072)
+                if chunk!=right.read(131072):return False
+                if not chunk:return True
+    except OSError:
+        return False
+
+def authority_change_copy_bytes(source,destination):
+    """Copy ``source``'s bytes to ``destination``; ``False`` when the name is taken.
+
+    The bytes go to a fresh temporary name in the same directory and are renamed into place
+    (kittrial-5bb.229 finding 4): a kill inside the copy leaves the temporary name, never a
+    partial file under a ``.damaged-*`` name. The temporary file is opened
+    ``O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW`` (finding 1), and ``destination`` is only renamed onto
+    when ``os.path.lexists`` says it is free, so a symlink there is never followed or overwritten;
+    the caller takes the next free name when this returns ``False``.
+
+    ``O_EXCL`` is the flag that does the work: it refuses a name that is already taken, a symlink
+    in the final component included, so ``O_NOFOLLOW`` adds nothing beside it (kittrial-5bb.229
+    rev-2 item 4). It is kept anyway - it says the intent, it is read with ``getattr`` because a
+    platform may not have it, and it costs nothing - but no test or comment should claim it is
+    what stops the write through a symlink. When every one of the ``AUTHORITY_CHANGE_ASIDE_ATTEMPTS``
+    temporary names is taken, this refuses with a sentence instead of a traceback (item 4).
+    """
+    import shutil
+    directory=str(destination.parent)
+    flags=os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,'O_NOFOLLOW',0)
+    temporary=None;descriptor=None
+    for _ in range(AUTHORITY_CHANGE_ASIDE_ATTEMPTS):
+        candidate=os.path.join(directory,'.%s.tmp-%s'%(destination.name,secrets.token_hex(8)))
+        try:descriptor=os.open(candidate,flags,0o600)
+        except FileExistsError:continue
+        temporary=candidate;break
+    if temporary is None:
+        raise AuthorityAuditDamaged(
+            'The kit could not write a temporary copy of %s beside it: every one of the %d names it tried in %s was '
+            'taken. Nothing was changed. Move the damaged file aside by hand and run the command again.'
+            %(source,AUTHORITY_CHANGE_ASIDE_ATTEMPTS,destination.parent))
+    try:
+        with os.fdopen(descriptor,'wb') as out, open(source,'rb') as src:
+            shutil.copyfileobj(src,out)
+        if os.path.lexists(str(destination)):return False
+        os.rename(temporary,destination)
+        temporary=None
+        return True
+    finally:
+        # The temporary copy never outlives this call, whether the copy failed or the name was
+        # taken: a leftover here is exactly what the widened cleanup must not have to guess at
+        # (kittrial-5bb.229 rev-2 item 4).
+        if temporary is not None:
+            try:os.unlink(temporary)
+            except OSError:pass
+
+def authority_change_keep_bytes(root,path):
+    """Keep ``path``'s bytes beside the runtime under a fresh, free ``.damaged-*`` name; return it.
+
+    ``os.link`` is the first choice, so the bytes are one inode under two names and the retry
+    finds them with ``os.samefile``. A filesystem without hard links gets a copy that is written
+    through a temporary name and renamed (kittrial-5bb.229 findings 1 and 4). A name is only used
+    when ``os.path.lexists`` says it is free, and ``EEXIST`` on the link is never a reason to copy
+    - a copy would follow a link that appeared at that name - so the next free name is taken.
+
+    Every attempt failing is a REFUSAL with a sentence naming the recovery, not a traceback
+    (kittrial-5bb.229 rev-2 item 4): 64 attempts was reached only by injecting ``EEXIST`` on a
+    name ``os.path.lexists`` had just called free, and a Python traceback told an operator
+    nothing.
+    """
+    for _ in range(AUTHORITY_CHANGE_ASIDE_ATTEMPTS):
+        aside=authority_change_aside_name(root)
+        try:
+            os.link(path,aside)
+        except FileExistsError:
+            continue
+        except OSError:
+            if authority_change_copy_bytes(path,aside):return aside
+            continue
+        else:
+            return aside
+    raise AuthorityAuditDamaged(
+        'The authority-changes audit %s is damaged, and the kit could not keep its bytes beside the runtime: every '
+        'one of the %d names it tried was taken. Nothing was changed. Move the file aside by hand (%s) and run the '
+        'command again.'%(root/AUTHORITY_CHANGES_AUDIT,AUTHORITY_CHANGE_ASIDE_ATTEMPTS,authority_change_aside_hint(root)))
+
+def set_aside_damaged_authority_changes(root,damage):
+    """Keep the DAMAGED audit's bytes beside the runtime under a dated name; return the path kept.
+
+    A REMOVAL is never refused for the audit (kittrial-5bb.192 review item 1, the coordinator's
+    decision). The bytes are put at the aside name FIRST - a hard link, or a copy where the
+    filesystem has none - and ``record_authority_change`` then lets the atomic write of the new
+    history REPLACE the audit path, so the path is never absent (round-2 review item 2): a kill, or
+    a write that fails, at any point leaves the damaged file exactly where it was plus one extra
+    name, and the retry reuses that name instead of filling the runtime with copies of the same
+    bytes.
+
+    It does NOT print the sentence saying a fresh history starts: ``record_authority_change``
+    prints that once the fresh history is actually written, so the kit never says a fresh history
+    starts and then refuses (kittrial-5bb.229 rev-2 item 1).
+
+    Only a regular, non-symlink ``.damaged-*`` file is a candidate (kittrial-5bb.229 finding 1):
+    a symlink at the name, even one pointing at the audit path, is neither reused nor listed, and
+    an existing regular copy holding the same bytes is reused (finding 4) so a filesystem without
+    hard links does not accumulate one copy per attempt. "The same bytes" is the BYTES, not the
+    size: a same-size file holding something else is not the kept copy and its bytes are not taken
+    for this audit's (rev-2 item 4).
+    """
+    path=root/AUTHORITY_CHANGES_AUDIT
+    aside=None
+    for name in authority_change_damaged_files(root):
+        candidate=root/name
+        try:
+            if os.path.samefile(path,candidate):aside=candidate;break
+        except OSError:
+            pass
+        if authority_change_same_bytes(path,candidate):aside=candidate;break
+    if aside is None:
+        aside=authority_change_keep_bytes(root,path)
+    return aside
+
+def authority_change_set_aside_reason(aside,reason):
+    """The reason on the change that starts a fresh history after a damaged audit.
+
+    The entry field set is closed, so the one place that change can record the set-aside is its
+    reason; it is written BEFORE the operator's own sentence so the fact cannot be lost. The
+    baseline written with it names the same file in the same way.
+    """
+    note='the previous audit was damaged and was kept beside the runtime as %s'%aside.name
+    return '%s; %s'%(note,reason) if reason else note
+
+def authority_change_baseline_reason(aside=None,dropped=0,late=False,unknown=()):
+    """Why a baseline was written: the trail's start, a late start, a set-aside, or the cap making room.
+
+    ``late`` says this history already held entries but no baseline - a file written by hand, or by
+    a kit older than this one - so the baseline holds the lists as they stand at THIS change, and
+    says plainly that the trail before it is incomplete instead of claiming to hold the lists "as
+    they stood when this history began" (kittrial-5bb.229 finding 6).
+
+    ``unknown`` names the lists this baseline holds as ``null`` because they could not be read
+    (kittrial-5bb.229 rev-2 item 1). The sentence then says so and says the trail is incomplete for
+    them, so the one place the closed entry field set can record WHY - the baseline's reason -
+    carries it. With the cap also folding entries in, the wording claims only the lists it could
+    read: the fold cannot invent the names a list held when nobody could read it.
+    """
+    if dropped:
+        if unknown:
+            note=('baseline: the %d entr%s the trail dropped at its %d-entry cap are folded into the lists it could '
+                  'read; the %s list could not be read and stays null (UNKNOWN), so the trail is incomplete for it'
+                  %(dropped,'y' if dropped==1 else 'ies',AUTHORITY_CHANGES_MAX,' and '.join(unknown)))
+        else:
+            note=('baseline: the lists as the trail held them where it was cut to its %d-entry cap; the %d entr%s '
+                  'dropped are folded in here, so the trail still leads to the lists'
+                  %(AUTHORITY_CHANGES_MAX,dropped,'y' if dropped==1 else 'ies'))
+    elif late:
+        note=('baseline: the lists as they stand at this change; this history held entries but no baseline, so the '
+              'trail before it is incomplete for these lists and nothing recorded what they were when it began')
+    else:
+        note='baseline: the lists as they stood when this history began'
+    if unknown:
+        note+=('; the %s list could not be read, so the baseline holds null (UNKNOWN) for it and the trail is '
+               'incomplete for it'%' and '.join(unknown))
+    if aside is not None:
+        note+='; the previous audit was damaged and was kept beside the runtime as %s'%aside.name
+    return note
+
+def authority_change_fold(baseline,entries):
+    """The ``{noun: [names]}`` a baseline holds after every entry in ``entries`` is applied to it.
+
+    The trail is replayed exactly as the reader replays it (the last word on a name wins, and a
+    baseline name is listed), so the state a cut trail is folded into is the state the reader would
+    have computed for those names. A list the baseline holds as ``None`` (UNKNOWN) STAYS ``None``:
+    the fold cannot invent the names a list held when nobody could read it, and an empty list there
+    would be exactly the claim finding 2 forbids (kittrial-5bb.229 rev-2 item 1).
+    """
+    held={noun:(baseline or {}).get('lists',{}).get(noun) for noun in AUTHORITY_CHANGES_LISTS}
+    lists={noun:set(held[noun] or ()) for noun in AUTHORITY_CHANGES_LISTS}
+    for item in entries:
+        if item['change']=='remove':lists[item['list']].discard(item['actor'])
+        else:lists[item['list']].add(item['actor'])
+    return {noun:(sorted(lists[noun]) if held[noun] is not None else None) for noun in AUTHORITY_CHANGES_LISTS}
+
+def authority_change_precheck(root,action,changes=True):
+    """Refuse an ADD that WOULD change the list on a damaged audit; refuse any command on a path that is not a regular file.
+
+    A REMOVAL is NOT refused for a damaged file: ``record_authority_change`` keeps it beside the
+    runtime under a dated name and starts a fresh history with the removal in it (kittrial-5bb.192
+    review item 1). ``changes`` says whether this command would really change the list: a no-op ADD
+    (the name is already listed) is NOT refused, because the release before this audit exited 0 for
+    it and a wrapper that re-runs its bare ``operators add`` must keep working (round-2 review item
+    4); only a grant that would change something pays the price of moving the file by hand. Called
+    BEFORE the lock, so a refusal costs nothing at all: no lock file, nothing written.
+    """
+    _,_,damage=read_authority_changes(root)
+    if damage is None:return
+    if damage[0]=='not-a-regular-file':
+        raise AuthorityAuditDamaged(authority_audit_refusal(root,damage,'remove' if action=='remove' else 'add'))
+    if action=='add' and changes:
+        raise AuthorityAuditDamaged(authority_audit_refusal(root,damage,'add'))
+
+def record_authority_change(root,noun,action,actor,operator,reason):
+    """Append one recorded list change and return the entry written.
+
+    Called only when the list really changes, from inside ``deployment_config_lock`` and
+    BEFORE the configuration is written: a host crash between the two leaves an audit entry
+    with no change - the safer mistake, the same ordering ``adopt_actor`` uses.
+
+    A damaged FILE is handled here (kittrial-5bb.192 review item 1, the coordinator's decision):
+    a REMOVAL keeps the file beside the runtime and starts a fresh history, an ADD is refused, and
+    a path that is not a regular file is refused for every command. A history with no baseline gets
+    one here - the lists as they stand, read under the lock and before this change - so the replay
+    starts from a known state and a listed-but-never-mentioned name really is a hand edit or an
+    older kit (round-2 review item 1). A REMOVAL is never refused because one of the two lists
+    cannot be read: that list is recorded as ``null`` (UNKNOWN) in the baseline and the removal
+    goes on; only an ADD is refused while a list cannot be read (kittrial-5bb.229 rev-2 item 1).
+    When a change needs room in the cap, the entries that make room are folded into a fresh
+    baseline rather than lost, and the drop is named on stderr (review item 3e).
+
+    The sentence saying a fresh history starts after a damaged audit is printed AFTER that fresh
+    history has actually been written, so the kit never says it and then refuses (rev-2 item 1).
+    """
+    entries,baseline,damage=read_authority_changes(root)
+    aside=None
+    if damage is not None:
+        if damage[0]=='not-a-regular-file' or action!='remove':
+            raise AuthorityAuditDamaged(authority_audit_refusal(root,damage,'add' if action!='remove' else 'remove'))
+        aside=set_aside_damaged_authority_changes(root,damage)
+        reason=authority_change_set_aside_reason(aside,reason)
+        entries=[];baseline=None
+    entry={'at':utc_stamp(),'operator':operator,'list':noun,'actor':actor,'change':action,'reason':reason}
+    if baseline is None:
+        listed,problem=authority_changes_current_lists(root)
+        if problem is not None and action!='remove':
+            raise ValueError(authority_change_baseline_problem_refusal(problem))
+        unknown=[] if problem is None else [name for name in AUTHORITY_CHANGES_LISTS
+                                            if listed is None or listed.get(name) is None]
+        baseline=authority_change_baseline(listed,operator,
+                                          authority_change_baseline_reason(aside,late=bool(entries),
+                                                                           unknown=unknown),at=entry['at'])
+    history=list(entries)
+    history.append(entry)
+    dropped=len(history)-AUTHORITY_CHANGES_MAX
+    if dropped>0:
+        # The oldest entries must go, and a trail cut at the head can no longer be replayed: the
+        # state they recorded is carried forward in a fresh baseline, and the entries over the cap
+        # are the newest ones (round-2 review item 1).
+        baseline=authority_change_baseline(authority_change_fold(baseline,history[:dropped]),operator,
+                                           authority_change_baseline_reason(
+                                               dropped=dropped,
+                                               unknown=[name for name in AUTHORITY_CHANGES_LISTS
+                                                        if baseline['lists'].get(name) is None]),
+                                           at=entry['at'])
+        history=history[dropped:]
+        print('WARNING: %d older entr%s dropped from %s: it keeps the last %d entries, and what they recorded is '
+              'folded into the baseline, so the trail still leads to the lists.'
+              %(dropped,'y was' if dropped==1 else 'ies were',root/AUTHORITY_CHANGES_AUDIT,AUTHORITY_CHANGES_MAX),
+              file=sys.stderr)
+    document={'schema_version':AUTHORITY_CHANGES_SCHEMA,'entries':history}
+    if baseline is not None:document['baseline']=baseline
+    atomic_private_write(root/AUTHORITY_CHANGES_AUDIT,json.dumps(document))
+    if aside is not None:
+        # Only now is it true (rev-2 item 1): the fresh history is on disk, so the sentence cannot
+        # be followed by a refusal that leaves it false.
+        print('The authority-changes audit %s is damaged (%s); it was kept beside the runtime as %s, and a fresh '
+              'history starts with the change that follows.'%(root/AUTHORITY_CHANGES_AUDIT,damage[1],aside),
+              file=sys.stderr)
+    return entry
+
+def authority_change_notice(noun,action,operator,reason):
+    """The one sentence a list change without the new flags prints on stderr.
+
+    It names exactly what to add, so the bare form the office wrapper uses keeps working and is
+    never silently unattributed. With one flag given it names that flag's holder and asks for the
+    other alone: a change made by a named operator is not called unattributed (kittrial-5bb.192
+    review item 3c). ``restore-new``'s re-grant prints the same sentence with
+    ``('restore-new','re-grant')`` when ``--actor`` or ``--reason`` was not given (round-2 review
+    item 3), so an unattributed re-grant is as loud as an unattributed list change.
+    """
+    if operator is None and reason is None:
+        return ('WARNING: this %s %s was recorded in %s without --actor OPERATOR and --reason TEXT, so the audit '
+                'reads it as unattributed. Add --actor OPERATOR and --reason TEXT to say who changed the '
+                'deployment authority and why.'%(noun,action,AUTHORITY_CHANGES_AUDIT))
+    if reason is None:
+        return ('WARNING: this %s %s by %s was recorded in %s without --reason TEXT, so the audit names %s but '
+                'does not say WHY the change was made. Add --reason TEXT to say why the deployment authority was '
+                'changed.'%(noun,action,operator,AUTHORITY_CHANGES_AUDIT,operator))
+    return ('WARNING: this %s %s was recorded in %s without --actor OPERATOR, so the audit does not say WHO made '
+            'the change (the reason you gave is recorded). Add --actor OPERATOR to name the operator who changed '
+            'the deployment authority.'%(noun,action,AUTHORITY_CHANGES_AUDIT))
+
+def authority_change_placeholder_notice(noun,action,dropped,operator):
+    """The one sentence a REMOVAL prints when it accepted a printed placeholder instead of refusing.
+
+    A removal must not be harder WITH the flags than without (kittrial-5bb.229 rev-2 item 3), so the
+    literal ``--actor OPERATOR``/``--reason TEXT`` the printed re-grant commands carry are not a
+    refusal on a removal: the placeholder is dropped, the entry is recorded without it, and this
+    sentence says exactly what was recorded. Nothing is silent, and an ADD is still refused
+    (finding 3), so a command copied from a warning and run unchanged does not record an operator
+    named OPERATOR on a grant.
+    """
+    labels={'actor':'--actor OPERATOR','reason':'--reason TEXT'}
+    given=' and '.join(labels[field] for field in dropped)
+    recorded=('unattributed (operator null)' if operator is None else 'by %s'%operator)
+    return ('WARNING: %s %s the placeholder the printed re-grant commands carry, not a real value. A REMOVAL is '
+            'never refused for it, and the placeholder is not recorded as a real value: this %s %s is recorded %s. '
+            'Replace it with the real value and run the command again to record it.'
+            %(given,'is' if len(dropped)==1 else 'are',noun,action,recorded))
+
+def authority_change_listed_operators(cfg):
+    """The names the deployment lists as operators, or ``()`` when that value cannot be read.
+
+    The literal ``--actor OPERATOR`` is a real name only while an operator this deployment lists
+    carries it (kittrial-5bb.229 rev-2 item 3). A ``verifiers`` command needs that answer too, and
+    an unusable ``operators`` value must NOT make it fail here: it lists nobody, so the literal is
+    the placeholder, and the removal the reviewer's mirror case exercises goes on (rev-2 item 1).
+    """
+    try:return list(stored_operators(cfg))
+    except (ValueError,TypeError,OSError,UnicodeError):return []
+
+def authority_change_arguments(args,noun,listed_operators=()):
+    """Validate ``--actor``/``--reason`` for one list change; returns ``(operator,reason,notice)``.
+
+    Both are optional, because the bare form ``admin.py --root RT operators add ACTOR`` (the
+    office wrapper ``coord.sh``) must keep working. A value that IS given is normalised and
+    checked here like ``adopt-actor``'s, and ``notice`` is the one sentence to print on
+    stderr when one or both were not recorded, so the bare form is never silently unattributed.
+    ``--actor``/``--reason`` may be given at most once: the parser refuses a repeat instead of
+    recording the last value silently (kittrial-5bb.192 review item 4).
+
+    The literal placeholders the printed re-grant commands carry are refused on an ADD
+    (kittrial-5bb.229 finding 3) and never on a REMOVAL (rev-2 item 3): a removal must not be
+    harder WITH the flags than without, so the placeholder is dropped, the entry is recorded
+    without it and ``authority_change_placeholder_notice`` says so. ``OPERATOR`` is a placeholder
+    only while no listed operator carries that name: ``operators add OPERATOR`` is still accepted,
+    so a real operator named OPERATOR is not locked out of attributing a change (rev-2 item 3).
+    """
+    from recovery import identity
+    listed=set(listed_operators)
+    operator=args.operator
+    dropped=[]
+    if operator is not None:
+        operator=identity(operator,'Invalid operator identity')
+        if operator==AUTHORITY_CHANGE_PLACEHOLDER_ACTOR and operator not in listed:
+            if args.action!='remove':
+                raise ValueError('--actor %s is the placeholder the printed re-grant commands carry; replace it with '
+                                 'the operator who is making the change, or the audit would record OPERATOR as a real '
+                                 'name'%AUTHORITY_CHANGE_PLACEHOLDER_ACTOR)
+            dropped.append('actor');operator=None
+    reason=args.reason
+    if reason is not None:
+        reason=reason.strip()
+        if not reason:raise ValueError('--reason must be a sentence, not blank')
+        if reason==AUTHORITY_CHANGE_PLACEHOLDER_REASON:
+            if args.action!='remove':
+                raise ValueError('--reason %s is the placeholder the printed re-grant commands carry; replace it with '
+                                 'a sentence saying why the deployment authority is changing'
+                                 %AUTHORITY_CHANGE_PLACEHOLDER_REASON)
+            dropped.append('reason');reason=None
+        elif len(reason)>AUTHORITY_CHANGES_REASON_MAX:
+            raise ValueError('--reason must be at most %d characters'%AUTHORITY_CHANGES_REASON_MAX)
+    if dropped:
+        notice=authority_change_placeholder_notice(noun,args.action,dropped,operator)
+    else:
+        notice=(authority_change_notice(noun,args.action,operator,reason)
+                if operator is None or reason is None else None)
+    return operator,reason,notice
+
+def authority_change_list_arguments(args,noun):
+    """Refuse the recording flags on ``list``: they were accepted and ignored (review item 4)."""
+    given=[flag for flag,value in (('--actor',args.operator),('--reason',args.reason)) if value is not None]
+    if given:
+        raise ValueError('%s list takes no %s: it changes nothing, so the flag would be accepted and ignored. '
+                         'The recording flags are for %s add and %s remove.'
+                         %(noun,' or '.join(given),noun,noun))
+
+def authority_changes_current_lists(root):
+    """``(lists, problem)``: each list as the deployment holds it, or ``None`` when it cannot be read.
+
+    Reads each list ON ITS OWN (kittrial-5bb.229 finding 2): a ``deployment.private.json`` whose
+    ``verifiers`` value cannot be used no longer hides the readable ``operators`` list. ``lists``
+    maps each noun to its names, or to ``None`` when that one alone could not be read; a file that
+    cannot be read at all makes ``lists`` ``None``. ``problem`` names each unreadable list (or the
+    whole file) and is ``None`` when both could be read. Reads only, and never raises: the reader
+    must still show the trail when the lists cannot be read, saying beside it that they could not.
+    """
+    try:
+        cfg=config(root)
+    except (OSError,UnicodeError,ValueError,TypeError) as error:
+        return None,'%s'%error
+    lists={};problems=[]
+    for noun,reader in (('operators',stored_operators),('verifiers',stored_verifiers)):
+        try:lists[noun]=list(reader(cfg))
+        except (OSError,UnicodeError,ValueError,TypeError) as error:
+            lists[noun]=None;problems.append('%s: %s'%(noun,error))
+    return lists,('; '.join(problems) if problems else None)
+
+def authority_change_replay(entries,listed,noun,baseline=None):
+    """Replay one list's trail against that list as it is now (kittrial-5bb.192 review item 3a).
+
+    An entry holds no before/after of the list itself, so the trail can only be replayed: the last
+    entry the trail holds for a name is the trail's last word on it, and a name the baseline holds
+    is the trail's word for the state its history began in. With a baseline to replay from, a name
+    the trail never mentions IS a hand edit or a change made by an older kit; without one - a file
+    written before this kit, or by hand - the trail may simply be older than the lists, and the
+    note says so (round-2 review item 1).
+
+    ``None`` when the baseline holds THIS list as ``null`` (UNKNOWN): it could not be read when that
+    history began, so there is no known state to replay from and the reader must say the trail is
+    incomplete for the list rather than replay it from an empty one (kittrial-5bb.229 rev-2 item 1).
+    """
+    if baseline is not None and baseline['lists'].get(noun) is None:return None
+    last={}
+    if baseline is not None:
+        for name in baseline['lists'].get(noun) or ():last[name]='baseline'
+    for item in entries:
+        if item['list']==noun:last[item['actor']]=item['change']
+    written=list(listed.get(noun,[]))
+    listed_twice=sorted({name for name in written if written.count(name)>1})
+    current=sorted(set(written))
+    expected=sorted(name for name,change in last.items() if change!='remove')
+    return {'agrees':current==expected,
+            'current':current,
+            'trail_expects':expected,
+            'listed_but_last_removed':sorted(name for name in current if last.get(name)=='remove'),
+            'listed_but_not_in_trail':sorted(name for name in current if name not in last),
+            'trail_added_but_not_listed':sorted(set(expected)-set(current)),
+            'listed_more_than_once':listed_twice}
+
+def authority_changes_lists_phrase(nouns):
+    """``the current <noun> list``/``the current lists``, for a note that must not overclaim.
+
+    With one list unreadable the note can only speak for the lists it could compare: saying "the
+    current lists" would claim the other one too (kittrial-5bb.229 rev-2 item 2).
+    """
+    if len(nouns)==len(AUTHORITY_CHANGES_LISTS):return 'the current lists'
+    return 'the current %s list'%' and '.join(nouns)
+
+def authority_changes_incomplete_sentence(incomplete,problem,unknown_in_baseline=()):
+    """The sentence for each list this read cannot compare, the unreadable list named FIRST.
+
+    ``incomplete`` are the lists with no replay, in ``AUTHORITY_CHANGES_LISTS`` order. A list is in
+    it because the deployment could not be read now (``problem`` names it) or because the baseline
+    this trail begins with holds it as ``null`` (UNKNOWN): it could not be read when that history
+    began (kittrial-5bb.229 rev-2 item 1). The caller puts this sentence BEFORE anything about the
+    lists that could be compared, so the unreadable list is named first (rev-2 item 2).
+    """
+    reasons=[]
+    for noun in incomplete:
+        if noun in unknown_in_baseline:
+            reasons.append('the baseline this trail begins with holds the %s list as null (UNKNOWN), because it could '
+                           'not be read when that history began'%noun)
+        else:
+            reasons.append(problem or 'it could not be read')
+    return ('The trail is incomplete for %s: %s. This read cannot say whether the trail leads to that list.'
+            %(' and '.join(incomplete),'; '.join(reasons)))
+
+def authority_changes_replay_note(replay,entries,capped,problem,baseline=None,unknown_in_baseline=()):
+    """The plain sentence beside the entries: does the trail lead to the lists as they are now?
+
+    ``capped`` says only that the trail HOLDS its cap (200 entries). It must never say entries were
+    dropped: at exactly 200 with nothing dropped yet, that was untrue (round-2 review item 1). What
+    the cap does with the entries that make room is said as the policy it is. A list that could not
+    be read has no replay (``None``): the note then says the trail is incomplete for that list and
+    that this read cannot say whether it leads to it (kittrial-5bb.229 finding 2), exactly as it
+    says the trail is incomplete when the history has no baseline (finding 6) or when the baseline
+    holds the list as ``null`` (rev-2 item 1). The incomplete sentence comes FIRST, so the
+    unreadable list is named first (rev-2 item 2), and everything after it speaks only for the
+    lists this read could compare.
+    """
+    if problem is not None and replay is None:
+        return ('WARNING: the trail cannot be compared with the current lists: %s. The audit records only the '
+                'changes the four list commands made here, so this read cannot say whether the trail leads to '
+                'the lists.'%problem)
+    incomplete=[noun for noun in AUTHORITY_CHANGES_LISTS if replay is None or replay.get(noun) is None]
+    readable=[noun for noun in AUTHORITY_CHANGES_LISTS if noun not in incomplete]
+    note=[]
+    if incomplete:
+        note.append(authority_changes_incomplete_sentence(incomplete,problem,unknown_in_baseline))
+    if not entries and baseline is None:
+        if incomplete:
+            note.append('No trail yet: no operator or verifier list change has been recorded here, so there is '
+                        'nothing to replay. The lists above are the ones this deployment holds and could be read; '
+                        'the first change that CAN start the trail does. A REMOVAL is never refused for a list that '
+                        'cannot be read: it starts the trail and the baseline records that list as null (UNKNOWN), '
+                        'so the trail is incomplete for it. A GRANT (an add) is refused while a list cannot be read. '
+                        'Reading again after a change says whether the trail leads to the lists.')
+        else:
+            note.append('No trail yet: no operator or verifier list change has been recorded here, so there is '
+                        'nothing to replay. The lists above are the ones this deployment holds; the first change '
+                        'starts the trail with a baseline of them, and reading again after it says whether the trail '
+                        'leads to them.')
+        return ' '.join(note)
+    parts=[];listed_twice=[]
+    for noun in readable:
+        item=None if replay is None else replay.get(noun)
+        if item is None:
+            continue
+        if item['listed_more_than_once']:
+            listed_twice.append('%s in %s'%(', '.join(item['listed_more_than_once']),noun))
+        if item['agrees']:continue
+        detail=[]
+        if item['listed_but_last_removed']:
+            detail.append('the list holds %s, whose last recorded change is a remove'
+                          %', '.join(item['listed_but_last_removed']))
+        if item['trail_added_but_not_listed']:
+            detail.append('the trail adds %s but the list does not hold it'
+                          %', '.join(item['trail_added_but_not_listed']))
+        if item['listed_but_not_in_trail']:
+            detail.append('the list holds %s, which the trail never mentions'
+                          %', '.join(item['listed_but_not_in_trail']))
+        parts.append('%s: %s'%(noun,'; '.join(detail)))
+    if readable and parts:
+        note.append('WARNING: the trail does not lead to %s - '%authority_changes_lists_phrase(readable)
+                    +' | '.join(parts)+'.')
+        if baseline is None:
+            note.append('A hand edit of deployment.private.json leaves no entry here; so does a list change made by a '
+                        'kit older than this one. This trail does not begin with a baseline either, so it may simply '
+                        'be older than the lists: nothing here can tell those apart. The trail is incomplete for '
+                        'these lists.')
+        else:
+            note.append('A hand edit of deployment.private.json leaves no entry here; so does a list change made by a '
+                        'kit older than the baseline this trail begins with (at %s).'%baseline['at'])
+    elif readable and baseline is None:
+        note.append('The trail leads to %s, but it does not begin with a baseline, so it was written '
+                    'before this kit or by hand and may be older than the lists. The trail is incomplete for these '
+                    'lists.'%authority_changes_lists_phrase(readable))
+    elif readable:
+        note.append('The trail leads to %s: every name listed now was put there by an entry or by the '
+                    'baseline this trail begins with (at %s), and every name the trail adds is listed.'
+                    %(authority_changes_lists_phrase(readable),baseline['at']))
+    if listed_twice:
+        note.append('WARNING: deployment.private.json lists %s more than once; the trail compares names as a set.'
+                    %'; '.join(listed_twice))
+    if capped:
+        note.append('The trail is at its cap of %d entries: the newest are kept, and when the next change needs room '
+                    'the oldest entries are folded into the baseline rather than lost, so the trail still leads to '
+                    'the lists.'%AUTHORITY_CHANGES_MAX)
+    return ' '.join(note)
+
+def authority_changes_report(root):
+    """``(report, note)`` for the ``authority-changes`` reader: the trail, the lists and the replay.
+
+    The report prints the current lists beside the entries, counts and marks the entries that name
+    nobody, prints the baseline the trail begins with and any damaged audit kept beside the
+    runtime, and replays the trail against the lists (kittrial-5bb.192 review items 3a and 3b,
+    round-2 review items 1 and 2). ``replay.agrees`` is ``true`` when the trail leads to the lists,
+    ``false`` when it does not, and ``null`` when there is no trail yet or when the trail is
+    INCOMPLETE for a list (it could not be read now, or the baseline holds it as ``null``/UNKNOWN
+    because it could not be read when that history began; kittrial-5bb.229 rev-2 item 1); ``replay``
+    itself is ``null`` when the lists cannot be read at all. The exit code is 0 in all of those
+    cases, so a script must read ``replay.agrees`` rather than the exit status (round-2 review item
+    4).
+    """
+    entries,baseline,damage=read_authority_changes(root)
+    if damage is not None:raise AuthorityAuditDamaged(authority_audit_refusal(root,damage,'read'))
+    listed,problem=authority_changes_current_lists(root)
+    capped=len(entries)>=AUTHORITY_CHANGES_MAX
+    kept=authority_change_damaged_files(root)
+    # A list the baseline holds as null (UNKNOWN) could not be read when that history began: it has
+    # no replay either, and the note says so in those words (kittrial-5bb.229 rev-2 item 1).
+    unknown_in_baseline=[noun for noun in AUTHORITY_CHANGES_LISTS
+                         if baseline is not None and baseline['lists'].get(noun) is None]
+    report={'schema_version':AUTHORITY_CHANGES_SCHEMA,
+            'entries':[dict(item,unattributed=True) if item['operator'] is None else item for item in entries],
+            'unattributed_entries':sum(1 for item in entries if item['operator'] is None),
+            'baseline':None if baseline is None else
+                       {'at':baseline['at'],'operator':baseline['operator'],'reason':baseline['reason'],
+                        'entries':sum(len(baseline['lists'][noun]) for noun in AUTHORITY_CHANGES_LISTS
+                                      if baseline['lists'][noun] is not None),
+                        'unknown_lists':list(unknown_in_baseline),
+                        'lists':{noun:(None if baseline['lists'][noun] is None else list(baseline['lists'][noun]))
+                                 for noun in AUTHORITY_CHANGES_LISTS}},
+            'damaged_files':kept,
+            'current_lists':listed,
+            'current_lists_problem':problem}
+    no_trail=not entries and baseline is None
+    if listed is None:
+        report['replay']=None
+        note=authority_changes_replay_note(None,entries,capped,problem,baseline,unknown_in_baseline)
+    else:
+        replay={noun:(None if listed[noun] is None else authority_change_replay(entries,listed,noun,baseline))
+                for noun in AUTHORITY_CHANGES_LISTS}
+        note=authority_changes_replay_note(replay,entries,capped,problem,baseline,unknown_in_baseline)
+        readable=all(replay[noun] is not None for noun in AUTHORITY_CHANGES_LISTS)
+        if not readable:
+            # One list could not be read (now, or when the baseline was written): the trail is
+            # incomplete for it, so this read cannot say whether it leads to the lists
+            # (kittrial-5bb.229 finding 2 and rev-2 item 1). With no trail at all the state is still
+            # no-trail; the note says which list could not be read, and says it first (rev-2 item 2).
+            agrees=None;state='no-trail' if no_trail else 'incomplete'
+        else:
+            agrees=None if no_trail else all(replay[noun]['agrees'] for noun in AUTHORITY_CHANGES_LISTS)
+            state='no-trail' if no_trail else ('agrees' if agrees else 'mismatch')
+        report['replay']={'agrees':agrees,'state':state,'lists':replay,'note':note}
+    if kept:
+        note+=' The kit has set %d damaged audit file(s) aside beside this runtime - %s - and never removes them.'\
+              %(len(kept),', '.join(kept))
+    if report['replay'] is not None:report['replay']['note']=note      # the JSON and stderr say the same thing
+    return report,note
+
+def credential_actors(root,state_path,service_namespace=None):
+    """Every worker credential of the web service with the name it writes under, and whether
+    that name is somebody else's on this host (kittrial-5bb.184). Reads; changes nothing.
+
+    A worker credential writes under the actor namespace its issuer chose. Before
+    kittrial-5bb.184 an owner could choose a registered session actor, a name on the operator
+    or verifier list or the service's own namespace, and the credential then acted as that
+    actor. Such a credential is refused when it writes from that kit on; this lists them, so
+    an operator can tell their owners. Nothing is revoked here: revoking is the owner's, in
+    the web interface.
+
+    ``tracker_rows`` says whether the project's tracker already has rows under the name (an
+    assignee, a creator, a comment author). For a name that collides they may be the real
+    actor's or the credential's: the rows cannot tell. For a name that does not, they are
+    what a credential under that name wrote, or an old actor from before sessions were
+    registered: worth a look when nobody remembers issuing it.
+
+    ``collides`` now holds the rows in too (kittrial-5bb.188 item 1): a plain name the tracker
+    was already holding before the credential was issued is refused when it writes, and the
+    credential is listed here. A credential issued after that rule carries
+    ``actor_rows_checked`` and is judged only against the rows older than its own issuance, so
+    the rows it wrote itself are not held against it. A credential issued before the rule is
+    judged by the rows once, and the outcome is kept on it (``actor_rows_checked`` or
+    ``actor_rows_refused``; item 5). A name a superuser waived carries ``actor_waived``
+    (item 4): it is listed as allowed -- ``collides`` null, ``refused_when_it_writes`` false,
+    with ``waived``, ``waived_by_username``, ``waived_at``, ``waived_reason`` and an
+    ``actor_allowed`` sentence -- because it writes. Rows inside an earlier same-name,
+    same-owner credential's lifetime are not held either (item 3). An export that answers no
+    rows is said as ``tracker_rows`` null, not false: the tracker was not read.
+    ``service_namespace`` is the namespace the web service was started with (its
+    ``--actor-namespace``), when the operator says so: a credential named under it is refused
+    at use too (kittrial-5bb.188 item 3).
+    """
+    import actor_names
+    from datetime import datetime,timezone
+    from sessions import registered_actors
+    source=Path(state_path)
+    if not source.is_file():raise ValueError('No web service state at %s'%source)
+    try:state=json.loads(source.read_text(encoding='utf-8'))
+    except (ValueError,RecursionError):raise ValueError('The web service state at %s is not readable as JSON'%source) from None
+    if not isinstance(state,dict) or not isinstance(state.get('credentials'),dict):
+        raise ValueError('The file at %s is not a web service state document'%source)
+    users=state.get('users') if isinstance(state.get('users'),dict) else {}
+    listed_operators,listed_verifiers=sorted(operators(root)),sorted(verifiers(root))
+    def moment(value):
+        if isinstance(value,(int,float)) and not isinstance(value,bool):
+            return datetime.fromtimestamp(value,timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        return value if isinstance(value,str) else None
+    projects={}
+    def project(name):
+        if name not in projects:
+            found={'on_host':False,'sessions':[],'marks':None}
+            try:path=project_dir(root,name)
+            except ValueError:path=None
+            if path is not None and (path/'.beads/metadata.json').is_file():
+                found['on_host']=True
+                found['sessions']=registered_actors(path)
+                try:
+                    rows=[json.loads(line) for line in run_bd(root,name,['export','--all']).splitlines() if line.strip()]
+                    if not any(isinstance(row,dict) for row in rows):
+                        raise ValueError('the export answered no rows')
+                    found['marks']=actor_names.tracker_marks(rows)
+                except (subprocess.CalledProcessError,OSError,ValueError,RecursionError):
+                    found['marks']=None                # the tracker could not be read: said as null, not as "no rows"
+            projects[name]=found
+        return projects[name]
+    out=[]
+    for identifier in sorted(state['credentials']):
+        credential=state['credentials'][identifier]
+        if not isinstance(credential,dict) or credential.get('agent_id'):continue
+        namespace=credential.get('actor')
+        if not isinstance(namespace,str) or not namespace:continue         # it writes under its issuer's own account id
+        name=credential.get('project_id')
+        host=project(name) if isinstance(name,str) else {'on_host':False,'sessions':[],'marks':None}
+        issued=credential.get('created_at')
+        before=issued if isinstance(issued,(str,int,float)) and not isinstance(issued,bool) else None
+        authors=None if host['marks'] is None else actor_names.tracker_names(host['marks'],before)
+        reason=actor_names.collision(namespace,sessions=host['sessions'],operators=listed_operators,
+                                     verifiers=listed_verifiers,authors=authors or (),
+                                     service=(service_namespace,actor_names.SERVICE_NAMESPACE)
+                                     if service_namespace else actor_names.SERVICE_NAMESPACE)
+        issuer=users.get(credential.get('user_id')) if isinstance(users.get(credential.get('user_id')),dict) else {}
+        waived=credential.get('actor_waived') if isinstance(credential.get('actor_waived'),dict) else None
+        if waived is not None:
+            # A superuser allowed this name on purpose (kittrial-5bb.188 item 4): it is not
+            # colliding and it is not refused when it writes; the listing says who allowed it
+            # and when, in plain words as well as in fields.
+            reason=None
+        item={'credential':identifier,'project':name,'project_on_host':host['on_host'],'label':credential.get('label'),
+              'actor':namespace,'collides':reason,'revoked':bool(credential.get('revoked')),
+              'refused_when_it_writes':reason is not None,
+              'tracker_rows':None if host['marks'] is None else actor_names.head(namespace) in {n for n,_ in host['marks']},
+              'issued_by':credential.get('user_id'),'issued_by_username':issuer.get('username'),
+              'created_at':moment(credential.get('created_at')),'last_used':moment(credential.get('last_used')),
+              'expires_at':moment(credential.get('expires_at'))}
+        if waived is not None:
+            item['waived']=True
+            item['waived_by']=waived.get('by')
+            item['waived_by_username']=issuer.get('username')
+            item['waived_at']=moment(waived.get('at'))
+            item['waived_reason']=waived.get('reason')
+            item['actor_allowed']='allowed by %s on %s' % (issuer.get('username') or waived.get('by') or 'a superuser',
+                                                            item['waived_at'] or 'an unrecorded date')
+        out.append(item)
+    colliding=[item for item in out if item['collides'] is not None and not item['revoked']]
+    return {'schema_version':1,'state':str(source),'worker_credentials_with_a_name':len(out),
+            'colliding_and_not_revoked':len(colliding),'credentials':out}
+
+class _OnceFlag(argparse.Action):
+    """A flag that may be given at most once.
+
+    argparse's default ``store`` keeps the LAST value silently, so ``--actor a --actor b``
+    recorded ``b`` with nothing said (kittrial-5bb.192 review item 4). The second occurrence is
+    refused instead: whose change it was must never depend on the order of the arguments. An
+    ABBREVIATED spelling never reaches this action: the subparsers that take these flags
+    (``operators``, ``verifiers`` and, since round-2 review item 3, ``restore-new``) are built
+    with ``allow_abbrev=False``, so argparse refuses ``--act``/``--reas`` itself with exit 2.
+    """
+    def __call__(self,parser,namespace,values,option_string=None):
+        if getattr(namespace,self.dest,None) is not None:
+            raise ValueError('%s was given more than once; give it once. The value recorded would otherwise be the '
+                             'last one, silently.'%(option_string or self.dest))
+        setattr(namespace,self.dest,values)
+
+def one_flag_value(values,label):
+    """The one value of a CLI flag that may be named at most once.
+
+    ``adopt-actor``'s ``--principal``, ``--from``, ``--actor`` and ``--reason`` are ``append``
+    arguments, so a flag named twice is refused here rather than silently taking the last
+    (kittrial-5bb.223, finding 4); the parser stores one or more values in a list.
+    """
+    if isinstance(values,list):
+        if len(values)>1:
+            raise ValueError('%s given more than once; name it once (got %s)'
+                             %(label,', '.join(str(value) for value in values)))
+        return values[0] if values else None
+    return values
+
 def main():
     p=argparse.ArgumentParser();p.add_argument('--root',required=True)
     sub=p.add_subparsers(dest='command',required=True)
     a=sub.add_parser('install');a.add_argument('--port',type=int,default=13317);a.add_argument('--unit',default='beads-team.service')
     a=sub.add_parser('add-project');a.add_argument('project')
+    a=sub.add_parser('finish-project',help='complete a project creation the web interface started and that stopped half way')
+    a.add_argument('project')
+    a=sub.add_parser('project-creations',help='list the project creations the web interface started (JSON), or set the limit of project databases on this server')
+    a.add_argument('--attention',action='store_true',help='only the ones that are running or that an operator must finish or remove')
+    a.add_argument('--usage',action='store_true',help='how many project databases this server holds, and its limit')
+    a.add_argument('--set-server-limit',type=int,metavar='N',help='set the limit of project databases (operator allowlist, audited); needs --actor')
+    a.add_argument('--actor')
+    a=sub.add_parser('remove-creation',help='remove a project creation that did not finish (operator allowlist); refuses a finished project and a running creation')
+    a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--reason',required=True)
     a=sub.add_parser('set-onboarding');a.add_argument('project');a.add_argument('--file',required=True)
     a=sub.add_parser('set-guidance',help='set the standing coordinator guidance every actor reads each run (operator allowlist, audited)')
     a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
@@ -3585,16 +6267,39 @@ def main():
     a.add_argument('--set-aside-evidence',action='store_true',dest='set_aside_evidence',
                    help='with --duplicate: release an anchor that carries acceptance evidence; with live evidence, a remaining anchor must have live evidence too')
     a=sub.add_parser('revert-record');a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
-    a=sub.add_parser('operators');a.add_argument('action',choices=['list','add','remove']);a.add_argument('actor',nargs='?')
-    a.add_argument('--confirm-revoke',action='store_true',dest='confirm_revoke',
-                   help='with remove: acknowledge that this operator\'s earlier operator voids stop applying')
-    a.add_argument('--all-revoked',action='store_true',dest='all_revoked',
-                   help='with remove: name every affected entry instead of the first 5 (the warning truncates otherwise)')
-    a=sub.add_parser('verifiers',help='the capability verifiers list: actors whose capability-verify records read verified')
+    a=sub.add_parser('operators',allow_abbrev=False,
+                     help='the installation operator allowlist: who may run the operator-gated host '
+                          'commands; add and remove are recorded in the authority-changes audit')
     a.add_argument('action',choices=['list','add','remove']);a.add_argument('actor',nargs='?')
-    a.add_argument('--confirm-revoke',action='store_true',dest='confirm_revoke',
+    a.add_argument('--actor',dest='operator',default=None,metavar='OPERATOR',action=_OnceFlag,
+                   help='with add/remove: the operator making this change, recorded in the authority-changes '
+                        'audit (the change still applies without it, and the entry records null). Given twice, '
+                        'refused')
+    a.add_argument('--reason',default=None,action=_OnceFlag,
+                   help='with add/remove: why the list is changed, recorded in the '
+                        'authority-changes audit (at most %d characters). Given twice, refused'
+                        %AUTHORITY_CHANGES_REASON_MAX)
+    a.add_argument('--confirm','--confirm-revoke',action='store_true',dest='confirm_revoke',
+                   help='with remove: acknowledge that this operator\'s earlier operator voids stop applying')
+    a.add_argument('--a','--all','--all-revoked',action='store_true',dest='all_revoked',
+                   help='with remove: name every affected entry instead of the first 5 (the warning truncates otherwise)')
+    a=sub.add_parser('verifiers',allow_abbrev=False,
+                     help='the capability verifiers list: actors whose capability-verify records read verified')
+    a.add_argument('action',choices=['list','add','remove']);a.add_argument('actor',nargs='?')
+    a.add_argument('--actor',dest='operator',default=None,metavar='OPERATOR',action=_OnceFlag,
+                   help='with add/remove: the operator making this change, recorded in the authority-changes '
+                        'audit (the change still applies without it, and the entry records null). Given twice, '
+                        'refused')
+    a.add_argument('--reason',default=None,action=_OnceFlag,
+                   help='with add/remove: why the list is changed, recorded in the '
+                        'authority-changes audit (at most %d characters). Given twice, refused'
+                        %AUTHORITY_CHANGES_REASON_MAX)
+    a.add_argument('--confirm','--confirm-revoke',action='store_true',dest='confirm_revoke',
                    help='with remove: acknowledge that this verifier\'s capability verifications stop reading verified')
     a=sub.add_parser('review-writes',help='read or set the per-installation switch that allows WRITING the new review-workflow record shapes (readers understand them either way; OFF by default)')
+    a.add_argument('action',choices=['status','on','off'])
+    a.add_argument('--actor',required=True,help='an actor on the deployment operator allowlist')
+    a=sub.add_parser('checkpoint-provenance-writes',help='operator-audited reader-first checkpoint rollout switch; OFF by default, existing provenance tasks refuse legacy writes')
     a.add_argument('action',choices=['status','on','off'])
     a.add_argument('--actor',required=True,help='an actor on the deployment operator allowlist')
     a=sub.add_parser('capability-verify',help='record verified capability checks (operator allowlist or verifiers list)')
@@ -3605,6 +6310,36 @@ def main():
                    help='which line(s) to print (default: both, for different keys)')
     a.add_argument('--python',default=None,help='interpreter in the contributor forced command (default: this interpreter, or /usr/bin/python3)')
     a.add_argument('--comment',default=None,help='replace the key line comment')
+    a.add_argument('--project',action='append',default=None,metavar='NAME',
+                   help='bind the contributor line to this project (repeatable): the endpoint then refuses every '
+                        'request of that key for another project. Without it the key may name any project')
+    a.add_argument('--principal',action='append',default=None,metavar='NAME',
+                   help='bind the contributor line to this principal (a lane, lane:NAME or person:NAME): the '
+                        'endpoint then refuses every request of that key whose actor that principal does not own '
+                        'in the project. Without it the key acts as any actor. Given twice, refused')
+    a=sub.add_parser('authorized-keys-list',help='read-only: every line of authorized_keys, what it may do here, the '
+                     'projects and the principal it is bound to, and whether it points at the installed kit')
+    a.add_argument('--file',default=None,help='the authorized_keys file to read (default: ~/.ssh/authorized_keys of this account)')
+    a=sub.add_parser('adopt-actor',help='give an existing actor to a principal (a lane) in one project, so a key '
+                                        'bound to that principal may act as it; recorded in the adoption audit '
+                                        '(operator allowlist)',allow_abbrev=False)
+    a.add_argument('project',help='the project whose registry records the actor')
+    a.add_argument('actor',metavar='ACTOR',help='the actor name to give to the principal, as it already appears in '
+                                                'the project (a session actor, or an older name with tracker rows)')
+    a.add_argument('--principal',required=True,action='append',default=None,metavar='NAME',
+                   help='the principal (a lane, lane:NAME or person:NAME) that actor is to belong to (given twice, refused)')
+    a.add_argument('--from',dest='from_principal',action='append',default=None,metavar='NAME',
+                   help='the principal that currently owns the actor, required to MOVE an actor another principal '
+                        'already owns: without it the move is refused (given twice, refused)')
+    a.add_argument('--actor',required=True,dest='operator',action='append',default=None,metavar='OPERATOR',
+                   help='the actor performing the adoption, on the deployment operator allowlist (given twice, refused)')
+    a.add_argument('--reason',required=True,action='append',default=None,
+                   help='why this actor is being adopted (recorded in the audit; given twice, refused)')
+    a=sub.add_parser('actor-adoptions',help='read-only: the recorded actor adoptions (who gave which actor to which '
+                                            'principal, when and why)')
+    a.add_argument('project',nargs='?',help='only the adoptions of this project')
+    a=sub.add_parser('authority-changes',help='read-only: the recorded changes of the installation operator and '
+                                              'verifier lists (which list changed, who changed it, when and why)')
     a=sub.add_parser('backup');a.add_argument('projects',nargs='*',metavar='project')
     a.add_argument('--all',action='store_true',dest='all_projects',
                    help='back up every initialized project in this runtime in one run')
@@ -3612,6 +6347,13 @@ def main():
     a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--reason',required=True)
     a.add_argument('--force',action='store_true',
                    help='retire it although it looks like a working tracker (or could not be checked), holds the merge slot or has pending reservations')
+    a=sub.add_parser('backup-authority',help='read only: the operators and verifiers a project backup records, '
+                                             'against what this installation lists now')
+    a.add_argument('project')
+    a=sub.add_parser('open-item-label-check',help='read only, at deploy time: list the projects whose rows already carry '
+                                                 'the label open-item or an open-item: label (exit 1 when any does, or '
+                                                 'cannot be read)')
+    a.add_argument('projects',nargs='*',metavar='project')
     a=sub.add_parser('backup-status')
     a.add_argument('--require-complete',action='store_true',dest='require_complete',
                    help='exit non-zero unless the last run covered every project (--all) and every initialized '
@@ -3626,7 +6368,10 @@ def main():
                    help='also refuse when any project is recorded degraded; without it a degraded project is '
                         'copied and named')
     a=sub.add_parser('backup-repoint');a.add_argument('project')
-    a=sub.add_parser('restore-new');a.add_argument('project');a.add_argument('destination')
+    a=sub.add_parser('restore-new',allow_abbrev=False,
+                     help='restore a backup into a new project; --restore-operators/--restore-verifiers '
+                          're-grant the authority the backup records, recorded in the authority-changes audit')
+    a.add_argument('project');a.add_argument('destination')
     a.add_argument('--restore-operators',action='store_true',dest='restore_operators',
                    help='explicitly re-grant the operator allowlist entries the backup records that this '
                         'host no longer lists; off by default because the allowlist is deployment-wide '
@@ -3634,6 +6379,25 @@ def main():
     a.add_argument('--restore-verifiers',action='store_true',dest='restore_verifiers',
                    help='explicitly re-grant the capability verifiers the backup records that this host no '
                         'longer lists; off by default for the same reason as --restore-operators')
+    a.add_argument('--actor',default=None,metavar='OPERATOR',action=_OnceFlag,
+                   help='with --restore-operators/--restore-verifiers: the operator making the re-grant, recorded '
+                        'in the authority-changes audit (the re-grant still applies without it, and the entry '
+                        'records null, with one sentence on stderr). Given twice, or abbreviated, refused')
+    a.add_argument('--reason',default=None,action=_OnceFlag,
+                   help='with --restore-operators/--restore-verifiers: why the re-grant is made; the recorded '
+                        'reason names restore-new and the source project and then this sentence, which must leave '
+                        'room for that prefix inside the %d-character ceiling. Given twice, or abbreviated, refused'
+                        %AUTHORITY_CHANGES_REASON_MAX)
+    a.add_argument('--without-coordination',action='store_true',dest='without_coordination',
+                   help='restore only the native tracker data of a backup whose coordination sidecar exists but '
+                        'cannot be used (restore-new refuses such a backup without this flag); its sessions, '
+                        'handoffs, requests, merge context and recorded operators and verifiers are not restored')
+    a.epilog=('Exit status: 0 restored; 3 restored, but --restore-operators/--restore-verifiers could not '
+              're-grant (another change held the deployment lock, or the authority-changes audit is damaged): '
+              'the last lines say what, with the commands to re-grant it; 1 failed. --actor OPERATOR and '
+              '--reason TEXT are recorded on every re-grant in the authority-changes audit, and one sentence on '
+              'stderr says so when they were not given. Compare a backup with this installation: '
+              'backup-authority PROJECT.')
     a=sub.add_parser('reconcile-request');a.add_argument('project');a.add_argument('--request-id',required=True)
     a.add_argument('--actor',required=True);a.add_argument('--reason',required=True)
     a.add_argument('--disposition',choices=['failed','released','complete'],default='released')
@@ -3642,6 +6406,11 @@ def main():
     a.add_argument('--any-actor',action='store_true',dest='any_actor',
                    help='with --disposition released (or failed on a receipt with no recorded actor), open the request ID to any actor')
     a=sub.add_parser('service');a.add_argument('action',choices=['start','stop','restart','status'])
+    a=sub.add_parser('credential-actors',help='list the web service\'s worker credentials and whether the name each writes under is somebody else\'s on this host (reads only)')
+    a.add_argument('--service-namespace',default=None,metavar='NS',dest='service_namespace',
+                   help='the namespace the web service was started with (its --actor-namespace): a credential named '
+                        'under it is listed as refused too. Without it only http is judged')
+    a.add_argument('--state',required=True,help='the web service state document (the --state of http_service.py)')
     a=sub.add_parser('record-store')
     a.add_argument('--state',required=True,
                    help='the HTTP service state document (its --state); the record store is '
@@ -3666,6 +6435,49 @@ def main():
     args=p.parse_args();root=root_path(args.root)
     if args.command=='install':install(root,args.port,args.unit)
     elif args.command=='add-project':add_project(root,args.project)
+    elif args.command=='finish-project':
+        import project_creation
+        result=project_creation.finish(root,args.project)
+        already=result.pop('already',False)
+        print(json.dumps(result,sort_keys=True))
+        if already:
+            print('%s is complete on the server already: there was nothing to finish. If it is not in the web '
+                  'interface, the account that started it creates it again there (the same name), or a superuser '
+                  'registers it.'%args.project,file=sys.stderr)
+        else:
+            print('Finished %s on the server. If it is not in the web interface yet, the account that started it '
+                  'creates it again there (the same name), or a superuser registers it.'%args.project,file=sys.stderr)
+    elif args.command=='project-creations':
+        import project_creation
+        if args.set_server_limit is not None:
+            if not args.actor:raise ValueError('--set-server-limit requires --actor (an operator on the allowlist)')
+            from recovery import identity
+            print(json.dumps(project_creation.set_server_limit(root,args.set_server_limit,identity(args.actor,'Invalid actor identity')),sort_keys=True))
+            print('The limit counts every project database on this server: archived and retired projects and '
+                  'unfinished creations too. Every bd write gets slower as their number grows; see OPERATIONS, '
+                  '"The cost of many projects on one server".',file=sys.stderr)
+        elif args.usage:
+            print(json.dumps(project_creation.server_usage(root),sort_keys=True))
+        else:
+            found=project_creation.attention(root) if args.attention else project_creation.records(root)
+            print(json.dumps(found,sort_keys=True,indent=1))
+    elif args.command=='remove-creation':
+        import project_creation
+        result=project_creation.remove(root,args.project,args.actor,args.reason)
+        print(json.dumps(result,sort_keys=True))
+        if result['removed']=='damaged-record':
+            print('The creation record of %s could not be read. It is kept as project-creations/%s and nothing else '
+                  'was touched. %s'%(args.project,result['kept_as'],
+                  'Nothing is under projects/%s, so the name is free again.'%args.project if result['name']=='free' else
+                  'projects/%s exists and is now a project with no creation record: register it in the web interface '
+                  'if it is complete, or retire it (admin.py retire-project %s --actor OPERATOR --reason REASON).'
+                  %(args.project,args.project)),file=sys.stderr)
+        elif result['name']=='free':
+            print('Removed the creation record of %s. Nothing had been made for it, so the name is free again.'
+                  %args.project,file=sys.stderr)
+        else:
+            print('Removed the unfinished creation of %s: its directory is retired and nothing was deleted. The '
+                  'name stays retired, because a database of that name may be on the server.'%args.project,file=sys.stderr)
     elif args.command=='set-onboarding':
         import fcntl
         from onboarding import probe_endpoints, write_project
@@ -3746,6 +6558,13 @@ def main():
             guidance_report=guidance_status(path,args.actor,operators(root,strict=True),host=True)
         print(json.dumps(guidance_report,sort_keys=True,indent=2))
     elif args.command=='service':print(service(root,args.action))
+    elif args.command=='credential-actors':
+        report=credential_actors(root,args.state,getattr(args,'service_namespace',None))
+        print(json.dumps(report,indent=2,sort_keys=True))
+        if report['colliding_and_not_revoked']:
+            print('%d worker credential(s) write under a name that is somebody else\'s on this host. Each is refused '
+                  'when it writes; its owner revokes it in the web interface and issues one under another name. '
+                  'Nothing was changed by this command.'%report['colliding_and_not_revoked'],file=sys.stderr)
     elif args.command=='record-store':
         try:
             report=record_store_reset(args.state) if args.reset_high_water \
@@ -3990,7 +6809,7 @@ def main():
                 if kind is None:raise ValueError('Unsupported operator void target kind')
                 print(json.dumps(kind.apply_void(payload,args.actor,run,authority)))
                 return
-            rows=[json.loads(line) for line in run_bd(root,args.project,['export','--all']).splitlines() if line.strip()]
+            rows=record_json.loads_rows(run_bd(root,args.project,['export','--all']))
             print(json.dumps(apply_void(rows,payload['task'],args.actor,payload,run,operator=True,
                                         operators=authority,journal=path)))
     elif args.command=='revert-record':
@@ -4003,7 +6822,7 @@ def main():
         def run(argv):return run_bd(root,args.project,['--actor',args.actor,*argv])
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
-            rows=[json.loads(line) for line in run_bd(root,args.project,['export','--all']).splitlines() if line.strip()]
+            rows=record_json.loads_rows(run_bd(root,args.project,['export','--all']))
             print(json.dumps(apply_revert(rows,payload['task'],args.actor,payload,run,operator=True,
                                           operators=authority,journal=path)))
     elif args.command=='operators':
@@ -4013,6 +6832,7 @@ def main():
         cfg=config(root)
         current=stored_operators(cfg)
         if args.action=='list':
+            authority_change_list_arguments(args,'operators')
             print(json.dumps({'operators':current}))
             # An allowlist that already holds an HTTP account or agent id (added by hand, or
             # by an older kit following its own advice) makes that id an operator.
@@ -4029,6 +6849,7 @@ def main():
         operators(root, strict=True)
         if not args.actor:raise ValueError('operators '+args.action+' requires an actor identity')
         actor=identity(args.actor,'Invalid operator identity')
+        operator,reason,notice=authority_change_arguments(args,'operators',current)
         if args.action=='add':
             # An HTTP account or agent id is never an operator (kittrial-5bb.70 review
             # 01a10308): the web service acts under those ids, and an older kit's advice
@@ -4038,7 +6859,8 @@ def main():
                 raise ValueError('%s has the shape of an HTTP account or agent id; such an id is never added to the '
                                  'operator allowlist. A web disposition counts through the web service, not '
                                  'through this list'%actor)
-            if actor not in current:current.append(actor)
+            changes=actor not in current
+            if changes:current.append(actor)
         else:
             if not args.confirm_revoke:
                 limit=None if args.all_revoked else 5
@@ -4048,10 +6870,26 @@ def main():
                                  ' (re-add restores them).' + revoked_keyed_voids(root,actor,limit) +
                                  revoked_proposal_records(root,actor,limit) +
                                  ' Re-run with --confirm-revoke to acknowledge this.')
-            if actor in current:current.remove(actor)
-        if current:cfg['operators']=current
-        else:cfg.pop('operators',None)
-        atomic_private_write(marker,json.dumps(cfg))
+            changes=actor in current
+        # A damaged audit refuses only an ADD that would really change the list: a no-op add is
+        # rc 0 here, exactly as the release before this audit, and the refusal costs nothing at
+        # all - no lock is taken (round-2 review item 4).
+        authority_change_precheck(root,args.action,changes)
+        # The change is applied to a fresh read under the deployment lock, so an add or
+        # remove made at the same instant by another command is not lost (kittrial-5bb.136).
+        changed=False
+        with deployment_config_lock(root):
+            cfg=config(root)
+            current=stored_operators(cfg)
+            changed=(actor not in current) if args.action=='add' else (actor in current)
+            if changed:record_authority_change(root,'operators',args.action,actor,operator,reason)
+            if args.action=='add':
+                if actor not in current:current.append(actor)
+            elif actor in current:current.remove(actor)
+            if current:cfg['operators']=current
+            else:cfg.pop('operators',None)
+            atomic_private_write(marker,json.dumps(cfg))
+        if changed and notice:print(notice,file=sys.stderr)
         print(json.dumps({'operators':current}))
     elif args.command=='verifiers':
         marker=root/'deployment.private.json'
@@ -4059,46 +6897,69 @@ def main():
         from recovery import identity
         cfg=config(root)
         current=stored_verifiers(cfg)
-        if args.action=='list':print(json.dumps({'verifiers':current}));return
+        if args.action=='list':
+            authority_change_list_arguments(args,'verifiers')
+            print(json.dumps({'verifiers':current}));return
         # Config is the single authority source, exactly as for `operators`.
         verifiers(root, strict=True)
         if not args.actor:raise ValueError('verifiers '+args.action+' requires an actor identity')
         actor=identity(args.actor,'Invalid verifier identity')
+        # The literal --actor placeholder is a real name for an operator the deployment lists
+        # (kittrial-5bb.229 rev-2 item 3), so the operators list is passed in, exactly as above -
+        # and an unusable operators value lists nobody rather than failing the command (item 1).
+        operator,reason,notice=authority_change_arguments(args,'verifiers',
+                                                          authority_change_listed_operators(cfg))
         if args.action=='add':
-            if actor not in current:current.append(actor)
+            changes=actor not in current
+            if changes:current.append(actor)
         else:
             if not args.confirm_revoke:
                 raise ValueError('verifiers remove revokes ' + actor + ': every capability verification they '
                                  'recorded reads `reported` instead of `verified`, and drift that only their '
                                  'passes had cleared reappears' + revoked_verifications(root,actor) +
                                  ' (re-add restores them). Re-run with --confirm-revoke to acknowledge this.')
-            if actor in current:current.remove(actor)
-        if current:cfg['verifiers']=current
-        else:cfg.pop('verifiers',None)
-        atomic_private_write(marker,json.dumps(cfg))
+            changes=actor in current
+        # As for `operators`: only a change that would really change the list is refused here, and
+        # the refusal takes no lock and writes nothing (round-2 review item 4).
+        authority_change_precheck(root,args.action,changes)
+        changed=False
+        with deployment_config_lock(root):
+            cfg=config(root)
+            current=stored_verifiers(cfg)
+            changed=(actor not in current) if args.action=='add' else (actor in current)
+            if changed:record_authority_change(root,'verifiers',args.action,actor,operator,reason)
+            if args.action=='add':
+                if actor not in current:current.append(actor)
+            elif actor in current:current.remove(actor)
+            if current:cfg['verifiers']=current
+            else:cfg.pop('verifiers',None)
+            atomic_private_write(marker,json.dumps(cfg))
+        if changed and notice:print(notice,file=sys.stderr)
         print(json.dumps({'verifiers':current}))
+    elif args.command=='checkpoint-provenance-writes':
+        print(json.dumps(checkpoint_provenance_switch(root,args.action,args.actor)))
     elif args.command=='review-writes':
-        marker=root/'deployment.private.json'
-        if not marker.is_file():raise ValueError('Deployment is not installed; run install first')
-        from recovery import identity
-        actor=identity(args.actor,'Invalid actor identity')
-        authority=operators(root, strict=True)
-        if actor not in authority:
-            raise ValueError('review-writes requires an actor on the deployment operator allowlist '
-                             '(deployment.private.json operators); ' + actor + ' is not on it')
-        cfg=config(root)
-        if args.action=='status':
-            print(json.dumps({'review_workflow_writes':review_workflow_writes(root)}))
-            return
-        enabled=args.action=='on'
-        # OFF is the absent key, so a deployment that never turned it on and one
-        # that turned it back off read identically.
-        if enabled:cfg['review_workflow_writes']=True
-        else:cfg.pop('review_workflow_writes',None)
-        atomic_private_write(marker,json.dumps(cfg))
-        print(json.dumps({'review_workflow_writes':review_workflow_writes(root)}))
+        result,warnings=review_writes_command(root,args.actor,args.action)
+        for line in warnings:print(line,file=sys.stderr)
+        print(json.dumps(result))
     elif args.command=='authorized-keys':
-        authorized_keys(root,args.key_file,args.role,args.python,args.comment)
+        authorized_keys(root,args.key_file,args.role,args.python,args.comment,args.project,args.principal)
+    elif args.command=='authorized-keys-list':
+        print(json.dumps(authorized_keys_listing(root,args.file),ensure_ascii=True,indent=2))
+    elif args.command=='adopt-actor':
+        print(json.dumps(adopt_actor(root,args.project,args.actor,
+                                     one_flag_value(args.principal,'--principal'),
+                                     one_flag_value(args.operator,'--actor'),
+                                     one_flag_value(args.reason,'--reason'),
+                                     from_principal=one_flag_value(args.from_principal,'--from')),
+                         ensure_ascii=True,sort_keys=True))
+    elif args.command=='actor-adoptions':
+        print(json.dumps({'schema_version':ACTOR_ADOPTIONS_SCHEMA,'entries':actor_adoptions(root,args.project)},
+                         ensure_ascii=True,indent=2))
+    elif args.command=='authority-changes':
+        report,note=authority_changes_report(root)
+        print(json.dumps(report,ensure_ascii=True,indent=2))
+        if note:print(note,file=sys.stderr)
     elif args.command=='backup':backup_projects(root,args.projects,args.all_projects)
     elif args.command=='backup-copy':backup_copy(root,args.destination,require_clean=args.require_clean)
     elif args.command=='backup-repoint':print(json.dumps(repoint_backup(root,args.project),sort_keys=True))
@@ -4109,6 +6970,12 @@ def main():
               'name stays reserved. If this project is registered in the web interface, archive it there: '
               'its task pages now answer "Unknown/uninitialized project".'
               %(args.project,result['destination'],args.project),file=sys.stderr)
+    elif args.command=='backup-authority':
+        print(json.dumps(backup_authority(root,args.project)))
+    elif args.command=='open-item-label-check':
+        report,clean=open_item_label_check(root,args.projects)
+        print(json.dumps(report,sort_keys=True))
+        if not clean:raise SystemExit(1)
     elif args.command=='backup-status':
         record=read_backup_status(root)
         # Retired projects are not part of the gate; they are listed so an operator can
@@ -4166,12 +7033,40 @@ def main():
                   file=__import__('sys').stderr)
     elif args.command=='restore-new':
         validate_name(args.project);validate_name(args.destination)
+        # --actor/--reason record the re-grant the two restore flags make (kittrial-5bb.192 review
+        # item 2). Everything about them is checked HERE, before the destination exists: a bad
+        # value must not be discovered after the native restore, when the re-grant step runs last.
+        args.reason=_restore_authority_reason(args.project,args.reason)
+        if args.actor is not None:
+            from recovery import identity
+            args.actor=identity(args.actor,'Invalid operator identity')
+        if (args.actor is not None or args.reason is not None) and not (args.restore_operators or args.restore_verifiers):
+            raise ValueError('--actor/--reason on restore-new record the re-grant that --restore-operators or '
+                             '--restore-verifiers makes in the authority-changes audit; without one of those '
+                             'flags nothing is re-granted, so they would record nothing')
         refuse_retired_name(root,args.destination)
         backup=root/'backups'/args.project
         if not backup.is_dir():raise ValueError('Source backup missing')
         if args.project==args.destination:raise ValueError('Restore requires a different destination')
         with backup_lock(root,args.project):
-            coordination_backup(root,args.project)
+            # The sidecar decides first, before anything is created (kittrial-5bb.152): a copy
+            # that exists but cannot be used refuses the restore unless --without-coordination
+            # asks for the native tracker data alone; a backup with no copy at all is legacy.
+            outcome,_,_,damaged=sidecar_outcome(root,args.project)
+            args.native_only=None
+            if outcome=='refuse':
+                if not args.without_coordination:
+                    raise ValueError(unusable_sidecar_message(root,args.project,damaged))
+                if args.restore_operators or args.restore_verifiers:
+                    raise ValueError('--restore-operators and --restore-verifiers re-grant what the coordination sidecar '
+                                     'records, and it cannot be read; they cannot be combined with --without-coordination')
+                args.native_only=damaged
+            elif args.without_coordination and outcome=='answer':
+                raise ValueError('--without-coordination is only for a backup whose coordination sidecar cannot be '
+                                 'used; this backup\'s can be, so restore it without the flag')
+            else:
+                coordination_backup(root,args.project)
+            args.flag_had_nothing=args.without_coordination and outcome=='legacy'
             # Validate the journal snapshot BEFORE creating anything: a corrupt snapshot
             # must fail the restore with no destination project, Dolt restore or
             # coordination files left behind.
@@ -4208,7 +7103,7 @@ def main():
                     step='native restore'
                     print(native_restore(root,args.project,args.destination))
                     step='re-point and coordination'
-                    finish_restore(root,args,snapshot)
+                    warning=finish_restore(root,args,snapshot)
             except BaseException as error:
                 # add-project's own refusals (a populated or retired destination) are raised
                 # before it creates anything: they need no notice about a leftover project.
@@ -4225,6 +7120,31 @@ def main():
         # an unreadable one must not fail a restore that has already succeeded.
         noted=restore_degraded_note(root,args.project,args.destination)
         if noted:print(noted)
+        if args.native_only is not None:
+            # The last lines, so the operator cannot miss what this restore left out.
+            print(native_only_note(root,args,args.native_only))
+        elif args.flag_had_nothing:
+            print('--without-coordination: this backup has no coordination sidecar at all, so there was nothing '
+                  'to leave out; it was restored as a legacy backup, exactly as without the flag.')
+        if warning:
+            # The last thing the restore says, after everything on stdout (kittrial-5bb.144),
+            # and a distinct exit status, so `restore-new ... && next-step` does not proceed.
+            sys.stdout.flush()
+            print(warning,file=sys.stderr)
+            sys.stderr.flush()
+            raise SystemExit(RESTORE_AUTHORITY_NOT_REGRANTED)
+
+def native_only_note(root,args,damaged):
+    """What a ``restore-new --without-coordination`` did NOT restore (its last lines)."""
+    journal=journal_snapshot_path(root,args.project)
+    return ('NOT restored (--without-coordination): the coordination sidecar of backup %s could not be used (%s). '
+            '%s has none of its coordination records: no sessions, handoffs, handoff or coordination requests, '
+            'merge context, guidance, onboarding, feedback or record journals; and the operators and verifiers that '
+            'backup records were neither compared nor re-granted.\nThe operation journal %s.'
+            %(args.project,'; '.join('%s: %s'%(copy.relative_to(root).as_posix(),problem) for copy,problem in damaged),
+              args.destination,
+              'was restored from %s'%journal.relative_to(root).as_posix() if getattr(args,'journal_restored',False)
+              else 'was not restored: the backup has no operation-journal snapshot'))
 
 def finish_restore(root,args,snapshot):
     """What ``restore-new`` does after the native restore: re-point, sidecar, journals."""
@@ -4238,13 +7158,27 @@ def finish_restore(root,args,snapshot):
     # already-configured destination in place; validate_backup_target refuses any
     # clone that was not re-pointed this way.
     run_bd(root,args.destination,['backup','init',str(root/'backups'/args.destination)])
-    restore_coordination(root,args.project,args.destination,
-                         restore_operators=args.restore_operators,
-                         restore_verifiers=args.restore_verifiers)
+    # The deployment authority merges come last (kittrial-5bb.142): they are the only step
+    # that waits on the deployment lock, and a refusal there must leave a complete restore.
+    # --without-coordination (kittrial-5bb.152): no coordination files, no authority; the
+    # operation journal is restored as before when the backup has a snapshot.
+    sidecar=False if getattr(args,'native_only',None) is not None else restore_coordination(root,args.project,args.destination,authority=False)
     restored=restore_journal(snapshot,
                              project_dir(root,args.destination)/JOURNAL_STORE_NAME)
+    args.journal_restored=restored is not None
     if restored is None:
         print('Backup has no operation-journal snapshot; the restored project starts with an empty identity journal.')
+    if getattr(args,'native_only',None) is not None:
+        return None
+    if not sidecar:
+        # A legacy backup records no deployment authority: there is nothing to re-grant, and
+        # the authority step does not run (it would read no sidecar).
+        if args.restore_operators or args.restore_verifiers:
+            print('This backup has no coordination sidecar, so it records no operators or verifiers: '
+                  '--restore-operators/--restore-verifiers re-granted nothing.')
+        return None
+    return restore_authority(root,args.project,restore_operators=args.restore_operators,
+                             restore_verifiers=args.restore_verifiers,actor=args.actor,reason=args.reason)
 
 def kit_refusal(error):
     """Whether a ``ValueError`` is one of the kit's own refusals: exactly ``ValueError``

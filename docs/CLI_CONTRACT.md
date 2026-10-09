@@ -30,6 +30,46 @@ Every request is one JSON object on stdin; every response is one JSON object on 
 - On validation or transport failure, `returncode` is nonzero (`2` for endpoint
   validation), `stdout` is empty, and `stderr` starts with the error type
   (`ValueError: ...`). Automation should parse stdout only when the exit code is `0`.
+- **The server's time of a write** (additive). The answer of a write that was carried
+  out has one more field, `"server_time": "2026-10-06T07:50:12+00:00"`: the endpoint
+  host's clock, UTC with its offset, whole seconds. Cite it where a record says when
+  something happened, in place of your own clock. The client prints it as one line on
+  its standard error after the endpoint's own diagnostics, `server_time:
+  2026-10-06T07:50:12+00:00`; standard output and a `--out` file are exactly what they
+  were. Rules:
+  - a refusal, a busy answer and an uncertain answer carry none (nothing was written at
+    a known time), and neither does a read, including the reads of an action that can
+    also write (`work`, `review TASK`, `brief`, `handoff TASK`), a `--dry-run`, and the
+    help of a command (`create --help`). Help is a help flag that is ON: bare, or with a
+    value bd reads as true; given more than once, the last one decides, as in bd.
+    `--help=false` (also `--help=0`, `-h=false`) is a flag bd accepts and then carries
+    the command out, so such a request is a write like any other: stamped, and its
+    outcome kept as unknown when it fails after bd was called. A flag between a verb and
+    its subcommand changes nothing: `comments --json add ID TEXT` is the write that
+    `comments add ID TEXT --json` is;
+  - the writes are: every bd write (`create`, `update`, `close`, `reopen`, `comments
+    add`, `dep add`, `remove`, `relate` and `unrelate`, ...), `review --file`, `handoff`
+    with a payload (a request, an acceptance, a decline), `checkpoint`, the lifecycle,
+    coordinate and requirement actions, the keyed records (`ref`, `capability`,
+    `proposal`), `session register`, `session resume` and `session run start`,
+    `heartbeat` and `end`, `guidance ack`, and `feedback` (add and correct);
+  - **a request that is already recorded carries none.** Where the kit recognises its
+    own record (the same `operation_id` in a lifecycle fact, a review record, a handoff,
+    a session registration, an acknowledgement, a feedback entry), the second answer
+    says so (`reconciled`, or the record it found) and writes nothing, so it has no
+    time of its own. The time of the first answer is the time of the write; keep it, or
+    read the record's own `created_at`;
+  - a request that is sent again with a transport operation identity (the HTTP
+    service's `Idempotency-Key`, which it hands to the endpoint) is answered from the
+    endpoint's journal with the stored answer, time included, and the field `replayed:
+    true`. An answer stored by a kit from before this field is replayed as it was
+    stored, without a time;
+  - the time is taken when the write has been carried out and is cut to the whole
+    second, while bd rounds its own times: a `created_at` or `updated_at` of the row
+    can read one second later than `server_time`. It is the host's wall clock, so it is
+    not monotonic across a step of that clock;
+  - an older endpoint sends no such field and the client then prints nothing; an older
+    client ignores the field.
 
 Native commands can succeed (exit `0`) while printing warnings. The endpoint forwards
 those warnings on `stderr` and keeps the success JSON clean; it does not silently drop
@@ -277,6 +317,31 @@ per-environment `live=superseded`) therefore never hides the current scope's fac
 which the previous reader got wrong. The native `dim:` label is still matched
 against the newest event of that dimension, so an unstructured or tampered event
 still reads `unknown` and its `event_id` names the event that caused it.
+`brief` also adds `newer` (null when current or without a checkpoint) and
+`directions` (null without a checkpoint). The former gives bounded activity
+references, own/other counts and explicit unknown/windowed coverage; the latter
+keeps other-actor comment directions visible until explicit resolution or
+supersession. Reading never acknowledges or completes them.
+`work --mine` adds `newer_activity_by_others`, `newer_activity_own`,
+`newer_activity_coverage` and `unresolved_directions` to displayed task rows.
+`session resume` records a resume event and returns session, resume and guidance
+metadata; it returns neither task IDs nor task rows. Read `work --mine` for tasks
+and checkpoint attention. The `worker.py resume` wrapper also runs onboarding,
+which prints that queue.
+Malformed/conflicting checkpoint history gives null counts. These fields do not
+set review state or lifecycle facts. See [BRIEFINGS.md](BRIEFINGS.md) for limits,
+direction dispositions and compatibility with older kits.
+
+`checkpoint TASK --provenance [--json]` is a read returning `task`, the complete
+`activity_cursor` and bounded `provenance`. `checkpoint TASK --verify [--json]`
+is a read returning newest-checkpoint identity, coverage and current entry counts
+(`fresh`, `changed`, `unchanged`, `unverified`), plus bounded changed entry IDs
+when evidence exists. The installation checkpoint_provenance_writes switch is OFF by default; old-shaped checkpoints are written until the operator enables new shapes after the rollback target reads them. With it enabled the server derives provenance deltas and carried acknowledgements on
+write; callers cannot authoritatively assert them. Verification follows linked
+checkpoint order, with newest per-entry evidence winning; a newest legacy
+checkpoint has unknown coverage even if an older one contains evidence. No read
+changes a checkpoint, direction disposition or lifecycle fact. Saved checkpoint
+receipts retain `comment_id`/`reconciled` and add `covered`/`bytes`.
 
 `brief` adds an `attention` array, plus `attention_total` and `attention_more`. It
 holds at most 3 items of each kind: `reference-review` items first, then `reference`
@@ -669,15 +734,24 @@ If the endpoint cannot answer, the local result is still returned, with
    with `trust: accepted` and pointers that are `live: resolved` is the answer.
 2. **On a miss** (`records_found: false`, or only candidates), use the code
    `candidates` the same lookup returned, then search the checkout by hand.
-3. **Update the index with what you found:**
+3. **Feed what you found back — as a file, never as a live write:**
    - it exists under another name: `capability propose-alias KEY "<phrase that missed>"
-     --evidence POINTER`;
-   - it is not indexed at all: `capability propose --file capability.json`, a draft
-     with the pointers you found.
-4. **A pending alias or a draft is never authoritative.** Until an operator accepts
-   it, it only lifts a candidate (`match: candidate`, `trust: draft`,
-   `alias_state: proposed`). Do not cite one as the accepted meaning of a capability,
-   and check its pointers yourself before relying on them.
+     --evidence POINTER` (that route is still a live contributor write);
+   - it is not indexed at all: write the payload file and carry it in your delivery —
+     one JSON file per record, conventionally `capability-proposals/<key>.json`, named
+     in your contribution summary. **Do not run `capability propose` or
+     `capability revise`:** the endpoint accepts either payload, but the process does
+     not use a live write from a lane, so the worker carries the payload as a file, the
+     reviewer judges it with the change, and the coordinator writes it into the index
+     after integration and accepts the meaning at release. With no delivery in flight,
+     hand the payload to the coordinator.
+4. **The payload is judged, not yet authoritative.** The check proves **location, not
+   meaning**: `code`, `tests` and `anchors` must resolve at the commit the check runs
+   at, which for a carried payload is the integrated commit, after the coordinator
+   writes it. Until an operator accepts the meaning, cite neither the payload nor a
+   pending alias as the accepted meaning of a capability — a pending alias only lifts a
+   candidate (`match: candidate`, `alias_state: proposed`) — and check the pointers
+   yourself before relying on them.
 
 **Writing.**
 - **`propose` and `revise`** take a closed JSON payload:
@@ -722,8 +796,10 @@ If the endpoint cannot answer, the local result is still returned, with
   - `submitted_by_agent` is `false` until then.
 
 Acceptance, retirement, alias rejection and a verified alias proposal are operator
-commands ([operations](OPERATIONS.md#operator-commands)). There is no demotion in slice 1a: the
-design's "demote" (section 4) is covered by retiring the key for now.
+commands ([operations](OPERATIONS.md#operator-commands)). There is no demotion: an accepted
+revision of a key is never weakened or withdrawn in place. The operator supersedes the key
+with a named successor (`admin.py capability-retire`) or accepts a later revision of it
+(design section 4).
 
 **Batch acceptance results** (`admin.py capability-apply`). Each item names the newest
 revision the operator reviewed, by `revision` and `record_sha256`, and gets one result:
@@ -1536,6 +1612,7 @@ it by failing.
 | Command | Option | Range |
 | --- | --- | --- |
 | every command | JSON nesting in a request, a `--file` attachment or a payload argument | at most 64 levels; deeper is refused with `JSON nested too deeply (more than 64 levels)`, exit 2, nothing written |
+| tracker export / bd rows | JSON nesting in an issue row (`bd export --all`, `bd list`, `bd show`) | at most 750 levels (ROW_NESTING_MAX); rows of 751 to about 980 levels, which earlier kits read normally, are now malformed (a catalog anchor at 751 levels reads accepted before and malformed now) |
 | `work` | `--limit`, `--handoff-limit` | 1..100 |
 | `work` | `--offset`, `--handoff-offset` | >= 0 |
 | `work` | `--state` | one of the documented review states |
@@ -1553,7 +1630,7 @@ it by failing.
 | `proposal` | proposals scanned by a list or the queue | first 1,000 |
 | `admin.py proposal-settings` | actor map / deciders | <= 200 actors, 100 namespaces / <= 50 |
 | `brief` | `--items-offset` | >= 0 |
-| `brief` | `--items-limit` | 1..10 |
+| `brief` | `--items-limit` | 1..100 (default 5; a checkpoint holds at most 100 open items) |
 | `history` | `--limit` | 1..20 |
 | `history` | `--body-budget` | 256..8000 encoded bytes |
 | `review` | `items`/`resolutions` | 1..20 entries |
@@ -1626,6 +1703,43 @@ field **and** the limit, for example:
 | `previous = latest_comment_id` in a review payload | `contribution = contribution.comment_id` | review workflow names the misused ID |
 | reading `brief.owner` as a string | read `brief.owner.text` | excerpt-object contract above |
 | `work --owner -h` | `work --owner ACTOR` | argparse `expected one argument`; `-h` is the option's value, not a help request |
+
+## Raw bd writes: which rows a command names
+
+A contributor may run these bd commands through the endpoint: `list`, `show`, `ready`, `search`, `count`, `state`, `lint`, `comments`, `create`, `update`, `close`, `reopen`, `dep`. The first seven, `comments TASK` and `dep list|tree|cycles` only read. Every write must name the rows it writes (kittrial-5bb.113):
+
+The read side is guarded too (kittrial-5bb.135). `bd ready --claim` "atomically claim[s] the first ready issue"; on a real project that is the priority-0 merge slot, so the guard refused none of it while `ready` sat in the read list, and bd damaged the slot. A read whose flags ask bd to choose a row is now refused before any native write:
+
+| Read command | Flag | What bd does with it | Answer |
+|---|---|---|---|
+| `ready` | `--claim` (and `--claim=true`; `--claim=false` stays a read) | claims the first ready row, which the caller did not name | refused: "--claim lets bd choose the row it writes, which is not named in this request; read the rows, then name the one you mean" |
+| `list`, `show`, `search`, `count`, `state`, `lint`, `comments TASK`, `dep list|tree|cycles` | none | they only read, as `bd COMMAND --help` shows | unchanged |
+
+The inventories are `reserved_comments.READ_FLAGS` and `READ_VALUE_FLAGS`; `tests/test_bd_write_flags.py` compares both with `bd COMMAND --help` (reads included) when a bd binary is available, so a read that gains a flag in a later bd fails the suite instead of being trusted. A value-taking read flag's value is consumed (`ready -a --claim` names the actor `--claim` and stays a read); a *short* flag's value is not resolved, which can only refuse more, never less.
+
+| Command | Rows it writes | How they are named | When they are not |
+|---|---|---|---|
+| `create` | a new row | none, or `--id` | `--id` of a row that exists is refused: bd would replace that row |
+| `create --parent`, `--deps`, `--waits-for` | a link to existing rows | the flag's value | |
+| `create -f`/`--file`, `--graph` | rows described in a file | not named | refused; create them one by one |
+| `update` | each positional id, and `--parent` | positional ids | with no id bd uses the row it touched last: refused |
+| `close`, `reopen` | each positional id | positional ids | with no id: refused |
+| `close --claim-next`, `--continue` | the next row, chosen by bd | not named | refused; close, then claim the next task by its id |
+| `comments add` | the first positional | that id | with no id: refused |
+| `dep add`, `remove`, `relate`, `unrelate` | both ends | positional ids, `--blocked-by`, `--depends-on` | |
+| `dep ID --blocks ID` | both ends | the id and `-b`/`--blocks` | |
+| `dep add --file` | both ends of every edge | `from`/`to` (or `issue_id`/`depends_on_id`) of each line, sent as an attachment | a list that cannot be read is refused |
+
+Rules that follow:
+- **Every named id is resolved through bd before the write**, in one read. bd resolves an id from any substring of the part after the project prefix, so `slot`, `e-s` and a lone `-` all reach `PROJECT-merge-slot`; the write is judged by the row bd finds, not by the text.
+- **Cost, measured (kittrial-5bb.135).** That read is one more bd process on each write: 2 instead of 1, and 3 instead of 2 for a status change. On bd 1.2.2, 30 ordinary writes took 641–662 ms each on the kit before the guard and 749–795 ms on the guard (about 115 ms more), while other suites ran on the same machine. The cost grows with the number of databases the write touches; kittrial-5bb.133 covers that scaling.
+- **An id that does not resolve to exactly one row refuses the write**: "... does not name exactly one task, so the rows this would write are not known. Name each task by its id." So does a read that fails or times out.
+- **A read must answer** (kittrial-5bb.135). An empty answer (exit 0 and no output) is a failed read, not "nothing there": bd prints `[]` for an empty JSON list, so `create --id NEW` was accepted against a read that had answered nothing. bd's real absence answer (non-zero exit, "no issue found") is still read as "no such row".
+- **A mistyped id answers rc 2, not rc 1** (kittrial-5bb.135). It used to reach bd, which answered rc 1 with "no issue found"; the guard now refuses it itself, so the exit code is 2 (the endpoint's refusal) and the text is the endpoint's sentence, "... does not name exactly one task, so the rows this would write are not known. Name each task by its id. Nothing was written." A script that matched bd's text or rc 1 must be updated.
+- **`create --id`**: the id must be `PROJECT-NAME` in lower-case letters, digits, dots and hyphens, ending in a letter or digit, and must not exist. On bd 1.2.2 `create TITLE --id EXISTING` answers rc 0 and replaces the row: the title is the new one; description, acceptance criteria, notes and assignee are emptied; status returns to open and priority to the default; labels, comments and dependencies stay. An explicit id that does not exist is still allowed. Ids are case-sensitive to bd (`p-ABC` would be a second row beside `p-abc`), which is why upper case is refused. The existence read is `show`, because `list --all --id` does not see ephemeral (`create --ephemeral`) or gate rows and `create --id` replaced an ephemeral row; an id that merely resembles one is still allowed, since only an exact match is the row bd would replace. An id ending in a dot or hyphen is refused: bd files `VICTIM.` as a child row of `VICTIM`.
+- **`external:PROJECT:CAPABILITY`** in a dependency is not a row and is not resolved.
+- A flag this table does not know refuses the write. The tables are `reserved_comments.WRITE_FLAGS`, `READ_FLAGS` and `READ_VALUE_FLAGS`; `tests/test_bd_write_flags.py` compares them with `bd COMMAND --help`, reads included, when a bd binary is available, so check it when the pinned bd changes.
+- The guard and the write run under the project's coordination lock, which every write through the endpoint holds. A `bd` run on the host outside the kit takes no such lock.
 
 ## Wrapper option ordering
 
@@ -1704,6 +1818,23 @@ request ID instead of creating a duplicate.
 
 ## Backward compatibility
 
+Unreadable native reference, capability and proposal rows are classified by their
+ID's membership in native label-filtered reads. Contributor-controlled titles and
+labels inside unreadable JSON are not classification evidence. Reference and
+capability catalogs name unreadable anchors as malformed (their exact key may be
+unknown); get reports that the selected key exists but cannot be read. These
+anchors stay out of work and remain in the anchors read. Healthy rows retain the
+existing label-plus-record rule and healthy reads need no extra membership reads.
+
+Unreadable lifecycle events use the complete native `list --type event --all
+--limit 0 --json` ID set, through the same helper. A failed event selection or an
+unreadable selected event refuses lifecycle writes with the operator repair
+sentence. Since its parent and dimension cannot be trusted, lifecycle reads of
+that snapshot report unknown instead of an older passed fact. The contributor
+endpoint currently permits creating an event and changing native type to/from
+event; a retyped ordinary row joins event membership, and a retyped event leaves
+it. Type membership alone never makes readable event content a trusted fact.
+
 Consumers should key on documented fields, tolerate additional fields, and treat any
 nonzero exit code as failure. The envelope, `work` top-level shape, `brief`
 excerpt-object fields, opaque cursors and the ID meanings above are stable for v1.
@@ -1726,3 +1857,4 @@ liveness receipt after intervening state changes fails before any writes with
 Plain CLI deploy is incremental and never automatically drops an uncarried task.
 See the exact two-step hotfix procedure and interim tracker state in
 [OPERATIONAL_WORKFLOW.md](OPERATIONAL_WORKFLOW.md).
+`checkpoint TASK --directions [--offset N] [--limit N] [--json]` returns full current digests for all outstanding directions, including entries outside stored evidence windows, in fresh pages (offset >= 0, limit 1..100, default 50). Fields: task, activity_cursor, total, items (id, digest, clipped author, timestamp), next_offset, coverage. Compare cursors across pages and restart on change. Only the current assignee can submit dispositions, and IDs/digests must match task history. See BRIEFINGS.md for legacy and reassignment baselines.

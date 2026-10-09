@@ -59,12 +59,22 @@ acceptance evidence.
 
 Payload schemas are closed. `schema_version` is the integer 1.
 """
+import sys
+if sys.version_info < (3, 10):
+    # Before every other import, and in syntax Python 3.6 reads: an older interpreter failed in
+    # an import further down, with a traceback that hid the cause (kittrial-5bb.191).
+    sys.stderr.write('requirement_records.py needs Python 3.10 or newer and was started with Python %d.%d.%d (%s). '
+                     'Nothing was carried out. Run it with Python 3.10 or newer.\n'
+                     % (sys.version_info[0], sys.version_info[1], sys.version_info[2], sys.executable))
+    sys.exit(2)
 import argparse
 import json
+import re
 import time
 from pathlib import Path
 
 import keyed_records as core
+import record_json
 from coordination import atomic, identifier
 from export_requirements import (ACCEPTANCE_PREFIX, REVISION_PREFIX, parse_json,
                                  revision_comment)
@@ -374,6 +384,21 @@ def require_bound_key(task, payload, existing):
                          '(the key is bound to the record).' % (task, prior, payload['key']))
 
 
+def uniqueness_rows(run):
+    rows = record_json.classify(read_rows(run), run, ['requirement'])
+    for row in rows:
+        if not row.get('malformed') or not record_json.selected(row, ['requirement']):
+            continue
+        # Native issue metadata is not part of this independent comment read.
+        # Only the validated immutable ledger can establish the bound key.
+        comments = record_json.loads(run(['comments', row['id'], '--json']) or '[]')
+        if not isinstance(comments, list) or any(not isinstance(c, dict) or c.get('issue_id') != row['id']
+                                                 for c in comments):
+            raise ValueError('Cannot read requirement ledger for %s; operator reconciliation required' % row['id'])
+        row['comments'] = comments
+    return rows
+
+
 def check_key_unique(rows, payload, task):
     """Requirement keys are unique across the project's requirement records."""
     if payload['kind'] != 'requirement':
@@ -383,6 +408,12 @@ def check_key_unique(rows, payload, task):
             continue
         if 'requirement' not in (row.get('labels') or []):
             continue
+        if row.get('malformed'):
+            key = existing_key(existing_revisions(row))
+            if key is not None and key != payload['key']:
+                continue
+            raise ValueError('Cannot verify requirement key uniqueness: anchor %s could not be parsed'
+                             % (row.get('id') or ''))
         record = latest_revision(existing_revisions(row))
         if record is not None and record.get('key') == payload['key']:
             raise ValueError('Requirement key %s is already used by record %s; requirement keys must be unique.'
@@ -525,7 +556,7 @@ SPEC = core.RecordSpec(
     validate=lambda payload, operator: validate_payload(payload, operator=operator),
     refuse_before_journal=_refuse_before_journal,
     explicit_task=lambda payload: payload.get('task'),
-    read_rows=lambda run, payload=None: read_rows(run),
+    read_rows=lambda run, payload=None: read_rows(run) if payload is None else uniqueness_rows(run),
     read_created=lambda run, task, payload: read_rows(run),
     resolve_task=lambda rows, payload, operator: None,
     check_key_unique=lambda rows, payload, task: check_key_unique(rows, payload, task),

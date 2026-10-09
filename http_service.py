@@ -15,12 +15,22 @@ contract tests; the Linux deployment binds the same method names to ``endpoint.p
 Standard library only. Plaintext binding is refused unless the interface is loopback,
 and TLS termination at the service itself is supported with ``--cert``/``--key``.
 """
+import sys
+if sys.version_info < (3, 10):
+    # Before every other import, and in syntax Python 3.6 reads: an older interpreter failed in
+    # an import further down, with a traceback that hid the cause (kittrial-5bb.191).
+    sys.stderr.write('http_service.py needs Python 3.10 or newer and was started with Python %d.%d.%d (%s). '
+                     'Nothing was carried out. Run it with Python 3.10 or newer; on an office installation that is the bundled interpreter, INSTALL_ROOT/current/python-runtime/....\n'
+                     % (sys.version_info[0], sys.version_info[1], sys.version_info[2], sys.executable))
+    sys.exit(2)
 import argparse
 import base64
 import binascii
+import errno
 import hashlib
 import ipaddress
 import json
+import os
 import record_json
 import re
 import secrets
@@ -32,19 +42,24 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
+import actor_names
 import agent_prompts
+import bd_refusals
 import project_setup
+from coordination import MERGE_SLOT_SUFFIX, is_merge_slot, merge_slot_sentence
 from reserved_comments import (ANCHOR_READ_IDS_MAX, carries_record_label, hide_records,
                                is_record_anchor)
 from http_auth import (AGENT_SECRET_ENV, agent_secret_file, CAP_ACCOUNTS_ADMIN, CAP_AGENTS, CAP_APPROVE,
                        CAP_CHECKPOINTS, CAP_FEEDBACK, CAP_PROPOSALS,
-                       CAP_PROJECT_ADMIN, CAP_PROJECT_CREATE, CAP_READ, CAP_REVIEWS,
+                       CAP_PROJECT_ADMIN, CAP_PROJECT_CREATE, CAP_PROJECT_HOST_CREATE, CAP_READ, CAP_REVIEWS,
                        CAP_TASKS, RESULT_RETENTION_SECONDS, HttpError, Service, Store,
-                       authority_request, conflict, forbidden, invalid, not_found,
+                       address_group, authority_request, busy, conflict, forbidden, invalid, not_found,
                        not_implemented, now_iso, request_hash, unauthenticated,
                        uncertain, unsupported)
 
 KIT_VERSION = '0.1.0'
+#: Where the installed kit is: the documents this service shows are read from it.
+KIT_DIRECTORY = Path(__file__).resolve().parent
 MAX_BODY_BYTES = 262144
 MAX_ATTACHMENTS = 8
 MAX_ATTACHMENT_BYTES = 65536
@@ -314,6 +329,8 @@ class UncertainOutcome(Exception):
 # The canonical Beads project name rule, as admin.validate_name enforces it on the host
 # and endpoint.py on every request: 2-24 lowercase letters/digits, beginning with a letter.
 CANONICAL_PROJECT = re.compile(r'[a-z][a-z0-9]{1,23}')
+#: A calendar day as the server's own records write it.
+DAY = re.compile(r'[0-9]{4}-[0-9]{2}-[0-9]{2}')
 REGISTER_HINT = ('A project is created on the coordination host by an operator (admin.py add-project NAME); '
                  'a superuser then registers it here with that name.')
 NO_CANONICAL = ('This project has no canonical Beads project behind it (it was created by an older kit), so its '
@@ -321,6 +338,24 @@ NO_CANONICAL = ('This project has no canonical Beads project behind it (it was c
 UNCONFIRMED = ('This project was created before registering a project was limited to superusers, and no superuser '
                'has confirmed it, so it cannot be used. A superuser confirms it (Projects page, or POST '
                '/v1/projects/ID/confirm) or archives it.')
+
+#: Said instead of the record's own sentence when the record is ARCHIVED and the backend
+#: will not serve it (kittrial-5bb.90 review item 2.1): the confirm route refuses an
+#: archived record and the record is already archived, so "confirm it or archive it" is
+#: two dead ends. Only removing the access being added works, and this says which call
+#: does it, and who may make it (kittrial-5bb.140): the refusal goes to whoever tried to
+#: add access, usually the agent's owner, but the project-scoped DELETE needs the project
+#: role, so it is offered beside the PATCH that the owner can use.
+ARCHIVED_UNUSABLE = ('This project is archived and this server will not serve its record; an archived record '
+                     'cannot be confirmed, so nothing that grants access is accepted on it. Remove the access '
+                     'being added instead, which does work on an archived record: an agent grant (PATCH the '
+                     'agent with its projects without this one, or DELETE /v1/projects/ID/agents/AGENT, which a '
+                     'project owner or superuser may use), a membership, or a worker credential.')
+
+#: Canonical names that cannot be registered: the same segment is a literal route under
+#: ``/v1/projects/...`` (``GET /v1/projects/unconfirmed`` is the upgrade check), so a
+#: project with that name could never be read back (kittrial-5bb.90).
+RESERVED_PROJECTS = frozenset({'unconfirmed'})
 
 
 def project_unusable(service, project_id):
@@ -371,6 +406,30 @@ def unusable_projects(service):
     return items
 
 
+#: The response header that carries the server's time of a write that was carried out, on
+#: every such answer whatever the shape of its body (kittrial-5bb.97).
+SERVER_TIME_HEADER = 'X-Server-Time'
+
+#: The endpoint's ``server_time`` of the write the current thread's request carried out, if
+#: any (set by ``EndpointBackend._checked``, read and cleared by ``ApiHandler._mutate``).
+WRITTEN = threading.local()
+
+
+def written_at(service):
+    """The time for a write answer: the endpoint's when it carried the write out, else the service's clock.
+
+    UTC with its offset, whole seconds: the endpoint's format (``http_authority.server_time``).
+    """
+    at = getattr(WRITTEN, 'at', None)
+    WRITTEN.at = None
+    if isinstance(at, str):
+        return at
+    if at is False:
+        return None                                   # an endpoint's stored answer that has no time
+    from http_authority import server_time
+    return server_time(service._now())
+
+
 class InProcessBackend:
     """Disposable canonical operations used for local validation.
 
@@ -388,14 +447,31 @@ class InProcessBackend:
     PROPOSALS = False
     # Everything here is service-local, so a project is created by the HTTP route itself.
     PROJECT_CREATE = 'create'
+    #: This backend has no host tracker, so a credential's name is judged by its shape and the
+    #: service's namespace only; no row rule is applied or recorded (kittrial-5bb.188 item 4).
+    ACTOR_ROWS = False
 
-    def __init__(self, service):
+    def __init__(self, service, actor_namespace=None):
+        import actor_names
         self.service = service
+        self.actor_namespace = actor_namespace or actor_names.SERVICE_NAMESPACE
         self.faults = {}
 
     def fail_next(self, route, times=1):
         """Test hook: commit, then raise :class:`UncertainOutcome` for the next call(s)."""
         self.faults[route] = times
+
+    def actor_standing(self, project_id, names, rows=False, own=()):
+        """For each name: why a worker credential may not write under it, or None.
+
+        This backend has no host, so no session actors, no operator list and no tracker rows:
+        what is left of ``actor_names.collision`` is the shape of a session actor, a
+        look-alike name, and the namespace this service was started with (``rows`` and ``own``
+        are accepted and ignored, so the routes need not know which backend they are on).
+        """
+        import actor_names
+        service = (self.actor_namespace, actor_names.SERVICE_NAMESPACE)
+        return {name: actor_names.collision(name, service=service) for name in names}
 
     @property
     def state(self):
@@ -420,10 +496,27 @@ class InProcessBackend:
             if authorize is not None:
                 authorize()
             if result_key is not None and self.service.has_result(result_key):
+                # A stored answer: the time kept with it, and none where none was kept. Never
+                # the clock now, which is the time of the retry (kittrial-5bb.97).
+                WRITTEN.at = self.service.result_written_at(result_key) or False
                 return self.service.result_get(result_key)
+            # The at-use rule the endpoint applies, applied here too (kittrial-5bb.188 item 4):
+            # this backend has no endpoint, so without this an earlier credential under a name
+            # it refuses at issue goes on writing. It is after the stored answer, so an exact
+            # retry of a write that already committed still returns that answer. What it knows
+            # is the name's shape, a look-alike, and the namespace the service was started
+            # with; it has no host lists and no tracker rows.
+            if getattr(principal, 'via', None) == 'credential':
+                import actor_names
+                namespace = getattr(principal, 'actor', None)
+                reason = self.actor_standing(project_id, [namespace]).get(namespace)
+                if reason is not None:
+                    raise forbidden(actor_names.refusal(namespace, reason))
             result = self._dispatch(route, principal, project_id, payload)
+            from http_authority import server_time
+            WRITTEN.at = server_time(self.service._now())
             if result_key is not None:
-                self.service.result_put(result_key, result)
+                self.service.result_put(result_key, result, written_at=WRITTEN.at)
             self.service.store.save()
         if self.faults.get(route, 0) > 0:
             self.faults[route] -= 1
@@ -469,7 +562,12 @@ class InProcessBackend:
         description = payload.get('description') or ''
         if not isinstance(description, str) or len(description) > 20000:
             raise invalid('Task description is too long')
-        priority = payload.get('priority', 2)
+        # A null priority is absent, not a value (kittrial-5bb.183 review item 4): the route
+        # guard and the endpoint backend already read it that way, and every released client
+        # sends null where it has no value, so bd's default 2 applies on both backends.
+        priority = payload.get('priority')
+        if priority is None:
+            priority = 2
         if type(priority) is not int or not 0 <= priority <= 4:
             raise invalid('Task priority must be an integer 0-4')
         task_id = 'task_' + secrets.token_hex(6)
@@ -492,7 +590,7 @@ class InProcessBackend:
         if not isinstance(version, int) or version != task['version']:
             raise conflict('Task was modified; reread it before updating',
                            {'expected_version': task['version']})
-        for field in ('title', 'description', 'status'):
+        for field in ('title', 'description', 'status', 'priority'):
             if field in payload and payload[field] is not None:
                 value = payload[field]
                 if field == 'title' and (not isinstance(value, str) or not value.strip() or len(value) > 200):
@@ -501,6 +599,8 @@ class InProcessBackend:
                     raise invalid('Task description is too long')
                 if field == 'status' and value not in ('open', 'closed'):
                     raise invalid('Task status must be open or closed')
+                if field == 'priority' and (type(value) is not int or not 0 <= value <= 4):
+                    raise invalid('Task priority must be an integer 0-4')
                 task[field] = value.strip() if isinstance(value, str) else value
         task['version'] += 1
         self._event(project_id, task['id'], 'task-updated', principal)
@@ -508,11 +608,16 @@ class InProcessBackend:
 
     def _task_claim(self, principal, project_id, payload):
         task = self._task(project_id, payload.get('task_id'))
+        claimant = payload.get('actor') or principal.actor
         if task['status'] != 'open':
             raise conflict('Task is not open')
+        if task['assignee'] is not None and task['assignee'] == claimant:
+            # One's own task, claimed again: answered as a real installation answers it (bd's
+            # claim), 200 and nothing changed (kittrial-5bb.187). It was 409 here.
+            return dict(task)
         if task['assignee'] is not None:
             raise conflict('Task is already claimed')
-        task['assignee'] = payload.get('actor') or principal.actor
+        task['assignee'] = claimant
         task['version'] += 1
         self._event(project_id, task['id'], 'task-claimed', principal, task['assignee'])
         return dict(task)
@@ -679,6 +784,8 @@ class InProcessBackend:
         actor = payload.get('actor') or principal.actor
         if author_key(actor) in (author_key(contribution['actor']), author_key(task.get('assignee'))):
             raise forbidden('Nobody recommends their own contribution')
+        if author_key(actor) in {author_key(view['author']) for view in self._standing_recommendations(task, records)}:
+            raise conflict(rec.ALREADY_RECOMMENDED % actor)
         record = {'id': 'rec_' + secrets.token_hex(6), 'task_id': task['id'], 'kind': 'recommendation',
                   'contribution_id': contribution['id'], 'commit': contribution['commit'],
                   'verdict': payload['verdict'], 'summary': summary.strip(), 'items': items, 'actor': actor,
@@ -707,7 +814,9 @@ class InProcessBackend:
         decided = max([position for position, record in enumerate(records)
                        if record['kind'] in ('request-changes', 'approve')
                        and record.get('contribution_id') == contribution['id']] or [-1])
-        excluded = {author_key(contribution['actor']), author_key(task.get('assignee'))}
+        # The author is excluded on every read; the assignee only when a recommendation is
+        # written, so a later reassignment does not hide an honest one (as canonically).
+        excluded = {author_key(contribution['actor'])}
         newest = {}
         for record in self.state.get('recommendations', {}).get(task['id']) or []:
             if record['contribution_id'] != contribution['id'] or record['after'] <= decided:
@@ -883,7 +992,8 @@ class InProcessBackend:
         return {'state': task.get('review_state') or 'none', 'contribution': contribution,
                 # Additive (kittrial-5bb.115): advice to approve the current contribution.
                 'recommendation': standing[0] if standing else None,
-                'recommendations': [{'id': r['id'], 'author': r['author'], 'at': r['at']} for r in standing],
+                # Each in full: the brief route leaves out the author's own person and shows the next.
+                'recommendations': [dict(r) for r in standing],
                 'requests': requests,
                 'open_requests': sum(1 for r in requests if r['status'] == 'open'),
                 'latest_id': records[-1]['id'] if records else None,
@@ -901,12 +1011,16 @@ class InProcessBackend:
                           'summary': last['summary'], 'next_action': last.get('next_action'),
                           'open_items': [{'id': item.get('id'),
                                           'kind': item.get('kind') or 'item',
-                                          'text': item.get('text')}
+                                          'text': item.get('text'), 'source': item.get('source')}
                                          for item in last.get('open_items') or []]}
         return {'task': dict(task), 'checkpoint': checkpoint, 'review': self._review_view(task),
+                'carry_open_items': [dict(item) for item in checkpoints[-1].get('open_items') or []
+                                     if isinstance(item, dict)] if checkpoints else [],
                 # The disposable backend records no lifecycle evidence, so every fact is
                 # honestly unknown rather than inferred from the review state.
-                'lifecycle': {}, 'depends_on': []}
+                'lifecycle': {}, 'depends_on': [],
+                # This backend keeps no activity cursor; its checkpoints need none.
+                'activity_cursor': None}
 
     #: The disposable backend is cheap to read and tests expect fresh reads.
     READ_CACHE_SECONDS = 0
@@ -990,17 +1104,86 @@ class InProcessBackend:
                 pending_request_ids=[r['id'] for r in review['requests'] if r['status'] == 'open'],
                 waiting_since=review['latest_at'],
                 attention=self._agent_fields(task, review),
-                recommended_by=[r['author'] for r in review['recommendations']]))
+                recommended_by=[r['author'] for r in review['recommendations']],
+                contribution_author=(review['contribution'] or {}).get('author')))
         items.sort(key=queue_order)
         return {'items': items, 'complete': True, 'warnings': []}
 
 
 #: Review states that still need someone to act (``work.queue`` keeps these even on a
 #: closed task). ``approved`` is the in-process name for ``awaiting-integration``.
+#: ``withdrawn``/``superseded`` are additive (kittrial-5bb.94): the canonical ``work``
+#: queue lists such a task while a blocking item is still open, so the HTTP queue and
+#: its ``state=`` filter accept them too or the two transports disagree
+#: (kittrial-5bb.110 item 9).
 ACTIVE_REVIEW_STATES = ('changes-requested', 'error', 'awaiting-review', 'legacy-review-ready',
-                        'awaiting-integration', 'approved')
+                        'awaiting-integration', 'approved', 'withdrawn', 'superseded')
 QUEUE_PRIORITY = {'changes-requested': 0, 'error': 1, 'awaiting-review': 2,
                   'legacy-review-ready': 2, 'awaiting-integration': 3, 'approved': 3}
+
+#: Review-payload fields the HTTP route accepts beyond the canonical per-operation
+#: set. ``task_id`` is filled from the path and ``actor`` is bound to the
+#: authenticated principal; ``contribution_revision``/``contribution_commit`` are the
+#: web page's presentation copies of the revision the reviewer saw. A contribution may
+#: also carry the two legacy in-process delivery fields ``bundle_sha256``/``branch``.
+#: Anything else -- an unknown key, or a canonical field on the WRONG operation (a
+#: top-level ``severity``, a ``disposition`` on a request-changes) -- is refused
+#: instead of silently dropped (kittrial-5bb.110 item 4: those used to be dropped and
+#: answered 201).
+REVIEW_HTTP_FIELDS = frozenset({'task_id', 'actor', 'contribution_revision',
+                                'contribution_commit'})
+REVIEW_HTTP_OPERATION_FIELDS = {'contribute': frozenset({'bundle_sha256', 'branch'})}
+#: How many unsupported field names one refusal reports, and how long each may be. The
+#: refusal used to echo every name in full: a 300-character key came back whole, and 400
+#: unknown keys produced a 2,429-character error (kittrial-5bb.110 item 4).
+UNSUPPORTED_FIELDS_SHOWN = 5
+#: A field name is echoed only when it is a plain identifier. Anything else (control
+#: characters, punctuation, a name built to read as a sentence in the error) is not
+#: repeated to the caller.
+UNSUPPORTED_FIELD_NAME = re.compile(r'[A-Za-z_][A-Za-z0-9_]{0,39}\Z')
+
+
+def unsupported_fields_text(keys):
+    """A bounded, non-echoing list of the caller's unsupported review field names.
+
+    At most ``UNSUPPORTED_FIELDS_SHOWN`` names, each echoed only when it is a plain
+    identifier, with ``(+N more)`` for the rest (kittrial-5bb.110 item 4 P3).
+    """
+    names = sorted(str(key) for key in keys)
+    shown = [name if UNSUPPORTED_FIELD_NAME.match(name) else '<non-identifier name>'
+             for name in names[:UNSUPPORTED_FIELDS_SHOWN]]
+    if len(names) > UNSUPPORTED_FIELDS_SHOWN:
+        shown.append('(+%d more)' % (len(names) - UNSUPPORTED_FIELDS_SHOWN))
+    return ', '.join(shown)
+
+
+def refuse_unknown_fields(payload, allowed, where, takes=None):
+    """Refuse a body field the route does not take, in the task-change shape (kittrial-5bb.183).
+
+    Several write routes accepted a request with a field they do not take and dropped the
+    field silently (task create, claim, checkpoint, member, worker credential, agent and
+    account). Every route that takes a caller body now refuses such a field with 422,
+    naming it and the fields the route does take, exactly as a task change has since
+    kittrial-5bb.181. ``where`` names the route in a sentence, ``allowed`` is the set it
+    accepts and ``takes`` the (usually equal) list the refusal names -- a task change takes
+    ``version`` and ``actor`` as transport fields but does not name them as its fields.
+    The caller runs this after authorization and before the effect, so nothing is reserved
+    and the answer is never 5xx or "may have committed".
+    """
+    if not isinstance(payload, dict):
+        raise invalid('%s must be a JSON object' % where)
+    named = tuple(allowed if takes is None else takes)
+    unknown = sorted(str(name) for name in set(payload) - set(allowed))
+    if not unknown:
+        return
+    # The names in the detail are cut as the sentence cuts them (review of kittrial-5bb.181, done
+    # for a task change in kittrial-5bb.185 and here for every route that uses this): a name is
+    # given back only when it is a plain identifier, never a 300-character or a made-up one whole.
+    raise invalid('%s does not take: %s. %s takes: %s'
+                  % (where, unsupported_fields_text(unknown), where, ', '.join(named)),
+                  {'unsupported': [name if UNSUPPORTED_FIELD_NAME.match(name) else '<non-identifier name>'
+                                   for name in unknown[:UNSUPPORTED_FIELDS_SHOWN]],
+                   'takes': list(named)})
 
 
 def queue_order(item):
@@ -1011,7 +1194,7 @@ def queue_order(item):
 
 def queue_item(project_id, task, review_state, contribution, open_requests,
                pending_request_ids=None, waiting_since=None, integration=None,
-               integration_warnings=None, attention=None, recommended_by=None):
+               integration_warnings=None, attention=None, recommended_by=None, contribution_author=None):
     """One review-queue row, in the shape both backends return.
 
     ``pending_request_ids`` and ``waiting_since`` (time of the latest review record)
@@ -1041,7 +1224,10 @@ def queue_item(project_id, task, review_state, contribution, open_requests,
             # Additive (kittrial-5bb.115): reviewers who recommend approving the current
             # contribution while nobody has decided. Never an approval.
             'recommended': bool(recommended_by),
-            'recommended_by': list(recommended_by or [])}
+            'recommended_by': list(recommended_by or []),
+            # Additive (kittrial-5bb.115 review): who delivered the current contribution, so
+            # the person rule can be applied to a row as it is to a brief.
+            'contribution_author': contribution_author}
 
 
 def own_queue_tasks(queue, actor=None):
@@ -1097,15 +1283,22 @@ class EndpointBackend:
         'list_feedback': 'the canonical feedback command ships with kittrial-5bb.13',
     }
     PROPOSALS = True
+    #: The endpoint owns the project's tracker rows and reads them when asked to
+    #: (kittrial-5bb.188 item 1): a credential issued through this backend records that the
+    #: name was verified row-free, so its ordinary writes need no such read.
+    ACTOR_ROWS = True
 
     def __init__(self, python, endpoint, root, *, service, actor_namespace='http',
-                 timeout=150, runner=None):
+                 timeout=150, runner=None, create_timeout=900):
         self.python = python
         self.endpoint = endpoint
         self.root = root
         self.service = service
         self.actor_namespace = actor_namespace
         self.timeout = timeout
+        #: How long one project creation may take (kittrial-5bb.118 part 2): it grows with the
+        #: number of project databases on the server. See OPERATIONS, the cost of many projects.
+        self.create_timeout = max(int(create_timeout), int(timeout))
         self.runner = runner
         self.faults = {}
         # Server-side authority locations. The endpoint is launched with these paths;
@@ -1143,6 +1336,34 @@ class EndpointBackend:
     # (kittrial-5bb.80). The HTTP project id is the canonical project name.
     PROJECT_CREATE = 'register'
 
+    def actor_standing(self, project_id, names, rows=False, own=()):
+        """For each name: why a worker credential may not write under it, or None (kittrial-5bb.184).
+
+        One read through the endpoint, which owns the session registry, the operator and
+        verifier lists and (when ``rows`` asks) the project's tracker rows, and answers with the
+        rule, never with the names. ``rows`` is one ``bd export --all``: the issue route asks for
+        it, the credential listing does not (kittrial-5bb.188 item 1). ``own`` are the lifetimes
+        of earlier credentials of the same name whose rows are not held against the one being
+        issued (item 3). This service's own namespace is judged here, because only the service
+        knows what it was started with.
+        """
+        import actor_names
+        names = [name for name in names if isinstance(name, str) and name]
+        if not names:
+            return {}
+        # ``rows`` is True (every row) or the instant the credential was issued (the rows older
+        # than it); both travel as the endpoint's ``tracker`` value, which owns the distinction.
+        extra = {'tracker': rows} if rows else None
+        if rows and own:
+            extra['own'] = [list(window) for window in own]
+        answer = self._run('actor-standing', project_id, self.actor_namespace + '/read', names,
+                           extra=extra)
+        found = answer.get('names') if isinstance(answer, dict) else None
+        if not isinstance(found, dict):
+            raise uncertain('The host did not say which names are taken')
+        return {name: found.get(name) or actor_names.collision(name, service=(self.actor_namespace, actor_names.SERVICE_NAMESPACE))
+                for name in names}
+
     def project_exists(self, project):
         """Whether the canonical project `project` exists and is initialized on the host.
 
@@ -1156,12 +1377,56 @@ class EndpointBackend:
                                ['list', '--limit', '1', '--json'], check_usable=False)
         if isinstance(reply, dict) and reply.get('returncode') == 2 \
                 and 'Unknown/uninitialized project' in (reply.get('stderr') or ''):
+            said = (reply.get('stderr') or '').strip().splitlines()[-1]
+            marker = 'Unknown/uninitialized project: '
+            if marker in said:
+                # It is on the host and is a creation that has not finished (or whose record is
+                # damaged): say that, not "no such project; run add-project" (review 01a109cc).
+                raise conflict(said.split(marker, 1)[1][:300])
             return False
         self._checked(reply)
+        # The endpoint serves a project whose creation record is damaged (a registered project
+        # does not depend on that record), so registration asks the host explicitly whether
+        # this name may be registered (kittrial-5bb.149). An endpoint without the action or
+        # without the answer says nothing against it, as before.
+        asked = self._endpoint('setup-status', project, self.actor_namespace + '/read', [], check_usable=False)
+        if isinstance(asked, dict) and asked.get('returncode') == 0:
+            try:
+                status = _canonical_payload(asked.get('stdout') or '')
+            except HttpError:
+                status = None
+            reason = status.get('creation_record') if isinstance(status, dict) else None
+            if isinstance(reason, str) and reason:
+                raise conflict(reason[:300])
         return True
 
     def _endpoint(self, action, project, actor, args, attachments=None, operation_id=None,
-                  authority=None, require_authority=False, route=None, check_usable=True):
+                  authority=None, require_authority=False, route=None, check_usable=True, timeout=None,
+                  extra=None):
+        """One answer of the canonical endpoint; its mark of a configuration fault is raised here.
+
+        Here and not where a route reads the answer, so that no route can hand the
+        endpoint's line (the path of the file, the parser's or the system's words) to the
+        person: some routes read a return code of 2 their own way (kittrial-5bb.156 review).
+        ``extra`` adds one named field to the request the service sends (kittrial-5bb.188:
+        ``tracker`` asks the host to read the project's rows for this answer).
+        """
+        reply = self._ask(action, project, actor, args, attachments, operation_id, authority,
+                          require_authority, route, check_usable, timeout, extra)
+        if isinstance(reply, dict) and reply.get('returncode') == 2 and reply.get('fault') == 'configuration':
+            # The server's own configuration file cannot be read: the endpoint's line names the
+            # file and the parser's words. Those are for the operator, in this service's log;
+            # the person is told who to ask. Nothing was carried out.
+            said = (reply.get('stderr') or '').strip().splitlines()
+            print('configuration: the endpoint could not read the deployment configuration for %s: %s'
+                  % (action or 'a request', ascii(said[-1][:600]) if said else '(nothing)'), file=sys.stderr, flush=True)
+            refused = HttpError(503, 'server_configuration', self.CONFIGURATION_UNREADABLE)
+            refused.nothing_done = True
+            raise refused
+        return reply
+
+    def _ask(self, action, project, actor, args, attachments, operation_id, authority,
+             require_authority, route, check_usable, timeout, extra=None):
         if isinstance(project, str):
             # A record the backend will not serve is refused here, before any endpoint
             # process starts: a `proj_...` id (no canonical project can be behind it;
@@ -1172,6 +1437,20 @@ class EndpointBackend:
                 None if CANONICAL_PROJECT.fullmatch(project) else ('no-canonical', NO_CANONICAL))
             if verdict is not None:
                 raise conflict(verdict[1])
+        store = self.service.store
+        if authority and store.unsaved_since is not None:
+            # The endpoint reads the session's idle deadline from the state file. A last-use
+            # stamp that is only in memory (Store.save_soon) is written before the endpoint is
+            # asked, so a live session is never refused as idle for it; when the lock still
+            # cannot be had the request is answered busy, and nothing was sent.
+            try:
+                store.save()
+            except TimeoutError as waited:
+                print('busy: the state could not be saved before %s was sent to the endpoint, so it was not sent: %s'
+                      % (action, ascii(str(waited)[:400])), file=sys.stderr, flush=True)
+                not_sent = busy()
+                not_sent.nothing_done = True
+                raise not_sent from None
         if self.runner is not None:
             return self.runner(action=action, project=project, actor=actor, args=args,
                                attachments=attachments or {}, operation_id=operation_id,
@@ -1179,6 +1458,8 @@ class EndpointBackend:
         import subprocess
         payload = {'project': project, 'actor': actor, 'action': action, 'args': args,
                    'attachments': attachments or {}}
+        if extra:
+            payload.update({key: value for key, value in extra.items() if value is not None})
         # The operation identity and the authority descriptor travel with the
         # mutation: the endpoint reserves the identity and re-validates live
         # authority immediately before the canonical effect. The descriptor carries
@@ -1194,13 +1475,14 @@ class EndpointBackend:
             payload['route'] = route
         argv = [self.python, self.endpoint, '--root', self.root,
                 '--authority-store', self.authority_store,
-                '--authority-lock', self.authority_lock]
+                '--authority-lock', self.authority_lock,
+                '--service-namespace', self.actor_namespace]
         if require_authority:
             argv.append('--require-authority')
         try:
             completed = subprocess.run(argv,
                                        input=json.dumps(payload), text=True, encoding='utf-8',
-                                       capture_output=True, timeout=self.timeout)
+                                       capture_output=True, timeout=timeout or self.timeout)
         except subprocess.TimeoutExpired:
             raise uncertain('Canonical endpoint timed out; outcome may be unknown')
         if completed.returncode:
@@ -1211,18 +1493,67 @@ class EndpointBackend:
             raise uncertain('Canonical endpoint returned an invalid response')
 
     def _run(self, action, project, actor, args, attachments=None, operation_id=None,
-             authority=None, require_authority=False, route=None):
+             authority=None, require_authority=False, route=None, extra=None):
         reply = self._endpoint(action, project, actor, args, attachments,
                                operation_id=operation_id, authority=authority,
-                               require_authority=require_authority, route=route)
-        return self._checked(reply)
+                               require_authority=require_authority, route=route, extra=extra)
+        # Without a descriptor the service only reads (every write it sends carries one).
+        return self._checked(reply, action, reading=authority is None)
+
+    #: How much of a canonical refusal's last line is handed on. A checkpoint refusal lists
+    #: every problem with the record (kittrial-5bb.113), so it gets room for all of them.
+    DETAIL_LIMIT = 200
+    DETAIL_LIMITS = {'checkpoint': 6000}
+    #: The follow-on base refusal is handed on whole (kittrial-5bb.158): cut at 200 it lost the
+    #: reason, the recorder's name and what an operator must do.
+    BASE_REFUSAL_LIMIT = 1500
+
+    @classmethod
+    def _detail_limit(cls, action, said):
+        """How much of a canonical refusal's last line is handed on.
+
+        The larger limit is for the kit's own sentence only, never for a caller's text echoed
+        back at length: the line must BE the follow-on base refusal, whole, as
+        ``review_workflow.BASE_REFUSAL`` describes it (the kit's words, hexadecimal commit
+        ids, a recorder name of a constrained shape). Anything else keeps the limit it had.
+        """
+        if action == 'review' and cls.base_refusal(said) is not None:
+            return cls.BASE_REFUSAL_LIMIT            # the longest form of the sentence is well below it
+        return cls.DETAIL_LIMITS.get(action, cls.DETAIL_LIMIT)
 
     @staticmethod
-    def _checked(reply):
-        """The payload of one canonical reply, or the HttpError its return code means."""
+    def base_refusal(said):
+        """The follow-on base refusal in ``said`` (a canonical refusal line), or None when it is not one, whole."""
+        from review_workflow import BASE_REFUSAL
+        text = said[len('ValueError: '):] if isinstance(said, str) and said.startswith('ValueError: ') else None
+        return text if text is not None and BASE_REFUSAL.fullmatch(text) else None
+
+    @classmethod
+    def _checked(cls, reply, action=None, reading=False):
+        """The payload of one canonical reply, or the HttpError its return code means.
+
+        ``reading`` says that the request could not have written: its failure is then never
+        "the outcome may be unknown" (kittrial-5bb.185: a change of a task that does not exist
+        began with a read of it, bd said it found none, and the caller was told that the change
+        may have been made).
+        """
         code = reply.get('returncode') if isinstance(reply, dict) else None
+        if code == 0 and isinstance(reply.get('server_time'), str):
+            # The endpoint's time of the write it carried out, for the body of the answer of
+            # the request this thread is serving (kittrial-5bb.97).
+            WRITTEN.at = reply['server_time']
+        elif code == 0 and reply.get('replayed') is True:
+            # A stored answer from before the time was kept: no time is known, and the
+            # service's clock now would be the time of the retry.
+            WRITTEN.at = False
         stderr = (reply.get('stderr') or '') if isinstance(reply, dict) else ''
         stdout = (reply.get('stdout') or '') if isinstance(reply, dict) else ''
+        if isinstance(reply, dict) and reply.get('fault') == 'tracker':
+            # The endpoint's export yielded no rows, so the project's tracker was not read
+            # (kittrial-5bb.188 item 1). The endpoint marks it a host fault, and the
+            # `reading` path above already decides what such a failure means: 503, nothing
+            # was changed, the key stays free. Never 422 "the request was rejected".
+            raise cls._unread()
         if code == 126:
             # The endpoint re-validated live authority immediately before the effect
             # and refused it. Nothing was written.
@@ -1231,13 +1562,113 @@ class EndpointBackend:
                 raise unauthenticated(detail or 'Authentication is no longer valid')
             raise forbidden(detail or 'Authority was revoked before the canonical write')
         if code == 124:
+            if reading:
+                raise cls._unread()
             raise uncertain('Canonical command timed out; outcome may be unknown')
+        if code == 75:
+            # The endpoint was occupied (a wait for a lock ran out): the request may simply be
+            # sent again. Its line names the lock file it waited for, a path of the host, so it
+            # goes to this service's log for the operator and the person gets the service's own
+            # sentence (kittrial-5bb.149).
+            cls._log_busy(action, stderr)
+            raise busy()
         if code:
-            detail = stderr.strip().splitlines()[-1][:200] if stderr.strip() else None
+            said = stderr.strip().splitlines()[-1] if stderr.strip() else None
+            detail = said[:cls._detail_limit(action, said)] if said else None
             if code == 2:
+                if reply.get('refused') == 'not-found':
+                    # bd found no row of that name (bd_refusals): the thing asked about is not there.
+                    raise not_found('Task not found')
+                if reply.get('refused') == bd_refusals.CLAIMED:
+                    # bd's claim found the task in somebody else's hands. The route names the
+                    # holder as people know them; here it is the label the tracker has.
+                    held_by = bd_refusals.holder(detail)
+                    refusal = conflict('Task is already claimed', {'held_by': held_by})
+                    refusal.held_by = held_by             # None when the holder is not an actor label: nobody is named
+                    raise refusal
+                if reply.get('refused') == bd_refusals.NOT_CLAIMABLE:
+                    state = bd_refusals.status(detail)
+                    raise conflict('Task is not open%s' % (' (it is %s)' % state.replace('_', ' ') if state else ''),
+                                   {'status': state})
                 raise invalid('Canonical command rejected the request', detail)
+            if reading:
+                raise cls._unread()
             raise uncertain('Canonical command failed; outcome may be unknown')
         return _canonical_payload(stdout)
+
+    #: Said when a read of the tracker failed: nothing was changed, and nothing is to reconcile.
+    UNREAD = 'The tracker could not be read just now. Nothing was changed; try again shortly.'
+
+    @classmethod
+    def _unread(cls):
+        failure = HttpError(503, 'unavailable', cls.UNREAD)
+        failure.nothing_done = True
+        return failure
+
+    #: Said when the endpoint reports that the server's configuration file cannot be read.
+    CONFIGURATION_UNREADABLE = ("The server's configuration cannot be read, so this request was not carried out. "
+                                'Ask an operator of the server to look.')
+
+    @staticmethod
+    def _log_busy(action, stderr):
+        """Which lock, and how long: the endpoint's own line, for the operator, in the service log."""
+        said = (stderr or '').strip().splitlines()
+        print('busy: the endpoint answered return code 75 for %s: %s'
+              % (action or 'a request', ascii(said[-1][:400]) if said else '(nothing)'), file=sys.stderr, flush=True)
+
+    def _settle_actor_rows(self, principal, project_id):
+        """Judge an unmarked credential's name by the tracker once and keep the outcome.
+
+        Kittrial-5bb.188 item 5. A credential issued before the row rule has no
+        ``actor_rows_checked`` mark, so every one of its writes would read the whole tracker
+        (measured at 3,000 rows: 3.8-4.1 s against 0.6 s). At its first write through this
+        backend the name is judged against the rows older than its issuance, exactly as the
+        endpoint judges it, and the outcome is kept ON THE CREDENTIAL: ``actor_rows_checked``
+        when the name is free, or ``actor_rows_refused`` (the rule word) when it is held. Every
+        later write reads no tracker, and a refused one is refused without one.
+
+        The keeping is not reachable from a request: there is no credential-update route, the
+        issue route accepts no such field, and this method is the only writer of the two marks.
+        It runs from the service, which owns the state, never from the endpoint (the endpoint
+        only reads the state file; a write there would be lost by the next service save).
+        A concurrent first write may run the export twice and both answer the same way; the
+        mark written by either is the same, so the result is idempotent. A name a cheap rule (a
+        session, an operator, a verifier, the service's namespace, a look-alike) already refuses
+        is left unmarked: the endpoint decides it every write with no tracker read, and a mark
+        would wrongly say the row rule had been judged.
+        """
+        if getattr(principal, 'via', None) != 'credential':
+            return
+        import actor_names
+        credential_id = getattr(principal, 'credential_id', None)
+        with self.service.store.lock:
+            credential = self.service.state['credentials'].get(credential_id)
+            if not isinstance(credential, dict) or credential.get('actor_rows_checked') \
+                    or credential.get('actor_waived') or credential.get('actor_rows_refused'):
+                return
+            namespace = credential.get('actor')
+            if not isinstance(namespace, str) or not namespace:
+                return                          # writes under its issuer's own account id
+            issued = credential.get('created_at')
+            rows = issued if isinstance(issued, str) and issued else True
+            own = actor_names.own_intervals(self.service.state.get('credentials') or {}, namespace,
+                                            credential.get('user_id'), credential.get('project_id'),
+                                            exclude=credential_id)
+        if self.actor_standing(project_id, [namespace]).get(namespace) is not None:
+            return                              # a cheap rule decides it every write; no row read
+        reason = self.actor_standing(project_id, [namespace], rows=rows, own=own).get(namespace)
+        with self.service.store.lock:
+            credential = self.service.state['credentials'].get(credential_id)
+            if not isinstance(credential, dict) or credential.get('actor_rows_checked') \
+                    or credential.get('actor_waived') or credential.get('actor_rows_refused'):
+                return                          # another first write settled it meanwhile
+            if reason is None:
+                credential['actor_rows_checked'] = True
+            elif reason == actor_names.ROWS:
+                credential['actor_rows_refused'] = actor_names.ROWS
+            else:
+                return                          # a cheap rule again: leave it unmarked
+            self.service.store.save()
 
     # -- mutations -------------------------------------------------------------
     def invoke(self, route, principal, project_id, payload, key, target=None, authorize=None,
@@ -1252,7 +1683,15 @@ class EndpointBackend:
             if authorize is not None:
                 authorize()
             if result_key is not None and self.service.has_result(result_key):
+                # The endpoint is not asked: the time is the one kept with the stored result,
+                # and none where none was kept (a result stored before the time was kept).
+                # Never the service's clock, which is the time of the retry (kittrial-5bb.97).
+                WRITTEN.at = self.service.result_written_at(result_key) or False
                 return self.service.result_get(result_key)
+        # The row rule for a credential issued before it is settled ONCE, here, before the
+        # write is sent: the credential then carries the outcome and no later write reads
+        # the tracker (kittrial-5bb.188 item 5).
+        self._settle_actor_rows(principal, project_id)
         # The durable canonical operation identity is the same deterministic digest as
         # the local result key, so an exact retry after a lost response carries the
         # identity the endpoint journaled with the effect.
@@ -1277,7 +1716,10 @@ class EndpointBackend:
             # failure) for a mutation whose identity it still reserves. Preserve that
             # uncertainty in the HTTP receipt too, so an exact retry reconciles
             # through the durable operation identity instead of releasing the key.
-            if failure.status == 503:
+            # Not when the answer itself says that nothing was carried out (kittrial-5bb.156):
+            # the request was never sent to the endpoint, or the endpoint could not read the
+            # server's configuration and refused it.
+            if failure.status == 503 and not getattr(failure, 'nothing_done', False):
                 raise UncertainOutcome() from None
             raise
         # The endpoint's guarded section linearized live authority with the effect, so
@@ -1286,7 +1728,8 @@ class EndpointBackend:
         # changed the authority the effect ran under.
         if result_key is not None:
             with self.service.store.lock:
-                self.service.result_put(result_key, result)
+                # With the endpoint's time of the write (``_checked`` left it for this thread).
+                self.service.result_put(result_key, result, written_at=getattr(WRITTEN, 'at', None))
                 self.service.store.save()
         if self.faults.get(route, 0) > 0:
             self.faults[route] -= 1
@@ -1305,15 +1748,29 @@ class EndpointBackend:
         # A reviewer's recommendation (kittrial-5bb.115): a record beside the chain, so
         # it carries no `previous` (see REVIEW_NO_PREVIOUS).
         'recommend': ('contribution', 'commit', 'verdict', 'summary', 'items'),
+        # The additive review-workflow operations (kittrial-5bb.94, checked over HTTP by
+        # kittrial-5bb.110 item 9). Without these the canonical backend refused every
+        # one of them as an unknown operation, so the new states could not be reached
+        # over HTTP at all.
+        'withdraw': ('contribution', 'reason'),
+        'request-review': ('contribution', 'reviewer'),
+        'resolve-item': ('contribution', 'request', 'item', 'reason'),
+        'decline-review': ('contribution', 'request', 'reason'),
     }
     #: Operations whose canonical record takes no ``previous``.
     REVIEW_NO_PREVIOUS = ('recommend',)
     #: Optional canonical review fields: forwarded only when the caller supplied them,
     #: so old payloads keep the exact legacy field set (no operation-inappropriate
     #: nulls) and a follow-on's additive ``follows`` relation is not silently dropped
-    #: into a first contribution or a supersede.
+    #: into a first contribution or a supersede. The request-changes summary, a
+    #: request-review summary and the withdrawn/resolve dispositions are the same kind
+    #: of additive field (kittrial-5bb.94 items 3 and 5).
     REVIEW_OPTIONAL_FIELDS = {
         'contribute': ('follows',),
+        'request-changes': ('summary',),
+        'request-review': ('summary',),
+        'withdraw': ('disposition',),
+        'resolve-item': ('disposition',),
     }
     CHECKPOINT_FIELDS = ('schema_version', 'previous', 'activity_cursor', 'source_commit',
                          'branch', 'intent', 'acceptance', 'summary', 'next_action',
@@ -1335,13 +1792,20 @@ class EndpointBackend:
                 # The title is a positional argument of the native create: a leading dash
                 # would be read as a flag, a leading @ as the attachment transport.
                 raise invalid('A task title cannot start with "-" or "@"')
+            args = ['create', title, '--json']
+            if payload.get('priority') is not None:
+                # The priority the caller chose is taken for real (kittrial-5bb.183 item 1):
+                # it used to be dropped here and the task was made with bd's default. bd's
+                # own default still applies when the caller sends none.
+                args[-1:-1] = ['--priority', str(payload['priority'])]
             description = payload.get('description')
             if description and str(description).strip():
                 # A blank description is no description (as PATCH treats it as "clear"):
                 # the endpoint refuses an empty body file.
-                return ('bd', project_id, ['create', title, '@attachment:0', '--json'],
+                args[-1:-1] = ['@attachment:0']
+                return ('bd', project_id, args,
                         {'0': {'flag': '--body-file', 'text': description}})
-            return 'bd', project_id, ['create', title, '--json'], {}
+            return 'bd', project_id, args, {}
         if route == 'tasks.update':
             args = ['update', str(task_id), '--json']
             if str(payload.get('title') or '').startswith(('-', '@')):
@@ -1363,30 +1827,50 @@ class EndpointBackend:
                 # ("@attachment:0") is stored as written whatever the native parser does.
                 args[2:2] = ['@attachment:0']
                 attachments = {'0': {'flag': '--body-file', 'text': str(payload['description'])}}
+            if payload.get('priority') is not None:
+                # Priority is a change like any other (kittrial-5bb.183 item 1). Kept beside
+                # --json, as every other flag, so the native parser reads it as a flag.
+                args[-1:-1] = ['--priority', str(payload['priority'])]
+            if len(args) == 3:
+                # Nothing to change: bd answers `update ID --json` with the words "No updates
+                # specified" and exit 0, which is not an answer this service can read, so it
+                # was taken for a write that may have been made (kittrial-5bb.181). The route
+                # refuses such a body with the fields it takes; this is the same refusal for
+                # any other caller of the backend. Nothing is sent.
+                raise invalid('Nothing to change. A task change takes: title, description, '
+                              'status, priority')
             return 'bd', project_id, args, attachments
         if route == 'tasks.claim':
-            actor = payload.get('actor') or self._actor(principal)
-            return ('bd', project_id,
-                    ['update', str(task_id), '--status', 'in_progress', '--assignee',
-                     str(actor), '--json'], {})
+            # bd's own claim, for the actor the request runs under (kittrial-5bb.187). It checks
+            # and writes in one step: a row that is somebody else's or is not open is refused,
+            # and of several claims of one free row exactly one is carried out. The plain update
+            # of status and assignee this sent before took the task from whoever held it and
+            # reopened a closed one.
+            return 'bd', project_id, ['update', str(task_id), '--claim', '--json'], {}
         if route == 'checkpoints.add':
-            missing = [field for field in self.CHECKPOINT_FIELDS if field not in payload]
-            if missing:
-                raise invalid('Canonical checkpoint payload is missing fields: %s'
-                              % ', '.join(missing))
-            body = {field: payload.get(field) for field in self.CHECKPOINT_FIELDS}
+            # A field left out is sent as left out: the canonical validator names it with
+            # every other problem of the record, where refusing it here hid the rest
+            # (kittrial-5bb.113 review).
+            body = {field: payload[field] for field in self.CHECKPOINT_FIELDS if field in payload}
             body['schema_version'] = payload.get('schema_version', 1)
             body['task'] = task_id
             return ('checkpoint', project_id, [str(task_id), '@attachment:0'],
                     {'0': {'flag': '--file', 'text': json.dumps(body)}})
         if route == 'reviews.add':
             operation = payload.get('operation')
-            if operation not in self.REVIEW_FIELDS:
-                raise invalid('Review operation must be contribute, request-changes, '
-                              'respond, approve or recommend')
+            # A fixed sentence, never the caller's value: `%r` of a 5,000-character
+            # operation came back in a 5,204-character error (kittrial-5bb.110 item 4).
+            # An operation sent as a list or object used to raise TypeError (an
+            # unhashable dict key) and answer 500; the str check makes it this 422.
+            if not isinstance(operation, str) or operation not in self.REVIEW_FIELDS:
+                raise invalid('Unsupported review operation; expected one of: %s'
+                              % ', '.join(sorted(self.REVIEW_FIELDS)))
             common = tuple(field for field in self.REVIEW_COMMON
                            if not (field == 'previous' and operation in self.REVIEW_NO_PREVIOUS))
-            if operation == 'recommend' and 'items' not in payload:
+            if operation == 'recommend' and payload.get('items') is None:
+                # A NULL items is absent, exactly like every other null optional field the
+                # released clients send (kittrial-5bb.110 items 1 and 2): a recommendation
+                # with no notes is the empty list the canonical record requires.
                 payload = dict(payload, items=[])
             fields = common + self.REVIEW_FIELDS[operation]
             missing = [field for field in fields
@@ -1397,7 +1881,12 @@ class EndpointBackend:
                               % ', '.join(missing))
             body = {field: payload.get(field) for field in fields}
             for field in self.REVIEW_OPTIONAL_FIELDS.get(operation, ()):
-                if field in payload:
+                # A null optional field is ABSENT, not a value: the kit's own client used
+                # to send every optional field as null, and forwarding `"summary": null`
+                # made the canonical writer refuse a legacy request-changes
+                # (kittrial-5bb.110 item 1). The canonical required fields (built above)
+                # keep their null, because their ABSENCE is an invalid field set.
+                if payload.get(field) is not None:
                     body[field] = payload.get(field)
             body['schema_version'] = payload.get('schema_version', 1)
             body['operation_id'] = payload.get('operation_id') or operation_id
@@ -1495,6 +1984,9 @@ class EndpointBackend:
         # (kittrial-5bb.64; the shared hidden-surface list).
         rows = hide_records(self._without_record_anchors(project_id,
                                                          self._in_project(rows, project_id)))
+        # The project's merge slot is an internal record too (kittrial-5bb.113): on real
+        # bd it is a row of type task, and was offered to agents as claimable work.
+        rows = [row for row in rows if not is_merge_slot(row)]
         return {'items': rows, 'total': len(rows)}
 
     def _without_record_anchors(self, project_id, rows):
@@ -1659,16 +2151,18 @@ class EndpointBackend:
         if not isinstance(data, dict):
             raise uncertain('Canonical brief returned an unexpected shape')
         checkpoint = None
+        carry = []
         if data.get('checkpoint'):
             point = data['checkpoint']
             unresolved = data.get('unresolved') or {}
+            carry = self._open_items_in_full(project_id, task_id, point.get('comment_id'), unresolved)
             checkpoint = {'id': point.get('comment_id'), 'at': point.get('timestamp'),
                           'author': point.get('author'), 'summary': data.get('current_position'),
                           'next_action': data.get('next_action'),
                           'branch': point.get('branch'), 'source_commit': point.get('source_commit'),
                           'newer_activity': point.get('newer_activity'),
                           'open_items': [{'id': item.get('id'), 'kind': item.get('kind'),
-                                          'text': item.get('text')}
+                                          'text': item.get('text'), 'source': item.get('source')}
                                          for item in unresolved.get('items') or []
                                          if isinstance(item, dict)],
                           'open_items_total': unresolved.get('total')}
@@ -1688,20 +2182,64 @@ class EndpointBackend:
         requests = [{'id': item.get('item'), 'request': item.get('request'),
                      'text': item.get('text'), 'contribution': item.get('contribution'),
                      'author': item.get('author'), 'at': item.get('timestamp'),
-                     'status': 'open', 'resolution': None}
+                     'status': 'open', 'resolution': None,
+                     # Additive (kittrial-5bb.94, exposed over HTTP by kittrial-5bb.110
+                     # item 9): the item's severity and the request-changes summary that
+                     # asked for it. Absent severity reads as blocking.
+                     'severity': item.get('severity') or 'blocking',
+                     'summary': item.get('summary')}
                     for item in review.get('pending_requests') or [] if isinstance(item, dict)]
+
+        def note_view(item):
+            return {'id': item.get('item'), 'request': item.get('request'),
+                    'text': item.get('text'), 'contribution': item.get('contribution'),
+                    'author': item.get('author'), 'at': item.get('timestamp'),
+                    'status': 'open', 'severity': item.get('severity') or 'note',
+                    'summary': item.get('summary')}
+
+        def request_view(entry):
+            return {'request': entry.get('request'), 'reviewer': entry.get('reviewer'),
+                    'summary': entry.get('summary'), 'contribution': entry.get('contribution'),
+                    'author': entry.get('author'), 'at': entry.get('timestamp')}
+
+        # The additive review-workflow states (kittrial-5bb.94): non-blocking items,
+        # open first-class review requests, the requests their named reviewer declined
+        # and the withdraw/supersede record for the current contribution.
+        note_requests = [note_view(item) for item in review.get('note_requests') or []
+                         if isinstance(item, dict)]
+        pending_review_requests = [request_view(entry)
+                                   for entry in review.get('pending_review_requests') or []
+                                   if isinstance(entry, dict)]
+        declined_review_requests = [dict(request_view(entry), reason=entry.get('reason'))
+                                    for entry in review.get('declined_review_requests') or []
+                                    if isinstance(entry, dict)]
+        raw_withdrawal = review.get('withdrawal')
+        withdrawal = ({'disposition': raw_withdrawal.get('disposition'),
+                       'reason': raw_withdrawal.get('reason'),
+                       'author': raw_withdrawal.get('author'),
+                       'at': raw_withdrawal.get('timestamp')}
+                      if isinstance(raw_withdrawal, dict) else None)
         lifecycle = {dimension: {'value': fact.get('value'), 'note': None}
                      for dimension, fact in (data.get('lifecycle') or {}).items()
                      if isinstance(fact, dict)}
         dependencies = (data.get('dependencies') or {}).get('items') or []
-        return {'task': task, 'checkpoint': checkpoint,
+        return {'task': task, 'checkpoint': checkpoint, 'carry_open_items': carry,
                 'review': {'state': review.get('review_state') or 'none',
                            'contribution': contribution, 'requests': requests,
                            'open_requests': review.get('pending_total', len(requests)),
                            'latest_id': review.get('latest_comment_id'),
+                           # Additive (kittrial-5bb.94): the new states travel with every
+                           # brief read, exactly as `review TASK` reports them.
+                           'note_requests': note_requests,
+                           'pending_review_requests': pending_review_requests,
+                           'declined_review_requests': declined_review_requests,
+                           'withdrawal': withdrawal,
                            # Additive (kittrial-5bb.115): the standing recommendation.
                            'recommendation': self._recommendation(review.get('recommendation')),
-                           'recommendations': [{'id': entry.get('comment_id'), 'author': entry.get('author'),
+                           # The newest few carry their whole content (a kit before that
+                           # change gives a name and a time only, and is read the same way).
+                           'recommendations': [self._recommendation(entry) if 'summary' in entry else
+                                               {'id': entry.get('comment_id'), 'author': entry.get('author'),
                                                 'at': entry.get('timestamp')}
                                                for entry in review.get('recommendations') or []
                                                if isinstance(entry, dict)],
@@ -1715,7 +2253,58 @@ class EndpointBackend:
                 'depends_on': [{'id': d.get('depends_on_id'), 'title': d.get('depends_on_id'),
                                 'status': 'unknown', 'type': d.get('type')}
                                for d in dependencies if isinstance(d, dict)],
+                # What a checkpoint must carry to say which activity it has seen. It is in
+                # the canonical brief; without it here an agent could not write a first
+                # checkpoint from the brief alone (kittrial-5bb.113).
+                'activity_cursor': data.get('activity_cursor'),
                 'warnings': data.get('warnings') or []}
+
+    def _open_items_in_full(self, project_id, task_id, checkpoint_id, unresolved):
+        """Every open item of the current checkpoint, as recorded, or None when they could not all be read.
+
+        The next checkpoint must carry each one forward unchanged, ``source`` included, so
+        the checkpoint template needs all of them (kittrial-5bb.113 review). The task page
+        shows the first ten. A task with more costs ONE further ``brief`` read that asks for
+        all of them (a checkpoint holds at most 100). An endpoint older than that page size
+        refuses it, and the items are then read ten at a time, at most ``OPEN_ITEM_PAGES``
+        reads. A checkpoint written between two reads makes the list unusable, and the
+        template then says to read again.
+        """
+        items = [dict(item) for item in unresolved.get('items') or [] if isinstance(item, dict)]
+        offset = unresolved.get('next_offset')
+        if offset is None:
+            return items
+        try:
+            whole = self._run('brief', project_id, self.actor_namespace + '/read',
+                              [str(task_id), '--json', '--items-limit', str(self.OPEN_ITEMS_MAX), '--items-offset', '0'])
+        except HttpError as refusal:
+            if refusal.status != 422:
+                raise
+            whole = None
+        if whole is not None:
+            if not isinstance(whole, dict) or (whole.get('checkpoint') or {}).get('comment_id') != checkpoint_id:
+                return None
+            every = whole.get('unresolved') or {}
+            if every.get('next_offset') is not None:
+                return None
+            return [dict(item) for item in every.get('items') or [] if isinstance(item, dict)]
+        for _ in range(self.OPEN_ITEM_PAGES):
+            if offset is None:
+                return items
+            page = self._run('brief', project_id, self.actor_namespace + '/read',
+                             [str(task_id), '--json', '--items-limit', str(self.BRIEF_ITEMS),
+                              '--items-offset', str(offset)])
+            if not isinstance(page, dict) or (page.get('checkpoint') or {}).get('comment_id') != checkpoint_id:
+                return None
+            more = page.get('unresolved') or {}
+            items += [dict(item) for item in more.get('items') or [] if isinstance(item, dict)]
+            offset = more.get('next_offset')
+        return items if offset is None else None
+
+    #: The page size that holds every open item a checkpoint may have (briefing.CHECKPOINT_ITEMS_MAX).
+    OPEN_ITEMS_MAX = 100
+    #: Reads of ten that an older endpoint may cost instead (100 items, ten a page).
+    OPEN_ITEM_PAGES = 9
 
     @staticmethod
     def _recommendation(value):
@@ -1732,6 +2321,183 @@ class EndpointBackend:
     READ_CACHE_SECONDS = 20
     #: ``review_states`` is derived from ``review_queue`` (see the handler's reuse).
     REVIEW_STATES_FROM_QUEUE = True
+
+    def creation_identity(self, principal, name, key, body_hash):
+        """The digest kept with a host-created project for the request that registered it.
+
+        Of the request as it was authenticated: the operation identity the endpoint journals
+        the creation under (the account and its credential, the route, the project name and
+        the idempotency key) and the hash of the request body. So "the same request again"
+        is the same account sending the same body with the same key, and nothing else.
+        Only the digest is kept: the web record holds neither the key nor the body.
+        """
+        operation = self._result_key(principal, None, 'projects.host-create', key, name)
+        return hashlib.sha256(('%s %s' % (operation, body_hash or '-')).encode('utf-8')).hexdigest()
+
+    def retired_on_host(self, project):
+        """Whether an operator retired ``project`` on the host, so that nothing is served under the name.
+
+        Read from the root itself: no endpoint process and no lock, so the answer to a
+        creator's repeat never waits for either (kittrial-5bb.156 review). What cannot be
+        read says nothing against the project.
+        """
+        try:
+            import admin
+            root = Path(self.root)
+            if (root / 'projects' / project / '.beads' / 'metadata.json').is_file():
+                return False
+            return any(name == project for name, _ in admin.retired_entries(root))
+        except (OSError, ValueError):
+            return False
+
+    def create_host_project(self, principal, name, key):
+        """Create project ``name`` on the host for ``principal`` (kittrial-5bb.118 part 2).
+
+        One ``create-project`` endpoint action. The endpoint re-checks the grant and the
+        limit against the live authority store under its lock, reserves the operation
+        identity before the first write and records the result with it, so the same
+        request sent again returns what happened instead of creating twice. Returns the
+        host's result (``status`` ``created`` or ``incomplete``). A refusal (name not
+        available, limit reached, nothing made) is a 409 with the host's sentence.
+        """
+        operation_id = self._result_key(principal, None, 'projects.host-create', key, name)
+        authority = authority_request(principal, None, CAP_PROJECT_HOST_CREATE,
+                                      now=self.service._expiry_now())
+        # A creation takes longer the more project databases the server holds, so it has its
+        # own, longer timeout (--create-timeout). No other request waits for it.
+        reply = self._endpoint('create-project', name, principal.user_id, [], operation_id=operation_id,
+                               authority=authority, require_authority=True, route='projects.host-create',
+                               check_usable=False, timeout=self.create_timeout)
+        if isinstance(reply, dict) and reply.get('returncode') == 75:
+            import project_creation
+            said = (reply.get('stderr') or '').strip().splitlines()
+            sentence = project_creation.busy_sentence(said[-1]) if said else None
+            if sentence is None:
+                # A wait for a lock ran out before the creation's own code answered: the
+                # endpoint's line names the lock file. The general sentence, and the log.
+                self._log_busy('create-project %s' % name, reply.get('stderr'))
+                raise busy(retry_after=60)
+            raise busy(sentence, retry_after=60)
+        if isinstance(reply, dict) and reply.get('returncode') == 2:
+            import project_creation
+            said = (reply.get('stderr') or '').strip().splitlines()
+            sentence = project_creation.creation_sentence(said[-1]) if said else None
+            if sentence is None:
+                # Not one of the creation's own sentences: an exception's text or a host path
+                # (kittrial-5bb.143). The person is told only that it failed; the line is for
+                # the operator, in this service's log, bounded and with control characters shown.
+                print('create-project %s answered a line that is not a creation sentence: %s'
+                      % (name, ascii(said[-1][:400]) if said else '(nothing)'), file=sys.stderr, flush=True)
+                raise conflict(self.CREATION_FAILED)
+            raise conflict(sentence)
+        return self._checked(reply)
+
+    ONBOARDING_FAILED = 'The onboarding text could not be saved on the server. Ask an operator of the server to look.'
+    #: Said when the host's answer to a creation is not one of its own sentences. It does not
+    #: say that nothing was made, because the service cannot know.
+    CREATION_FAILED = ('The project could not be created, or was only partly made. Ask an operator of the server '
+                       'to look before you try again.')
+
+    def set_onboarding(self, principal, project_id, text, key):
+        """An owner sets (``text``) or clears (``None``) the project's onboarding text.
+
+        One service-only ``set-onboarding`` endpoint action. The endpoint re-checks the
+        project-administration capability under the authority lock and applies the same
+        size limit as ``admin.py set-onboarding`` plus the plain-text rule. The text
+        travels as an attachment, never on a command line.
+        """
+        operation_id = self._result_key(principal, project_id, 'projects.onboarding', key, None)
+        authority = authority_request(principal, project_id, CAP_PROJECT_ADMIN, now=self.service._expiry_now())
+        attachments = {} if text is None else {'text': {'flag': '--file', 'text': text}}
+        reply = self._endpoint('set-onboarding', project_id, principal.user_id,
+                               ['clear'] if text is None else ['set'], attachments, operation_id=operation_id,
+                               authority=authority, require_authority=True, route='projects.onboarding')
+        if isinstance(reply, dict) and reply.get('returncode') == 2:
+            said = (reply.get('stderr') or '').strip().splitlines()
+            sentence = said[-1][:400] if said else ''
+            if not sentence.startswith('ValueError: '):
+                # Not a refusal of the text by the kit's own rules but a failure on the host (a
+                # file that cannot be written, say): its line may name host paths, so it goes
+                # to this service's log and not to the person (kittrial-5bb.143).
+                print('set-onboarding %s answered a line that is not a refusal of the text: %s'
+                      % (project_id, ascii(sentence) if sentence else '(nothing)'), file=sys.stderr, flush=True)
+                raise conflict(self.ONBOARDING_FAILED)
+            raise invalid(sentence[len('ValueError: '):])
+        return self._checked(reply)
+
+    def read_onboarding(self, project_id):
+        """The project's onboarding document as stored, or None when none is set."""
+        reply = self._endpoint('docs', project_id, self.actor_namespace + '/read', ['project'])
+        if isinstance(reply, dict) and reply.get('returncode') == 2 and \
+                'Onboarding document missing' in (reply.get('stderr') or ''):
+            return None
+        code = reply.get('returncode') if isinstance(reply, dict) else None
+        if code:
+            self._checked(reply)
+        return reply.get('stdout') if isinstance(reply, dict) else None
+
+    def host_creations(self, principal):
+        """What the host says about project creations (superusers; read-only).
+
+        ``{'items': the ones that run or need an operator, 'created': the finished ones,
+        'server': {'used', 'limit'}}``. An endpoint older than this revision answers
+        ``items`` only.
+        """
+        authority = authority_request(principal, None, CAP_ACCOUNTS_ADMIN, now=self.service._expiry_now())
+        reply = self._endpoint('project-creations', None, principal.user_id, [], authority=authority,
+                               require_authority=True)
+        if isinstance(reply, dict) and reply.get('returncode') == 2:
+            # A failure on the host, not a refusal of the request: its line may name a host path
+            # and an exception, and this list is shown on a page (kittrial-5bb.149).
+            said = (reply.get('stderr') or '').strip().splitlines()
+            print('project-creations answered a failure: %s' % (ascii(said[-1][:400]) if said else '(nothing)'),
+                  file=sys.stderr, flush=True)
+            raise conflict(self.CREATIONS_UNREADABLE)
+        result = self._checked(reply, 'project-creations')
+        result = result if isinstance(result, dict) else {}
+        return {'items': [item for item in result.get('items') or [] if isinstance(item, dict)],
+                'created': [item for item in result.get('created') or [] if isinstance(item, dict)],
+                'server': result.get('server') if isinstance(result.get('server'), dict) else None,
+                'server_readable': result.get('server_readable') is not False}
+
+    CREATIONS_UNREADABLE = ('The project creations on the server could not be read. Ask an operator of the server '
+                            'to look.')
+
+    #: An account's own standing on the host is asked for at most this often (seconds).
+    STANDING_CACHE_SECONDS = 20
+
+    def creation_standing(self, principal):
+        """The names ``principal`` holds on the host and whether the server is full, or None.
+
+        One read-only endpoint action, kept for a few seconds per account: the session
+        read asks on every page load. None when the host cannot say (an older endpoint,
+        a failure): the page then shows the web service's own count, as before.
+        """
+        cache = getattr(self, '_standing_cache', None)
+        if cache is None:
+            cache = self._standing_cache = {}
+        now = time.monotonic()
+        kept = cache.get(principal.user_id)
+        if kept and now - kept[0] < self.STANDING_CACHE_SECONDS:
+            return kept[1]
+        authority = authority_request(principal, None, CAP_PROJECT_HOST_CREATE, now=self.service._expiry_now())
+        try:
+            result = self._checked(self._endpoint('creation-standing', None, principal.user_id, [], authority=authority,
+                                                  require_authority=True))
+        except HttpError:
+            result = None
+        if not isinstance(result, dict) or not isinstance(result.get('held'), list):
+            result = None
+        else:
+            result = {'held': [name for name in result['held'] if isinstance(name, str)],
+                      'server_full': result.get('server_full') is True}
+        cache[principal.user_id] = (now, result)
+        if len(cache) > 500:
+            cache.pop(next(iter(cache)))
+        return result
+
+    def forget_standing(self, user_id):
+        getattr(self, '_standing_cache', {}).pop(user_id, None)
 
     def setup_status(self, project_id):
         """What the host knows about this project's setup (kittrial-5bb.118).
@@ -1857,6 +2623,11 @@ class EndpointBackend:
             for row in page.get('items') or []:
                 if not isinstance(row, dict):
                     continue
+                if row.get('task') == '%s%s' % (project_id, MERGE_SLOT_SUFFIX):
+                    # The row bd keeps as the project's merge slot. This kit's `work` never
+                    # lists it; an older endpoint did, and a slot that lost its label would
+                    # be listed again. It is never offered here (kittrial-5bb.113 review).
+                    continue
                 contribution = ({'id': row.get('contribution_id'), 'commit': row.get('commit'),
                                  'revision': None, 'at': None}
                                 if row.get('contribution_id') else None)
@@ -1873,7 +2644,9 @@ class EndpointBackend:
                                         integration_warnings=row_warnings,
                                         attention=self._attention_fields(row),
                                         recommended_by=[name for name in row.get('recommended_by') or []
-                                                        if isinstance(name, str)]))
+                                                        if isinstance(name, str)],
+                                        contribution_author=row.get('contribution_author')
+                                        if isinstance(row.get('contribution_author'), str) else None))
             offset = page.get('next_offset')
             if offset is None:
                 complete = True
@@ -1890,19 +2663,173 @@ class EndpointBackend:
         return self.review_queue(project_id,stop_if_over_bound=True)
 
 
+#: What a row that cannot be read is called, in the words of the endpoint's readers
+#: (kittrial-5bb.141): the row is named, marked, and nothing of it is trusted.
+MALFORMED_ROW = 'Malformed issue row'
+#: Quotes with what they hold, and the brackets: all that matters for finding where one
+#: element of a JSON text ends. Each match consumes its characters, so a scan is one pass.
+_JSON_PIECE = re.compile(r'"(?:\\.|[^"\\])*"|[\[\]{}:,]', re.DOTALL)
+#: The only id a marker row may carry: the shape of a tracker id (the same bound as the
+#: endpoint's readers use), so that what is named in the list and put into a link is an id
+#: and not whatever text stood there.
+_ROW_ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,160}\Z')
+
+
+def unreadable_row(task_id):
+    """409 for a task whose row exists and cannot be read (kittrial-5bb.169)."""
+    return HttpError(409, 'unreadable_row',
+                     'Task %s exists, but its row cannot be read (it is malformed or nested too deeply). '
+                     'Ask an operator of the server to repair it.' % task_id,
+                     {'task': task_id, 'state': 'unreadable'})
+
+
+def _row_id(text):
+    """The id a row's text gives at its own top level, without parsing the row; None when it gives none.
+
+    Only a string value of the key ``id`` of the outermost object is read; what is nested
+    below is skipped by counting brackets. One pass, no recursion.
+    """
+    depth, key, expect_value = 0, None, False
+    for match in _JSON_PIECE.finditer(text):
+        piece = match.group()
+        if piece in '[{':
+            depth += 1
+            key, expect_value = None, False
+        elif piece in ']}':
+            depth -= 1
+            if depth <= 0:
+                break
+        elif depth != 1:
+            continue
+        elif piece == ':':
+            expect_value = key is not None
+        elif piece == ',':
+            key, expect_value = None, False
+        elif piece[0] == '"':
+            try:
+                value = json.loads(piece)
+            except ValueError:
+                value = None
+            if expect_value:
+                if key == 'id':
+                    return value if isinstance(value, str) and _ROW_ID.match(value) else None
+                key, expect_value = None, False
+            else:
+                key = value
+    return None
+
+
+def _marker(text):
+    """The row the service shows in place of one it does not read: its id, and nothing else of it.
+
+    Not its title: the title is the stored text of a row nobody has read, control
+    characters and all, and the id is what names the row and what the operator needs.
+    A piece without an id of a tracker id's shape at its own top level is not a row at
+    all, and the answer it stands in is refused.
+    """
+    task_id = _row_id(text)
+    if task_id is None:
+        raise ValueError('an element nested too deeply to read is not a tracker row (it has no id)')
+    return {'id': task_id, 'malformed': True, 'unreadable': True, 'error': MALFORMED_ROW, 'status': 'unknown'}
+
+
+def _elements(text):
+    """Where each element of a JSON array of objects begins and ends; None when the text is not exactly that.
+
+    One pass that counts brackets outside string literals, so a row nested thousands of
+    levels deep costs what its length costs and no recursion. Exactly that: ``[``, objects
+    separated by one comma each, ``]``, and white space. Anything else between the rows
+    or around the list (a number, a word, a second comma, text after the end) is what
+    ``json.loads`` refuses or is not a list of rows, and is refused here too.
+    """
+    stripped = text.strip()
+    if stripped[:1] != '[':
+        return None
+    offset = len(text) - len(text.lstrip())
+    spans, depth, start, last, closed = [], 0, None, offset + 1, None
+    for match in _JSON_PIECE.finditer(text, offset):
+        piece = match.group()
+        if piece in '[{':
+            depth += 1
+            if depth == 2:
+                if piece != '{':
+                    return None
+                gap = text[last:match.start()].strip()
+                if gap != (',' if spans else ''):
+                    return None
+                start = match.start()
+        elif piece in ']}':
+            depth -= 1
+            if depth == 1 and start is not None:
+                spans.append((start, match.end()))
+                start, last = None, match.end()
+            if depth == 0:
+                closed = match
+                break
+            if depth < 0:
+                return None
+    if closed is None or closed.group() != ']' or text[last:closed.start()].strip() or text[closed.end():].strip():
+        return None
+    return spans
+
+
+def _row(piece):
+    """One element of the tracker's list: the row, or its marker when it nests deeper than the kit reads."""
+    if record_json.nesting(piece, record_json.ROW_NESTING_MAX) > record_json.ROW_NESTING_MAX:
+        return _marker(piece)
+    try:
+        return json.loads(piece)
+    except RecursionError:
+        # An interpreter that gives up below the kit's own bound: the row is unreadable here.
+        return _marker(piece)
+
+
+def _parse_native(text):
+    """Parse one JSON text of the tracker; a row nested deeper than the kit reads becomes a marker row.
+
+    The rule is the kit's own, the one the endpoint's readers have (kittrial-5bb.141):
+    a row nested deeper than ``record_json.ROW_NESTING_MAX`` is not read. It is counted,
+    not tried: what ``json.loads`` can parse differs from one interpreter to the next
+    (3.10 gives up at about a thousand levels with ``RecursionError``, which is how one such
+    row made the task list answer 500; 3.13 parses 3,000 levels), and a rule that
+    depended on it marked a row on one host and read it on another (review of
+    kittrial-5bb.169).
+
+    A text whose deepest nesting is within the bound is parsed whole, as before. Otherwise
+    it is taken apart: each row is judged on its own, one that is too deep is named and
+    marked instead of failing the read, and every other row is parsed. Raises
+    ``ValueError`` for a text that is not JSON, and for a deep text that is not a single
+    row or a clean list of rows.
+    """
+    if record_json.nesting(text, record_json.ROW_NESTING_MAX) <= record_json.ROW_NESTING_MAX:
+        try:
+            return json.loads(text)
+        except RecursionError:
+            pass                                      # the interpreter gives up below the bound: row by row
+    if text.lstrip()[:1] == '{':
+        # One row printed alone: it must be a whole object, and nothing else, to be called a row.
+        if _elements('[' + text + ']') is None:
+            raise ValueError('not a whole JSON object')
+        return _row(text)
+    spans = _elements(text)
+    if spans is None:
+        raise ValueError('not a list of tracker rows')
+    return [_row(text[start:end]) for start, end in spans]
+
+
 def _canonical_payload(stdout):
     """Parse the JSON body a canonical command returned, tolerating NDJSON."""
     text = (stdout or '').strip()
     if not text:
         raise uncertain('Canonical command returned no data; outcome may be unknown')
     try:
-        return json.loads(text)
+        return _parse_native(text)
     except ValueError:
         for line in reversed(text.splitlines()):
             line = line.strip()
             if line[:1] in ('{', '['):
                 try:
-                    return json.loads(line)
+                    return _parse_native(line)
                 except ValueError:
                     continue
     raise uncertain('Canonical command returned unparsable data; outcome may be unknown')
@@ -2045,13 +2972,111 @@ class ApiHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):  # never log query strings or headers
         pass
 
+    def setup(self):
+        """The TLS handshake, in this connection's own thread and under the client deadline.
+
+        The listening socket is plain (kittrial-5bb.163 review): wrapped itself, it did the
+        handshake inside ``accept``, in the one accepting thread and without a limit, so a
+        single client that connected and said nothing stopped every other client.
+        """
+        server = self.server
+        context = getattr(server, 'tls_context', None)
+        self._guarded = hasattr(server, 'watch')
+        try:
+            if context is not None:
+                self.request = context.wrap_socket(self.request, server_side=True, do_handshake_on_connect=False)
+            if self._guarded:
+                # The second half of the bound (see GuardedServer): no single wait on the client is
+                # longer than this, on every platform. A little longer than the deadline, so that
+                # it is the reaper that ends a wait wherever it can.
+                self.request.settimeout(server.client_seconds + server.TIMEOUT_MARGIN)
+        except ssl.SSLError as failed:
+            # The wrap looks at what the client has sent already; what it refuses there is a
+            # handshake that did not come about, and has the line of one.
+            raise ConnectionAbortedError('TLS handshake not completed: %s'
+                                         % (str(failed)[:120] or type(failed).__name__)) from None
+        except OSError as failed:
+            said = str(failed)[:120] or type(failed).__name__
+            if isinstance(failed, ConnectionError) or failed.errno in SOCKET_GONE:
+                # The socket is closed already (the client reset it, or the server gave the
+                # connection up): there is nobody to serve, and it is not an error of the
+                # service. Never a traceback out of the thread (kittrial-5bb.175).
+                raise ConnectionAbortedError('the connection was closed before it was served: %s' % said) from None
+            # Anything else is a fault of the server itself (no descriptor left for the TLS
+            # object, say): the connection cannot be served either, but the operator must be
+            # able to see why. One line, rate-limited in ``GuardedServer.handle_error``
+            # (kittrial-5bb.177: it was silent, and before kittrial-5bb.175 a traceback each).
+            raise ConnectionAbortedError('%s%s' % (SETUP_FAILED, said)) from None
+        if context is not None:
+            if self._guarded:
+                server.watch(self.request, server.client_seconds)
+            try:
+                self.request.do_handshake()
+            except Exception as failed:
+                self.request.close()
+                raise ConnectionAbortedError('TLS handshake not completed: %s'
+                                             % (type(failed).__name__ if not str(failed) else str(failed)[:120])) from None
+            finally:
+                if self._guarded:
+                    server.unwatch(self.request)
+        super().setup()
+        if self._guarded:
+            self.wfile = _WatchedWriter(self.wfile, server, self.connection)
+
+    def finish(self):
+        try:
+            super().finish()
+        finally:
+            if getattr(self.server, 'tls_context', None) is not None:
+                # The server closes the socket it accepted; the TLS socket made from it is this one.
+                try:
+                    self.request.close()
+                except OSError:
+                    pass
+
+    def handle_one_request(self):
+        """One request, with a bound on how long the client may take to send it.
+
+        The watch runs from here (waiting for the request line: a connection that has just
+        been made, or an idle keep-alive one) until the request has been read, and not while
+        the service works on it. ``_dispatch`` stops it; a body is read under its own.
+        """
+        if not getattr(self, '_guarded', False):
+            return super().handle_one_request()
+        self.server.watch(self.connection, self.server.client_seconds)
+        try:
+            return super().handle_one_request()
+        except ConnectionError:
+            self.close_connection = True          # the client went away, or was cut off for being too slow
+        finally:
+            self.server.unwatch(self.connection)
+
+    #: Said for a write when the service's own lock could not be had in time: it may have been
+    #: carried out already, so "not completed" would not always be true.
+    BUSY_UNCERTAIN = ('The server was busy and cannot say whether this request was carried out. Look before you '
+                      'repeat it, or send it again with the same idempotency key.')
+    #: The same for a write that carried no idempotency key (kittrial-5bb.156): there is no key
+    #: to send again, and a repeat is a second request.
+    BUSY_UNCERTAIN_NO_KEY = ('The server was busy and cannot say whether this request was carried out. Look before '
+                             'you repeat it: sent again without an idempotency key, it may be carried out twice.')
+    #: `_mutate`'s own two, for an outcome the endpoint left unknown.
+    UNCERTAIN = 'The operation may have committed; reconcile with the same idempotency key'
+    UNCERTAIN_NO_KEY = ('The operation may have committed. Look before you repeat it: sent again without an '
+                        'idempotency key, it may be carried out twice.')
+
     def _dispatch(self, method):
+        if getattr(self, '_guarded', False):
+            self.server.unwatch(self.connection)        # the request line and headers are here: the service's time now
+        self._written_at = None                         # one connection serves request after request
         request_id = self._request_id()
         self._current_request_id = request_id
         # Per-request agent read cache. An HTTP/1.1 keep-alive connection reuses this
         # handler instance, so the cache is reset for every request and never outlives it.
         self._agent_task_cache = {}
         self._request_reads = {}
+        # What the answer to a lock wait that runs out depends on: whether the route had begun
+        # (before it, nothing can have been carried out), which route, and whether a key came.
+        begun = None
         try:
             parsed = urlsplit(self.path)
             path = parsed.path
@@ -2079,23 +3104,69 @@ class ApiHandler(BaseHTTPRequestHandler):
             ctx = RouteContext(self._principal, payload, query, params, request_id,
                                self._idempotency_key(), self._body_hash, auth_source,
                                self._is_secure(), route_target)
+            begun = (name, ctx.idempotency_key is not None)
             status, response = getattr(self, name)(ctx)
             self._send_json(status, response)
         except HttpError as error:
             self._note_denied(error, request_id)
+            self._retry_after = getattr(error, 'retry_after', None)
             self._send_json(error.status, error.body(request_id))
+        except TimeoutError as waited:
+            # Which lock, for the operator: the message of the wait names the lock file.
+            print('busy: a wait for a lock ran out in the service for %s: %s' % (method, ascii(str(waited)[:400])),
+                  file=sys.stderr, flush=True)
+            # A wait for the state lock ran out (file_lock raises it while acquiring). The server
+            # is occupied; this is not an internal error. For a read nothing can have happened.
+            # For a write the wait may have run out AFTER the effect: a creation was made and
+            # registered, and the lock for the receipt could not be had (seen on real bd,
+            # kittrial-5bb.149). The service does not know which, and says so.
+            # Not every write: before the route began nothing was carried out, and a log-in that
+            # was made and not answered is a session nobody holds (kittrial-5bb.156). Otherwise
+            # the sentence names the idempotency key only when the request carried one.
+            if method in ('GET', 'HEAD') or begun is None or begun[0] == 'sessions_create':
+                error = busy()
+                self._retry_after = error.retry_after
+            else:
+                error = uncertain(self.BUSY_UNCERTAIN if begun[1] else self.BUSY_UNCERTAIN_NO_KEY)
+            self._send_json(error.status, error.body(request_id))
+        except ConnectionError:
+            raise                                   # the client is gone: nothing to answer, and not an internal error
         except Exception:
             # No traceback, no internal detail: a clean, generic JSON error.
             self._send_json(500, {'error': {'code': 'internal_error',
                                             'message': 'Internal error'},
                                   'request_id': request_id})
 
-    do_GET = lambda self: self._dispatch('GET')
-    do_POST = lambda self: self._dispatch('POST')
-    do_PUT = lambda self: self._dispatch('PUT')
-    do_PATCH = lambda self: self._dispatch('PATCH')
-    do_DELETE = lambda self: self._dispatch('DELETE')
-    do_HEAD = lambda self: self._dispatch('HEAD')
+    def _admit(self, method):
+        """Behind a trusted proxy, one forwarded address has a share of the requests being served.
+
+        The connection is the proxy's, so the limit per address (``GuardedServer``) cannot be
+        taken at accept; it is taken here, for the time this request is served, under the
+        address the service already takes as the request's source. A request over it is
+        answered 503 ``busy`` before its route begins: nothing was carried out.
+        """
+        server = self.server
+        group = self._forwarded_group() if hasattr(server, 'request_begins') else None
+        if group is None:
+            return self._dispatch(method)
+        if not server.request_begins(group):
+            server.unwatch(self.connection)
+            error = busy(ADDRESS_BUSY, retry_after=1)
+            self._retry_after = error.retry_after
+            self._say_close = True                # its body, if it has one, was not read
+            self._current_request_id = self._request_id()
+            return self._send_json(error.status, error.body(self._current_request_id))
+        try:
+            return self._dispatch(method)
+        finally:
+            server.request_ends(group)
+
+    do_GET = lambda self: self._admit('GET')
+    do_POST = lambda self: self._admit('POST')
+    do_PUT = lambda self: self._admit('PUT')
+    do_PATCH = lambda self: self._admit('PATCH')
+    do_DELETE = lambda self: self._admit('DELETE')
+    do_HEAD = lambda self: self._admit('HEAD')
 
     def _request_id(self):
         supplied = self.headers.get('X-Request-Id')
@@ -2136,6 +3207,40 @@ class ApiHandler(BaseHTTPRequestHandler):
             return value.split(',')[0].strip().lower()
         return None
 
+    def _source_is_shared(self):
+        """Whether this request's source is an address everybody arrives from, not one client's.
+
+        True where no client address was forwarded and the peer is the service's own host
+        (loopback: the SSH tunnel of a first install, or a proxy on the host that was not
+        named) or a trusted proxy. In both the people behind it cannot be told apart, so a
+        share per address would be one share for all of them: ten people logging in at nine
+        in the morning would be turned away for each other. Such a log-in is held to the
+        places in all only. With a forwarded address from a trusted proxy the source is that
+        client's, and it has its share.
+        """
+        if self._forwarded_group() is not None:
+            return False
+        if self._peer_is_trusted_proxy():
+            return True
+        try:
+            return ipaddress.ip_address(self._peer_address().split('%', 1)[0]).is_loopback
+        except ValueError:
+            return False
+
+    def _forwarded_group(self):
+        """The address group a trusted proxy forwarded this request for; None for any other request."""
+        if not self._peer_is_trusted_proxy():
+            return None
+        forwarded = self.headers.get('X-Forwarded-For')
+        if not isinstance(forwarded, str) or not forwarded:
+            return None
+        candidate = forwarded.split(',')[-1].strip()
+        try:
+            ipaddress.ip_address(candidate)
+        except ValueError:
+            return None
+        return address_group(candidate)
+
     def _source(self):
         if self._peer_is_trusted_proxy():
             forwarded = self.headers.get('X-Forwarded-For')
@@ -2172,7 +3277,12 @@ class ApiHandler(BaseHTTPRequestHandler):
                 raise invalid('Request body is not valid JSON')
             if not isinstance(payload, dict):
                 raise invalid('Request body must be a JSON object')
-        self._body_hash = request_hash(payload) if payload is not None else request_hash(None)
+        try:
+            self._body_hash = request_hash(payload) if payload is not None else request_hash(None)
+        except UnicodeEncodeError:
+            # Half of a surrogate pair is valid JSON text and not valid Unicode: it cannot be hashed,
+            # stored or sent on. It answered 500 on every route (kittrial-5bb.118 part 2 review).
+            raise invalid('The request holds text that is not valid Unicode (half of a surrogate pair)') from None
         self._principal = None
         self._set_cookie_token = None
         auth_source = None
@@ -2200,7 +3310,21 @@ class ApiHandler(BaseHTTPRequestHandler):
             raise HttpError(413, 'payload_too_large', 'Request body exceeds the configured limit')
         if length == 0:
             return b''
-        return self.rfile.read(length)
+        if not getattr(self, '_guarded', False):
+            return self.rfile.read(length)
+        self.server.watch(self.connection, self.server.client_seconds)
+        try:
+            body = self.rfile.read(length)
+        except OSError:
+            # The socket's own timeout. Not the TimeoutError of a lock wait, which _dispatch
+            # answers as "busy": this is the client, and there is nobody to answer.
+            body = b''
+        finally:
+            self.server.unwatch(self.connection)
+        if len(body) < length:
+            # Cut off for being too slow, or gone: there is nobody to answer.
+            raise ConnectionAbortedError('the request body did not arrive')
+        return body
 
     def _authenticate(self):
         header = self.headers.get('Authorization')
@@ -2220,6 +3344,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         return self.service.authenticate(token, source=self._source()), source
 
     def _note_denied(self, error, request_id):
+        if getattr(self, '_audited_refusal', False):
+            self._audited_refusal = False
+            return
         if error.status not in (401, 403):
             return
         principal = getattr(self, '_principal', None)
@@ -2227,7 +3354,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             with self.service.store.lock:
                 self.service.audit(request_id, principal, 'authorization', 'denied',
                                    reason=error.code)
-                self.service.store.save()
+                self.service.store.save_soon('the audit entry of a refusal')
         except Exception:
             pass
 
@@ -2244,6 +3371,15 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.send_header('X-Content-Type-Options', 'nosniff')
         self.send_header('Referrer-Policy', 'no-referrer')
         self.send_header('X-Request-Id', getattr(self, '_current_request_id', '') or '')
+        if getattr(self, '_written_at', None):
+            # Set only for the answer of a write that was carried out; _dispatch clears it for the next request.
+            self.send_header(SERVER_TIME_HEADER, self._written_at)
+        if getattr(self, '_retry_after', None):
+            self.send_header('Retry-After', str(int(self._retry_after)))
+            self._retry_after = None
+        if getattr(self, '_say_close', False):
+            self.send_header('Connection', 'close')         # which also ends the connection after this answer
+            self._say_close = False
         if getattr(self, '_set_cookie_token', None):
             self._send_cookie(self._set_cookie_token)
         self.end_headers()
@@ -2298,7 +3434,7 @@ class ApiHandler(BaseHTTPRequestHandler):
     # -- mutation helper -------------------------------------------------------
     def _mutate(self, ctx, route_name, project_id, fn, *, capability, allow_self_user=None,
                 status=200, idempotent=True, replay_status=None, serialize=True,
-                canonical=False, reason=None):
+                canonical=False, reason=None, refused_reason=None):
         """Run one authorized, idempotent mutation.
 
         ``capability`` names the authority the route needs. The idempotency key is
@@ -2325,10 +3461,13 @@ class ApiHandler(BaseHTTPRequestHandler):
             if kind == 'replay':
                 # An exact retry must not re-deliver a one-time secret; the caller
                 # marks that with replay_status (200 metadata-only for issue routes).
+                # The header carries the time of the write, as kept with the stored answer.
+                self._written_at = self.service.idempotency_written_at(ctx.principal, project_id, idem_route, key)
                 return (replay_status or value), response
             digest = value
             # 'new' or 'reconcile': both proceed with the reserved digest; a canonical
             # reconcile re-invokes with the durable operation identity.
+        WRITTEN.at = None
         try:
             if serialize:
                 with self.service.store.lock:
@@ -2342,19 +3481,37 @@ class ApiHandler(BaseHTTPRequestHandler):
             self.service.audit(ctx.request_id, ctx.principal, route_name, 'unknown',
                                project_id=project_id, reason=reason or 'uncertain')
             self.service.store.save()
-            raise uncertain('The operation may have committed; reconcile with the same '
-                            'idempotency key')
+            raise uncertain(self.UNCERTAIN if ctx.idempotency_key is not None else self.UNCERTAIN_NO_KEY)
         except HttpError as error:
             self.service.idempotency_release(digest)
+            # ``refused_reason`` lets a route whose target is not a registered project (a
+            # creation) say what was refused; the error code stays first.
             self.service.audit(ctx.request_id, ctx.principal, route_name,
                                'denied' if error.status in (401, 403) else 'rejected',
-                               project_id=project_id, reason=error.code)
-            self.service.store.save()
+                               project_id=project_id,
+                               reason=error.code if refused_reason is None else '%s: %s' % (error.code, refused_reason))
+            # The refusal is the answer whether or not its audit entry can be saved now
+            # (kittrial-5bb.156): nothing was carried out, so a lock wait that runs out here
+            # must not turn it into "cannot say". The entry is written with the next save.
+            self.service.store.save_soon('the audit entry of a refusal')
             raise
         except Exception:
             self.service.idempotency_release(digest)
             raise
-        self.service.idempotency_commit(digest, status, stored)
+        # The server's time of the write, at the top level of the answer and of what is kept for
+        # a retry, so that the same request sent again is answered with the time the write was
+        # carried out (kittrial-5bb.97). An answer that is not an object carries none.
+        at = written_at(self.service)
+        for body in (public, stored):
+            if at is not None and isinstance(body, dict) and 'server_time' not in body:
+                body['server_time'] = at
+        # And in a header, whatever the shape of the body: a JSON list or an empty answer has
+        # no field for it. An answer that already carries a time (a canonical retry answered
+        # from the endpoint's journal) keeps that one in both places.
+        if isinstance(public, dict) and isinstance(public.get('server_time'), str):
+            at = public['server_time']
+        self._written_at = at
+        self.service.idempotency_commit(digest, status, stored, written_at=at)
         self._forget_cached_reads(ctx.principal, project_id)
         self.service.audit(ctx.request_id, ctx.principal, route_name, 'committed',
                            project_id=project_id, reason=reason)
@@ -2372,6 +3529,87 @@ class ApiHandler(BaseHTTPRequestHandler):
         payload = dict(ctx.payload or {})
         payload['task_id'] = ctx.params['tid']
         return payload
+
+    #: ONE TABLE of what each write route takes from the caller's own body (kittrial-5bb.183
+    #: item 2). A field outside the route's set is refused with 422, naming it and the fields
+    #: the route takes, exactly as a task change has since kittrial-5bb.181 -- it is never
+    #: dropped silently and never answered 5xx or "may have committed". Each set is what the
+    #: named clients in this repository send today (web/js/api.js, http_client.py), so no
+    #: client that exists here is broken by the refusal. These sets are the whole table; the
+    #: review, project PATCH, onboarding and proposals routes already refuse the same way.
+    TASK_CREATE_FIELDS = ('title', 'description', 'priority', 'attachments', 'actor')
+    TASK_CLAIM_FIELDS = ('actor',)
+    CHECKPOINT_BODY_FIELDS = EndpointBackend.CHECKPOINT_FIELDS + ('actor',)
+    MEMBER_FIELDS = ('role',)
+    CREDENTIAL_ISSUE_FIELDS = ('label', 'scopes', 'actor', 'allow_actor', 'allow_actor_reason')
+    AGENT_CREATE_FIELDS = ('name', 'tool', 'working_directory', 'machine', 'notes',
+                           'projects', 'scopes')
+    AGENT_UPDATE_FIELDS = ('name', 'tool', 'working_directory', 'machine', 'notes',
+                           'projects', 'enabled')
+    AGENT_CREDENTIAL_FIELDS = ('label', 'scopes')
+    ACCOUNT_CREATE_FIELDS = ('username', 'display_name')
+
+    #: What a task change may change, and what else its body may carry: ``version`` is the
+    #: in-process backend's check that the task was not changed meanwhile (the endpoint backend
+    #: has none and does not read it), ``actor`` the attribution label, bound as on a claim.
+    TASK_CHANGES = ('title', 'description', 'status', 'priority')
+    TASK_CHANGE_FIELDS = TASK_CHANGES + ('version', 'actor')
+
+    def _task_change(self, ctx):
+        """The body of a task change, or the refusal that says what is wrong with it.
+
+        Refused here, before the idempotency key is reserved and before anything is sent to
+        the backend, so the same key serves the corrected request (kittrial-5bb.181). A field
+        the route does not take was dropped silently, and a body that changed nothing made
+        the endpoint backend send bd an update with nothing in it: bd answers that with a
+        sentence, the sentence was read as an answer that could not be understood, and the
+        caller was told that the change may have been made and to try again with the same
+        key, for ever.
+        """
+        payload = self._task_payload(ctx)
+        refuse_unknown_fields({name: value for name, value in payload.items() if name != 'task_id'},
+                              self.TASK_CHANGE_FIELDS, 'A task change', self.TASK_CHANGES)
+        takes = 'A task change takes: %s' % ', '.join(self.TASK_CHANGES)
+        if all(payload.get(name) is None for name in self.TASK_CHANGES):
+            raise invalid('Nothing to change. %s' % takes, {'takes': list(self.TASK_CHANGES)})
+        title, description, status, priority = (payload.get(name) for name in self.TASK_CHANGES)
+        if title is not None:
+            self._task_title(title)
+        if description is not None and not isinstance(description, str):
+            raise invalid('Task description must be text')
+        if status is not None and status not in ('open', 'closed'):
+            raise invalid('Task status must be open or closed')
+        if priority is not None and (type(priority) is not int or not 0 <= priority <= 4):
+            raise invalid('Task priority must be an integer 0-4')
+        self._bind_task_actor(ctx, payload)
+        return payload
+
+    #: bd's own limit for a title (bd 1.2.2: "title must be 500 characters or less"). A longer
+    #: one on a change is not even refused by bd's check: the database refuses it.
+    TASK_TITLE_MAX = 500
+
+    def _task_title(self, title):
+        """A task's title is text, not blank, and no longer than bd takes; else the refusal."""
+        # Not blank: at least one character that can be seen. A title of spaces, or of one control
+        # character (review of kittrial-5bb.185: bd stores it), is no title.
+        if not isinstance(title, str) or not any(ch.isprintable() and not ch.isspace() for ch in title):
+            raise invalid('Task title must be text and not empty')
+        if len(title) > self.TASK_TITLE_MAX:
+            raise invalid('Task title must be %d characters or less (it has %d)' % (self.TASK_TITLE_MAX, len(title)))
+
+    def _bind_task_actor(self, ctx, payload):
+        """An ``actor`` in the body of a task write is the caller's own label or it is refused.
+
+        The canonical write runs under ``payload['actor']`` when there is one. Task create and
+        task change handed the caller's value over as it came, so a member could have a task
+        made, or changed, under any name that does not have the shape of a web account: a host
+        session's, an operator's (kittrial-5bb.181). Bound as a claim, a checkpoint and a
+        review bind it.
+        """
+        if 'actor' in payload:
+            bound = self.service.bind_actor(ctx.principal, payload.pop('actor'))
+            if bound is not None:
+                payload['actor'] = bound
 
     def _paged(self, ctx, items, limit, state, **extra):
         """One bounded page of an in-memory list, with a cursor bound to this query."""
@@ -2400,29 +3638,132 @@ class ApiHandler(BaseHTTPRequestHandler):
                        'task\'s assignee, the person who owns the agent that delivered it, and that person\'s '
                        'other agents cannot recommend it')
 
-    def _independent(self, actors, parties):
+    #: The same with the installation's setting on (kittrial-5bb.199): a worker credential is a reason too,
+    #: in both directions -- work delivered under your credential, and a credential you issued recommending
+    #: your own work (round 2, N6).
+    NOT_INDEPENDENT_PARTY = (NOT_INDEPENDENT + '; and on this server neither can the account that issued the worker '
+                             'credential it was delivered under, nor that account\'s agents, nor a worker credential '
+                             'issued by the contribution\'s author or by the task\'s assignee')
+
+    #: Said to an approver of the party the work belongs to (the setting of kittrial-5bb.199). Which of
+    #: the three is said depends on what is true; each ends with OWN_PARTY_NEXT.
+    OWN_PARTY = ('This contribution was delivered by your own party: you, one of your agents, or a name that a '
+                 'worker credential you issued holds or has held.')
+    OWN_PARTY_SHARED = ('This contribution was delivered under %s, a name that worker credentials of more than one '
+                        'account have held. One of those accounts is yours, and nothing on the record says which '
+                        'credential wrote it, so it counts as the work of each of them.')
+    OWN_PARTY_ASSIGNEE = ('This task is assigned to your own party (you, one of your agents, or a name of a worker '
+                          'credential you issued). Another account delivered the contribution, but nobody approves '
+                          'work on a task their own party holds.')
+    OWN_PARTY_NEXT = (' Somebody of another party who may approve here must approve it: another owner of this '
+                      'project, or a superuser. If there is nobody else, a superuser makes a second account an owner '
+                      'of this project (Members) and that person approves; where the only owner is also the only '
+                      'superuser, that second account has to be made first.')
+
+    def _own_party_refusal(self, names, assignee, author, project):
+        """The sentence for an approver whose party the work is, or None when it is not.
+
+        ``names`` are the approver: the name it acts under and the account behind the request.
+        The author is looked at first; the assignee only when the author is another party.
+        """
+        if not self._independent_all(names, [author], project):
+            shared = len(self.service.actor_parties(author, project)) > 1 if isinstance(author, str) else False
+            return (self.OWN_PARTY_SHARED % author if shared else self.OWN_PARTY) + self.OWN_PARTY_NEXT
+        if not self._independent_all(names, [assignee], project):
+            return self.OWN_PARTY_ASSIGNEE + self.OWN_PARTY_NEXT
+        return None
+
+    def _independent_all(self, names, parties, project=None):
+        """Whether EVERY one of ``names`` is of another party than all of ``parties``."""
+        names = [name for name in names if isinstance(name, str) and name]
+        return len(self._independent(names, parties, project)) == len(names)
+
+    def _independent(self, actors, parties, project=None):
         """The ``actors`` who are a different PERSON from every one of ``parties``.
 
         The canonical rule compares actor names, and a person and their agents are
         different names. The web service knows who owns each agent, so here a person,
         their agent, and two agents of one person are all the same party
-        (kittrial-5bb.115).
+        (kittrial-5bb.115). With the installation's setting on, work under a worker
+        credential belongs to the account that issued it as well (``Service.actor_parties``;
+        ``project`` says where the work of ``parties`` was written).
         """
-        persons = {self.service.actor_person(party) for party in parties if isinstance(party, str) and party}
+        taken = set()
+        for party in parties:
+            if isinstance(party, str) and party:
+                taken |= self.service.actor_parties(party, project)
         return [actor for actor in actors
-                if isinstance(actor, str) and self.service.actor_person(actor) not in persons]
+                if isinstance(actor, str) and not (self.service.actor_parties(actor, project) & taken)]
 
-    def _independent_queue(self, read):
-        """Drop from each row's ``recommended_by`` anyone who is the assignee's person."""
+    @staticmethod
+    def _read_parties(assignee, author):
+        """Whom a standing recommendation in a BRIEF is compared with when it is read.
+
+        The contribution's author, and nobody else: the assignee rule is applied when a
+        recommendation is written, so a reassignment hides nothing. A brief whose
+        contribution does not say who delivered is compared with the assignee (review
+        01a10c80). With neither, the list is empty, and the caller shows no
+        recommendation: "nobody to compare with" is never read as "independent of
+        everybody" (kittrial-5bb.137).
+        """
+        if isinstance(author, str) and author:
+            return [author]
+        return [assignee] if isinstance(assignee, str) and assignee else []
+
+    def _independent_queue(self, read, project=None):
+        """Drop from each row's ``recommended_by`` anyone who is the contribution author's person.
+
+        The same party as the brief compares with (kittrial-5bb.115 review): a
+        recommendation by another agent of the contribution's author is left out of the
+        queue and My work as it is left out of the brief. The assignee is not compared
+        on a read, here or in the canonical reader: that rule is applied when a
+        recommendation is written, so a later reassignment hides nothing.
+
+        A row that does not say who delivered counts NO recommendation (kittrial-5bb.137).
+        Such a row comes from an endpoint older than this service, in a staged upgrade or a
+        rollback: the service cannot tell whose recommendation is independent, and it does
+        not guess from the assignee, who may have changed since the delivery. The queue
+        row, My work and the agent actions then show no recommendation until the endpoint
+        is updated; the brief, which names the author, still shows an independent one.
+
+        The names that were not counted are kept on such a row as ``recommended_unchecked``
+        (kittrial-5bb.147). They say nothing about whether the delivery is recommended.
+        They answer one question the service CAN answer whoever delivered: has this
+        reviewer recommended it already. Without them a reviewer on a mixed installation
+        was offered the same delivery again on every read.
+        """
         changed = False
         for item in read.get('items') or []:
             names = item.get('recommended_by') or []
-            kept = self._independent(names, [item.get('assignee')]) if names else names
+            author = item.get('contribution_author')
+            if names and not (isinstance(author, str) and author):
+                kept, item['recommended_unchecked'] = [], list(names)
+            elif names:
+                kept = self._independent(names, [author], project)
+            else:
+                kept = names
             if len(kept) != len(names):
                 item['recommended_by'], item['recommended'], changed = kept, bool(kept), True
         if changed:
             read['items'].sort(key=queue_order)
         return read
+
+    @staticmethod
+    def _every_recommender(row):
+        """Everyone who recommended the row's delivery, whether or not the service counts them."""
+        return [name for name in (row.get('recommended_by') or []) + (row.get('recommended_unchecked') or [])
+                if isinstance(name, str)]
+
+    def _own_party_recommended(self, row, actor, project=None):
+        """Whether ``actor``'s own PERSON has already recommended the row's delivery (kittrial-5bb.154).
+
+        The one answer to "already recommended?" for an agent's actions and for My work: the
+        actor itself, the person who owns it, or another agent of that person. Independence
+        is by person everywhere else in the review rules, and a second agent of the same
+        person adds no independent reading. Read from every name on the row, counted or not.
+        """
+        names = self._every_recommender(row)
+        return len(self._independent(names, [actor], project)) != len(names)
 
     def _review_queue(self, project_id, shared=False):
         """One review-queue read of a project per request (and, when ``shared`` and the
@@ -2431,7 +3772,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         Authorization is never cached: callers re-check live authority first.
         """
         return self._cached_read('queue', project_id,
-                                 lambda: self._independent_queue(self.backend.review_queue(project_id)), shared)
+                                 lambda: self._independent_queue(self.backend.review_queue(project_id), project_id), shared)
 
     def _cached_read(self, kind, project_id, load, shared=False):
         """One canonical read per request, optionally reused across requests.
@@ -2441,9 +3782,12 @@ class ApiHandler(BaseHTTPRequestHandler):
         server's small read cache for that long, keyed by the *principal* (user id and
         credential id, so an agent never sees its owner's entry or the reverse), the
         project and the read kind. Callers re-check live authority before every read;
-        authorization is never cached. The principal's own successful write drops its
-        entries for that project (:meth:`_forget_cached_reads`). The cache is bounded
-        to :data:`READ_CACHE_MAX_ENTRIES` entries.
+        authorization is never cached, and neither is usability (kittrial-5bb.90): each
+        entry carries the verdict it was stored under, and a record that became usable
+        or unusable is a miss, so the loader's own refusal or fresh read wins at once.
+        The principal's own successful write drops its entries for that project
+        (:meth:`_forget_cached_reads`). The cache is bounded to
+        :data:`READ_CACHE_MAX_ENTRIES` entries.
         """
         memo = getattr(self, '_request_reads', None)
         if memo is None:
@@ -2455,10 +3799,13 @@ class ApiHandler(BaseHTTPRequestHandler):
         key = (getattr(principal, 'user_id', None), getattr(principal, 'credential_id', None)
                or '-', project_id, kind)
         now = time.monotonic()
+        usable = (self._unusable(project_id) is None) if ttl else None
         if ttl and self.read_cache is not None:
             with self.read_cache_lock:
                 hit = self.read_cache.get(key)
-            if hit is not None and hit[0] > now:
+            # A two-tuple is an entry written before this rule (or aged by a test): it
+            # carries no verdict, so it is served as before.
+            if hit is not None and hit[0] > now and (len(hit) < 3 or hit[2] == usable):
                 memo[(kind, project_id)] = hit[1]
                 return hit[1]
         result = load()
@@ -2469,7 +3816,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                     for stale in [k for k, v in self.read_cache.items() if v[0] <= now] or \
                             list(self.read_cache)[:READ_CACHE_MAX_ENTRIES // 2]:
                         self.read_cache.pop(stale, None)
-                self.read_cache[key] = (now + ttl, result)
+                self.read_cache[key] = (now + ttl, result, usable)
         return result
 
     def _forget_cached_reads(self, principal, project_id):
@@ -2513,7 +3860,8 @@ class ApiHandler(BaseHTTPRequestHandler):
     def sessions_create(self, ctx):
         payload = ctx.payload or {}
         result = self.service.login(payload.get('username'), payload.get('password'),
-                                    source=self._source(), request_id=ctx.request_id)
+                                    source=self._source(), request_id=ctx.request_id,
+                                    shared_source=self._source_is_shared())
         self._set_cookie_token = result['session_token']
         self._current_request_id = ctx.request_id
         return 201, {'session': {'token': result['session_token'],
@@ -2538,6 +3886,11 @@ class ApiHandler(BaseHTTPRequestHandler):
                 'project_create': (
                     'create' if getattr(self.backend, 'PROJECT_CREATE', 'create') == 'create' else
                     'register' if principal.superuser and principal.via != 'credential' else 'operator-only')}
+        # Additive (kittrial-5bb.118 part 2): whether this account may create a project
+        # on the host from here, with its limit and how many it has. Only where the
+        # backend has a host.
+        if getattr(self.backend, 'PROJECT_CREATE', 'create') == 'register':
+            body['project_host_create'] = self._host_creation(principal)
         # A browser keeps its CSRF token in memory only, so a reload re-reads it here.
         # It is returned only to the cookie session it belongs to; a cross-origin page
         # cannot read this same-origin response.
@@ -2558,6 +3911,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                             idempotent=bool(ctx.idempotency_key))
 
     def _account_created(self, ctx, payload):
+        # A field the route does not take is refused, not dropped (kittrial-5bb.183 item 2).
+        refuse_unknown_fields(payload, self.ACCOUNT_CREATE_FIELDS, 'An account creation')
         user = self.service.create_user(ctx.principal, payload.get('username'),
                                         payload.get('display_name'))
         return user, user
@@ -2565,7 +3920,25 @@ class ApiHandler(BaseHTTPRequestHandler):
     @route('GET', r'/v1/accounts')
     def accounts_list(self, ctx):
         self.require(ctx, CAP_ACCOUNTS_ADMIN)
-        return 200, {'items': self.service.list_users(ctx.principal)}
+        items = self.service.list_users(ctx.principal)
+        # Additive (kittrial-5bb.118 part 2 revision): the names each account holds on the host
+        # that are not registered here count toward its limit too. One host read, for a
+        # superuser's session only; left out when the host cannot say.
+        if getattr(self.backend, 'PROJECT_CREATE', 'create') == 'register' and hasattr(self.backend, 'host_creations')                 and ctx.principal.superuser and ctx.principal.via != 'credential':
+            try:
+                found = self.backend.host_creations(ctx.principal)
+            except HttpError:
+                found = None
+            if found is not None:
+                registered = self.service.state['projects']
+                held = {}
+                for item in found['items'] + found['created']:
+                    if (isinstance(item.get('project'), str) and item['project'] not in registered
+                            and item.get('state') != 'damaged' and isinstance(item.get('by'), str)):
+                        held.setdefault(item['by'], []).append(item['project'])
+                for view in items:
+                    view['projects_held'] = sorted(held.get(view['id'], []))
+        return 200, {'items': items}
 
     @route('GET', r'/v1/accounts/lookup')
     def accounts_lookup(self, ctx):
@@ -2636,6 +4009,8 @@ class ApiHandler(BaseHTTPRequestHandler):
     def projects_create(self, ctx):
         payload = ctx.payload or {}
         if getattr(self.backend, 'PROJECT_CREATE', 'create') == 'register':
+            if payload.get('create') is True:
+                return self._project_host_create(ctx, payload)
             return self._project_register(ctx, payload)
 
         def create():
@@ -2647,6 +4022,219 @@ class ApiHandler(BaseHTTPRequestHandler):
         # (409) instead of creating a second project.
         return self._mutate(ctx, 'projects.create', None, create,
                             status=201, capability=CAP_PROJECT_CREATE)
+
+    #: Said to everyone who may not create or register, whatever the payload names.
+    NOT_ALLOWED_TO_CREATE = 'Only a superuser registers a project on this server. ' + REGISTER_HINT
+
+    def _host_creation(self, principal):
+        """``Service.host_creation`` with what the host holds for the account counted in.
+
+        A creation that is running, stopped or stalled holds a place the web service has
+        no record of; the endpoint counts it and refuses at the limit. Counted here too,
+        so ``allowed`` and ``used`` say what the endpoint will answer (review 01a109cc).
+        ``reason`` gains ``server-limit``: the server holds as many project databases as
+        its operator allows, whatever this account's own numbers are.
+        """
+        creation = self.service.host_creation(principal)
+        if creation['reason'] in ('credential', 'no-grant') or not hasattr(self.backend, 'creation_standing'):
+            return creation
+        standing = self.backend.creation_standing(principal)
+        if standing is None:
+            return dict(creation, held=None)          # the host could not say
+        registered = set(self.service.state['projects'])
+        held = [name for name in standing['held'] if name not in registered]
+        used = creation['used'] + len(held)
+        creation = dict(creation, used=used, held=held)
+        if creation['limit'] is not None and used >= creation['limit']:
+            creation.update(allowed=False, reason='limit')
+        elif standing['server_full']:
+            creation.update(allowed=False, reason='server-limit')
+        return creation
+
+    #: Said to the account a project is registered to by its own creation, and to nobody else.
+    ALREADY_YOURS = 'You already have project %s: you created it on this server%s. Nothing was made again.'
+    #: The same, when an operator has since retired the project on the host: the page links nothing.
+    RETIRED_YOURS = ('You created project %s on this server%s, and it has since been retired there, so it is no '
+                     'longer served. The name is not available: choose another name.')
+
+    def _created_here_by(self, record, principal):
+        """Whether ``record`` is a project this account created on the host and still belongs to."""
+        made = record.get('host_created')
+        return principal.via != 'credential' and isinstance(made, dict) and made.get('by') == principal.user_id \
+            and record.get('created_by') == principal.user_id \
+            and principal.user_id in (self.service.state['memberships'].get(record.get('id')) or {})
+
+    def _project_host_create(self, ctx, payload):
+        """`POST /v1/projects` with `"create": true`: create the project on the host and register it.
+
+        For a superuser, or an account a superuser granted "may create projects", within
+        the grant's limit (kittrial-5bb.118 part 2). Never a credential. Everyone else
+        gets the same 403 as the register route, before anything about the name is
+        looked at, so the answer cannot be used to find out which names exist.
+
+        The project is registered here only after the host reports it created, first
+        backup included. Until then nothing about it is visible in the web interface. A
+        creation that stopped half way answers 409 with the host's sentence, which names
+        the project and says an operator must finish or remove it.
+        """
+        principal = ctx.principal
+        creation = self.service.host_creation(principal)
+        asked = payload.get('project_id')
+        # What the audit says was asked for: the name when it is one, never caller text otherwise.
+        shown = asked if isinstance(asked, str) and CANONICAL_PROJECT.fullmatch(asked) else '(not a project name)'
+
+        def refuse(error):
+            """A refusal before the mutation starts is audited with the route and the name (review 01a109cc)."""
+            with self.service.store.lock:
+                self.service.audit(ctx.request_id, principal, 'projects.host-create',
+                                   'denied' if error.status in (401, 403) else 'rejected',
+                                   reason='%s: create %s' % (error.code, shown))
+                self.service.store.save_soon('the audit entry of a refusal')
+            # The generic authorization entry would only repeat it.
+            self._audited_refusal = True
+            raise error
+        if creation['reason'] in ('credential', 'no-grant'):
+            refuse(forbidden(self.NOT_ALLOWED_TO_CREATE))
+        if hasattr(self.backend, 'forget_standing'):
+            self.backend.forget_standing(principal.user_id)
+        if set(payload) - {'create', 'project_id', 'name'}:
+            refuse(invalid('Send project_id, name and create only'))
+        project_id = payload.get('project_id')
+        if not isinstance(project_id, str) or not CANONICAL_PROJECT.fullmatch(project_id):
+            refuse(invalid('project_id must be 2-24 lowercase letters or digits, beginning with a letter'))
+        name = payload.get('name') or project_id
+        try:
+            self.service._validate_project_name(name)
+        except HttpError as error:
+            refuse(error)
+        key = ctx.idempotency_key or ctx.request_id
+        identity = self.backend.creation_identity(principal, project_id, key, ctx.body_hash) \
+            if hasattr(self.backend, 'creation_identity') else None
+        existing = self.service.state['projects'].get(project_id)
+        again = False
+        if existing is not None:
+            refusal = conflict('Project name %s is not available: choose another name' % project_id)
+            if self._created_here_by(existing, principal):
+                # The creator's own repeat (kittrial-5bb.156). The exact request that registered
+                # it, sent again with its idempotency key: the endpoint's journal answers what
+                # happened and the project is returned, 201. Anything else from the creator is
+                # told that they have it. Nobody else learns who has the name, or since when.
+                made = existing.get('host_created') or {}
+                again = ctx.idempotency_key is not None and identity is not None and made.get('operation') == identity
+                day = str(existing.get('created_at') or '')[:10]
+                since = ' on ' + day if DAY.fullmatch(day) else ''
+                if hasattr(self.backend, 'retired_on_host') and self.backend.retired_on_host(project_id):
+                    # The web record outlives a retirement on the host. "You already have it", with
+                    # a link, would point at a project that answers "unknown" (review of .156).
+                    again = False
+                    refusal = conflict(self.RETIRED_YOURS % (project_id, since), {'project': project_id, 'state': 'retired'})
+                else:
+                    refusal = conflict(self.ALREADY_YOURS % (project_id, since), {'project': project_id, 'state': 'yours'})
+            if not again:
+                return self._refuse_unless_replay(ctx, 'projects.host-create', refusal,
+                                                  capability=CAP_PROJECT_HOST_CREATE)
+
+        def create():
+            try:
+                result = self.backend.create_host_project(principal, project_id, key)
+            except HttpError as failure:
+                # Busy means nothing was done (another creation is running): it is answered as
+                # busy, to be sent again, and is not an outcome to reconcile.
+                if failure.status == 503 and failure.code != 'busy' and not getattr(failure, 'nothing_done', False):
+                    raise UncertainOutcome() from None
+                if again and failure.status == 409:
+                    # The same request for a project that is registered to this account, and the
+                    # endpoint will not answer it from its journal: sent from another session
+                    # (logged in again; the page keeps its key), the operation identity belongs
+                    # to the first one. Nothing was made, and the project is theirs: say that,
+                    # not "could not be created" (review of kittrial-5bb.156).
+                    raise refusal from None
+                raise
+            if not isinstance(result, dict) or result.get('status') not in ('created', 'incomplete'):
+                raise UncertainOutcome()
+            if result['status'] == 'incomplete':
+                raise conflict(result.get('message') or 'Project %s did not finish; an operator must finish or '
+                               'remove it' % project_id, {'project': project_id, 'state': 'incomplete',
+                                                          'stage': result.get('stage')})
+            view = self._usable(self.service.register_host_created(principal, project_id, name, result,
+                                                                   operation=identity))
+            view['backup'] = result.get('backup')
+            return view, view
+        limit = 'none (superuser)' if creation['limit'] is None else str(creation['limit'])
+        reason = 'create %s account=%s limit=%s count=%d' % (project_id, principal.user_id, limit,
+                                                              creation['used'] + (0 if again else 1))
+        if again:
+            reason += ' (the same request again; it is registered already)'
+        return self._mutate(ctx, 'projects.host-create', None, create, status=201,
+                            capability=CAP_PROJECT_HOST_CREATE, serialize=False, canonical=True, reason=reason,
+                            refused_reason='create %s account=%s' % (project_id, principal.user_id))
+
+    @route('GET', r'/v1/project-creations')
+    def project_creations(self, ctx):
+        """Superusers: creations that stopped half way, so that none is forgotten.
+
+        Each names the project, the account that started it, the stage it stopped at and
+        the two operator commands. Empty where the backend has no host.
+        """
+        principal = self._superuser_session(ctx, 'Only a superuser sees the project creations')
+        self.require(ctx, CAP_ACCOUNTS_ADMIN)
+        if getattr(self.backend, 'PROJECT_CREATE', 'create') != 'register' or \
+                not hasattr(self.backend, 'host_creations'):
+            return 200, {'items': [], 'host': 'not-applicable'}
+        found = self.backend.host_creations(principal)
+        registered = self.service.state['projects']
+        waiting = [item for item in found['created'] if isinstance(item.get('project'), str)
+                   and item['project'] not in registered]
+        names = self.service.actor_names([item.get('by') for item in found['items'] + waiting])
+
+        def view(item, **more):
+            project = item['project']
+            return dict({'project': project, 'state': item.get('state'), 'by': item.get('by'),
+                         'by_name': names.get(item.get('by'), item.get('by')), 'stage': item.get('stage'),
+                         'started_at': item.get('started_at'), 'stopped_at': item.get('stopped_at')}, **more)
+        items = []
+        for item in found['items']:
+            if not isinstance(item.get('project'), str):
+                continue
+            project, state = item['project'], item.get('state')
+            # The commands are tied to what the record reads as (review 01a109cc): a running
+            # creation has none, and no reading is given `retire-project --force`.
+            remove = 'admin.py remove-creation %s --actor OPERATOR --reason REASON' % project
+            items.append(view(item, what=item.get('command'),
+                              finish='admin.py finish-project %s' % project if state == 'incomplete' else None,
+                              remove=remove if state in ('incomplete', 'stalled', 'damaged') else None))
+        # Finished on the server and not registered here: the creator's grant was revoked, the
+        # account was disabled or the server was over its limit when the work ended.
+        unregistered = [view(item, state='created-unregistered', completed_at=item.get('completed_at'),
+                             what='It is complete on the server and not registered here. Register it as a superuser '
+                                  '(New project, with this name), or retire it on the server.',
+                             finish=None, remove=None) for item in waiting]
+        server = found['server']
+        if server is None and not found.get('server_readable', True):
+            server = {'used': None, 'limit': None,
+                      'note': 'The server\'s limit of project databases could not be read, so no project can be '
+                              'created from the web interface. An operator must look at the server\'s configuration.'}
+        elif server is not None:
+            server = {'used': server.get('used'), 'limit': server.get('limit'),
+                      'note': 'Counts every project database on the server: archived and retired projects and '
+                              'unfinished creations too, because their databases stay on it. An operator changes '
+                              'the limit (admin.py project-creations --set-server-limit N --actor OPERATOR).'}
+        return 200, {'items': items, 'unregistered': unregistered, 'server': server, 'host': 'available'}
+
+    @route('PUT', r'/v1/accounts/(?P<uid>' + ID + r')/project-grant')
+    def account_project_grant(self, ctx):
+        """A superuser lets an account create projects: `{"limit": N}` (default 5)."""
+        payload = ctx.payload or {}
+        if set(payload) - {'limit'}:
+            raise invalid('Send limit only')
+        self.require(ctx, CAP_ACCOUNTS_ADMIN)
+        return 200, self.service.set_project_grant(ctx.principal, ctx.params['uid'], payload.get('limit'),
+                                                   request_id=ctx.request_id)
+
+    @route('DELETE', r'/v1/accounts/(?P<uid>' + ID + r')/project-grant')
+    def account_project_grant_clear(self, ctx):
+        self.require(ctx, CAP_ACCOUNTS_ADMIN)
+        return 200, self.service.clear_project_grant(ctx.principal, ctx.params['uid'], request_id=ctx.request_id)
 
     def _project_register(self, ctx, payload):
         """`POST /v1/projects` on the endpoint backend: register an existing canonical project.
@@ -2666,6 +4254,12 @@ class ApiHandler(BaseHTTPRequestHandler):
         if not isinstance(project_id, str) or not CANONICAL_PROJECT.fullmatch(project_id):
             raise invalid('project_id must be the canonical project name: 2-24 lowercase letters or digits, '
                           'beginning with a letter (the NAME given to admin.py add-project)')
+        if project_id in RESERVED_PROJECTS:
+            # A literal route of the same name is registered before `/v1/projects/{pid}`
+            # (kittrial-5bb.90): the record could never be read back, so refuse it here
+            # rather than on every later read.
+            raise invalid('project_id %s is reserved for this server\'s own routes; choose another canonical '
+                          'project name' % project_id)
         name = payload.get('name') or project_id
         existing = self.service.state['projects'].get(project_id)
         if existing is not None:
@@ -2688,7 +4282,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         return self._mutate(ctx, 'projects.create', None, register, status=201, capability=CAP_ACCOUNTS_ADMIN,
                             reason='register ' + project_id)
 
-    def _refuse_unless_replay(self, ctx, route_name, error):
+    def _refuse_unless_replay(self, ctx, route_name, error, capability=CAP_ACCOUNTS_ADMIN):
         """Raise `error`, unless this request is an exact idempotent retry of one that
         already committed on this route: then its stored response is replayed.
 
@@ -2701,7 +4295,7 @@ class ApiHandler(BaseHTTPRequestHandler):
 
         def refuse():
             raise error
-        return self._mutate(ctx, route_name, None, refuse, capability=CAP_ACCOUNTS_ADMIN)
+        return self._mutate(ctx, route_name, None, refuse, capability=capability)
 
     def _superuser_session(self, ctx, message):
         principal = ctx.principal
@@ -2721,11 +4315,21 @@ class ApiHandler(BaseHTTPRequestHandler):
         new agent grant. Whatever REMOVES access stays open on such a record (removing
         a member, revoking a credential or an agent grant, archiving), so cleaning one
         up never requires confirming it first. Called after the route's authority
-        check, so it never tells a caller without access that the record exists."""
+        check, so it never tells a caller without access that the record exists.
+
+        An ARCHIVED record is answered with :data:`ARCHIVED_UNUSABLE` instead of the
+        record's own sentence (kittrial-5bb.90 review item 2.1): an archived record
+        cannot be confirmed, so advising "confirm it or archive it" points at two dead
+        ends, while removing the access does work.
+        """
         verdict = self._unusable(project_id)
-        if verdict is not None:
-            raise conflict(verdict[1] + ' Until then nothing that grants access is accepted on it; removing a '
-                           'member, revoking a credential or an agent grant, and archiving still work.')
+        if verdict is None:
+            return
+        record = self.service.state.get('projects', {}).get(project_id)
+        if isinstance(record, dict) and record.get('archived'):
+            raise conflict(ARCHIVED_UNUSABLE)
+        raise conflict(verdict[1] + ' Until then nothing that grants access is accepted on it; removing a '
+                       'member, revoking a credential or an agent grant, and archiving still work.')
 
     def _usable(self, view):
         """Mark a project the backend cannot serve (kittrial-5bb.80, .84)."""
@@ -2738,6 +4342,34 @@ class ApiHandler(BaseHTTPRequestHandler):
                 if verdict[0] == 'no-canonical' else verdict[1]
             view['needs_confirmation'] = verdict[0] == 'unconfirmed'
         return view
+
+    # -- the kit's documents for members (kittrial-5bb.226) --------------------------------
+    #
+    # How a worker finds its work, how a coordinator reaches it, and the prompts a worker is
+    # started and woken with. The same files the client's ``docs`` serves, read by the same
+    # reader, so the page shows what the kit serves. For any signed-in member, a viewer
+    # included, and for an agent's credential; nothing of a project and no secret is in them.
+    @route('GET', r'/v1/docs')
+    def docs_list(self, ctx):
+        import onboarding
+        return 200, {'items': [{key: value for key, value in onboarding.member_document(KIT_DIRECTORY, name).items()
+                                if key != 'text' and key != 'prompt'} for name in onboarding.WEB_DOCUMENTS],
+                     'server_url': self.service.public_url or None}
+
+    @route('GET', r'/v1/docs/(?P<name>[a-z][a-z-]{0,40})')
+    def docs_get(self, ctx):
+        import onboarding
+        name = ctx.params['name']
+        if name not in onboarding.WEB_DOCUMENTS:
+            raise not_found('No such document. GET /v1/docs lists the documents this service serves.')
+        try:
+            document = onboarding.member_document(KIT_DIRECTORY, name)
+        except (OSError, ValueError) as failed:
+            raise HttpError(503, 'unavailable', 'The document %s could not be read from the installed kit (%s).'
+                            % (name, type(failed).__name__))
+        # The address this service is configured with, for the page to put into a prompt.
+        # Never the request's Host header, which a client controls.
+        return 200, dict(document, server_url=self.service.public_url or None)
 
     @route('GET', r'/v1/projects')
     def projects_list(self, ctx):
@@ -2784,6 +4416,10 @@ class ApiHandler(BaseHTTPRequestHandler):
             item = next(item for item in unusable_projects(self.service) if item['id'] == project_id)
             record['confirmed_by'] = principal.user_id
             record['confirmed_at'] = now_iso(self.service._now())
+            # Backfill the mark the register route writes: a record a superuser stands
+            # behind stays usable even if that superuser is later demoted (kittrial-5bb.90).
+            # A record that already names its registrant keeps it.
+            record.setdefault('registered_by', principal.user_id)
             result = {'id': project_id, 'name': record.get('name'), 'usable': True,
                       'confirmed_by': principal.user_id, 'confirmed_at': record['confirmed_at'],
                       'created_by': item['created_by'], 'members': item['members']}
@@ -2809,6 +4445,84 @@ class ApiHandler(BaseHTTPRequestHandler):
             return result, result
         return self._mutate(ctx, 'projects.update', ctx.params['pid'], update,
                             capability=CAP_PROJECT_ADMIN)
+
+    def _onboarding_owner(self, ctx):
+        # Project administration is refused for every credential by the authority rule itself
+        # (CREDENTIAL_FORBIDDEN_CAPABILITIES), so no second check for a credential stands here:
+        # one stood, could not be reached, and no test could pin it (review 01a109cc).
+        self._project(ctx, CAP_PROJECT_ADMIN)
+        if not hasattr(self.backend, 'set_onboarding'):
+            raise not_implemented('This server has no host project behind it, so there is no onboarding text to set')
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/onboarding')
+    def project_onboarding(self, ctx):
+        """The onboarding text, for an owner to edit (kittrial-5bb.118 part 2).
+
+        ``source`` says who set it: ``web`` (an owner, here) or ``operator`` (on the
+        server). Only owner-written text is returned for editing; the operator's own
+        document is reported as set, with its size, and is not returned here.
+        """
+        self._onboarding_owner(ctx)
+        from onboarding import PROJECT_LIMIT, WEB_HEADER, split_web
+        document = self.backend.read_onboarding(ctx.params['pid'])
+        if document is None:
+            return 200, {'state': 'not-set', 'source': None, 'text': None, 'limit': PROJECT_LIMIT}
+        by_owner, text = split_web(document)
+        return 200, {'state': 'set', 'source': 'web' if by_owner else 'operator',
+                     'text': text if by_owner else None, 'bytes': len(document.encode('utf-8')),
+                     'limit': PROJECT_LIMIT, 'header': WEB_HEADER if by_owner else None}
+
+    @route('PUT', r'/v1/projects/(?P<pid>' + ID + r')/onboarding')
+    def project_onboarding_set(self, ctx):
+        """An owner sets the project's onboarding text: `{"text": "..."}`.
+
+        Stored with a first line that says an owner wrote it in the web interface, so
+        every reader sees it as information from the project, not as an instruction from
+        the server's operator. Guidance is not settable here. Audited with the size,
+        never the text.
+        """
+        self._onboarding_owner(ctx)
+        payload = ctx.payload if isinstance(ctx.payload, dict) else {}
+        if set(payload) != {'text'} or not isinstance(payload['text'], str):
+            raise invalid('Send exactly: text')
+        try:
+            payload['text'].encode('utf-8')
+        except UnicodeEncodeError:
+            # Half of a surrogate pair cannot be stored as UTF-8; it used to answer 500 (review 01a109cc).
+            raise invalid('Project onboarding must be valid Unicode text (it holds half of a surrogate pair)') from None
+        return self._onboarding_write(ctx, payload['text'])
+
+    @route('DELETE', r'/v1/projects/(?P<pid>' + ID + r')/onboarding')
+    def project_onboarding_clear(self, ctx):
+        """Remove onboarding text an owner set here. The operator's own text is not removable here."""
+        self._onboarding_owner(ctx)
+        return self._onboarding_write(ctx, None)
+
+    def _onboarding_write(self, ctx, text):
+        key = ctx.idempotency_key or ctx.request_id
+
+        def write():
+            try:
+                result = self.backend.set_onboarding(ctx.principal, ctx.params['pid'], text, key)
+            except HttpError as failure:
+                # Not when the answer says that nothing was carried out (the server's configuration
+                # could not be read; kittrial-5bb.156 review).
+                if failure.status == 503 and not getattr(failure, 'nothing_done', False):
+                    raise UncertainOutcome() from None
+                raise
+            kept = result.get('operator_text_kept_as') if isinstance(result, dict) else None
+            if kept:
+                # The owner's text replaced the operator's: say so in the audit, with where the copy is.
+                with self.service.store.lock:
+                    self.service.audit(ctx.request_id, ctx.principal, 'projects.onboarding', 'committed',
+                                       project_id=ctx.params['pid'],
+                                       reason='account=%s replaced the text an operator set; a copy is kept beside it as %s'
+                                              % (ctx.principal.user_id, str(kept)[:60]))
+                    self.service.store.save()
+            return result, result
+        size = 'cleared' if text is None else 'set %d bytes' % len(text.encode('utf-8'))
+        return self._mutate(ctx, 'projects.onboarding', ctx.params['pid'], write, capability=CAP_PROJECT_ADMIN,
+                            serialize=False, canonical=True, reason='account=%s %s' % (ctx.principal.user_id, size))
 
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/setup')
     def project_setup(self, ctx):
@@ -2840,6 +4554,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         payload = ctx.payload or {}
 
         def set_member():
+            # A field the route does not take is refused, not dropped (kittrial-5bb.183 item 2).
+            refuse_unknown_fields(payload, self.MEMBER_FIELDS, 'A member change')
             self._require_usable(ctx.params['pid'])
             result = self.service.set_member(ctx.principal, ctx.params['pid'],
                                              ctx.params['uid'], payload.get('role'),
@@ -2870,26 +4586,113 @@ class ApiHandler(BaseHTTPRequestHandler):
         self._project(ctx, CAP_PROJECT_ADMIN)
         limit, state = self._page(ctx, ctx.query)
         items = self.service.list_worker_credentials(ctx.principal, ctx.params['pid'])
+        # A credential issued, before kittrial-5bb.184, under a name that is somebody else's on
+        # the host is refused when it writes. The list says so, with what to do, so that its
+        # owner need not find out from a worker's failure. `actor_refused` is the reason or null.
+        named = sorted({item['actor'] for item in items if item.get('actor') and not item.get('revoked')})
+        standing = self.backend.actor_standing(ctx.params['pid'], named) if named else {}
+        # A credential a first write already settled as refused by the row rule carries the mark
+        # on its record; the list reads it, so the owner is told without a second tracker read
+        # (kittrial-5bb.188 revision-3 item 3(3)).
+        stored = self.service.state.get('credentials') if isinstance(self.service.state, dict) else {}
+        for item in items:
+            waived = item.get('actor_waived')
+            if isinstance(waived, dict) and not item.get('revoked'):
+                # A superuser allowed this name on purpose (kittrial-5bb.188 item 4): it is not
+                # colliding and not refused, and the owner is told who allowed it and when.
+                who = waived.get('by_name') or waived.get('by') or 'a superuser'
+                when = waived.get('at') or 'an unrecorded date'
+                item['actor_refused'] = None
+                item['actor_allowed'] = 'allowed by %s on %s' % (who, when)
+                continue
+            reason = standing.get(item.get('actor')) if not item.get('revoked') else None
+            if reason is None and not item.get('revoked'):
+                record = stored.get(item.get('id')) if isinstance(stored, dict) else None
+                mark = record.get('actor_rows_refused') if isinstance(record, dict) else None
+                if isinstance(mark, str) and mark:
+                    reason = mark
+            item['actor_refused'] = None if reason is None else actor_names.refusal(item['actor'], reason)
         return 200, self._paged(ctx, items, limit, state)
 
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/worker-credentials')
     def credential_issue(self, ctx):
         payload = ctx.payload or {}
+        # Only who may issue one is told whether a name is taken: the answer says that a name
+        # is an operator's or a session's, which is not for every member to probe.
+        self._project(ctx, CAP_PROJECT_ADMIN)
+        named = payload.get('actor')
+        # An operator's allowance for a name the project's tracker already holds (kittrial-5bb.188
+        # item 1): a superuser only, and only for the row rule -- never for a session, an
+        # operator, a verifier or the service's own namespace. The waiver must say why it was
+        # used (item 4): the reason travels to the audit entry, the stored record carries its
+        # own mark, and the owner's list and admin.py credential-actors show it as allowed.
+        allowed = payload.get('allow_actor') is True
+        if 'allow_actor' in payload and not isinstance(payload.get('allow_actor'), bool):
+            raise invalid('allow_actor must be true or false')
+        waiver = payload.get('allow_actor_reason')
+        if 'allow_actor_reason' in payload and waiver is not None and not isinstance(waiver, str):
+            raise invalid('allow_actor_reason must be a short text')
+        if not allowed and 'allow_actor_reason' in payload and waiver is not None:
+            raise invalid('allow_actor_reason is only for a superuser waiver; send allow_actor: true too')
+        if allowed:
+            if not ctx.principal.superuser:
+                raise forbidden('Only a superuser may allow a name the project\'s tracker already holds')
+            if not isinstance(waiver, str) or not waiver.strip():
+                raise invalid('allow_actor requires allow_actor_reason: say why the name is allowed')
+            waiver = waiver.strip()
+            if len(waiver) > 500:
+                raise invalid('allow_actor_reason must be at most 500 characters')
+            # The reason is shown to other people (the audit entry, the record, the owner's list
+            # and the operator's listing), so it passes the kit's plain-text rule -- the same one
+            # `guidance` applies: no control, bidi, zero-width, C1, tag or variation-selector
+            # characters (kittrial-5bb.188 revision-3 item 3(2)). Tab, newline and carriage
+            # return stay allowed, exactly as the guidance rule allows them.
+            from review_workflow import plain_text
+            try:
+                plain_text(waiver, 'allow_actor_reason')
+            except ValueError as error:
+                raise invalid(str(error))
+        checked = False
+        waived_mark = None
+        if isinstance(named, str) and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.@/-]{0,63}', named):
+            # A worker credential writes under this name, and the tracker's rows carry the name
+            # and nothing else: under a host actor's name it IS that actor (kittrial-5bb.184).
+            # A name the tracker already holds is refused too (kittrial-5bb.188 item 1), which is
+            # one bd export for this project. Refused before the key is reserved; the endpoint
+            # refuses the same again at use.
+            own = actor_names.own_intervals(self.service.state.get('credentials') or {}, named,
+                                            ctx.principal.user_id, ctx.params['pid'])
+            reason = self.backend.actor_standing(ctx.params['pid'], [named],
+                                                 rows=self.backend.ACTOR_ROWS, own=own).get(named)
+            if reason is None:
+                checked = self.backend.ACTOR_ROWS
+            elif allowed and reason == actor_names.ROWS:
+                # The waiver is its own mark, never actor_rows_checked: an honestly checked
+                # name and an allowed one are told apart on the record (item 4).
+                waived_mark = {'by': ctx.principal.user_id, 'reason': waiver}
+            else:
+                raise invalid(actor_names.refusal(named, reason, actor_names.CHOOSE), {'actor': named, 'rule': reason})
 
         def issue():
+            # A field the route does not take is refused, not dropped (kittrial-5bb.183 item 2).
+            refuse_unknown_fields(payload, self.CREDENTIAL_ISSUE_FIELDS, 'A worker credential issue')
             self._require_usable(ctx.params['pid'])
             result = self.service.issue_credential(ctx.principal, ctx.params['pid'],
                                                    label=payload.get('label'),
                                                    scopes=payload.get('scopes'),
                                                    actor=payload.get('actor'),
-                                                   request_id=ctx.request_id)
+                                                   request_id=ctx.request_id,
+                                                   actor_checked=checked,
+                                                   actor_waived=waived_mark)
             public = {'operation': 'credentials.issue', 'credential': result}
             stored = {'operation': 'credentials.issue',
                       'credential': {k: v for k, v in result.items() if k != 'secret'},
                       'secret_available': False}
             return public, stored
+        audit_reason = None if waived_mark is None else \
+            'waiver used for worker credential actor %s: %s' % (named, waived_mark['reason'])
         return self._mutate(ctx, 'credentials.issue', ctx.params['pid'], issue, status=201,
-                            capability=CAP_PROJECT_ADMIN, replay_status=200)
+                            capability=CAP_PROJECT_ADMIN, replay_status=200, reason=audit_reason)
 
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/worker-credentials/'
                   r'(?P<cid>' + ID + r')/revoke')
@@ -2940,7 +4743,14 @@ class ApiHandler(BaseHTTPRequestHandler):
         payload = dict(ctx.payload or {})
 
         def create():
+            # The caller's right over every named project is judged before the route's
+            # field list is answered (kittrial-5bb.183 review item 1): a project the
+            # caller cannot see keeps the service's own 404, exactly as the same body
+            # without the unknown field does. Only then is a field the route does not
+            # take refused, not dropped (kittrial-5bb.183 item 2).
             self._require_grantable(ctx.principal, payload.get('projects'), ())
+            self.service.check_agent_grant(ctx.principal, payload.get('projects'))
+            refuse_unknown_fields(payload, self.AGENT_CREATE_FIELDS, 'An agent creation')
             result = self.service.create_agent(
                 ctx.principal, name=payload.get('name'), tool=payload.get('tool'),
                 working_directory=payload.get('working_directory'),
@@ -2981,24 +4791,63 @@ class ApiHandler(BaseHTTPRequestHandler):
         payload = dict(ctx.payload or {})
 
         def update():
-            held = (self.service.state['agents'].get(ctx.params['aid']) or {}).get('projects') or ()
-            self._require_grantable(ctx.principal, payload.get('projects'), held)
+            record = self.service.state['agents'].get(ctx.params['aid'])
+            if isinstance(record, dict):
+                # An id with no agent record is the service's own 404: judging a grant
+                # here would answer the usability refusal for an agent that is not there
+                # (kittrial-5bb.90 item 1).
+                self._require_grantable(ctx.principal, payload.get('projects'),
+                                        record.get('projects') or (),
+                                        owner_id=record.get('owner'))
+            # The record's ownership is judged before the route's field list is answered
+            # (kittrial-5bb.183 review item 1): a caller who may not change the agent gets
+            # the service's own 404, exactly as the same body without the unknown field
+            # does. Only then is a field the route does not take refused, not dropped
+            # (kittrial-5bb.183 item 2). This is the same lookup update_agent() makes.
+            self.service.get_agent(ctx.principal, ctx.params['aid'])
+            if 'projects' in payload:
+                # And so is the grant (kittrial-5bb.183 review, P3): a project the agent's owner
+                # cannot see keeps the service's own 404 whether or not the body also carries a
+                # field the route does not take. Nothing is written by the check.
+                self.service.check_agent_grant(ctx.principal, payload.get('projects'), owner_id=record['owner'])
+            refuse_unknown_fields(payload, self.AGENT_UPDATE_FIELDS, 'An agent change')
             result = self.service.update_agent(ctx.principal, ctx.params['aid'], payload)
             return result, result
         return self._mutate(ctx, 'agents.update', None, update, capability=CAP_AGENTS)
 
-    def _require_grantable(self, principal, projects, held):
-        """Refuse a NEW agent grant on a record the backend will not serve (kittrial-5bb.84).
+    def _require_grantable(self, principal, projects, held, owner_id=None):
+        """Refuse a NEW agent grant on a record the backend will not serve (kittrial-5bb.84, .90).
 
-        Only projects the caller is a member of are judged here, so the refusal never
-        reveals a record the caller cannot see (the service refuses those itself); a
-        grant the agent already holds is left alone, so its other fields stay editable.
+        Judged against the *agent owner's* live membership, not the caller's: a superuser
+        editing somebody else's agent is not a member of the owner's projects, and a
+        record's usability is the same for everyone. A project the owner cannot see is
+        left to the service's own not-found refusal, so no record is revealed to either
+        account; a grant the agent already holds is left alone, so its other fields stay
+        editable.
+
+        Nothing is judged for a caller who may not administer the agent (kittrial-5bb.90
+        item 1): the owner's membership is not the caller's business, and answering the
+        usability refusal to an outsider would tell a caller with no rights that the agent
+        id exists, that the record exists and is unusable, and that the owner is a member.
+        The service's own ``_agent_owned`` then answers its unchanged 404, exactly as the
+        credential route in the same commit leaves an unauthorized caller to it.
         """
         if not isinstance(projects, (list, tuple)):
             return
+        owner_id = owner_id or principal.user_id
+        caller = self.service.state.get('users', {}).get(principal.user_id) or {}
+        if not (caller.get('superuser') or owner_id == principal.user_id):
+            return
+        owner = self.service.state.get('users', {}).get(owner_id) or {}
+        owner_is_superuser = bool(owner.get('superuser'))
         for project_id in projects:
-            if isinstance(project_id, str) and project_id not in held \
-                    and principal.user_id in self.service.state['memberships'].get(project_id, {}):
+            if not isinstance(project_id, str) or project_id in held:
+                continue
+            # An id with no record is the service's own not-found refusal; this only judges
+            # records that exist and that the owner could otherwise be granted.
+            if project_id not in self.service.state['projects']:
+                continue
+            if owner_is_superuser or owner_id in self.service.state['memberships'].get(project_id, {}):
                 self._require_usable(project_id)
 
     @route('POST', r'/v1/agents/(?P<aid>' + ID + r')/disable')
@@ -3020,6 +4869,24 @@ class ApiHandler(BaseHTTPRequestHandler):
         payload = dict(ctx.payload or {})
 
         def issue():
+            agent = self.service.state['agents'].get(ctx.params['aid'])
+            user = self.service.state.get('users', {}).get(ctx.principal.user_id) or {}
+            if isinstance(agent, dict) and agent.get('enabled') and (
+                    user.get('superuser') or agent.get('owner') == ctx.principal.user_id):
+                # A new credential extends the agent's access to the projects it already
+                # holds, so on a record the backend will not serve it is refused like any
+                # other grant (kittrial-5bb.90). Checked only for an agent this principal
+                # may administer, so an unauthorized caller still gets the service's 404.
+                # Never checked for a DISABLED agent: the service's own earlier "A disabled
+                # agent cannot receive a credential" must answer first, not this record's
+                # sentence (kittrial-5bb.90 review item 3.2).
+                for project_id in agent.get('projects') or ():
+                    self._require_usable(project_id)
+            # A field this route does not take is refused, not dropped, as when an agent is
+            # made (kittrial-5bb.208 review). After the checks above: who may not see the
+            # agent keeps the service's 404.
+            self.service.get_agent(ctx.principal, ctx.params['aid'])
+            refuse_unknown_fields(payload, self.AGENT_CREDENTIAL_FIELDS, 'A new agent credential')
             result = self.service.issue_agent_credential(
                 ctx.principal, ctx.params['aid'], scopes=payload.get('scopes'),
                 label=payload.get('label'), request_id=ctx.request_id)
@@ -3121,6 +4988,89 @@ class ApiHandler(BaseHTTPRequestHandler):
         return {'tasks': [task for task in read['tasks'] if task.get('assignee') == actor],
                 'complete': read['complete']}
 
+    #: At most this many reviewer actions are listed per read; the counts stay exact.
+    AGENT_REVIEW_LIMIT = 20
+
+    def _agent_review_actions(self, principal, agent, project_id, rows, counts):
+        """The review work one agent is shown in one project: the actions to list.
+
+        Two kinds, both at the priority of claimable work and listed before it
+        (kittrial-5bb.115). Everything comes from ``rows``, the review-queue snapshot the
+        caller already holds: no further read.
+
+        ``review-recommended``: a contribution that awaits review and has a standing
+        recommendation, shown to an agent whose OWNER can approve it. The agent cannot
+        approve; the action says to tell the owner it is ready.
+
+        ``to-review``: a contribution that awaits review and that this agent has not
+        recommended yet, shown to any agent that may review.
+
+        An agent is shown a delivery only if it could itself recommend it: it holds the
+        reviews capability in the project, and it is a different PERSON from the task's
+        assignee and from the contribution's author (not its own, not its owner's, not
+        another agent of its owner; see ``_independent``). ``counts`` gains the exact
+        numbers; the caller caps the whole list over every project (``_capped_review_actions``)
+        and can tell from the counts that some were left out.
+        """
+        agent_id = agent.get('id')
+        actor = agent.get('actor') or agent_id
+        may_review, owner_approves = self.service.agent_review_standing(agent_id, project_id)
+        if not may_review:
+            return []
+        actions = []
+        for row in rows:
+            if row.get('review_state') != 'awaiting-review' or row.get('status') == 'closed':
+                continue
+            if not self._independent([actor], [row.get('assignee'), row.get('contribution_author')], project_id):
+                continue
+            recommended_by = [name for name in row.get('recommended_by') or [] if isinstance(name, str)]
+            if recommended_by and owner_approves:
+                kind, count, who = 'review-recommended', 'review_recommended', 'owner'
+                reason = ('A reviewer recommends approving this contribution. Tell your owner it is ready to '
+                          'approve; an agent cannot approve.')
+            elif not self._own_party_recommended(row, actor, project_id):
+                kind, count, who = 'to-review', 'to_review', 'agent'
+                reason = ('A contribution by someone else awaits review. Review it, then record a recommendation '
+                          'or request changes.')
+            else:
+                continue                      # this agent's person has recommended it already
+            counts[count] += 1
+            contribution = row.get('contribution') if isinstance(row.get('contribution'), dict) else {}
+            actions.append(self._agent_action(
+                4, kind, project_id, row, reason, who=who, recommended_by=recommended_by[:20],
+                contribution=contribution.get('id'), commit=contribution.get('commit')))
+        return actions                        # ordered by the caller, over every project
+
+    def _capped_review_actions(self, actions):
+        """At most AGENT_REVIEW_LIMIT review actions in ALL, over every project (review 01a10c80).
+
+        A cap on each project's share let three full projects list three times the limit
+        and push claimable work off the list.
+        Recommended ones are kept first, then by project and task.
+        """
+        ordered = sorted(actions, key=lambda action: (0 if action['kind'] == 'review-recommended' else 1,
+                                                       action['project'], action['task']))
+        return ordered[:self.AGENT_REVIEW_LIMIT]
+
+    @staticmethod
+    def _agent_review_summary(counts):
+        """What to add to an agent's summary when there is review work, whatever its state.
+
+        The state values do not change for review work, so without this an agent with
+        nothing of its own would read "idle, nothing in flight" while contributions wait
+        for it or for its owner.
+        """
+        parts = []
+        if counts.get('review_recommended'):
+            parts.append('%d contribution(s) recommended for approval: tell the owner' % counts['review_recommended'])
+        if counts.get('to_review'):
+            parts.append('%d contribution(s) to review' % counts['to_review'])
+        return (' ' + '; '.join(parts) + '.') if parts else ''
+
+    #: The order of the kinds that share a priority. The ORDER of ``next_actions`` is the
+    #: contract; the priority numbers are not renumbered when a kind is added.
+    AGENT_KIND_ORDER = {'review-recommended': 0, 'to-review': 1, 'claimable-task': 2}
+
     def _agent_action(self, priority, kind, project_id, task, reason, **extra):
         task_id = task.get('id')
         base = '/v1/projects/%s/tasks/%s' % (project_id, task_id)
@@ -3199,9 +5149,11 @@ class ApiHandler(BaseHTTPRequestHandler):
         actor = agent.get('actor') or agent.get('id')
         counts = {'claimable': 0, 'claimed': 0, 'changes_requested': 0,
                   'awaiting_review': 0, 'blocked': 0, 'in_progress': 0, 'awaiting_integration': 0,
-                  'review_errors':0,'checkpoint_errors':0}
+                  'review_errors': 0, 'checkpoint_errors': 0,
+                  'review_recommended': 0, 'to_review': 0}
         own_actions = []
         claimable_actions = []
+        review_actions = []
         truncated = False
         snapshot_truncated = own_tasks_truncated = actions_truncated = False
         for project_id in agent.get('projects') or []:
@@ -3286,14 +5238,20 @@ class ApiHandler(BaseHTTPRequestHandler):
                         claimable_actions.append(self._agent_action(
                             4, 'claimable-task', project_id, task,
                             'Open, unclaimed work the agent may take.'))
+            # Review work for this agent, from the same snapshot (kittrial-5bb.115): one call.
+            review_actions += self._agent_review_actions(principal, agent, project_id, read['tasks'], counts)
         # Counts cover the read pages; incomplete-source counts are lower bounds.
         # Only the collected suggestions are capped,
         # so a long claimable list can never hide the agent's own feedback.
         if counts['claimable'] > len(claimable_actions):
             truncated = True
             actions_truncated = True
-        actions = own_actions + claimable_actions
-        actions.sort(key=lambda a: (a['priority'], a['project'], a['task']))
+        review_actions = self._capped_review_actions(review_actions)
+        if counts['review_recommended'] + counts['to_review'] > len(review_actions):
+            truncated = True
+            actions_truncated = True
+        actions = own_actions + review_actions + claimable_actions
+        actions.sort(key=lambda a: (a['priority'], self.AGENT_KIND_ORDER.get(a['kind'], 0), a['project'], a['task']))
         if len(actions) > AGENT_ACTION_LIMIT:
             actions = actions[:AGENT_ACTION_LIMIT]
             truncated = True
@@ -3314,7 +5272,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             state = 'working'
         else:
             state = 'idle'
-        return {'state': state, 'summary': self._agent_summary(state, counts),
+        return {'state': state, 'summary': self._agent_summary(state, counts) + self._agent_review_summary(counts),
                 'counts': counts, 'actions': actions, 'truncated': truncated,
                 'snapshot_truncated':snapshot_truncated,'own_tasks_truncated':own_tasks_truncated,
                 'actions_truncated':actions_truncated,
@@ -3381,7 +5339,19 @@ class ApiHandler(BaseHTTPRequestHandler):
     def tasks_create(self, ctx):
         self._project(ctx, CAP_TASKS)
         payload = dict(ctx.payload or {})
+        # A field this route does not take is refused, not dropped (kittrial-5bb.183 item 2).
+        refuse_unknown_fields(payload, self.TASK_CREATE_FIELDS, 'A task creation')
+        priority = payload.get('priority')
+        if priority is not None and (type(priority) is not int or not 0 <= priority <= 4):
+            raise invalid('Task priority must be an integer 0-4')
         payload['attachments'] = validate_attachments(payload.get('attachments'))
+        # The title is checked here as on a change, before the key is reserved (kittrial-5bb.185):
+        # an empty one and one of 600 characters went to bd, which refused them, and the caller
+        # was told that the task may have been made. A blank one bd stored as it came.
+        self._task_title(payload.get('title'))
+        if payload.get('description') is not None and not isinstance(payload['description'], str):
+            raise invalid('Task description must be text')
+        self._bind_task_actor(ctx, payload)
 
         def create():
             result = self.backend.invoke('tasks.create', ctx.principal, ctx.params['pid'],
@@ -3395,8 +5365,8 @@ class ApiHandler(BaseHTTPRequestHandler):
     @route('PATCH', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')')
     def tasks_update(self, ctx):
         self._project(ctx, CAP_TASKS)
-        self._refuse_record_anchor(self.backend.get_task(ctx.params['pid'], ctx.params['tid']))
-        payload = self._task_payload(ctx)
+        payload = self._task_change(ctx)
+        self._refuse_record_anchor(self.backend.get_task(ctx.params['pid'], ctx.params['tid']), write=True)
 
         def update():
             result = self.backend.invoke('tasks.update', ctx.principal, ctx.params['pid'],
@@ -3420,16 +5390,34 @@ class ApiHandler(BaseHTTPRequestHandler):
                                      lambda: self.backend.read_tasks(ctx.params['pid']),
                                      shared=True)
         rows = [dict(t) if isinstance(t, dict) else t for t in snapshot.get('items') or []]
+        # Rows the tracker returned and the service could not read (kittrial-5bb.169): the
+        # ones with an id stay in the list, marked; all are named beside it, whatever the
+        # page or the filter, so that one such row is seen and not a reason to show nothing.
+        unreadable = [t['id'] for t in rows if isinstance(t, dict) and t.get('malformed') and t.get('id')]
+        def review_states(of):
+            # The review states come from another read of the endpoint. While a row cannot be
+            # read that read may fail too (an endpoint from before it learned to name such a
+            # row): the list is then answered without review states, and says so, instead of
+            # failing with it. Without an unreadable row a failure is what it was.
+            try:
+                return self._with_review_states(ctx.params['pid'], of, shared=True)
+            except HttpError:
+                if not unreadable:
+                    raise
+                for row in of:
+                    if isinstance(row, dict):
+                        row.setdefault('review_state', None)
+                unavailable.append(True)
+                return False
+        unavailable = []
         if filters:
             rows = [t for t in rows if isinstance(t, dict)]
-            complete = self._with_review_states(ctx.params['pid'], rows, shared=True)
+            complete = review_states(rows)
             rows = [t for t in rows if task_matches(t, filters)]
             result = {'items': rows[state['o']:state['o'] + limit], 'total': len(rows)}
         else:
-            result = {'items': rows[state['o']:state['o'] + limit],
-                      'total': snapshot.get('total', len(rows))}
-            complete = self._with_review_states(ctx.params['pid'], result['items'],
-                                                shared=True)
+            result = {'items': rows[state['o']:state['o'] + limit], 'total': snapshot.get('total', len(rows))}
+            complete = review_states(result['items'])
         result['items'] = self._task_views(result['items'])
         # False when some rows' review state is unknown (``review_state: null``): the
         # bounded canonical projection did not cover them, or they are closed tasks
@@ -3439,6 +5427,10 @@ class ApiHandler(BaseHTTPRequestHandler):
         result['next_cursor'] = (make_cursor(ctx.principal, ctx.params['pid'], ctx.query,
                                              state['o'] + limit)
                                  if state['o'] + limit < result['total'] else None)
+        if unreadable:
+            result['unreadable'] = unreadable
+            if unavailable:
+                result['review_states_unavailable'] = True
         return 200, result
 
     @staticmethod
@@ -3464,12 +5456,31 @@ class ApiHandler(BaseHTTPRequestHandler):
         self._refuse_record_anchor(row)
         return 200, self._task_views([row])[0]
 
+    def _row_or_none(self, project_id, task_id):
+        """The task's row for deciding why another read of it failed; None when this read fails too."""
+        try:
+            return self.backend.get_task(project_id, task_id)
+        except HttpError:
+            return None
+
     @staticmethod
-    def _refuse_record_anchor(row):
+    def _refuse_record_anchor(row, write=False):
         """A record anchor is not a task: the task, brief and history routes answer
         404 for it, never its row or raw record comments, and the task write routes
-        (PATCH, claim, checkpoints, reviews) refuse it the same way (kittrial-5bb.64)."""
+        (PATCH, claim, checkpoints, reviews) refuse it the same way (kittrial-5bb.64).
+
+        The project's merge slot is not a task either (kittrial-5bb.113). The read
+        routes answer 404 for it; a write route says what it is, so an agent that was
+        once offered it learns why the claim is refused."""
+        if isinstance(row, dict) and row.get('malformed'):
+            # The row exists and cannot be read: say that, for a read and for a write
+            # (kittrial-5bb.169). Nothing of an unreadable row is shown or changed here.
+            raise unreadable_row(row.get('id'))
         if is_record_anchor(row):
+            raise not_found('Task not found')
+        if is_merge_slot(row):
+            if write:
+                raise conflict(merge_slot_sentence(row.get('id')))
             raise not_found('Task not found')
 
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/references')
@@ -3780,7 +5791,14 @@ class ApiHandler(BaseHTTPRequestHandler):
         """
         self._project(ctx, CAP_READ)
         pid, tid = ctx.params['pid'], ctx.params['tid']
-        brief = self.backend.task_brief(pid, tid)
+        try:
+            brief = self.backend.task_brief(pid, tid)
+        except HttpError:
+            # The brief of a row that cannot be read fails in the endpoint; say what is the
+            # matter with the row instead of the endpoint's failure (kittrial-5bb.169). Only
+            # on this path is the row read again, so a healthy brief costs what it did.
+            self._refuse_record_anchor(self._row_or_none(pid, tid))
+            raise
         self._refuse_record_anchor(brief.get('task'))
         review = brief['review']
         checkpoint = brief.get('checkpoint')
@@ -3789,16 +5807,21 @@ class ApiHandler(BaseHTTPRequestHandler):
         actors += [checkpoint.get('author')] if checkpoint else []
         actors += [contribution.get('author')] if contribution else []
         actors += [r.get('author') for r in review.get('requests') or []]
-        # Only a recommendation by a different person from the author and the assignee is
-        # shown (see _independent). The canonical read gives the newest one in full; when
-        # that one is dropped here the full text of an older one is not available, so the
-        # list still names who else recommends and `recommendation` is null.
-        parties = [brief['task'].get('assignee'), (contribution or {}).get('author')]
-        standing = review.get('recommendations') or []
-        kept = set(self._independent([entry.get('author') for entry in standing], parties))
-        review['recommendations'] = [entry for entry in standing if entry.get('author') in kept]
-        if review.get('recommendation') and review['recommendation'].get('author') not in kept:
-            review['recommendation'] = None
+        # Only a recommendation by a different person from the contribution's author is
+        # shown (see _independent); the assignee is checked when one is written, not here,
+        # as in the canonical reader. When the newest one is left out, the newest of the
+        # others is shown in its place: the backend gives the newest few in full
+        # (kittrial-5bb.115 review). Past those, one is still named and has no text here.
+        parties = self._read_parties(brief['task'].get('assignee'), (contribution or {}).get('author'))
+        standing = [entry for entry in review.get('recommendations') or [] if isinstance(entry, dict)]
+        kept = set(self._independent([entry.get('author') for entry in standing], parties, pid)) if parties else set()
+        shown = [entry for entry in standing if entry.get('author') in kept]
+        newest = review.get('recommendation')
+        if not (newest and newest.get('author') in kept):
+            newest = next((dict(entry) for entry in shown if 'summary' in entry), None)
+        review['recommendation'] = newest
+        review['recommendations'] = [{'id': entry.get('id'), 'author': entry.get('author'), 'at': entry.get('at')}
+                                     for entry in shown]
         advice = [review.get('recommendation')] if review.get('recommendation') else []
         advice += review.get('recommendations') or []
         actors += [entry.get('author') for entry in advice]
@@ -3821,22 +5844,86 @@ class ApiHandler(BaseHTTPRequestHandler):
         brief['project_repository'] = self.service.project_view(ctx.principal, pid).get('repository')
         # The same note wherever the value reaches an agent: it is a label, not an instruction.
         brief['project_repository_note'] = self.service.REPOSITORY_NOTE if brief['project_repository'] else None
+        brief['checkpoint_template'] = self._checkpoint_template(brief, base, brief.pop('carry_open_items', []))
         brief['generated_at'] = now_iso(self.service._now())
         return 200, brief
+
+    #: The fields of a checkpoint that may be left out over HTTP, with what is sent for them.
+    CHECKPOINT_DEFAULTS = (('source_commit', ''), ('branch', ''), ('open_items', []), ('resolved', []))
+
+    @staticmethod
+    def _checkpoint_template(brief, base, carry=()):
+        """The checkpoint record to send for this task at this moment (kittrial-5bb.113).
+
+        An agent fills the four texts and posts ``body`` to ``send_to``. ``previous`` and
+        ``activity_cursor`` are already those of this read; they go stale when the task
+        changes, and the refusal then says to read the brief again. ``open_items`` already
+        holds every open item of the previous checkpoint exactly as recorded, source
+        included: sent as it is, the record carries them all forward.
+        """
+        import briefing
+        limits = dict(briefing.CHECKPOINT_FIELD_LIMITS)
+        current = brief.get('checkpoint') or {}
+        keys = ('id', 'kind', 'text', 'source')
+        carried = [{key: item.get(key) for key in keys} for item in carry or []]
+        template = {
+            'send_to': base + '/checkpoints', 'method': 'POST',
+            'body': {'schema_version': 1, 'previous': current.get('id'),
+                     'activity_cursor': brief.get('activity_cursor'),
+                     'intent': '', 'acceptance': '', 'summary': '', 'next_action': '',
+                     'source_commit': '', 'branch': '', 'open_items': carried, 'resolved': []},
+            'carried_open_items': len(carried),
+            'required': ['intent', 'acceptance', 'summary', 'next_action'],
+            'optional': {'source_commit': 'the commit the work is at; leave out when there is none',
+                         'branch': 'the branch; leave out when there is none',
+                         'open_items': 'what is unresolved: the ones already in body, unchanged, plus any new one; '
+                                       'leave out only when nothing is',
+                         'resolved': 'open items of the previous checkpoint that this one resolves: take the item '
+                                     'out of open_items and name its id here; leave out when none'},
+            'limits': {name: '<= %d characters' % limits[name]
+                       for name in ('intent', 'acceptance', 'summary', 'next_action', 'source_commit', 'branch')},
+            'open_item': {'id': 'a short id of your choosing', 'kind': sorted(briefing.KINDS),
+                          'text': '<= %d characters' % briefing.CHECKPOINT_TEXT_LIMIT,
+                          'source': 'where it came from, <= %d characters' % briefing.CHECKPOINT_SOURCE_LIMIT},
+            'resolved_item': {'id': 'the id of the open item', 'reason': '<= %d characters' % briefing.CHECKPOINT_TEXT_LIMIT,
+                              'evidence': '<= %d characters' % briefing.CHECKPOINT_SOURCE_LIMIT},
+            'items_max': briefing.CHECKPOINT_ITEMS_MAX,
+            'note': 'Every open item of the previous checkpoint must be carried forward unchanged or resolved. '
+                    'body.open_items already holds them all, complete with source. '
+                    'A refusal names every problem with the record at once.'}
+        if carry is None:
+            # More open items than could be read in one go, or the task changed meanwhile.
+            template['carried_open_items'] = None
+            template['note'] = ('The open items of the previous checkpoint could not all be read, so body.open_items '
+                                'is empty and this record would be refused: read the brief again. '
+                                + template['note'])
+        return template
 
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/claim')
     def tasks_claim(self, ctx):
         self._project(ctx, CAP_TASKS)
-        self._refuse_record_anchor(self.backend.get_task(ctx.params['pid'], ctx.params['tid']))
-        payload = self._task_payload(ctx)
+        payload = dict(ctx.payload or {})
+        # A field the route does not take is refused, not dropped (kittrial-5bb.183 item 2).
+        refuse_unknown_fields(payload, self.TASK_CLAIM_FIELDS, 'A task claim')
+        self._refuse_record_anchor(self.backend.get_task(ctx.params['pid'], ctx.params['tid']), write=True)
+        payload['task_id'] = ctx.params['tid']
         actor = self.service.bind_actor(ctx.principal, payload.pop('actor', None))
         payload['actor'] = actor
 
         def claim():
-            result = self.backend.invoke('tasks.claim', ctx.principal, ctx.params['pid'],
-                                         payload, ctx.idempotency_key,
-                                         target=ctx.route_target, authorize=ctx.authorize,
-                                         capability=CAP_TASKS)
+            try:
+                result = self.backend.invoke('tasks.claim', ctx.principal, ctx.params['pid'],
+                                             payload, ctx.idempotency_key,
+                                             target=ctx.route_target, authorize=ctx.authorize,
+                                             capability=CAP_TASKS)
+            except HttpError as refusal:
+                held_by = getattr(refusal, 'held_by', None)
+                if held_by is None:
+                    raise
+                # Somebody else has it. Nobody takes a task over through a claim, an owner
+                # included (kittrial-5bb.187); said with the holder's name as people know it.
+                shown = self.service.actor_names([held_by]).get(held_by) or held_by
+                raise conflict('Task is already claimed by %s' % shown, {'held_by': held_by}) from None
             return result, result
         return self._mutate(ctx, 'tasks.claim', ctx.params['pid'], claim,
                             capability=CAP_TASKS, serialize=False, canonical=True)
@@ -3844,17 +5931,35 @@ class ApiHandler(BaseHTTPRequestHandler):
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/checkpoints')
     def checkpoints_add(self, ctx):
         self._project(ctx, CAP_CHECKPOINTS)
-        self._refuse_record_anchor(self.backend.get_task(ctx.params['pid'], ctx.params['tid']))
-        payload = self._task_payload(ctx)
+        payload = dict(ctx.payload or {})
+        # A field the record does not carry is refused, not dropped (kittrial-5bb.183 item 2).
+        refuse_unknown_fields(payload, self.CHECKPOINT_BODY_FIELDS, 'A checkpoint')
+        self._refuse_record_anchor(self.backend.get_task(ctx.params['pid'], ctx.params['tid']), write=True)
+        payload['task_id'] = ctx.params['tid']
         payload.setdefault('schema_version', 1)
+        # Over HTTP these four may be left out (kittrial-5bb.113): an agent with no commit
+        # yet, or nothing unresolved, need not send empty values. The canonical record is
+        # unchanged: what is left out is sent as the empty value.
+        for name, empty in self.CHECKPOINT_DEFAULTS:
+            payload.setdefault(name, type(empty)())
         if 'actor' in payload:
             payload['actor'] = self.service.bind_actor(ctx.principal, payload.get('actor'))
 
         def add():
-            result = self.backend.invoke('checkpoints.add', ctx.principal, ctx.params['pid'],
-                                         payload, ctx.idempotency_key,
-                                         target=ctx.route_target, authorize=ctx.authorize,
-                                         capability=CAP_CHECKPOINTS)
+            try:
+                result = self.backend.invoke('checkpoints.add', ctx.principal, ctx.params['pid'],
+                                             payload, ctx.idempotency_key,
+                                             target=ctx.route_target, authorize=ctx.authorize,
+                                             capability=CAP_CHECKPOINTS)
+            except HttpError as refusal:
+                # The canonical refusal names every problem with the record. Hand them over
+                # as a list too, so an agent need not parse the sentence.
+                if refusal.status == 422 and isinstance(refusal.detail, str):
+                    import briefing
+                    said = refusal.detail[len('ValueError: '):] if refusal.detail.startswith('ValueError: ') \
+                        else refusal.detail
+                    refusal.problems = briefing.split_problems(said)
+                raise
             return result, result
         return self._mutate(ctx, 'checkpoints.add', ctx.params['pid'], add, status=201,
                             capability=CAP_CHECKPOINTS, serialize=False, canonical=True)
@@ -3868,21 +5973,84 @@ class ApiHandler(BaseHTTPRequestHandler):
         # approve at all.
         capability = CAP_APPROVE if payload.get('operation') == 'approve' else CAP_REVIEWS
         self._project(ctx, capability)
-        self._refuse_record_anchor(self.backend.get_task(ctx.params['pid'], ctx.params['tid']))
+        recommending = payload.get('operation') == 'recommend'
+        # With the installation's setting on, an approval is judged by whose work it is, which
+        # needs the same read a recommendation makes (kittrial-5bb.199). Off: no read, no rule.
+        judged = payload.get('operation') == 'approve' and self.service.approval_by_another_party
+        current = None
+        if recommending or judged:
+            # A field this kit does not know is refused, not dropped, by the one rule for
+            # every review operation below (kittrial-5bb.110): at most five plain names.
+            # One read serves the record-anchor check and the person rule below.
+            current = self.backend.task_brief(ctx.params['pid'], ctx.params['tid'])
+            self._refuse_record_anchor(current.get('task'), write=True)
+        else:
+            self._refuse_record_anchor(self.backend.get_task(ctx.params['pid'], ctx.params['tid']), write=True)
         if 'actor' in payload:
             payload['actor'] = self.service.bind_actor(ctx.principal, payload.get('actor'))
+        operation = payload.get('operation')
+        if isinstance(operation, str) and operation in EndpointBackend.REVIEW_FIELDS:
+            # Unknown and misplaced fields are refused, not dropped (kittrial-5bb.110
+            # item 4). The allowed set is the canonical field set for THIS operation
+            # plus the documented transport/presentation keys, so a `disposition` on a
+            # request-changes or a top-level `severity` is a 422 instead of a silent
+            # 201. An operation the canonical writer does not know is left to the
+            # backend, which names it in a fixed sentence.
+            #
+            # A key whose VALUE is null is ABSENT, not a misplaced field (kittrial-5bb.110
+            # items 1 and 2): the released Client at cbf6d01 and at b0a4fbd sends every
+            # optional field of every operation as null (one 16-key union), and counting
+            # those nulls here refused switch on/off, contribute, request-changes,
+            # respond, approve, withdraw and recommend alike. The check therefore runs on
+            # the SUPPLIED keys only. The nulls stay in the payload: the canonical build
+            # below drops a null optional field itself and keeps the null on the required
+            # fields whose ABSENCE -- unlike their null -- is an invalid field set.
+            allowed = ({'schema_version', 'operation', 'operation_id', 'previous'}
+                       | set(EndpointBackend.REVIEW_FIELDS[operation])
+                       | set(EndpointBackend.REVIEW_OPTIONAL_FIELDS.get(operation, ()))
+                       | set(REVIEW_HTTP_FIELDS)
+                       | set(REVIEW_HTTP_OPERATION_FIELDS.get(operation, ())))
+            # `previous` is deliberately NOT removed for REVIEW_NO_PREVIOUS: a
+            # recommendation is a record beside the chain and carries none, but the
+            # released clients send the key (null, or the chain's latest comment id) for
+            # every operation, so it is accepted and IGNORED here (the canonical body
+            # builder omits it for `recommend`; kittrial-5bb.110 items 1 and 2).
+            supplied = {key for key, value in payload.items() if value is not None}
+            unknown = sorted(str(key) for key in supplied - allowed)
+            if unknown:
+                raise invalid('Unsupported review payload field(s) for %s: %s'
+                              % (operation, unsupported_fields_text(unknown)))
 
         def add():
-            if payload.get('operation') == 'recommend':
+            delivered = (current.get('review') or {}).get('contribution') or {} if current else {}
+            pid = ctx.params['pid']
+            if judged:
+                # Nobody approves work of their own party: the account that approves, against the
+                # account behind the contribution's author and behind the task's assignee. A
+                # superuser is bound like anybody else for their own party's work.
+                actor = payload.get('actor') or ctx.principal.actor or ctx.principal.user_id
+                refusal = self._own_party_refusal([actor, ctx.principal.user_id], (current.get('task') or {}).get('assignee'),
+                                                  delivered.get('author'), pid)
+                if refusal:
+                    raise forbidden(refusal)
+            if recommending:
                 # Independence by PERSON, which only the web service can know; the
                 # canonical write then applies the name rule and every other rule.
-                current = self.backend.task_brief(ctx.params['pid'], ctx.params['tid'])
-                parties = [(current.get('task') or {}).get('assignee'),
-                           ((current.get('review') or {}).get('contribution') or {}).get('author')]
+                parties = [(current.get('task') or {}).get('assignee'), delivered.get('author')]
                 actor = payload.get('actor') or ctx.principal.actor or ctx.principal.user_id
-                if not self._independent([actor], parties) or \
-                        not self._independent([ctx.principal.user_id], parties):
-                    raise forbidden(self.NOT_INDEPENDENT)
+                if not self._independent_all([actor, ctx.principal.user_id], parties, pid):
+                    raise forbidden(self.NOT_INDEPENDENT_PARTY if self.service.approval_by_another_party
+                                    else self.NOT_INDEPENDENT)
+                # One standing recommendation for a contribution from each PERSON
+                # (kittrial-5bb.154): a second one, by the same actor or by another agent of
+                # the same person, is refused and nothing is stored. Read from the brief, so
+                # it is every standing one, whether or not this service counts it.
+                standing = [entry.get('author') for entry in (current.get('review') or {}).get('recommendations') or []
+                            if isinstance(entry, dict) and isinstance(entry.get('author'), str)]
+                own = [name for name in standing if not self._independent([name], [actor, ctx.principal.user_id], pid)]
+                if own:
+                    shown = self.service.actor_names(own[:1]).get(own[0]) or own[0]
+                    raise conflict(self.ALREADY_RECOMMENDED % shown, {'recommended_by': own[0]})
             if payload.get('operation') == 'respond':
                 # Only the task's assignee (the contributor of the current revision)
                 # may respond to requested changes. Both backends enforce it at the
@@ -3894,14 +6062,35 @@ class ApiHandler(BaseHTTPRequestHandler):
                 if not isinstance(task, dict) or not task.get('assignee') or \
                         task['assignee'] != actor:
                     raise forbidden('Only the task assignee may respond to requested changes')
-            result = self.backend.invoke('reviews.add', ctx.principal, ctx.params['pid'],
-                                         payload, ctx.idempotency_key,
-                                         target=ctx.route_target, authorize=ctx.authorize,
-                                         capability=capability)
+            try:
+                result = self.backend.invoke('reviews.add', ctx.principal, ctx.params['pid'],
+                                             payload, ctx.idempotency_key,
+                                             target=ctx.route_target, authorize=ctx.authorize,
+                                             capability=capability)
+            except HttpError as refusal:
+                # A refused recommendation says which rule it hit: the canonical sentence is
+                # fixed text of this kit (it names the contribution id the caller sent and
+                # nothing else of theirs), so it is the message, not only the detail.
+                if recommending and refusal.status == 422 and isinstance(refusal.detail, str) \
+                        and refusal.detail.startswith('ValueError: '):
+                    raise invalid(refusal.detail[len('ValueError: '):], refusal.detail) from None
+                # So does a refused follow-on base (kittrial-5bb.158): the sentence says which
+                # base is acceptable, why this one is not and what an operator does about it.
+                sentence = EndpointBackend.base_refusal(refusal.detail) if refusal.status == 422 else None
+                if sentence is not None:
+                    raise invalid(sentence, refusal.detail) from None
+                raise
             return result, result
         return self._mutate(ctx, 'reviews.add', ctx.params['pid'], add, status=201,
                             capability=capability, serialize=False, canonical=True)
 
+    #: Said to somebody whose own party (themselves, their owner, their owner's other agent)
+    #: has a standing recommendation for the contribution. It names the two ways on from there.
+    ALREADY_RECOMMENDED = ('%s has already recommended this contribution, and that recommendation stands until the '
+                           'contribution is revised or decided. To ask for changes instead, request changes: the '
+                           'recommendation then stops counting. A recommendation cannot be withdrawn.')
+
+    #: Every field a recommendation may carry over HTTP (``task_id`` is set by the route).
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/history')
     def tasks_history(self, ctx):
         self._project(ctx, CAP_READ)
@@ -3954,7 +6143,10 @@ class ApiHandler(BaseHTTPRequestHandler):
         memberships, re-authorizing each project with the live ``CAP_READ`` check,
         one queue read per project and at most :data:`ME_WORK_MAX_PROJECTS` projects.
         ``to_review`` lists contributions only in projects where the caller holds the
-        approval capability. Computed at read time; nothing is scheduled or marked.
+        approval capability. With the party rule on it holds only work the caller may
+        actually approve: a row of the caller's own party is left out, since approving it
+        would be refused (kittrial-5bb.199 review, N4). Computed at read time; nothing is
+        scheduled or marked.
         """
         principal = ctx.principal
         if principal.via == 'credential':
@@ -3989,9 +6181,16 @@ class ApiHandler(BaseHTTPRequestHandler):
             for item in items:
                 if item.get('review_state') not in (None,'none') or item.get('contribution'):
                     blocked.discard(item.get('id'))
-            names = self.service.actor_names([i.get('assignee') for i in items])
+            names = self.service.actor_names([i.get('assignee') for i in items]
+                                             + [i.get('contribution_author') for i in items])
+            # What this person could recommend: someone else's contribution, by person, that
+            # nobody of theirs has recommended yet (the rule of _agent_review_actions). "Yet" is
+            # read from every name on the row, counted or not (kittrial-5bb.147).
+            reviewable = {i.get('id') for i in items if CAP_REVIEWS in capabilities
+                          and self._independent([actor], [i.get('assignee'), i.get('contribution_author')], project['id'])
+                          and not self._own_party_recommended(i, actor, project['id'])}
             classified.append(agent_prompts.classify(project, capabilities, items,
-                                                     actor, blocked, now, names))
+                                                     actor, blocked, now, names, reviewable))
             for item in items:
                 row = dict(item, project_name=project['name'])
                 if item.get('id') in blocked and item.get('status') != 'closed':
@@ -4001,7 +6200,14 @@ class ApiHandler(BaseHTTPRequestHandler):
                 if CAP_APPROVE in capabilities and item['review_state'] in (
                         'awaiting-review', 'legacy-review-ready', 'awaiting-integration',
                         'approved'):
-                    to_review.append(row)
+                    # The party rule's read (kittrial-5bb.199 review, N4): a row whose author or
+                    # assignee is the caller's own party would be refused at approval, so My work
+                    # does not offer it. Off, `_independent_all` is by person, as it always was.
+                    if not self.service.approval_by_another_party or self._independent_all(
+                            [actor, principal.user_id],
+                            [item.get('assignee'), item.get('contribution_author')],
+                            project['id']):
+                        to_review.append(row)
         if len(assigned) > MAX_PAGE or len(to_review) > MAX_PAGE:
             truncated = True
         try:
@@ -4152,25 +6358,425 @@ def build_handler(service, backend, *, trusted_proxies=(), max_body=MAX_BODY_BYT
     })
 
 
+#: What a socket that is already gone raises when it is wrapped or given its timeout: closed
+#: (EBADF; on Windows WSAENOTSOCK, which is ENOTSOCK there), not connected any more, reset,
+#: aborted, a broken pipe. Nobody is there to be served; nothing is said.
+SOCKET_GONE = frozenset({errno.EBADF, errno.ENOTSOCK, errno.ENOTCONN, errno.ECONNRESET, errno.ECONNABORTED, errno.EPIPE})
+#: How the error of a connection whose set-up failed for a reason of the server's own begins.
+SETUP_FAILED = 'connection set-up failed: '
+#: The exit status of ``main`` when the port to listen on is taken. The office supervisor
+#: reads it to say so in one line (``office_service.WEB_PORT_TAKEN`` is the same number).
+EXIT_PORT_TAKEN = 4
+
+#: How long a client may take over each thing the service waits for from it: completing the
+#: TLS handshake, sending a request (its line and headers; then its body), and taking a
+#: response. Also how long an idle keep-alive connection is kept. Then the connection is closed.
+CLIENT_SECONDS = 30
+#: Connections served at once, one thread each. A connection beyond it is closed at once.
+#: The bound is what keeps silent connections from using up the process's file descriptors
+#: (1024 by default on Linux), which the endpoint's own processes and files need too.
+CONNECTION_LIMIT = 200
+#: Of those, how many one client address may have at once (kittrial-5bb.170 item 2): without
+#: it one address that keeps reopening silent connections holds every place for as long as it
+#: likes. Half of the places: an office behind one address is the ordinary case (a browser
+#: uses up to six connections while a page loads), and one address still cannot take them
+#: all; two acting together can. 0: no limit per address (the settings do not offer it:
+#: they take 1 to CONNECTION_LIMIT).
+ADDRESS_LIMIT = 100
+#: Said to a request that came through a trusted proxy while its forwarded address already
+#: has that many requests being served.
+ADDRESS_BUSY = 'Too many requests from your address are being served at once. Send this one again in a moment.'
+
+
+class _WatchedWriter:
+    """The handler's ``wfile``: every write is under the client deadline (a client that stops reading)."""
+
+    def __init__(self, inner, server, connection):
+        self._inner, self._server, self._connection = inner, server, connection
+
+    def write(self, data):
+        self._server.watch(self._connection, self._server.client_seconds)
+        try:
+            return self._inner.write(data)
+        except TimeoutError:
+            # The socket's own timeout: the client, not a lock wait (which is answered "busy").
+            raise ConnectionAbortedError('the client did not take the response') from None
+        finally:
+            self._server.unwatch(self._connection)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+class GuardedServer(ThreadingHTTPServer):
+    """One thread per connection, with what an open port needs (kittrial-5bb.163 review).
+
+    * The listening socket is never a TLS socket: ``accept`` returns at once and the
+      handshake is the connection's own business (``ApiHandler.setup``).
+    * ``watch``/``unwatch``: a connection the service is waiting on has a deadline. One
+      reaper thread shuts down a connection whose deadline has passed, which ends the wait
+      in its thread whatever it was (handshake, request line, headers, body, a write). A
+      shutdown, because a socket timeout bounds each read and not the whole wait: a client
+      that sends a byte now and then would stay. The socket has a timeout as well, a
+      little longer (``ApiHandler.setup``): on Windows a shutdown from another thread
+      reaches the client at once but does not end a read that is already waiting, and the
+      timeout does, at most one more such time later. On Linux the shutdown ends it.
+    * At most ``connection_limit`` connections at once; one more is closed at once.
+    * At most ``address_limit`` of them from one client address (``address_group``); one more
+      from it is closed at once, before a thread or a handshake is spent on it. A peer named
+      as a trusted proxy is not limited as an address, since every client behind it arrives
+      from it: there the limit is per forwarded address and per request being served
+      (``request_begins``), which only ``ApiHandler`` can know, from the request's headers.
+    """
+    daemon_threads = True
+    request_queue_size = 128
+    tls_context = None
+    client_seconds = CLIENT_SECONDS
+    connection_limit = CONNECTION_LIMIT
+    address_limit = ADDRESS_LIMIT
+    trusted_proxies = ()
+    REAP_EVERY = 0.25
+    TIMEOUT_MARGIN = 2.0
+    TLS_LINE_EVERY = 5.0
+    ADDRESS_LINE_EVERY = 60.0
+
+    def __init__(self, *args, **kwargs):
+        # Before the base class binds: when the bind fails it closes the server, and
+        # ``server_close`` must find what it reads. Made after the bind, the missing field
+        # turned "Address already in use" into an AttributeError (kittrial-5bb.180).
+        self._stopping = threading.Event()
+        super().__init__(*args, **kwargs)
+        self._guard = threading.Lock()
+        self._deadlines = {}
+        self._open = 0
+        self.cut_off = 0                 # connections closed for being too slow
+        self.turned_away = 0             # connections closed for being over the limit
+        self.turned_away_for_address = 0  # of those, and requests refused, for the limit per address
+        self._said_no_thread = False
+        self._said_limit = False
+        self._serving = {}              # thread -> (its connection, the address group it is counted in or None)
+        self._by_address = {}            # address group -> its open connections
+        self._requests_by_address = {}   # forwarded address group -> its requests being served
+        self._address_said, self._address_unsaid = None, 0
+        self._begun = set()              # of those threads, the ones start() has returned for
+        self._tls_said, self._tls_unsaid = None, 0
+        self._setup_said, self._setup_unsaid = None, 0
+        self._reaper = threading.Thread(target=self._reap, name='connection-reaper', daemon=True)
+        self._reaper.start()
+
+    def watch(self, connection, seconds):
+        with self._guard:
+            self._deadlines[connection] = time.monotonic() + seconds
+
+    def unwatch(self, connection):
+        with self._guard:
+            self._deadlines.pop(connection, None)
+
+    def _reap(self):
+        import socket
+        while not self._stopping.wait(self.REAP_EVERY):
+            now = time.monotonic()
+            with self._guard:
+                late = [connection for connection, deadline in self._deadlines.items() if deadline <= now]
+                for connection in late:
+                    del self._deadlines[connection]
+                self.cut_off += len(late)
+            for connection in late:
+                try:
+                    # The plain shutdown also for a TLS socket: it ends the other thread's wait
+                    # without touching the TLS state that thread is using.
+                    socket.socket.shutdown(connection, socket.SHUT_RDWR)
+                except OSError:
+                    pass
+            # A thread that was started and is no longer alive while its connection is still
+            # registered died before it served (out of memory in its first steps).
+            # "Was started" is: start() has returned for it. Not "has an ident": a thread has
+            # its ident a few steps BEFORE it is marked started, and is_alive() is False until
+            # that mark, so a thread that was only starting looked dead, and an honest
+            # connection was closed under it (kittrial-5bb.175).
+            with self._guard:
+                dead = [(thread, entry[0]) for thread, entry in self._serving.items()
+                        if thread in self._begun and not thread.is_alive()]
+            for thread, request in dead:
+                self._gave_up(thread, request, 'the thread ended before it served')
+
+    def open_connections(self, address=None):
+        """How many connections are open: all of them, or those counted for ``address``."""
+        with self._guard:
+            return self._open if address is None else self._by_address.get(address_group(address), 0)
+
+    def _limited_as(self, client_address):
+        """The group ``client_address`` is counted in, or None when it is not limited as an address."""
+        if not self.address_limit:
+            return None
+        try:
+            peer = client_address[0]
+        except (IndexError, TypeError):
+            return None
+        if any(address_matches(peer, network) for network in self.trusted_proxies):
+            return None
+        return address_group(peer)
+
+    def _address_turned_away(self, group, counted, done):
+        """Count it and make its line (the caller holds the lock): at most one every ADDRESS_LINE_EVERY seconds."""
+        self.turned_away_for_address += 1
+        now = time.monotonic()
+        if self._address_said is not None and now - self._address_said < self.ADDRESS_LINE_EVERY:
+            self._address_unsaid += 1
+            return None
+        unsaid, self._address_unsaid, self._address_said = self._address_unsaid, 0, now
+        return ('connections: %s has %d %s, the limit for one address; further ones from it are %s%s'
+                % (ascii(str(group))[:60], self.address_limit, counted, done,
+                   ' (%d more such, from any address, since the last such line)' % unsaid if unsaid else ''))
+
+    def request_begins(self, group):
+        """A request that came through a trusted proxy for ``group``: False when it has its share already."""
+        with self._guard:
+            if not self.address_limit:
+                return True
+            if self._requests_by_address.get(group, 0) < self.address_limit:
+                self._requests_by_address[group] = self._requests_by_address.get(group, 0) + 1
+                return True
+            line = self._address_turned_away(group, 'requests being served', 'answered 503')
+        if line:
+            print(line, file=sys.stderr, flush=True)
+        return False
+
+    def request_ends(self, group):
+        with self._guard:
+            left = self._requests_by_address.get(group, 0) - 1
+            if left > 0:
+                self._requests_by_address[group] = left
+            else:
+                self._requests_by_address.pop(group, None)
+
+    def _left(self, thread):
+        """Free the place of ``thread``'s connection (the caller holds the lock): its request, or None."""
+        self._begun.discard(thread)
+        entry = self._serving.pop(thread, None)
+        if entry is None:
+            return None
+        request, group = entry
+        self._open -= 1
+        if group is not None:
+            left = self._by_address.get(group, 0) - 1
+            if left > 0:
+                self._by_address[group] = left
+            else:
+                self._by_address.pop(group, None)
+        return request
+
+    def process_request(self, request, client_address):
+        group = self._limited_as(client_address)
+        line = None
+        with self._guard:
+            over = self._open >= self.connection_limit
+            if over:
+                self.turned_away += 1
+                if not self._said_limit:
+                    self._said_limit = True
+                    line = ('connections: the limit of %d open connections was reached; further ones are closed '
+                            'at once (said once)' % self.connection_limit)
+            elif group is not None and self._by_address.get(group, 0) >= self.address_limit:
+                over = True
+                self.turned_away += 1
+                line = self._address_turned_away(group, 'connections open', 'closed at once')
+            else:
+                self._open += 1
+                if group is not None:
+                    self._by_address[group] = self._by_address.get(group, 0) + 1
+        if over:
+            if line:
+                print(line, file=sys.stderr, flush=True)
+            self.shutdown_request(request)
+            return
+        # The thread is started here and not by the base class, so that it is known: one that
+        # could not be started, or that died before it served (no memory for it), must not
+        # keep its connection open and its place taken for ever.
+        thread = threading.Thread(target=self.process_request_thread, args=(request, client_address), daemon=True)
+        with self._guard:
+            self._serving[thread] = (request, group)
+        try:
+            thread.start()
+        except RuntimeError as failed:
+            # "can't start new thread": the process is at a limit of its own (memory, threads)
+            # below the connection limit. The connection is closed like one over the limit,
+            # and it is said once, in one line: not a traceback for each (review of .163).
+            self._gave_up(thread, request, ascii(str(failed))[:80])
+        except BaseException:
+            with self._guard:
+                self._left(thread)
+            raise
+        else:
+            with self._guard:
+                if thread in self._serving:           # it may have served and gone already
+                    self._begun.add(thread)
+
+    def _gave_up(self, thread, request, why):
+        """No thread serves ``request``: close it, free its place, and say so the first time."""
+        with self._guard:
+            if self._left(thread) is None:
+                return
+            self.turned_away += 1
+            first = not self._said_no_thread
+            self._said_no_thread = True
+            open_now = self._open
+        if first:
+            print('connections: no thread could be started for a connection with %d open (%s); such '
+                  'connections are closed at once (said once)' % (open_now, why), file=sys.stderr, flush=True)
+        self.shutdown_request(request)
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            with self._guard:
+                self._left(threading.current_thread())
+
+    def handle_error(self, request, client_address):
+        """A client that went away or was cut off is not an error of the service: no traceback."""
+        error = sys.exc_info()[1]
+        if isinstance(error, (ConnectionError, ssl.SSLError, TimeoutError)):
+            if str(error).startswith('TLS handshake not completed'):
+                # One line for the operator (a certificate the client does not accept shows
+                # here), and at most one every TLS_LINE_EVERY seconds: a port scan is not a
+                # line for each connection. The next line says how many were not shown.
+                now = time.monotonic()
+                with self._guard:
+                    quiet = self._tls_said is not None and now - self._tls_said < self.TLS_LINE_EVERY
+                    if quiet:
+                        self._tls_unsaid += 1
+                    else:
+                        unsaid, self._tls_unsaid, self._tls_said = self._tls_unsaid, 0, now
+                if not quiet:
+                    print('tls: %s: %s%s' % (ascii(str(client_address[0]))[:60], ascii(str(error))[:200],
+                                             ' (and %d more since the last such line)' % unsaid if unsaid else ''),
+                          file=sys.stderr, flush=True)
+            elif str(error).startswith(SETUP_FAILED):
+                # A fault of the server itself in a connection's set-up: said, and like the
+                # line above at most once every TLS_LINE_EVERY seconds, because it comes with
+                # every connection while it lasts.
+                now = time.monotonic()
+                with self._guard:
+                    quiet = self._setup_said is not None and now - self._setup_said < self.TLS_LINE_EVERY
+                    if quiet:
+                        self._setup_unsaid += 1
+                    else:
+                        unsaid, self._setup_unsaid, self._setup_said = self._setup_unsaid, 0, now
+                if not quiet:
+                    print('setup: %s: %s; the connection was closed%s'
+                          % (ascii(str(client_address[0]))[:60], ascii(str(error)[len(SETUP_FAILED):])[:200],
+                             ' (and %d more since the last such line)' % unsaid if unsaid else ''),
+                          file=sys.stderr, flush=True)
+            return
+        super().handle_error(request, client_address)
+
+    def server_close(self):
+        # Also for a server that never finished starting (the base class calls this when its
+        # bind fails): nothing here may need a field that is made later.
+        self._stopping.set()
+        super().server_close()
+
+
+def quiet_memory_errors():
+    """Out of memory in a thread's first steps is one line, said once, not a traceback each time.
+
+    The interpreter reports it as an exception nobody can catch ("Exception ignored in thread
+    started by"), once per connection under a memory limit. The connection itself is closed by
+    the server's reaper. Everything else that cannot be raised is reported as before.
+    """
+    usual = sys.unraisablehook
+    said = []
+
+    def hook(unraisable):
+        if isinstance(unraisable.exc_value, MemoryError):
+            if not said:
+                said.append(True)
+                print('memory: the process ran out of memory while starting a thread; its limit is below what the '
+                      'connections it is asked to serve need (said once)', file=sys.stderr, flush=True)
+            return
+        usual(unraisable)
+    sys.unraisablehook = hook
+    return hook
+
+
 def create_server(service, backend, *, host='127.0.0.1', port=0, trusted_proxies=(),
                   max_body=MAX_BODY_BYTES, certfile=None, keyfile=None,
-                  allow_plaintext_non_loopback=False, web_root=DEFAULT_WEB_ROOT):
+                  allow_plaintext_non_loopback=False, web_root=DEFAULT_WEB_ROOT,
+                  client_seconds=None, connection_limit=None, address_limit=None):
     """Bind the service. Refuse a non-loopback plaintext listener unless explicitly allowed."""
     loopback = host in LOOPBACK
     if not loopback and certfile is None and not allow_plaintext_non_loopback:
         raise ValueError('Refusing plaintext on a non-loopback interface; supply TLS or '
                          'explicitly allow disposable plaintext')
-    httpd = ThreadingHTTPServer((host, port), build_handler(service, backend,
-                                                            trusted_proxies=trusted_proxies,
-                                                            max_body=max_body,
-                                                            web_root=web_root))
-    httpd.daemon_threads = True
+    context = None
     if certfile:
+        # Before anything is bound: a certificate or key that cannot be used stops the start.
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.minimum_version = ssl.TLSVersion.TLSv1_2
         context.load_cert_chain(certfile, keyfile)
-        httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
+    if ':' in host:
+        server_class = type('GuardedServer6', (GuardedServer,), {'address_family': __import__('socket').AF_INET6})
+    else:
+        server_class = GuardedServer
+    httpd = server_class((host, port), build_handler(service, backend,
+                                                     trusted_proxies=trusted_proxies,
+                                                     max_body=max_body,
+                                                     web_root=web_root))
+    # The TLS context is the connection's (ApiHandler.setup): the listening socket stays plain.
+    httpd.tls_context = context
+    if client_seconds is not None:
+        httpd.client_seconds = client_seconds
+    if connection_limit is not None:
+        httpd.connection_limit = connection_limit
+    if address_limit is not None:
+        httpd.address_limit = address_limit
+    # Who is not limited as an address: the same peers whose forwarded headers are believed.
+    httpd.trusted_proxies = tuple(trusted_proxies or ())
     return httpd
+
+
+def runtime_service_lock(root):
+    """Take the supervisor's runtime lock, or return None when a service holds it.
+
+    ``office_service.py run`` holds an exclusive flock on ``<root>/office-service.lock``
+    for its whole life. Taking the same lock here makes bootstrap and a running
+    service mutually exclusive: bootstrap is refused while a service runs (a running
+    service keeps the state in memory and writes it back, so an account added
+    underneath it is silently lost), and a service cannot start underneath a bootstrap
+    in progress. The caller holds the returned file descriptor until the bootstrap is
+    written, then releases it.
+
+    Raises ``ValueError`` on a platform without ``fcntl``, because the office service
+    is a POSIX deployment and silently skipping the guard would reintroduce the loss.
+    """
+    try:
+        import fcntl
+    except ImportError:
+        raise ValueError('Bootstrapping needs the runtime lock, which requires a POSIX host') from None
+    path = Path(root)/'office-service.lock'
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def bootstrap_refusal_advice(error):
+    """What the person at the terminal has to do about a refused ``--bootstrap-user``.
+
+    Only "a superuser already exists" can be answered with "add this person as an account
+    inside the service": on a first bootstrap there is no superuser who could, so a refused
+    password or user name says to run the command again with a good one (kittrial-5bb.176
+    item 3).
+    """
+    if getattr(error, 'status', None) == 409:
+        return 'Add this person as an account inside the service instead.'
+    if 'Password' in getattr(error, 'message', ''):
+        return 'Run the command again with a password of 8 to 1024 characters.'
+    return 'Run the command again with a name of 2 to 64 characters of letters, digits, . _ @ -.'
 
 
 def build_backend(service, args):
@@ -4178,17 +6784,36 @@ def build_backend(service, args):
     if args.backend == 'endpoint':
         return EndpointBackend(args.endpoint_python, args.endpoint, args.root,
                                service=service, actor_namespace=args.actor_namespace,
-                               timeout=args.endpoint_timeout)
-    return InProcessBackend(service)
+                               timeout=args.endpoint_timeout, create_timeout=getattr(args, 'create_timeout', 900))
+    return InProcessBackend(service, getattr(args, 'actor_namespace', None))
+
+
+def settings_lines(service):
+    """What the service says about its rule settings when it starts: one line each, and the
+    change is in the audit when it differs from the last start (``Service.note_settings``).
+    A last start that cannot be read is named as unknown, not shown as ``off`` (N5)."""
+    was, now = service.note_settings()
+    word = {True: 'on', False: 'off'}
+    line = 'approval by another party (--approval-by-another-party): %s' % word[now]
+    if was is None:
+        line += ' (the last start was not recorded; that is written to the audit)'
+    elif was != now:
+        line += ' (it was %s at the last start; recorded in the audit)' % word[was]
+    return [line]
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description='Orchestra authenticated HTTP service')
+    # No abbreviations: a prefix of a flag that changes a rule of the installation
+    # (--approval-by-another) must not turn the rule on (kittrial-5bb.199 review).
+    parser = argparse.ArgumentParser(description='Orchestra authenticated HTTP service', allow_abbrev=False)
     parser.add_argument('--state', required=True, help='private service state path (outside source)')
     parser.add_argument('--host', default='127.0.0.1')
     parser.add_argument('--port', type=int, default=8443)
     parser.add_argument('--cert', help='TLS certificate (PEM)')
     parser.add_argument('--key', help='TLS private key (PEM)')
+    parser.add_argument('--allow-plaintext-on-network', action='store_true',
+                        help='serve plain HTTP on a host that is not loopback (no --cert): passwords and session '
+                             'cookies then cross the network unencrypted. Refused without this flag.')
     parser.add_argument('--trusted-proxy', action='append', default=[], metavar='ADDR',
                         help='honor forwarded headers only from this address/CIDR (repeatable)')
     parser.add_argument('--trust-proxy', action='store_true',
@@ -4202,7 +6827,21 @@ def main(argv=None):
     parser.add_argument('--actor-namespace', default='http',
                         help='actor namespace attributed to session principals')
     parser.add_argument('--endpoint-timeout', type=int, default=150)
+    parser.add_argument('--create-timeout', type=int, default=900,
+                        help='seconds one project creation may take (never less than --endpoint-timeout); a '
+                             'creation is slower the more project databases the server holds')
     parser.add_argument('--max-body', type=int, default=MAX_BODY_BYTES)
+    parser.add_argument('--connections-per-address', type=int, default=ADDRESS_LIMIT, metavar='N',
+                        help='connections one client address may have open at once, of the %d the service '
+                             'serves (default %d; 1 to %d). Behind a --trusted-proxy: requests being served at '
+                             'once for one forwarded address.' % (CONNECTION_LIMIT, ADDRESS_LIMIT, CONNECTION_LIMIT))
+    parser.add_argument('--logins-per-address', type=int, default=Service.LOGINS_PER_ADDRESS, metavar='N',
+                        help='log-ins one client address may have in flight at once, of the %d in all '
+                             '(default %d; 1 to %d)' % (Service.LOGINS_AT_ONCE, Service.LOGINS_PER_ADDRESS,
+                                                        Service.LOGINS_AT_ONCE))
+    parser.add_argument('--approval-by-another-party', action='store_true',
+                        help='nobody approves (or recommends) work of their own party: an account, its agents '
+                             'and the worker credentials it issued. Off unless given')
     parser.add_argument('--public-url',
                         help='canonical base URL of this service, used only to render '
                              'copyable agent setup/resume snippets (e.g. https://host)')
@@ -4231,30 +6870,96 @@ def main(argv=None):
         items = unusable_projects(types.SimpleNamespace(state=document))
         print(json.dumps({'items': items, 'total': len(items)}, indent=2))
         return 0
-    store = Store(args.state)
     if args.bootstrap_user:
+        # Checked before the state store is opened, so a refusal neither reads nor
+        # writes the state a running service is about to save over.
+        if not args.root:
+            parser.error('--bootstrap-user needs --root: the runtime lock is what proves no service is running')
+        if not Path(args.root).is_dir():
+            # One plain sentence, checked before the lock is opened: os.open on a path
+            # under a missing root raises FileNotFoundError, and the review asked for a
+            # sentence instead of a traceback (kittrial-5bb.162 item bootstrap-docs-and-root).
+            print('Refusing to bootstrap %s: --root must name an existing runtime directory, and %s is not one.'
+                  % (args.bootstrap_user, args.root), file=sys.stderr)
+            return 1
+        try:
+            lock_fd = runtime_service_lock(args.root)
+        except ValueError as error:
+            # A host without fcntl (Windows): one sentence instead of a traceback, before the
+            # state store is opened (kittrial-5bb.176 item 2).
+            print('Refusing to bootstrap %s: %s. Run this command on the POSIX host that runs the service.'
+                  % (args.bootstrap_user, error), file=sys.stderr)
+            return 1
+        if lock_fd is None:
+            print('Refusing to bootstrap %s: a service is running for runtime %s (it holds '
+                  'office-service.lock). Stop the service and bootstrap while it is stopped; a running '
+                  'service keeps its state in memory and writes it back, so the new account would be lost.'
+                  % (args.bootstrap_user, args.root), file=sys.stderr)
+            return 1
         import getpass
-        password = getpass.getpass('New superuser password: ')
-        Service.bootstrap_superuser(store, args.bootstrap_user, password)
+        try:
+            store = Store(args.state)
+            password = getpass.getpass('New superuser password: ')
+            Service.bootstrap_superuser(store, args.bootstrap_user, password)
+        except HttpError as error:
+            # A second bootstrap, a refused user name or a password the kit refuses: one
+            # sentence and the one thing to do about it, never a traceback
+            # (kittrial-5bb.176 items 2 and 3).
+            print('Refusing to bootstrap %s: %s. %s'
+                  % (args.bootstrap_user, error.message, bootstrap_refusal_advice(error)), file=sys.stderr)
+            return 1
+        finally:
+            import fcntl
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
         print('Bootstrapped %s' % args.bootstrap_user)
         return 0
+    if not 1 <= args.connections_per_address <= CONNECTION_LIMIT:
+        parser.error('--connections-per-address must be a whole number from 1 to %d (the connections served in all)'
+                     % CONNECTION_LIMIT)
+    if not 1 <= args.logins_per_address <= Service.LOGINS_AT_ONCE:
+        parser.error('--logins-per-address must be a whole number from 1 to %d (the log-ins in flight in all)'
+                     % Service.LOGINS_AT_ONCE)
+    store = Store(args.state)
     if args.backend == 'endpoint' and (not args.endpoint or not args.root):
         parser.error('--backend endpoint requires --endpoint and --root '
                      '(use --backend inprocess only for a disposable local check)')
     trusted = list(args.trusted_proxy)
     if args.trust_proxy and 'localhost' not in trusted:
         trusted.append('localhost')
-    service = Service(store, public_url=args.public_url)
+    service = Service(store, public_url=args.public_url, approval_by_another_party=args.approval_by_another_party)
+    service.LOGINS_PER_ADDRESS = args.logins_per_address
     backend = build_backend(service, args)
     for line in operator_allowlist_warnings(args.root if args.backend == 'endpoint' else None):
         print(line, file=sys.stderr)
-    httpd = create_server(service, backend, host=args.host, port=args.port,
-                          trusted_proxies=trusted, max_body=args.max_body,
-                          certfile=args.cert, keyfile=args.key,
-                          web_root=None if args.no_web else args.web_root)
+    try:
+        httpd = create_server(service, backend, host=args.host, port=args.port,
+                              trusted_proxies=trusted, max_body=args.max_body,
+                              certfile=args.cert, keyfile=args.key,
+                              allow_plaintext_non_loopback=args.allow_plaintext_on_network,
+                              web_root=None if args.no_web else args.web_root,
+                              address_limit=args.connections_per_address)
+    except OSError as failed:
+        # On Windows a port another program holds for itself alone is refused as "access", not "in use".
+        if failed.errno != errno.EADDRINUSE and getattr(failed, 'winerror', None) != 10013:
+            raise
+        # One line and a status of its own, not a traceback: the commonest reason a service
+        # does not start, and the operator must be able to read it.
+        print('orchestra-http: port %d on %s is taken: something else is listening on it, so the web service did '
+              'not start. Stop that, or start this service on another port.' % (args.port, args.host),
+              file=sys.stderr, flush=True)
+        return EXIT_PORT_TAKEN
+    # Said once the service has its port: a start that failed says its one line and has
+    # started nothing, so it has changed no setting either.
+    for line in settings_lines(service):
+        print(line, file=sys.stderr, flush=True)
+    if args.host not in LOOPBACK and not args.cert:
+        print('WARNING: serving plain HTTP on %s:%d. Passwords and session cookies cross the network unencrypted. '
+              'Use --cert and --key for HTTPS.' % (args.host, httpd.server_address[1]), file=sys.stderr, flush=True)
     print('orchestra-http listening on %s:%d (backend=%s, web=%s)'
           % (args.host, httpd.server_address[1], args.backend,
              'off' if args.no_web else args.web_root))
+    quiet_memory_errors()
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

@@ -195,7 +195,7 @@ export async function detail(ctx, { pid, tid }) {
 // Review bodies carry the canonical fields (the contribution id being judged and the
 // latest review record as ``previous``), so a stale page is refused with a 409 instead
 // of judging a revision the reviewer never saw.
-function reviewActions(ctx, pid, tid, contribution, review) {
+export function reviewActions(ctx, pid, tid, contribution, review) {
   const target = { contribution: contribution.id, previous: review.latest_id ?? null, contribution_revision: contribution.revision, contribution_commit: contribution.commit };
   const status = h('div', { class: 'banner crit', role: 'alert', hidden: true });
   const form = h('form', { class: 'form', novalidate: true },
@@ -205,12 +205,15 @@ function reviewActions(ctx, pid, tid, contribution, review) {
     h('div', { class: 'actions' },
       h('button', { type: 'submit', name: 'request', class: '' }, 'Request changes'),
       h('button', { type: 'button', class: 'primary', onclick: async (e) => {
-        if (!(await confirmDialog({ title: `Approve revision ${contribution.revision}?`, body: `Commit ${shortSha(contribution.commit)} will be marked reviewed and approved. It is not integrated or deployed until those steps are recorded separately.`, confirmLabel: 'Approve' }))) return;
+        if (!(await confirmDialog({ title: `Approve revision ${contribution.revision}?`, body: `Commit ${shortSha(contribution.commit)} will be marked reviewed and approved if the server accepts it; a server set to require another party refuses an approval of your own party's work. It is not integrated or deployed until those steps are recorded separately.`, confirmLabel: 'Approve' }))) return;
         await submit(e.currentTarget, { operation: 'approve', ...target, summary: `Approved revision ${contribution.revision} in the web interface` }, 'Approved');
       } }, 'Approve')));
   async function submit(button, body, message) {
     try {
       await act(button, () => ctx.api.review(pid, tid, body), { success: message, onError: (error) => {
+        // A refusal that says who must act instead (403: the approver's own party delivered it, or holds
+        // the task) stays on the page; as a toast it was gone in seconds (kittrial-5bb.199 review).
+        if (error.status === 403) { status.replaceChildren(error.message || 'Not permitted.'); status.setAttribute('data-refused', '403'); status.hidden = false; return true; }
         if (error.status !== 409) return false;
         status.replaceChildren('A newer revision arrived or someone else already reviewed this. ', h('button', { type: 'button', class: 'link', onclick: () => ctx.render() }, 'Reload to see it'), '.');
         status.hidden = false; return true;

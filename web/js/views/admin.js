@@ -33,6 +33,55 @@ export async function users(ctx) {
             try { await act(e.currentTarget, () => ctx.api.disableAccount(u.id), { success: 'Account disabled' }); } catch { return; }
             load();
           } }, 'Disable')))))))) : empty('No matching people', null));
+    drawGrants();
+  }
+
+  // Who may create projects. A superuser always may; another account needs this grant,
+  // which carries a limit on how many projects it may have at one time.
+  const grants = h('div', { class: 'panel-body stack', id: 'project-grants' });
+  function drawGrants() {
+    const people = all.filter((u) => !u.disabled && !u.superuser);
+    const holders = people.filter((u) => u.project_grant);
+    const others = people.filter((u) => !u.project_grant);
+    const limitForm = (u) => {
+      const form = h('form', { class: 'toolbar', novalidate: true, 'data-grant': u.id },
+        h('span', null, h('strong', null, u.display_name), ` (@${u.username}): ${u.projects_created + ((u.projects_held || []).length)} of ${u.project_grant.limit} in use`, (u.projects_held || []).length ? ` (${u.projects_held.length} not finished or not registered: ${u.projects_held.join(', ')})` : ''),
+        h('label', { class: 'visually-hidden', for: 'limit-' + u.id }, 'Limit for ' + u.display_name),
+        h('input', { id: 'limit-' + u.id, name: 'limit', type: 'number', min: 1, max: 100, value: String(u.project_grant.limit) }),
+        h('button', { type: 'submit' }, 'Change limit'),
+        h('button', { type: 'button', class: 'danger', onclick: async (e) => {
+          if (!(await confirmDialog({ title: `Stop ${u.display_name} creating projects?`, body: 'The projects they already created are kept and they stay their owner. They cannot create another.', confirmLabel: 'Remove', danger: true }))) return;
+          try { await act(e.currentTarget, () => ctx.api.clearProjectGrant(u.id), { success: 'Removed' }); } catch { return; }
+          load();
+        } }, 'Remove'));
+      form.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        const limit = Number(form.querySelector('input').value);
+        if (!Number.isInteger(limit) || limit < 1 || limit > 100) return;
+        try { await act(form.querySelector('button[type=submit]'), () => ctx.api.setProjectGrant(u.id, limit), { success: 'Limit changed' }); } catch { return; }
+        load();
+      });
+      return form;
+    };
+    const add = others.length ? h('form', { class: 'form', novalidate: true, id: 'grant-add' },
+      h('div', { class: 'form-row' },
+        field({ id: 'g-account', label: 'Account', type: 'select', value: others[0].id, options: others.map((u) => [u.id, `${u.display_name} (@${u.username})`]) }),
+        field({ id: 'g-limit', label: 'Projects at one time', type: 'number', value: '5', hint: 'From 1 to 100. Archived projects do not count.' })),
+      h('div', null, h('button', { type: 'submit', class: 'primary' }, 'Allow creating projects'))) : null;
+    if (add) add.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const v = formValues(add);
+      const limit = Number(v['g-limit']);
+      if (!Number.isInteger(limit) || limit < 1 || limit > 100) return setFieldError(add, 'g-limit', 'Enter a whole number from 1 to 100.');
+      setFieldError(add, 'g-limit', '');
+      try { await act(add.querySelector('button'), () => ctx.api.setProjectGrant(v['g-account'], limit), { success: 'Allowed' }); } catch { return; }
+      load();
+    });
+    // replaceChildren takes nodes, not arrays or null: spread the forms and leave out a missing one.
+    grants.replaceChildren(...[
+      h('p', { class: 'small muted' }, 'A superuser can always create a project. Any other account needs to be allowed here, with a limit. An agent can never create a project, whoever owns it.'),
+      ...(holders.length ? holders.map(limitForm) : [h('p', { class: 'small muted' }, 'Nobody else may create projects yet.')]),
+      add].filter(Boolean));
   }
   filter.addEventListener('input', draw);
   load();
@@ -60,7 +109,8 @@ export async function users(ctx) {
     pageHead({ title: 'People & access', lede: 'Create accounts, reset passwords and disable access. Project membership is managed in each project’s settings.' }),
     h('div', { class: 'toolbar' }, filter),
     host,
-    h('section', { class: 'panel' }, h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'New account')), h('div', { class: 'panel-body' }, form)));
+    h('section', { class: 'panel' }, h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'New account')), h('div', { class: 'panel-body' }, form)),
+    h('section', { class: 'panel' }, h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Who may create projects')), grants));
 }
 
 export async function account(ctx) {

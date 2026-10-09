@@ -59,6 +59,8 @@ python client.py --config client.local.json --project example --actor RETURNED_A
 
 Registration is the only client action that does not require an actor. Other commands retain the existing explicit-actor rule. The output is JSON containing `session.actor`, `session.name`, `session.created_at` and `session.request_id`.
 
+**Bound keys (`--principal lane:NAME`)**: For a key bound to a principal, `session register` is the **only** permitted first action. Because the principal owns no actors in the project before its first registration, any pre-registration command (including `docs`, `onboard`, or `ready`) is refused: client commands require `--actor`, and the endpoint's principal gate refuses any unowned actor. Workers in a newly bound lane must read instructions from their local checkout of the repository rather than querying served docs before registering. Operators can verify key installation without registering using `admin.py --root RUNTIME authorized-keys-list` on the server or plain SSH on the client (see [checking a bound key](OPERATIONS.md#checking-a-bound-key-without-registering)).
+
 Before sending a registration, the client prints its generated request ID to stderr. After an uncertain response, retry with the **same name and request ID**:
 
 ```sh
@@ -80,3 +82,12 @@ Explicit recurring-run resume is now available: `worker.py ... --actor SAVED_ACT
 This is attribution and accidental-collision prevention, not authentication, an access role, a lease, or a detector of two processes deliberately sharing one ID. Existing explicitly named actors continue working; they do not acquire registry records automatically. A trusted participant can still reuse another actor string. Never use registration to take over existing claims.
 
 Registration is project-scoped. UUIDs make accidental cross-project collisions extremely unlikely, but there is no global identity service. `.sessions.json` is operator-owned runtime state, included in the existing coordination backup sidecar; do not edit or delete it to free names. Restore with this kit version or newer. As with other coordination data, never operate a restored copy as a second live authority. Shared backups do not include a worker's local saved actor/request ID; keep those in the private session handoff.
+
+The registry also carries an `owners` map (actor to principal) where a key is bound to a
+principal (kittrial-5bb.194): `session register` under such a key records the new actor under
+the key's principal, `session show` returns it as `principal`, and `admin.py adopt-actor`
+gives an existing actor to a principal once (see
+[bind a key to its principal](OPERATIONS.md#bind-a-key-to-its-principal)). The map is
+written only when non-empty, so an installation that configures nothing writes the registry
+exactly as before. Once it is present, a kit that predates it refuses the registry as an
+unknown key: remove `owners` before a downgrade, or restore with this kit or newer.
