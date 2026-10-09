@@ -1571,6 +1571,49 @@ requirement record or an area equal to one of the task's labels; for an actor on
 operator allowlist it adds the oldest proposals waiting for triage, a decision or
 incorporation. Rejected and duplicate proposals are never selected.
 
+## `coordinator`: the acceptance commands of a confined coordinator
+
+`coordinator SUBCOMMAND [--file FILE]` (kittrial-5bb.195, slice 3 of
+[COORDINATORS_PER_PROJECT_DESIGN.md](COORDINATORS_PER_PROJECT_DESIGN.md)) runs the acceptance
+commands a coordinator needs when it has given up the shell, over a key bound to a principal.
+The client names the action `coordinator`; it appears in `client.py`'s action list, so the word
+is not sent to `bd`.
+
+| Subcommand | The host command it runs |
+| --- | --- |
+| `guidance-set --file FILE` | `admin.py set-guidance` |
+| `guidance-clear` | `admin.py clear-guidance` |
+| `guidance-status` | `admin.py guidance-status` (the authoritative read, with the text) |
+| `reference-apply --file FILE` | `admin.py reference-apply` (one entry, or an `items` batch) |
+| `capability-apply --file FILE` | `admin.py capability-apply` |
+| `capability-verify --file FILE` | `admin.py capability-verify` |
+| `proposal-review --file FILE` | `admin.py proposal-review` |
+| `proposal-decide --file FILE` | `admin.py proposal-decide` |
+| `handoff --file FILE` | `admin.py handoff` (the operator's transfer) |
+| `set-onboarding --file FILE` | `admin.py set-onboarding` |
+
+**Authority.** The action is refused unless all of these hold: the request arrives over a key
+bound to a principal (the forced command's `--key-principal`), the project's session registry
+gives the request's actor to that principal (rule 2), that actor is on the installation's
+operator allowlist - for `capability-verify`, on the `verifiers` list instead - and the project
+is one the key may name (rule 1). The operator list is per installation, so a listed actor is a
+coordinator in every project where its principal owns that name. With no bound principal the
+action is refused before a project file is read, a lock is taken or `bd` is called, so an
+installation that configures nothing is unchanged.
+
+**Payload and file transport.** `--file FILE` is a local JSON or text file the client transports
+as the same one-token `@attachment:N` attachment every other write uses; the server never reads
+a path out of the request. `guidance-set` and `set-onboarding` take plain text; `guidance-clear`
+and `guidance-status` take no payload; the rest take one JSON object. `reference-apply` and
+`capability-apply` carry only the payload `operation` values `accept` and `draft`; `retire`,
+`propose` and `revise` are refused before the library is called (`incorporated` is a proposal
+disposition reached with `proposal-review`/`proposal-decide`, not an entry-apply operation).
+`set-onboarding` records `set_by` in its answer and does not probe the text for endpoint paths.
+`guidance-status` takes the project's coordination lock, as the host command does.
+
+**Refusals.** An unknown subcommand, or a host-only command named here, is refused with
+"Unknown coordinator command" and the list of the ten. A refused operation changes nothing.
+
 ## IDs and cursor roles
 
 - **Native task ID**: `task`/`items[].task`/the positional argument to `show`, `brief`,

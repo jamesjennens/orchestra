@@ -516,10 +516,20 @@ def key_principal_refusal(request,path,key_principal):
 COORDINATOR_COMMANDS=('guidance-set','guidance-clear','guidance-status','reference-apply',
                       'capability-apply','capability-verify','proposal-review','proposal-decide',
                       'handoff','set-onboarding')
-#: The coordinator commands that only read (no lock, no journal, no server time).
+#: The coordinator commands that only read (no journal, no server time; the read takes the
+#: project's coordination lock, exactly as the host command does).
 COORDINATOR_READS=('guidance-status',)
 #: The coordinator commands whose attachment is plain text rather than a JSON payload.
 COORDINATOR_TEXTS=('guidance-set','set-onboarding')
+#: The payload ``operation`` values ``reference-apply`` and ``capability-apply`` may carry
+#: through this route (review of 958e883, item 1). The host command's operator route also
+#: allows ``retire`` on a capability, the only route that withdraws an accepted entry, and
+#: ``propose``/``revise`` are the contributor route; both stay off this surface, so a confined
+#: coordinator can accept a reviewed draft or write a direct accepted revision 1 and nothing
+#: that weakens or withdraws what an earlier operator accepted. ``incorporated`` is not an
+#: entry-apply operation at all: it is a proposal disposition state reached through
+#: ``proposal-review``/``proposal-decide``, so it is neither allowed nor needed here.
+COORDINATOR_APPLY_OPERATIONS=('accept','draft')
 
 def coordinator_refusal(request,root,key_principal):
     """Refuse the coordinator acceptance commands unless the caller is a key bound to a principal
@@ -547,23 +557,55 @@ def coordinator_refusal(request,root,key_principal):
                                 'run %s through the endpoint'
                                 %(command if command else 'a coordinator command'))
 
-def coordinator_payload(args,request):
-    """The text of the one ``--file`` attachment a coordinator command carries, or None.
+def coordinator_apply_refusal(payload,command):
+    """Refuse a payload operation ``reference-apply``/``capability-apply`` is not meant to carry.
 
-    The client transports a local file as ``--file @attachment:N`` (``client.py``
-    ``_attachments``), exactly as it does for every other write, so the server never reads a
-    path out of the request. ``args`` is everything after the subcommand.
+    The check is on the PAYLOAD, before the library is called, for the single form and the
+    ``items`` batch alike, so a payload can never carry an operation the route does not name
+    (review of 958e883, item 1: ``operation: retire`` reached ``apply_native(operator=True)``
+    and superseded an accepted capability). The host commands are unchanged.
+    """
+    operation=payload.get('operation','accept')
+    if operation not in COORDINATOR_APPLY_OPERATIONS:
+        raise ValueError('coordinator %s carries only %s through this surface; %r stays with the '
+                         'installation operator (retiring is admin.py capability-retire, and '
+                         'propose/revise are the contributor route). Nothing was changed.'
+                         %(command,', '.join(COORDINATOR_APPLY_OPERATIONS),operation))
+    items=payload.get('items')
+    if isinstance(items,list):
+        for index,item in enumerate(items):
+            if isinstance(item,dict) and 'operation' in item:
+                raise ValueError('coordinator %s items[%d] carries operation %r; every batch item is an '
+                                 'acceptance (%s). Nothing was changed.'
+                                 %(command,index,item.get('operation'),', '.join(COORDINATOR_APPLY_OPERATIONS)))
+
+def coordinator_payload(args,request):
+    """The text of the one attachment a coordinator command carries, or None.
+
+    The client transports a local file as ONE token ``@attachment:N`` with the flag kept on
+    the attachment (``client.py`` ``_attachments``), exactly as it does for every other write,
+    so the server never reads a path out of the request (review of 958e883, item 2: this used
+    to demand the two tokens ``--file @attachment:N`` the client never sends). The two-token
+    form is still accepted for a hand-built request, and a token that is neither is refused
+    without ever being read as a path. ``args`` is everything after the subcommand.
     """
     if not args:return None
-    if len(args)!=2 or args[0] not in ('--file','-f'):
+    if len(args)==1:
+        flag=None;token=args[0]
+    elif len(args)==2 and args[0] in ('--file','-f'):
+        flag=args[0];token=args[1]
+    else:
         raise ValueError('Use --file with a local JSON or text file; the server reads no file path')
-    token=args[1]
+    attachments=request.get('attachments') if isinstance(request,dict) else None
     item=None
-    if isinstance(token,str) and token.startswith('@attachment:'):
-        item=(request.get('attachments') or {}).get(token.partition(':')[2])
+    if isinstance(attachments,dict) and isinstance(token,str) and token.startswith('@attachment:'):
+        item=attachments.get(token.partition(':')[2])
     if (not isinstance(item,dict) or not isinstance(item.get('text'),str)
             or item.get('flag') not in ('--file','-f')):
-        raise ValueError('Invalid attachment')
+        raise ValueError('Invalid attachment: a coordinator command needs --file with one local JSON or '
+                         'text file, carried as a single @attachment token; the server reads no file path')
+    if flag is not None and item.get('flag')!=flag:
+        raise ValueError('Invalid attachment: the flag on the attachment does not match the request')
     return item['text']
 
 def execute(root,request,authority_config=None,require_authority=False,key_projects=None,key_principal=None):
@@ -945,9 +987,17 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             if text is None:raise ValueError('coordinator %s needs --file with the text to set'%command)
         else:
             if text is None:raise ValueError('coordinator %s needs --file with its JSON payload'%command)
-            payload=record_json.loads(text)
+            try:
+                payload=record_json.loads(text)
+            except ValueError as error:
+                # A bare JSONDecodeError is not a sentence a confined coordinator can act on
+                # (review of 958e883, item 3c).
+                raise ValueError('coordinator %s payload is not valid JSON (%s); supply one JSON object '
+                                 'in the --file attachment. Nothing was changed.'%(command,error)) from None
             if not isinstance(payload,dict):
                 raise ValueError('coordinator %s payload must be a JSON object'%command)
+            if command in ('reference-apply','capability-apply'):
+                coordinator_apply_refusal(payload,command)
         operators=configured_operators(root)
         verifiers=configured_verifiers(root)
         run_warnings=[]
@@ -971,9 +1021,12 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                            and isinstance(payload,dict) and 'items' in payload))
         if command=='guidance-status':
             # The host read (`admin.py guidance-status`): a bound, listed actor may see the
-            # text, which the endpoint's self-declared `guidance status` withholds.
+            # text, which the endpoint's self-declared `guidance status` withholds. The host
+            # command takes the project's coordination lock around the read, so this does too
+            # (review of 958e883, item 4d): the answer is one snapshot, not a read racing a set.
             import guidance
-            result=guidance.status(path,actor,operators,host=True)
+            with held():
+                result=guidance.status(path,actor,operators,host=True)
             return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''}
         def coordinator_effect():
             if command=='guidance-set':
@@ -983,12 +1036,20 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                 import guidance
                 result=guidance.clear(path,actor)
             elif command=='set-onboarding':
-                from onboarding import probe_endpoints,write_project
-                write_project(path/'ONBOARDING.md',text)
-                # A warning must never block the operator's update (admin.py says the same).
-                for warning in probe_endpoints(text,name,Path(__file__).resolve().parent):
-                    run_warnings.append(warning)
-                result={'state':'set','source':'operator','bytes':len(text.encode('utf-8'))}
+                from onboarding import write_project
+                from http_authority import server_time as now_stamp
+                target=path/'ONBOARDING.md'
+                previous=(target.read_text(encoding='utf-8-sig')
+                          if target.is_file() and not target.is_symlink() else None)
+                write_project(target,text)
+                # This route does NOT probe the text for endpoint paths (review of 958e883, item 3b):
+                # probe_endpoints resolves and reads every absolute *.py path the text names and
+                # reveals one bit about each plus the resolved symlink target, and the server must
+                # never read a path out of the request. The host `admin.py set-onboarding` keeps its
+                # warning for the operator with a shell. WHO set the text is recorded here, as
+                # guidance records set_by.
+                result={'state':'set','source':'operator','bytes':len(text.encode('utf-8')),
+                        'changed':previous!=text,'set_by':actor,'set_at':now_stamp()}
             elif command=='handoff':
                 from handoff import execute as handoff_execute
                 result=handoff_execute(path,actor,payload,runner,operator=True)
@@ -1015,9 +1076,20 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                 import proposal_records
                 result=proposal_records.dispose(payload,actor,runner,path,operators=operators,
                                                 route='decide' if command=='proposal-decide' else 'review')
-            # A set that wrote a file and not a bd row (guidance, onboarding) is a write all
-            # the same, so the answer carries the server's time; an idempotent retry does not.
+            # The answer carries the server's time when this call wrote: a file set (guidance,
+            # onboarding), a record accepted, a verification, a disposition. A no-op - an
+            # idempotent retry the record module answered `reconciled: true` or `changed: false`,
+            # or an items batch whose every item was already-accepted - wrote nothing and carries
+            # no server_time (review of 958e883, finding 11: the comment used to claim this while
+            # guidance-set, set-onboarding and a batch still carried server_time).
+            no_op=(isinstance(result,dict)
+                   and (result.get('reconciled') is True or result.get('changed') is False
+                        or (command in ('reference-apply','capability-apply') and isinstance(payload,dict)
+                            and isinstance(payload.get('items'),list) and bool(result.get('items'))
+                            and all(isinstance(item,dict) and item.get('result')=='already-accepted'
+                                    for item in result['items']))))
             if not (isinstance(result,dict) and result.get('reconciled') is True):runner.wrote=True
+            if no_op:runner.wrote=False
             return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n',
                     'stderr':''.join(run_warnings)}
         if per_item_lock:

@@ -990,9 +990,15 @@ def clear(path, actor):
     validate_actor(actor)
     text, meta = _paths(path)
     try:
-        cleared_version = version_of(read_text(path))
+        current = read_text(path)
     except ValueError:
-        cleared_version = None
+        # A guidance file that cannot be read AS guidance (a refused character, over the
+        # limit, not UTF-8) is still removed below; its version is simply unknown.
+        current = None
+    # `read_text` answers None when no guidance is set at all, and version_of(None) is not a
+    # hash (review of 958e883, item 3a: this raised AttributeError and the endpoint answered
+    # "outcome unknown" for a clear with nothing set).
+    cleared_version = version_of(current) if current is not None else None
     removed = []
     for target in (text, meta, meta.with_suffix('.tmp'), Path(path) / REPAIR_NAME):
         if target.exists() or target.is_symlink():
@@ -1001,6 +1007,13 @@ def clear(path, actor):
             except OSError:
                 raise ValueError('The guidance file could not be removed; ask the operator to check permissions')
             removed.append(target.name)
+    if not removed:
+        # Nothing was set (or an earlier clear already removed it): this is a no-op, not an
+        # uncertain outcome. Answer changed: false and write nothing, so a caller with no shell
+        # can reconcile a retry of a clear whose first answer was lost (review of 958e883,
+        # item 3a). The host command prints the same "(nothing was set)" message.
+        return {'changed': False, 'removed': [], 'cleared_by': actor, 'cleared_at': None,
+                'cleared_version': None, 'clear_record': CLEAR_NAME}
     stamp = datetime.now(timezone.utc).isoformat()
     state, previous = clear_record_state(path)
     kept_aside = None
@@ -1026,7 +1039,7 @@ def clear(path, actor):
     record = {'schema_version': 1, 'clears': clears}
     validate_clear_record(record)
     atomic(Path(path) / CLEAR_NAME, record)
-    result = {'removed': sorted(set(removed)), 'cleared_by': actor, 'cleared_at': stamp,
+    result = {'changed': True, 'removed': sorted(set(removed)), 'cleared_by': actor, 'cleared_at': stamp,
               'cleared_version': cleared_version, 'clear_record': CLEAR_NAME}
     if kept_aside:
         result['invalid_record_kept_as'] = kept_aside

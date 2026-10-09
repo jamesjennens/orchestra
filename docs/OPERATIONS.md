@@ -477,7 +477,23 @@ the `verifiers` list is enough), and the project is one the key may name.
 Each runs the same library call with the same payload as its host command, so the payload
 schemas in the table above apply unchanged. `--file` is a local file the client transports
 with the same attachment transport every other write uses; the server never reads a path out
-of the request.
+of the request. `coordinator set-onboarding` writes the document and answers with `set_by`
+(the actor that set it) and `changed`; unlike the host command it does **not** probe the text
+for endpoint paths, because that probe resolves and reads every absolute `*.py` path the text
+names - server files read out of the request - and the host `admin.py set-onboarding` still
+warns the operator with a shell. A clear with nothing set (`guidance-clear`) answers
+`changed: false` and writes nothing, so a retry whose answer was lost is reconcilable without
+a shell.
+
+**Which payload operations this surface carries.** `coordinator reference-apply` and
+`coordinator capability-apply` carry exactly the payload `operation` values `accept` (the
+reviewed draft) and `draft` (the direct accepted revision 1, the same as the host command).
+They do **not** carry `retire`, the only operation that withdraws an accepted entry - that
+stays with the installation operator (`admin.py capability-retire`, above) - nor the
+contributor operations `propose`/`revise`. `incorporated` is not an entry-apply operation at
+all: it is a proposal disposition state, reached with `coordinator proposal-review` and
+`coordinator proposal-decide`. Any other operation, in the single payload or anywhere in an
+`items` batch, is refused before the library is called and nothing is written.
 
 **What stays with the installation operator.** `proposal-settings`, `capability-retire`,
 `capability-alias-propose`/`-reject`, `void-record`, `revert-record`, every `*-reconcile`,
@@ -485,6 +501,19 @@ of the request.
 (`review-writes`, `checkpoint-provenance-writes`) and the operator and verifier list commands
 are **not** reachable through this surface, for anybody: they remain `admin.py` host commands.
 The action refuses any name it does not know and names the ones it does.
+
+**How the power is taken away.** The operator list is checked against the name the project's
+session registry gives the key's principal, so removing the **actor** from the list
+(`admin.py operators remove ACTOR --confirm-revoke`) refuses it at once, with no key change.
+Removing the **key** means removing **every** `authorized_keys` line of that principal: a
+principal that still has a second line still works, so one line removed is not a revocation.
+An unbound key that names a listed actor is still refused by this action (it sends no
+`--key-principal`), but, as before, it is not confined and can still write ordinary rows.
+
+**The list is per installation, not per project.** A listed actor is a coordinator in **every**
+project where its principal owns that actor name, and a key bound only to a principal (no
+`--project`) reaches all of those projects. A confined coordinator therefore needs a key bound
+to the projects it may serve (rule 1), not just a listed actor name.
 
 **An installation that configures nothing is unchanged.** The action exists only for a key
 bound to a principal: without `--key-principal` - every ordinary host loop and every key that
