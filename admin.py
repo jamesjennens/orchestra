@@ -5093,17 +5093,26 @@ def project_actor_names(root,project,path):
     rather than adopted into a fictitious owner (kittrial-5bb.194 review, finding 10). The
     tracker is read because the actors this command exists for are the legacy ones: they
     predate the registry and are visible only in the rows they wrote. A tracker that cannot
-    be read is a refusal, never "the name is unknown".
+    be read is a refusal, never "the name is unknown". Rows are parsed with the row bound
+    of kittrial-5bb.141 (``record_json.loads_rows``, ``ROW_NESTING_MAX`` 750): rows nested
+    up to 750 levels read normally, and ANY row that cannot be parsed -- unparseable text,
+    deeper than 750, a line cut short -- refuses the whole command as a tracker that could
+    not be read, exactly as before (kittrial-5bb.221 revision 2): the unreadable row may be
+    the one that names the actor, and a name that cannot be shown to be held must not be
+    adopted either.
     """
     from sessions import read_registry, owner_map, used_actors
     data=read_registry(path)
     names={record['actor'] for record in data['records'].values()}|set(owner_map(data))
     try:
-        text=run_bd(root,project,['export','--all'])
-        rows=[json.loads(line) for line in text.splitlines() if line.strip()]
+        rows=record_json.loads_rows(run_bd(root,project,['export','--all']))
     except (subprocess.SubprocessError,OSError,ValueError,RecursionError):
         raise ValueError('Cannot read the tracker of project %s to check whether that actor exists there; '
                          'nothing was changed'%project) from None
+    if any(not isinstance(row,dict) or row.get('malformed') for row in rows):
+        raise ValueError('Cannot read the tracker of project %s: it holds unreadable row(s) (nested deeper '
+                         'than the row bound or not parseable), so the names it holds cannot be told; '
+                         'nothing was changed'%project)
     names|=used_actors(rows)
     return names
 
@@ -6081,7 +6090,13 @@ def credential_actors(root,state_path,service_namespace=None):
     with ``waived``, ``waived_by_username``, ``waived_at``, ``waived_reason`` and an
     ``actor_allowed`` sentence -- because it writes. Rows inside an earlier same-name,
     same-owner credential's lifetime are not held either (item 3). An export that answers no
-    rows is said as ``tracker_rows`` null, not false: the tracker was not read.
+    rows is said as ``tracker_rows`` null, not false: the tracker was not read. The rows are
+    parsed with the row bound of kittrial-5bb.141 (``record_json.loads_rows``,
+    ``ROW_NESTING_MAX`` 750): rows nested up to 750 levels read normally, and an export that
+    holds ANY unreadable row is one the tracker could not be read from -- ``tracker_rows``
+    null for every credential of that project, with the unreadable row ids named beside it
+    (``unreadable_rows``), so an operator sees there is something unread rather than "no
+    such rows" (kittrial-5bb.221 revision 2).
     ``service_namespace`` is the namespace the web service was started with (its
     ``--actor-namespace``), when the operator says so: a credential named under it is refused
     at use too (kittrial-5bb.188 item 3).
@@ -6111,7 +6126,15 @@ def credential_actors(root,state_path,service_namespace=None):
                 found['on_host']=True
                 found['sessions']=registered_actors(path)
                 try:
-                    rows=[json.loads(line) for line in run_bd(root,name,['export','--all']).splitlines() if line.strip()]
+                    rows=record_json.loads_rows(run_bd(root,name,['export','--all']))
+                    unreadable=[row.get('id') if isinstance(row,dict) else None
+                                for row in rows if not isinstance(row,dict) or row.get('malformed')]
+                    if unreadable:
+                        # kittrial-5bb.221 revision 2: an unreadable row may be the row that holds the
+                        # name, so no name of this project can be judged; said as null with the row ids
+                        # named, never as "no such rows".
+                        found['unreadable_rows']=unreadable
+                        raise ValueError('the export holds %d unreadable row(s)'%len(unreadable))
                     if not any(isinstance(row,dict) for row in rows):
                         raise ValueError('the export answered no rows')
                     found['marks']=actor_names.tracker_marks(rows)
@@ -6156,6 +6179,11 @@ def credential_actors(root,state_path,service_namespace=None):
             item['waived_reason']=waived.get('reason')
             item['actor_allowed']='allowed by %s on %s' % (issuer.get('username') or waived.get('by') or 'a superuser',
                                                             item['waived_at'] or 'an unrecorded date')
+        if host.get('unreadable_rows') is not None:
+            # kittrial-5bb.221 revision 2: this project's tracker holds unreadable row(s), so
+            # tracker_rows is null (could not be read) and the row ids are named, so an
+            # operator sees there is something unread rather than "no such rows".
+            item['unreadable_rows']=host['unreadable_rows']
         out.append(item)
     colliding=[item for item in out if item['collides'] is not None and not item['revoked']]
     return {'schema_version':1,'state':str(source),'worker_credentials_with_a_name':len(out),

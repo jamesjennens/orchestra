@@ -425,25 +425,46 @@ def tracker_actors(root,path,before=None,own=()):
     One ``bd export --all`` for the project, through the same read ``admin.py
     credential-actors`` makes: a bd process that opens the project's database. That is the
     cost of judging a plain name by the rows it has, and it is paid where the rule is
-    applied, never by every write (docs/HTTP_DEPLOYMENT.md says so). A tracker that cannot
-    be read raises, and so does an answer that is not a whole tracker -- an export that
-    parses to no rows, that fails partway (a cut line, a non-JSON word, a bd that exits
-    nonzero), or that carries rows but not the project's merge slot
-    (``actor_names.TrackerUnreadable``): every project this kit makes holds that slot, so an
-    answer without it did not come from a whole read and is a host fault, not "the tracker
-    holds no names" (kittrial-5bb.188 review of item 1, revision-3 item 3). ``own`` are the
-    lifetimes of earlier credentials of the same name whose rows are not held against this
-    one (item 3)."""
+    applied, never by every write (docs/HTTP_DEPLOYMENT.md says so). What depends on it:
+    ``reserved_actors`` feeds the tracker names to the worker-credential name rule on every
+    HTTP-path write (``descriptor_actor_denial``, kittrial-5bb.184/188) and to the
+    ``actor-standing`` rows read the web service makes when it issues a credential, so a
+    read that fails blocks every write under a plain name and every issue, for the whole
+    project.
+
+    Rows are parsed with the row bound of kittrial-5bb.141 (``record_json.loads_rows``,
+    ``ROW_NESTING_MAX`` 750), not the 64-level record-comment guard that used to refuse
+    this read on one row nested 65 levels (kittrial-5bb.221): a row nested up to 750
+    levels parses normally and its own author, assignee and comment names count. ANY row
+    that cannot be parsed -- unparseable text, deeper than 750, a line cut short -- still
+    refuses the whole read exactly as before: an unreadable row may be the row that holds
+    the name, and a name the tracker might hold must not become issuable or writable
+    through a worker credential (revision-2 review item 1: a comment holding U+0085, or
+    751-level metadata, hid a row's author and a credential under that name was issued and
+    wrote). A marked row never counts as the project's merge slot: its id can be recovered
+    from text nobody has read, and the whole-read proof must rest on a row that was read.
+    (bd's answer being cut at U+0085 inside a string is kittrial-5bb.239's, on
+    record_json.loads_rows itself; until that lands, such a row refuses here exactly as on
+    main.) So a tracker that cannot be read raises, and so does an answer that is not a
+    whole tracker -- an export that parses to no rows, that holds an unreadable row, that
+    fails partway, a bd that exits nonzero, or that carries rows but not the project's
+    merge slot (``actor_names.TrackerUnreadable``): every project this kit makes holds that
+    slot, so an answer without it did not come from a whole read and is a host fault, not
+    "the tracker holds no names" (kittrial-5bb.188 review of item 1, revision-3 item 3).
+    ``own`` are the lifetimes of earlier credentials of the same name whose rows are not
+    held against this one (item 3)."""
     import actor_names
     from admin import run_bd
     try:
-        text=run_bd(root,path.name,['export','--all'])
-        rows=[record_json.loads(line) for line in text.splitlines() if line.strip()]
+        rows=record_json.loads_rows(run_bd(root,path.name,['export','--all']))
     except (subprocess.SubprocessError,OSError,ValueError,RecursionError):
         # bd could not answer, or answered something that is not rows: a host fault, never an
         # empty tracker and never a rejection of the caller's request.
         raise actor_names.TrackerUnreadable()
-    if not any(isinstance(row,dict) for row in rows) or not any(is_merge_slot(row) for row in rows):
+    if any(not isinstance(row,dict) or row.get('malformed') for row in rows) \
+            or not any(is_merge_slot(row) for row in rows):
+        # One unreadable row refuses the whole read (not only its own names): the row may be
+        # the one that holds the name, and an unreadable row's id never proves the slot.
         raise actor_names.TrackerUnreadable()
     return actor_names.tracker_names(actor_names.tracker_marks(rows),before,own)
 

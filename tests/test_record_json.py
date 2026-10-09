@@ -188,10 +188,10 @@ class NoUnguardedParseTests(unittest.TestCase):
 
     ALLOWED = {
         'activity.py': (2, "the tracker export, and a cursor file on the caller's own machine"),
-        'admin.py': (25, 'bd output and files on the coordination host, in operator commands; credential-actors '
-                         '(kittrial-5bb.184) reads the web state and an export and catches RecursionError itself; '
-                         'adopt-actor (kittrial-5bb.194 revision 2) reads one export to check that the actor '
-                         'appears in the project and catches RecursionError itself'),
+        'admin.py': (23, 'bd output and files on the coordination host, in operator commands; the export row reads '
+                         'of credential-actors (kittrial-5bb.184) and adopt-actor\'s tracker check (kittrial-5bb.194 '
+                         'revision 2) go through record_json.loads_rows (kittrial-5bb.221 revision 2): rows nested '
+                         'to 750 read normally and any unreadable row fails the read as a whole'),
         'artifacts.py': (1, 'the artifact index the kit writes'),
         'bootstrap.py': (2, 'bd output on the host'),
         'bd_refusals.py': (1, "bd's own answer to one command; it catches RecursionError itself"),
@@ -271,7 +271,9 @@ class NoUnguardedParseTests(unittest.TestCase):
             # endpoint.py's fifth (kittrial-5bb.195): the JSON payload of a coordinator
             # acceptance command, which the caller transports as a file attachment. It is
             # the caller's text, so it is parsed through the guard.
-            'briefing.py': 3, 'coordination.py': 3, 'endpoint.py': 5, 'export_requirements.py': 1, 'feedback.py': 3, 'guidance.py': 3,
+            # kittrial-5bb.221 revision 2 moved tracker_actors' export rows to
+            # record_json.loads_rows (the row bound), so four remain.
+            'briefing.py': 3, 'coordination.py': 3, 'endpoint.py': 4, 'export_requirements.py': 1, 'feedback.py': 3, 'guidance.py': 3,
             'handoff.py': 1, 'http_service.py': 2, 'lifecycle.py': 1, 'recovery.py': 1, 'requirements.py': 1, 'requirement_records.py': 1, 'reserved_comments.py': 1,
             'review_recommendations.py': 2, 'review_workflow.py': 4, 'work.py': 1, 'worker_gate.py': 1})
 
