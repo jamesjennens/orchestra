@@ -26,7 +26,10 @@ ADVICE = {'endpoint.py': 'Set "python" in the client configuration to an interpr
           'client.py': 'Run the client with Python 3.10 or newer',
           'admin.py': SERVER, 'office_service.py': SERVER, 'http_service.py': SERVER, 'tools/office_verify.py': SERVER,
           'capabilities.py': OWN, 'http_client.py': OWN, 'lifecycle.py': OWN, 'coordination.py': OWN,
-          'requirement_records.py': OWN, 'setup_assistant.py': OWN, 'worker.py': OWN, 'worker_gate.py': OWN}
+          'requirement_records.py': OWN, 'setup_assistant.py': OWN, 'worker.py': OWN, 'worker_gate.py': OWN,
+          'tools/http_rev3_probe.py': OWN, 'tools/http_rev4_probe.py': OWN, 'tools/http_rev5_probe.py': OWN,
+          'tools/http_security_probe.py': OWN, 'tools/strict_canonical_endpoint.py': OWN,
+          'tools/demonstrate_review_targeting.py': OWN}
 ENTRY_POINTS = tuple(ADVICE)
 #: Programs with a ``__main__`` block and NO check, and why. The first two run under the host's
 #: Python 3.6 on purpose. The others were started with ``--help`` under a real Python 3.6.8
@@ -34,8 +37,15 @@ ENTRY_POINTS = tuple(ADVICE)
 #: claimed of them. A new program belongs in ADVICE unless somebody has shown the same of it.
 RUN_UNDER_3_6 = ('ssh_forced_command.py', 'tools/office_release.py')
 STARTED_UNDER_3_6 = ('activity.py', 'bootstrap.py', 'export_requirements.py', 'publish_brd.py', 'requirement_impact.py',
-                     'requirements.py', 'tools/http_rev3_probe.py', 'tools/http_rev4_probe.py', 'tools/http_rev5_probe.py',
-                     'tools/http_security_probe.py', 'tools/strict_canonical_endpoint.py')
+                     'requirements.py')
+#: Library-only modules: imported by programs, never run as one. No shebang, no ``__main__`` block.
+MODULES = ('actor_names.py', 'agent_prompts.py', 'artifacts.py', 'bd_refusals.py', 'briefing.py',
+           'capability_misses.py', 'capability_records.py', 'capability_verification.py', 'credential_store.py',
+           'feedback.py', 'field_limits.py', 'guidance.py', 'handoff.py', 'http_auth.py', 'http_authority.py',
+           'keyed_entries.py', 'keyed_records.py', 'native.py', 'onboarding.py', 'open_items.py',
+           'project_creation.py', 'project_setup.py', 'proposal_records.py', 'record_json.py', 'recovery.py',
+           'reference_records.py', 'render.py', 'reserved_comments.py', 'review_recommendations.py',
+           'review_state.py', 'review_workflow.py', 'sessions.py', 'version.py', 'work.py')
 
 AS_VERSION = """
 import collections, runpy, sys
@@ -125,10 +135,45 @@ class ClientSaysItTests(unittest.TestCase):
     def test_with_a_forced_command_the_advice_is_about_the_key_line(self):
         said = self.answered(2, '', self.SAID, dict(self.SSH, forced_command=True))
         self.assertTrue(said.startswith('SSH: endpoint.py needs Python 3.10 or newer and was started with Python 3.6.8 '
-                                        '(/usr/libexec/platform-python). Nothing was carried out. This key runs a forced command'))
+                                        '(/usr/libexec/platform-python). Nothing was carried out.'))
+        self.assertIn('This key runs a forced command', said)
         self.assertIn('print that line again (admin.py authorized-keys) with an interpreter of 3.10 or newer', said)
-        self.assertNotIn('Set "python" in the client configuration', said)
         self.assertNotIn('uncertain', said)
+        # The tail (the endpoint's advice) is shown alongside the forced-command note (kittrial-5bb.222).
+        self.assertIn('Set "python" in the client configuration', said)
+
+    def test_with_a_forced_command_the_tail_is_shown(self):
+        """The recogniser stays loose so a reworded advice is still recognised, and the tail is shown
+        with a forced command too (kittrial-5bb.222)."""
+        reworded = ('endpoint.py needs Python 3.10 or newer and was started with Python 3.6.8 (/usr/bin/python3). '
+                    'Nothing was carried out. Ask your operator for a newer interpreter.\n')
+        said = self.answered(2, '', reworded, dict(self.SSH, forced_command=True))
+        self.assertIn('Ask your operator for a newer interpreter.', said)
+        self.assertIn('This key runs a forced command', said)
+        self.assertNotIn('uncertain', said)
+
+    def test_the_recogniser_accepts_any_tail(self):
+        """A server whose advice was reworded in another release is still recognised (kittrial-5bb.222)."""
+        for tail in ('Set "python" in the client configuration.',
+                     'Ask your operator for a newer interpreter.',
+                     'Something entirely different that a future release might say.',
+                     ''):
+            with self.subTest(tail=tail):
+                stderr = ('endpoint.py needs Python 3.10 or newer and was started with Python 3.6.8 (/usr/bin/python3). '
+                          'Nothing was carried out.' + (' ' + tail if tail else '') + '\n')
+                said = self.answered(2, '', stderr)
+                self.assertTrue(said.startswith('SSH: endpoint.py needs Python 3.10 or newer'), said)
+                self.assertNotIn('uncertain', said)
+                self.assertNotIn('SSH failed', said)
+
+    def test_local_transport_with_forced_command_shows_the_sentence(self):
+        """A local-transport config with forced_command is still the local label; forced_command is an SSH
+        concept and does not change the local advice (kittrial-5bb.222, mutant c12)."""
+        said = self.answered(2, '', self.SAID, {'transport': 'local', 'python': '/usr/bin/python3',
+                                                 'endpoint': '/srv/kit/endpoint.py', 'root': '/srv/state',
+                                                 'forced_command': True})
+        self.assertEqual(said, 'Local endpoint: ' + self.SAID.strip())
+        self.assertNotIn('This key runs a forced command', said)
 
     def test_anything_else_keeps_what_the_client_always_said(self):
         for returncode, stdout, stderr in ((1, '', self.SAID), (2, 'x', self.SAID), (2, '', 'Traceback\n' + self.SAID),
@@ -163,7 +208,7 @@ class SourceTests(unittest.TestCase):
                                  ['sys.stderr.write', 'sys.exit'])
                 self.assertEqual(ast.unparse(check.body[1]), 'sys.exit(2)')
 
-    def test_the_four_checks_are_the_same_lines(self):
+    def test_the_checks_are_the_same_lines(self):
         """They are written out in each file (client.py is copied alone to a worker's machine), so nothing but the
         program's name and what to do may differ."""
         shapes = set()
@@ -186,16 +231,16 @@ class SourceTests(unittest.TestCase):
                 ast.parse((ROOT/name).read_text(encoding='utf-8'), feature_version=(3, 6))
 
     def test_every_program_of_the_kit_has_the_check_or_is_known_to_start_without_it(self):
-        """Review of kittrial-5bb.191: six programs had been missed. Every file with a ``__main__`` block is
-        in ADVICE (and so in every test above) or on one of the two short lists, and on one only."""
+        """Review of kittrial-5bb.191: six programs had been missed. Every .py in the root and tools/ is
+        in ADVICE (and so in every test above), on one of the two short lists, or in MODULES (library-only).
+        A script without a ``__main__`` block (as tools/demonstrate_review_targeting.py is) must be seen
+        too (kittrial-5bb.222, reviewer mutant l4)."""
         programs = set()
         for folder in (ROOT, ROOT/'tools'):
             for path in folder.glob('*.py'):
-                if any(isinstance(node, ast.If) and '__main__' in ast.unparse(node.test) and '__name__' in ast.unparse(node.test)
-                       for node in ast.parse(path.read_text(encoding='utf-8')).body):
-                    programs.add(path.relative_to(ROOT).as_posix())
+                programs.add(path.relative_to(ROOT).as_posix())
         self.assertGreaterEqual(len(programs), 27)
-        listed = list(ADVICE) + list(RUN_UNDER_3_6) + list(STARTED_UNDER_3_6)
+        listed = list(ADVICE) + list(RUN_UNDER_3_6) + list(STARTED_UNDER_3_6) + list(MODULES)
         self.assertEqual(len(listed), len(set(listed)))
         self.assertEqual(sorted(programs), sorted(listed))
         for name in RUN_UNDER_3_6 + STARTED_UNDER_3_6:
