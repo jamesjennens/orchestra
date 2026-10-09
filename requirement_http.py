@@ -150,7 +150,7 @@ def _spec(context, body, action, operation_id):
             args = ['create', '--title', title, '--description', description, '--type', 'decision',
                     '--no-inherit-labels', '--labels', label, '--json']
             run(args + ['--dry-run'])
-            decision = json.loads(run(args))
+            decision = record_json.loads(run(args))
             if not isinstance(decision, dict) or not decision.get('id'):
                 raise ValueError('Generated decision outcome is uncertain; reconcile the operation')
             decision_id = decision['id']

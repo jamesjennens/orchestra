@@ -246,6 +246,36 @@ class OwnerHttpTests(EndpointCase):
         self.assertEqual(len(self.backend.native.writes()), before)
         self.assertEqual(set(records.existing_revisions(row)), {1})
 
+    def test_deep_decision_receipt_keeps_draft_and_recovers_without_duplicate(self):
+        import record_json
+        first = self.create_requirement()
+        route = self.base + '/requirements/' + first['id'] + '/accept'
+        native_type = type(self.backend.native)
+        original = native_type.__call__
+
+        def deep_receipt(native, args):
+            answer = original(native, args)
+            if (args[0] == 'create' and '--dry-run' not in args
+                    and args[args.index('--type') + 1] == 'decision'):
+                depth = record_json.NESTING_MAX + 1
+                return answer[:-1] + ',"extra":' + '[' * depth + '0' + ']' * depth + '}'
+            return answer
+
+        with mock.patch.object(native_type, '__call__', deep_receipt):
+            failed = self.request('POST', route, self.expected(first),
+                                  token=self.owner_token, key='deep-decision-receipt')
+        self.assertEqual(failed.status, 503, failed.data)
+        row = self.backend.native.row(first['id'])
+        self.assertEqual(set(records.existing_revisions(row)), {1})
+        self.assertFalse(owner_records.existing_acceptances(row))
+        self.assertEqual(sum(r['issue_type'] == 'decision' for r in self.backend.native.rows), 1)
+        recovered = self.request('POST', route, self.expected(first),
+                                 token=self.owner_token, key='deep-decision-receipt')
+        self.assertEqual(recovered.status, 200, recovered.data)
+        self.assertEqual(set(records.existing_revisions(row)), {1, 2})
+        self.assertEqual(len(owner_records.existing_acceptances(row)), 1)
+        self.assertEqual(sum(r['issue_type'] == 'decision' for r in self.backend.native.rows), 1)
+
     def test_closed_fields_and_idempotency_conflict_do_not_write(self):
         first = self.create_requirement()
         before = len(self.backend.native.writes())
