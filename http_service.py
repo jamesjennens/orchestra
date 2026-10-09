@@ -3505,12 +3505,17 @@ class ApiHandler(BaseHTTPRequestHandler):
                                            project_id=project_id, reason=reason)
                 if audit_metadata:
                     event.update(audit_metadata)
-            # A durable replay answer must never precede its state. A crash between
-            # these writes leaves an in-progress reservation, not a fictional result.
-            self.service.store.save()
             if state_saved:
+                # Credential issuance/revocation owns a persistence boundary. A
+                # crash before its receipt must not replay a nonexistent credential.
+                self.service.store.save()
                 state_saved()
-            self.service.idempotency_commit(digest, status, stored, written_at=at)
+                self.service.idempotency_commit(digest, status, stored, written_at=at)
+            else:
+                # Preserve ordinary routes' receipt-first retry contract: a failed
+                # state save must not strand their key as in-progress for 24 hours.
+                self.service.idempotency_commit(digest, status, stored, written_at=at)
+                self.service.store.save()
             self._forget_cached_reads(ctx.principal, project_id)
         return status, public
 

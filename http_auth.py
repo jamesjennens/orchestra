@@ -2876,7 +2876,7 @@ class Service:
                         self.store.unsaved_since = self.store.clock()
                 else:
                     self.store.unsaved_since = unsaved
-            elif not saved[0] and self.store.unsaved_since is None:
+            elif not saved[0] and not isinstance(error, HttpError) and self.store.unsaved_since is None:
                 self.store.unsaved_since = self.store.clock()
             raise
         finally:
@@ -3128,6 +3128,10 @@ class Service:
             if not isinstance(credential, dict) or \
                     credential.get('agent_id') != agent['id']:
                 raise not_found('Credential not found')
+            if credential.get('revoked'):
+                # A retry after a failed save can persist the pending revocation,
+                # without claiming another revocation or appending a second event.
+                return {'id': credential_id, 'agent': agent['id'], 'revoked': True}
             before = self.agent_scopes(agent)
             credential['revoked'] = True
             self._prune_agent_credentials(agent)

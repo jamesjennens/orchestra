@@ -4,6 +4,7 @@ await import(shim);
 const { createApi } = await import(apiUrl);
 const view = await import(viewUrl);
 const reads = [];
+const requestedLimits = [];
 let pending = 0;
 const api = createApi(async (method, path, headers, body) => {
   reads.push(path);
@@ -13,7 +14,10 @@ const api = createApi(async (method, path, headers, body) => {
     return { status: response.status, data: await response.json() };
   } finally { pending -= 1; }
 });
-const ctx = { api: { ...api, agents: (params) => api.agents({ ...params, limit: 2 }) },
+const ctx = { api: { ...api, agents: (params) => {
+  requestedLimits.push(params.limit);
+  return api.agents({ ...params, limit: 2 });
+} },
   me: { id: owner, superuser: true }, projects: [], href: (path) => '#' + path, go() {} };
 const page = await view.list(ctx);
 async function settle() {
@@ -36,6 +40,7 @@ await click('Next agents');
 const second = ids();
 await click('Previous agents');
 const back = ids();
+await click('Next agents');
 const filter = page.all((element) => element.attributes['data-filter'] === 'unconfirmed-scopes')[0];
 filter.checked = true;
 await filter.dispatch('change');
@@ -43,4 +48,4 @@ await settle();
 const filteredFirst = ids();
 await click('Next agents');
 const filteredSecond = ids();
-console.log(JSON.stringify({ first, second, back, filteredFirst, filteredSecond, reads }));
+console.log(JSON.stringify({ first, second, back, filteredFirst, filteredSecond, reads, requestedLimits }));

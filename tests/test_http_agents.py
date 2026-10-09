@@ -1836,6 +1836,10 @@ class AgentsPageTests(RenewalScopeTests):
         self.assertIn('inferred', seen['ownerInferredAsked'])
         self.assertIn('not confirmed', seen['ownerInferredAsked'])
         self.assertIn('stored scopes: read', seen['ownerInferredAsked'])
+        self.assertIn('inferred', seen['ownerInferredSaveText'])
+        self.assertIn('confirms', seen['ownerInferredSaveText'])
+        self.assertIn('inferred', seen['ownerInferredSaveAsked'])
+        self.assertIn('confirms', seen['ownerInferredSaveAsked'])
         self.assertEqual({'boxes': {}, 'ownerChoice': 1, 'save': False}, seen['adminInferred'])
         # 1. What the card says, and what "What it may do" shows.
         self.assertEqual((first['Kestrel']['scopes'], first['Kestrel']['source'], first['Kestrel']['differ']), ('read', 'set', None))

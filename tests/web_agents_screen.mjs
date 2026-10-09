@@ -105,6 +105,9 @@ async function open(ctx) { const page = await view.list(ctx); await settle(); re
   await settle();
   out.ownerInferredAsked = await pressAndConfirm(button(dialogs().slice(-1)[0], 'Issue a new secret'), 'click', 'Cancel');
   await closeDialogs();
+  out.ownerInferredSaveText = form(page, 'Wren').textContent;
+  out.ownerInferredSaveAsked = await pressAndConfirm(form(page, 'Wren'), 'submit', 'Cancel');
+  await closeDialogs();
 
   // 3. Nothing ticked: said, and nothing is sent.
   const before = sent.length;

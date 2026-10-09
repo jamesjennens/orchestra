@@ -1803,7 +1803,8 @@ revoked one that was wider then seeded the next renewal once nothing worked).
   `agents.credentials.issued` and `agents.credentials.revoked` name `agent_id`,
   `target_credential_id`, `credential_scopes`, `scopes_before`/`scopes_after` and their
   sources, alongside the acting account, request ID and time. Each successful issue
-  or revoke leaves one event, including scope changes in that event. These contain no
+  or first revocation leaves one event, including scope changes in that event. Revoking
+  an already revoked credential returns success without a second revocation event. These contain no
   labels, secrets, token hashes or working directories. Pruning credentials does not
   remove their audit entries; retention eventually does. HTTP disable events
   (`agents.disable`, `agents.update` with `enabled: false`, `accounts.disable`) include
@@ -1827,11 +1828,20 @@ revoked one that was wider then seeded the next renewal once nothing worked).
   authentication with that secret is refused; the next successful save persists the
   revocation. A service restart before that save can lose the pending revocation, so
   the failed response does not claim durable revocation.
+  A same-key retry after a failed state save can finish saving that revocation without
+  a second revocation event. A refused revoke leaves only its refusal audit pending
+  if that audit could not be saved; it does not mark already saved state as unsaved.
+- Ordinary mutation routes retain receipt-before-state-save ordering. After a failed
+  save (`500` for a write error or `503` for a lock timeout), a same-key retry replays
+  their recorded answer (agent creation returns `200` without its one-time secret;
+  other routes retain their original success status). This replay records the in-memory
+  operation, and does not by itself prove the state file survived a restart. Credential
+  issuance and revocation use the stricter state-before-receipt boundary described above.
 - The new agents page requests 20 cards at a time with `limit`, `cursor` and
   `unconfirmed=true|false`. Filtering is applied on the service before building the
   bounded card response; Previous/Next controls fetch one page at a time. An existing
   client requesting `/v1/agents` without those parameters retains the full-list response.
-  The owning account's Set up folder confirmation explicitly says when issuing a
+  The owning account's Save form and confirmation, and Set up folder confirmation, say when issuing a
   secret will confirm inferred scopes as stored scopes.
 - The carried `agents.renewal-keeps-scopes` revision 3 proposal's `expected_sha256`
   identifies the accepted canonical revision 2 record

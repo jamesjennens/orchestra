@@ -187,6 +187,7 @@ export async function list(ctx) {
   function editScopes(agent) {
     const own = Boolean(ctx.me && agent.owner === ctx.me.id);
     const known = Array.isArray(agent.scopes);
+    const inferredWarning = agent.scopes_source === 'inferred' ? 'These scopes are inferred. Saving confirms the chosen list as this agent’s stored scopes. ' : '';
     const has = known ? agent.scopes : [];
     const other = otherCredentials(agent);
     const details = h('details', { class: 'deliver', 'data-panel': 'agent-scopes', open: !known || other.length ? true : null });
@@ -210,7 +211,7 @@ export async function list(ctx) {
         SCOPES.map(([scope, label]) => h('label', { class: 'check', for: `sc-${agent.id}-${scope}` },
           h('input', { type: 'checkbox', id: `sc-${agent.id}-${scope}`, name: 'scope', value: scope, checked: ticked.has(scope) ? true : null,
             disabled: !own && !has.includes(scope) ? true : null }), label)),
-        h('p', { class: 'small muted' }, own ? 'Saving issues a new secret that carries exactly these, and a later new secret carries them too. A credential it already has keeps what it allows until you revoke it above.' :
+        h('p', { class: 'small muted' }, own ? inferredWarning + 'Saving issues a new secret that carries exactly these, and a later new secret carries them too. A credential it already has keeps what it allows until you revoke it above.' :
           'Only the agent’s own account may give it more than it has; you may take something away. Saving issues a new secret.')),
       h('p', { class: 'error', role: 'alert', hidden: true }),
       h('div', null, h('button', { type: 'submit' }, 'Save and issue a new secret')));
@@ -222,7 +223,7 @@ export async function list(ctx) {
       problem.textContent = chosen.length ? '' : 'Tick at least one.';
       if (!chosen.length) return;
       if (!(await confirmDialog({ title: 'Set what it may do and issue a new secret?',
-        body: `${agent.name} will have: ${chosen.join(', ')}. A new credential with exactly these is created and its secret is shown once.`, confirmLabel: 'Issue new secret' }))) return;
+        body: inferredWarning + `${agent.name} will have: ${chosen.join(', ')}. A new credential with exactly these is created and its secret is shown once.`, confirmLabel: 'Issue new secret' }))) return;
       let result;
       try { result = await act(form.querySelector('button'), () => ctx.api.issueAgentCredential(agent.id, chosen), { success: 'New secret issued' }); } catch { return; }
       const fresh = await ctx.api.agent(agent.id).catch(() => agent);

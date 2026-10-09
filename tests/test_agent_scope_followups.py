@@ -240,6 +240,131 @@ class AgentScopeFollowupTests(AgentHarness):
         self.assertEqual(200, replay.status, replay.data)
         self.assertNotIn('secret', replay.data['credential'])
 
+    def test_ordinary_routes_retry_after_failed_save_without_in_progress_refusal(self):
+        for fault in (OSError, TimeoutError):
+            for operation in ('notes', 'create-agent', 'disable-agent', 'create-account'):
+                with self.subTest(fault=fault.__name__, operation=operation):
+                    aid, _, _ = self.agent(['read'], name=fault.__name__ + operation)
+                    method, path, body, token, action, expected = {
+                        'notes': ('PATCH', '/v1/agents/' + aid, {'notes': 'saved notes'},
+                                  self.owner, 'agents.update', 200),
+                        'create-agent': ('POST', '/v1/agents', {'name': 'Retry agent ' + fault.__name__,
+                                         'projects': [self.project], 'scopes': ['read']},
+                                         self.owner, 'agents.create', 200),
+                        'disable-agent': ('POST', '/v1/agents/' + aid + '/disable', {},
+                                          self.owner, 'agents.disable', 200),
+                        'create-account': ('POST', '/v1/accounts', {'username': 'retry-' + fault.__name__.lower(),
+                                           'display_name': 'Retry account'}, self.admin, 'accounts.create', 201),
+                    }[operation]
+                    write = self.store._write
+                    fired = []
+                    def fail_once():
+                        if not fired and len(self.service.state['audit']) > audit_start and self.service.state['audit'][-1]['action'] == action:
+                            fired.append(True)
+                            raise fault('synthetic ordinary mutation save failure')
+                        return write()
+                    key = fault.__name__ + operation
+                    audit_start = len(self.service.state['audit'])
+                    with mock.patch.object(self.store, '_write', side_effect=fail_once):
+                        first = self.request(method, path, body, token=token, key=key)
+                    self.assertEqual([True], fired)
+                    self.assertEqual(500 if fault is OSError else 503, first.status, first.data)
+                    retry = self.request(method, path, body, token=token, key=key)
+                    self.assertEqual(expected, retry.status, retry.data)
+                    events = [e for e in self.service.state['audit'][audit_start:]
+                              if e['action'] == action and e['outcome'] == 'committed']
+                    self.assertEqual(1, len(events))
+
+    def test_refused_revoke_does_not_mark_saved_state_pending(self):
+        aid, secret, made = self.agent(['read'])
+        path = '/v1/agents/%s/credentials/%s/revoke' % (aid, made['credential']['id'])
+        cases = ((404, path.replace(made['credential']['id'], 'cred_missing'), self.owner),
+                 (403, path, secret), (422, path, self.owner))
+        for status, target, token in cases:
+            with self.subTest(status=status):
+                refused = mock.patch.object(self.service, 'revoke_agent_credential',
+                                            side_effect=http_auth.invalid('synthetic refusal')) if status == 422 else contextlib.nullcontext()
+                with refused:
+                    reply = self.request('POST', target, {}, token=token)
+                self.assertEqual(status, reply.status, reply.data)
+                self.assertFalse(self.service.state['credentials'][made['credential']['id']]['revoked'])
+                self.assertIsNone(self.store.unsaved_since)
+                self.assertEqual(reply.data['request_id'], json.loads(self.store.path.read_text())['audit'][-1]['request_id'])
+
+    def test_refused_revoke_preserves_busy_refusal_audit(self):
+        aid, _, made = self.agent(['read'])
+        path = '/v1/agents/%s/credentials/cred_missing/revoke' % aid
+        write = self.store._write
+        def busy_refusal():
+            if self.service.state['audit'][-1]['action'] == 'agents.credentials.revoke':
+                raise TimeoutError('synthetic refusal save busy')
+            return write()
+        with mock.patch.object(self.store, '_write', side_effect=busy_refusal):
+            reply = self.request('POST', path, {}, token=self.owner)
+        self.assertEqual(404, reply.status, reply.data)
+        self.assertIsNotNone(self.store.unsaved_since)
+        self.assertFalse(self.service.state['credentials'][made['credential']['id']]['revoked'])
+        self.store.save()
+        self.assertIsNone(self.store.unsaved_since)
+        self.assertEqual(reply.data['request_id'], json.loads(self.store.path.read_text())['audit'][-1]['request_id'])
+
+    def test_open_credential_boundary_retains_prefix_but_saves_only_audit_tail(self):
+        aid, _, _ = self.agent(['read'])
+        with self.store.lock:
+            self.service.state['audit'] = [dict(action='fixture', request_id=str(i))
+                                           for i in range(http_auth.AUDIT_LIMIT)]
+            with self.service._agent_credential_transaction(self.service.state['agents'][aid]):
+                self.service.audit('append-inside', None, 'fixture', 'committed')
+                self.assertEqual(http_auth.AUDIT_LIMIT + 1, len(self.service.state['audit']))
+                self.assertEqual('0', self.service.state['audit'][0]['request_id'])
+                self.store.save()
+                disk = json.loads(self.store.path.read_text())['audit']
+                self.assertEqual(http_auth.AUDIT_LIMIT, len(disk))
+                self.assertEqual(('1', 'append-inside'), (disk[0]['request_id'], disk[-1]['request_id']))
+            self.assertEqual(http_auth.AUDIT_LIMIT, len(self.service.state['audit']))
+
+    def test_failed_issue_restores_exact_prior_unsaved_stamp(self):
+        aid, _, _ = self.agent(['read'])
+        agent = self.service.state['agents'][aid]
+        for prior in (None, 1234.5):
+            with self.subTest(prior=prior), self.store.lock:
+                self.store.unsaved_since = prior
+                with self.assertRaises(TimeoutError):
+                    with self.service._agent_credential_transaction(agent):
+                        agent['scopes'] = ['read', 'tasks']
+                        self.store.unsaved_since = 9999.0
+                        raise TimeoutError('synthetic failed issuance')
+                self.assertEqual(prior, self.store.unsaved_since)
+                self.assertEqual(['read'], agent['scopes'])
+        self.store.save()
+
+    def test_credential_liveness_uses_positive_current_expiry_time(self):
+        aid, _, made = self.agent(['read'])
+        credential = self.service.state['credentials'][made['credential']['id']]
+        credential.pop('issued_raw', None)
+        credential['expires_at'] = time.time() - 10
+        self.assertFalse(self.service._credential_live(credential))
+        self.assertFalse(self.service._credential_live(credential, time.time()))
+
+    def test_renewal_prunes_expired_credentials_at_positive_current_time(self):
+        aid, _, made = self.agent(['read'])
+        template = self.service.state['credentials'][made['credential']['id']]
+        with self.store.lock:
+            for i in range(http_auth.AGENT_DEAD_CREDENTIALS_KEPT + 1):
+                expired = dict(template, id='cred_expired_%d' % i,
+                               token_hash='synthetic-expired-hash-%d' % i,
+                               expires_at=time.time() - 10)
+                expired.pop('issued_raw', None)
+                self.service.state['credentials'][expired['id']] = expired
+                self.service.state['credential_tokens'][expired['token_hash']] = expired['id']
+            self.store.save()
+        reply = self.renew(aid)
+        self.assertEqual(201, reply.status, reply.data)
+        expired_ids = [cid for cid in self.service.state['credentials'] if cid.startswith('cred_expired_')]
+        self.assertEqual(http_auth.AGENT_DEAD_CREDENTIALS_KEPT, len(expired_ids))
+        self.assertNotIn('cred_expired_0', self.service.state['credentials'])
+        self.assertNotIn('synthetic-expired-hash-0', self.service.state['credential_tokens'])
+
     def test_failed_receipt_keeps_saved_credential_and_reservation(self):
         aid, _, _ = self.agent(['read'])
         before = set(self.service.state['credentials'])
@@ -313,6 +438,9 @@ client.getresponse()
             with self.subTest(operation=operation):
                 aid, secret, made = self.agent(['read'], name='Disable ' + operation)
                 cid = made['credential']['id']
+                dead = self.renew(aid).data['credential']['id']
+                self.service.state['credentials'][dead]['revoked'] = True
+                self.store.save()
                 if operation == 'agent':
                     reply = self.request('POST', '/v1/agents/%s/disable' % aid, {}, token=self.owner)
                     action = 'agents.disable'
@@ -326,6 +454,7 @@ client.getresponse()
                 event = next(event for event in reversed(self.service.state['audit']) if event['action'] == action)
                 self.assertIn(aid, event['agent_ids'])
                 self.assertIn(cid, event['target_credential_ids'])
+                self.assertNotIn(dead, event['target_credential_ids'])
                 self.assertEqual(401, self.request('GET', '/v1/agents/me', token=secret).status)
                 self.assertNotIn(secret, json.dumps(event))
 
@@ -382,6 +511,9 @@ client.getresponse()
         self.assertEqual(set(ids[1:]), set(seen['filteredFirst'] + seen['filteredSecond']))
         self.assertTrue(all('limit=2' in path for path in seen['reads']))
         self.assertTrue(any('unconfirmed=true' in path and 'cursor=' in path for path in seen['reads']))
+        filtered = [path for path in seen['reads'] if 'unconfirmed=true' in path]
+        self.assertNotIn('cursor=', filtered[0])
+        self.assertTrue(all(limit == 20 for limit in seen['requestedLimits']))
 
     def test_failed_revocation_keeps_access_revoked_and_next_save_persists(self):
         aid, secret, made = self.agent(['read'])
@@ -404,6 +536,13 @@ client.getresponse()
         disk = json.loads(self.store.path.read_text(encoding='utf-8'))
         self.assertTrue(disk['credentials'][cid]['revoked'])
         self.assertIsNone(self.store.unsaved_since)
+        retry = self.request('POST', '/v1/agents/%s/credentials/%s/revoke' % (aid, cid),
+                             {}, token=self.owner, key='revoke-failed')
+        self.assertEqual(204, retry.status, retry.data)
+        events = [event for event in self.service.state['audit']
+                  if event['action'] == 'agents.credentials.revoked'
+                  and event['target_credential_id'] == cid]
+        self.assertEqual(1, len(events))
 
     def test_issue_and_revoke_each_leave_one_private_metadata_event(self):
         aid, _, _ = self.agent(['read'])
@@ -428,6 +567,10 @@ client.getresponse()
             self.assertTrue(event['time'])
         self.assertEqual((['read'], ['read', 'tasks']),
                          (events[0]['scopes_before'], events[0]['scopes_after']))
+        self.assertEqual((['read', 'tasks'], ['read', 'tasks']),
+                         (events[1]['scopes_before'], events[1]['scopes_after']))
+        self.assertEqual(('set', 'set'), (events[1]['scopes_source_before'], events[1]['scopes_source_after']))
+        self.assertEqual(['read', 'tasks'], events[1]['credential_scopes'])
         raw = json.dumps(events)
         for private in ['PRIVATE LABEL', reply.data['credential']['secret'], 'token_hash', 'working_directory']:
             self.assertNotIn(private, raw)
