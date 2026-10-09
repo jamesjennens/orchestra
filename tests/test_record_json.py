@@ -271,7 +271,10 @@ class NoUnguardedParseTests(unittest.TestCase):
             # operator/verifier list commands append to and an operator reads: a nested or
             # unreadable file must be a refusal naming it, not a traceback.
             'admin.py': 5,
-            'briefing.py': 3, 'coordination.py': 3, 'endpoint.py': 4, 'export_requirements.py': 1, 'feedback.py': 3, 'guidance.py': 3,
+            # endpoint.py's fifth (kittrial-5bb.195): the JSON payload of a coordinator
+            # acceptance command, which the caller transports as a file attachment. It is
+            # the caller's text, so it is parsed through the guard.
+            'briefing.py': 3, 'coordination.py': 3, 'endpoint.py': 5, 'export_requirements.py': 1, 'feedback.py': 3, 'guidance.py': 3,
             'handoff.py': 1, 'http_service.py': 2, 'lifecycle.py': 1, 'recovery.py': 1, 'requirements.py': 1, 'requirement_records.py': 1, 'reserved_comments.py': 1,
             'review_recommendations.py': 2, 'review_workflow.py': 4, 'work.py': 1, 'worker_gate.py': 1})
 
