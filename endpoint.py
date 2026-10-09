@@ -425,8 +425,31 @@ def tracker_actors(root,path,before=None,own=()):
     One ``bd export --all`` for the project, through the same read ``admin.py
     credential-actors`` makes: a bd process that opens the project's database. That is the
     cost of judging a plain name by the rows it has, and it is paid where the rule is
-    applied, never by every write (docs/HTTP_DEPLOYMENT.md says so). A tracker that cannot
-    be read raises ``actor_names.TrackerUnreadable``, and a read that came back without the
+    applied, never by every write (docs/HTTP_DEPLOYMENT.md says so). What depends on it:
+    ``reserved_actors`` feeds the tracker names to the worker-credential name rule on every
+    HTTP-path write (``descriptor_actor_denial``, kittrial-5bb.184/188) and to the
+    ``actor-standing`` rows read the web service makes when it issues a credential, so a
+    read that fails blocks every write under a plain name and every issue, for the whole
+    project.
+
+    Rows are parsed with the row bound of kittrial-5bb.141 (``record_json.loads_rows``,
+    ``ROW_NESTING_MAX`` 750), not the 64-level record-comment guard that used to refuse
+    this read on one row nested 65 levels (kittrial-5bb.221): a row nested up to 750
+    levels parses normally and its own author, assignee and comment names count. ANY row
+    that cannot be parsed -- unparseable text, deeper than 750, a line cut short -- still
+    refuses the whole read exactly as before: an unreadable row may be the row that holds
+    the name, and a name the tracker might hold must not become issuable or writable
+    through a worker credential (revision-2 review item 1: a comment holding U+0085, or
+    751-level metadata, hid a row's author and a credential under that name was issued and
+    wrote). A marked row never counts as the project's merge slot: its id can be recovered
+    from text nobody has read, and the whole-read proof must rest on a row that was read.
+    (bd's answer being cut at U+0085 inside a string is kittrial-5bb.239's, on
+    record_json.loads_rows itself; until that lands, such a row refuses here exactly as on
+    main.)
+
+    A tracker that cannot be read raises ``actor_names.TrackerUnreadable`` -- a bd that
+    exits nonzero, an export that holds an unreadable row or a line that is not a row, or
+    text that is not rows at all --, and a read that came back without the
     project's merge slot raises ``actor_names.TrackerMergeSlotMissing``: every project this
     kit makes holds that slot, and a missing slot is what the merge-create operation
     repairs, so it must not be answered as the transient fault "try again shortly"
@@ -457,13 +480,17 @@ def tracker_actors(root,path,before=None,own=()):
         raise actor_names.TrackerUnreadable()
     try:
         text=run_bd(root,path.name,['export','--all'])
-        rows=[record_json.loads(line) for line in text.splitlines() if line.strip()]
+        rows=record_json.loads_rows(text)
     except (subprocess.SubprocessError,OSError,ValueError,RecursionError):
         # bd could not answer, or answered something that is not rows: a host fault, never an
         # empty tracker and never a rejection of the caller's request.
         raise actor_names.TrackerUnreadable()
-    if rows and not any(isinstance(row,dict) for row in rows):
-        # Text came back, but it is not rows at all: the same failed read, not an empty tracker.
+    if any(not isinstance(row,dict) or row.get('malformed') for row in rows) \
+            or (not rows and text.strip()):
+        # One unreadable row refuses the whole read (not only its own names): the row may be
+        # the one that holds the name, and an unreadable row's id never proves the slot
+        # (kittrial-5bb.221). Text came back, but it is not rows at all (``null``, which the
+        # row reader drops): the same failed read, not an empty tracker (kittrial-5bb.202).
         raise actor_names.TrackerUnreadable()
     if not any(is_merge_slot(row) for row in rows):
         # Zero rows (a plain `bd init`: the read succeeded and the tracker holds nothing,
@@ -547,14 +574,19 @@ COORDINATOR_READS=('guidance-status',)
 #: The coordinator commands whose attachment is plain text rather than a JSON payload.
 COORDINATOR_TEXTS=('guidance-set','set-onboarding')
 #: The payload ``operation`` values ``reference-apply`` and ``capability-apply`` may carry
-#: through this route (review of 958e883, item 1). The host command's operator route also
-#: allows ``retire`` on a capability, the only route that withdraws an accepted entry, and
-#: ``propose``/``revise`` are the contributor route; both stay off this surface, so a confined
-#: coordinator can accept a reviewed draft or write a direct accepted revision 1 and nothing
-#: that weakens or withdraws what an earlier operator accepted. ``incorporated`` is not an
+#: through this route (review of 958e883, item 1; the owner decision of 2026-10-09 on
+#: kittrial-5bb.238). ``accept`` is the ONLY one: a record reaches this route only after
+#: somebody proposed it as a draft, so every acceptance has a recorded proposal before it (two
+#: attributed steps; that proposer and accepter differ is NOT checked here). ``draft`` - the
+#: library's direct accepted revision 1, which
+#: creates a key that did not exist already accepted, on one party's own word - is refused
+#: here and stays with the installation operator on the host (``admin.py reference-apply`` /
+#: ``admin.py capability-apply``). The host command's operator route also allows ``retire`` on
+#: a capability, the only route that withdraws an accepted entry, and ``propose``/``revise``
+#: are the contributor route; both stay off this surface. ``incorporated`` is not an
 #: entry-apply operation at all: it is a proposal disposition state reached through
 #: ``proposal-review``/``proposal-decide``, so it is neither allowed nor needed here.
-COORDINATOR_APPLY_OPERATIONS=('accept','draft')
+COORDINATOR_APPLY_OPERATIONS=('accept',)
 
 def coordinator_refusal(request,root,key_principal):
     """Refuse the coordinator acceptance commands unless the caller is a key bound to a principal
@@ -582,27 +614,48 @@ def coordinator_refusal(request,root,key_principal):
                                 'run %s through the endpoint'
                                 %(command if command else 'a coordinator command'))
 
+def coordinator_operation_refusal(command,where,operation,in_batch=False):
+    """One sentence for a payload operation this route does not carry (kittrial-5bb.238).
+
+    ``where`` says where the operation was found: ``carries`` for the single payload, or
+    ``items[2] carries`` for one item of a batch. ``draft`` gets its own sentence, because it
+    is the one operation a caller may expect from the host command: through this route a
+    record is accepted only after somebody proposed it, so the direct accepted revision 1
+    (a key created already accepted, on one party's own word) stays on the host. A batch item
+    carries no operation of its own whatever the value - the batch itself is the acceptance -
+    and that has its own sentence too.
+    """
+    if operation=='draft':
+        return ('coordinator %s %s operation %r: a new record is proposed first (capability propose / '
+                'ref propose) and then accepted, or created directly by the installation operator on the '
+                'host (admin.py %s with operation draft). Nothing was written.'
+                %(command,where,operation,command))
+    if in_batch:
+        return ('coordinator %s %s operation %r; a batch item carries no operation of its own - the batch '
+                'itself is the acceptance, and %s is the only operation this route carries. Nothing was '
+                'written.'%(command,where,operation,', '.join(COORDINATOR_APPLY_OPERATIONS)))
+    return ('coordinator %s %s operation %r; this route carries only %s. Nothing was written.'
+            %(command,where,operation,', '.join(COORDINATOR_APPLY_OPERATIONS)))
+
 def coordinator_apply_refusal(payload,command):
     """Refuse a payload operation ``reference-apply``/``capability-apply`` is not meant to carry.
 
     The check is on the PAYLOAD, before the library is called, for the single form and the
     ``items`` batch alike, so a payload can never carry an operation the route does not name
     (review of 958e883, item 1: ``operation: retire`` reached ``apply_native(operator=True)``
-    and superseded an accepted capability). The host commands are unchanged.
+    and superseded an accepted capability). ``accept`` is the only operation carried here (the
+    owner decision of 2026-10-09 on kittrial-5bb.238): ``draft``, the direct accepted
+    revision 1, is refused with its own sentence. The host commands are unchanged.
     """
     operation=payload.get('operation','accept')
     if operation not in COORDINATOR_APPLY_OPERATIONS:
-        raise ValueError('coordinator %s carries only %s through this surface; %r stays with the '
-                         'installation operator (retiring is admin.py capability-retire, and '
-                         'propose/revise are the contributor route). Nothing was changed.'
-                         %(command,', '.join(COORDINATOR_APPLY_OPERATIONS),operation))
+        raise ValueError(coordinator_operation_refusal(command,'carries',operation))
     items=payload.get('items')
     if isinstance(items,list):
         for index,item in enumerate(items):
             if isinstance(item,dict) and 'operation' in item:
-                raise ValueError('coordinator %s items[%d] carries operation %r; every batch item is an '
-                                 'acceptance (%s). Nothing was changed.'
-                                 %(command,index,item.get('operation'),', '.join(COORDINATOR_APPLY_OPERATIONS)))
+                raise ValueError(coordinator_operation_refusal(command,'items[%d] carries'%index,
+                                                               item.get('operation'),in_batch=True))
 
 def coordinator_payload(args,request):
     """The text of the one attachment a coordinator command carries, or None.
@@ -1088,15 +1141,28 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                 from onboarding import write_project
                 from http_authority import server_time as now_stamp
                 target=path/'ONBOARDING.md'
-                previous=(target.read_text(encoding='utf-8-sig')
-                          if target.is_file() and not target.is_symlink() else None)
+                previous=None
+                if target.is_file() and not target.is_symlink():
+                    try:
+                        previous=target.read_text(encoding='utf-8-sig')
+                    except (UnicodeDecodeError,OSError):
+                        # A damaged previous document must not stop the route from replacing it
+                        # (review of 6f3007a, finding 1; kittrial-5bb.238 item 1): the host command
+                        # replaces it, and a caller with no shell has no other way. The unreadable
+                        # previous text is treated as changed, and the answer says so in a sentence
+                        # rather than the bare UnicodeDecodeError that used to answer rc 2 with
+                        # nothing written.
+                        run_warnings.append('the previous ONBOARDING.md could not be read as UTF-8 text; '
+                                            'it was treated as changed and replaced')
                 write_project(target,text)
                 # This route does NOT probe the text for endpoint paths (review of 958e883, item 3b):
                 # probe_endpoints resolves and reads every absolute *.py path the text names and
                 # reveals one bit about each plus the resolved symlink target, and the server must
                 # never read a path out of the request. The host `admin.py set-onboarding` keeps its
-                # warning for the operator with a shell. WHO set the text is recorded here, as
-                # guidance records set_by.
+                # warning for the operator with a shell. `set_by` ECHOES the actor the server chose
+                # for this request (kittrial-5bb.238 item 4): the route records no attribution of its
+                # own, a request field called set_by is ignored, and the installation's own log is
+                # the only trace of who set the text.
                 result={'state':'set','source':'operator','bytes':len(text.encode('utf-8')),
                         'changed':previous!=text,'set_by':actor,'set_at':now_stamp()}
             elif command=='handoff':
@@ -1128,14 +1194,20 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             # The answer carries the server's time when this call wrote: a file set (guidance,
             # onboarding), a record accepted, a verification, a disposition. A no-op - an
             # idempotent retry the record module answered `reconciled: true` or `changed: false`,
-            # or an items batch whose every item was already-accepted - wrote nothing and carries
-            # no server_time (review of 958e883, finding 11: the comment used to claim this while
-            # guidance-set, set-onboarding and a batch still carried server_time).
+            # an items batch whose every item was already-accepted, or a verify whose every item
+            # was already-recorded - wrote nothing and carries no server_time (review of 958e883,
+            # finding 11: the comment used to claim this while guidance-set, set-onboarding and a
+            # batch still carried server_time; review of 6f3007a, finding 4: an all-
+            # already-recorded verify still did).
             no_op=(isinstance(result,dict)
                    and (result.get('reconciled') is True or result.get('changed') is False
                         or (command in ('reference-apply','capability-apply') and isinstance(payload,dict)
                             and isinstance(payload.get('items'),list) and bool(result.get('items'))
                             and all(isinstance(item,dict) and item.get('result')=='already-accepted'
+                                    for item in result['items']))
+                        or (command=='capability-verify' and isinstance(result.get('items'),list)
+                            and bool(result['items'])
+                            and all(isinstance(item,dict) and item.get('result')=='already-recorded'
                                     for item in result['items']))))
             if not (isinstance(result,dict) and result.get('reconciled') is True):runner.wrote=True
             if no_op:runner.wrote=False

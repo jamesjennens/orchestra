@@ -239,6 +239,27 @@ class GuidanceAndOnboardingTests(unittest.TestCase):
         self.assertEqual((self.project/'ONBOARDING.md').read_text(encoding='utf-8'),
                          'Project onboarding for alpha.\n')
 
+    def test_set_onboarding_replaces_a_damaged_previous_document(self):
+        # kittrial-5bb.238 item 1 (review of 6f3007a, finding 1): the previous document is read
+        # to compute `changed`, and a file that is not UTF-8 answered a bare UnicodeDecodeError,
+        # rc 2, nothing written - so the route could not replace a damaged document, which the
+        # host command can. An unreadable previous text is treated as changed and replaced, and
+        # the answer says so in a sentence.
+        (self.project/'ONBOARDING.md').write_bytes(b'\xff\xfe\x00damaged')
+        answer = self.ask('set-onboarding', text='Fresh onboarding for alpha.\n')
+        self.assertEqual(answer['returncode'], 0, answer['stderr'])
+        result = json.loads(answer['stdout'])
+        self.assertIs(result['changed'], True)
+        self.assertEqual((self.project/'ONBOARDING.md').read_bytes(),
+                         b'Fresh onboarding for alpha.\n')
+        self.assertIn('could not be read', answer['stderr'])
+        self.assertNotIn('UnicodeDecodeError', answer['stderr'])
+        # The next set of the same text is not changed, and says nothing about the old damage.
+        again = self.ask('set-onboarding', text='Fresh onboarding for alpha.\n')
+        self.assertEqual(again['returncode'], 0, again['stderr'])
+        self.assertIs(json.loads(again['stdout'])['changed'], False)
+        self.assertNotIn('could not be read', again['stderr'])
+
     def test_guidance_clear_with_nothing_set_answers_changed_false_and_writes_nothing(self):
         # Review of 958e883, item 3a: this used to answer rc 124 "outcome unknown" through an
         # AttributeError (version_of(None)), and a caller with no shell cannot reconcile that.
@@ -406,6 +427,37 @@ class DispatchedToTheHostRoutesTests(unittest.TestCase):
         self.assertEqual(seen['journal'], self.root/'projects'/'alpha')
         self.assertTrue(callable(seen['lock']))
 
+    def test_a_verify_whose_every_item_was_already_recorded_carries_no_server_time(self):
+        # kittrial-5bb.238 item 4 (review of 6f3007a, finding 4): the rule is that an answer
+        # carries the server's time when the call WROTE. A retry whose every item was already
+        # recorded wrote nothing, so it carries none, like the reconciled and already-accepted
+        # no-ops.
+        import capability_verification
+
+        def verify_batch(payload, actor, run, operators=None, verifiers=None, journal=None, lock=None):
+            return {'items': [{'key': 'c-1', 'result': 'already-recorded'},
+                              {'key': 'c-2', 'result': 'already-recorded'}],
+                    'recorded': 2, 'refused': 0}
+
+        with mock.patch.object(capability_verification, 'verify_batch', side_effect=verify_batch):
+            answer = self.execute('capability-verify',
+                                  payload={'schema_version': 1, 'items': [{'key': 'c-1'}]},
+                                  actor=VERIFIER)
+        self.assertEqual(answer['returncode'], 0, answer['stderr'])
+        self.assertNotIn('server_time', answer)
+        # One item really recorded: the call wrote, so it carries the time.
+        def mixed(payload, actor, run, operators=None, verifiers=None, journal=None, lock=None):
+            return {'items': [{'key': 'c-1', 'result': 'recorded'},
+                              {'key': 'c-2', 'result': 'already-recorded'}],
+                    'recorded': 2, 'refused': 0}
+
+        with mock.patch.object(capability_verification, 'verify_batch', side_effect=mixed):
+            answer = self.execute('capability-verify',
+                                  payload={'schema_version': 1, 'items': [{'key': 'c-1'}]},
+                                  actor=VERIFIER)
+        self.assertEqual(answer['returncode'], 0, answer['stderr'])
+        self.assertIn('server_time', answer)
+
     def test_proposal_review_and_decide_keep_their_two_roles(self):
         import proposal_records
         routes = []
@@ -452,11 +504,14 @@ class ApplyOperationAllowlistTests(unittest.TestCase):
     `coordinator capability-apply` with ``operation: retire`` reached
     ``apply_native(operator=True)`` and superseded an accepted capability. The check is now on
     the payload, before the library, for the single form and the ``items`` batch alike.
+    ``accept`` is the only operation left (owner decision of 2026-10-09 on kittrial-5bb.238):
+    ``draft`` is refused with its own sentence, because through this route a new record is
+    proposed first and then accepted.
     """
 
     #: Every operation the route must refuse, including '' (a present but empty value).
     REFUSED = ('retire', 'propose', 'revise', 'void', 'revert', 'reconcile', 'settings',
-               'incorporated', 'acceptance', '')
+               'incorporated', 'acceptance', '', 'ACCEPT', 'Draft')
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -490,12 +545,12 @@ class ApplyOperationAllowlistTests(unittest.TestCase):
                                  'approvers': ['account:u-1'], 'policy': 'any-owner',
                                  'evidence': 'decision-1'}}
         said = self.refused('capability-apply', single)
-        self.assertIn('accept, draft', said)
+        self.assertIn('carries only accept', said)
         self.assertIn('retire', said)
         for operation in self.REFUSED:
             with self.subTest(operation=operation):
-                self.assertIn('accept, draft', self.refused('capability-apply',
-                                                            dict(single, operation=operation)))
+                self.assertIn('carries only accept',
+                              self.refused('capability-apply', dict(single, operation=operation)))
 
     def test_reference_apply_refuses_every_operation_it_does_not_carry(self):
         for operation in self.REFUSED:
@@ -503,15 +558,51 @@ class ApplyOperationAllowlistTests(unittest.TestCase):
                 self.refused('reference-apply', {'schema_version': 1, 'operation': operation,
                                                  'key': 'r-1'})
 
+    def test_draft_is_refused_single_with_the_propose_first_sentence(self):
+        # The owner decision (2026-10-09, comment 01a1215a): the direct accepted revision 1 is
+        # NOT carried by this route. The sentence names the two ways a record is made and says
+        # nothing was written; it must never read as one of the other refusals.
+        for command in ('capability-apply', 'reference-apply'):
+            with self.subTest(command=command):
+                said = self.refused(command, {'schema_version': 1, 'operation': 'draft',
+                                              'key': 'c-1'})
+                self.assertIn('proposed first', said)
+                self.assertIn('capability propose / ref propose', said)
+                self.assertIn('installation operator on the host', said)
+                self.assertIn('operation draft', said)
+                self.assertIn('Nothing was written', said)
+                self.assertNotIn('carries only accept', said)
+
+    def test_a_draft_beside_a_valid_item_refuses_the_whole_batch(self):
+        # The owner decision: draft anywhere in a batch refuses the batch, whichever place it
+        # holds, so a valid item beside it is NOT applied (nothing is written at all). A batch
+        # item carries no `operation` of its own, so the valid item is a bare item.
+        for command in ('capability-apply', 'reference-apply'):
+            for index in (0, 1):
+                with self.subTest(command=command, index=index):
+                    items = [{'key': 'c-1'}, {'key': 'c-2'}]
+                    items[index] = {'key': 'c-%d' % (index + 1), 'operation': 'draft'}
+                    said = self.refused(command, {'schema_version': 1, 'operation_id': 'batch-draft',
+                                                  'items': items})
+                    self.assertIn('items[%d]' % index, said)
+                    self.assertIn('proposed first', said)
+
     def test_an_items_batch_refuses_a_stray_operation_field(self):
         batch = {'schema_version': 1, 'operation_id': 'batch-1', 'items': [{'key': 'c-1'}],
                  'acceptance_state': 'accepted', 'acceptance': {}}
         for command in ('capability-apply', 'reference-apply'):
             with self.subTest(command=command):
-                self.refused(command, dict(batch, items=[{'key': 'c-1', 'operation': 'retire'}]))
+                said = self.refused(command, dict(batch, items=[{'key': 'c-1', 'operation': 'retire'}]))
+                self.assertIn('items[0]', said)
+                self.assertIn('retire', said)
                 self.refused(command, dict(batch, operation='retire'))
+                # An item that repeats the batch's own acceptance is refused too: the field
+                # belongs to the batch, not to an item (the behaviour on main, kept).
+                self.assertIn('no operation of its own',
+                              self.refused(command, dict(batch, items=[{'key': 'c-1',
+                                                                        'operation': 'accept'}])))
 
-    def test_accept_and_draft_reach_the_library(self):
+    def test_accept_reaches_the_library(self):
         import capability_records
         import reference_records
         seen = []
@@ -522,13 +613,12 @@ class ApplyOperationAllowlistTests(unittest.TestCase):
 
         for command, module in (('capability-apply', capability_records),
                                 ('reference-apply', reference_records)):
-            for operation in ('accept', 'draft'):
-                with self.subTest(command=command, operation=operation):
-                    with mock.patch.object(module, 'apply_native', side_effect=apply_native):
-                        answer = self.execute(command, {'schema_version': 1, 'operation': operation,
-                                                        'key': 'k-1'})
-                    self.assertEqual(answer['returncode'], 0, answer['stderr'])
-        self.assertEqual(sorted(seen), ['accept', 'accept', 'draft', 'draft'])
+            with self.subTest(command=command):
+                with mock.patch.object(module, 'apply_native', side_effect=apply_native):
+                    answer = self.execute(command, {'schema_version': 1, 'operation': 'accept',
+                                                    'key': 'k-1'})
+                self.assertEqual(answer['returncode'], 0, answer['stderr'])
+        self.assertEqual(seen, ['accept', 'accept'])
 
 
 @POSIX
@@ -608,6 +698,101 @@ class MutantCoverageTests(unittest.TestCase):
                 self.assertEqual(file_tree(self.root), before)
         self.assertFalse((self.root/'projects'/'alpha'/'GUIDANCE.md').exists())
         self.assertFalse((self.root/'projects'/'alpha'/'ONBOARDING.md').exists())
+
+
+@POSIX
+class RoundTwoMutantCoverageTests(unittest.TestCase):
+    """The four mutants the second review of kittrial-5bb.195 left alive (README, finding 2).
+
+    N2 the operation allowlist is checked on the FIRST batch item only; N6 ``set_by`` is taken
+    from the request; N14 ``guidance-status`` takes no lock; N19 an attachment the token did not
+    name is used (the first one wins). One test each, through the real endpoint.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = runtime(self.tmp.name, 'alpha')
+        deployment(self.root)
+        registry(self.root/'projects'/'alpha', {ACTOR: PRINCIPAL})
+        self.project = self.root/'projects'/'alpha'
+
+    def ask(self, built):
+        return endpoint.execute(self.root, built, key_principal=PRINCIPAL, key_projects=['alpha'])
+
+    def refused_before_the_library(self, subcommand, payload):
+        import capability_records
+        import reference_records
+        called = AssertionError('the library was called for a refused operation')
+        before = file_tree(self.root)
+        with mock.patch.object(capability_records, 'apply_native', side_effect=called), \
+                mock.patch.object(capability_records, 'apply_batch', side_effect=called), \
+                mock.patch.object(reference_records, 'apply_native', side_effect=called), \
+                mock.patch.object(reference_records, 'apply_batch', side_effect=called):
+            with self.assertRaises(ValueError) as refusal:
+                self.ask(request(subcommand, payload=payload))
+        self.assertEqual(file_tree(self.root), before)
+        return str(refusal.exception)
+
+    def test_n2_the_allowlist_is_checked_on_every_batch_item_not_only_the_first(self):
+        # The only rev-2 batch test had one item, so a check that stopped after items[0]
+        # survived. Item 0 is a plain acceptance and item 1 carries the operation.
+        batch = {'schema_version': 1, 'operation_id': 'batch-n2', 'items': [],
+                 'acceptance_state': 'accepted', 'acceptance': {}}
+        for command in ('capability-apply', 'reference-apply'):
+            for operation in ('retire', 'draft'):
+                with self.subTest(command=command, operation=operation):
+                    items = [{'key': 'c-1'}, {'key': 'c-2', 'operation': operation}]
+                    said = self.refused_before_the_library(command, dict(batch, items=items))
+                    self.assertIn('items[1]', said)
+                    self.assertIn(operation, said)
+        # And a batch whose first item carries it is still refused at items[0].
+        said = self.refused_before_the_library(
+            'capability-apply', dict(batch, items=[{'key': 'c-1', 'operation': 'retire'},
+                                                   {'key': 'c-2'}]))
+        self.assertIn('items[0]', said)
+
+    def test_n6_set_by_is_the_servers_actor_and_never_the_requests(self):
+        built = request('set-onboarding', text='Onboarding for alpha.\n')
+        built['set_by'] = 'somebody-else'
+        built['set_at'] = '1999-01-01T00:00:00Z'
+        built['actor_field'] = 'somebody-else'
+        built['attachments']['0']['set_by'] = 'somebody-else'
+        answer = self.ask(built)
+        self.assertEqual(answer['returncode'], 0, answer['stderr'])
+        result = json.loads(answer['stdout'])
+        self.assertEqual(result['set_by'], ACTOR)
+        self.assertNotIn('somebody-else', json.dumps(result))
+        self.assertEqual((self.project/'ONBOARDING.md').read_text(encoding='utf-8'),
+                         'Onboarding for alpha.\n')
+
+    def test_n14_guidance_status_takes_the_project_coordination_lock(self):
+        # The host `admin.py guidance-status` takes the lock so the answer is one snapshot,
+        # not a read racing a set; the route must take it too.
+        before = file_tree(self.project)
+        with mock.patch.object(endpoint.fcntl, 'flock') as flock:
+            answer = self.ask(request('guidance-status'))
+        self.assertEqual(answer['returncode'], 0, answer['stderr'])
+        self.assertEqual(json.loads(answer['stdout'])['schema_version'], 1)
+        self.assertEqual(flock.call_count, 1)
+        self.assertEqual(flock.call_args.args[1], endpoint.fcntl.LOCK_EX)
+        self.assertEqual(file_tree(self.project), before)
+
+    def test_n19_only_the_attachment_the_token_names_is_used(self):
+        decoy = 'Text the token does not name.\n'
+        named = 'Text the token names.\n'
+        built = request('guidance-set')
+        built['args'] = ['guidance-set', '@attachment:1']
+        built['attachments'] = {'0': {'flag': '--file', 'text': decoy},
+                                '1': {'flag': '--file', 'text': named}}
+        answer = self.ask(built)
+        self.assertEqual(answer['returncode'], 0, answer['stderr'])
+        self.assertEqual((self.project/'GUIDANCE.md').read_text(encoding='utf-8'), named)
+        # The other token picks the other attachment: the token is the only key used.
+        built['args'] = ['guidance-set', '@attachment:0']
+        answer = self.ask(built)
+        self.assertEqual(answer['returncode'], 0, answer['stderr'])
+        self.assertEqual((self.project/'GUIDANCE.md').read_text(encoding='utf-8'), decoy)
 
 
 @POSIX
@@ -751,6 +936,30 @@ class ClientThroughTheForcedCommandTests(unittest.TestCase):
                 said = (answer.get('stderr') or '') + (answer.get('stdout') or '')
                 self.assertNotIn('Use --file with a local JSON or text file', said)
                 self.assertNotIn('Invalid attachment', said)
+
+    def test_a_draft_is_refused_through_the_real_wrapper(self):
+        # The owner decision of 2026-10-09, on the path a confined coordinator really uses:
+        # the shipped client's wire into the real ssh_forced_command wrapper and the shipped
+        # endpoint. Single, then inside a batch (second item), and nothing is written.
+        for subcommand in ('capability-apply', 'reference-apply'):
+            with self.subTest(subcommand=subcommand):
+                request = self.wire(subcommand, json.dumps({'schema_version': 1,
+                                                            'operation': 'draft', 'key': 'c-1'}))
+                before = file_tree(self.root)
+                answer = self.envelope(self.through(request))
+                self.assertEqual(answer['returncode'], 2, answer)
+                self.assertIn('proposed first', answer['stderr'])
+                self.assertIn('installation operator on the host', answer['stderr'])
+                self.assertIn('Nothing was written', answer['stderr'])
+                self.assertEqual(file_tree(self.root), before)
+        request = self.wire('reference-apply', json.dumps(
+            {'schema_version': 1, 'operation_id': 'batch-draft',
+             'items': [{'key': 'r-1'}, {'key': 'r-2', 'operation': 'draft'}]}))
+        before = file_tree(self.root)
+        answer = self.envelope(self.through(request))
+        self.assertEqual(answer['returncode'], 2, answer)
+        self.assertIn('items[1]', answer['stderr'])
+        self.assertEqual(file_tree(self.root), before)
 
 
 if __name__ == '__main__':
