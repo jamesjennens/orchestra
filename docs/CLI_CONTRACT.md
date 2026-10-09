@@ -1621,7 +1621,8 @@ a path out of the request. `guidance-set` and `set-onboarding` take plain text; 
 and `guidance-status` take no payload; the rest take one JSON object. `reference-apply` and
 `capability-apply` carry only the payload `operation` value `accept`: through this route a record
 is accepted only after somebody proposed it as a draft (`ref propose` / `capability propose`), so
-an accepted record was judged by someone other than its author. `draft` - the direct accepted
+every acceptance has a recorded proposal before it (the same actor may do both; that is not
+checked). `draft` - the direct accepted
 revision 1, which creates a key that did not exist already accepted on one party's own word -
 and `retire`, `propose` and `revise` are refused before the library is called, and nothing is
 written; a `draft` anywhere in an `items` batch refuses the whole batch. A batch item carries no

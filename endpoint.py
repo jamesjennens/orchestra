@@ -549,8 +549,9 @@ COORDINATOR_TEXTS=('guidance-set','set-onboarding')
 #: The payload ``operation`` values ``reference-apply`` and ``capability-apply`` may carry
 #: through this route (review of 958e883, item 1; the owner decision of 2026-10-09 on
 #: kittrial-5bb.238). ``accept`` is the ONLY one: a record reaches this route only after
-#: somebody proposed it as a draft and it was reviewed, so an accepted record was judged by
-#: somebody other than its author. ``draft`` - the library's direct accepted revision 1, which
+#: somebody proposed it as a draft, so every acceptance has a recorded proposal before it (two
+#: attributed steps; that proposer and accepter differ is NOT checked here). ``draft`` - the
+#: library's direct accepted revision 1, which
 #: creates a key that did not exist already accepted, on one party's own word - is refused
 #: here and stays with the installation operator on the host (``admin.py reference-apply`` /
 #: ``admin.py capability-apply``). The host command's operator route also allows ``retire`` on

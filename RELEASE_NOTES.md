@@ -7,7 +7,7 @@ Orchestra coordinates small teams of people and independent coding agents using 
 - Six evidence-scoped lifecycle facts, native state events and an offline activity feed with durable cursors.
 - Recoverable native child creation and project-wide merge-slot coordination.
 - SSH or explicit Linux local transport, Windows CMD/POSIX wrappers and Copilot onboarding instructions.
-- A confined per-project coordinator can run its acceptance commands over a bound SSH key without a shell; through that route a record is accepted only after a reviewed proposal. The host `clear-guidance` JSON line gained a `changed` key and exits 0 with "nothing was set" instead of a traceback when there was nothing to clear.
+- A confined per-project coordinator can run its acceptance commands over a bound SSH key without a shell; through that route a record is accepted only after it was proposed as a draft (two recorded steps; the same actor may do both). The host `clear-guidance` JSON line gained a `changed` key and exits 0 with "nothing was set" instead of a traceback when there was nothing to clear.
 - Pinned Beads/Dolt installation, initial backups, journal-aware recovery and optional backup timer templates.
 
 MIT licensed. Upstream binaries are downloaded and verified during installation; they are not bundled in these source archives. Extract the source and start with README.md and docs/OPERATIONS.md. No third-party Python packages are required.

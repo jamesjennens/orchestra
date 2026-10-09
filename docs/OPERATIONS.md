@@ -492,10 +492,11 @@ path the text names - server files read out of the request - and the host
 is reconcilable without a shell.
 
 **Which payload operations this surface carries.** `coordinator reference-apply` and
-`coordinator capability-apply` carry exactly one payload `operation` value: `accept`, the
-reviewed draft. Through this route a record is accepted only after somebody proposed it as a
-draft (`ref propose` / `capability propose`), and that is the point of an index of accepted
-records: an accepted record was judged by someone other than its author. They do **not** carry
+`coordinator capability-apply` carry exactly one payload `operation` value: `accept`, of a
+draft that exists. Through this route a record is accepted only after somebody proposed it as a
+draft (`ref propose` / `capability propose`), so every accepted record has a recorded proposal
+before its acceptance: two steps, both attributed. The route does not check that the proposer and
+the accepter differ; the same actor may do both. They do **not** carry
 `draft`, the library's direct accepted revision 1, which creates a key that did not exist
 already accepted on one party's own word - a per-project coordinator, possibly an agent,
 accepting its own brand-new record in one step; a direct revision 1 is created by the
