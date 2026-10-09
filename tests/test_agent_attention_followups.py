@@ -280,9 +280,7 @@ class NativeAttentionFollowups(held_stack.RealStackTests):
         finally:
             self.backend.endpoint = current
 
-    @unittest.skipUnless(os.environ.get('ORCHESTRA_ATTENTION_SCALE') == '1',
-                         'set ORCHESTRA_ATTENTION_SCALE=1 for the large native fixture')
-    def test_large_native_snapshot_recovers_250_owned_rows(self):
+    def seed_native_scale(self):
         actor = self.next()['agent']['actor']; owned = []
         for index in range(1070):
             args = ['create', '--title', 'Scale %04d' % index, '--json']
@@ -296,18 +294,31 @@ class NativeAttentionFollowups(held_stack.RealStackTests):
         rows = self.export_rows()
         self.assertGreaterEqual(len(rows), 1070)
         self.assertEqual(250, sum(row.get('assignee') == actor and row.get('status') != 'closed' for row in rows))
+        return rows
+
+    def native_scale_reads(self, rows):
         run = self.backend._run; calls = []
         def recording(action, project, reader, args, *rest, **kwargs):
             calls.append(dict(action=action, args=args))
             return run(action, project, reader, args, *rest, **kwargs)
         self.backend._run = recording
-        for label in ('first', 'repeat'):
-            calls.clear(); started = time.monotonic(); data = self.next(); elapsed = time.monotonic() - started
+        try:
+            for label in ('first', 'repeat'):
+                calls.clear(); started = time.monotonic(); data = self.next(); elapsed = time.monotonic() - started
+                view = data['attention']
+                print('NATIVE_ATTENTION_SCALE ' + json.dumps(dict(read=label, seconds=elapsed, rows=len(rows),
+                      claimed=view['counts']['claimed'], calls=calls, snapshot_truncated=view.get('snapshot_truncated'),
+                      own_tasks_truncated=view.get('own_tasks_truncated'), actions_truncated=view.get('actions_truncated'))),
+                      file=sys.stderr, flush=True)
+                yield data, list(calls)
+        finally:
+            self.backend._run = run
+
+    @unittest.skipUnless(os.environ.get('ORCHESTRA_ATTENTION_SCALE') == '1',
+                         'set ORCHESTRA_ATTENTION_SCALE=1 for the large native fixture')
+    def test_large_native_snapshot_recovers_250_owned_rows(self):
+        for data, calls in self.native_scale_reads(self.seed_native_scale()):
             view = data['attention']
-            print('NATIVE_ATTENTION_SCALE ' + json.dumps(dict(read=label, seconds=elapsed, rows=len(rows),
-                  claimed=view['counts']['claimed'], calls=calls, snapshot_truncated=view.get('snapshot_truncated'),
-                  own_tasks_truncated=view.get('own_tasks_truncated'), actions_truncated=view.get('actions_truncated'))),
-                  file=sys.stderr, flush=True)
             self.assertEqual((250, 250), (view['counts']['claimed'], view['counts']['in_progress']))
             self.assertEqual(4, len(calls))
             self.assertEqual([False, True, True, True], ['--owner' in row['args'] for row in calls])
