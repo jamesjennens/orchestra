@@ -266,7 +266,7 @@ class Integrated:
             # Only lifecycle rows are kept while the export streams by, so memory does
             # not grow with the project.
             rows = []
-            for line in self.run(['export', '--all']).splitlines():
+            for line in self.run(['export', '--all']).split('\n'):
                 if not line.strip():
                     continue
                 row = record_json.loads_row(line)
