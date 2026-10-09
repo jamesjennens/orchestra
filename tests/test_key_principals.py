@@ -870,6 +870,15 @@ class PrintAndAdoptCommandTests(unittest.TestCase):
                                          '--python', '/usr/bin/python3', '--principal', 'lane:orc-coord'))
         self.assertEqual(lane['principal'], 'lane:orc-coord')
 
+    def test_the_printed_payload_notes_first_call_and_pre_registration_check(self):
+        bound = json.loads(self.run_admin('authorized-keys', '--key-file', str(self.key),
+                                          '--python', '/usr/bin/python3', '--principal', MINE))
+        notes = ' '.join(bound['notes'])
+        self.assertIn('first kit call must be session register', notes)
+        self.assertIn('No other command (such as docs or ready) can precede registration', notes)
+        self.assertIn('admin.py authorized-keys-list', notes)
+        self.assertIn('ssh HOST exit or ssh -T HOST', notes)
+
     def test_a_repeated_principal_is_refused(self):
         # Finding 3: `authorized-keys --principal A --principal B` used to print B silently.
         self.assertEqual(admin.key_principal(MINE), MINE)

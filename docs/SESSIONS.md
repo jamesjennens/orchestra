@@ -59,6 +59,8 @@ python client.py --config client.local.json --project example --actor RETURNED_A
 
 Registration is the only client action that does not require an actor. Other commands retain the existing explicit-actor rule. The output is JSON containing `session.actor`, `session.name`, `session.created_at` and `session.request_id`.
 
+**Bound keys (`--principal lane:NAME`)**: For a key bound to a principal, `session register` is the **only** permitted first action. Because the principal owns no actors in the project before its first registration, any pre-registration command (including `docs`, `onboard`, or `ready`) is refused: client commands require `--actor`, and the endpoint's principal gate refuses any unowned actor. Workers in a newly bound lane must read instructions from their local checkout of the repository rather than querying served docs before registering. Operators can verify key installation non-destructively using `admin.py authorized-keys-list` on the server or plain SSH on the client (see [checking a bound key](OPERATIONS.md#checking-a-bound-key-without-spending-the-lanes-registration)).
+
 Before sending a registration, the client prints its generated request ID to stderr. After an uncertain response, retry with the **same name and request ID**:
 
 ```sh
