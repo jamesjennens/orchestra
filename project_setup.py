@@ -192,30 +192,52 @@ def steps(handler, principal, project_id):
     def backup(block):
         # Two different things, and the step says which is missing (kittrial-5bb.200: "todo" beside
         # "the last backup run recorded this project complete" read as a contradiction): a backup that
-        # has been RUN, and a SCHEDULE that will run the next one.
+        # has been RUN (as the last run recorded it), and a SCHEDULE that will run the next one. The
+        # step sees only systemd user units, so it never asserts as fact that no schedule anywhere
+        # covers the project: it says "no systemd user schedule was found", and an operator's recorded
+        # statement that backups are scheduled elsewhere reads the step done (kittrial-5bb.220 F1).
         last = block.get('last_run') if isinstance(block.get('last_run'), dict) else None
         if last:
             when = ' on %s' % last['completed_at'][:10] if last.get('completed_at') else ''
             run = 'A backup of this project was run%s and recorded it %s%s' % (
                 when, last.get('status'), ', degraded' if last.get('degraded') else '')
         scheduled = block.get('scheduled')
+        # An operator's recorded statement, shown with who recorded it and when. The server did
+        # not check it; it is about the whole runtime and never expires (kittrial-5bb.220 F1).
+        note = block.get('elsewhere')
+        recorded = None
+        if note:
+            who = ' by %s' % block.get('elsewhere_by') if block.get('elsewhere_by') else ''
+            when = ' on %s' % block.get('elsewhere_at')[:10] if block.get('elsewhere_at') else ''
+            recorded = ('An operator%s%s recorded that this runtime\'s backups are scheduled elsewhere: %s'
+                        % (who, when, note))
         if scheduled == 'covered':
             return 'done', ('A scheduled backup on the server covers this project. ' + (run + '.' if last else
                             'It has not run yet: no backup run has recorded this project.'))
-        if scheduled == 'not-covered':
-            looked = ('The step looks for a systemd unit of the service account (beads-*backup*.service) that backs '
-                      'up this runtime; a schedule kept anywhere else is not seen here.')
+        if scheduled == 'elsewhere':
+            detail = recorded + '. The server did not check this; the statement covers the whole runtime and never expires.'
             if last:
-                return 'todo', (run + ', but no schedule on the server covers it, so it will not be backed up again '
-                                'by itself. What is missing is the schedule. ' + looked)
-            return 'todo', ('No backup of this project has been run, and no schedule on the server covers it: both '
-                            'are missing. Run one now, then add the schedule. ' + looked)
+                detail += ' ' + run + '.'
+            return 'done', detail
+        if scheduled == 'not-covered':
+            looked = ('The step looks for an enabled systemd user timer (beads-*backup*.timer) that runs a '
+                      'beads-*backup*.service unit backing up this runtime; a schedule kept anywhere else is not '
+                      'seen here, and an operator can record one so this step reads done.')
+            if last:
+                return 'todo', (run + ', but no systemd user schedule was found for it. What is missing is the '
+                                'schedule. ' + looked)
+            return 'todo', ('No backup run has recorded this project yet, and no systemd user schedule was found '
+                            'for it: both are missing. Run one now, then add the schedule. ' + looked)
         ran = (' ' + run + '.') if last else ' No backup run has recorded this project yet.'
         if block.get('reason') == 'no-account-home':
-            return 'unknown', ('The server could not check its backup schedule: the web service was started without '
-                               'the account\'s home directory, so it cannot see the installed schedule. Ask an '
-                               'operator to check on the server.' + ran)
-        return 'unknown', 'The server could not read its backup schedule, so ask an operator.' + ran
+            detail = ('The server could not check its backup schedule: the web service was started without '
+                      'the account\'s home directory, so it cannot see the installed schedule. Ask an '
+                      'operator to check on the server.' + ran)
+        else:
+            detail = 'The server could not read its backup schedule, so ask an operator.' + ran
+        if recorded:
+            detail += ' ' + recorded + ' (the server did not check it).'
+        return 'unknown', detail
     block = (status or {}).get('backup') if isinstance((status or {}).get('backup'), dict) else {}
     line, run_now, check = (block.get(key) if isinstance(block.get(key), str) else None for key in ('line', 'run_now', 'check'))
     where = block.get('unit_directory') if isinstance(block.get('unit_directory'), str) else None

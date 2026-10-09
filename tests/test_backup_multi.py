@@ -493,6 +493,15 @@ class ScheduledCoverageGuidanceCase(unittest.TestCase):
             encoding='utf-8')
         return path
 
+    def write_timer(self, unit='beads-backup.service'):
+        """Enable a beads-*backup*.timer for ``unit`` in timers.target.wants (kittrial-5bb.220 F4)."""
+        name = unit.replace('.service', '.timer')
+        path = self.units / name
+        path.write_text('[Timer]\nOnCalendar=daily\nUnit=%s\n' % unit, encoding='utf-8')
+        wants = self.units / 'timers.target.wants'
+        wants.mkdir(parents=True, exist_ok=True)
+        (wants / name).write_text(path.read_text(encoding='utf-8'), encoding='utf-8')
+
     def admin_line(self, root, *projects):
         # A systemd ExecStart line carries a POSIX path, so render the root with
         # forward slashes even when the test runs on Windows: shlex parses backslashes
@@ -541,6 +550,10 @@ class ScheduledCoverageGuidanceCase(unittest.TestCase):
     def test_unit_using_all_is_reported_as_already_covering_every_project(self):
         self.write_unit(self.line('--all'))
         covered, message = admin.scheduled_backup_coverage(self.root, 'second')
+        self.assertFalse(covered)                 # no enabled timer yet
+        self.assertIn('no enabled beads-*backup*.timer', message)
+        self.write_timer()
+        covered, message = admin.scheduled_backup_coverage(self.root, 'second')
         self.assertTrue(covered)
         self.assertIn('cover every project', message)
         self.assertIn('no change is needed', message)
@@ -556,6 +569,9 @@ class ScheduledCoverageGuidanceCase(unittest.TestCase):
         self.assertIn('do not cover second', message)
         self.assertIn('do not back up this runtime', message)
         self.assertIn('backup --all', message)
+        # The not-covered branch names the line to install, under its label (kittrial-5bb.220 F3).
+        self.assertIn('ExecStart=', message)
+        self.assertIn('not a shell command', message)
 
     def test_an_unreadable_unit_is_reported_unconfirmed_not_fine(self):
         self.unit.write_text('[Service]\n', encoding='utf-8')
@@ -564,6 +580,9 @@ class ScheduledCoverageGuidanceCase(unittest.TestCase):
         self.assertFalse(covered)
         self.assertIn('could not be read', message)
         self.assertIn('second', message)
+        # The unreadable-units branch names the line to install, under its label (kittrial-5bb.220 F3).
+        self.assertIn('ExecStart=', message)
+        self.assertIn('not a shell command', message)
 
     def test_bare_backup_with_no_project_is_reported_as_no_coverage(self):
         self.write_unit('ExecStart=/usr/bin/python3 /opt/orchestra/admin.py --root %s backup'
@@ -580,6 +599,7 @@ class ScheduledCoverageGuidanceCase(unittest.TestCase):
 
     def test_a_differently_named_backup_unit_is_read(self):
         self.write_unit(self.line('--all'), name='beads-example-backup.service')
+        self.write_timer(unit='beads-example-backup.service')
         covered, message = admin.scheduled_backup_coverage(self.root, 'second')
         self.assertTrue(covered)
         self.assertIn('beads-example-backup.service', message)
@@ -677,6 +697,7 @@ class ScheduledCoverageGuidanceCase(unittest.TestCase):
 
     def test_add_project_states_when_the_schedule_already_covers_every_project(self):
         self.write_unit(self.line('--all'))
+        self.write_timer()
         output = io.StringIO()
         with patch.object(admin, 'config', return_value={'port': 13317}), \
                 patch.object(admin, 'run_bd', return_value=''), \

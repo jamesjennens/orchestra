@@ -1870,6 +1870,28 @@ def scheduled_backup_unit_paths():
     except OSError:
         return []
 
+def systemd_quote(word):
+    """``word`` as one systemd word, quoted only when it must be.
+
+    systemd splits ``ExecStart`` on whitespace and does NOT follow shell rules: a path
+    with a space must be wrapped in double quotes, or systemd takes the first fragment as
+    the program (kittrial-5bb.220 F4). Inside the quotes a backslash escapes the next
+    character, a double quote closes the word, and a percent begins a specifier, so those
+    are doubled (``\\``, ``\\"``, ``%%``); a single quote is literal there. A word with a
+    ``$`` or a control character has no literal spelling in an ``ExecStart`` line (systemd
+    expands ``$VAR``/``${VAR}`` and refuses control characters), so it is refused here
+    rather than printing a line systemd would expand or reject. A word that needs nothing
+    comes back unchanged, so the printed line stays readable.
+    """
+    value=str(word)
+    if not value:
+        return '""'
+    if any(ch=='$' or ord(ch)<0x20 for ch in value):
+        raise ValueError('A systemd ExecStart line cannot name this path literally')
+    if any(ch.isspace() or ch in '"\\%\'' for ch in value):
+        return '"%s"'%value.replace('\\','\\\\').replace('"','\\"').replace('%','%%')
+    return value
+
 def scheduled_backup_execstart(root):
     """The exact ``ExecStart`` line that covers every project of this runtime.
 
@@ -1877,12 +1899,14 @@ def scheduled_backup_execstart(root):
     ``install/current`` link where it has one, so an upgrade moves the schedule with the
     service. A line whose interpreter came through ``current`` but whose ``admin.py``
     named ``releases/<ID>`` kept running the release that printed it after the next
-    upgrade (kittrial-5bb.182 item 2).
+    upgrade (kittrial-5bb.182 item 2). The interpreter and module are quoted for systemd,
+    not for a shell (kittrial-5bb.220 F4); ``root`` is NOT quoted because ``root_path``
+    already accepts only a path without a space, quote, backslash or specifier.
     """
     python=install_current_path(sys.executable)
     module=install_current_path(Path(__file__).resolve())
-    return (f'ExecStart={python} {module} '
-            f'--root {root} backup --all')
+    return ('ExecStart=%s %s --root %s backup --all'
+            %(systemd_quote(python),systemd_quote(module),root))
 
 def host_command(root,*words):
     """A host command as the service user pastes it into a shell: interpreter, this module,
@@ -1989,14 +2013,51 @@ def scheduled_backup_unit_report(text,root):
             report['other_runtime']=True
     return report
 
+def scheduled_backup_timer_target(text,path):
+    """The service unit a ``beads-*backup*.timer`` schedules: its ``[Timer] Unit=``, or its own base name.
+
+    A timer file normally names the service it runs in ``[Timer] Unit=``; when it does
+    not, the convention is that ``beads-backup.timer`` runs ``beads-backup.service``.
+    """
+    for raw in text.splitlines():
+        line=raw.strip()
+        if line.startswith('Unit='):
+            value=line[len('Unit='):].strip()
+            if value:return value
+    base=Path(path).name
+    return base[:-len('.timer')]+'.service' if base.endswith('.timer') else None
+
+def scheduled_backup_enabled_timer_targets(directory):
+    """The service names an enabled ``beads-*backup*.timer`` schedules, or an empty set.
+
+    An enabled user timer is a unit under ``timers.target.wants`` (``systemctl enable``
+    puts a symlink there, but a real file there enables it too); a timer only in the unit
+    directory is installed but not enabled, so it will not run. Reading the timer through
+    the symlink gives its ``[Timer] Unit=``.
+    """
+    targets=set()
+    try:
+        wants=directory/'timers.target.wants'
+        paths=sorted(path for path in wants.glob('beads-*backup*.timer') if path.is_file())
+    except OSError:
+        return targets
+    for path in paths:
+        try:text=path.read_text(encoding='utf-8')
+        except OSError:continue
+        target=scheduled_backup_timer_target(text,path)
+        if target:targets.add(target)
+    return targets
+
 def scheduled_backup_covers(root,name):
     """Whether the INSTALLED schedule backs up one project: True, False or None (unknown).
 
     The same unit files and the same classification as ``scheduled_backup_coverage``,
     reduced to one answer for the project setup page (kittrial-5bb.118): True when a
-    unit runs ``backup --all`` for this runtime or names this project, False when units
-    were read and none does (or none is installed), None when a unit could not be read
-    and nothing that was read covers the project. Drop-ins are not inspected.
+    unit runs ``backup --all`` for this runtime or names this project AND an enabled
+    ``beads-*backup*.timer`` schedules it; a unit with no timer, or a timer that is not
+    enabled, is not a schedule (kittrial-5bb.220 F4). False when units were read and none
+    covers the project (or none is installed, or none is enabled), None when a unit could
+    not be read and nothing that was read covers the project. Drop-ins are not inspected.
     """
     # The same candidates as scheduled_backup_unit_paths(), looked up in account_unit_dir.
     directory=account_unit_dir(root)
@@ -2005,14 +2066,18 @@ def scheduled_backup_covers(root,name):
         paths=sorted(path for path in directory.glob('beads-*backup*.service') if path.is_file())
     except OSError:
         return None
+    enabled=scheduled_backup_enabled_timer_targets(directory)
     unreadable=False
+    covering=[]
     for path in paths:
         try:text=path.read_text(encoding='utf-8')
         except OSError:
             unreadable=True;continue
         report=scheduled_backup_unit_report(text,root)
         if report['all_line'] or name in report['named'] or name in report['wrapper_projects']:
-            return True
+            covering.append(Path(path).name)
+    if covering:
+        return any(service in enabled for service in covering)
     return None if unreadable else False
 
 def project_setup_status(root,name,path=None):
@@ -2048,8 +2113,23 @@ def project_setup_status(root,name,path=None):
         covers=scheduled_backup_covers(root,name)
     except OSError:
         covers=None
-    backup={'scheduled':'covered' if covers else 'unknown' if covers is None else 'not-covered',
-            'line':scheduled_backup_execstart(root),'last_run':None,
+    # An operator's recorded statement that backups are scheduled elsewhere (kittrial-5bb.220
+    # F1): it reads a found-nowhere answer done, but never a found-nowhere answer that was
+    # not looked for. A found unit with an enabled timer still wins.
+    note=read_backup_schedule_note(root)
+    if covers is True:scheduled='covered'
+    elif covers is None:scheduled='unknown'
+    elif note is not None:scheduled='elsewhere'
+    else:scheduled='not-covered'
+    try:
+        line=scheduled_backup_execstart(root)
+    except ValueError:
+        line=None
+    backup={'scheduled':scheduled,
+            'elsewhere':(note['note'] if note else None),
+            'elsewhere_at':(note['recorded_at'] if note else None),
+            'elsewhere_by':(note['recorded_by'] if note else None),
+            'line':line,'last_run':None,
             # What can be pasted into a shell, beside the unit-file line that cannot (kittrial-5bb.200).
             'run_now':backup_now_command(root),
             'check':host_command(root,'backup-status','--require-complete')}
@@ -2116,6 +2196,8 @@ def scheduled_backup_coverage(root,name):
     both=schedule_text(root)
     dropins=(f'Systemd drop-ins ({directory}/*.service.d/*.conf) are not inspected, so this reports the unit '
              f'files themselves.')
+    # A unit file is not a schedule: an enabled timer must run it (kittrial-5bb.220 F4).
+    enabled=scheduled_backup_enabled_timer_targets(directory)
     paths=scheduled_backup_unit_paths()
     if not paths:
         return False,(f'No installed scheduled backup unit matching beads-*backup*.service was found in '
@@ -2138,9 +2220,15 @@ def scheduled_backup_coverage(root,name):
     if durable:
         note=(' Read: '+', '.join(read)+'.') if read else ''
         if unreadable:note+=' Not readable: '+'; '.join(unreadable)+'.'
-        return True,(f'The installed scheduled backup unit(s) read for this runtime cover every project, '
-                      f'including {name}, so no change is needed (durable backup --all: '+', '.join(durable)+
-                      ').'+note+' '+dropins)
+        scheduled=[path for path in durable if Path(path).name in enabled]
+        if scheduled:
+            return True,(f'The installed scheduled backup unit(s) read for this runtime cover every project, '
+                          f'including {name}, so no change is needed (durable backup --all: '+', '.join(durable)+
+                          ').'+note+' '+dropins)
+        return False,(f'The installed scheduled backup unit(s) read for this runtime cover every project '
+                      f'(durable backup --all: '+', '.join(durable)+f'), but no enabled beads-*backup*.timer runs '
+                      f'them, so they will not run. Install and enable a timer for one, or record that backups '
+                      f'are scheduled elsewhere.\n{both}')
     covered=sorted({item for names in named.values() for item in names} |
                    {item for names in wrapper_projects.values() for item in names})
     individual=list(named)+list(wrapper_projects)
@@ -2150,6 +2238,10 @@ def scheduled_backup_coverage(root,name):
         if unreadable:note+=' Not readable: '+'; '.join(unreadable)+'.'
         units=', '.join(individual)
         projectless=any(not projects for projects in wrapper_projects.values())
+        # A named or wrapper line that covers this project only counts as a schedule when an
+        # enabled timer runs its unit (kittrial-5bb.220 F4).
+        covering_paths=[path for path,projects in {**named,**wrapper_projects}.items() if name in projects]
+        covers_with_timer=any(Path(path).name in enabled for path in covering_paths)
         if name in covered:
             message=(f'The installed scheduled backup unit(s) read for this runtime already include {name} '
                      f'(projects: {", ".join(covered)}) at {units}, but they name projects individually, so the '
@@ -2161,6 +2253,9 @@ def scheduled_backup_coverage(root,name):
             else:
                 message+=(f' Replace that project list with the durable form (do not combine named projects with '
                           f'--all in one command); it is a line of the unit file, not a shell command:\n  {line}')
+            if not covers_with_timer:
+                message+=(f' No enabled beads-*backup*.timer runs them, so they will not run; install and enable '
+                          f'a timer for one, or record that backups are scheduled elsewhere.')
             return False,message+note+' '+dropins
         message=(f'The installed scheduled backup unit(s) read for this runtime cover only '
                  f'{", ".join(covered) if covered else "no project"}, so they do not include {name}.')
@@ -3610,6 +3705,57 @@ def read_backup_status(root):
     except (OSError,ValueError):raise ValueError('Backup status file is not readable JSON') from None
     validate_backup_status(record)
     return record
+
+#: The operator's recorded statement that this runtime's backups are scheduled elsewhere
+#: (kittrial-5bb.220 F1). A separate sidecar from backup-status.json, which a backup run
+#: rewrites; this note is an operator statement, not a run result.
+BACKUP_SCHEDULE_NOTE_NAME='backup-schedule-note.json'
+#: The note is one short line of operator text, so a file much bigger than this is not read.
+BACKUP_SCHEDULE_NOTE_MAX=300
+BACKUP_SCHEDULE_NOTE_FILE_MAX=4096
+
+def read_backup_schedule_note(root):
+    """The recorded statement that backups are scheduled elsewhere, or None.
+
+    The statement is an explicit, attributed record written by an operator (never an
+    inference from the age of the last run, which a manual or one-off run would fake).
+    An unreadable, oversized or malformed note reads as None: it is a lead, never a fact.
+    """
+    path=root/'backups'/BACKUP_SCHEDULE_NOTE_NAME
+    if path.is_symlink() or not path.is_file():return None
+    try:
+        if path.stat().st_size>BACKUP_SCHEDULE_NOTE_FILE_MAX:return None
+        record=record_json.loads(path.read_text(encoding='utf-8'))
+    except (OSError,ValueError):return None
+    if not isinstance(record,dict) or record.get('schema_version')!=1:return None
+    note=record.get('note')
+    if not isinstance(note,str) or not note.strip():return None
+    return {'note':note.strip(),'recorded_at':record.get('recorded_at'),'recorded_by':record.get('recorded_by')}
+
+def write_backup_schedule_note(root,note,actor):
+    """Record the operator's statement that backups are scheduled elsewhere."""
+    from coordination import atomic
+    note=(note or '').strip()
+    if not note:raise ValueError('The note must be non-empty text')
+    if '\n' in note or '\r' in note or len(note)>BACKUP_SCHEDULE_NOTE_MAX:
+        raise ValueError('The note must be one line of at most %d characters'%BACKUP_SCHEDULE_NOTE_MAX)
+    actor=(actor or '').strip()
+    if not actor:raise ValueError('Name the operator recording it with --actor')
+    backups=root/'backups'
+    if backups.is_symlink() or not backups.is_dir():
+        raise ValueError('The backups directory does not exist under this root; prepare the runtime first')
+    record={'schema_version':1,'note':note,'recorded_at':utc_stamp(),'recorded_by':actor}
+    atomic(backups/BACKUP_SCHEDULE_NOTE_NAME,record)
+    return record
+
+def clear_backup_schedule_note(root):
+    """Remove the recorded statement that backups are scheduled elsewhere; True if one was removed."""
+    path=root/'backups'/BACKUP_SCHEDULE_NOTE_NAME
+    if path.is_symlink():raise ValueError('Backup schedule note must not be a symlink')
+    if path.is_file():
+        path.unlink();return True
+    if path.exists():raise ValueError('Backup schedule note is not a file')
+    return False
 
 def degraded_projects(root,record):
     """``[(name, message)]``: the projects the last run recorded complete but degraded.
@@ -6343,6 +6489,13 @@ def main():
     a=sub.add_parser('backup');a.add_argument('projects',nargs='*',metavar='project')
     a.add_argument('--all',action='store_true',dest='all_projects',
                    help='back up every initialized project in this runtime in one run')
+    a=sub.add_parser('backup-schedule',help='record, as an operator, that this runtime\'s backups are scheduled '
+                                             'elsewhere (the project setup step then reads done; a systemd user '
+                                             'unit that covers the project still wins) (operator allowlist)')
+    a.add_argument('--note',metavar='TEXT',help='the one-line statement to record (at most %d characters); '
+                                                'with --clear it must be absent'%BACKUP_SCHEDULE_NOTE_MAX)
+    a.add_argument('--actor',required=True,metavar='OPERATOR',help='the operator recording it (operator allowlist)')
+    a.add_argument('--clear',action='store_true',help='remove the recorded statement')
     a=sub.add_parser('retire-project',help='retire a partial or drill project: move it to retired/; deletes nothing (operator allowlist)')
     a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--reason',required=True)
     a.add_argument('--force',action='store_true',
@@ -6961,6 +7114,16 @@ def main():
         print(json.dumps(report,ensure_ascii=True,indent=2))
         if note:print(note,file=sys.stderr)
     elif args.command=='backup':backup_projects(root,args.projects,args.all_projects)
+    elif args.command=='backup-schedule':
+        from keyed_records import require_configured_operator
+        require_configured_operator(args.actor,operators(root,strict=True),'record a backup schedule note')
+        if args.clear:
+            if args.note:raise ValueError('backup-schedule --clear takes no --note')
+            print('Removed the recorded backup schedule note.' if clear_backup_schedule_note(root)
+                  else 'No backup schedule note was recorded.')
+        else:
+            if not args.note:raise ValueError('backup-schedule needs --note TEXT, or --clear to remove it')
+            print(json.dumps(write_backup_schedule_note(root,args.note,args.actor),sort_keys=True))
     elif args.command=='backup-copy':backup_copy(root,args.destination,require_clean=args.require_clean)
     elif args.command=='backup-repoint':print(json.dumps(repoint_backup(root,args.project),sort_keys=True))
     elif args.command=='retire-project':

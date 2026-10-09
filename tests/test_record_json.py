@@ -267,7 +267,9 @@ class NoUnguardedParseTests(unittest.TestCase):
             # The fifth (kittrial-5bb.192) reads the authority-changes audit, which the
             # operator/verifier list commands append to and an operator reads: a nested or
             # unreadable file must be a refusal naming it, not a traceback.
-            'admin.py': 5,
+            # The sixth (kittrial-5bb.220 F1) reads the backup-schedule note an operator
+            # records; a damaged or nested note reads as no note, never a traceback.
+            'admin.py': 6,
             # endpoint.py's fifth (kittrial-5bb.195): the JSON payload of a coordinator
             # acceptance command, which the caller transports as a file attachment. It is
             # the caller's text, so it is parsed through the guard.
