@@ -275,8 +275,13 @@ class NativeAttentionFollowups(held_stack.RealStackTests):
             self.assertEqual('in-progress', self.action(task)['kind'])
             self.assertEqual(0, self.action(task)['open_items'])
             self.review(task, 'contribute', previous=None, **fixes.CONTRIBUTION)
-            self.backend.endpoint = str(prior)
             self.assertEqual('awaiting-review', self.action(task)['kind'])
+            self.backend.endpoint = str(prior)
+            # An older attention view may omit delivered rows at its page bound.
+            # Record compatibility is established by that task's direct brief.
+            brief = self.request('GET', self.base(task) + '/brief', token=self.secret)
+            self.assertEqual(200, brief.status, brief.data)
+            self.assertEqual('awaiting-review', brief.data['review']['state'])
         finally:
             self.backend.endpoint = current
 
