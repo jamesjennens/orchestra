@@ -1559,16 +1559,20 @@ class EndpointBackend:
         stderr = (reply.get('stderr') or '') if isinstance(reply, dict) else ''
         stdout = (reply.get('stdout') or '') if isinstance(reply, dict) else ''
         if isinstance(reply, dict) and reply.get('fault') == 'tracker':
-            # The endpoint's export yielded no rows, so the project's tracker was not read
-            # (kittrial-5bb.188 item 1). The endpoint marks it a host fault, and the
-            # `reading` path above already decides what such a failure means: 503, nothing
-            # was changed, the key stays free. Never 422 "the request was rejected".
+            # The endpoint could not read the project's tracker: a nonzero bd exit, a line cut
+            # short, text that is not rows, or a project whose metadata records no server
+            # coordinates (kittrial-5bb.188 item 1; kittrial-5bb.202 rev-3 item 2). The endpoint
+            # marks it a host fault, and the `reading` path above already decides what such a
+            # failure means: 503, nothing was changed, the key stays free. Never 422 "the
+            # request was rejected".
             raise cls._unread()
         if isinstance(reply, dict) and reply.get('fault') == 'merge-slot':
-            # Rows came back but the project's merge slot is missing (kittrial-5bb.202 item 1).
-            # It is not the transient tracker fault: trying again never helps and only an
-            # operator's merge-create puts the row back, so the caller gets that sentence and
-            # its own code, never UNREAD's "try again shortly".
+            # The tracker was read but carries no merge-slot row: rows that came back without
+            # it, or a readable tracker with no rows at all, the plain `bd init` shape
+            # (kittrial-5bb.202 item 1 and rev-2's empty-project decision). It is not the
+            # transient tracker fault: trying again never helps and only an operator's
+            # merge-create puts the row back, so the caller gets that sentence and its own
+            # code, never UNREAD's "try again shortly".
             raise cls._merge_slot_missing()
         if code == 126:
             # The endpoint re-validated live authority immediately before the effect
@@ -1621,7 +1625,8 @@ class EndpointBackend:
         failure.nothing_done = True
         return failure
 
-    #: Said when rows came back but the project has no merge-slot row (kittrial-5bb.202 item 1).
+    #: Said when the tracker was read but carries no merge-slot row: rows without it, or no rows
+    #: at all (kittrial-5bb.202 item 1; rev-3 item 3(c) corrected "rows came back but").
     #: Not transient: the row will not appear by retrying, and only an operator's merge-create
     #: puts it back. Its own code, so a caller can tell it from UNREAD.
     MERGE_SLOT_MISSING = ("The project's tracker holds no merge slot row, so it was not read as a whole "

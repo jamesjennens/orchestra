@@ -1247,6 +1247,12 @@ revision-3 item 3(1)), and the two shapes of it are told apart:
   that is present but is not rows, or a project whose metadata records no Dolt server
   coordinates -- is the host fault: **503 `unavailable`**, "The tracker could not be read
   just now. Nothing was changed; try again shortly.", and the idempotency key is free.
+A transient fault that makes `bd` print nothing with exit 0 is indistinguishable from the
+plain `bd init` shape at the export, so it gets the `merge_slot_missing` answer too; it is
+still a refusal (nothing is written, no mark is kept, the idempotency key stays free), and
+the set-up step and the read-only `merge-slot-report` tell the two apart, because they read
+the slot itself and answer `unknown`/`unreadable` for a project they cannot read where a
+genuinely slotless one is `missing`.
 The same answer at use is the same 503, never 422. A
 superuser may pass `"allow_actor": true` together with `"allow_actor_reason"` -- 1 to 500
 characters saying WHY, which must pass the kit's plain-text rule (`guidance`'s: no control,
@@ -1291,7 +1297,12 @@ written by the service, which owns the state; there is no route that changes a c
 (`PATCH`/`PUT` are 404) and the issue route takes no such field, so the keeping cannot be
 reached from a request. A **concurrent first write** may run the export twice; both
 answer the same way and write the same mark, so the outcome is idempotent. An export that
-answers no rows at all is the host fault above: 503, nothing written, and no mark kept. A
+answers no rows at all is the **missing-slot** answer above, not the host fault: 503
+`merge_slot_missing`, nothing written, and no mark kept. The transient `unavailable` answer
+is the other shape -- a nonzero `bd` exit, a line cut short, or text that is not rows -- and
+a project whose metadata records no Dolt server coordinates is that shape too, because bd
+would fall back to an embedded database there (kittrial-5bb.202 rev-3 item 3(b): this line
+said "the host fault above", which the empty-project decision of revision 2 had changed). A
 credential the settle marked refused is shown as refused in the owner's list even though
 that list reads no rows from the host: it reads the stored `actor_rows_refused` mark
 (revision-3 item 3(3)).

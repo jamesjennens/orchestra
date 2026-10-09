@@ -1582,12 +1582,17 @@ def restore_destination_state(root,destination):
 #: ``restore_failure_notice`` can say what is true after it fails (kittrial-5bb.202 rev-2).
 MERGE_SLOT_STEP='merge-slot provisioning'
 
-def restore_failure_notice(destination,error,state='partial',step='native restore'):
+def restore_failure_notice(destination,error,state='partial',step='native restore',merge_slot=None):
     """What an operator must do after the native step of ``restore-new`` did not complete.
 
     ``state`` is ``restore_destination_state``'s answer: the notice says "partial" only
     when the destination is partial (kittrial-5bb.82 review). ``step`` names the step
     that stopped: every step after the destination starts to exist prints this notice.
+    ``merge_slot`` is ``project_merge_slot_state``'s answer for the destination, read AFTER
+    a failure of the provisioning step: the step now runs after the re-point, the
+    coordination sidecar and the journals, so the notice may say those are in place, and it
+    must not call the slot unprovisioned or "named missing by the report" unless this fresh
+    read of the clone actually says so (kittrial-5bb.202 review of revision 2, F1).
     """
     if isinstance(error,subprocess.TimeoutExpired):
         cause='the native restore reached its %d s ceiling and its client was stopped'%RESTORE_TIMEOUT
@@ -1608,22 +1613,43 @@ def restore_failure_notice(destination,error,state='partial',step='native restor
                 'may or may not have been created. Do not use it as a tracker. Retire it (%s) and run '
                 'restore-new again into another unused destination name; the source backup was not modified.'
                 %(cause,destination,retire))
-    if state=='empty':
+    if state=='empty' and step!=MERGE_SLOT_STEP:
         return ('restore-new did not complete: %s. Project %s exists as an empty, working project: nothing '
                 'was restored into it (and its coordination sidecar, journals and operation journal were NOT '
                 'restored). Do not use it as a tracker. Retire it (%s) and run restore-new again into another '
                 'unused destination name; the source backup was not modified.'%(cause,destination,retire))
     if step==MERGE_SLOT_STEP:
-        # This step runs AFTER the re-point, so the clone's own backup target is in place and
-        # a backup of it succeeds: the generic "its backup fails" wording below is not true
-        # here (kittrial-5bb.202 review item 4, review F8).
-        return ('restore-new did not complete: %s. Project %s exists and holds the restored tracker (its data, '
-                'its re-pointed backup target and its journals are in place), but its merge slot was not '
-                'provisioned: merge-check, merge-acquire and merge-release on it refuse and name the merge-create '
-                'operation, and so does issuing a worker credential. Run the merge-create coordination operation '
-                'for %s (the read-only merge-slot-report names it missing), or retire it (%s) and run restore-new '
-                'again into another unused destination name; the source backup was not modified. A backup of %s '
-                'taken now is expected to succeed.'%(cause,destination,destination,retire,destination))
+        # This step runs LAST, after the re-point, the coordination sidecar and the journals
+        # (kittrial-5bb.202 rev-3 item 1, review F1): so the clone really does hold the
+        # restored tracker, its own backup target and its journals here, and the notice says
+        # that. Whether the slot itself is there is re-read from the clone (``merge_slot``)
+        # rather than assumed: the step can fail on its own check with a slot that came with
+        # the source, and then "not provisioned" and "the report names it missing" would both
+        # be untrue (the reviewer measured exactly that; merge-check rc 0, report healthy).
+        # This branch comes BEFORE the "empty, working project" one on purpose: a clone from an
+        # empty slotless source reads as that shape (bd lists no rows at all), and the generic
+        # sentence there would then claim the sidecar and journals were NOT restored, which is
+        # exactly what the reordering made false.
+        in_place=('Project %s exists and holds the restored tracker: its data, its re-pointed backup target and '
+                  'its journals are in place, and a backup of it taken now is expected to succeed.'%destination)
+        where=(merge_slot or {}).get('state')
+        detail=(merge_slot or {}).get('detail')
+        if where in ('missing','damaged'):
+            return ('restore-new did not complete: %s. %s Its merge slot is still %s: %s Run the merge-create '
+                    'coordination operation for %s, or retire it (%s) and run restore-new again into another '
+                    'unused destination name; the source backup was not modified.'
+                    %(cause,in_place,where,detail or 'the host read it as unusable.',destination,retire))
+        if where=='healthy':
+            return ('restore-new did not complete: %s. %s Its merge slot reads healthy, so the failure was in the '
+                    '%s step and not in the slot: nothing is left to mend, and merge-check and the read-only '
+                    'merge-slot-report are expected to agree. Confirm with merge-check before using it, or retire '
+                    'it (%s) and run restore-new again into another unused destination name; the source backup was '
+                    'not modified.'%(cause,in_place,MERGE_SLOT_STEP,retire))
+        return ('restore-new did not complete: %s. %s Whether it has a usable merge slot could not be read: the '
+                'same fault stopped the %s step, so this notice does not claim it is missing. Run merge-check for '
+                '%s, or the read-only merge-slot-report, and if it names the merge-create operation run that; else '
+                'retire it (%s) and run restore-new again into another unused destination name. The source backup '
+                'was not modified.'%(cause,in_place,MERGE_SLOT_STEP,destination,retire))
     return ('restore-new did not complete: %s. Project %s exists but holds a partial restore (its '
             'coordination sidecar, journals and operation journal were NOT restored). Preserve it for '
             'inspection, do not use or back it up as a tracker, and run restore-new again into another '
@@ -6204,11 +6230,14 @@ def credential_actors(root,state_path,service_namespace=None):
                 try:
                     text=run_bd(root,name,['export','--all'])
                     rows=[json.loads(line) for line in text.splitlines() if line.strip()]
-                    if rows and not any(isinstance(row,dict) for row in rows):
-                        raise ValueError('the export answered something that is not rows')
-                    # Zero rows is a READABLE tracker that holds nothing (a plain `bd init`),
-                    # so it reads as no names, not as an unread tracker (kittrial-5bb.202 rev-2,
-                    # the same empty-project decision endpoint.tracker_actors makes).
+                    if not rows or not any(isinstance(row,dict) for row in rows):
+                        raise ValueError('the export answered no rows, or something that is not rows')
+                    # A listing, and main's answer here: an export that answered nothing is
+                    # ``tracker_rows`` null ("the tracker was not read"), never false ("the
+                    # tracker has no names"), which an operator would take as a read. This read
+                    # does NOT run the merge-slot decision ``endpoint.tracker_actors`` runs, so
+                    # the empty-project decision does not reach it (kittrial-5bb.202 review of
+                    # revision 2, F3: revision 2 had changed it to false).
                     found['marks']=actor_names.tracker_marks(rows)
                 except (subprocess.CalledProcessError,OSError,ValueError,RecursionError):
                     found['marks']=None                # the tracker could not be read: said as null, not as "no rows"
@@ -7230,8 +7259,16 @@ def main():
                 # add-project's own refusals (a populated or retired destination) are raised
                 # before it creates anything: they need no notice about a leftover project.
                 if not (step[0]=='add-project' and isinstance(error,ValueError)):
-                    print(restore_failure_notice(args.destination,error,
-                                                 restore_destination_state(root,args.destination),step=step[0]),
+                    destination_state=restore_destination_state(root,args.destination)
+                    # The provisioning notice says what the clone now holds, so read the slot
+                    # from the clone itself (read-only) instead of assuming the step's failure
+                    # means a missing slot (kittrial-5bb.202 rev-3 item 1, review F1). Its
+                    # "empty, working project" shape is included: a clone from an empty slotless
+                    # source reads that way, and it still needs the provisioning notice.
+                    slot=(project_merge_slot_state(root,args.destination)
+                          if step[0]==MERGE_SLOT_STEP and destination_state in ('partial','empty') else None)
+                    print(restore_failure_notice(args.destination,error,destination_state,step=step[0],
+                                                 merge_slot=slot),
                           file=sys.stderr)
                 raise
             finally:
@@ -7269,7 +7306,7 @@ def native_only_note(root,args,damaged):
               else 'was not restored: the backup has no operation-journal snapshot'))
 
 def finish_restore(root,args,snapshot,step=None):
-    """What ``restore-new`` does after the native restore: re-point, slot, sidecar, journals.
+    """What ``restore-new`` does after the native restore: re-point, sidecar, journals, slot.
 
     ``step`` is the caller's one-word holder, when it has one: the merge-slot provisioning
     step names itself in it, so a failure there prints its own notice rather than the
@@ -7288,14 +7325,6 @@ def finish_restore(root,args,snapshot,step=None):
     # already-configured destination in place; validate_backup_target refuses any
     # clone that was not re-pointed this way.
     run_bd(root,args.destination,['backup','init',str(root/'backups'/args.destination)])
-    # The native restore replaced the destination's rows with the SOURCE database's, so a
-    # source made before the slot was provisioned leaves the clone without a merge slot.
-    # This is a way of making a project that the kit controls, so close it here: provision
-    # the slot idempotently before anything reads the restored project (kittrial-5bb.202 item 3).
-    # It runs AFTER the re-point, so a failure here leaves a clone whose own backup already
-    # succeeds; restore_failure_notice says so for this step (review item 4, F8).
-    at(MERGE_SLOT_STEP)
-    provision_merge_slot(root,args.destination)
     at('re-point and coordination')
     # The deployment authority merges come last (kittrial-5bb.142): they are the only step
     # that waits on the deployment lock, and a refusal there must leave a complete restore.
@@ -7307,6 +7336,16 @@ def finish_restore(root,args,snapshot,step=None):
     args.journal_restored=restored is not None
     if restored is None:
         print('Backup has no operation-journal snapshot; the restored project starts with an empty identity journal.')
+    # The native restore replaced the destination's rows with the SOURCE database's, so a
+    # source made before the slot was provisioned leaves the clone without a merge slot.
+    # This is a way of making a project that the kit controls, so close it here: provision the
+    # slot idempotently, AFTER the re-point, the coordination sidecar and the journals, so a
+    # failure here leaves everything else the clone needs in place and only the slot to mend
+    # (kittrial-5bb.202 item 3; rev-3 item 1, review F1: it ran BEFORE them and the notice
+    # then claimed journals that were never restored). It still runs for a native-only
+    # restore, whose journal step above is kept.
+    at(MERGE_SLOT_STEP)
+    provision_merge_slot(root,args.destination)
     if getattr(args,'native_only',None) is not None:
         return None
     if not sidecar:

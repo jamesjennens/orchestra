@@ -202,7 +202,8 @@ class NoUnguardedParseTests(unittest.TestCase):
         'capability_misses.py': (1, 'the telemetry file the kit writes; any failure starts a new log'),
         'client.py': (10, "the endpoint's own answer, on the caller's machine"),
         'coordination.py': (7, 'bd output'),
-        'endpoint.py': (4, 'bd output'),
+        'endpoint.py': (5, 'bd output, and the project\'s .beads/metadata.json whose Dolt server coordinates '
+                           'guard bd (kittrial-5bb.202 rev-3 item 2; the file is the host\'s own)'),
         'handoff.py': (15, 'bd output and the request, receipt and recovery files the kit writes'),
         'http_auth.py': (3, "the service's own store"),
         'http_authority.py': (3, "the service's own store and journal"),

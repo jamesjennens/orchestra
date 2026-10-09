@@ -13,6 +13,7 @@ its own), so it starts slotless, as a real project that predates the slot does.
 import contextlib
 import io
 import json
+import sqlite3
 import subprocess
 import sys
 import unittest
@@ -24,6 +25,33 @@ sys.path.insert(0, str(KIT))
 sys.path.insert(0, str(KIT / 'tests'))
 import admin  # noqa: E402
 import test_bd_label_aliases as rb  # noqa: E402
+
+
+def write_live_journal(path, operation_ids):
+    """A minimal live operation journal, in the schema the kit validates and snapshots."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        path.unlink()
+    connection = sqlite3.connect(str(path))
+    try:
+        connection.execute('CREATE TABLE operations(operation_id TEXT PRIMARY KEY, state TEXT)')
+        connection.execute('CREATE TABLE meta(key TEXT)')
+        connection.executemany('INSERT INTO operations VALUES(?,?)',
+                               [(item, 'committed') for item in operation_ids])
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def journal_ids(path):
+    """The operation ids a restored journal holds, or None when the file is not there."""
+    if not Path(path).is_file():
+        return None
+    connection = sqlite3.connect(str(path))
+    try:
+        return {row[0] for row in connection.execute('SELECT operation_id FROM operations')}
+    finally:
+        connection.close()
 
 
 def without_inherited_tests(cls):
@@ -124,6 +152,67 @@ class MergeSlotRealBdTests(rb.RealBdLabelAliasTests):
         # The restore copied the source's rows, so the clone's slot came from the provisioning
         # step, and the source is untouched and still slotless.
         self.assertEqual(admin.project_merge_slot_state(self.root, 'rsrc')['state'], 'missing')
+
+    def test_a_failed_provisioning_leaves_the_clone_with_its_journals_and_its_slot(self):
+        """kittrial-5bb.202 rev-3 item 1 (F1), checked against a REAL clone.
+
+        The provisioning step runs LAST (re-point, coordination sidecar, journals), so when it
+        fails the clone really does hold the restored tracker, its own backup target and its
+        journals, and the notice says so. The reviewer's `g3` (`failcheck`) failed the step on a
+        clone whose slot came with the source, where "was not provisioned" and "the report names
+        it missing" were untrue; this checks the notice's claims against the clone itself rather
+        than pinning its words: the restored operation journal is there with its operation ids,
+        and the host's own read of the clone's slot is healthy.
+        """
+        self.slotless_project('rsrc3')
+        admin.provision_merge_slot(self.root, 'rsrc3')          # the source HAS a slot
+        (self.root / 'backups').mkdir(exist_ok=True)
+        admin.run_bd(self.root, 'rsrc3', ['backup', 'init', str(self.root / 'backups' / 'rsrc3')])
+        write_live_journal(self.root / 'projects' / 'rsrc3' / '.http-operations.sqlite3', ['op-restore-1'])
+        with contextlib.redirect_stdout(io.StringIO()):
+            admin.backup_projects(self.root, ['rsrc3'])
+        self.assertEqual(admin.project_merge_slot_state(self.root, 'rsrc3')['state'], 'healthy')
+        out, err = io.StringIO(), io.StringIO()
+        argv = ['admin.py', '--root', str(self.root), 'restore-new', 'rsrc3', 'rdst3']
+        # `add_project` provisions the new project's own slot too, so fail the step only once
+        # the native restore has run: from then on `provision_merge_slot` is `finish_restore`'s.
+        state = {'restored': False}
+        real_add, real_provision = admin.add_project, admin.provision_merge_slot
+
+        def add(root, name):
+            real_add(root, name)
+            state['restored'] = True
+
+        def provision(root, name):
+            if state['restored']:
+                raise subprocess.CalledProcessError(1, 'bd', stderr='merge-slot check refused')
+            return real_provision(root, name)
+
+        with mock.patch.object(sys, 'argv', argv), mock.patch.object(admin, 'root_path', return_value=self.root), \
+                mock.patch.object(admin, 'add_project', side_effect=add), \
+                mock.patch.object(admin, 'provision_merge_slot', side_effect=provision), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), \
+                self.assertRaises(subprocess.CalledProcessError):
+            admin.main()
+        notice = err.getvalue()
+        destination = self.root / 'projects' / 'rdst3'
+        self.assertIn('the merge-slot provisioning step failed', notice)
+        # The claim "its journals are in place" against the clone: they were restored, because
+        # the journal step now runs BEFORE the one that failed.
+        self.assertEqual(journal_ids(destination / '.http-operations.sqlite3'), {'op-restore-1'},
+                         (notice, sorted(p.name for p in destination.iterdir())))
+        self.assertIn('its data, its re-pointed backup target and its journals are in place', notice)
+        # The claim about the slot against the clone: the host reads it healthy, so the notice
+        # must not call it unprovisioned or "named missing by the report".
+        clone = admin.project_merge_slot_state(self.root, 'rdst3')
+        self.assertEqual(clone['state'], 'healthy', (clone, notice))
+        self.assertIn('Its merge slot reads healthy', notice)
+        self.assertNotIn('was not provisioned', notice)
+        self.assertNotIn('names it missing', notice)
+        # And the clone's own backup really does succeed, as the notice says.
+        with contextlib.redirect_stdout(io.StringIO()):
+            admin.backup_projects(self.root, ['rdst3'])
+        self.assertTrue((self.root / 'backups' / 'rdst3').is_dir())
 
 
 if __name__ == '__main__':
