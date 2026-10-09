@@ -55,6 +55,15 @@ class EndpointFollowups(a.EndpointAttentionTests):
         self.assertFalse(view['own_tasks_truncated'])
         self.assertTrue(view['actions_truncated'])  # Other deliveries exceed the review-action cap.
 
+    def test_over_bound_partial_claimables_continue_until_suggestions_fill(self):
+        run,calls=self.large_work(99,1521)
+        with patch.object(self.backend,'_run',side_effect=run):
+            data=self.next();view=data['attention']
+        self.assertEqual(calls,[(False,0),(False,100),(True,0)])
+        self.assertEqual(view['counts']['claimable'],101)
+        self.assertTrue(any(x['kind']=='claimable-task' for x in data['next_actions']))
+        self.assertIn('at least 101 claimable',view['summary'])
+
     def test_legacy_work_fields_keep_blocked_attention_and_my_work(self):
         task=self.tasks[0];self.claim(task)
         self.checkpoint(task,[dict(id='waiting',kind='blocker',text='waiting',source='fixture')])
@@ -168,8 +177,8 @@ class EndpointFollowups(a.EndpointAttentionTests):
         row=dict(id=task,title='requests',assignee=actor,status='in_progress',review_state='changes-requested',
                  contribution_id='delivery',open_items=0,blocking_items=0,
                  pending_change_requests=['request-%02d'%i for i in range(21)])
-        # Defensive action projection: valid protocol records cap at20, so this
-        # deliberately injected row tests the last boundary without inventing writes.
+        # A second request-changes on one contribution is refused. This injected
+        # oversized row defends projection; no reachable real-write sequence is claimed.
         with patch.object(self.backend,'agent_tasks',return_value=dict(tasks=[row],complete=True)):
             action=self.next()['next_action']
         self.assertEqual(action['requests'],row['pending_change_requests'][:20])
