@@ -452,6 +452,45 @@ not a warning. Use the identity of the person actually running the command as
 `--actor`; the owner decision is named in the payload, never by reusing the
 owner's actor.
 
+### A confined coordinator runs the acceptance commands through the endpoint
+
+Slice 3 of [COORDINATORS_PER_PROJECT_DESIGN.md](COORDINATORS_PER_PROJECT_DESIGN.md)
+(kittrial-5bb.195). A coordinator that gave up the shell (a key bound to a principal) can run
+the acceptance commands it needs without one, when **all** of these hold: the request arrives
+over a key bound to a principal, the project's session registry gives the request's actor to
+that principal, that actor is on the deployment operator allowlist (for `capability-verify`
+the `verifiers` list is enough), and the project is one the key may name.
+
+| Command | The host command it runs |
+| --- | --- |
+| `coordinator guidance-set --file FILE` | `admin.py set-guidance` |
+| `coordinator guidance-clear` | `admin.py clear-guidance` |
+| `coordinator guidance-status` | `admin.py guidance-status` (the authoritative read, with the text) |
+| `coordinator reference-apply --file FILE` | `admin.py reference-apply` (one entry, or an `items` batch) |
+| `coordinator capability-apply --file FILE` | `admin.py capability-apply` |
+| `coordinator capability-verify --file FILE` | `admin.py capability-verify` |
+| `coordinator proposal-review --file FILE` | `admin.py proposal-review` |
+| `coordinator proposal-decide --file FILE` | `admin.py proposal-decide` |
+| `coordinator handoff --file FILE` | `admin.py handoff` (the operator's transfer) |
+| `coordinator set-onboarding --file FILE` | `admin.py set-onboarding` |
+
+Each runs the same library call with the same payload as its host command, so the payload
+schemas in the table above apply unchanged. `--file` is a local file the client transports
+with the same attachment transport every other write uses; the server never reads a path out
+of the request.
+
+**What stays with the installation operator.** `proposal-settings`, `capability-retire`,
+`capability-alias-propose`/`-reject`, `void-record`, `revert-record`, every `*-reconcile`,
+`anchor-release`, `remove-creation`, `retire-project`, the backups, the switch commands
+(`review-writes`, `checkpoint-provenance-writes`) and the operator and verifier list commands
+are **not** reachable through this surface, for anybody: they remain `admin.py` host commands.
+The action refuses any name it does not know and names the ones it does.
+
+**An installation that configures nothing is unchanged.** The action exists only for a key
+bound to a principal: without `--key-principal` - every ordinary host loop and every key that
+binds nothing - the endpoint refuses it before it reads a project file, takes a lock or calls
+`bd`, and every other action behaves exactly as it did.
+
 ### The operator and verifier list changes are audited
 
 `operators add|remove` and `verifiers add|remove` take `--actor OPERATOR` (the operator
