@@ -3419,7 +3419,8 @@ class ApiHandler(BaseHTTPRequestHandler):
     # -- mutation helper -------------------------------------------------------
     def _mutate(self, ctx, route_name, project_id, fn, *, capability, allow_self_user=None,
                 status=200, idempotent=True, replay_status=None, serialize=True,
-                canonical=False, reason=None, refused_reason=None):
+                canonical=False, reason=None, refused_reason=None,
+                audit_success=True, state_saved=None, audit_metadata=None):
         """Run one authorized, idempotent mutation.
 
         ``capability`` names the authority the route needs. The idempotency key is
@@ -3475,6 +3476,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                                'denied' if error.status in (401, 403) else 'rejected',
                                project_id=project_id,
                                reason=error.code if refused_reason is None else '%s: %s' % (error.code, refused_reason))
+            if not audit_success:
+                self._audited_refusal = True
             # The refusal is the answer whether or not its audit entry can be saved now
             # (kittrial-5bb.156): nothing was carried out, so a lock wait that runs out here
             # must not turn it into "cannot say". The entry is written with the next save.
@@ -3496,11 +3499,24 @@ class ApiHandler(BaseHTTPRequestHandler):
         if isinstance(public, dict) and isinstance(public.get('server_time'), str):
             at = public['server_time']
         self._written_at = at
-        self.service.idempotency_commit(digest, status, stored, written_at=at)
-        self._forget_cached_reads(ctx.principal, project_id)
-        self.service.audit(ctx.request_id, ctx.principal, route_name, 'committed',
-                           project_id=project_id, reason=reason)
-        self.service.store.save()
+        with self.service.store.lock:
+            if audit_success:
+                event = self.service.audit(ctx.request_id, ctx.principal, route_name, 'committed',
+                                           project_id=project_id, reason=reason)
+                if audit_metadata:
+                    event.update(audit_metadata)
+            if state_saved:
+                # Credential issuance/revocation owns a persistence boundary. A
+                # crash before its receipt must not replay a nonexistent credential.
+                self.service.store.save()
+                state_saved()
+                self.service.idempotency_commit(digest, status, stored, written_at=at)
+            else:
+                # Preserve ordinary routes' receipt-first retry contract: a failed
+                # state save must not strand their key as in-progress for 24 hours.
+                self.service.idempotency_commit(digest, status, stored, written_at=at)
+                self.service.store.save()
+            self._forget_cached_reads(ctx.principal, project_id)
         return status, public
 
     def require(self, ctx, capability):
@@ -3979,8 +3995,12 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     @route('POST', r'/v1/accounts/(?P<uid>' + ID + r')/disable')
     def account_disable(self, ctx):
+        metadata = {}
+        def disable():
+            metadata.update(self._revocation_metadata(user_id=ctx.params['uid']))
+            return self._account_disabled(ctx)
         return self._mutate(ctx, 'accounts.disable', None,
-                            lambda: self._account_disabled(ctx),
+                            disable, audit_metadata=metadata,
                             capability=CAP_ACCOUNTS_ADMIN,
                             allow_self_user=ctx.params['uid'],
                             idempotent=bool(ctx.idempotency_key))
@@ -3988,6 +4008,17 @@ class ApiHandler(BaseHTTPRequestHandler):
     def _account_disabled(self, ctx):
         result = self.service.disable_user(ctx.principal, ctx.params['uid'])
         return result, result
+
+    def _revocation_metadata(self, *, agent_id=None, user_id=None):
+        """IDs affected by disable, captured under the mutation lock before pruning."""
+        agents = self.service.state['agents']
+        agent_ids = [agent_id] if agent_id is not None else sorted(
+            aid for aid, agent in agents.items() if agent.get('owner') == user_id)
+        credential_ids = sorted(cid for cid, credential in self.service.state['credentials'].items()
+                                if not credential.get('revoked') and
+                                (credential.get('agent_id') == agent_id if agent_id is not None
+                                 else credential.get('user_id') == user_id))
+        return {'agent_ids': agent_ids, 'target_credential_ids': credential_ids}
 
     # -- project and membership routes ----------------------------------------
     @route('POST', r'/v1/projects')
@@ -4746,9 +4777,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         return self._mutate(ctx, 'agents.create', None, create, status=201,
                             capability=CAP_AGENTS, replay_status=200)
 
-    def _agent_items(self, principal):
+    def _agent_items(self, principal, agents=None):
         items = []
-        for agent in self.service.list_agents(principal):
+        for agent in self.service.list_agents(principal) if agents is None else agents:
             # One read per project for all the agents listed, not one per agent.
             attention = self._agent_attention(principal, agent, many=True)
             items.append(dict(agent, attention=self._agent_attention_view(agent, attention),
@@ -4758,6 +4789,17 @@ class ApiHandler(BaseHTTPRequestHandler):
     @route('GET', r'/v1/agents')
     def agents_list(self, ctx):
         self.require(ctx, CAP_AGENTS)
+        if any(key in ctx.query for key in ('limit', 'cursor', 'unconfirmed')):
+            limit, state = self._page(ctx, ctx.query)
+            unconfirmed = ctx.query.get('unconfirmed', 'false')
+            if unconfirmed not in ('true', 'false'):
+                raise invalid('unconfirmed must be true or false')
+            agents, total = self.service.agent_page(ctx.principal, state['o'], limit,
+                                                  unconfirmed=unconfirmed == 'true')
+            return 200, {'items': self._agent_items(ctx.principal, agents), 'total': total,
+                         'next_cursor': make_cursor(ctx.principal, None, ctx.query, state['o'] + limit)
+                         if state['o'] + limit < total else None,
+                         'generated_at': now_iso(self.service._now())}
         items = self._agent_items(ctx.principal)
         return 200, {'items': items, 'total': len(items),
                      'generated_at': now_iso(self.service._now())}
@@ -4774,6 +4816,7 @@ class ApiHandler(BaseHTTPRequestHandler):
     @route('PATCH', r'/v1/agents/(?P<aid>' + ID + r')')
     def agents_update(self, ctx):
         payload = dict(ctx.payload or {})
+        metadata = {}
 
         def update():
             record = self.service.state['agents'].get(ctx.params['aid'])
@@ -4796,9 +4839,12 @@ class ApiHandler(BaseHTTPRequestHandler):
                 # field the route does not take. Nothing is written by the check.
                 self.service.check_agent_grant(ctx.principal, payload.get('projects'), owner_id=record['owner'])
             refuse_unknown_fields(payload, self.AGENT_UPDATE_FIELDS, 'An agent change')
+            if 'enabled' in payload and payload['enabled'] is not None and not bool(payload['enabled']):
+                metadata.update(self._revocation_metadata(agent_id=ctx.params['aid']))
             result = self.service.update_agent(ctx.principal, ctx.params['aid'], payload)
             return result, result
-        return self._mutate(ctx, 'agents.update', None, update, capability=CAP_AGENTS)
+        return self._mutate(ctx, 'agents.update', None, update, capability=CAP_AGENTS,
+                            audit_metadata=metadata)
 
     def _require_grantable(self, principal, projects, held, owner_id=None):
         """Refuse a NEW agent grant on a record the backend will not serve (kittrial-5bb.84, .90).
@@ -4837,10 +4883,13 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     @route('POST', r'/v1/agents/(?P<aid>' + ID + r')/disable')
     def agents_disable(self, ctx):
+        metadata = {}
         def disable():
+            metadata.update(self._revocation_metadata(agent_id=ctx.params['aid']))
             result = self.service.disable_agent(ctx.principal, ctx.params['aid'])
             return result, result
-        return self._mutate(ctx, 'agents.disable', None, disable, capability=CAP_AGENTS)
+        return self._mutate(ctx, 'agents.disable', None, disable, capability=CAP_AGENTS,
+                            audit_metadata=metadata)
 
     @route('POST', r'/v1/agents/(?P<aid>' + ID + r')/enable')
     def agents_enable(self, ctx):
@@ -4876,8 +4925,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                 ctx.principal, ctx.params['aid'], scopes=payload.get('scopes'),
                 label=payload.get('label'), request_id=ctx.request_id)
             return result, _redact_agent_secret(result)
-        return self._mutate(ctx, 'agents.credentials.issue', None, issue, status=201,
-                            capability=CAP_AGENTS, replay_status=200)
+        return self._mutate_agent_credential(ctx, 'agents.credentials.issue', issue, status=201,
+                                             replay_status=200)
 
     @route('POST', r'/v1/agents/(?P<aid>' + ID + r')/credentials/'
                   r'(?P<cid>' + ID + r')/revoke')
@@ -4887,8 +4936,36 @@ class ApiHandler(BaseHTTPRequestHandler):
                 ctx.principal, ctx.params['aid'], ctx.params['cid'],
                 request_id=ctx.request_id)
             return result, result
-        return self._mutate(ctx, 'agents.credentials.revoke', None, revoke, status=204,
-                            capability=CAP_AGENTS)
+        return self._mutate_agent_credential(ctx, 'agents.credentials.revoke', revoke, status=204)
+
+    def _mutate_agent_credential(self, ctx, operation, fn, **options):
+        """Save the credential and its route audit in one atomic JSON replacement.
+
+        Issuance rolls back before a successful state save. Revocation stays effective
+        in memory even if that save fails. A receipt failure after saving keeps the
+        durable effect and its in-progress reservation; it cannot issue a second secret.
+        """
+        with self.service.store.lock:
+            agent = self.service.state['agents'].get(ctx.params['aid'])
+            if not isinstance(agent, dict):
+                return self._mutate(ctx, operation, None, fn, capability=CAP_AGENTS, **options)
+            saved = [False]
+            with self.service._agent_credential_transaction(
+                    agent, rollback=operation != 'agents.credentials.revoke') as mark_saved:
+                def state_saved():
+                    mark_saved()
+                    saved[0] = True
+                try:
+                    return self._mutate(ctx, operation, None, fn, capability=CAP_AGENTS,
+                                        audit_success=False, state_saved=state_saved, **options)
+                except HttpError:
+                    raise  # _mutate already releases a refused reservation and audits it
+                except Exception:
+                    if not saved[0] and ctx.idempotency_key is not None:
+                        digest = self.service._idempotency_key(ctx.principal, None,
+                            '%s %s' % (operation, ctx.route_target), ctx.idempotency_key)
+                        self.service.idempotency_release(digest)
+                    raise
 
     # -- project-scoped agent routes (owner decision 4) ------------------------
     #

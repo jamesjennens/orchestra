@@ -1,8 +1,4 @@
 {
-  "schema_version": 1,
-  "operation_id": "capnew-352a090f9a004575ade24162260f7f24",
-  "key": "agents.renewal-keeps-scopes",
-  "name": "An agent's scopes are kept on the agent; a new credential carries exactly them",
   "aliases": [
     "agent credential renewal",
     "new secret scopes",
@@ -13,9 +9,9 @@
     "scopes_needed",
     "at most 20 credentials",
     "dead credentials pruned",
-    "What it may do"
+    "What it may do",
+    "agent credential scopes"
   ],
-  "summary": "What an agent may do is kept on the agent record (scopes): written when the agent is made and changed only by a renewal that sends a scopes list. A new credential (POST /v1/agents/{id}/credentials) with no list carries exactly those; no credential, working or dead, decides anything. A list that asks for nothing more is taken from the agent's account or a superuser; one that widens only from its own account, else 403. scopes must be a list of known names and the body takes only label and scopes (422). An agent made before the record kept its scopes: while its working credentials all allow the same, that is inferred (scopes_source inferred, stored by its first renewal); when none works or they differ, nothing is guessed: scopes is null and a renewal with no list is refused 409 with detail.scopes_needed, never the default four. The record carries scopes, scopes_source, scopes_differ and per credential scopes and working. The agents page shows what an agent may do, lists each credential with a Revoke button, and lets its account set the scopes under What it may do. At most 20 that work; of the dead ones the newest 5 are kept, older ones deleted (the audit log keeps the events).",
   "requirements": [],
   "anchors": [
     "docs/HTTP_DEPLOYMENT.md#personal-agents"
@@ -29,16 +25,31 @@
     "http_auth.py::Service._credential_live",
     "http_auth.py::Service.issue_agent_credential",
     "http_auth.py::Service.agent_scope_differences",
-    "http_service.py::ApiHandler.agents_credential_issue"
+    "http_service.py::ApiHandler.agents_credential_issue",
+    "http_auth.py::Service._agent_credential_transaction",
+    "http_auth.py::Service._audit_agent_credential",
+    "http_auth.py::Service.revoke_agent_credential",
+    "http_auth.py::Service._credential_label",
+    "http_auth.py::Service.agent_page",
+    "http_service.py::ApiHandler._revocation_metadata"
   ],
   "tests": [
     "tests/test_http_agents.py",
-    "tests/web_agents_screen.mjs"
+    "tests/web_agents_screen.mjs",
+    "tests/test_http_web.py",
+    "tests/test_agent_scope_followups.py"
   ],
   "owner": "person:orchestra-coordinator",
   "tags": [
     "agents",
     "http",
     "identity"
-  ]
+  ],
+  "schema_version": 1,
+  "operation_id": "130f4fb6-0d34-4bcd-a858-a72039909577",
+  "key": "agents.renewal-keeps-scopes",
+  "name": "An agent's scopes are kept on the agent; a new credential carries exactly them",
+  "revision": 3,
+  "expected_sha256": "382ef27503f577919935912952151d5b16576db13b44ec1827d183306fa63cd7",
+  "summary": "Stored scopes govern renewal; dead or wider credentials cannot reset them. Only the owner confirms inferred/unknown scopes; non-owner lists refuse 403 and plain renewal 409 asks for the owner. Confirmed scopes can be narrowed by an authorized account, widened only by the owner. Names/printable labels (stripped, max 64) are validated; reads never confirm. Retain at most 20 working/newest 5 dead credentials; pruning removes indexes. One renewal/first-revoke audit event records IDs, actor/account/request/time, and scopes/source before/after; disable events name affected IDs. No labels/secrets/hashes/paths. Audit has a shared 10,000-entry service-state tail. Issuance saves before its replay receipt; failed save rolls back issuance and retains refusal audit/prior pending state. Crash/receipt failure may leave 409 in-progress. Failed revoke save keeps access revoked in memory, pending a successful save; retry adds no second event, not durable across restart. Ordinary routes keep receipt-first retries. The page warns before owner confirmation, hides non-owner confirmation forms, and pages 20 filtered cards. See documentation for details. This remains an unaccepted proposal."
 }

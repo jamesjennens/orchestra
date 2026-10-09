@@ -1692,8 +1692,16 @@ class AgentSetupDialogCase(unittest.TestCase):
         # Losing the secret means issuing a NEW credential; only its fresh secret is shown.
         reissue = self.function_body(code, 'reissueSection')
         self.assertIn('ctx.api.issueAgentCredential(agent.id)', reissue)
+        # The confirmation has nested template literals for inferred versus stored
+        # scopes. The simple quoted-text stripper cannot parse those; check the
+        # confirmation separately without treating its prose as a secret variable.
+        confirmation = next(line.strip() for line in reissue.splitlines()
+                            if line.strip().startswith('body:'))
+        self.assertNotIn('.secret', confirmation)
+        self.assertIn('Issuing this secret confirms them as this agent’s stored scopes', confirmation)
         uses = [line.strip() for line in reissue.splitlines()
-                if re.search(r'\bsecret\b', self.unquoted(line))]
+                if not line.strip().startswith('body:')
+                and re.search(r'\bsecret\b', self.unquoted(line))]
         self.assertEqual(['if (!credential.secret) {',
                           "section.replaceChildren(secretSection(credential.secret, 'New secret (shown once)', payload),"],
                          uses)
@@ -1706,7 +1714,7 @@ class AgentSetupDialogCase(unittest.TestCase):
         # that sends a list (the page is run in tests/test_http_agents.py AgentsPageTests).
         self.assertIn('    compact ? null : scopesLine(raw),\n', self.function_body(code, 'agentCard'))
         self.assertNotIn('before this was fixed', code)
-        self.assertIn("if (agent.scopes === null) {", reissue)
+        self.assertIn('agent.scopes === null', reissue)
         self.assertIn("issueAgentCredential: (aid, scopes) => mutate('POST', `/v1/agents/${aid}/credentials`, "
                       "scopes ? { label: 'web: new secret', scopes } : { label: 'web: new secret' })",
                       (WEB / 'js' / 'api.js').read_text(encoding='utf-8'))
