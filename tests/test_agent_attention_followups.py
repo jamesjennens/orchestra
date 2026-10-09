@@ -280,6 +280,16 @@ class NativeAttentionFollowups(held_stack.RealStackTests):
         finally:
             self.backend.endpoint = current
 
+    def test_conflicting_native_checkpoint_roots_stay_unknown(self):
+        task = self.new('conflicting checkpoint roots'); self.own(task); self.checkpoint(task, [])
+        comments = json.loads(self.native_ok('comments', task, '--json'))
+        original = next(row for row in comments if row['text'].startswith('Kind: task-checkpoint-v1\n'))
+        self.native_ok('comments', 'add', task, original['text'], '--author', 'conflicting-author')
+        action = self.action(task)
+        self.assertEqual(('checkpoint-error', 2, 'operator', None),
+                         (action['kind'], action['priority'], action['who'], action['open_items']))
+        self.assertEqual('error', self.next()['attention']['state'])
+
     def seed_native_scale(self):
         actor = self.next()['agent']['actor']; owned = []
         for index in range(1070):
