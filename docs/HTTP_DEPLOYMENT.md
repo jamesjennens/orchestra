@@ -1200,7 +1200,8 @@ begins or ends with `.` or `-`, or that carries an `@` (`im2-coordinator.`,
 other than `im2-coordinator`; the kit refuses them rather than choosing a normal form
 that would silently rename somebody.
 
-A name with the shape of another account's or agent's id was already refused. A
+A name with the shape of another account's or agent's id was already refused, and is now
+refused in any letter case (an id written in capitals is read as that id). A
 credential without `actor` writes under its issuer's own account id, as before.
 
 **One name, one issuer** -- an always-on rule, not part of the setting below. A worker
@@ -1211,10 +1212,15 @@ another letter case, and whether or not anything has been written under it yet.
 working credential of this project that another account issued (...). A name has one issuer at
 a time: have that credential revoked first, or choose another name", with the holding
 credential's id in `error.detail`. The same account may issue a name it already holds, which
-is how it replaces a credential without a gap. The comparison folds case as the tracker's own
-name rule does (`actor_names.head`), so `IT-A745` and `it-a745` are one name: a second account
+is how it replaces a credential without a gap. The comparison folds case over the whole name (the
+tracker's own name rule, `actor_names.head`, folds the first part only), so `IT-A745` and `it-a745` are one name: a second account
 cannot take the other spelling and then write, with no waiver, work that the first account's
 rows also answer to.
+
+An installation upgraded from a kit that issued both spellings to two accounts keeps both
+credentials working, but neither account can replace its own (409 each way) until the
+other's is revoked, and work under either spelling is refused to both: have one of the two
+revoked (the 409 names the credential that holds the name).
 
 **At issue**, `POST /v1/projects/{id}/worker-credentials` answers 422, "A worker
 credential cannot write as NAME: that is a name on the operator list. Choose another
@@ -1593,7 +1599,7 @@ that account made, and every worker credential that account issued. From the nex
   it. **No route deletes a worker credential record**, and a revoked record counts for ever,
   so no superuser can clear it. Two owners who each once issued a common name (`ci`,
   `lane-1`), never at the same time, both lose the approval of all work under it. The ways
-  out are a third approver, a new name, or the writer stamp described below. Refusing a
+  out are a third approver or a new name (the writer stamp described below is not built). Refusing a
   second issuer for any name an account ever held, unused included, unless a superuser waives
   it, was considered and is **not** done here: the tracker already refuses (422) a name one of
   its rows holds, refusing the unused case would stop a project reusing a label whose holder

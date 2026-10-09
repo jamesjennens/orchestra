@@ -205,7 +205,7 @@ export function reviewActions(ctx, pid, tid, contribution, review) {
     h('div', { class: 'actions' },
       h('button', { type: 'submit', name: 'request', class: '' }, 'Request changes'),
       h('button', { type: 'button', class: 'primary', onclick: async (e) => {
-        if (!(await confirmDialog({ title: `Approve revision ${contribution.revision}?`, body: `Commit ${shortSha(contribution.commit)} will be marked reviewed and approved if the server accepts it; approving work of your own party is refused. It is not integrated or deployed until those steps are recorded separately.`, confirmLabel: 'Approve' }))) return;
+        if (!(await confirmDialog({ title: `Approve revision ${contribution.revision}?`, body: `Commit ${shortSha(contribution.commit)} will be marked reviewed and approved if the server accepts it; a server set to require another party refuses an approval of your own party's work. It is not integrated or deployed until those steps are recorded separately.`, confirmLabel: 'Approve' }))) return;
         await submit(e.currentTarget, { operation: 'approve', ...target, summary: `Approved revision ${contribution.revision} in the web interface` }, 'Approved');
       } }, 'Approve')));
   async function submit(button, body, message) {
