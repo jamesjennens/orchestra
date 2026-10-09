@@ -42,6 +42,19 @@ def identity_sets(rows):
 
 
 class RendererExportAgreementTests(unittest.TestCase):
+    def test_unicode_separators_in_title_and_comments_round_trip(self):
+        rows = make_snapshot(n_issues=3, comments_each=1)
+        for row, character in zip(rows, ('\u0085', '\u2028', '\u2029')):
+            row['title'] += character + 'end'
+            row['comments'][0]['text'] += character + 'end'
+        with tempfile.TemporaryDirectory() as folder:
+            target = Path(folder) / 'views'
+            rendered = render(rows, target)
+            reread = load_export(target / 'issues.jsonl')
+            self.assertEqual(rows, reread)
+            self.assertEqual((3, 3), (rendered['issues'], rendered['comments']))
+            self.assertEqual(identity_sets(rows), identity_sets(reread))
+
     def test_large_render_comments_roundtrip(self):
         rows = make_snapshot()
         issues, comments = identity_sets(rows)
@@ -54,7 +67,7 @@ class RendererExportAgreementTests(unittest.TestCase):
             raw = (dest / 'issues.jsonl').read_text(encoding='utf-8')
             raw_bytes = (dest / 'issues.jsonl').read_bytes()
             digest = hashlib.sha256(raw_bytes).hexdigest()
-            reread = [json.loads(line) for line in raw.splitlines() if line.strip()]
+            reread = [json.loads(line) for line in raw.split('\n') if line.strip()]
             self.assertEqual(identity_sets(reread), (issues, comments))
             # Local file copy is byte-identical (renderer result, not a native read).
             client_file = Path(d) / 'client-copy.jsonl'
@@ -78,8 +91,8 @@ class RendererExportAgreementTests(unittest.TestCase):
                              (second['issues'], second['comments']))
             a = (Path(d) / 'v1/issues.jsonl').read_bytes()
             b = (Path(d) / 'v2/issues.jsonl').read_bytes()
-            self.assertEqual(identity_sets([json.loads(l) for l in a.decode().splitlines()]),
-                             identity_sets([json.loads(l) for l in b.decode().splitlines()]))
+            self.assertEqual(identity_sets([json.loads(l) for l in a.decode().split('\n') if l.strip()]),
+                             identity_sets([json.loads(l) for l in b.decode().split('\n') if l.strip()]))
 
     def test_failure_behaviour(self):
         with tempfile.TemporaryDirectory() as d:

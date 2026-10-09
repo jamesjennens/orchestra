@@ -56,7 +56,7 @@ class NativeExportLineTests(fixture.RealBdLabelAliasTests):
                 self.assertFalse(any(r.get('malformed') for r in intact))
                 self.assertEqual(text, briefing.brief(intact, 'pp', task)['title']['text'])
                 self.assertEqual(text, next(i for i in work.queue(intact, 'victim', ['--mine'])['items'] if i['task'] == task)['title'])
-                self.assertIn(text, json.dumps(briefing.history_page(intact, 'pp', task), ensure_ascii=False))
+                self.assertIn(text, json.dumps(briefing.history_page(briefing.snapshot(intact, 'pp', task), 'pp', task), ensure_ascii=False))
                 self.assertIn(task, {r['id'] for r in lifecycle.project_facts(intact)})
                 refresh = fixture.endpoint.execute(self.root, {'project': 'pp', 'actor': 'victim',
                                                                'action': 'refresh', 'args': []})

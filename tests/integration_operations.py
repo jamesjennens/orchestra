@@ -50,7 +50,7 @@ def main():
     assert lifecycle('implemented','passed','implemented')['event_id']==event['event_id']
     call([],action='refresh')
     def facts():
-        rows=[json.loads(x) for x in call([],action='view',path='issues.jsonl')['stdout'].splitlines()]
+        rows=[json.loads(x) for x in call([],action='view',path='issues.jsonl')['stdout'].split('\n') if x.strip()]
         return next(r for r in project_facts(rows) if r['id']==task)
     assert facts()['facts']['implemented']['value']=='passed'
     assert facts()['facts']['deployed']['value']=='unknown'
