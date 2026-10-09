@@ -301,42 +301,6 @@ class NativeAttentionFollowups(held_stack.RealStackTests):
         self.assertTrue(view['own_tasks_truncated'])
         self.assertIn('counts are incomplete',view['summary'])
 
-    @unittest.skipUnless(os.environ.get('ORCHESTRA_ATTENTION_R4_SCALE'),
-                         'set ORCHESTRA_ATTENTION_R4_SCALE for review-heavy native paging')
-    def test_review_heavy_native_first_page_recovers_unclaimed_work(self):
-        import test_http_review_fixes as fixes
-        other=self.agent('Other deliveries')
-        for index in range(100):
-            task=self.new('other delivered %03d'%index);self.own(task,other)
-            self.review(task,'contribute',token=other,previous=None,**fixes.CONTRIBUTION)
-        for index in range(920):self.new('unclaimed %04d'%index)
-        original=self.backend._run;calls=[];first=[]
-        def recording(action,project,reader,args,*rest,**kwargs):
-            value=original(action,project,reader,args,*rest,**kwargs)
-            if action=='work':
-                calls.append(list(args))
-                if '--owner' not in args and args[args.index('--offset')+1]=='0':
-                    first.extend(value['items'])
-            return value
-        with patch.object(self.backend,'_run',side_effect=recording):
-            data=self.next();view=data['attention']
-        self.assertEqual(len(first),100)
-        self.assertTrue(all(x['review_state']=='awaiting-review' for x in first))
-        self.assertEqual([int(x[x.index('--offset')+1]) for x in calls if '--owner' not in x],[0,100])
-        self.assertEqual(sum('--owner' in x for x in calls),1)
-        self.assertEqual(view['counts']['claimed'],0)
-        self.assertGreaterEqual(view['counts']['claimable'],30)
-        self.assertEqual(view['state'],'unknown')
-        self.assertIn('at least',view['summary'])
-        self.assertTrue(view['snapshot_truncated'])
-        self.assertFalse(view['own_tasks_truncated'])
-        self.assertTrue(view['actions_truncated'])
-        self.assertTrue(all(x['kind']=='claimable-task' for x in data['next_actions']))
-        print('NATIVE_R4_HIDDEN',json.dumps(dict(rows=len(self.export_rows()),work_calls=calls,
-              claimed=view['counts']['claimed'],claimable=view['counts']['claimable'],
-              state=view['state'],summary=view['summary'],snapshot_truncated=view['snapshot_truncated'],
-              own_tasks_truncated=view['own_tasks_truncated'],actions_truncated=view['actions_truncated'])),flush=True)
-
     def agent(self, name):
         made = self.request('POST', '/v1/agents',
                             dict(name=name, working_directory='/scratch/agent', projects=['pp']),
@@ -459,7 +423,12 @@ class NativeAttentionFollowups(held_stack.RealStackTests):
             self.assertEqual('in-progress', self.action(task)['kind'])
             self.assertEqual(0, self.action(task)['open_items'])
             self.review(task, 'contribute', previous=None, **fixes.CONTRIBUTION)
-            self.assertEqual('awaiting-review', self.action(task)['kind'])
+            # The shared native fixture may already exceed the snapshot bound.
+            # This checks record compatibility, so read the task directly in
+            # both directions rather than require it in a bounded suggestion list.
+            brief = self.request('GET', self.base(task) + '/brief', token=self.secret)
+            self.assertEqual(200, brief.status, brief.data)
+            self.assertEqual('awaiting-review', brief.data['review']['state'])
             self.backend.endpoint = str(prior)
             # An older attention view may omit delivered rows at its page bound.
             # Record compatibility is established by that task's direct brief.
@@ -529,3 +498,49 @@ for base in (rb.RealBdLabelAliasTests, held_stack.RealStackTests):
     for name in unittest.defaultTestLoader.getTestCaseNames(base):
         if name not in NativeAttentionFollowups.__dict__:
             setattr(NativeAttentionFollowups, name, None)
+
+
+class NativeAttentionHiddenScale(NativeAttentionFollowups):
+    """A separate real tracker: earlier cases must not alter the first-page inventory."""
+
+    @unittest.skipUnless(os.environ.get('ORCHESTRA_ATTENTION_R4_SCALE'),
+                         'set ORCHESTRA_ATTENTION_R4_SCALE for review-heavy native paging')
+    def test_review_heavy_native_first_page_recovers_unclaimed_work(self):
+        import test_http_review_fixes as fixes
+        other=self.agent('Other deliveries')
+        for index in range(100):
+            task=self.new('other delivered %03d'%index);self.own(task,other)
+            self.review(task,'contribute',token=other,previous=None,**fixes.CONTRIBUTION)
+        for index in range(920):self.new('unclaimed %04d'%index)
+        original=self.backend._run;calls=[];first=[]
+        def recording(action,project,reader,args,*rest,**kwargs):
+            value=original(action,project,reader,args,*rest,**kwargs)
+            if action=='work':
+                calls.append(list(args))
+                if '--owner' not in args and args[args.index('--offset')+1]=='0':
+                    first.extend(value['items'])
+            return value
+        with patch.object(self.backend,'_run',side_effect=recording):
+            data=self.next();view=data['attention']
+        self.assertEqual(len(first),100)
+        self.assertTrue(all(x['review_state']=='awaiting-review' for x in first))
+        self.assertEqual([int(x[x.index('--offset')+1]) for x in calls if '--owner' not in x],[0,100])
+        self.assertEqual(sum('--owner' in x for x in calls),1)
+        self.assertEqual(view['counts']['claimed'],0)
+        self.assertGreaterEqual(view['counts']['claimable'],30)
+        self.assertEqual(view['state'],'unknown')
+        self.assertIn('at least',view['summary'])
+        self.assertTrue(view['snapshot_truncated'])
+        self.assertFalse(view['own_tasks_truncated'])
+        self.assertTrue(view['actions_truncated'])
+        self.assertTrue(all(x['kind']=='claimable-task' for x in data['next_actions']))
+        print('NATIVE_R4_HIDDEN',json.dumps(dict(rows=len(self.export_rows()),work_calls=calls,
+              claimed=view['counts']['claimed'],claimable=view['counts']['claimable'],
+              state=view['state'],summary=view['summary'],snapshot_truncated=view['snapshot_truncated'],
+              own_tasks_truncated=view['own_tasks_truncated'],actions_truncated=view['actions_truncated'])),flush=True)
+
+
+# Borrow the fixture and helpers, while running only this isolated inventory case.
+for name in unittest.defaultTestLoader.getTestCaseNames(NativeAttentionFollowups):
+    if name not in NativeAttentionHiddenScale.__dict__:
+        setattr(NativeAttentionHiddenScale, name, None)
