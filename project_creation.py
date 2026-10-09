@@ -68,7 +68,7 @@ SERVER_LIMIT_MAX = 500
 #: names, such as information_schema, hold an underscore and are not project names anyway.)
 RESERVED_NAMES = frozenset({'mysql', 'sys', 'dolt', 'doltcfg'})
 #: The stages of the work, in order; a record names the one that was running.
-STAGES = ('init', 'configure', 'backup-target', 'merge-slot', 'first-backup')
+STAGES = ('init', 'configure', 'requirements-governance', 'backup-target', 'merge-slot', 'first-backup')
 ERROR_LIMIT = 300
 #: One sentence for a name that cannot be used, whatever the reason (taken by a project,
 #: held by another creation, or retired), so the answer does not say which.

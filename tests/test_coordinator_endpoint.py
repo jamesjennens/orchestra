@@ -158,6 +158,21 @@ class CoordinatorGateTests(unittest.TestCase):
                 self.refused(request(name), 'Unknown coordinator command',
                              key_principal=PRINCIPAL, key_projects=['alpha'])
 
+    def test_confined_coordinator_gains_no_owner_acceptance_or_governance_actions(self):
+        for name in ('owner-requirements', 'requirements-accept', 'requirements-governance'):
+            with self.subTest(name=name):
+                self.refused(request(name), 'Unknown coordinator command',
+                             key_principal=PRINCIPAL, key_projects=['alpha'])
+        built = {'project': 'alpha', 'actor': ACTOR, 'action': 'owner-requirements',
+                      'args': ['governance'], 'operation_id': 'try-owner-mode',
+                      'attachments': {'payload': {'text': json.dumps({
+                          'mode': 'simple', 'expected_revision': 0, 'expected_sha256': None})}}}
+        before = file_tree(self.root)
+        with mock.patch.object(endpoint.native, 'run', side_effect=AssertionError('native effect')):
+            with self.assertRaisesRegex(ValueError, 'only to the web service'):
+                endpoint.execute(self.root, built, key_principal=PRINCIPAL, key_projects=['alpha'])
+        self.assertEqual(file_tree(self.root), before)
+
     def test_a_listed_actor_of_the_principal_is_served(self):
         # The positive control for the gate: the same request that is refused above reaches
         # the guidance reader when the actor is bound, listed and in its own project.

@@ -24,6 +24,8 @@ from handoff import (
 from lifecycle import PREFIX as LIFECYCLE_PREFIX
 from requirements import ACCEPTANCE_FIELDS, SHA256_TEXT
 from recovery import PREFIX as VOID_PREFIX
+from requirement_owner_records import (ACCEPTANCE_PREFIX as OWNER_REQUIREMENT_ACCEPTANCE_PREFIX,
+                                       STATE_PREFIX as OWNER_REQUIREMENT_STATE_PREFIX)
 from review_workflow import PREFIX as REVIEW_PREFIX, REVERT_PREFIX
 RECOMMENDATION_PREFIX = 'Kind: review-recommendation-v1\n'    # review_recommendations.PREFIX (imports this module's peers)
 from worker_gate import PREFIX as PLAN_PREFIX, parse_body as parse_plan_body
@@ -207,6 +209,8 @@ RESERVED = (
     (LIFECYCLE_PREFIX, 'lifecycle evidence record', 'lifecycle.py record --file event.json'),
     (REQUIREMENT_PREFIX, 'requirement revision', 'requirement_records.py draft|revise'),
     (ACCEPTANCE_PREFIX, 'requirement acceptance evidence', 'admin.py requirement-apply'),
+    (OWNER_REQUIREMENT_ACCEPTANCE_PREFIX, 'owner requirement acceptance evidence', 'the owner requirements page'),
+    (OWNER_REQUIREMENT_STATE_PREFIX, 'owner requirement state evidence', 'the owner requirements page'),
     (HANDOFF_PREFIX, 'handoff intent', 'handoff TASK --file handoff.json'),
     (HANDOFF_COMPLETE_PREFIX, 'handoff completion', 'handoff TASK --file handoff.json'),
     (PLAN_PREFIX, 'worker plan registration', 'worker_gate.py register'),

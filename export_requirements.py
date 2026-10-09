@@ -134,6 +134,12 @@ def adapt(rows, selection, acceptance=None, previous=None, previous_acceptance=N
             record = revisions.get((rid, rev))
             if record is None or record['sha256'] != digest:
                 raise ValueError('selected revision missing or mismatched: ' + rid)
+            # Owner evidence is carried in source_issues with its exact native
+            # author. A claimed acceptance cannot be published on a label alone.
+            from requirement_records import resolved_acceptance
+            accepted = resolved_acceptance(issues[rid], record)
+            if record['acceptance_state'] == 'accepted' and not accepted:
+                raise ValueError('selected acceptance evidence missing or mismatched: ' + rid)
             manifest[group].append(record)
             selected_ids.append(rid)
             sources.append({'reference': ref, 'comment_ids': sorted(locations[(rid, rev)])})

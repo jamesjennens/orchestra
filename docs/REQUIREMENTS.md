@@ -4,6 +4,34 @@ The validator and publisher operate over explicit structured snapshots. Beads re
 
 The [BRD](BRD.md) and [source snapshot](requirements-baseline.json) are draft-0.1. They are not an accepted specification. The [contract](REQUIREMENTS_CONTRACT.md) records the implemented boundary and the disposition of the independent review.
 
+## Editing a project's requirements in the web interface
+
+In simple mode, a signed-in project owner opens **Requirements**, edits the text
+and saves a draft. **Accept** records the owner's decision for that content.
+Editing accepted text creates a new draft; the earlier accepted content remains
+available to existing exact references. The business requirements document is a
+read-only view of the records, including narrative, requirements, open questions
+and decisions. Every project member, including viewers, can read it.
+
+Newly provisioned projects start in simple mode. Existing projects with no
+governance history remain governed. An owner can switch modes from the page;
+changing modes preserves history and never accepts a draft automatically.
+Credentials, agents and superusers without owner membership cannot use these
+editing controls. The host's governed publication commands below retain their
+existing operator authority.
+
+The service stores immutable revision comments, server-generated owner decision
+evidence and a hash-chained governance sidecar. Backup/restore includes the
+governance history and operation receipts. A restore under a new project name
+retains historical hashes and validated source ranges rather than rewriting
+decisions. A retry after an interrupted write checks the exact original receipt
+and uses a separately guarded recovery operation; uncertainty without a matching
+receipt remains unresolved. Private review evidence contains verification detail.
+
+This slice supplies direct editing and acceptance. Withdrawal, supersession,
+baseline controls, downloadable baseline comparisons and proposal/room acceptance
+controls await their separate releases.
+
 ## Validate and publish a draft
 
 From the kit directory, using Python 3.10 or newer:
