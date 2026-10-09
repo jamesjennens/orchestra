@@ -1203,6 +1203,19 @@ that would silently rename somebody.
 A name with the shape of another account's or agent's id was already refused. A
 credential without `actor` writes under its issuer's own account id, as before.
 
+**One name, one issuer** -- an always-on rule, not part of the setting below. A worker
+credential may not be issued under a name that a working credential of another account in the
+same project already holds: the same name, one holding the other, or the same characters in
+another letter case, and whether or not anything has been written under it yet.
+`POST /v1/projects/{id}/worker-credentials` answers **409**, "The name NAME is held by a
+working credential of this project that another account issued (...). A name has one issuer at
+a time: have that credential revoked first, or choose another name", with the holding
+credential's id in `error.detail`. The same account may issue a name it already holds, which
+is how it replaces a credential without a gap. The comparison folds case as the tracker's own
+name rule does (`actor_names.head`), so `IT-A745` and `it-a745` are one name: a second account
+cannot take the other spelling and then write, with no waiver, work that the first account's
+rows also answer to.
+
 **At issue**, `POST /v1/projects/{id}/worker-credentials` answers 422, "A worker
 credential cannot write as NAME: that is a name on the operator list. Choose another
 name.", with the rule in `error.detail` and never another name of the host's. Nothing
@@ -1549,8 +1562,13 @@ that account made, and every worker credential that account issued. From the nex
   the task page the sentence stays in the review form until the page is left.
 - `recommend`, the review queue, My work and the brief count by the same parties, so the
   agent of the account that issued a worker credential can no longer recommend work
-  delivered under it (with the setting off that work is nobody's, and it can). The
-  refusal of a recommendation names the worker credential as one of its reasons.
+  delivered under it (with the setting off that work is nobody's, and it can). My work's
+  `to_review` holds only work the caller may actually approve: a contribution of the
+  caller's own party is left out of that list, since approving it would be refused
+  (the project's review queue still lists every row for everybody, with no per-caller
+  mark). The refusal of a recommendation names the worker credential as one of its reasons,
+  in both directions: work delivered under a credential the person issued, and a credential
+  the person issued recommending that person's own work.
 
 **Whose party a name is.**
 
@@ -1565,14 +1583,30 @@ that account made, and every worker credential that account issued. From the nex
   credential wrote it, and the tracker's time stamp can be a second later than this
   service's clock, so "the credential alive at that moment" picked the wrong account
   now and then. Counting each of them only ever refuses more.
+- **What "ever held" costs.** Because every issuer of a name is of the work's party, a name
+  an account issued and revoked **unused** still belongs to that account for ever: another
+  account may take the name (no working credential holds it and the tracker holds no row),
+  but work under it is then refused to both and only a third party may approve it. Widen that
+  and a project can be left with nobody who may approve: three owners and a superuser who
+  each once held a name (issued and revoked unused in turn) leave a fourth party's work under
+  it refused to all of them, and only a new account made an owner by a superuser can approve
+  it. **No route deletes a worker credential record**, and a revoked record counts for ever,
+  so no superuser can clear it. Two owners who each once issued a common name (`ci`,
+  `lane-1`), never at the same time, both lose the approval of all work under it. The ways
+  out are a third approver, a new name, or the writer stamp described below. Refusing a
+  second issuer for any name an account ever held, unused included, unless a superuser waives
+  it, was considered and is **not** done here: the tracker already refuses (422) a name one of
+  its rows holds, refusing the unused case would stop a project reusing a label whose holder
+  is gone, and it needs a new superuser waiver route. This is the cost of the rule as decided.
 - So that two accounts do not come to share a name without anybody meaning it, **a name
-  has one issuer at a time**: issuing a worker credential whose name is held by a working
-  credential that another account issued in the same project (the same name, or one
-  holding the other) is `409`, "The name NAME is held by a working credential of this
-  project that another account issued (...). A name has one issuer at a time: have that
-  credential revoked first, or choose another name", whether or not anything was written
-  under it yet. The same account may issue a name it already holds: that is how it
-  replaces a credential without a gap.
+  has one issuer at a time** (whether or not this setting is on; the rule is stated in full
+  under "The name a worker credential writes under"): issuing a worker credential whose name
+  is held by a working credential that another account issued in the same project (the same
+  name, or one holding the other, in any letter case) is `409`, "The name NAME is held by a
+  working credential of this project that another account issued (...). A name has one issuer
+  at a time: have that credential revoked first, or choose another name", whether or not
+  anything was written under it yet. The same account may issue a name it already holds: that
+  is how it replaces a credential without a gap.
 - **A writer that is no account, no agent and under no credential record is its own
   party.** That is a name written over the host route (a lane with an SSH key): another
   party than every web account, so whoever may approve here approves its work. This is
@@ -1598,7 +1632,12 @@ service's and not a host switch, and the endpoint's `setup-status` cannot report
 is on. The service writes one line to its log at every start, "approval by another party
 (--approval-by-another-party): on" or "off", and when that differs from the last start
 it says so and writes an audit entry `settings.approval_by_another_party` ("off -> on at
-service start"); the state file keeps what the last start had.
+service start"); the state file keeps what the last start had. A record that is anything
+but a JSON `true` or `false` -- missing, null, a string (`"yes"` and `"false"` included), a
+list, an object or a number -- is **unknown**, not off: the start line says the last start
+was not recorded, and the audit entry says "unknown -> on" or "unknown -> off". So a lost
+ON no longer leaves a later OFF start silent, and a damaged record no longer invents an
+"off -> on" change.
 
 **Going back to an older kit.** Remove `"approval_by_another_party"` from the office
 service configuration first: an office service older than this setting refuses to start

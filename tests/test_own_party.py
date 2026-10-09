@@ -227,6 +227,71 @@ class SettingOnTests(Party):
                 self.assertEqual(self.state_of(task), 'awaiting-review')
                 self.assertEqual(201, self.approve(other, task, contribution).status)
 
+    def test_a_two_level_label_under_an_account_id_is_still_that_account(self):
+        """Reviewer mutant N3 (round 2): the head is everything before the FIRST slash, not the last.
+        No test wrote ACCOUNT/x/y, so a mutant taking the last slash survived and reopened finding F1
+        for two-level labels: ACCOUNT/x/y was then nobody's and its issuer approved it."""
+        accounts = self.request('GET', '/v1/accounts', token=self.admin).data['items']
+        self.ids['admin'] = [account['id'] for account in accounts if account.get('superuser')][0]
+        account = self.ids['olive']
+        made = self.request('POST', '/v1/projects/%s/worker-credentials' % self.project, {'label': 'unnamed'},
+                            token=self.tokens['olive'])
+        self.assertEqual((201, None), (made.status, made.data['credential']['actor']), made.data)
+        label = account + '/x/y'
+        self.assertEqual(self.service.actor_parties(label, self.project), {account})
+        self.assertEqual(self.service.actor_parties(label, None), {account})          # an account is one everywhere
+        task, contribution = self.deliver_as(made.data['credential']['secret'], label)
+        brief = self.request('GET', self.base(task) + '/brief', token=self.admin).data
+        self.assertEqual(brief['review']['contribution']['author'], label)
+        self.refused(self.approve(self.tokens['olive'], task, contribution))
+        self.assertEqual(self.state_of(task), 'awaiting-review')
+        self.assertEqual(201, self.approve(self.tokens['oscar'], task, contribution).status)
+
+    def test_a_name_ending_in_a_slash_holds_the_labels_below_it(self):
+        """Reviewer mutant N21 (round 2): a credential named ``x/`` holds ``x/...`` and ``x//...`` (the
+        trailing slash is stripped before the separator is added). No test had a credential named ``x/``."""
+        held = self.issue('oscar', 'ts-n/')
+        self.assertEqual(201, held.status, held.data)
+        self.assertTrue(self.service._holds('ts-n/', 'ts-n/'))
+        self.assertTrue(self.service._holds('ts-n/', 'ts-n/x'))
+        self.assertTrue(self.service._holds('ts-n/', 'ts-n//y'))
+        self.assertFalse(self.service._holds('ts-n/', 'ts-n'))                        # the bare name is above it
+        self.assertFalse(self.service._holds('ts-n/', 'ts-nx'))
+        task = self.request('POST', '/v1/projects/%s/tasks' % self.project, {'title': 'slash'}, token=self.admin).data['id']
+        token = held.data['credential']['secret']
+        self.assertEqual(200, self.request('POST', self.base(task) + '/claim', {'actor': 'ts-n/x'}, token=token).status)
+        made = self.request('POST', self.base(task) + '/reviews', {
+            'operation': 'contribute', 'commit': test_http_agents.COMMIT, 'base_commit': test_http_agents.BASE,
+            'bundle_sha256': test_http_agents.BUNDLE, 'summary': 'delivered', 'actor': 'ts-n/x'}, token=token)
+        self.assertEqual(201, made.status, made.data)
+        self.assertEqual(self.service.actor_parties('ts-n/x', self.project), {self.ids['oscar']})
+        self.refused(self.approve(self.tokens['oscar'], task, made.data['contribution']['id']))
+
+    def test_a_name_is_the_same_name_in_any_letter_case(self):
+        """N2: the tracker's own name rule folds case and so does this rule. A working ``it-a745`` refuses
+        another account's ``IT-A745`` (it used to be issued and the two then shared the name), and a name
+        that changed hands under another spelling is the work of every account that held it."""
+        first = self.issue('oscar', 'it-a745')
+        self.assertEqual(201, first.status, first.data)
+        refused = self.issue('olive', 'IT-A745')
+        self.assertEqual(409, refused.status, refused.data)
+        self.assertEqual(409, self.issue('olive', 'IT-A745/night').status)
+        self.assertEqual(201, self.issue('olive', 'it-a745x').status)                 # only looks like it
+        # Revoked unused, the name is free; both spellings then trace to both accounts.
+        self.assertEqual(204, self.revoke('oscar', first.data['credential']['id']).status)
+        second = self.issue('olive', 'IT-A745')
+        self.assertEqual(201, second.status, second.data)
+        both = {self.ids['olive'], self.ids['oscar']}
+        for name in ('it-a745', 'IT-A745', 'It-A745/night'):
+            with self.subTest(name=name):
+                self.assertEqual(self.service.actor_parties(name, self.project), both)
+
+    def test_an_account_id_in_capitals_is_still_that_account_id(self):
+        """N8: the actor namespace accepted another account's id in capitals (``USR_.../x``), which only
+        looks like that account. The id shape is read case-folded; the issuer's own id is still its own."""
+        self.assertEqual(422, self.issue('olive', self.ids['oscar'].upper() + '/x').status)
+        self.assertEqual(201, self.issue('olive', self.ids['olive'].upper() + '/x').status)
+
     def test_a_named_credential_is_issued_beside_another_accounts_unnamed_one(self):
         """Round 2 of the review: with one account holding a working credential issued with NO name (the
         default), every other account asking for a NAMED one was answered 500 (the unnamed credential's
@@ -375,6 +440,32 @@ class SettingOnTests(Party):
         row = [item for item in self.request('GET', '/v1/projects/%s/queue' % self.project, token=self.tokens['oscar']).data['items']
                if item['id'] == task][0]
         self.assertEqual(row.get('recommended_by') or [], [])
+
+    def test_a_credential_the_author_issued_cannot_recommend_the_authors_work(self):
+        """N6: a recommendation under a worker credential olive issued for olive's OWN work is refused,
+        and the party sentence names that reason (round 2: the sentence listed the other direction only)."""
+        task, contribution = self.deliver(self.tokens['olive'])
+        worker, _ = self.worker_of('olive', 'lane-r')
+        refused = self.recommend(worker, task, contribution)
+        self.assertEqual(403, refused.status, refused.data)
+        self.assertEqual(refused.data['error']['message'], API.NOT_INDEPENDENT_PARTY)
+        self.assertIn("nor a worker credential issued by the contribution's author or by the task's assignee",
+                      refused.data['error']['message'])
+
+    def test_my_work_does_not_offer_own_party_work_for_approval(self):
+        """N4: with the setting on, ``GET /v1/me/work`` ``to_review`` leaves out the caller's own party's
+        contributions, which approving is refused for; another party's stay. Off, it lists as it always did."""
+        own_task, _ = self.deliver(self.tokens['olive'])
+        other_task, _ = self.deliver(self.tokens['carl'])
+        answer = self.request('GET', '/v1/me/work', token=self.tokens['olive'])
+        self.assertEqual(200, answer.status, answer.data)
+        shown = {row['id'] for row in answer.data['to_review']}
+        self.assertNotIn(own_task, shown)
+        self.assertIn(other_task, shown)
+        self.service.approval_by_another_party = False
+        shown_off = {row['id'] for row in self.request('GET', '/v1/me/work', token=self.tokens['olive']).data['to_review']}
+        self.assertIn(own_task, shown_off)
+        self.assertIn(other_task, shown_off)
 
     def test_a_name_is_traced_in_the_project_of_the_work(self):
         """`lane-a` is olive's in Alpha and oscar's in Beta. Work under it in Alpha is olive's alone: oscar's agent
@@ -582,10 +673,13 @@ class WiringTests(Party):
             with self.service.store.lock:
                 return [(event['action'], event['outcome'], event['reason'], event['user_id'])
                         for event in self.service.state['audit'] if event['action'].startswith('settings.')]
+        with self.service.store.lock:                         # a READABLE record: the case this test is about
+            self.service.state['settings_seen'] = {'approval_by_another_party': False}
+            self.service.store.save()
         self.service.approval_by_another_party = False
         self.assertEqual(http_service.settings_lines(self.service),
                          ['approval by another party (--approval-by-another-party): off'])
-        self.assertEqual(entries(), [])                                           # never recorded counts as off
+        self.assertEqual(entries(), [])                                           # the same again: nothing
         self.service.approval_by_another_party = True
         self.assertEqual(http_service.settings_lines(self.service),
                          ['approval by another party (--approval-by-another-party): on '
@@ -598,6 +692,57 @@ class WiringTests(Party):
         self.assertEqual(again.note_settings(), (True, False))
         self.assertEqual([event['reason'] for event in again.state['audit'] if event['action'].startswith('settings.')],
                          ['off -> on at service start', 'on -> off at service start'])
+
+    def test_a_last_start_that_cannot_be_read_is_unknown(self):
+        """N5: a settings_seen that is anything but a JSON true or false is UNKNOWN, not off. A start ON
+        says "unknown -> on" (not a spurious "off -> on"), a start OFF after a lost ON writes an entry
+        (not nothing), and the strings ``"yes"`` and ``"false"`` are unknown too."""
+        def entries():
+            with self.service.store.lock:
+                return [(event['reason'], event['user_id'])
+                        for event in self.service.state['audit'] if event['action'].startswith('settings.')]
+        for damaged in (None, 'yes', 'false', 0, 1, [], {}):
+            with self.subTest(record=damaged):
+                with self.service.store.lock:
+                    del self.service.state['audit'][:]
+                    self.service.state['settings_seen'] = {'approval_by_another_party': damaged}
+                    self.service.store.save()
+                self.service.approval_by_another_party = True
+                line = http_service.settings_lines(self.service)[0]
+                self.assertEqual(entries(), [('unknown -> on at service start', None)])
+                self.assertIn('the last start was not recorded', line)
+                self.assertIn('(--approval-by-another-party): on', line)
+        # A readable true is "on": no unknown, no entry.
+        with self.service.store.lock:
+            del self.service.state['audit'][:]
+            self.service.state['settings_seen'] = {'approval_by_another_party': True}
+            self.service.store.save()
+        self.service.approval_by_another_party = True
+        self.assertEqual(entries(), [])
+        self.assertNotIn('not recorded', http_service.settings_lines(self.service)[0])
+        # A start OFF after a lost ON writes the entry it used to omit.
+        with self.service.store.lock:
+            del self.service.state['audit'][:]
+            self.service.state['settings_seen'] = {'approval_by_another_party': 'true'}
+            self.service.store.save()
+        self.service.approval_by_another_party = False
+        self.assertEqual(http_service.settings_lines(self.service)[0],
+                         'approval by another party (--approval-by-another-party): off '
+                         '(the last start was not recorded; that is written to the audit)')
+        self.assertEqual(entries(), [('unknown -> off at service start', None)])
+        # A missing settings_seen is unknown once, and readable from then on.
+        with self.service.store.lock:
+            del self.service.state['audit'][:]
+            self.service.state.pop('settings_seen', None)
+            self.service.store.save()
+        self.service.approval_by_another_party = True
+        self.assertIn('the last start was not recorded', http_service.settings_lines(self.service)[0])
+        self.service.approval_by_another_party = False
+        self.assertEqual(http_service.settings_lines(self.service)[0],
+                         'approval by another party (--approval-by-another-party): off '
+                         '(it was on at the last start; recorded in the audit)')
+        self.assertEqual([reason for reason, _ in entries()],
+                         ['unknown -> on at service start', 'on -> off at service start'])
 
 if __name__ == '__main__':
     unittest.main()
