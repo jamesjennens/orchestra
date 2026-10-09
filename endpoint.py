@@ -426,12 +426,12 @@ def tracker_actors(root,path,before=None,own=()):
     credential-actors`` makes: a bd process that opens the project's database. That is the
     cost of judging a plain name by the rows it has, and it is paid where the rule is
     applied, never by every write (docs/HTTP_DEPLOYMENT.md says so). A tracker that cannot
-    be read raises, and so does an answer that is not a whole tracker -- an export that
-    parses to no rows, that fails partway (a cut line, a non-JSON word, a bd that exits
-    nonzero), or that carries rows but not the project's merge slot
-    (``actor_names.TrackerUnreadable``): every project this kit makes holds that slot, so an
-    answer without it did not come from a whole read and is a host fault, not "the tracker
-    holds no names" (kittrial-5bb.188 review of item 1, revision-3 item 3). ``own`` are the
+    be read raises ``actor_names.TrackerUnreadable``, and an answer that carries rows but
+    not the project's merge slot raises ``actor_names.TrackerMergeSlotMissing``: every
+    project this kit makes holds that slot, so a whole read carries it. The two are told
+    apart so that a missing row, which only the merge-create operation repairs, is not
+    answered as the transient fault "try again shortly" (kittrial-5bb.188 review of item 1,
+    revision-3 item 3; kittrial-5bb.202 item 1). ``own`` are the
     lifetimes of earlier credentials of the same name whose rows are not held against this
     one (item 3)."""
     import actor_names
@@ -443,8 +443,12 @@ def tracker_actors(root,path,before=None,own=()):
         # bd could not answer, or answered something that is not rows: a host fault, never an
         # empty tracker and never a rejection of the caller's request.
         raise actor_names.TrackerUnreadable()
-    if not any(isinstance(row,dict) for row in rows) or not any(is_merge_slot(row) for row in rows):
+    if not any(isinstance(row,dict) for row in rows):
         raise actor_names.TrackerUnreadable()
+    if not any(is_merge_slot(row) for row in rows):
+        # Rows came back, so this is not a failed read: what is absent is the merge-slot row
+        # itself, which only an operator's merge-create puts back (kittrial-5bb.202 item 1).
+        raise actor_names.TrackerMergeSlotMissing()
     return actor_names.tracker_names(actor_names.tracker_marks(rows),before,own)
 
 def reserved_actors(root,path,rows=False,own=()):
@@ -1075,6 +1079,10 @@ def main():
             # service reads this mark and answers 503 "nothing was changed" (kittrial-5bb.188
             # item 1); `fault` is how it tells a read the service may retry from a rejection.
             answer['fault']='tracker'
+        if isinstance(e,actor_names.TrackerMergeSlotMissing):
+            # Rows came back but the merge slot is missing: not transient, so its own mark and
+            # its own sentence naming the merge-create repair (kittrial-5bb.202 item 1).
+            answer['fault']='merge-slot'
         if configuration_fault(a.root,e):
             # Not a fault of the request: the server's own configuration file cannot be read.
             # The line names the file, as it does for the operator; `fault` lets the web service

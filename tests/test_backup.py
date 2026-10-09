@@ -303,7 +303,11 @@ class BackupTests(unittest.TestCase):
         # native backup target (a restored clone otherwise keeps the source's target).
         self.assertEqual([item.args[2] for item in native.call_args_list],
                          [['backup', 'restore', str(self.root / 'backups' / 'source'), '--force'],
-                          ['backup', 'init', str(self.root / 'backups' / 'destination')]])
+                          ['backup', 'init', str(self.root / 'backups' / 'destination')],
+                          # kittrial-5bb.202 item 3: a source made before the slot was provisioned
+                          # would leave the clone without one, so restore-new provisions it too.
+                          ['merge-slot', 'check', '--json'],
+                          ['merge-slot', 'create', '--json']])
         self.assertIn('Restored only into the newly created project', out.getvalue())
         self.assertEqual(json.loads((self.destination / self.request_name).read_text()), self.receipt)
 
@@ -363,11 +367,14 @@ class BackupTests(unittest.TestCase):
                 patch.object(admin, 'add_project'), patch.object(admin, 'run_bd', side_effect=native), \
                 contextlib.redirect_stdout(io.StringIO()):
             admin.main()
-        self.assertEqual([name for name, _ in calls], ['destination', 'destination'])
+        self.assertEqual([name for name, _ in calls], ['destination', 'destination', 'destination', 'destination'])
         self.assertEqual(calls[0][1],
                          ['backup', 'restore', str(self.root / 'backups' / 'source'), '--force'])
         self.assertEqual(calls[1][1],
                          ['backup', 'init', str(self.root / 'backups' / 'destination')])
+        # kittrial-5bb.202 item 3: the restore provisions the clone's merge slot (idempotent).
+        self.assertEqual(calls[2][1], ['merge-slot', 'check', '--json'])
+        self.assertEqual(calls[3][1], ['merge-slot', 'create', '--json'])
 
     def test_restore_holds_source_backup_lock_across_entire_pair(self):
         self.save_bundle()
@@ -395,7 +402,7 @@ class BackupTests(unittest.TestCase):
         with patch.object(sys, 'argv', argv), patch.object(admin, 'root_path', return_value=self.root), patch.object(admin, 'coordination_backup', side_effect=read), patch.object(admin, 'add_project', side_effect=create), patch.object(admin, 'run_bd', side_effect=native), patch.object(admin, 'restore_coordination', side_effect=restore), contextlib.redirect_stdout(io.StringIO()):
             admin.main()
         self.assertEqual(phases, ['validate-sidecar', 'create-destination', 'restore-native',
-                                  'repoint-native', 'restore-sidecar'])
+                                  'repoint-native', 'restore-native', 'restore-native', 'restore-sidecar'])
         self.assertTrue(self.flock.call_args.args[0].closed)
 
     def test_backup_rejects_symlink_journal_directory(self):

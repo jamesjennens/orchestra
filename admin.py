@@ -2015,6 +2015,40 @@ def scheduled_backup_covers(root,name):
             return True
     return None if unreadable else False
 
+def project_merge_slot_state(root,name,path=None):
+    """The project's merge slot as the host reads it, for the setup page and the report.
+
+    Read-only (kittrial-5bb.202 item 2). ``healthy`` (bd reports a free or held slot),
+    ``missing`` (bd reports no slot for this project), ``damaged`` (the row is there but it
+    is not available and names no holder) or ``unknown`` (nothing was read: the metadata
+    does not record the Dolt server coordinates, where bd would create an embedded database
+    and answer nothing, or bd could not run or answer). ``detail`` is a sentence for a
+    person; for missing and damaged it names the merge-create operation and uses the kit's
+    existing words (``coordination.merge_slot_missing``, ``SLOT_DAMAGED``), and it is None
+    for a healthy or unreadable slot.
+    """
+    from coordination import merge_slot_damaged,merge_slot_missing,SLOT_DAMAGED
+    path=project_dir(root,name) if path is None else Path(path)
+    # bd is never run without the server coordinates: it would fall back to an embedded
+    # database and CREATE .beads/embeddeddolt here (see project_metadata_state).
+    try:
+        metadata=json.loads((path/'.beads'/'metadata.json').read_text(encoding='utf-8'))
+    except (OSError,ValueError,UnicodeError):
+        metadata=None
+    keys=('dolt_server_host','dolt_server_port','dolt_server_user','dolt_database')
+    if not isinstance(metadata,dict) or not all(metadata.get(key) for key in keys):
+        return {'state':'unknown','detail':None}
+    try:
+        state=json.loads(run_bd(root,name,['merge-slot','check','--json']) or 'null')
+    except (subprocess.CalledProcessError,subprocess.TimeoutExpired,OSError,ValueError,TypeError,RecursionError):
+        return {'state':'unknown','detail':None}
+    if merge_slot_missing(state):
+        return {'state':'missing','detail':'Merge slot does not exist for this project; run the merge-create '
+                                           'operation to create it.'}
+    if merge_slot_damaged(state):
+        return {'state':'damaged','detail':SLOT_DAMAGED}
+    return {'state':'healthy','detail':None}
+
 def project_setup_status(root,name,path=None):
     """What the host knows about one project's setup, for the web setup page.
 
@@ -2075,6 +2109,9 @@ def project_setup_status(root,name,path=None):
     except (ValueError,OSError):
         pass
     result['backup']=backup
+    # The project's merge slot, so the setup page can name a missing or damaged one as a
+    # step (kittrial-5bb.202 item 2). Unknown when bd cannot say; never a write.
+    result['merge_slot']=project_merge_slot_state(root,name,path)
     # How full the server is (kittrial-5bb.118 part 2 revision): every project database on it
     # counts, and every bd write gets slower as they grow. The web service shows it to a
     # superuser only.
@@ -3311,6 +3348,29 @@ def initialized_projects(root):
         if not re.fullmatch(r'[a-z][a-z0-9]{1,23}',path.name):continue
         if (path/'.beads'/'metadata.json').is_file():found.append(path.name)
     return sorted(found)
+
+def merge_slot_report(root,names=None):
+    """Read-only report of the projects whose merge slot is not healthy (kittrial-5bb.202 item 4).
+
+    Every initialized project of this runtime (or the ones named) is read once through
+    ``project_merge_slot_state``, which never writes. A project is listed under exactly one
+    of ``missing``, ``damaged``, ``unreadable`` or ``healthy``. ``missing``/``damaged`` name
+    the merge-create repair in the project's ``detail``; ``unreadable`` is a project whose
+    slot could not be read at all. Returns ``(report, healthy)``: ``healthy`` is true only
+    when at least one project was read and every one of them is healthy, so a caller can use
+    it as a gate. No lock and no write: bd runs only for a project whose metadata records
+    the Dolt server coordinates.
+    """
+    report={}
+    for name in (names or initialized_projects(root)):
+        report[name]=project_merge_slot_state(root,name)
+    groups={state:sorted(name for name,entry in report.items() if entry['state']==state)
+            for state in ('missing','damaged','unknown','healthy')}
+    return ({'schema_version':1,'projects':report,
+             'missing':groups['missing'],'damaged':groups['damaged'],
+             'unreadable':groups['unknown'],'healthy':groups['healthy'],
+             'not_healthy':sorted(groups['missing']+groups['damaged']+groups['unknown'])},
+            bool(report) and not groups['missing'] and not groups['damaged'] and not groups['unknown'])
 
 def _revoked_list(found,limit):
     """One revocation list: the first `limit` entries, or every entry when limit is None.
@@ -6345,6 +6405,9 @@ def main():
                                                  'the label open-item or an open-item: label (exit 1 when any does, or '
                                                  'cannot be read)')
     a.add_argument('projects',nargs='*',metavar='project')
+    a=sub.add_parser('merge-slot-report',help='read only: the projects whose merge slot is missing, damaged or cannot '
+                                              'be read, with the merge-create repair (exit 1 when any is not healthy)')
+    a.add_argument('projects',nargs='*',metavar='project')
     a=sub.add_parser('backup-status')
     a.add_argument('--require-complete',action='store_true',dest='require_complete',
                    help='exit non-zero unless the last run covered every project (--all) and every initialized '
@@ -6967,6 +7030,16 @@ def main():
         report,clean=open_item_label_check(root,args.projects)
         print(json.dumps(report,sort_keys=True))
         if not clean:raise SystemExit(1)
+    elif args.command=='merge-slot-report':
+        report,healthy=merge_slot_report(root,args.projects)
+        print(json.dumps(report,sort_keys=True))
+        if not healthy:
+            # stdout stays one JSON document; the plain sentence goes to stderr.
+            names=report['not_healthy']
+            print('merge-slot-report: %d project(s) do not have a healthy merge slot: %s. An operator runs the '
+                  'merge-create coordination operation for each, then re-runs this report.'
+                  %(len(names),', '.join(names)),file=sys.stderr)
+            raise SystemExit(1)
     elif args.command=='backup-status':
         record=read_backup_status(root)
         # Retired projects are not part of the gate; they are listed so an operator can
@@ -7149,6 +7222,11 @@ def finish_restore(root,args,snapshot):
     # already-configured destination in place; validate_backup_target refuses any
     # clone that was not re-pointed this way.
     run_bd(root,args.destination,['backup','init',str(root/'backups'/args.destination)])
+    # The native restore replaced the destination's rows with the SOURCE database's, so a
+    # source made before the slot was provisioned leaves the clone without a merge slot.
+    # This is a way of making a project that the kit controls, so close it here: provision
+    # the slot idempotently before anything reads the restored project (kittrial-5bb.202 item 3).
+    provision_merge_slot(root,args.destination)
     # The deployment authority merges come last (kittrial-5bb.142): they are the only step
     # that waits on the deployment lock, and a refusal there must leave a complete restore.
     # --without-coordination (kittrial-5bb.152): no coordination files, no authority; the

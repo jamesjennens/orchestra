@@ -1550,6 +1550,12 @@ class EndpointBackend:
             # `reading` path above already decides what such a failure means: 503, nothing
             # was changed, the key stays free. Never 422 "the request was rejected".
             raise cls._unread()
+        if isinstance(reply, dict) and reply.get('fault') == 'merge-slot':
+            # Rows came back but the project's merge slot is missing (kittrial-5bb.202 item 1).
+            # It is not the transient tracker fault: trying again never helps and only an
+            # operator's merge-create puts the row back, so the caller gets that sentence and
+            # its own code, never UNREAD's "try again shortly".
+            raise cls._merge_slot_missing()
         if code == 126:
             # The endpoint re-validated live authority immediately before the effect
             # and refused it. Nothing was written.
@@ -1598,6 +1604,19 @@ class EndpointBackend:
     @classmethod
     def _unread(cls):
         failure = HttpError(503, 'unavailable', cls.UNREAD)
+        failure.nothing_done = True
+        return failure
+
+    #: Said when rows came back but the project has no merge-slot row (kittrial-5bb.202 item 1).
+    #: Not transient: the row will not appear by retrying, and only an operator's merge-create
+    #: puts it back. Its own code, so a caller can tell it from UNREAD.
+    MERGE_SLOT_MISSING = ("The project's tracker holds no merge slot row, so it was not read as a whole "
+                          "tracker. An operator must run the merge-create operation, which creates the "
+                          "slot, then try again.")
+
+    @classmethod
+    def _merge_slot_missing(cls):
+        failure = HttpError(503, 'merge_slot_missing', cls.MERGE_SLOT_MISSING)
         failure.nothing_done = True
         return failure
 

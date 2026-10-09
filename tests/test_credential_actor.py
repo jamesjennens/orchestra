@@ -404,6 +404,22 @@ class DenialTests(unittest.TestCase):
         self.assertEqual((2, 'tracker'), (answer['returncode'], answer.get('fault')), answer)
         self.assertNotEqual(126, answer['returncode'])
 
+    def test_a_tracker_without_the_merge_slot_is_its_own_fault_naming_merge_create(self):
+        """kittrial-5bb.202 item 1: rows without the slot are not the transient no-rows fault."""
+        def slotless(rows=False, own=()):
+            if rows:
+                raise actor_names.TrackerMergeSlotMissing()
+            return dict(HOST)
+        answer = http_authority.descriptor_actor_denial(
+            {'project': 'probe', 'actor': 'opus-worker-lane', 'action': 'bd', 'args': ['create', 'x'],
+             'authority': {'via': 'credential', 'user_id': 'usr_a', 'credential_id': 'cred_old',
+                           'session_hash': 'sess_a', 'project': 'probe', 'capability': 'tasks.write'}},
+            self.config, slotless)
+        self.assertEqual((2, 'merge-slot'), (answer['returncode'], answer.get('fault')), answer)
+        self.assertIn('merge-create', answer['stderr'])
+        self.assertNotIn('try again shortly', answer['stderr'])
+        self.assertNotEqual(126, answer['returncode'])
+
     def test_a_settled_credential_is_not_read_against_the_tracker_again(self):
         """Items 4 and 5: checked, waived and refused marks each answer without an export."""
         state = json.loads((self.tmp / 'authority.json').read_text(encoding='utf-8'))
@@ -1002,9 +1018,10 @@ class UseCase(HostNames, fixes.EndpointCase):
         self.assertNotIn('actor_rows_refused', record)
 
     def test_every_broken_tracker_answer_is_unavailable_and_changes_nothing(self):
-        """kittrial-5bb.188 revision-3 item 3(1): a cut line, a nonzero bd, words that are not
-        rows and a tracker without its merge slot are host faults answered 503, not 422, at
-        issue and at use."""
+        """kittrial-5bb.188 revision-3 item 3(1): a cut line, a nonzero bd and words that are not
+        rows are host faults answered 503, not 422, at issue and at use. A tracker without its
+        merge slot is 503 too, but its own, non-transient sentence naming merge-create
+        (kittrial-5bb.202 item 1)."""
         self.project()
         for mode in ('unreadable', 'cut', 'exit1', 'words', 'no-slot'):
             with self.subTest(tracker=mode):
@@ -1012,7 +1029,14 @@ class UseCase(HostNames, fixes.EndpointCase):
                 refused = self.request('POST', self.credentials, {'actor': 'lane-%s' % mode},
                                        token=self.alex, key='bad-tracker-%s' % mode)
                 self.assertEqual(503, refused.status, refused.data)
-                self.assertIn('Nothing was changed', message(refused))
+                said = message(refused)
+                if mode == 'no-slot':
+                    self.assertIn('merge-create', said)
+                    self.assertNotIn('try again shortly', said)
+                    self.assertEqual('merge_slot_missing', refused.data['error']['code'])
+                else:
+                    self.assertIn('Nothing was changed', said)
+                    self.assertEqual('unavailable', refused.data['error']['code'])
         self.assertEqual([], self.listed_without_asking())
         # At use, an unjudged credential's first write is the same host fault, with no mark.
         legacy = self.old_credential('lane-old', checked=False)
@@ -1273,23 +1297,32 @@ class RealEndpointCase(unittest.TestCase):
 
     def test_an_answer_without_the_merge_slot_or_not_rows_at_all_is_a_host_fault(self):
         """kittrial-5bb.188 revision-3 item 3(1): a whole read requires the merge slot, and an
-        answer that is a cut line, a nonzero bd or words that are not rows is a host fault."""
+        answer that is a cut line, a nonzero bd or words that are not rows is a host fault.
+        kittrial-5bb.202 item 1: rows that came back without the slot row are their own,
+        non-transient fault naming the merge-create repair."""
         row = json.dumps(json.dumps({'id': 'probe-1', 'created_by': 'opus-worker-lane',
                                      'created_at': '2026-01-01T00:00:00Z'}))
         shapes = (
-            ('rows but no merge slot', '#!/bin/sh\necho %s\nexit 0\n' % row),
-            ('the last line cut short', '#!/bin/sh\necho %s\necho \'{"id": "probe-2", "created_\'\nexit 0\n' % row),
-            ('exit 1 with an error line', '#!/bin/sh\necho "bd: the database is locked" >&2\nexit 1\n'),
-            ('words that are not rows', '#!/bin/sh\necho "not a row at all"\nexit 0\n'),
+            ('rows but no merge slot', '#!/bin/sh\necho %s\nexit 0\n' % row,
+             actor_names.TrackerMergeSlotMissing, 'merge-slot'),
+            ('the last line cut short', '#!/bin/sh\necho %s\necho \'{"id": "probe-2", "created_\'\nexit 0\n' % row,
+             actor_names.TrackerUnreadable, 'tracker'),
+            ('exit 1 with an error line', '#!/bin/sh\necho "bd: the database is locked" >&2\nexit 1\n',
+             actor_names.TrackerUnreadable, 'tracker'),
+            ('words that are not rows', '#!/bin/sh\necho "not a row at all"\nexit 0\n',
+             actor_names.TrackerUnreadable, 'tracker'),
         )
-        for number, (label, script) in enumerate(shapes):
+        for number, (label, script, fault_class, fault) in enumerate(shapes):
             with self.subTest(answer=label):
                 self.set_bd_raw(script)
-                with self.assertRaises(actor_names.TrackerUnreadable):
+                with self.assertRaises(fault_class):
                     self.endpoint.tracker_actors(self.root, self.project)
                 answer = self.write('worker-a', self.credential('worker-a', rows_checked=False,
                                                                 created_at='2026-10-07T00:00:00Z'), 'bad-%d' % number)
-                self.assertEqual((2, 'tracker'), (answer['returncode'], answer.get('fault')), answer)
+                self.assertEqual((2, fault), (answer['returncode'], answer.get('fault')), answer)
+                if fault == 'merge-slot':
+                    self.assertIn('merge-create', answer['stderr'])
+                    self.assertNotIn('try again shortly', answer['stderr'])
                 self.assertFalse((self.project / '.http-operations.sqlite3').exists(),
                                  'an operation identity was reserved')
 
@@ -1462,6 +1495,22 @@ class TrackerFaultTests(unittest.TestCase):
                 self.assertEqual((503, 'unavailable', http_service.EndpointBackend.UNREAD, True),
                                  (error.status, error.code, error.message,
                                   getattr(error, 'nothing_done', False)))
+
+    def test_the_missing_slot_is_its_own_error_and_says_merge_create(self):
+        """kittrial-5bb.202 item 1: not UNREAD's transient sentence, and its own code."""
+        for reading in (True, False):
+            with self.subTest(reading=reading):
+                with self.assertRaises(http_service.HttpError) as failed:
+                    http_service.EndpointBackend._checked(
+                        {'returncode': 2, 'stdout': '', 'stderr': 'ValueError: no slot\n', 'fault': 'merge-slot'},
+                        'actor-standing', reading=reading)
+                error = failed.exception
+                self.assertEqual((503, 'merge_slot_missing', http_service.EndpointBackend.MERGE_SLOT_MISSING, True),
+                                 (error.status, error.code, error.message,
+                                  getattr(error, 'nothing_done', False)))
+                self.assertIn('merge-create', error.message)
+                self.assertNotEqual(http_service.EndpointBackend.UNREAD, error.message)
+                self.assertNotEqual('unavailable', error.code)
 
     def test_an_ordinary_code_two_reading_refusal_is_still_422(self):
         """The endpoint's own guard refusals stay 422 on the reading path (main's rule)."""

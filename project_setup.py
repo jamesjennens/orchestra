@@ -156,6 +156,25 @@ def steps(handler, principal, project_id):
 
     status, reason = host_status(backend, project_id)
     name = project_id
+
+    def merge_slot(block):
+        # The host's own read of the project's merge slot (kittrial-5bb.202 item 2): a
+        # project with none, or one whose slot record is damaged, cannot issue a worker
+        # credential and needs an operator to run the merge-create coordination operation.
+        state = block.get('state')
+        if state == 'healthy':
+            return 'done', 'The project has a usable merge slot.'
+        if state in ('missing', 'damaged'):
+            return 'todo', (block.get('detail') or
+                            'Run the merge-create operation, which creates or repairs it, then try again.')
+        return 'unknown', 'The server could not say whether the project has a usable merge slot.'
+
+    result.append(host_step(
+        'merge-slot', 'Make sure the project has a usable merge slot',
+        # The host's key is ``merge_slot``; host_step looks a step up by its id, so hand it a
+        # one-key status. A service that predates the field says unknown, not "no host".
+        None if status is None else {'merge-slot': status.get('merge_slot')},
+        reason, merge_slot, None, [], None))
     result.append(host_step(
         'guidance', 'Set the standing guidance every worker reads', status, reason,
         lambda block: ({'set': ('done', 'Set%s.' % (' on %s' % block['set_at'][:10] if block.get('set_at') else '')),

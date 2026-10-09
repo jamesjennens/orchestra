@@ -337,10 +337,13 @@ class RestoreNewCommandCase(RuntimeCase):
     def test_restore_new_uses_the_sql_path_then_every_existing_step(self):
         stdout, stderr, code = self.run_restore()
         self.assertEqual(code, 0, stderr)
-        self.assertEqual([call[0] for call in self.calls], ['add_project', 'sql-restore', 'bd'])
+        self.assertEqual([call[0] for call in self.calls], ['add_project', 'sql-restore', 'bd', 'bd', 'bd'])
         self.assertIn("CALL DOLT_BACKUP('restore', '--force',", self.calls[1][1])
-        # No `bd backup restore`; the re-point of the clone's own target is kept.
+        # No `bd backup restore`; the re-point of the clone's own target is kept, then the
+        # merge slot is provisioned (kittrial-5bb.202 item 3: a legacy source may lack it).
         self.assertEqual(self.calls[2], ('bd', 'beta', ['backup', 'init', str(self.root / 'backups' / 'beta')]))
+        self.assertEqual(self.calls[3], ('bd', 'beta', ['merge-slot', 'check', '--json']))
+        self.assertEqual(self.calls[4], ('bd', 'beta', ['merge-slot', 'create', '--json']))
         destination = self.root / 'projects' / 'beta'
         self.assertEqual(json.loads((destination / '.beads' / 'metadata.json').read_text(
             encoding='utf-8'))['project_id'], SOURCE_ID)

@@ -431,6 +431,26 @@ class CoordinationTests(unittest.TestCase):
             with self.subTest(state=state):
                 self.assertFalse(coordination.merge_slot_missing(state))
 
+    def test_merge_slot_damaged_predicate_is_the_unavailable_row_without_a_holder(self):
+        """kittrial-5bb.202: the damaged shape is available false and no holder."""
+        for state in ({'available': False, 'holder': None, 'id': 'pp-merge-slot', 'waiters': None},
+                      {'available': False, 'holder': None, 'id': 'pp-merge-slot'},
+                      {'available': False, 'holder': None, 'waiters': ['bob']}):
+            with self.subTest(state=state):
+                self.assertTrue(coordination.merge_slot_damaged(state))
+        # A free slot, a held slot and every missing shape are not damaged: the two never overlap.
+        for state in ({'available': True, 'holder': None, 'id': 'pp-merge-slot', 'waiters': None},
+                      {'available': False, 'holder': 'alice', 'id': 'pp-merge-slot', 'waiters': None},
+                      {'available': False, 'error': 'not found', 'id': 'pp-merge-slot'},
+                      {'error': 'not found'}, {'available': False}, {}, None, 'not JSON'):
+            with self.subTest(state=state):
+                self.assertFalse(coordination.merge_slot_damaged(state))
+        # The damaged shapes are not missing either: a caller tests missing first and then damaged.
+        for state in ({'available': False, 'holder': None, 'id': 'pp-merge-slot', 'waiters': None},
+                      {'available': False, 'holder': None, 'waiters': ['bob']}):
+            with self.subTest(state=state):
+                self.assertFalse(coordination.merge_slot_missing(state))
+
     def test_missing_slot_refuses_check_acquire_and_release_naming_create(self):
         self.native.slot_exists = False
         for payload in ({'operation': 'merge-check'}, MERGE, {'operation': 'merge-release'}):
