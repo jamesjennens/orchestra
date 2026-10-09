@@ -32,6 +32,13 @@ This slice supplies direct editing and acceptance. Withdrawal, supersession,
 baseline controls, downloadable baseline comparisons and proposal/room acceptance
 controls await their separate releases.
 
+For the existing host export command, selections containing owner acceptance
+also supply `--governance SNAPSHOT.json`: a captured files map containing
+`.requirements-governance.json` and, after a restore under another name,
+`.requirements-governance-source.json`. The exporter validates the same history
+and project binding as the live reader and retains those files in its provenance.
+Historical acceptance does not depend on today's membership or mode.
+
 ## Validate and publish a draft
 
 From the kit directory, using Python 3.10 or newer:

@@ -299,6 +299,23 @@ def web_action(root, project_path, project, request, authority_config, runner, g
     recovery = dict(request, operation_id='owner-recover-' + content_hash({
         'original': operation_id, 'request_sha256': operation_hash(request, True)})[:40],
         route='requirements-recovery')
+    # An interrupted recovery remains unknown too. Never rerun that identity:
+    # a later attempt gets its own deterministic successor and must again prove
+    # the original inner receipt under the authority lock before any effect.
+    seen = set()
+    while recovery['operation_id'] not in seen:
+        seen.add(recovery['operation_id'])
+        interrupted = journal.lookup(recovery['operation_id'])
+        if interrupted is None or interrupted.get('state') not in ('unknown', 'in_progress'):
+            break
+        if (journal.expired(interrupted) or interrupted.get('principal') != principal_key(recovery, True)
+                or interrupted.get('request_hash') != operation_hash(recovery, True)):
+            return answer  # preserve the conflicting or expired uncertainty
+        recovery['operation_id'] = 'owner-recover-' + content_hash({
+            'original': operation_id, 'previous': recovery['operation_id'],
+            'request_sha256': operation_hash(request, True)})[:40]
+    else:
+        return answer
     return guarded_write(root, recovery, journal_path(project_path), reconcile,
                          authority_config=authority_config, require_authority=True, runner=runner)
 

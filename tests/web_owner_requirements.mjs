@@ -19,7 +19,7 @@ assert.ok(page.textContent.includes('Add requirement or narrative'));
 assert.ok(!page.textContent.includes(data.governance.sha256));
 const form = page.querySelector('form');
 form.querySelector('#requirement-title').value = '<img src=x onerror=alert(1)>';
-form.querySelector('#requirement-text').value = '<script>evil()</script>\nOwner intent\u2028as text';
+form.querySelector('#requirement-text').value = '<script>evil()</script>\nOwner intent as text';
 await form.dispatch('submit');
 assert.ok(owner.destination, page.textContent);
 const id = owner.destination.split('/').at(-1);

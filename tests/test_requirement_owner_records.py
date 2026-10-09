@@ -139,8 +139,19 @@ class OwnerEvidenceTests(unittest.TestCase):
         manifest['requirements'][0] = revisions[2]
         seal(manifest)
         rows = [r for r in exported(manifest) if r['id'] != row['id']] + [row]
-        result = adapt(rows, selection_from_manifest(manifest))
+        history = governance.snapshot(self.path, 'alpha')
+        with self.assertRaisesRegex(ValueError, 'governance snapshot'):
+            adapt(rows, selection_from_manifest(manifest))
+        result = adapt(rows, selection_from_manifest(manifest), governance=history)
         self.assertEqual(result['manifest'], manifest)
+        self.assertEqual(result['provenance']['requirements_governance'], history)
+        wrong_project = dict(selection_from_manifest(manifest), canonical_project='other')
+        with self.assertRaisesRegex(ValueError, 'different project'):
+            adapt(rows, wrong_project, governance=history)
+        restored = governance.restored_files(history, 'alpha', 'restored')
+        restored_selection = dict(selection_from_manifest(manifest), canonical_project='restored')
+        self.assertEqual(adapt(rows, restored_selection, governance=restored)['manifest']['requirements'][0],
+                         revisions[2])
         evidence = owner.existing_acceptances(row)[2]
         publication = records.publication_acceptance(dict(
             evidence['decision'], record_sha256=evidence['record_sha256']), manifest)
@@ -154,12 +165,12 @@ class OwnerEvidenceTests(unittest.TestCase):
         self.assertIsNone(accepting_revision(row, revisions, revisions[1]))
         self.assertTrue(records.resolved_acceptance(row, revisions[2]))
         self.assertFalse(records.resolved_acceptance(row, revisions[changed['revision']]))
-        self.assertEqual(adapt(rows, selection_from_manifest(manifest))['manifest'], manifest)
+        self.assertEqual(adapt(rows, selection_from_manifest(manifest), governance=history)['manifest'], manifest)
         forged = copy.deepcopy(rows)
         own_row = next(r for r in forged if r['id'] == row['id'])
         own_row['comments'] = [c for c in own_row['comments'] if not c['text'].startswith(owner.ACCEPTANCE_PREFIX)]
         with self.assertRaisesRegex(ValueError, 'acceptance evidence'):
-            adapt(forged, selection_from_manifest(manifest))
+            adapt(forged, selection_from_manifest(manifest), governance=history)
 
     def test_partial_evidence_write_retry_finishes_one_decision_and_exact_revision(self):
         item = self.create()

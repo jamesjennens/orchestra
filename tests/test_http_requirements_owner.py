@@ -169,6 +169,35 @@ class OwnerHttpTests(EndpointCase):
         self.assertIn(result.status, (403, 422), result.data)
         self.assertEqual(len(self.backend.native.writes()), before)
 
+    def test_concurrent_accepts_of_the_same_draft_write_one_decision_and_revision(self):
+        from concurrent.futures import ThreadPoolExecutor
+        first = self.create_requirement()
+        route = self.base + '/requirements/' + first['id'] + '/accept'
+        def accept(number):
+            return self.request('POST', route, self.expected(first), token=self.owner_token,
+                                key='race-accept-'+str(number))
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            responses = list(pool.map(accept, (1, 2)))
+        self.assertEqual(sorted(r.status for r in responses), [200, 409], [r.data for r in responses])
+        row = self.backend.native.row(first['id'])
+        self.assertEqual(set(records.existing_revisions(row)), {1, 2})
+        self.assertEqual(len(owner_records.existing_acceptances(row)), 1)
+        self.assertEqual(sum(r['issue_type']=='decision' for r in self.backend.native.rows), 1)
+
+    def test_owner_narrative_uses_the_same_acceptance_and_member_read_path(self):
+        created = self.request('POST', self.base+'/requirements', {
+            'kind':'brd-section', 'parent':'job-1', 'title':'Purpose',
+            'description':'Who uses the project and why.'}, token=self.owner_token, key='narrative-create')
+        self.assertEqual(created.status, 201, created.data)
+        accepted = self.request('POST', self.base+'/requirements/'+created.data['id']+'/accept',
+                               self.expected(created.data), token=self.owner_token, key='narrative-accept')
+        self.assertEqual(accepted.status, 200, accepted.data)
+        document = self.request('GET', self.base+'/brd', token=self.owner_token)
+        item = next(i for i in document.data['items'] if i['id']==created.data['id'])
+        self.assertEqual(item['kind'], 'brd-section')
+        self.assertNotIn('key', item['current'])
+        self.assertEqual(item['current']['acceptance_state'], 'accepted')
+
     def test_partial_owner_acceptance_reconciles_exact_receipt_through_guarded_recovery(self):
         first = self.create_requirement()
         route = self.base + '/requirements/' + first['id'] + '/accept'
@@ -181,6 +210,10 @@ class OwnerHttpTests(EndpointCase):
         conflict = self.request('POST', route, dict(self.expected(first), expected_sha256='0'*64),
                                 token=self.owner_token, key='partial-accept')
         self.assertEqual(conflict.status, 409, conflict.data)
+        # The first recovery also loses its outcome. Its unknown identity must
+        # remain held; the next reconciliation proves the same inner receipt.
+        interrupted = self.request('POST', route, self.expected(first), token=self.owner_token, key='partial-accept')
+        self.assertEqual(interrupted.status, 503, interrupted.data)
         self.backend.native.fail_comment_prefix = None
         completed = self.request('POST', route, self.expected(first), token=self.owner_token, key='partial-accept')
         self.assertEqual(completed.status, 200, completed.data)
@@ -191,6 +224,27 @@ class OwnerHttpTests(EndpointCase):
         replay = self.request('POST', route, self.expected(first), token=self.owner_token, key='partial-accept')
         self.assertEqual(replay.data, completed.data)
         self.assertEqual(len(self.backend.native.writes()), before)
+
+    def test_unknown_owner_request_without_matching_receipt_cannot_be_recovered(self):
+        first = self.create_requirement()
+        route = self.base + '/requirements/' + first['id'] + '/accept'
+        self.backend.native.fail_comment_prefix = records.REVISION_PREFIX
+        failed = self.request('POST', route, self.expected(first), token=self.owner_token, key='missing-receipt')
+        self.assertEqual(failed.status, 503, failed.data)
+        row = self.backend.native.row(first['id'])
+        from requirements import load_json
+        # Match the pending native receipt by its exact accepted target, not by a
+        # guessed filename; only this disposable fixture's receipt is removed.
+        pending = [p for p in (self.path/requirements.JOURNAL).glob('*.json')
+                   if load_json(p).get('id') == first['id'] and load_json(p).get('status') == 'pending']
+        self.assertEqual(len(pending), 1)
+        pending[0].unlink()
+        before = len(self.backend.native.writes())
+        self.backend.native.fail_comment_prefix = None
+        refused = self.request('POST', route, self.expected(first), token=self.owner_token, key='missing-receipt')
+        self.assertEqual(refused.status, 422, refused.data)
+        self.assertEqual(len(self.backend.native.writes()), before)
+        self.assertEqual(set(records.existing_revisions(row)), {1})
 
     def test_closed_fields_and_idempotency_conflict_do_not_write(self):
         first = self.create_requirement()

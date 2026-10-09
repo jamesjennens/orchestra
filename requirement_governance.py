@@ -150,7 +150,12 @@ def validate_evidence(directory, project, evidence):
     Restored history retains its source identity; newly appended decisions bind
     the destination. Current membership and current mode cannot erase history.
     """
-    files = snapshot(directory, project)
+    return validate_evidence_files(snapshot(directory, project), project, evidence)
+
+
+def validate_evidence_files(files, project, evidence):
+    """The same project/history binding for a captured offline snapshot."""
+    validate_files(files, project)
     record = files.get(FILE)
     claimed = evidence['governance']
     number = claimed['revision']

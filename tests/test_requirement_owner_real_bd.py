@@ -4,6 +4,7 @@ The borrowed fixture starts and stops its own disposable loopback SQL server.
 No native adapter is mocked. ORCHESTRA_BD_BIN selects the pinned test binaries.
 """
 import json
+import shutil
 import sys
 import unittest
 from pathlib import Path
@@ -84,6 +85,29 @@ class NativeOwnerTests(fixture.RealBdLabelAliasTests):
             replay = harness.request('POST', route+'/accept', expected(first), token=token, key='native-owner-accept')
             self.assertEqual(replay.data, accepted.data)
             self.assertEqual(next(r for r in self.rows() if r['id']==first['id']), original)
+            viewer_id = harness.create_account(admin, 'viewer', 'viewer-password-1')
+            viewer = harness.login('viewer', 'viewer-password-1')[0]
+            self.assertEqual(harness.request('PUT', base+'/members/'+viewer_id,
+                                           {'role':'viewer'}, token=admin).status, 200)
+            credential = harness.issue_credential(token, 'pp', label='worker', scopes=['read','tasks'])
+            agent = harness.request('POST', '/v1/agents', {'name':'Owner helper',
+                'working_directory':'/tmp/synthetic-worker', 'projects':['pp']}, token=token)
+            self.assertEqual(agent.status, 201, agent.data)
+            admin_id = harness.service.authenticate(admin).user_id
+            self.assertEqual(harness.request('PUT', base+'/members/'+admin_id,
+                                           {'role':'contributor'}, token=admin).status, 200)
+            before = self.rows()
+            for denied_token in (viewer, admin, credential['secret'], agent.data['credential']['secret']):
+                refused = harness.request('POST', route+'/accept', expected(accepted.data),
+                                           token=denied_token, key='native-principal-denied')
+                self.assertEqual(refused.status, 403, refused.data)
+                mode_refused = harness.request('PUT', base+'/requirements/governance',
+                    dict(expected(simple.data), mode='governed'), token=denied_token, key='native-mode-denied')
+                self.assertEqual(mode_refused.status, 403, mode_refused.data)
+            self.assertEqual(self.rows(), before)
+            viewer_document = harness.request('GET', base+'/brd', token=viewer)
+            self.assertEqual(viewer_document.status, 200, viewer_document.data)
+            self.assertEqual(viewer_document.data['items'][0]['current']['sha256'], accepted.data['sha256'])
             # Both machine kinds remain unavailable to ordinary native contributors.
             for prefix in (owner.ACCEPTANCE_PREFIX, owner.STATE_PREFIX):
                 with self.assertRaises(ValueError):
@@ -109,6 +133,58 @@ class NativeOwnerTests(fixture.RealBdLabelAliasTests):
             self.assertTrue(records.resolved_acceptance(next(r for r in before if r['id']==first['id']),
                                                        detail.data['history'][1]))
             governance.validate_evidence(self.project, 'pp', evidence)
+            # Run the shipped owner and viewer pages against this real endpoint.
+            node = shutil.which('node')
+            if not node:
+                self.fail('Node.js is required for the configured native page proof')
+            enabled = harness.request('PUT', base+'/requirements/governance',
+                dict(expected(governed.data), mode='simple'), token=token, key='native-page-simple')
+            self.assertEqual(enabled.status, 200, enabled.data)
+            partial = harness.request('POST', base+'/requirements', {
+                'kind':'requirement', 'parent':job, 'title':'Recoverable owner content',
+                'description':'The evidence survives an interrupted revision.'},
+                token=token, key='native-partial-create')
+            self.assertEqual(partial.status, 201, partial.data)
+            # Fault injection at the native process boundary: all successful
+            # commands still use the actual pinned binary. Fail one revision
+            # command after the real decision and real evidence were written.
+            real = self.bd_path.with_name('bd-real')
+            shutil.copy(self.bd_path, real)
+            marker = self.bd_path.with_name('fail-one-owner-revision')
+            self.bd_path.write_text(
+                '#!/usr/bin/env python3\nimport os,sys\nfrom pathlib import Path\n'
+                'p=Path(sys.argv[0]); args=sys.argv[1:]; marker=p.with_name("fail-one-owner-revision")\n'
+                'if marker.exists() and "comments" in args:\n'
+                ' i=args.index("comments")\n'
+                ' if args[i+1]=="add" and args[i+3].startswith("Kind: requirement-revision-v1\\n"):\n'
+                '  marker.unlink(); print("synthetic interruption before revision",file=sys.stderr); sys.exit(1)\n'
+                'os.execv(str(p.with_name("bd-real")),[str(p.with_name("bd-real")),*args])\n',
+                encoding='utf-8')
+            marker.write_text('one synthetic interruption', encoding='utf-8')
+            partial_route = base+'/requirements/'+partial.data['id']+'/accept'
+            interrupted = harness.request('POST', partial_route, expected(partial.data),
+                                          token=token, key='native-partial-accept')
+            self.assertEqual(interrupted.status, 503, interrupted.data)
+            pending = next(r for r in self.rows() if r['id']==partial.data['id'])
+            self.assertEqual(set(records.existing_revisions(pending)), {1})
+            self.assertEqual(set(owner.existing_acceptances(pending)), {2})
+            recovered = harness.request('POST', partial_route, expected(partial.data),
+                                        token=token, key='native-partial-accept')
+            self.assertEqual(recovered.status, 200, recovered.data)
+            finished = next(r for r in self.rows() if r['id']==partial.data['id'])
+            self.assertEqual(set(records.existing_revisions(finished)), {1,2})
+            self.assertEqual(sum(c['text'].startswith(owner.ACCEPTANCE_PREFIX) for c in finished['comments']), 1)
+            replay = harness.request('POST', partial_route, expected(partial.data),
+                                     token=token, key='native-partial-accept')
+            self.assertEqual(replay.data, recovered.data)
+            self.assertEqual(next(r for r in self.rows() if r['id']==partial.data['id']), finished)
+            from test_http_web import run_node_module
+            page = run_node_module(self, node, 'await import(process.argv[1])',
+                (KIT/'tests'/'web_owner_requirements.mjs').as_uri(),
+                (KIT/'web'/'js'/'api.js').as_uri(), (KIT/'web'/'js'/'views'/'owner_requirements.js').as_uri(),
+                'http://127.0.0.1:'+str(harness.port), 'pp', token, viewer)
+            self.assertEqual(page.returncode, 0, page.stderr)
+            self.assertTrue(all(json.loads(page.stdout).values()), page.stdout)
         finally:
             harness._stop_server(); harness.doCleanups()
 
