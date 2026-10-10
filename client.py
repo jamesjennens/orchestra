@@ -169,7 +169,10 @@ def _wire(project,actor,args,action,path):
 #: What endpoint.py answers, and only that, when it was started by an interpreter too old for
 #: it: exit 2, nothing on stdout, this one line (kittrial-5bb.191).
 TOO_OLD=re.compile(r'(endpoint\.py needs Python 3\.10 or newer and was started with Python \d+\.\d+\.\d+ \([^\n]{0,400}\)\. '
-                   r'Nothing was carried out\.) [^\n]{0,600}\n?')
+                   r'Nothing was carried out\.)(?: ([^\n]{0,600}))?\n?')
+
+#: The endpoint's own advice tail; under a forced command it contradicts the note below and is left out.
+SET_PYTHON = 'Set "python"'
 
 def _interpreter_refusal(returncode,stdout,stderr,config):
     """The endpoint's own sentence when it refused to start under an old interpreter, else None.
@@ -181,9 +184,15 @@ def _interpreter_refusal(returncode,stdout,stderr,config):
     found=TOO_OLD.fullmatch(stderr or '') if returncode==2 and not stdout else None
     if not found:return None
     if config.get('transport','ssh')=='ssh' and config.get('forced_command') is True:
-        return (found.group(1)+' This key runs a forced command, so the interpreter is the one in its '
-                'authorized_keys line on the server, not "python" in this configuration: ask the operator to '
-                'print that line again (admin.py authorized-keys) with an interpreter of 3.10 or newer.')
+        tail=(found.group(2) or '').strip()
+        note=(' This key runs a forced command, so the interpreter is the one in its '
+              'authorized_keys line on the server, not "python" in this configuration: ask the operator to '
+              'print that line again (admin.py authorized-keys) with an interpreter of 3.10 or newer.')
+        # The endpoint's own advice says to set "python" here; under a forced command that is
+        # wrong (the key's authorized_keys line decides), so the note replaces it (kittrial-5bb.222).
+        if tail.startswith(SET_PYTHON):
+            return found.group(1)+note
+        return found.group(1)+(' '+tail if tail else '')+note
     return stderr.strip()
 
 def request(config,project,actor,args,action='bd',path=None):

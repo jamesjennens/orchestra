@@ -1285,6 +1285,28 @@ def project_metadata_state(root,name):
         return 'unreadable'
     return 'server' if project_server_metadata(root,name) is not None else 'unreadable'
 
+def server_database_exists(root,name):
+    """Whether the server has the exact database name for a project missing metadata."""
+    validate_name(name)
+    rows=list(csv.reader(io.StringIO(sql(root,"SHOW DATABASES LIKE '%s';"%name,
+                                         timeout=RETIRE_PROBE_TIMEOUT))))
+    if not rows or len(rows[0])!=1 or rows[0][0].strip().lower()!='database':
+        raise ValueError('unexpected SHOW DATABASES output')
+    return any(len(row)==1 and row[0]==name for row in rows[1:])
+
+def server_database_issue_count(root,name):
+    """Count Beads issues in a same-named server database."""
+    validate_name(name)
+    rows=list(csv.reader(io.StringIO(sql(
+        root,"SELECT COUNT(*) FROM `%s`.issues WHERE id <> '%s-merge-slot';"%(name,name),
+        timeout=RETIRE_PROBE_TIMEOUT))))
+    if (len(rows)!=2 or len(rows[0])!=1 or rows[0][0].strip().lower()!='count(*)'
+            or len(rows[1])!=1):
+        raise ValueError('unexpected server issue-count output')
+    count=int(rows[1][0])
+    if count<0:raise ValueError('unexpected negative server issue count')
+    return count
+
 def project_backup_record(root,name):
     """The parsed ``.beads/dolt-backup.json`` a project records, or None.
 
@@ -2326,8 +2348,8 @@ def restore_lock_path(root,name):
     validate_name(name)
     return root/'backups'/(name+'.restore.lock')
 
-#: Ceiling for the ``SELECT 1`` probe ``retire-project`` sends the Dolt server. Retire holds
-#: the restore, backup and coordination locks while it probes, so a frozen server must not
+#: Ceiling for each SQL probe ``retire-project`` sends the Dolt server. Retire holds the
+#: restore, backup and coordination locks while it probes, so a frozen server must not
 #: hold them forever; no answer in this time is "could not be checked".
 RETIRE_PROBE_TIMEOUT=15
 
@@ -2339,8 +2361,8 @@ def retire_findings(root,name):
 
     * ``metadata`` is ``project_metadata_state``'s answer. bd runs only for ``server``
       (review 01a1026a): with ``unreadable`` nothing is known and bd would create an
-      embedded database inside the project, so ``bd`` is ``unreachable``; with ``absent``
-      the project was never initialized and ``bd`` is ``uninitialized``.
+      embedded database inside the project, so ``bd`` is ``unreachable``. With ``absent``,
+      the same-named server database is checked directly before treating bd as uninitialized.
     * ``bd`` is ``reads`` (bd lists the project; ``issues`` counts what it holds besides
       its merge slot), ``rejects`` (the server answers and bd refuses the project, which
       is what a stopped restore leaves) or ``unreachable`` (the Dolt server, or bd
@@ -2351,6 +2373,8 @@ def retire_findings(root,name):
       ``not-applicable`` (bd rejects the project, so nothing holds a slot through it).
     * ``pending_reservations`` counts pending receipts per request journal, and
       ``unreadable_reservations`` the receipts that could not be read (treated as pending).
+    * ``server_database`` and ``server_database_issues`` report the direct server check
+      used when metadata is absent; an unreadable count is treated as a blocker.
     * ``backup_pair`` and ``last_backup_run`` are reported for the journal; they no longer
       decide anything, because a healthy project whose last backup failed is still a
       healthy project.
@@ -2364,14 +2388,27 @@ def retire_findings(root,name):
     except (OSError,ValueError,KeyError,TypeError):pass
     metadata=project_metadata_state(root,name)
     server='not-used'
+    server_database='not-checked';server_database_issues=None
     if metadata=='server':
         try:
             sql(root,'SELECT 1;',timeout=RETIRE_PROBE_TIMEOUT);server='up'
         except (subprocess.CalledProcessError,subprocess.TimeoutExpired,OSError,ValueError,KeyError,TypeError):
             server='unreachable'
+    elif metadata=='absent':
+        try:
+            exists=server_database_exists(root,name)
+            server='up';server_database='present' if exists else 'absent'
+        except (subprocess.CalledProcessError,subprocess.TimeoutExpired,OSError,ValueError,KeyError,TypeError,
+                csv.Error,RecursionError):
+            server='unreachable';server_database='unreadable'
+        if server_database=='present':
+            try:server_database_issues=server_database_issue_count(root,name)
+            except (subprocess.CalledProcessError,subprocess.TimeoutExpired,OSError,ValueError,KeyError,TypeError,
+                    csv.Error,RecursionError):
+                server_database='unreadable'
     bd='unreachable';issues=None;holder=None;slot='unreadable'
     if metadata=='absent':
-        bd='uninitialized';slot='not-applicable'
+        if server=='up':bd='uninitialized';slot='not-applicable'
     elif server=='up':
         try:
             rows=json.loads(run_bd(root,name,['list','--all','--limit','0','--json']) or '[]')
@@ -2405,6 +2442,7 @@ def retire_findings(root,name):
     except OSError:initialized=False   # .beads itself cannot be entered: `metadata` says unreadable
     return {'initialized':initialized,'metadata':metadata,'server':server,'bd':bd,
             'issues':issues,
+            'server_database':server_database,'server_database_issues':server_database_issues,
             'backup_pair':'complete' if complete else reason,'last_backup_run':recorded,
             'merge_slot':slot,'merge_slot_holder':holder,'pending_reservations':pending,
             'unreadable_reservations':unreadable}
@@ -2421,6 +2459,12 @@ def retire_blockers(findings):
                         'may be a healthy tracker')
     elif findings['bd']=='reads' and findings['issues']:
         blockers.append('bd reads it and it holds %d issue(s), so it looks like a working tracker'%findings['issues'])
+    if findings.get('server_database')=='unreadable' and findings.get('server')=='up':
+        blockers.append('its same-named server database could not be checked for issues, so it may be a healthy '
+                        'tracker')
+    elif findings.get('server_database_issues') is not None and findings['server_database_issues']>0:
+        blockers.append('its same-named server database holds %d issue(s), so it looks like a working tracker'
+                        %findings['server_database_issues'])
     if findings['merge_slot']=='held':
         blockers.append('its merge slot is held by %s'%findings['merge_slot_holder'])
     elif findings['merge_slot']=='unreadable':
@@ -2443,11 +2487,12 @@ def retire_project(root,name,actor,reason,force=False,creation_locked=False):
     The name stays reserved (``refuse_retired_name``).
 
     Refused, naming what was found, unless ``force`` (``retire_blockers``): bd reads the
-    project and it holds issues; the Dolt server or bd could not be reached; its merge
-    slot is held or could not be read; it has pending reservations or receipts that could
-    not be read. Refused even with ``force`` while a ``restore-new`` into the name is
-    running. The operator allowlist is checked first, strictly. Both steps are journaled in
-    ``retired/journal.jsonl`` (intent before the move, the result after it).
+    project and it holds issues; missing metadata hides a same-named server database with
+    issues; the server or issue count could not be checked; its merge slot is held or could
+    not be read; it has pending reservations or receipts that could not be read. Refused
+    even with ``force`` while a ``restore-new`` into the name is running. The operator
+    allowlist is checked first, strictly. Both steps are journaled in ``retired/journal.jsonl``
+    (intent before the move, the result after it).
 
     It holds the project creation lock (kittrial-5bb.118 part 2, review 01a109cc), without
     waiting: retiring under a creation in flight pulled the directory away from it, and the

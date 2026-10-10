@@ -32,6 +32,44 @@ VALUE_OPTIONS = {'--owner', '--state', '--limit', '--offset', '--handoff-limit',
 #: At most this many request ids are named per work item (a review record holds at most 20 items).
 PENDING_REQUEST_IDS_MAX = 20
 
+# Compact owned-work context, not a recipient or authorization inference.
+CHECKPOINT_WAIT_ITEMS_MAX = 3
+
+
+def checkpoint_wait(row, actor, state, delivered=False):
+    """Project the caller's latest validated checkpoint from the existing parse.
+
+    A later checkpoint by someone else makes this explicitly historical. Review
+    delivery likewise keeps the authored context without turning it into work.
+    No transport reads or checkpoint writes are performed here.
+    """
+    result = dict(status='unknown', checkpoint=None, author=None, is_current=None,
+                  active=None, items=[], total=None, omitted=None, next_action=None)
+    if row.get('assignee') != actor or not actor:
+        result.update(status='not-owned', active=False)
+        return result
+    if state is None or state['invalid']:
+        return result
+    comments = {str(c.get('id')): c for c in row.get('comments') or [] if isinstance(c, dict)}
+    own = [(cid, p) for cid, p in state['history']
+           if comments.get(str(cid), {}).get('author') == actor]
+    if not own:
+        result.update(status='none', is_current=False, active=False, total=0, omitted=0)
+        return result
+    from briefing import clip, plain_text
+    cid, p = own[-1]
+    current = state['current'] is not None and str(state['current'][1]['id']) == str(cid)
+    items = [item for item in p['open_items'] if item['kind'] in ('blocker', 'dependency')]
+    bounded = lambda value, limit: clip(plain_text(value), limit)
+    result.update(status='recorded', checkpoint=cid, author=actor, is_current=current,
+                  active=current and bool(items) and not delivered and row.get('status') != 'closed',
+                  items=[dict(id=item['id'], kind=item['kind'],
+                              text=bounded(item['text'], 400), source=bounded(item['source'], 240))
+                         for item in items[:CHECKPOINT_WAIT_ITEMS_MAX]],
+                  total=len(items), omitted=max(0, len(items)-CHECKPOINT_WAIT_ITEMS_MAX),
+                  next_action=bounded(p['next_action'], 600))
+    return result
+
 
 def help_requested(args):
     """True when args ask for help; side-effect free for every command."""
@@ -102,7 +140,7 @@ def help_payload(action='work'):
                              'contribution comment ID, not a Git commit or latest_comment_id',
             'item_fields': ['task', 'title', 'owner', 'status', 'review_state', 'contribution_id',
                             'commit', 'pending_review_items', 'pending_change_requests', 'open_items',
-                            'blocking_items', 'checkpoint_at', 'newer_activity',
+                            'blocking_items', 'checkpoint_at', 'newer_activity', 'checkpoint_wait',
                             'pending_handoff_requests',
                             'pending_handoff_total', 'pending_handoff_next_offset', 'lifecycle',
                             'lifecycle_scope', 'lifecycle_matches_contribution', 'error',
@@ -489,6 +527,9 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
     from briefing import checkpoint_queue_fields
     task_rows={row['id']:row for row in rows if isinstance(row,dict) and row.get('id')}
     for item in result['items']:
+        item['checkpoint_wait']=checkpoint_wait(task_rows.get(item['task'],{}),actor,
+            checkpoint_states.get(item['task']),
+            delivered=bool(item['contribution_id']) or item['review_state'] not in (None,'none'))
         if item['task'] in task_rows:
             item.update(checkpoint_queue_fields(rows,task_rows[item['task']],checkpoint_states.get(item['task'])))
     if journal is not None:

@@ -67,6 +67,8 @@ class RetireCase(unittest.TestCase):
         self.unreadable = {'gamma'}
         self.slot = {}
         self.issues = {}
+        self.server_databases = {}
+        self.server_database_count_fails = set()
         self.slot_fails = set()
         self.bd = []
         self.probes = []
@@ -83,6 +85,15 @@ class RetireCase(unittest.TestCase):
         self.probes.append((query, timeout))
         if isinstance(self.server, BaseException):
             raise self.server
+        if query.startswith("SHOW DATABASES LIKE '"):
+            name=query.split("'")[1]
+            return 'Database\n%s\n'%name if name in self.server_databases else 'Database\n'
+        if query.startswith('SELECT COUNT(*) FROM `'):
+            name=query.split('`')[1]
+            if name in self.server_database_count_fails:
+                raise subprocess.CalledProcessError(1,['dolt'],stderr='issues table unreadable')
+            self.assertIn("WHERE id <> '%s-merge-slot';"%name,query)
+            return 'COUNT(*)\n%d\n'%self.server_databases[name]
         return self.server
 
     def run_bd(self, root, name, args):
@@ -286,6 +297,45 @@ class RetireCase(unittest.TestCase):
         self.assertEqual((findings['metadata'], findings['bd'], findings['merge_slot'],
                           admin.retire_blockers(findings), self.bd),
                          ('absent', 'uninitialized', 'not-applicable', [], []))
+
+    def test_absent_metadata_does_not_hide_issues_in_the_server_database(self):
+        metadata=self.root/'projects'/'alpha'/'.beads'/'metadata.json'
+        metadata.unlink()
+        self.server_databases['alpha']=3
+
+        findings=admin.retire_findings(self.root,'alpha')
+        self.assertEqual((findings['metadata'],findings['server'],findings['bd'],
+                          findings['server_database'],findings['server_database_issues']),
+                         ('absent','up','uninitialized','present',3))
+        self.assertIn('its same-named server database holds 3 issue(s)',
+                      '; '.join(admin.retire_blockers(findings)))
+        before=tree(self.root)
+        _,stderr,code=self.retire('alpha')
+        self.assertNotEqual(code,0)
+        self.assertIn('its same-named server database holds 3 issue(s)',stderr)
+        self.assertIn('--force to retire it anyway',stderr)
+        self.assertEqual(tree(self.root),before)
+        self.assertEqual(self.journal(),[])
+        self.assertEqual(self.bd,[])
+
+    def test_an_unreadable_server_database_issue_count_requires_force(self):
+        (self.root/'projects'/'alpha'/'.beads'/'metadata.json').unlink()
+        self.server_databases['alpha']=3
+        self.server_database_count_fails.add('alpha')
+
+        findings=admin.retire_findings(self.root,'alpha')
+        self.assertEqual((findings['server'],findings['server_database'],findings['server_database_issues']),
+                         ('up','unreadable',None))
+        self.assertIn('same-named server database could not be checked for issues',
+                      '; '.join(admin.retire_blockers(findings)))
+
+    def test_an_empty_same_named_server_database_does_not_require_force(self):
+        (self.root/'projects'/'alpha'/'.beads'/'metadata.json').unlink()
+        self.server_databases['alpha']=0
+
+        findings=admin.retire_findings(self.root,'alpha')
+        self.assertEqual((findings['server_database'],findings['server_database_issues'],
+                          admin.retire_blockers(findings)),('present',0,[]))
 
     def test_a_frozen_server_is_could_not_be_checked_not_a_hang(self):
         # Review 01a1026a, P3: the probe has a ceiling; no answer in time is "unreachable".
