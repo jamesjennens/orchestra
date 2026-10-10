@@ -161,6 +161,7 @@ def adapt(rows, selection, acceptance=None, previous=None, previous_acceptance=N
     if not isinstance(selection, dict) or set(selection) != expected:
         raise ValueError('selection has missing or unknown fields')
     issues, revisions, locations = {}, {}, {}
+    terminal_states = {}
     if not isinstance(rows, list):
         raise ValueError('export must be a list of issues')
     # Malformed content costs only its explicitly selected row. Identity and
@@ -236,6 +237,14 @@ def adapt(rows, selection, acceptance=None, previous=None, previous_acceptance=N
             manifest[group].append(record)
             selected_ids.append(rid)
             sources.append({'reference': ref, 'comment_ids': sorted(locations[(rid, rev)])})
+            from requirement_owner_records import state_ledger
+            terminal, explanation = state_ledger(issues[rid])
+            if terminal is not None:
+                if governance is None:
+                    raise ValueError('Terminal requirement export needs its exact governance history')
+                from requirement_governance import validate_evidence_files
+                validate_evidence_files(governance, selection['canonical_project'], terminal)
+                terminal_states[rid] = {'state': terminal, 'reason': explanation}
     for field in ('context_ids', 'blocking_ids'):
         values = selection[field]
         if not isinstance(values, list) or any(not isinstance(v, str) or not v for v in values) or len(set(values)) != len(values):
@@ -258,6 +267,8 @@ def adapt(rows, selection, acceptance=None, previous=None, previous_acceptance=N
                   'export_sha256': content_hash({'issues': rows}),
                   'selection': selection, 'sources': sources,
                   'source_issues': [issues[rid] for rid in included]}
+    if terminal_states:
+        provenance['requirement_terminal_states'] = terminal_states
     if governance is not None:
         from requirement_governance import validate_files, FILE, SOURCE_FILE
         validate_files(governance, selection['canonical_project'])

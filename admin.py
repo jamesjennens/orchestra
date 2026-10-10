@@ -2766,6 +2766,9 @@ def validate_record_receipt(name,record):
     if name.startswith('.requirement-owner-requests/'):
         from requirement_http import validate_receipt as validate_owner_receipt
         validate_owner_receipt(record)
+        if 'owner_state' in record and name != '.requirement-owner-requests/' + content_hash(
+                {'operation_id': record['owner_state']['operation_id']}) + '.json':
+            raise ValueError('Owner terminal receipt path mismatch')
         if 'owner_decision' in record and name != '.requirement-owner-requests/' + content_hash(
                 {'operation_id': record['owner_decision']['operation_id']}) + '.json':
             raise ValueError('Owner decision receipt path mismatch')
