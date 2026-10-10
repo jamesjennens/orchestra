@@ -36,7 +36,7 @@ a project; use the [requirements snapshot command](REQUIREMENTS.md) for offline
 owner-evidence export. Operator requirement-apply/backfill authority remains
 unchanged in both modes.
 
-**Rollback and restore of simple requirements.** The predecessor kit can restore
+**Rollback and restore of simple requirements.** The release before slice A can restore
 a backup of a project that has never had these sidecars. It refuses a backup
 containing `.requirements-governance.json`, `.requirement-owner-requests/` or
 `.requirements-governance-source.json` with `Invalid coordination backup path`.
@@ -46,9 +46,20 @@ owner-accepted requirements cannot be read because their governance history is
 missing. Keep the current kit's complete backup when rolling back; an older
 kit's successful backup does not preserve owner requirement authority.
 The optional `owner_decision` binding in an existing owner request receipt does
-not change this predecessor restore limit. Current backups preserve and validate
-the binding; an interrupted legacy acceptance without one remains unknown and
-needs host operator reconciliation.
+not change this restore limit for the release before slice A. Current backups preserve
+and validate the binding. An interrupted acceptance without a binding keeps the
+old operation unknown; the owner reloads the requirement and accepts again with a
+new request key. For a legacy interrupted acceptance with a readable draft, the owner edits that
+draft and accepts the new revision. Unreadable history still needs host operator
+reconciliation.
+Neither action completes the unbound old operation or invents its decision.
+
+The failed-creation recovery panel lists at most 20 of the current owner's pending
+creations and reports the exact total and whether more remain. A request needing an absence proof reads
+one native export and one complete native membership list, then reuses the validated
+request-label index for those items. An unreadable receipt affects its own item;
+an unreadable native absence proof refuses clearing. The clear action checks a
+fresh absence proof and the exact receipt hash under the existing locks.
 
 Configure the [server-owned project entry point](ONBOARDING.md) so new workers can start from an empty directory using a single SSH onboarding command. Its private instructions are included in coordination sidecar backups.
 
