@@ -227,7 +227,7 @@ export async function list(ctx) {
       let result;
       try { result = await act(form.querySelector('button'), () => ctx.api.issueAgentCredential(agent.id, chosen), { success: 'New secret issued' }); } catch { return; }
       const fresh = await ctx.api.agent(agent.id).catch(() => agent);
-      setupDialog(ctx, { agent: fresh, setup: result && result.setup }, { secret: result && result.credential && result.credential.secret });
+      setupDialog(ctx, { agent: fresh, setup: result && result.setup }, { secret: result && result.credential && result.credential.secret, certificate: await agentCertificate(ctx) });
       load();
     });
     details.append(h('summary', null, known ? 'What it may do' : 'What it may do (choose)'),
@@ -268,7 +268,7 @@ export async function list(ctx) {
     }).catch(() => null);
     if (!created) return;
     form.reset();
-    setupDialog(ctx, created, { secret: created.credential && created.credential.secret });
+    setupDialog(ctx, created, { secret: created.credential && created.credential.secret, certificate: await agentCertificate(ctx) });
     load();
   });
 
@@ -286,13 +286,39 @@ export async function list(ctx) {
 
 export const SETUP_INTRO = 'Set up the agent’s folder in one of two ways: Save to agent folder, or paste the setup prompt into the agent’s chat. Copy path is only for saving the files by hand.';
 export const SETUP_PROMPT_LABEL = 'Copy setup prompt (creates the files)';
+// What the prompt writes, in one line (kittrial-5bb.203 scope 2), and the one thing left to the
+// person (scope 4).
+export const SETUP_WRITES_LINE = 'The prompt writes .orchestra/agent.json and .orchestra/AGENT.md, merges the VS Code bridge settings into .vscode/settings.json (this page’s address, the agent name, watching on, that folder’s project and what the agent does there), adds .orchestra/ to an existing .gitignore, and — when the service uses its own certificate — saves that certificate beside your credential file and names it. It changes nothing else, and no secret ever goes into a settings file.';
+export const SETUP_ONCE_LINE = 'What is still yours, once: install the Orchestra Bridge extension in VS Code, reload the window, and click the first wake. Nothing is typed into a chat before you do.';
 
 const canSaveToFolder = () => typeof window.showDirectoryPicker === 'function' && Boolean(window.isSecureContext);
 
-// Writes .orchestra/agent.json and .orchestra/AGENT.md into a folder the user picks, and
-// appends .orchestra/ to an EXISTING .gitignore that lacks it. Creates or rewrites
-// nothing else. `files` is [[name, text], ...] built from the secretless payload.
-async function saveSetupFiles(files) {
+// The service's own certificate, when it has one: the route is served only by an https service
+// that was given a certificate, so a plain-http install or the first-install tunnel simply has
+// none and the dialog says nothing about certificates. A failed read is not an error here.
+async function agentCertificate(ctx) {
+  try { const data = await ctx.api.certificate(); return data && data.certificate ? data : null; } catch { return null; }
+}
+
+// Saves that certificate as a file, in one click. The bytes are the ones the fingerprint above was
+// computed from, and the setup prompt saves the same file beside the credential file.
+function saveCertificate(certificate, file) {
+  const blob = new Blob([certificate.certificate], { type: 'application/x-pem-file' });
+  const url = URL.createObjectURL(blob);
+  const link = h('a', { href: url, download: file.name });
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  toast('Certificate saved as ' + file.name);
+}
+
+// Writes .orchestra/agent.json and .orchestra/AGENT.md into a folder the user picks, merges the
+// bridge settings into an existing-or-new .vscode/settings.json (changing nothing already there),
+// and appends .orchestra/ to an EXISTING .gitignore that lacks it. Creates or rewrites nothing
+// else. `files` is [[name, text], ...] built from the secretless payload; `addition` is the bridge
+// settings object for that workspace.
+async function saveSetupFiles(files, addition = null) {
   let root;
   try {
     root = await window.showDirectoryPicker({ id: 'orchestra-agent', mode: 'readwrite' });
@@ -323,6 +349,7 @@ async function saveSetupFiles(files) {
   }
   dir = dir || await root.getDirectoryHandle('.orchestra', { create: true });
   const written = [];
+  const notes = [];
   for (const [name, text] of files) {
     const handle = await dir.getFileHandle(name, { create: true });
     const out = await handle.createWritable();
@@ -330,20 +357,37 @@ async function saveSetupFiles(files) {
     await out.close();
     written.push('.orchestra/' + name);
   }
+  if (addition) {
+    let vscode = null;
+    try { vscode = await root.getDirectoryHandle('.vscode'); } catch (error) { if (!missing(error)) throw error; }
+    let settings = null;
+    if (vscode) { try { settings = await vscode.getFileHandle('settings.json'); } catch (error) { if (!missing(error)) throw error; } }
+    const current = settings ? await (await settings.getFile()).text() : '';
+    const merged = setupText.mergeSettings(current, addition);
+    if (merged.refused) notes.push(setupText.SETTINGS_REFUSED_SENTENCE);
+    else {
+      vscode = vscode || await root.getDirectoryHandle('.vscode', { create: true });
+      const handle = await vscode.getFileHandle('settings.json', { create: true });
+      const out = await handle.createWritable();
+      await out.write(merged.text);
+      await out.close();
+      written.push(setupText.VSCODE_SETTINGS_PATH + (merged.created ? '' : ' (merged)'));
+    }
+  }
   let ignore = null;
   try { ignore = await root.getFileHandle('.gitignore'); } catch (error) { if (!missing(error)) throw error; }
   if (ignore) {
     const current = await ignore.getFile();
-    const addition = setupText.gitignoreAppend(await current.text());
-    if (addition) {
+    const additionText = setupText.gitignoreAppend(await current.text());
+    if (additionText) {
       const out = await ignore.createWritable({ keepExistingData: true });
       await out.seek(current.size);
-      await out.write(addition);
+      await out.write(additionText);
       await out.close();
       written.push('.gitignore (added .orchestra/)');
     }
   }
-  return { written, folder: root.name };
+  return { written, notes, folder: root.name };
 }
 
 function fileBlock(title, text, folder, relative) {
@@ -461,16 +505,26 @@ function olderCredentials(ctx, agent, newId) {
 async function reopenSetup(ctx, agentId, button) {
   let agent;
   try { agent = await act(button, () => ctx.api.agent(agentId)); } catch { return; }
-  setupDialog(ctx, { agent }, { secret: null });
+  setupDialog(ctx, { agent }, { secret: null, certificate: await agentCertificate(ctx) });
 }
 
 // `source` is the create response ({agent, setup, ...}) or {agent} from GET
-// /v1/agents/{id}; `secret` is present only straight after creation.
-function setupDialog(ctx, source, { secret = null } = {}) {
+// /v1/agents/{id}; `secret` is present only straight after creation; `certificate` is the
+// service's own certificate (GET /v1/service/certificate) or null when it has none.
+function setupDialog(ctx, source, { secret = null, certificate = null } = {}) {
   const payload = setupText.secretlessPayload(source, location.origin);
   const files = [['agent.json', setupText.agentJson(payload)], ['AGENT.md', setupText.agentGuide(payload)]];
   const folder = payload.workingDirectory;
   const where = folder ? h('code', { class: 'path' }, folder) : 'the agent’s folder';
+  // The address the extension must use is the one this page is connected to, not the configured
+  // public address, which may be a name that does not resolve from this person's network
+  // (coordinator note of 2026-10-08).
+  const bridgeServer = location.origin;
+  const caFile = certificate ? payload.certificateFile.posix : null;
+  let role = 'worker';
+  const settingsFor = (chosen) => setupText.bridgeSettings(payload, { role: chosen, server: bridgeServer, caFile });
+  const prompt = setupText.setupPrompt(payload, { role, certificate, bridgeServer, caFile });
+  const promptText = (chosen) => setupText.setupPrompt(payload, { role: chosen, certificate, bridgeServer, caFile });
 
   const status = h('p', { class: 'small', role: 'status', hidden: true });
   let save;
@@ -481,11 +535,11 @@ function setupDialog(ctx, source, { secret = null } = {}) {
         button.disabled = true;
         status.hidden = true;
         try {
-          const result = await saveSetupFiles(files);
+          const result = await saveSetupFiles(files, settingsFor(role));
           if (!result.cancelled) {
             status.className = 'small';
             status.setAttribute('role', 'status');
-            status.textContent = `Saved in ${result.folder}: ${result.written.join(', ')}.`;
+            status.textContent = `Saved in ${result.folder}: ${result.written.join(', ')}.` + (result.notes || []).map((note) => ' ' + note).join('');
             status.hidden = false;
             toast('Setup files saved');
           }
@@ -500,12 +554,32 @@ function setupDialog(ctx, source, { secret = null } = {}) {
           button.disabled = false;
         }
       } }, 'Save to agent folder…'),
-      h('span', { class: 'small muted', id: 'setup-save-hint' }, 'Pick ', where, '. Writes .orchestra/agent.json and .orchestra/AGENT.md, and adds .orchestra/ to an existing .gitignore. The secret is never saved.'));
+      h('span', { class: 'small muted', id: 'setup-save-hint' }, 'Pick ', where, '. Writes .orchestra/agent.json and .orchestra/AGENT.md, merges the bridge settings into .vscode/settings.json, and adds .orchestra/ to an existing .gitignore. The secret is never saved.'));
   } else {
     save = h('p', { class: 'small muted', role: 'note' }, 'Saving directly needs Edge or Chrome on an https or localhost address. Use the copy buttons below instead.');
   }
 
-  const prompt = setupText.setupPrompt(payload);
+  // One line about what is written, the role this window's agent takes (the extension's worker or
+  // reviewer), and — when the service has its own certificate — its fingerprint with a Save button.
+  const roleChoice = h('label', { class: 'small', for: 'setup-role' }, 'What this agent does in this window: ',
+    h('select', { id: 'setup-role', onchange: (event) => { role = event.target.value; drawPrompt(promptText(role)); } },
+      h('option', { value: 'worker' }, 'works on tasks and answers reviews'),
+      h('option', { value: 'reviewer' }, 'reviews other agents’ deliveries')));
+  const certificateBlock = certificate ? h('section', { class: 'setup-block', 'aria-label': 'The service’s own certificate' },
+    h('div', { class: 'copy-row' }, h('h4', { class: 'small' }, 'The service’s own certificate'),
+      copyButton('Copy', certificate.sha256, { ariaLabel: 'Copy the certificate fingerprint', what: 'Fingerprint' }),
+      h('button', { type: 'button', onclick: () => saveCertificate(certificate, payload.certificateFile) }, 'Save certificate')),
+    h('p', { class: 'small' }, 'SHA-256 fingerprint: ', h('code', { class: 'path', 'data-fingerprint': certificate.sha256 }, certificate.sha256)),
+    h('p', { class: 'small muted' }, 'The extension shows the same string before it trusts this server: compare the two. This is the public certificate only — what the TLS handshake already gives — and the setup prompt saves it beside your credential file and names it in orchestraBridge.caFile.')) : null;
+
+  const promptBody = h('div', { class: 'stack' });
+  const drawPrompt = (text) => promptBody.replaceChildren(
+    h('div', { class: 'copy-row' }, h('h4', { class: 'small' }, 'Or let the agent do it'), copyButton(SETUP_PROMPT_LABEL, text, { what: 'Setup prompt' })),
+    h('p', { class: 'small muted' }, 'Paste this into the agent’s own chat, opened in its folder. It creates both files, merges the bridge settings, updates .gitignore in a Git repository, then continues. It does not contain the secret.'),
+    h('details', null, h('summary', null, 'Show the prompt'), h('pre', { class: 'json' }, text)));
+  drawPrompt(prompt);
+  const promptSection = h('section', { class: 'setup-block', 'aria-label': 'Setup prompt' }, promptBody);
+
   const resume = setupText.resumePrompt(payload.name);
   const step = (number, title, ...body) => h('li', { class: 'setup-step', 'aria-label': `Step ${number}: ${title}` },
     h('h3', { class: 'small' }, `${number}. ${title}`), ...body);
@@ -522,16 +596,17 @@ function setupDialog(ctx, source, { secret = null } = {}) {
           h('p', { class: 'setup-intro' }, SETUP_INTRO),
           h('p', { class: 'small' }, 'The folder gets two small files, ', h('code', null, setupText.CONFIG_PATH), ' and ', h('code', null, setupText.GUIDE_PATH),
             ', in ', where, '. Keep .orchestra/ out of Git. Neither file holds the secret; they only name the file from step 1.'),
+          h('p', { class: 'small', 'data-writes': setupText.VSCODE_SETTINGS_PATH }, SETUP_WRITES_LINE),
+          roleChoice,
+          certificateBlock,
           h('section', { class: 'setup-block', 'aria-label': 'Save the setup files' }, save, status),
-          h('section', { class: 'setup-block', 'aria-label': 'Setup prompt' },
-            h('div', { class: 'copy-row' }, h('h4', { class: 'small' }, 'Or let the agent do it'), copyButton(SETUP_PROMPT_LABEL, prompt, { what: 'Setup prompt' })),
-            h('p', { class: 'small muted' }, 'Paste this into the agent’s own chat, opened in its folder. It creates both files, updates .gitignore in a Git repository, then continues. It does not contain the secret.'),
-            h('details', null, h('summary', null, 'Show the prompt'), h('pre', { class: 'json' }, prompt))),
+          promptSection,
           fileBlock(setupText.CONFIG_PATH, files[0][1], folder, setupText.CONFIG_PATH),
           fileBlock(setupText.GUIDE_PATH, files[1][1], folder, setupText.GUIDE_PATH),
           source.setup && source.setup.setup_snippet ? h('details', null, h('summary', null, 'Shell commands instead (optional)'), h('pre', { class: 'json' }, source.setup.setup_snippet)) : null),
         step(3, 'Start the agent',
           h('p', { class: 'small' }, 'Open ', where, ' in VS Code (File > Open Folder…), open the agent’s chat, and paste the resume prompt. Do this after steps 1 and 2.'),
+          h('p', { class: 'small', 'data-once': 'true' }, SETUP_ONCE_LINE),
           folder ? copyLine('Folder:', folder, { ariaLabel: 'Copy the agent folder path', what: 'Folder path' }) : null,
           copyLine('Resume prompt:', resume, { ariaLabel: 'Copy the resume prompt', what: 'Resume prompt' })))),
     h('div', { class: 'dialog-foot' }, h('button', { type: 'button', class: 'primary', onclick: () => { dialog.close(); dialog.remove(); } }, 'Done')));

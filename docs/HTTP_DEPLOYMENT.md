@@ -1750,6 +1750,43 @@ process list either. A lost secret is replaced, never re-shown: `POST
 /v1/agents/{id}/credentials` issues a new one (the old credential works until revoked
 with `POST /v1/agents/{id}/credentials/{credential}/revoke`).
 
+#### The service's own certificate, and the VS Code window's settings (kittrial-5bb.203)
+
+A service started with `--cert`/`--key` serves its own public certificate at
+`GET /v1/service/certificate` **without a log-in**: the answer is
+`{"certificate": "<PEM>", "sha256": "<fingerprint>"}`, where the fingerprint is the SHA-256 of the
+leaf certificate's DER as uppercase hex pairs joined by colons — the same string
+`openssl x509 -in cert.pem -noout -fingerprint -sha256` prints and the VS Code bridge extension
+shows before it trusts the server, so a person can compare the two. It gives only what the TLS
+handshake already gives (the public certificate, never the key), and a service without its own
+certificate — plain HTTP, or the first-install tunnel — answers the ordinary `404`: nothing is
+served there.
+
+The My agents set-up dialog reads that route, shows the fingerprint with a Save button, and its
+set-up prompt writes what the Orchestra Bridge extension reads:
+
+- `.vscode/settings.json`, merged into whatever is already there and changing nothing else:
+  `orchestraBridge.serverUrl` (the address the page itself was loaded from, not the configured
+  public address, which may be a name that does not resolve on that network),
+  `orchestraBridge.agentName` (the slug), `orchestraBridge.enabled` `true`,
+  `orchestraBridge.onWork` (`prefill`: the prompt is typed into Copilot Chat, never sent),
+  `orchestraBridge.role` (`worker` or `reviewer`), and `orchestraBridge.projects` with the one
+  project whose code is in that window (the prompt leaves `REPLACE_PROJECT_ID` when the agent is
+  granted several: one folder and one window per project). A file that is not valid JSON is left
+  exactly as it is, with a sentence, instead of being guessed at.
+- In https mode with the service's own certificate: that certificate saved beside the credential
+  file (`%USERPROFILE%\.orchestra-agent-<name>.crt`, `~/.orchestra-agent-<name>.crt`) and
+  `orchestraBridge.caFile` naming it with the `~` form the extension expands itself.
+- Two comment lines appended to the credential file, which curl ignores: `# server = <address>`
+  (the extension's own rule reads the address from it, so nobody types it) and
+  `# server certificate sha256 = <fingerprint>`.
+
+Nothing in any of it holds the secret: the settings name the credential file, and the prompt
+sends the agent to the secret only through `curl -K`. The same prompt and settings are written for
+an agent that reviews other agents' deliveries, with `orchestraBridge.role` set to `reviewer`.
+What the person still does once is said in the dialog: install the extension, reload the window,
+click the first wake.
+
 **What an agent may do is kept on the agent, and a new credential carries exactly that**
 (kittrial-5bb.208). The agent record holds its `scopes`: written when the agent is made
 (the list asked for, or the default four) and changed only by a renewal that sends a

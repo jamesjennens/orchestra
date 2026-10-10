@@ -142,6 +142,9 @@ export function createApi(transport) {
     docs: () => call('GET', '/v1/docs'),
     doc: (name) => call('GET', `/v1/docs/${name}`),
     createAgent: (body) => mutate('POST', '/v1/agents', body),
+    // The service's own public certificate, for the My agents set-up dialog: a read with no log-in
+    // that only an https service with its own certificate answers (kittrial-5bb.203).
+    certificate: () => call('GET', '/v1/service/certificate'),
     updateAgent: (aid, body) => mutate('PATCH', `/v1/agents/${aid}`, body),
     agent: (aid) => call('GET', `/v1/agents/${aid}`),
     // A NEW credential for the agent; its secret is in this one response only.

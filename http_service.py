@@ -6470,6 +6470,23 @@ class ApiHandler(BaseHTTPRequestHandler):
     def healthz(self, ctx):
         return 200, {'status': 'ok'}
 
+    @route('GET', r'/v1/service/certificate', anonymous=True, csrf=False)
+    def service_certificate(self, ctx):
+        """The service's own public certificate, for the person setting up an agent (kittrial-5bb.203).
+
+        Only what the TLS handshake already gives every client: the public certificate, never the
+        key, and no log-in, because the point is that the certificate can be fetched before the
+        browser or the agent has been made to trust it (the My agents set-up dialog shows its
+        SHA-256 fingerprint and saves the file). A service without its own certificate — plain http,
+        or the first-install tunnel — serves nothing here: the ordinary not-found answer, as if the
+        route did not exist.
+        """
+        certificate = getattr(self.server, 'tls_certificate_pem', None)
+        if not certificate:
+            raise not_found('No such operation')
+        return 200, {'certificate': certificate,
+                     'sha256': certificate_fingerprint(certificate)}
+
     def _page(self, ctx, query):
         limit_raw = query.get('limit', str(DEFAULT_PAGE))
         try:
@@ -6835,6 +6852,29 @@ def quiet_memory_errors():
     return hook
 
 
+def certificate_fingerprint(certificate):
+    """The SHA-256 fingerprint of a PEM certificate, in the form the dialog and the extension show it.
+
+    The same string ``openssl x509 -noout -fingerprint -sha256`` prints and the VS Code extension
+    shows for the certificate the TLS handshake presented: the SHA-256 of the certificate's DER,
+    as uppercase hex pairs joined by colons. A careful person compares the two before trusting an
+    office install's own certificate (kittrial-5bb.203); the dialog's Save button saves the very
+    PEM this is computed from, so the two cannot drift.
+
+    Only the FIRST certificate of the text is used: that is the leaf the handshake presents, and a
+    chain after it does not change it. Anything that is not a certificate block is refused.
+    """
+    match = re.search(r'-----BEGIN CERTIFICATE-----(.*?)-----END CERTIFICATE-----',
+                      str(certificate or ''), re.S)
+    if not match:
+        raise ValueError('not a PEM certificate')
+    try:
+        der = base64.b64decode(''.join(match.group(1).split()), validate=True)
+    except (binascii.Error, ValueError):
+        raise ValueError('not a PEM certificate: its body is not base64') from None
+    return ':'.join('%02X' % byte for byte in hashlib.sha256(der).digest())
+
+
 def create_server(service, backend, *, host='127.0.0.1', port=0, trusted_proxies=(),
                   max_body=MAX_BODY_BYTES, certfile=None, keyfile=None,
                   allow_plaintext_non_loopback=False, web_root=DEFAULT_WEB_ROOT,
@@ -6845,11 +6885,16 @@ def create_server(service, backend, *, host='127.0.0.1', port=0, trusted_proxies
         raise ValueError('Refusing plaintext on a non-loopback interface; supply TLS or '
                          'explicitly allow disposable plaintext')
     context = None
+    certificate = None
     if certfile:
         # Before anything is bound: a certificate or key that cannot be used stops the start.
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.minimum_version = ssl.TLSVersion.TLSv1_2
         context.load_cert_chain(certfile, keyfile)
+        # What the handshake will present, kept to serve at GET /v1/service/certificate
+        # (kittrial-5bb.203): read once, from the same file that was just loaded, so the
+        # fingerprint the dialog shows is of the certificate this process is serving.
+        certificate = Path(certfile).read_text(encoding='utf-8')
     if ':' in host:
         server_class = type('GuardedServer6', (GuardedServer,), {'address_family': __import__('socket').AF_INET6})
     else:
@@ -6860,6 +6905,9 @@ def create_server(service, backend, *, host='127.0.0.1', port=0, trusted_proxies
                                                      web_root=web_root))
     # The TLS context is the connection's (ApiHandler.setup): the listening socket stays plain.
     httpd.tls_context = context
+    # The public certificate this listener serves, for GET /v1/service/certificate: None when the
+    # service has no certificate of its own (plain http, or the first-install tunnel).
+    httpd.tls_certificate_pem = certificate
     if client_seconds is not None:
         httpd.client_seconds = client_seconds
     if connection_limit is not None:

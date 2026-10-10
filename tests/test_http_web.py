@@ -1666,7 +1666,7 @@ class AgentSetupDialogCase(unittest.TestCase):
         # that renders one; everything else is built from the secretless payload.
         uses = [line.strip() for line in dialog.splitlines()
                 if re.search(r'\bsecret\b', self.unquoted(line))]
-        self.assertIn('function setupDialog(ctx, source, { secret = null } = {}) {', code)
+        self.assertIn('function setupDialog(ctx, source, { secret = null, certificate = null } = {}) {', code)
         self.assertEqual(["secret ? secretSection(secret, 'Secret (shown once)', payload) : "
                           "reissueSection(ctx, source.agent || {}, payload)),"], uses)
         section = self.function_body(code, 'secretSection')
@@ -1687,7 +1687,7 @@ class AgentSetupDialogCase(unittest.TestCase):
         reopen = self.function_body(code, 'reopenSetup')
         # Built from the agent's current secretless record, with no secret at all.
         self.assertIn('ctx.api.agent(agentId)', reopen)
-        self.assertIn('setupDialog(ctx, { agent }, { secret: null })', reopen)
+        self.assertIn('setupDialog(ctx, { agent }, { secret: null, certificate: await agentCertificate(ctx) })', reopen)
         self.assertIsNone(re.search(r'credential|\.secret\b', reopen))
         # Losing the secret means issuing a NEW credential; only its fresh secret is shown.
         reissue = self.function_body(code, 'reissueSection')
@@ -1831,8 +1831,14 @@ const reopened = m.secretlessPayload({ agent: { id: 'agent_1', name: 'Kestrel', 
     owner_display_name: 'Olive', working_directory: 'C:\\k', projects: ['p1'],
     credentials: [{ id: 'c1', label: 'x', revoked: false }] } }, 'http://127.0.0.1:9');
 const q = m.secretlessPayload(mock, 'http://fallback');
+// kittrial-5bb.203: the VS Code workspace settings the prompt writes, taken from the prompt's own
+// last JSON block, so what the agent is told to write is what is checked.
+const blockOf = (text) => JSON.parse(text.split('~~~json\n').slice(-1)[0].split('\n~~~')[0]);
+const plain = m.setupPrompt(p, { bridgeServer: 'https://office.example.invalid:7443' });
+const certificate = { certificate: '-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n', sha256: 'AB:CD' };
+const withCert = m.setupPrompt(p, { role: 'reviewer', bridgeServer: 'https://office.example.invalid:7443', certificate });
 const texts = [m.agentJson(p), m.agentGuide(p), m.setupPrompt(p), JSON.stringify(p),
-               m.agentJson(q), m.agentGuide(q), m.setupPrompt(q), JSON.stringify(q)];
+               m.agentJson(q), m.agentGuide(q), m.setupPrompt(q), JSON.stringify(q), plain, withCert];
 console.log(JSON.stringify({
   leaks: texts.filter((t) => t.includes('SECRET-XYZ-123') || t.includes('MOCK-SECRET-777')).length,
   json: JSON.parse(m.agentJson(p)), mockJson: JSON.parse(m.agentJson(q)),
@@ -1846,6 +1852,14 @@ console.log(JSON.stringify({
   promptNamesFile: m.setupPrompt(p).includes('%USERPROFILE%\\.orchestra-agent-kestrel.curlrc'),
   placeholder: m.headerLine(), real: m.headerLine('S3'),
   tests: m.testCommands(p),
+  settingsPlain: blockOf(plain), settingsCert: blockOf(withCert),
+  settingsLeak: JSON.stringify(blockOf(withCert)).includes('SECRET-XYZ-123'),
+  commentLines: m.credentialCommentLines('https://office.example.invalid:7443', 'AB:CD'),
+  merged: m.mergeSettings('{\n  "editor.tabSize": 2\n}', { 'orchestraBridge.enabled': true }),
+  kept: m.mergeSettings('{"a": 1}', {}).text,
+  refused: m.mergeSettings('{\n  // a comment\n  "a": 1\n}', { 'a': 2 }),
+  absent: m.mergeSettings('', { 'a': 1 }),
+  certFile: m.certificateFile('Kestrel (agent of Olive)'),
   paths: [m.destinationPath(p.workingDirectory, m.CONFIG_PATH), m.destinationPath('/home/j/x/', m.GUIDE_PATH),
           m.destinationPath('D:', m.CONFIG_PATH), m.destinationPath('', m.CONFIG_PATH)],
   ignore: [m.gitignoreAppend('node_modules'), m.gitignoreAppend('a\r\n'), m.gitignoreAppend('/.orchestra\n'),
@@ -1880,6 +1894,32 @@ console.log(JSON.stringify({
             {'path': '.orchestra\\agent.json', 'relative': True}], result['paths'])
         self.assertEqual(['\n.orchestra/\n', '.orchestra/\r\n', '', '', '.orchestra/\n'],
                          result['ignore'])
+        # kittrial-5bb.203: the settings block the prompt writes, and that the credential never
+        # reaches it. The address is the page's, the role is the one asked for, and the
+        # certificate (with caFile naming the file beside the credential) only when there is one.
+        self.assertEqual({
+            'orchestraBridge.serverUrl': 'https://office.example.invalid:7443',
+            'orchestraBridge.agentName': 'kestrel',
+            'orchestraBridge.enabled': True,
+            'orchestraBridge.onWork': 'prefill',
+            'orchestraBridge.role': 'worker',
+            'orchestraBridge.projects': ['p1']}, result['settingsPlain'])
+        self.assertEqual(dict(result['settingsPlain'], **{
+            'orchestraBridge.role': 'reviewer', 'orchestraBridge.caFile': '~/.orchestra-agent-kestrel.crt'}),
+            result['settingsCert'])
+        self.assertEqual(False, result['settingsLeak'])
+        self.assertEqual(['# server = https://office.example.invalid:7443',
+                          '# server certificate sha256 = AB:CD'], result['commentLines'])
+        # Merging changes nothing that was already there; a file that is not valid JSON is left alone.
+        self.assertEqual({'text': '{\n  "editor.tabSize": 2,\n  "orchestraBridge.enabled": true\n}\n',
+                          'refused': False, 'created': False}, result['merged'])
+        self.assertEqual('{\n  "a": 1\n}\n', result['kept'])
+        self.assertEqual({'text': None, 'refused': True, 'created': False}, result['refused'])
+        self.assertEqual({'text': '{\n  "a": 1\n}\n', 'refused': False, 'created': True}, result['absent'])
+        self.assertEqual({'name': '.orchestra-agent-kestrel-agent-of-olive.crt',
+                          'windows': '%USERPROFILE%\\.orchestra-agent-kestrel-agent-of-olive.crt',
+                          'powershell': '$env:USERPROFILE\\.orchestra-agent-kestrel-agent-of-olive.crt',
+                          'posix': '~/.orchestra-agent-kestrel-agent-of-olive.crt'}, result['certFile'])
 
 
 
