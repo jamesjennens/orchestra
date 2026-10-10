@@ -277,7 +277,9 @@ class NoUnguardedParseTests(unittest.TestCase):
             # unreadable file must be a refusal naming it, not a traceback.
             # The sixth (kittrial-5bb.220 F1) reads the backup-schedule note an operator
             # records; a damaged or nested note reads as no note, never a traceback.
-            'admin.py': 6,
+            # The seventh (kittrial-5bb.220 review 2 item 4a) reads one line of the
+            # backup-schedule log the kit writes; a damaged line is skipped.
+            'admin.py': 7,
             # endpoint.py's fifth (kittrial-5bb.195): the JSON payload of a coordinator
             # acceptance command, which the caller transports as a file attachment. It is
             # the caller's text, so it is parsed through the guard.

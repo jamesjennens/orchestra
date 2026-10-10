@@ -707,6 +707,23 @@ class ScheduledCoverageGuidanceCase(unittest.TestCase):
         self.assertIn('cover every project', text)
         self.assertIn('no change is needed', text)
 
+    def test_add_project_does_not_stop_half_way_when_no_unit_line_can_be_printed(self):
+        """kittrial-5bb.220 review 2 item 2a: a $ in the install path must not cut the report short."""
+        output = io.StringIO()
+        with patch.object(admin, 'config', return_value={'port': 13317}), \
+                patch.object(admin, 'run_bd', return_value=''), \
+                patch.object(admin, 'backup_project'), \
+                patch.object(admin, 'worker_client_setup', return_value='WORKER CONFIG HERE'), \
+                patch.object(admin, 'install_current_path',
+                             side_effect=lambda path: Path('/srv/a$b/' + Path(str(path)).name)), \
+                contextlib.redirect_stdout(output):
+            admin.add_project(self.root, 'newproject')
+        text = output.getvalue()
+        self.assertIn('Created project newproject', text)
+        self.assertIn('No line for a schedule can be printed for this installation', text)
+        self.assertIn('can name the path', text)          # the reason, naming the path
+        self.assertIn('WORKER CONFIG HERE', text)         # everything else still printed
+
     def test_add_project_does_not_steer_off_a_longsync_wrapper(self):
         self.write_unit(self.wrapper_line(), name='beads-example-backup.service')
         output = io.StringIO()

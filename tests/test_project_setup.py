@@ -28,6 +28,31 @@ def by_id(body):
     return {item['id']: item for item in body['steps']}
 
 
+def backup_step_from(block):
+    """The backup step as the page is given it, from one host ``backup`` block."""
+    class Backend:
+        def setup_status(_, project_id):
+            return {'schema_version': 1, 'project': project_id,
+                    'guidance': {'state': 'not-set', 'version': None, 'set_at': None},
+                    'onboarding': {'state': 'not-set', 'updated_at': None}, 'backup': block}
+
+        def read_tasks(_, project_id):
+            return {'items': []}
+
+    class Service:
+        def project_view(_, principal, project_id):
+            return {'id': project_id, 'name': 'Alpha', 'repository': None}
+
+        def list_members(_, principal, project_id):
+            return [{}]
+
+        def list_project_agents(_, principal, project_id):
+            return []
+    handler = type('Handler', (), {'service': Service(), 'backend': Backend()})()
+    principal = type('Principal', (), {'user_id': 'u1', 'superuser': True})()
+    return by_id(project_setup.steps(handler, principal, 'alpha'))['backup']
+
+
 class RepositoryRuleTests(unittest.TestCase):
     def test_accepted_shapes(self):
         for value in ('https://git.example/team/project.git', 'ssh://git@git.example:2222/team/project.git',
@@ -194,7 +219,9 @@ class InProcessSetupTests(test_http_agents.AgentHarness):
                          [['PYTHON', 'KIT', 'RUNTIME_ROOT', 'OPERATOR', 'FILE']])
         self.assertEqual([one['replace'] for one in steps['onboarding']['commands']], [['PYTHON', 'KIT', 'RUNTIME_ROOT', 'FILE']])
         self.assertEqual([(one['kind'], one['text']) for one in steps['backup']['commands']],
-                         [('unit-line', 'ExecStart=PYTHON admin.py --root RUNTIME_ROOT backup --all')])
+                         [('unit-line', 'ExecStart=PYTHON admin.py --root RUNTIME_ROOT backup --all'),
+                          ('shell-fill', 'PYTHON KIT/admin.py --root RUNTIME_ROOT backup-schedule --note NOTE '
+                                         '--actor OPERATOR')])
         self.assertEqual(answer.data['project'], {'id': self.project, 'name': 'Alpha', 'repository': None})
         self.assertTrue(answer.data['generated_at'])
 
@@ -478,53 +505,104 @@ class HostStatusTests(unittest.TestCase):
         self.assertIn('/srv/my kit/python3', said)
         self.assertNotIn('Command /srv/my is not executable', said)
 
-    @unittest.skipIf(sys.platform == 'win32', 'systemd unit lines are POSIX command lines')
     def test_systemd_quote_escapes_specifiers_and_refuses_what_has_no_literal_spelling(self):
-        """kittrial-5bb.220 F4 revision: systemd's own rules, not a shell's."""
+        """kittrial-5bb.220 F4 revision 2: systemd's own rules, not a shell's.
+
+        A pure string function on literal POSIX strings, so it runs on every platform.
+        """
         self.assertEqual(admin.systemd_quote('/srv/rt'), '/srv/rt')
         self.assertEqual(admin.systemd_quote('/srv/my kit/p'), '"/srv/my kit/p"')
         # A percent begins a specifier (%h is the home folder), so it is doubled.
         self.assertEqual(admin.systemd_quote('/srv/%h/p'), '"/srv/%%h/p"')
-        # A single quote is literal inside the double quotes; a backslash is doubled.
-        self.assertEqual(admin.systemd_quote("/srv/o'brien/p"), '"/srv/o\'brien/p"')
-        self.assertEqual(admin.systemd_quote('/srv/a\\b'), '"/srv/a\\\\b"')
-        # A $ or a control character has no literal spelling in an ExecStart line.
-        for bad in ('/srv/$HOME/p', '/srv/a\nb', '/srv/a\tb'):
-            with self.assertRaisesRegex(ValueError, 'cannot name this path literally'):
+        # A quote, a backslash, a $ or a control/format character has no literal spelling in an
+        # ExecStart line: systemd-analyze verify refuses the executable name (review 2 item 2b).
+        for bad in ("/srv/o'brien/p", '/srv/a"b', '/srv/a\\b', '/srv/$HOME/p', '/srv/a\nb', '/srv/a\tb',
+                    '/srv/a\x7fb', '/srv/a\u2028b', '/srv/a\u202eb'):
+            with self.assertRaisesRegex(ValueError, 'can name the path'):
                 admin.systemd_quote(bad)
 
-    def test_the_operator_note_reads_the_schedule_done_and_a_unit_still_wins(self):
-        """kittrial-5bb.220 F1: an operator's statement reads done; a found unit still wins over it."""
+    def test_the_operator_note_reads_the_schedule_done(self):
+        """kittrial-5bb.220 F1: an operator's statement reads done; clearing it returns to not-covered.
+
+        The note parts run on every platform; only the unit-line part needs POSIX paths.
+        """
         admin.write_backup_schedule_note(self.root, 'Site cron backs it up nightly.', 'operator-1')
         self.assertEqual(self.status()['backup']['scheduled'], 'elsewhere')
         self.assertEqual(self.status()['backup']['elsewhere'], 'Site cron backs it up nightly.')
-        # Clearing the note returns to not-covered.
-        admin.clear_backup_schedule_note(self.root)
+        self.assertTrue(admin.clear_backup_schedule_note(self.root, 'operator-1'))
         self.assertEqual(self.status()['backup']['scheduled'], 'not-covered')
-        # A covering unit with an enabled timer is the more specific answer, and clearing the
-        # note does not undo it.
+
+    @unittest.skipIf(sys.platform == 'win32', 'systemd unit lines are POSIX command lines')
+    def test_a_covering_unit_with_an_enabled_timer_wins_over_a_note(self):
+        """kittrial-5bb.220 F1: a found unit+timer is the more specific answer; clearing the note keeps it."""
         admin.write_backup_schedule_note(self.root, 'Site cron backs it up nightly.', 'operator-1')
         self.unit(admin.scheduled_backup_execstart(self.root))
         self.timer()
         self.assertEqual(self.status()['backup']['scheduled'], 'covered')
-        admin.clear_backup_schedule_note(self.root)
+        admin.clear_backup_schedule_note(self.root, 'operator-1')
         self.assertEqual(self.status()['backup']['scheduled'], 'covered')
 
     def test_the_note_records_who_and_when_and_is_limited(self):
-        """kittrial-5bb.220 F1: the note carries who/when and a one-line length limit; --clear reports."""
+        """kittrial-5bb.220 F1/F3: the note carries who/when and a one-line limit; the log keeps the trace."""
         admin.write_backup_schedule_note(self.root, 'Site cron backs it up nightly.', 'operator-1')
         backup = self.status()['backup']
         self.assertEqual((backup['scheduled'], backup['elsewhere'], backup['elsewhere_by']),
                          ('elsewhere', 'Site cron backs it up nightly.', 'operator-1'))
         self.assertTrue(backup['elsewhere_at'])
-        self.assertTrue(admin.clear_backup_schedule_note(self.root))
-        self.assertFalse(admin.clear_backup_schedule_note(self.root))
+        self.assertTrue(admin.clear_backup_schedule_note(self.root, 'operator-2'))
+        self.assertFalse(admin.clear_backup_schedule_note(self.root, 'operator-2'))
+        # Every set and clear is kept in the bounded log (review 2 item 4a).
+        log = admin.backup_schedule_log(self.root)
+        self.assertEqual([(entry['action'], entry['by']) for entry in log],
+                         [('set', 'operator-1'), ('clear', 'operator-2')])
         with self.assertRaisesRegex(ValueError, 'one line'):
             admin.write_backup_schedule_note(self.root, 'x' * 301, 'operator-1')
         with self.assertRaisesRegex(ValueError, 'one line'):
             admin.write_backup_schedule_note(self.root, 'line one\nline two', 'operator-1')
+        with self.assertRaisesRegex(ValueError, 'control or format'):
+            admin.write_backup_schedule_note(self.root, 'line\u2028sep', 'operator-1')
+        with self.assertRaisesRegex(ValueError, 'control or format'):
+            admin.write_backup_schedule_note(self.root, 'esc\u001b[31m', 'operator-1')
         with self.assertRaisesRegex(ValueError, 'backups directory'):
             admin.write_backup_schedule_note(Path(self.tmp.name) / 'no-runtime', 'note', 'operator-1')
+
+    def test_a_hand_made_note_with_wrong_field_types_is_no_note(self):
+        """kittrial-5bb.220 review 2 item 3: one bad file must not take the whole set-up page down."""
+        path = self.root / 'backups' / admin.BACKUP_SCHEDULE_NOTE_NAME
+        for wrong in ({'schema_version': 1, 'note': 'x', 'recorded_by': {'a': [1, 2]}, 'recorded_at': 12345},
+                      {'schema_version': 1, 'note': ['a', 'b'], 'recorded_by': 'x', 'recorded_at': '2026-10-08T09:00:00Z'},
+                      {'schema_version': 1, 'note': 'x', 'recorded_by': 'x', 'recorded_at': 'not-a-stamp'},
+                      {'schema_version': 1, 'note': 'x', 'recorded_at': '2026-10-08T09:00:00Z'},
+                      {'schema_version': 2, 'note': 'x', 'recorded_by': 'x', 'recorded_at': '2026-10-08T09:00:00Z'}):
+            with self.subTest(wrong=wrong):
+                path.write_text(json.dumps(wrong), encoding='utf-8')
+                self.assertIsNone(admin.read_backup_schedule_note(self.root))
+                backup = self.status()['backup']
+                self.assertEqual(backup['scheduled'], 'not-covered')
+                self.assertIsNone(backup['elsewhere'])
+
+    def test_a_symlinked_or_oversized_note_is_ignored(self):
+        """kittrial-5bb.220 review 2 item 5: a symlinked note, and one past the file-size limit, are no note."""
+        real = self.root / 'real-note.json'
+        real.write_text(json.dumps({'schema_version': 1, 'note': 'x', 'recorded_by': 'op',
+                                    'recorded_at': '2026-10-08T09:00:00Z'}), encoding='utf-8')
+        link = self.root / 'backups' / admin.BACKUP_SCHEDULE_NOTE_NAME
+        try:
+            link.symlink_to(real)
+        except (OSError, NotImplementedError):
+            self.skipTest('symlink creation is not available')
+        self.assertIsNone(admin.read_backup_schedule_note(self.root))
+        link.unlink()
+        link.write_text('{"schema_version":1,"note":"' + 'x' * admin.BACKUP_SCHEDULE_NOTE_FILE_MAX + '"}',
+                        encoding='utf-8')
+        self.assertIsNone(admin.read_backup_schedule_note(self.root))
+
+    def test_a_note_ending_in_a_full_stop_does_not_print_two(self):
+        """kittrial-5bb.220 review 2 item 3: the sentence must not end '..'."""
+        step = backup_step_from({'scheduled': 'elsewhere', 'elsewhere': 'Site cron runs it.',
+                                 'elsewhere_by': 'operator-1', 'elsewhere_at': '2026-10-08T09:00:00Z'})
+        self.assertNotIn('..', step['detail'].replace('...', ''))
+        self.assertIn('elsewhere: Site cron runs it. The server did not check this', step['detail'])
 
     def test_a_note_does_not_read_done_when_the_schedule_could_not_be_checked(self):
         """kittrial-5bb.220 F1: with no account home the answer is unknown, not done; the note is still reported."""
@@ -536,12 +614,93 @@ class HostStatusTests(unittest.TestCase):
         self.assertEqual(backup['elsewhere'], 'Site cron backs it up nightly.')
 
     def test_backup_schedule_note_requires_a_configured_operator(self):
-        """kittrial-5bb.220 F1: --actor must be on the deployment operator allowlist."""
+        """kittrial-5bb.220 F1: --actor must be on the deployment operator allowlist.
+
+        ``admin.root_path`` is patched to ``Path`` so the check under test is the operator
+        one on every platform (the Windows temp root would fail root_path first).
+        """
         (self.root / 'deployment.private.json').write_text(json.dumps({'operators': ['operator-1']}), encoding='utf-8')
         argv = ['admin.py', '--root', str(self.root), 'backup-schedule', '--note', 'cron', '--actor', 'nobody-unlisted']
-        with patch.object(sys, 'argv', argv), patch('sys.stdout', io.StringIO()), patch('sys.stderr', io.StringIO()):
+        with patch.object(sys, 'argv', argv), patch.object(admin, 'root_path', Path), \
+                patch('sys.stdout', io.StringIO()), patch('sys.stderr', io.StringIO()):
             with self.assertRaisesRegex(ValueError, 'not a server-side configured operator'):
                 admin.main()
+
+    def test_a_timer_covers_only_the_unit_it_names(self):
+        """kittrial-5bb.220 review 2 item 5 (n06, n07): an enabled timer covers its unit, not any unit."""
+        self.unit(admin.scheduled_backup_execstart(self.root))            # beads-backup.service covers alpha
+        # An enabled timer for another unit, and one whose file name differs but whose Unit= is the
+        # covering service: only the latter is coverage (the timer's Unit= is what counts).
+        self.timer(name='beads-other.timer', unit='beads-other.service')
+        self.assertEqual(self.status()['backup']['scheduled'], 'not-covered')
+        self.timer(name='beads-x-backup.timer', unit='beads-backup.service')
+        self.assertEqual(self.status()['backup']['scheduled'], 'covered')
+
+    def test_coverage_says_so_when_no_unit_line_can_be_printed(self):
+        """kittrial-5bb.220 review 2 item 2a: a $ path does not break the report; it says why, naming it."""
+        with patch.object(admin, 'install_current_path',
+                          side_effect=lambda path: Path('/srv/a$b/' + Path(str(path)).name)):
+            covered, message = admin.scheduled_backup_coverage(self.root, 'alpha')
+        self.assertFalse(covered)
+        self.assertIn('No line for a schedule can be printed for this installation', message)
+        self.assertIn('can name the path', message)
+        self.assertIn('/srv/a$b', message)                # the reason names the path
+        self.assertIn('No installed scheduled backup unit', message)   # the rest of the report is still there
+
+    @unittest.skipUnless(sys.platform == 'linux', 'systemd unit lines are verified on Linux')
+    def test_systemd_refuses_the_characters_the_kit_refuses(self):
+        """kittrial-5bb.220 review 2 item 2b: verify the refusal set with systemd-analyze where it exists."""
+        if not self._systemd_analyze_verifies():
+            self.skipTest('systemd-analyze cannot verify here')
+        spellings = {"'": '"/srv/a\'b/py"', '"': '"/srv/a\\"b/py"', '\\': '"/srv/a\\\\b/py"'}
+        for char, spelling in spellings.items():
+            with self.subTest(char=char):
+                with tempfile.TemporaryDirectory() as directory:
+                    unit = Path(directory) / 'bad.service'
+                    unit.write_text('[Service]\nType=oneshot\nExecStart=%s\n' % spelling, encoding='utf-8')
+                    done = subprocess.run(['systemd-analyze', 'verify', str(unit)], capture_output=True, text=True)
+                self.assertIn('special characters', done.stdout + done.stderr)
+                with self.assertRaises(ValueError):
+                    admin.systemd_quote('/srv/a%sb/py' % char)
+
+    def test_the_backup_schedule_command_round_trip(self):
+        """kittrial-5bb.220 review 2 item 5: the command's happy path, --clear and the size limit."""
+        (self.root / 'deployment.private.json').write_text(json.dumps({'operators': ['operator-1']}), encoding='utf-8')
+
+        def run(*args):
+            out, err = io.StringIO(), io.StringIO()
+            argv = ['admin.py', '--root', str(self.root), 'backup-schedule', *args]
+            with patch.object(sys, 'argv', argv), patch.object(admin, 'root_path', Path), \
+                    contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = 0
+                try:
+                    admin.main()
+                except SystemExit as error:
+                    code = error.code if isinstance(error.code, int) else 1
+                    err.write(str(error.code) if not isinstance(error.code, int) else '')
+                except ValueError as error:
+                    code = 1
+                    err.write(str(error))
+            return code, out.getvalue(), err.getvalue()
+
+        code, out, err = run('--note', 'cron runs it.', '--actor', 'operator-1')
+        self.assertEqual((code, err), (0, ''), out)
+        self.assertEqual(json.loads(out)['note'], 'cron runs it.')
+        self.assertEqual(self.status()['backup']['scheduled'], 'elsewhere')
+        code, out, err = run('--clear', '--actor', 'operator-1')
+        self.assertEqual(code, 0)
+        self.assertIn('Removed', out)
+        self.assertEqual(self.status()['backup']['scheduled'], 'not-covered')
+        code, out, err = run('--clear', '--actor', 'operator-1')
+        self.assertEqual(code, 0)
+        self.assertIn('No backup schedule note was recorded', out)
+        # The size limit and the --clear/--note conflict are refusals (n19 and the size limit).
+        code, out, err = run('--note', 'x' * 301, '--actor', 'operator-1')
+        self.assertEqual(code, 1)
+        self.assertIn('one line', out + err)
+        code, out, err = run('--clear', '--note', 'x', '--actor', 'operator-1')
+        self.assertEqual(code, 1)
+        self.assertIn('takes no --note', out + err)
 
     def test_a_damaged_creation_record_is_said_as_a_sentence_without_a_path(self):
         """kittrial-5bb.149: the register route asks here, since the endpoint serves such a project."""
@@ -718,7 +877,7 @@ class EndpointSetupTests(fixes.EndpointCase):
                 self.assertIn(word, one['note'])
         self.assertIn(steps['backup']['state'], ('todo', 'done', 'unknown'))
         self.assertEqual([one['kind'] for one in steps['backup']['commands']] if steps['backup']['state'] != 'done' else
-                         ['shell', 'unit-line', 'shell'], ['shell', 'unit-line', 'shell'])
+                         ['shell', 'unit-line', 'shell'], ['shell', 'unit-line', 'shell', 'shell-fill'])
         # Guidance is the operator's alone. Onboarding an owner may set on the page, or the operator on the server.
         self.assertEqual((steps['guidance']['who'], steps['onboarding']['who']), ('operator', 'owner-or-operator'))
         self.assertIn('cannot do this step', steps['guidance']['note'])
@@ -792,7 +951,10 @@ class EndpointSetupTests(fixes.EndpointCase):
         # given the line as a line of a unit file, never as a command.
         step, body = host('not-covered')
         self.assertEqual((step['state'], step['command']), ('todo', line))
-        self.assertEqual([(one['kind'], one['text']) for one in step['commands']], [('unit-line', line)])
+        self.assertEqual([(one['kind'], one['text']) for one in step['commands']],
+                         [('unit-line', line),
+                          ('shell-fill', 'PYTHON KIT/admin.py --root RUNTIME_ROOT backup-schedule --note NOTE '
+                                         '--actor OPERATOR')])
         self.assertIn('not a shell command', step['commands'][0]['label'])
         self.assertIn('backup', [item['id'] for item in body['steps'] if item['state'] == 'todo'])
         # This kit's endpoint: what to run now, the line for a schedule, and the check, each labelled.
@@ -800,7 +962,9 @@ class EndpointSetupTests(fixes.EndpointCase):
             '/opt/py/bin/python3 /opt/kit/admin.py --root /srv/rt backup-status --require-complete'
         step, _ = host('not-covered', run_now=run, check=check, unit_directory='/home/svc/.config/systemd/user')
         self.assertEqual([(one['kind'], one['text']) for one in step['commands']],
-                         [('shell', run), ('unit-line', line), ('shell', check)])
+                         [('shell', run), ('unit-line', line), ('shell', check),
+                          ('shell-fill', 'PYTHON KIT/admin.py --root RUNTIME_ROOT backup-schedule --note NOTE '
+                                         '--actor OPERATOR')])
         self.assertEqual(step['command'], run)                     # what an older page shows can be pasted
         labels = [one['label'] for one in step['commands']]
         self.assertTrue(labels[0].startswith('Run a backup now (a shell command'))
@@ -837,6 +1001,13 @@ class EndpointSetupTests(fixes.EndpointCase):
         self.assertIn('covers the whole runtime and never expires', step['detail'])
         self.assertNotIn('outside this server', step['detail'])
         self.assertNotIn('backup', [item['id'] for item in body['steps'] if item['state'] == 'todo'])
+        # The host refused to print a unit line: the page says why, and shows no placeholder
+        # (kittrial-5bb.220 review 2 item 2a).
+        step, _ = host('not-covered', line=None,
+                       line_reason='no systemd ExecStart line can name the path "/srv/a$b" literally')
+        self.assertNotIn('unit-line', [one['kind'] for one in step['commands']])
+        self.assertIn('No line for a schedule can be printed for this installation', step['detail'])
+        self.assertIn('can name the path', step['detail'])
         step, _ = host('covered', last_run=ran)
         self.assertEqual((step['state'], step['commands'], step['command']), ('done', [], None))
         self.assertEqual(step['detail'], 'A scheduled backup on the server covers this project. A backup of this project '
@@ -1291,7 +1462,7 @@ class PastedIntoAShellTests(unittest.TestCase):
 
     def test_what_the_backup_step_labels_a_shell_command_runs_as_shown(self):
         commands = {one['kind'] + ':' + one['label'][:5]: one for one in self.step('backup')['commands']}
-        self.assertEqual(sorted(commands), ['shell:Check', 'shell:Run a', 'unit-line:The l'])
+        self.assertEqual(sorted(commands), ['shell-fill:Recor', 'shell:Check', 'shell:Run a', 'unit-line:The l'])
         for key in ('shell:Run a', 'shell:Check'):
             with self.subTest(command=key):
                 self.assertEqual(commands[key]['replace'], [])

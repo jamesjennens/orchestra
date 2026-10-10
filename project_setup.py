@@ -66,6 +66,15 @@ def fill_coordination(status, label, words, note, replace):
                  ('PYTHON', 'KIT') + tuple(replace))
 
 
+def ended(text):
+    """``text`` with one full stop, unless it already ends in a sentence mark.
+
+    An operator's note may itself end in a full stop, and appending another would print '..'
+    (kittrial-5bb.220 review 2 item 3).
+    """
+    return text if text.endswith(('.', '!', '?')) else text + '.'
+
+
 def is_merge_slot(row, project_id=None):
     """The project's merge slot row: an internal record, not a task.
 
@@ -259,11 +268,16 @@ def steps(handler, principal, project_id):
             when = ' on %s' % block.get('elsewhere_at')[:10] if block.get('elsewhere_at') else ''
             recorded = ('An operator%s%s recorded that this runtime\'s backups are scheduled elsewhere: %s'
                         % (who, when, note))
+        # When no unit line can be printed for this installation, say why where the line would be
+        # shown (kittrial-5bb.220 review 2 item 2a).
+        line_reason = block.get('line_reason') if isinstance(block.get('line_reason'), str) else None
+        no_line = (' No line for a schedule can be printed for this installation: %s.' % line_reason) if line_reason else ''
         if scheduled == 'covered':
             return 'done', ('A scheduled backup on the server covers this project. ' + (run + '.' if last else
                             'It has not run yet: no backup run has recorded this project.'))
         if scheduled == 'elsewhere':
-            detail = recorded + '. The server did not check this; the statement covers the whole runtime and never expires.'
+            detail = (ended(recorded) + ' The server did not check this; the statement covers the whole runtime '
+                      'and never expires.' + no_line)
             if last:
                 detail += ' ' + run + '.'
             return 'done', detail
@@ -273,9 +287,9 @@ def steps(handler, principal, project_id):
                       'seen here, and an operator can record one so this step reads done.')
             if last:
                 return 'todo', (run + ', but no systemd user schedule was found for it. What is missing is the '
-                                'schedule. ' + looked)
+                                'schedule. ' + looked + no_line)
             return 'todo', ('No backup run has recorded this project yet, and no systemd user schedule was found '
-                            'for it: both are missing. Run one now, then add the schedule. ' + looked)
+                            'for it: both are missing. Run one now, then add the schedule. ' + looked + no_line)
         ran = (' ' + run + '.') if last else ' No backup run has recorded this project yet.'
         if block.get('reason') == 'no-account-home':
             detail = ('The server could not check its backup schedule: the web service was started without '
@@ -284,24 +298,42 @@ def steps(handler, principal, project_id):
         else:
             detail = 'The server could not read its backup schedule, so ask an operator.' + ran
         if recorded:
-            detail += ' ' + recorded + ' (the server did not check it).'
-        return 'unknown', detail
+            detail += ' ' + ended(recorded) + ' (the server did not check it).'
+        return 'unknown', detail + no_line
     block = (status or {}).get('backup') if isinstance((status or {}).get('backup'), dict) else {}
     line, run_now, check = (block.get(key) if isinstance(block.get(key), str) else None for key in ('line', 'run_now', 'check'))
+    line_reason = block.get('line_reason') if isinstance(block.get('line_reason'), str) else None
     where = block.get('unit_directory') if isinstance(block.get('unit_directory'), str) else None
     commands = []
     if run_now:
         commands.append(entry('shell', 'Run a backup now (a shell command, on the server, as the service account)', run_now,
                               'It backs up every project of this server once. It does not schedule anything.'))
-    commands.append(entry(
-        'unit-line', 'The line for a schedule (a line of a systemd unit file, not a shell command)',
-        line or 'ExecStart=PYTHON admin.py --root RUNTIME_ROOT backup --all',
-        'It goes in the [Service] section of a beads-*backup*.service unit%s, which a timer runs. To check, reload this '
-        'page: the step reads the installed units.%s' % (
-            ' in %s' % where if where else ' in the service account\'s systemd user directory',
-            ' On the server: systemctl --user list-timers, and the check below.' if check else '')))
+    if line:
+        commands.append(entry(
+            'unit-line', 'The line for a schedule (a line of a systemd unit file, not a shell command)',
+            line,
+            'It goes in the [Service] section of a beads-*backup*.service unit%s, which a timer runs. To check, reload this '
+            'page: the step reads the installed units.%s' % (
+                ' in %s' % where if where else ' in the service account\'s systemd user directory',
+                ' On the server: systemctl --user list-timers, and the check below.' if check else '')))
+    elif not line_reason:
+        # A page older than the host's answer, or one with no line to show: the placeholder line,
+        # never when the host refused to print one (then the detail says why).
+        commands.append(entry(
+            'unit-line', 'The line for a schedule (a line of a systemd unit file, not a shell command)',
+            'ExecStart=PYTHON admin.py --root RUNTIME_ROOT backup --all',
+            'It goes in the [Service] section of a beads-*backup*.service unit%s, which a timer runs.' % (
+                ' in %s' % where if where else ' in the service account\'s systemd user directory')))
     if check:
         commands.append(entry('shell', 'Check that every project has a complete backup (a shell command, on the server)', check))
+    # An operator can record that backups are scheduled elsewhere: show the command, as the other
+    # steps show theirs (kittrial-5bb.220 review 2 item 4c).
+    commands.append(fill(status, 'Record that backups are scheduled elsewhere (a shell command, on the server)',
+                         'backup-schedule --note NOTE --actor OPERATOR',
+                         'Replace NOTE with one line of at most 300 characters and OPERATOR with your name on the '
+                         'server\'s operator list. The statement is about the whole runtime and never expires; the '
+                         'server does not check it. Every set and clear is kept in backups/backup-schedule-log.jsonl.',
+                         ('NOTE', 'OPERATOR')))
     result.append(host_step('backup', 'Make sure a scheduled backup covers this project', status, reason, backup,
                             None, commands, None))
 

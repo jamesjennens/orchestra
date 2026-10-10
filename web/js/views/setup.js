@@ -114,7 +114,7 @@ function stepItem(ctx, pid, item, redraw) {
       h('div', { class: 'row' },
         copyButton(line ? 'Copy line' : (fill ? 'Copy command (fill in first)' : 'Copy command'),
           one.text, { what: line ? 'Line' : 'Command' }),
-        fill ? h('span', { class: 'small muted' }, 'Replace first: ' + words.join(', ')) : null),
+        words.length ? h('span', { class: 'small muted' }, 'Replace first: ' + words.join(', ')) : null),
       one.note ? h('p', { class: 'small muted' }, one.note) : null));
   }
   if (item.note) body.push(h('p', { class: 'small muted' }, item.note));

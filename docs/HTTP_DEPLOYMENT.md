@@ -377,7 +377,14 @@ the exact command for the server. `remaining` counts the `todo` ones.
   records that backups are scheduled elsewhere (`admin.py backup-schedule --note TEXT
   --actor OPERATOR`, operator allowlist) makes the step read done with the operator's
   own words, who recorded them and when; the statement is runtime-wide, never expires,
-  and the server does not check it.
+  and the server does not check it. Every set and clear is appended, with who and when,
+  to `backups/backup-schedule-log.jsonl` (bounded to the newest 100 entries): the note
+  itself is only the current statement, and the log is what says there was one. A
+  hand-made note whose fields are not the expected strings, or that is a symlink, is
+  read as no note, so one bad file never hides the other steps. Some installation paths
+  (an interpreter or kit path holding a `$`, a quote, a backslash or a control character)
+  get no unit line at all; the step then says so, with the reason, instead of printing a
+  line systemd would reject.
 - **The page runs nothing on the server.** The host steps show a command to copy; the
   web interface does not run it. One host step can also be done on the page: an owner
   may write the project's onboarding text there (see "Onboarding text from the setup

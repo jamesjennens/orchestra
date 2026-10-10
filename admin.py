@@ -27,6 +27,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import weakref
 from pathlib import Path
 from contextlib import contextmanager
@@ -1911,26 +1912,36 @@ def scheduled_backup_unit_paths():
     except OSError:
         return []
 
+def unit_unspellable(ch):
+    """True for a character no ``ExecStart`` word can spell literally.
+
+    systemd expands ``$VAR``/``${VAR}`` and a ``%`` specifier, and refuses a quote, a
+    backslash or a control, format or line-separator character in the executable name
+    (``systemd-analyze verify`` says "Executable name contains special characters").
+    ``%`` is not here: it is spellable as ``%%`` (kittrial-5bb.220 review 2 item 2b).
+    """
+    return ch in '$"\'\\' or unicodedata.category(ch) in ('Cc','Cf','Zl','Zp')
+
 def systemd_quote(word):
     """``word`` as one systemd word, quoted only when it must be.
 
     systemd splits ``ExecStart`` on whitespace and does NOT follow shell rules: a path
     with a space must be wrapped in double quotes, or systemd takes the first fragment as
-    the program (kittrial-5bb.220 F4). Inside the quotes a backslash escapes the next
-    character, a double quote closes the word, and a percent begins a specifier, so those
-    are doubled (``\\``, ``\\"``, ``%%``); a single quote is literal there. A word with a
-    ``$`` or a control character has no literal spelling in an ``ExecStart`` line (systemd
-    expands ``$VAR``/``${VAR}`` and refuses control characters), so it is refused here
-    rather than printing a line systemd would expand or reject. A word that needs nothing
-    comes back unchanged, so the printed line stays readable.
+    the program (kittrial-5bb.220 F4). A ``%`` begins a specifier, so it is doubled (``%%``)
+    inside the quotes. A word holding a ``$``, a quote, a backslash or a control, format or
+    line-separator character has no literal spelling in an ``ExecStart`` line, so it is
+    refused here (naming the path) rather than printing a line systemd would expand or
+    reject (kittrial-5bb.220 review 2 item 2b). A word that needs nothing comes back
+    unchanged, so the printed line stays readable.
     """
     value=str(word)
     if not value:
         return '""'
-    if any(ch=='$' or ord(ch)<0x20 for ch in value):
-        raise ValueError('A systemd ExecStart line cannot name this path literally')
-    if any(ch.isspace() or ch in '"\\%\'' for ch in value):
-        return '"%s"'%value.replace('\\','\\\\').replace('"','\\"').replace('%','%%')
+    if any(unit_unspellable(ch) for ch in value):
+        raise ValueError('no systemd ExecStart line can name the path "%s" literally: it holds a $, a quote, a '
+                         'backslash or a control character systemd refuses or expands'%value)
+    if any(ch.isspace() or ch=='%' for ch in value):
+        return '"%s"'%value.replace('%','%%')
     return value
 
 def scheduled_backup_execstart(root):
@@ -2211,13 +2222,17 @@ def project_setup_status(root,name,path=None):
     else:scheduled='not-covered'
     try:
         line=scheduled_backup_execstart(root)
-    except ValueError:
+        line_reason=None
+    except ValueError as error:
+        # The path systemd cannot name, in one sentence, so the page can say why it shows no line
+        # (kittrial-5bb.220 review 2 item 2a).
         line=None
+        line_reason=str(error)
     backup={'scheduled':scheduled,
             'elsewhere':(note['note'] if note else None),
             'elsewhere_at':(note['recorded_at'] if note else None),
             'elsewhere_by':(note['recorded_by'] if note else None),
-            'line':line,'last_run':None,
+            'line':line,'line_reason':line_reason,'last_run':None,
             # What can be pasted into a shell, beside the unit-file line that cannot (kittrial-5bb.200).
             'run_now':backup_now_command(root),
             'check':host_command(root,'backup-status','--require-complete')}
@@ -2286,8 +2301,17 @@ def scheduled_backup_coverage(root,name):
     enables a unit.
     """
     directory=scheduled_backup_unit_dir()
-    line=scheduled_backup_execstart(root)
-    both=schedule_text(root)
+    try:
+        line=scheduled_backup_execstart(root)
+        both=schedule_text(root)
+    except ValueError as error:
+        # A path systemd cannot name must not cut the whole report short (kittrial-5bb.220 review 2
+        # item 2a): say so once, and print everything else.
+        line=None
+        both=('No line for a schedule can be printed for this installation: %s. Install the schedule by hand, or '
+              'move the installation to a path systemd can name.'%error)
+    # Where the unit-file line would be shown, or nothing when there is none to print.
+    suggest=('\n  %s'%line) if line else ''
     dropins=(f'Systemd drop-ins ({directory}/*.service.d/*.conf) are not inspected, so this reports the unit '
              f'files themselves.')
     # A unit file is not a schedule: an enabled timer must run it (kittrial-5bb.220 F4).
@@ -2346,7 +2370,7 @@ def scheduled_backup_coverage(root,name):
                           f'named projects with --all in one command.')
             else:
                 message+=(f' Replace that project list with the durable form (do not combine named projects with '
-                          f'--all in one command); it is a line of the unit file, not a shell command:\n  {line}')
+                          f'--all in one command); it is a line of the unit file, not a shell command:{suggest}')
             if not covers_with_timer:
                 message+=(f' No enabled beads-*backup*.timer runs them, so they will not run; install and enable '
                           f'a timer for one, or record that backups are scheduled elsewhere.')
@@ -2364,7 +2388,7 @@ def scheduled_backup_coverage(root,name):
                           f'projects with --all in one command.')
         else:
             message+=(f' Add {name} there, or replace the project list with the durable form (do not combine named '
-                      f'projects with --all in one command); it is a line of the unit file, not a shell command:\n  {line}')
+                      f'projects with --all in one command); it is a line of the unit file, not a shell command:{suggest}')
         return False,message+note+' '+dropins
     details=[]
     if foreign:details.append('these units do not back up this runtime: '+', '.join(foreign))
@@ -3865,13 +3889,53 @@ BACKUP_SCHEDULE_NOTE_NAME='backup-schedule-note.json'
 #: The note is one short line of operator text, so a file much bigger than this is not read.
 BACKUP_SCHEDULE_NOTE_MAX=300
 BACKUP_SCHEDULE_NOTE_FILE_MAX=4096
+#: Every set and clear is appended (who, when, which) to this bounded log beside the note
+#: (kittrial-5bb.220 review 2 item 4a): the note itself is only the current statement.
+BACKUP_SCHEDULE_LOG_NAME='backup-schedule-log.jsonl'
+BACKUP_SCHEDULE_LOG_MAX=100
+
+def backup_schedule_log(root):
+    """The recorded set and clear history, oldest first, as a read-only list of entries."""
+    path=root/'backups'/BACKUP_SCHEDULE_LOG_NAME
+    if path.is_symlink() or not path.is_file():return []
+    try:lines=path.read_text(encoding='utf-8').splitlines()
+    except OSError:return []
+    entries=[]
+    for line in lines[-BACKUP_SCHEDULE_LOG_MAX:]:
+        if not line.strip():continue
+        try:entry=record_json.loads(line)
+        except ValueError:continue
+        if isinstance(entry,dict):entries.append(entry)
+    return entries
+
+def _append_backup_schedule_log(root,entry):
+    """Append one set or clear line, keeping only the newest ``BACKUP_SCHEDULE_LOG_MAX``.
+
+    A convenience log, never a gate: a log that cannot be written does not fail the command
+    that recorded the note.
+    """
+    backups=root/'backups'
+    if backups.is_symlink() or not backups.is_dir():return
+    path=backups/BACKUP_SCHEDULE_LOG_NAME
+    if path.is_symlink():return
+    lines=[]
+    try:
+        if path.is_file():lines=[line for line in path.read_text(encoding='utf-8').splitlines() if line.strip()]
+    except OSError:
+        lines=[]
+    lines.append(json.dumps(entry,sort_keys=True,ensure_ascii=True))
+    try:atomic_private_write(path,'\n'.join(lines[-BACKUP_SCHEDULE_LOG_MAX:])+'\n')
+    except (OSError,ValueError):pass
 
 def read_backup_schedule_note(root):
     """The recorded statement that backups are scheduled elsewhere, or None.
 
     The statement is an explicit, attributed record written by an operator (never an
     inference from the age of the last run, which a manual or one-off run would fake).
-    An unreadable, oversized or malformed note reads as None: it is a lead, never a fact.
+    ``note``, ``recorded_by`` and ``recorded_at`` must each be a string of the expected
+    shape: an unreadable, oversized or malformed note, or a hand-made one with a wrong
+    type, reads as None, so one bad file can never take the whole set-up page down
+    (kittrial-5bb.220 review 2 item 3).
     """
     path=root/'backups'/BACKUP_SCHEDULE_NOTE_NAME
     if path.is_symlink() or not path.is_file():return None
@@ -3880,17 +3944,23 @@ def read_backup_schedule_note(root):
         record=record_json.loads(path.read_text(encoding='utf-8'))
     except (OSError,ValueError):return None
     if not isinstance(record,dict) or record.get('schema_version')!=1:return None
-    note=record.get('note')
+    note,by,at=record.get('note'),record.get('recorded_by'),record.get('recorded_at')
     if not isinstance(note,str) or not note.strip():return None
-    return {'note':note.strip(),'recorded_at':record.get('recorded_at'),'recorded_by':record.get('recorded_by')}
+    if not isinstance(by,str) or not by.strip():return None
+    if not isinstance(at,str) or not utc_timestamp(at):return None
+    return {'note':note.strip(),'recorded_at':at,'recorded_by':by.strip()}
 
 def write_backup_schedule_note(root,note,actor):
-    """Record the operator's statement that backups are scheduled elsewhere."""
+    """Record the operator's statement that backups are scheduled elsewhere, and log the set."""
     from coordination import atomic
     note=(note or '').strip()
     if not note:raise ValueError('The note must be non-empty text')
-    if '\n' in note or '\r' in note or len(note)>BACKUP_SCHEDULE_NOTE_MAX:
+    if any(ch in '\n\r' for ch in note) or len(note)>BACKUP_SCHEDULE_NOTE_MAX:
         raise ValueError('The note must be one line of at most %d characters'%BACKUP_SCHEDULE_NOTE_MAX)
+    # A control, format or line-separator character would be invisible or reorder the page, so it
+    # is refused as a newline is (kittrial-5bb.220 review 2 item 3).
+    if any(unicodedata.category(ch) in ('Cc','Cf','Zl','Zp') for ch in note):
+        raise ValueError('The note must not contain control or format characters')
     actor=(actor or '').strip()
     if not actor:raise ValueError('Name the operator recording it with --actor')
     backups=root/'backups'
@@ -3898,16 +3968,21 @@ def write_backup_schedule_note(root,note,actor):
         raise ValueError('The backups directory does not exist under this root; prepare the runtime first')
     record={'schema_version':1,'note':note,'recorded_at':utc_stamp(),'recorded_by':actor}
     atomic(backups/BACKUP_SCHEDULE_NOTE_NAME,record)
+    _append_backup_schedule_log(root,{'at':record['recorded_at'],'by':actor,'action':'set'})
     return record
 
-def clear_backup_schedule_note(root):
-    """Remove the recorded statement that backups are scheduled elsewhere; True if one was removed."""
+def clear_backup_schedule_note(root,actor=None):
+    """Remove the recorded statement; True if one was removed. The clear is logged too."""
     path=root/'backups'/BACKUP_SCHEDULE_NOTE_NAME
     if path.is_symlink():raise ValueError('Backup schedule note must not be a symlink')
+    removed=False
     if path.is_file():
-        path.unlink();return True
-    if path.exists():raise ValueError('Backup schedule note is not a file')
-    return False
+        path.unlink();removed=True
+    elif path.exists():
+        raise ValueError('Backup schedule note is not a file')
+    if removed and isinstance(actor,str) and actor.strip():
+        _append_backup_schedule_log(root,{'at':utc_stamp(),'by':actor.strip(),'action':'clear'})
+    return removed
 
 def degraded_projects(root,record):
     """``[(name, message)]``: the projects the last run recorded complete but degraded.
@@ -7378,7 +7453,7 @@ def main():
         require_configured_operator(args.actor,operators(root,strict=True),'record a backup schedule note')
         if args.clear:
             if args.note:raise ValueError('backup-schedule --clear takes no --note')
-            print('Removed the recorded backup schedule note.' if clear_backup_schedule_note(root)
+            print('Removed the recorded backup schedule note.' if clear_backup_schedule_note(root,args.actor)
                   else 'No backup schedule note was recorded.')
         else:
             if not args.note:raise ValueError('backup-schedule needs --note TEXT, or --clear to remove it')
