@@ -548,17 +548,23 @@ class EndpointSingleDispatchTests(_EndpointRootMixin, unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertFalse(self.out(result)['reconciled'])
         # The endpoint resolves the operator allowlist and the project journal for
-        # the release revert rule (kittrial-5bb.107 item 2) and passes both down.
-        self.assertEqual(set(passed), {'operators', 'journal'})
+        # the release revert rule (kittrial-5bb.107 item 2) and passes both down; since
+        # kittrial-5bb.197 it also passes the lifecycle_authors rule and the list the
+        # transport reports its warnings in.
+        self.assertEqual(set(passed), {'operators', 'journal', 'lifecycle_authors', 'warnings'})
         self.assertEqual(passed['journal'], self.root / 'projects' / 'pp')
+        self.assertIs(passed['lifecycle_authors'], False)   # this installation configures nothing
+        self.assertEqual(passed['warnings'], [])
 
     def test_coordinate_dispatches_exactly_once(self):
         import coordination
         counts = {}
+        settings = {}
 
-        def apply(payload, actor, run, path):
+        def apply(payload, actor, run, path, **kwargs):
             operation = payload.get('operation')
             counts[operation] = counts.get(operation, 0) + 1
+            settings.update(kwargs)
             if operation == 'merge-release':
                 return {'released': counts[operation] == 1}
             return {'reconciled': counts[operation] > 1}
@@ -571,6 +577,10 @@ class EndpointSingleDispatchTests(_EndpointRootMixin, unittest.TestCase):
         self.assertEqual(counts, {'merge-release': 1, 'merge-acquire': 1})
         self.assertTrue(release['released'])
         self.assertFalse(acquire['reconciled'])
+        # kittrial-5bb.197: the merge slot is judged against the operator allowlist and
+        # the coordinator_writes rule, which is OFF on an installation that configures nothing.
+        self.assertIn('operators', settings)
+        self.assertIs(settings.get('coordinator_writes'), False)
 
     def test_requirement_dispatches_exactly_once_not_lifecycle(self):
         import requirement_records
