@@ -126,6 +126,7 @@ class OwnerEvidenceTests(unittest.TestCase):
         healthy = copy.deepcopy(self.native.rows)
         marker = {'id': 'deep-row', 'malformed': True}
         def membership(args):
+            self.assertNotIn('--type', args, 'Requirements use native task labels, not unsupported issue types')
             if args[0] == 'list':
                 return json.dumps([{'id': 'deep-row'}] if '--label' in args and args[args.index('--label')+1]=='requirement' else [])
             return self.native(args)

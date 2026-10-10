@@ -356,11 +356,14 @@ def read(project_path, project, args, run, operators=None):
     if len(args) != (2 if args[0] == 'get' else 1):
         raise ValueError('Unexpected requirements read argument')
     labels = ['requirement', 'brd-section']
-    rows = record_json.classify(records.read_rows(run), run, labels, types=labels)
+    # Requirements are native tasks carrying these labels. The pinned native
+    # tracker has no requirement/brd-section issue types, so its unreadable-row
+    # membership probes must use the supported label filters.
+    rows = record_json.classify(records.read_rows(run), run, labels)
     items, decisions = [], []
     for row in rows:
         if not (records.TYPE_LABELS.intersection(row.get('labels') or [])
-                or row.get('issue_type') in labels or record_json.selected(row, labels, labels)):
+                or row.get('issue_type') in labels or record_json.selected(row, labels)):
             continue
         try:
             if row.get('malformed'):
