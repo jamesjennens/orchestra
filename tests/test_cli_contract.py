@@ -147,7 +147,8 @@ class WorkHelpContractTests(unittest.TestCase):
         result = work.queue(rows(), 'alice/session', ['--mine'])
         self.assertEqual(set(result), {'owner', 'total', 'items', 'next_offset', 'coverage'})
         self.assertEqual(result['total'], 1)
-        self.assertEqual(set(result['items'][0]), ITEM_FIELDS)
+        # Every existing field remains; owned authored wait context is additive.
+        self.assertEqual(set(result['items'][0]), ITEM_FIELDS | {'checkpoint_wait'})
 
     def test_brief_shape_is_backward_compatible(self):
         result = briefing.brief(rows(), PROJECT, TASK)
