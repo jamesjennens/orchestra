@@ -61,7 +61,7 @@ def load_export(source):
     try:text=path.read_text(encoding='utf-8-sig')
     except OSError as e:raise ValueError(f'cannot read export {path}: {e}') from None
     rows=[]
-    for number,line in enumerate(text.splitlines(),1):
+    for number,line in enumerate(text.split('\n'),1):
         if not line.strip():continue
         try:row=json.loads(line)
         except (json.JSONDecodeError, RecursionError, ValueError) as e:raise ValueError(f'{path}: line {number} is not valid JSON ({getattr(e, "msg", str(e))})') from None

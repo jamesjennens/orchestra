@@ -70,7 +70,7 @@ def said(returncode, stdout, stderr):
                 or not isinstance(answer['error'], str):
             return None
         return answer['error'].strip() or None
-    errors = [line for line in stderr.splitlines() if line.startswith('Error')]
+    errors = [line for line in stderr.split('\n') if line.startswith('Error')]
     if len(errors) != 1:
         return None
     found = ERROR_LINE.match(errors[0].rstrip())
