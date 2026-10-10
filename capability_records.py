@@ -278,15 +278,22 @@ def check_requirements(links, run):
         return
     from requirement_records import existing_revisions as requirement_revisions
     known = {}
+    active = set()
     for row in read_labelled(run, 'requirement'):
         try:
+            keys = set()
             for revision, record in requirement_revisions(row).items():
                 if record.get('key'):
                     known.setdefault(record['key'], set()).add(revision)
+                    keys.add(record['key'])
+            from requirement_owner_records import state_ledger
+            if state_ledger(row)[0] is None:
+                active.update(keys)
         except ValueError:
             continue   # a malformed requirement record cannot be linked
     bad = [link['key'] for link in links
-           if link['key'] not in known or ('revision' in link and link['revision'] not in known[link['key']])]
+           if link['key'] not in known or ('revision' in link and link['revision'] not in known[link['key']])
+           or ('revision' not in link and link['key'] not in active)]
     if bad:
         raise ValueError('Unknown requirement link(s) %s: each must name an existing requirement record key (and '
                          'revision, when given)' % ', '.join(bad))
