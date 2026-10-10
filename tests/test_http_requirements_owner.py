@@ -80,6 +80,130 @@ class OwnerHttpTests(EndpointCase):
     def expected(item):
         return dict(expected_revision=item['revision'], expected_sha256=item['sha256'])
 
+    def failed_creation(self, key='failed-create'):
+        self.backend.native.create_outcome = 'fail-after-preflight'
+        fields = dict(kind='requirement', parent='job-1', title='Failed intent', description='No row yet.')
+        failed = self.request('POST', self.base + '/requirements', fields, token=self.owner_token, key=key)
+        self.backend.native.create_outcome = 'ok'
+        self.assertEqual(failed.status, 503, failed.data)
+        listing = self.request('GET', self.base + '/requirements/recoveries', token=self.owner_token)
+        self.assertEqual(listing.status, 200, listing.data)
+        return fields, listing.data['items'][0]
+
+    @staticmethod
+    def recovery_body(item):
+        return dict(original_operation_id=item['operation_id'],
+                    expected_receipt_sha256=item['expected_receipt_sha256'], reason='No requirement was written.')
+
+    def test_clear_empty_failed_creation_retains_audit_and_requires_new_intent(self):
+        import admin
+        from requirements import content_hash
+        fields, item = self.failed_creation()
+        self.assertTrue(item['can_clear'], item)
+        before = len(self.backend.native.writes())
+        body = self.recovery_body(item)
+        cleared = self.request('POST', self.base + '/requirements/recoveries/clear', body,
+                               token=self.owner_token, key='clear-empty')
+        self.assertEqual(cleared.status, 200, cleared.data)
+        self.assertTrue(cleared.data['released'])
+        self.assertEqual(len(self.backend.native.writes()), before)
+        path = self.path / requirements.JOURNAL / (content_hash({'operation_id': item['operation_id']}) + '.json')
+        receipt = json.loads(path.read_text())
+        self.assertEqual(receipt['status'], 'released')
+        self.assertEqual(receipt['release_history'], [cleared.data['audit']])
+        admin.validate_coordination_files({requirements.JOURNAL + '/' + path.name: receipt})
+        new_token = self.login('alex', 'alex-password-1')[0]
+        repeated = self.request('POST', self.base + '/requirements/recoveries/clear', body,
+                                token=new_token, key='clear-empty')
+        self.assertEqual(repeated.data, cleared.data)
+        old = self.request('POST', self.base + '/requirements', fields, token=new_token, key='failed-create')
+        self.assertEqual(old.status, 422, old.data)
+        self.assertEqual(len(self.backend.native.writes()), before)
+        # Even after the outer journal's retention window, the inner terminal
+        # receipt cannot become the generic core's reusable released reservation.
+        context = requirements.OwnerContext(self.project, self.account, governance.current(self.path, self.project))
+        with self.assertRaisesRegex(ValueError, 'Start a new creation'):
+            requirements.apply(self.path, context, 'create', fields, item['operation_id'], self.backend.native)
+        self.assertEqual(len(self.backend.native.writes()), before)
+        self.assertEqual(self.request('GET', self.base + '/requirements/recoveries',
+                                     token=new_token).data['items'], [])
+        changed = self.request('POST', self.base + '/requirements/recoveries/clear',
+            dict(body, reason='Changed reason'), token=new_token, key='clear-changed')
+        self.assertEqual(changed.status, 422, changed.data)
+        self.assertEqual(self.request('POST', self.base + '/requirements', fields,
+                                     token=new_token, key='new-creation').status, 201)
+
+    def test_allocated_even_empty_native_row_refuses_owner_clear_with_next_action(self):
+        fields = dict(kind='requirement', parent='job-1', title='Allocated', description='No comment.')
+        self.backend.native.fail_comment_prefix = records.REVISION_PREFIX
+        failed = self.request('POST', self.base + '/requirements', fields, token=self.owner_token, key='allocated')
+        self.assertEqual(failed.status, 503, failed.data)
+        self.backend.native.fail_comment_prefix = None
+        listing = self.request('GET', self.base + '/requirements/recoveries', token=self.owner_token)
+        item = listing.data['items'][0]
+        self.assertFalse(item['can_clear'])
+        self.assertIn('Retry the original creation', item['message'])
+        self.assertIn('host operator', item['message'])
+        before = len(self.backend.native.writes())
+        refused = self.request('POST', self.base + '/requirements/recoveries/clear',
+                               self.recovery_body(item), token=self.owner_token, key='clear-allocated')
+        self.assertEqual(refused.status, 422, refused.data)
+        self.assertEqual(len(self.backend.native.writes()), before)
+        retried = self.request('POST', self.base + '/requirements', fields, token=self.owner_token, key='allocated')
+        self.assertEqual(retried.status, 201, retried.data)
+        self.assertEqual(sum('requirement' in row['labels'] for row in self.backend.native.rows), 1)
+
+    def test_recovery_rechecks_current_owner_and_original_account(self):
+        _, item = self.failed_creation()
+        admin = self.admin_token()
+        other_id = self.create_account(admin, 'other', 'other-password-1')
+        token = self.login('other', 'other-password-1')[0]
+        self.assertEqual(self.request('PUT', self.base + '/members/' + other_id,
+                                     {'role': 'owner'}, token=admin).status, 200)
+        self.assertEqual(self.request('GET', self.base + '/requirements/recoveries', token=token).data['items'], [])
+        body = self.recovery_body(item)
+        before = len(self.backend.native.writes())
+        self.assertEqual(self.request('POST', self.base + '/requirements/recoveries/clear', body,
+                                     token=token, key='foreign-clear').status, 422)
+        admin_id = self.service.authenticate(admin).user_id
+        self.service.state['memberships'][self.project].pop(admin_id)
+        self.service.store.save()
+        self.assertEqual(self.request('GET', self.base + '/requirements/recoveries', token=admin).status, 403)
+        self.assertEqual(self.request('POST', self.base + '/requirements/recoveries/clear', body,
+                                     token=admin, key='superuser-clear').status, 403)
+        def demote():
+            self.service.state['memberships'][self.project][self.account] = 'contributor'
+            self.service.store.save()
+        self.backend.before_owner = demote
+        refused = self.request('POST', self.base + '/requirements/recoveries/clear', body,
+                               token=self.owner_token, key='demoted-clear')
+        self.assertIn(refused.status, (403, 422), refused.data)
+        self.assertEqual(len(self.backend.native.writes()), before)
+
+    def test_interrupted_release_reuses_audit_without_releasing_a_second_intent(self):
+        from http_authority import OperationJournal
+        _, item = self.failed_creation()
+        complete = OperationJournal.complete
+        def fail_original(journal, operation_id, *args):
+            if operation_id == item['operation_id']:
+                raise OSError('Synthetic interruption after release audit')
+            return complete(journal, operation_id, *args)
+        body = self.recovery_body(item)
+        with mock.patch.object(OperationJournal, 'complete', fail_original):
+            failed = self.request('POST', self.base + '/requirements/recoveries/clear', body,
+                                  token=self.owner_token, key='interrupted-clear')
+        self.assertEqual(failed.status, 503, failed.data)
+        pending = self.request('GET', self.base + '/requirements/recoveries', token=self.owner_token).data['items'][0]
+        self.assertTrue(pending['can_clear'])
+        self.assertEqual(pending['reason'], body['reason'])
+        self.assertEqual(pending['expected_receipt_sha256'], body['expected_receipt_sha256'])
+        recovered = self.request('POST', self.base + '/requirements/recoveries/clear', body,
+                                 token=self.owner_token, key='interrupted-clear')
+        self.assertEqual(recovered.status, 200, recovered.data)
+        repeated = self.request('POST', self.base + '/requirements/recoveries/clear', body,
+                                token=self.owner_token, key='interrupted-clear')
+        self.assertEqual(repeated.data, recovered.data)
+
     def test_owner_create_accept_edit_and_member_read_only_document(self):
         first = self.create_requirement()
         route = self.base + '/requirements/' + first['id']
@@ -228,20 +352,44 @@ class OwnerHttpTests(EndpointCase):
 
     def test_new_login_recovers_the_same_account_unknown_acceptance(self):
         first = self.create_requirement(); route = self.base+'/requirements/'+first['id']+'/accept'
-        self.backend.native.fail_comment_prefix = records.REVISION_PREFIX
+        self.backend.native.fail_comment_prefix = owner_records.ACCEPTANCE_PREFIX
         failed = self.request('POST', route, self.expected(first), token=self.owner_token, key='new-login-recovery')
         self.assertEqual(failed.status, 503, failed.data)
+        decision = next(row for row in self.backend.native.rows if row['issue_type'] == 'decision')
+        self.backend.native.seed('duplicate-decision-label', issue_type='decision', labels=decision['labels'])
+        decision.update(title='Retitled by contributor', description='Reworded', created_by='alice', labels=[])
         new_token = self.login('alex', 'alex-password-1')[0]
         self.assertNotEqual(new_token, self.owner_token)
         self.backend.native.fail_comment_prefix = None
         recovered = self.request('POST', route, self.expected(first), token=new_token, key='new-login-recovery')
         self.assertEqual(recovered.status, 200, recovered.data)
-        self.assertEqual(sum(r['issue_type']=='decision' for r in self.backend.native.rows), 1)
+        self.assertEqual(sum(r['issue_type']=='decision' for r in self.backend.native.rows), 2)
+        evidence = next(iter(owner_records.existing_acceptances(self.backend.native.row(first['id'])).values()))
+        self.assertEqual(evidence['decision']['decision_id'], decision['id'])
         self.assertEqual(len(owner_records.existing_acceptances(self.backend.native.row(first['id']))), 1)
         before = len(self.backend.native.writes())
         self.assertEqual(self.request('POST', route, self.expected(first), token=new_token,
                                      key='new-login-recovery').data, recovered.data)
         self.assertEqual(len(self.backend.native.writes()), before)
+
+    def test_future_governance_warning_preserves_owner_http_reads_and_writes(self):
+        from requirements import content_hash
+        path = self.path / governance.FILE
+        history = json.loads(path.read_text())
+        history['revisions'][0]['at'] = '2999-01-01T00:00:00Z'
+        history['revisions'][0]['sha256'] = content_hash(history['revisions'][0])
+        path.write_text(json.dumps(history))
+        before = path.read_bytes()
+        current = self.request('GET', self.base + '/requirements/governance', token=self.owner_token)
+        self.assertEqual(current.status, 200, current.data)
+        self.assertEqual(current.data['warnings'][0]['revision'], 1)
+        first = self.create_requirement()
+        accepted = self.request('POST', self.base + '/requirements/' + first['id'] + '/accept',
+                                self.expected(first), token=self.owner_token, key='future-history-accept')
+        self.assertEqual(accepted.status, 200, accepted.data)
+        self.assertEqual(self.request('GET', self.base + '/requirements/' + first['id'],
+                                     token=self.owner_token).status, 200)
+        self.assertEqual(path.read_bytes(), before)
 
     def test_keyless_edits_are_distinct_requests_and_latest_acceptance_is_noop(self):
         first = self.create_requirement(); route = self.base+'/requirements/'+first['id']
@@ -256,6 +404,48 @@ class OwnerHttpTests(EndpointCase):
         self.assertEqual(repeated.status, 200, repeated.data)
         self.assertEqual(repeated.data['sha256'], accepted.data['sha256'])
         self.assertEqual(len(self.backend.native.writes()), before)
+
+    def test_lost_committed_owner_answer_replays_in_same_and_new_session(self):
+        from http_service import UncertainOutcome
+        from http_service import SERVER_TIME_HEADER
+        for new_session in (False, True):
+            with self.subTest(new_session=new_session):
+                payload = dict(kind='requirement', parent='job-1', title='Owner intent',
+                               description='Preserve this original committed answer.')
+                key = 'lost-owner-answer-' + str(new_session)
+                original = self.backend._endpoint
+                committed = []
+                def lose_answer(action, *args, **kwargs):
+                    answer = original(action, *args, **kwargs)
+                    if action == 'owner-requirements':
+                        committed.append(answer)
+                        raise UncertainOutcome('synthetic answer loss after commit')
+                    return answer
+                self.backend._endpoint = lose_answer
+                try:
+                    lost = self.request('POST', self.base+'/requirements', payload,
+                                        token=self.owner_token, key=key)
+                finally:
+                    self.backend._endpoint = original
+                self.assertEqual(lost.status, 503, lost.data)
+                self.assertEqual(committed[0]['returncode'], 0, committed)
+                before = len(self.backend.native.writes())
+                receipt_before = journal_path(self.path).read_bytes()
+                token = self.login('alex', 'alex-password-1')[0] if new_session else self.owner_token
+                replay = self.request('POST', self.base+'/requirements', payload, token=token, key=key)
+                self.assertEqual(replay.status, 201, replay.data)
+                original_data = json.loads(committed[0]['stdout'])
+                for name, value in original_data.items():
+                    self.assertEqual(replay.data[name], value)
+                self.assertEqual(replay.headers[SERVER_TIME_HEADER.lower()], committed[0]['server_time'])
+                self.assertEqual(len(self.backend.native.writes()), before)
+                self.assertEqual(journal_path(self.path).read_bytes(), receipt_before)
+                self.assertEqual(self.request('POST', self.base+'/requirements', payload,
+                                             token=token, key=key).data, replay.data)
+                changed = self.request('POST', self.base+'/requirements',
+                                       dict(payload, title='Different request'), token=token, key=key)
+                self.assertEqual(changed.status, 409, changed.data)
+                self.assertEqual(len(self.backend.native.writes()), before)
 
     def test_owner_is_checked_inside_effect_with_authority_lock_held(self):
         import contextlib
@@ -336,7 +526,7 @@ class OwnerHttpTests(EndpointCase):
         self.assertEqual(len(self.backend.native.writes()), before)
         self.assertEqual(set(records.existing_revisions(row)), {1})
 
-    def test_deep_decision_receipt_keeps_draft_and_recovers_without_duplicate(self):
+    def test_lost_deep_decision_id_keeps_draft_and_unknown_without_regeneration(self):
         import record_json
         first = self.create_requirement()
         route = self.base + '/requirements/' + first['id'] + '/accept'
@@ -359,11 +549,14 @@ class OwnerHttpTests(EndpointCase):
         self.assertEqual(set(records.existing_revisions(row)), {1})
         self.assertFalse(owner_records.existing_acceptances(row))
         self.assertEqual(sum(r['issue_type'] == 'decision' for r in self.backend.native.rows), 1)
+        before = len(self.backend.native.writes())
         recovered = self.request('POST', route, self.expected(first),
                                  token=self.owner_token, key='deep-decision-receipt')
-        self.assertEqual(recovered.status, 200, recovered.data)
-        self.assertEqual(set(records.existing_revisions(row)), {1, 2})
-        self.assertEqual(len(owner_records.existing_acceptances(row)), 1)
+        self.assertEqual(recovered.status, 422, recovered.data)
+        self.assertIn('no recorded decision binding', str(recovered.data))
+        self.assertEqual(set(records.existing_revisions(row)), {1})
+        self.assertFalse(owner_records.existing_acceptances(row))
+        self.assertEqual(len(self.backend.native.writes()), before)
         self.assertEqual(sum(r['issue_type'] == 'decision' for r in self.backend.native.rows), 1)
 
     def test_closed_fields_and_idempotency_conflict_do_not_write(self):
@@ -388,6 +581,8 @@ class OwnerHttpTests(EndpointCase):
         node = shutil.which('node')
         if not node:
             self.skipTest('Node.js is required for page behavior checks')
+        self.backend.native.seed('task-2', title='Another task', issue_type='task')
+        self.failed_creation('page-failed-creation')
         admin = self.admin_token()
         user = self.create_account(admin, 'viewer', 'viewer-password-1')
         viewer = self.login('viewer', 'viewer-password-1')[0]

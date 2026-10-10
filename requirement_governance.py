@@ -5,7 +5,7 @@ belongs to the service adapter; neither this file nor its absence grants rights.
 """
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from coordination import atomic, identifier
@@ -119,12 +119,12 @@ def validate_source(binding, governance):
 
 def validate_files(files, project=None):
     record, binding = files.get(FILE), files.get(SOURCE_FILE)
-    if record is None:
-        if binding is not None:
+    if FILE not in files:
+        if SOURCE_FILE in files:
             raise ValueError('Requirements governance restore binding has no history')
         return
     validate(record)
-    if binding is not None:
+    if SOURCE_FILE in files:
         validate_source(binding, record)
     identity = binding['project'] if binding is not None else record['project']
     if project is not None and identity != project:
@@ -146,7 +146,7 @@ def snapshot(directory, project):
             try:
                 files[name] = load_json(path)
             except (ValueError, OSError):
-                raise ValueError('Requirements governance cannot be read; ask the project owner to reconcile it') from None
+                raise ValueError('Requirements governance cannot be read; ask the host operator to repair it') from None
     validate_files(files, project)
     return files
 
@@ -157,6 +157,36 @@ def current(directory, project):
         return {'revision': 0, 'sha256': None, 'mode': 'governed'}
     entry = files[FILE]['revisions'][-1]
     return {name: entry[name] for name in ('revision', 'sha256', 'mode')}
+
+
+def read_state(directory, project, comparison_time=None):
+    """Project governance with clock diagnostics, never an authority decision.
+
+    Revisions and hashes order the history. A restored history can legitimately
+    be ahead of this host's clock; report it without changing or refusing it.
+    """
+    from http_authority import JOURNAL_MAX_SKEW_SECONDS
+    files = snapshot(directory, project)
+    if FILE not in files:
+        return {'revision': 0, 'sha256': None, 'mode': 'governed'}
+    entries = files[FILE]['revisions']
+    result = {name: entries[-1][name] for name in ('revision', 'sha256', 'mode')}
+    comparison = time.time() if comparison_time is None else comparison_time
+    warnings = []
+    count = 0
+    for entry in entries:
+        timestamp = datetime.strptime(entry['at'], '%Y-%m-%dT%H:%M:%SZ').replace(
+            tzinfo=timezone.utc).timestamp()
+        if timestamp - comparison > JOURNAL_MAX_SKEW_SECONDS:
+            count += 1
+            if len(warnings) < 8:
+                warnings.append({'revision': entry['revision'],
+                                 'message': 'Governance revision %d is ahead of the host clock; '
+                                            'ask the host operator to check the clock and history.'
+                                            % entry['revision']})
+    if warnings:
+        result.update(warnings=warnings, warnings_truncated=count > len(warnings))
+    return result
 
 
 def validate_evidence(directory, project, evidence):

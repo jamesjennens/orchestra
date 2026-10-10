@@ -163,6 +163,8 @@ export function createApi(transport) {
     createRequirement: (pid, body) => mutate('POST', `/v1/projects/${pid}/requirements`, body),
     reviseRequirement: (pid, rid, body) => mutate('PATCH', `/v1/projects/${pid}/requirements/${rid}`, body),
     acceptRequirement: (pid, rid, body) => mutate('POST', `/v1/projects/${pid}/requirements/${rid}/accept`, body),
+    requirementRecoveries: (pid) => call('GET', `/v1/projects/${pid}/requirements/recoveries`),
+    clearRequirementCreation: (pid, body) => mutate('POST', `/v1/projects/${pid}/requirements/recoveries/clear`, body),
     setRequirementsGovernance: (pid, body) => mutate('PUT', `/v1/projects/${pid}/requirements/governance`, body),
     decisions: (pid) => call('GET', `/v1/projects/${pid}/decisions`),
     record: (pid, id) => call('GET', `/v1/projects/${pid}/records/${id}`),

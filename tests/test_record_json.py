@@ -204,6 +204,11 @@ class NoUnguardedParseTests(unittest.TestCase):
         'coordination.py': (7, 'bd output'),
         'endpoint.py': (5, 'bd output, and the project\'s .beads/metadata.json whose Dolt server coordinates '
                            'guard bd (kittrial-5bb.202 rev-3 item 2; the file is the host\'s own)'),
+        'export_requirements.py': (3, 'offline native export rows are first parsed through the row guard '
+                                  '(750 levels), then reparsed with duplicate-field refusal; syntax checking '
+                                  'of a malformed row runs only within the same bound and catches parser '
+                                  'recursion; the iterative identity scanner parses single string literals '
+                                  'only. Reserved revision comments still use the 64-level record guard'),
         'handoff.py': (15, 'bd output and the request, receipt and recovery files the kit writes'),
         'http_auth.py': (3, "the service's own store"),
         'http_authority.py': (3, "the service's own store and journal"),
@@ -231,7 +236,7 @@ class NoUnguardedParseTests(unittest.TestCase):
         'worker_gate.py': (1, "the endpoint's answer, on the caller's machine"),
     }
     # Files that parse text somebody else wrote, and have no bare json.loads at all.
-    GUARDED_ONLY = ('capability_records.py', 'capability_verification.py', 'export_requirements.py', 'feedback.py', 'guidance.py', 'keyed_entries.py', 'recovery.py', 'reserved_comments.py')
+    GUARDED_ONLY = ('capability_records.py', 'capability_verification.py', 'feedback.py', 'guidance.py', 'keyed_entries.py', 'recovery.py', 'reserved_comments.py')
 
     def bare(self, path):
         return len(re.findall(r'(?<![A-Za-z_.])json\.loads\(', path.read_text(encoding='utf-8')))

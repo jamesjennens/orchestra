@@ -1988,6 +1988,12 @@ class EndpointBackend:
                 raise conflict('Requirements changed. Reload and try again.')
         return self._checked(reply)
 
+    def owner_requirement_recoveries(self, principal, project_id):
+        authority=authority_request(principal,project_id,CAP_PROJECT_ADMIN,now=self.service._expiry_now())
+        reply=self._endpoint('owner-requirements',project_id,principal.user_id,['recoveries'],
+                             authority=authority,require_authority=True,route='requirements.recoveries')
+        return self._checked(reply,reading=True)
+
     def proposal_read(self, project_id, args, missing=False):
         """One read-only `proposal get|list|mine` through the endpoint (.58 slice 1b).
 
@@ -5690,6 +5696,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             'create':('kind','parent','title','description','key'),
             'revise':('expected_revision','expected_sha256','title','description'),
             'accept':('expected_revision','expected_sha256'),
+            'release':('original_operation_id','expected_receipt_sha256','reason'),
             'governance':('mode','expected_revision','expected_sha256')}[action],'Requirements')
         import requirement_http
         try: requirement_http.checked_body(fields,action)
@@ -5708,6 +5715,15 @@ class ApiHandler(BaseHTTPRequestHandler):
     def requirements_governance_read(self,ctx):
         self._requirements_backend(); self._project(ctx,CAP_READ)
         return 200,self.backend.requirements_read(ctx.params['pid'],['governance'])
+
+    @route('GET', r'/v1/projects/(?P<pid>'+ID+r')/requirements/recoveries')
+    def requirements_recoveries(self,ctx):
+        self._requirements_backend(); self._requirements_owner(ctx)
+        return 200,self.backend.owner_requirement_recoveries(ctx.principal,ctx.params['pid'])
+
+    @route('POST', r'/v1/projects/(?P<pid>'+ID+r')/requirements/recoveries/clear')
+    def requirements_clear_creation(self,ctx):
+        return self._requirements_write(ctx,'release')
 
     @route('PUT', r'/v1/projects/(?P<pid>'+ID+r')/requirements/governance')
     def requirements_governance_write(self,ctx):

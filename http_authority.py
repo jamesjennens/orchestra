@@ -1696,6 +1696,20 @@ class OperationJournal:
                                      (operation_id,)).fetchone()
         return self._row_record(row) if row is not None else None
 
+    def pending_owner_creates(self, principal):
+        """Bounded candidates for the owner adapter's empty-create recovery read.
+
+        This is only discovery. The adapter must validate the inner receipt and
+        prove native absence under its project and authority locks before release.
+        """
+        self._ensure_store()
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM operations WHERE principal = ? AND route = 'requirements.create' "
+                "AND state IN ('unknown', 'in_progress') ORDER BY operation_id LIMIT 21",
+                (principal,)).fetchall()
+        return [dict(self._row_record(row), operation_id=row['operation_id']) for row in rows]
+
     # -- mutations -------------------------------------------------------------
     def reserve(self, operation_id, request_hash, principal):
         """Reserve a new identity, compacting closed receipt windows first.
@@ -2207,7 +2221,7 @@ def run_guarded(request, journal_path, effect, authority_config=None,
             code = envelope.get('returncode')
             if code in (None, 0):
                 try:
-                    journal.complete(operation_id, envelope, operation_hash(request, trusted),
+                    journal.complete(operation_id, envelope, operation_hash(request, trusted, account_identity),
                                      principal)
                 except JournalFull:
                     journal.mark_unknown(operation_id)

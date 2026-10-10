@@ -91,6 +91,46 @@ class ExportTests(unittest.TestCase):
             f=Path(tmp)/'export.jsonl';f.write_text('{"id":"a","id":"b"}\n',encoding='utf-8')
             with self.assertRaisesRegex(ValueError,'duplicate'):read_export(f)
 
+    def test_jsonl_ordinary_row_nesting_is_isolated_from_selected_records(self):
+        m = baseline()
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / 'export.jsonl'
+            for depth in (60, 80, 500, 751):
+                # Literal array framing avoids depending on the writer's own
+                # recursion limit when generating an over-limit native row.
+                ordinary = '{"id":"unrelated","metadata":'+'['*depth+'0'+']'*depth+'}'
+                source.write_text('\n'.join(json.dumps(r) for r in exported(m))+'\n'+ordinary+'\n')
+                rows = read_export(source)
+                self.assertEqual(adapt(rows, selection_from_manifest(m))['manifest'], m)
+                self.assertEqual(bool(rows[-1].get('malformed')), depth >= 751)
+            selected = exported(m)[0]['id']
+            source.write_text('{"id":'+json.dumps(selected)+',"metadata":'+'['*751+'0'+']'*751+'}')
+            with self.assertRaisesRegex(ValueError, 'selected requirement row cannot be read'):
+                adapt(read_export(source), selection_from_manifest(m))
+
+    def test_overlimit_jsonl_identity_cannot_be_nested_missing_or_duplicated(self):
+        nested = '['*751+'0'+']'*751
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / 'export.jsonl'
+            for row in ('{"metadata":{"id":"nested","value":'+nested+'}}',
+                        '{"id":"one","id":"two","metadata":'+nested+'}',
+                        '{"metadata":'+nested+'}',
+                        '{"id":'+nested+'}',
+                        '{"id":"one","metadata":'+nested+'}{}'):
+                with self.subTest(row=row[:40]):
+                    source.write_text(row)
+                    with self.assertRaisesRegex(ValueError, 'ID|trailing'):
+                        read_export(source)
+
+    def test_overlimit_jsonl_duplicate_issue_still_refuses_whole_selection(self):
+        m = baseline(); selected = exported(m)[0]['id']
+        bad = '{"id":'+json.dumps(selected)+',"metadata":'+'['*751+'0'+']'*751+'}'
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / 'export.jsonl'
+            source.write_text('\n'.join(json.dumps(r) for r in exported(m))+'\n'+bad)
+            with self.assertRaisesRegex(ValueError, 'duplicate issue id'):
+                adapt(read_export(source), selection_from_manifest(m))
+
     def test_cli_export_and_publish(self):
         m=baseline();root=Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as tmp:

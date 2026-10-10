@@ -25,6 +25,13 @@ class OwnerNative(Native):
         self.seed('job-1', issue_type='job')
 
     def __call__(self, args):
+        if args[0] == 'list':
+            self.calls.append(list(args))
+            rows = self.rows
+            if '--label' in args:
+                label = args[args.index('--label') + 1]
+                rows = [row for row in rows if label in row['labels']]
+            return json.dumps(rows)
         result = super().__call__(args)
         if args[0] == 'create' and '--dry-run' not in args:
             row = self.row(json.loads(result)['id'])
@@ -36,7 +43,7 @@ class OwnerNative(Native):
 class OwnerEvidenceTests(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory(); self.addCleanup(temp.cleanup)
-        self.path = Path(temp.name)
+        self.path = Path(temp.name) / 'alpha'; self.path.mkdir()
         governance.initialize(self.path, 'alpha', ACCOUNT, 'creation-alpha')
         self.context = http.OwnerContext('alpha', ACCOUNT, governance.current(self.path, 'alpha'))
         self.native = OwnerNative()
@@ -50,6 +57,119 @@ class OwnerEvidenceTests(unittest.TestCase):
         return http.apply(self.path, self.context, 'accept', {
             'expected_revision': item['revision'], 'expected_sha256': item['sha256']},
             operation, self.native, task=item['id'])
+
+    def contributor_revision(self, item, operation='contributor-revision'):
+        latest = records.latest_revision(records.existing_revisions(self.native.row(item['id'])))
+        self.native.actor = 'alice'
+        return records.apply_native({'schema_version': 1, 'operation_id': operation,
+            'operation': 'revise', 'kind': 'requirement', 'task': item['id'],
+            'key': latest['key'], 'title': 'Proposed wording', 'description': 'Contributor wording',
+            'revision': latest['revision'] + 1, 'acceptance_state': 'draft'},
+            'alice', self.native, self.path)
+
+    def test_contributor_cannot_replace_owner_pending_create_or_edit(self):
+        for accepted_first in (False, True):
+            with self.subTest(accepted_first=accepted_first):
+                self.native.actor = ACCOUNT
+                item = http.apply(self.path, self.context, 'create', {
+                    'kind': 'requirement', 'parent': 'job-1', 'title': 'Owner text',
+                    'description': 'Owner pending content'}, 'create-'+str(accepted_first), self.native)
+                if accepted_first:
+                    item = self.accept(item, 'accept-'+str(accepted_first))
+                    item = http.apply(self.path, self.context, 'revise', {
+                        'expected_revision': item['revision'], 'expected_sha256': item['sha256'],
+                        'description': 'Owner pending edit'}, 'owner-edit', self.native, item['id'])
+                row = self.native.row(item['id'])
+                row['created_by'] = 'alice'; row['title'] = 'Contributor title'
+                before = copy.deepcopy(row); writes = len(self.native.writes())
+                receipts = sorted(p.name for p in self.path.rglob('*.json'))
+                for attempt in range(2):
+                    with self.assertRaisesRegex(ValueError, 'belongs to the project owner.*Propose'):
+                        self.contributor_revision(item, 'refused-'+str(accepted_first))
+                self.assertEqual(row, before)
+                self.assertEqual(len(self.native.writes()), writes)
+                self.assertEqual(sorted(p.name for p in self.path.rglob('*.json')), receipts)
+
+    def test_governed_mode_retains_contributor_revision_policy(self):
+        item = self.create(); accepted = self.accept(item)
+        item = http.apply(self.path, self.context, 'revise', {
+            'expected_revision': accepted['revision'], 'expected_sha256': accepted['sha256'],
+            'description': 'Pending owner edit'}, 'owner-edit', self.native, item['id'])
+        state = governance.current(self.path, 'alpha')
+        governance.set_mode(self.path, 'alpha', 'governed', ACCOUNT, 'governed',
+                            state['revision'], state['sha256'])
+        self.assertEqual(self.contributor_revision(item)['revision'], 4)
+
+    def test_contributor_draft_with_owner_creator_metadata_remains_revisable(self):
+        from test_requirement_records import RequirementRecordTests
+        payload = RequirementRecordTests().draft()
+        self.native.actor = 'alice'
+        item = records.apply_native(payload, 'alice', self.native, self.path)
+        self.native.row(item['id'])['created_by'] = ACCOUNT
+        self.assertEqual(self.contributor_revision(item)['revision'], 2)
+
+    def test_host_operator_can_accept_owner_draft_with_configured_authority(self):
+        from test_requirement_records import RequirementRecordTests
+        item = self.create()
+        latest = records.latest_revision(records.existing_revisions(self.native.row(item['id'])))
+        payload = RequirementRecordTests().accept(task=item['id'], key=latest['key'])
+        self.native.actor = 'operator'
+        result = records.apply_native(payload, 'operator', self.native, self.path,
+                                      operator=True, operators=['operator'])
+        self.assertEqual(result['acceptance_state'], 'accepted')
+        self.assertEqual(result['revision'], 2)
+
+    def test_restored_simple_project_keeps_pending_owner_edit_protected(self):
+        item = self.create(); self.accept(item)
+        item = http.apply(self.path, self.context, 'revise', {
+            'expected_revision': 2,
+            'expected_sha256': records.existing_revisions(self.native.row(item['id']))[2]['sha256'],
+            'description': 'Pending owner edit'}, 'owner-edit', self.native, item['id'])
+        files = governance.restored_files(governance.snapshot(self.path, 'alpha'), 'alpha', 'beta')
+        self.path = self.path.parent / 'beta'; self.path.mkdir()
+        for name, value in files.items():
+            (self.path / name).write_text(json.dumps(value))
+        with self.assertRaisesRegex(ValueError, 'belongs to the project owner'):
+            self.contributor_revision(item)
+
+    def test_same_contributor_request_rechecks_governance_after_refusal(self):
+        item = self.create()
+        with self.assertRaisesRegex(ValueError, 'belongs to the project owner'):
+            self.contributor_revision(item)
+        state = governance.current(self.path, 'alpha')
+        governance.set_mode(self.path, 'alpha', 'governed', ACCOUNT, 'governed',
+                            state['revision'], state['sha256'])
+        self.assertEqual(self.contributor_revision(item)['revision'], 2)
+
+    def test_interrupted_contributor_revision_rechecks_owner_protection(self):
+        item = self.create()
+        state = governance.current(self.path, 'alpha')
+        governance.set_mode(self.path, 'alpha', 'governed', ACCOUNT, 'allow-revision',
+                            state['revision'], state['sha256'])
+        self.native.fail_comment_prefix = records.REVISION_PREFIX
+        with self.assertRaisesRegex(ValueError, 'native comment failed'):
+            self.contributor_revision(item, 'interrupted-contributor')
+        receipts = {p: p.read_bytes() for p in (self.path / '.requirement-requests').glob('*.json')}
+        self.assertEqual(len(receipts), 1)
+        self.assertEqual(json.loads(next(iter(receipts.values())))['status'], 'pending')
+        state = governance.current(self.path, 'alpha')
+        governance.set_mode(self.path, 'alpha', 'simple', ACCOUNT, 'protect-owner',
+                            state['revision'], state['sha256'])
+        self.native.fail_comment_prefix = None
+        before = copy.deepcopy(self.native.row(item['id']))
+        writes = len(self.native.writes())
+        with self.assertRaisesRegex(ValueError, 'belongs to the project owner'):
+            self.contributor_revision(item, 'interrupted-contributor')
+        self.assertEqual(self.native.row(item['id']), before)
+        self.assertEqual(len(self.native.writes()), writes)
+        self.assertEqual({p: p.read_bytes() for p in receipts}, receipts)
+        state = governance.current(self.path, 'alpha')
+        governance.set_mode(self.path, 'alpha', 'governed', ACCOUNT, 'allow-retry',
+                            state['revision'], state['sha256'])
+        result = self.contributor_revision(item, 'interrupted-contributor')
+        self.assertEqual(result['revision'], 2)
+        self.assertEqual(len(records.existing_revisions(self.native.row(item['id']))), 2)
+        self.assertEqual(sum('requirement' in row['labels'] for row in self.native.rows), 1)
 
     def test_poisoned_row_is_marked_while_healthy_accepted_content_survives(self):
         first = self.create(); accepted = self.accept(first)
@@ -302,6 +422,181 @@ class OwnerEvidenceTests(unittest.TestCase):
         self.assertEqual(sum(row['issue_type'] == 'decision' for row in self.native.rows), 1)
         self.assertEqual(sum(c['text'].startswith(owner.ACCEPTANCE_PREFIX)
                              for c in row['comments']), 1)
+
+    def acceptance_receipt(self, operation='accept-requirement'):
+        return self.path / http.JOURNAL / (content_hash({'operation_id': operation}) + '.json')
+
+    def interrupted_acceptance(self):
+        item = self.create()
+        self.native.fail_comment_prefix = owner.ACCEPTANCE_PREFIX
+        with self.assertRaisesRegex(ValueError, 'native comment failed'):
+            self.accept(item)
+        self.native.fail_comment_prefix = None
+        receipt = self.acceptance_receipt()
+        saved = json.loads(receipt.read_text())
+        self.assertEqual(saved['status'], 'pending')
+        binding = saved['owner_decision']
+        self.assertEqual(binding['operation_id'], 'accept-requirement')
+        self.assertEqual(binding['account_id'], ACCOUNT)
+        return item, receipt, saved
+
+    def test_interrupted_acceptance_reuses_recorded_decision_despite_mutable_metadata(self):
+        item, receipt, saved = self.interrupted_acceptance()
+        decision_id = saved['owner_decision']['decision']['decision_id']
+        decision = self.native.row(decision_id)
+        labels = list(decision['labels'])
+        decision.update(title='Retitled', description='Reworded', created_by='alice', labels=[])
+        self.native.seed('decoy', title='Accept requirement ' + item['id'],
+                         labels=labels, issue_type='decision')['created_by'] = ACCOUNT
+        before = self.native.count('create')
+        accepted = self.accept(item)
+        self.assertEqual(accepted['revision'], 2)
+        self.assertEqual(self.native.count('create'), before)
+        evidence = owner.existing_acceptances(self.native.row(item['id']))[2]
+        self.assertEqual(evidence['decision']['decision_id'], decision_id)
+        self.assertEqual(evidence['at'], saved['owner_decision']['at'])
+        completed = http.validate_receipt(json.loads(receipt.read_text()))
+        self.assertEqual(completed['owner_decision'], saved['owner_decision'])
+
+    def test_missing_unreadable_and_legacy_decision_bindings_never_regenerate(self):
+        item, receipt, saved = self.interrupted_acceptance()
+        decision_id = saved['owner_decision']['decision']['decision_id']
+        decision = self.native.row(decision_id)
+        self.native.rows.remove(decision)
+        before = len(self.native.writes())
+        original = receipt.read_bytes()
+        with self.assertRaisesRegex(ValueError, 'missing or unreadable.*host operator'):
+            self.accept(item)
+        self.assertEqual(len(self.native.writes()), before)
+        self.assertEqual(receipt.read_bytes(), original)
+        self.native.rows.append(dict(decision, malformed=True))
+        with self.assertRaisesRegex(ValueError, 'missing or unreadable'):
+            self.accept(item)
+        self.assertEqual(len(self.native.writes()), before)
+        legacy = dict(saved); del legacy['owner_decision']
+        http.validate_receipt(legacy)  # Exact-base receipts are still valid.
+        receipt.write_text(json.dumps(legacy))
+        original = receipt.read_bytes()
+        with self.assertRaisesRegex(ValueError, 'no recorded decision binding.*host operator'):
+            self.accept(item)
+        self.assertEqual(len(self.native.writes()), before)
+        self.assertEqual(receipt.read_bytes(), original)
+
+    def test_lost_decision_create_answer_does_not_select_label_or_allocate_again(self):
+        item = self.create()
+        self.native.create_outcome = 'lost-response'
+        with self.assertRaisesRegex(RuntimeError, 'response lost'):
+            self.accept(item)
+        self.native.create_outcome = 'ok'
+        saved = json.loads(self.acceptance_receipt().read_text())
+        self.assertNotIn('owner_decision', saved)
+        before = len(self.native.writes())
+        with self.assertRaisesRegex(ValueError, 'no recorded decision binding'):
+            self.accept(item)
+        self.assertEqual(len(self.native.writes()), before)
+
+    def test_missing_bound_decision_after_evidence_still_keeps_revision_pending(self):
+        item = self.create()
+        self.native.fail_comment_prefix = records.REVISION_PREFIX
+        with self.assertRaisesRegex(ValueError, 'native comment failed'):
+            self.accept(item)
+        self.native.fail_comment_prefix = None
+        saved = json.loads(self.acceptance_receipt().read_text())
+        decision = self.native.row(saved['owner_decision']['decision']['decision_id'])
+        self.native.rows.remove(decision)
+        before = len(self.native.writes())
+        with self.assertRaisesRegex(ValueError, 'missing or unreadable'):
+            self.accept(item)
+        self.assertEqual(len(self.native.writes()), before)
+        self.assertEqual(set(records.existing_revisions(self.native.row(item['id']))), {1})
+
+    def test_optional_decision_binding_backup_validation_and_conflicts(self):
+        import admin
+        item, receipt, saved = self.interrupted_acceptance()
+        name = http.JOURNAL + '/' + receipt.name
+        admin.validate_coordination_files({name: saved})
+        for field, value in (('account_id', 'usr_' + 'b' * 16), ('id', 'different'),
+                             ('operation_id', 'different'), ('record_sha256', '0' * 64)):
+            bad = copy.deepcopy(saved)
+            binding = bad['owner_decision']; binding[field] = value
+            binding['sha256'] = content_hash(binding)
+            receipt.write_text(json.dumps(bad))
+            before = len(self.native.writes())
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                self.accept(item)
+            self.assertEqual(len(self.native.writes()), before)
+        bad = copy.deepcopy(saved); bad['owner_decision']['extra'] = 'bad'
+        with self.assertRaises(ValueError):
+            admin.validate_coordination_files({name: bad})
+        with self.assertRaisesRegex(ValueError, 'path mismatch'):
+            admin.validate_coordination_files({http.JOURNAL + '/' + '0' * 64 + '.json': saved})
+
+    def test_empty_create_absence_requires_complete_read_and_no_request_row(self):
+        self.native.create_outcome = 'fail-after-preflight'
+        with self.assertRaises(ValueError):
+            self.create()
+        self.native.create_outcome = 'ok'
+        path = self.path / http.JOURNAL / (content_hash({'operation_id': 'new-requirement'}) + '.json')
+        receipt = json.loads(path.read_text())
+        before = path.read_bytes()
+        http.empty_creation(receipt, self.context, 'new-requirement', self.native)
+        # An ID-less or truncated read cannot prove that a request is absent.
+        def incomplete(args):
+            if args[0] == 'list':
+                return json.dumps([dict(id='hidden', labels=[])])
+            return self.native(args)
+        with self.assertRaisesRegex(ValueError, 'absence cannot be proved'):
+            http.empty_creation(receipt, self.context, 'new-requirement', incomplete)
+        self.native.seed('allocated-empty', labels=['request:' + content_hash({'operation_id': 'new-requirement'})])
+        with self.assertRaisesRegex(ValueError, 'native row already carries'):
+            http.empty_creation(receipt, self.context, 'new-requirement', self.native)
+        self.native.rows[-1]['labels'] = []
+        self.native.rows[-1]['malformed'] = True
+        with self.assertRaisesRegex(ValueError, 'absence cannot be proved'):
+            http.empty_creation(receipt, self.context, 'new-requirement', self.native)
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_actual_backup_restore_preserves_optional_binding_and_release_audit(self):
+        import admin
+        from http_authority import NativeRunner, OperationJournal, journal_path
+        from test_backup import BackupTests
+        case = BackupTests(); case.setUp()
+        try:
+            native = OwnerNative()
+            governance.initialize(case.source, 'source', ACCOUNT, 'source-create')
+            context = http.OwnerContext('source', ACCOUNT, governance.current(case.source, 'source'))
+            fields = dict(kind='requirement', parent='job-1', title='Content', description='Pending acceptance.')
+            item = http.apply(case.source, context, 'create', fields, 'source-draft', native)
+            native.fail_comment_prefix = owner.ACCEPTANCE_PREFIX
+            with self.assertRaisesRegex(ValueError, 'native comment failed'):
+                http.apply(case.source, context, 'accept', {'expected_revision': item['revision'],
+                    'expected_sha256': item['sha256']}, 'source-accept', native, item['id'])
+            native.fail_comment_prefix = None
+            native.create_outcome = 'fail-after-preflight'
+            with self.assertRaises(ValueError):
+                http.apply(case.source, context, 'create', dict(fields, title='Empty'), 'source-empty', native)
+            native.create_outcome = 'ok'
+            path = case.source / http.JOURNAL / (content_hash({'operation_id': 'source-empty'}) + '.json')
+            journal = OperationJournal(journal_path(case.source))
+            journal._actor = ACCOUNT; journal._route = 'requirements.create'
+            journal.reserve('source-empty', 'f' * 64, 'owner-account:' + ACCOUNT)
+            journal.mark_unknown('source-empty')
+            result = http.release_creation(case.source, context, {'original_operation_id': 'source-empty',
+                'expected_receipt_sha256': http.receipt_sha256(json.loads(path.read_text())),
+                'reason': 'No row was allocated.'}, native, NativeRunner(native))
+            with patch.object(admin, 'run_bd', return_value='synthetic native sync'):
+                admin.backup_project(case.root, 'source')
+            files = json.loads(case.bundle.read_text())['files']
+            binding_name = http.JOURNAL + '/' + content_hash({'operation_id': 'source-accept'}) + '.json'
+            release_name = http.JOURNAL + '/' + path.name
+            self.assertIn('owner_decision', files[binding_name])
+            self.assertEqual(files[release_name]['release_history'], [result['audit']])
+            admin.restore_coordination(case.root, 'source', 'destination')
+            for name in (binding_name, release_name):
+                self.assertEqual(json.loads((case.destination / name).read_text()), files[name])
+                http.validate_receipt(files[name])
+        finally:
+            case.doCleanups()
 
     def test_schema_hash_author_binding_and_raw_guard(self):
         item = self.create(); self.accept(item)

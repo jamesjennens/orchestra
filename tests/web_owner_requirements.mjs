@@ -1,7 +1,7 @@
 // Actual API calls to a loopback service; text and controls rendered with the DOM shim.
 import './web_dom_shim.mjs';
 import assert from 'node:assert/strict';
-const [apiUrl, viewUrl, base, pid, ownerToken, viewerToken] = process.argv.slice(2);
+const [apiUrl, viewUrl, base, pid, ownerToken, viewerToken, recoveryExpectation = 'required'] = process.argv.slice(2);
 const { createApi } = await import(apiUrl);
 const view = await import(viewUrl);
 const transport = (token) => async (method, path, headers, body) => {
@@ -22,7 +22,20 @@ if (!page.querySelector('form')) {
   page = await view.brd(owner, { pid }, {}, await owner.api.requirements(pid));
 }
 assert.ok(page.textContent.includes('Add requirement or narrative'));
+const parentLabel = page.querySelectorAll('label').find(e=>e.attributes.for==='requirement-parent');
+assert.ok(parentLabel.textContent.startsWith('Task'));
+assert.equal(page.querySelector('#requirement-parent').querySelectorAll('option').length, 2);
 assert.ok(!page.textContent.includes(data.governance.sha256));
+const recovery = page.querySelectorAll('form').find((form) => form.textContent.includes('Clear failed creation'));
+if (recoveryExpectation === 'required') assert.ok(recovery, page.textContent);
+if (recovery) {
+  assert.ok(page.textContent.includes('only when no requirement was written'));
+  recovery.querySelector('input').value = 'No requirement was written.';
+  await recovery.dispatch('submit');
+  assert.equal(owner.destination, `/p/${pid}/requirements`);
+  page = await view.brd(owner, { pid }, {}, await owner.api.requirements(pid));
+  assert.ok(!page.textContent.includes('Clear failed creation'));
+}
 const form = page.querySelector('form');
 form.querySelector('#requirement-title').value = '<img src=x onerror=alert(1)>\u202e\u0085';
 form.querySelector('#requirement-text').value = '<script>evil()</script>\nOwner intent as text';
@@ -37,14 +50,14 @@ assert.ok(page.textContent.includes('<img src=x onerror=alert(1)>'));
 assert.ok(item.current.title.endsWith('\u202e\u0085'));
 assert.ok(page.textContent.includes('[U+202E][U+0085]'));
 assert.ok(!page.textContent.includes(item.current.sha256));
-let accept = page.querySelectorAll('button').find((b) => b.textContent === 'Accept');
+let accept = page.querySelectorAll('button').find((b) => b.textContent === 'Accept draft');
 assert.ok(accept);
 await accept.dispatch('click');
 item = await owner.api.requirement(pid, id);
 assert.equal(item.current.acceptance_state, 'accepted');
 const acceptedHash = item.current.sha256;
 page = await view.requirement(owner, { pid, rid: id }, {}, item);
-assert.ok(!page.querySelectorAll('button').some((b) => b.textContent === 'Accept'));
+assert.ok(!page.querySelectorAll('button').some((b) => b.textContent.startsWith('Accept')));
 page.querySelector('#requirement-text').value = 'Changed intent';
 await page.querySelector('form').dispatch('submit');
 item = await owner.api.requirement(pid, id);
@@ -56,6 +69,8 @@ assert.equal(readOnly.querySelectorAll('button').length, 0);
 assert.ok(readOnly.textContent.includes('Changed intent'));
 assert.ok(readOnly.textContent.includes('Owner intent as text'));
 assert.ok(readOnly.textContent.includes('Pending edit'));
+assert.ok(readOnly.textContent.includes('Accepted revision 2'));
+assert.ok(readOnly.textContent.includes('Pending edit · revision 3'));
 assert.ok(readOnly.textContent.indexOf('Owner intent as text') < readOnly.textContent.indexOf('Changed intent'));
 const viewerDocument = await view.brd(viewer, { pid }, {}, await viewer.api.requirements(pid));
 assert.equal(viewerDocument.querySelectorAll('form').length, 0);
@@ -64,6 +79,10 @@ assert.ok(viewerDocument.textContent.includes('Owner intent as text'));
 assert.ok(viewerDocument.textContent.includes('Pending edit'));
 assert.ok(!viewerDocument.textContent.includes('Open questions'));
 page = await view.brd(owner, { pid }, {}, await owner.api.requirements(pid));
+const editablePending = await view.requirement(owner, { pid, rid: id }, {}, item);
+assert.ok(editablePending.querySelectorAll('button').some(b=>b.textContent==='Accept pending edit'));
+assert.ok(page.textContent.includes('Accepted revision 2'));
+assert.ok(page.textContent.includes('Pending edit · revision 3'));
 await page.querySelectorAll('button').find((b) => b.textContent === 'Use governed requirements').dispatch('click');
 page = await view.requirement(owner, { pid, rid: id }, {}, await owner.api.requirement(pid, id));
 assert.equal(page.querySelectorAll('form').length, 0);

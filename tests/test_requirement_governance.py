@@ -3,6 +3,7 @@ import json
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -37,6 +38,75 @@ class GovernanceTests(unittest.TestCase):
         self.assertEqual(list(self.project.iterdir()), [])
         current = self.set_mode('simple')
         self.assertEqual((current['revision'], current['mode']), (1, 'simple'))
+
+    def test_present_null_is_invalid_history_or_restore_binding_not_absence(self):
+        (self.project / governance.FILE).write_text('null', encoding='utf-8')
+        before = (self.project / governance.FILE).read_bytes()
+        with self.assertRaisesRegex(ValueError, 'Invalid requirements governance record'):
+            governance.current(self.project, 'alpha')
+        self.assertEqual((self.project / governance.FILE).read_bytes(), before)
+        (self.project / governance.FILE).unlink()
+        self.initialize()
+        (self.project / governance.SOURCE_FILE).write_text('null', encoding='utf-8')
+        with self.assertRaisesRegex(ValueError, 'Invalid requirements governance restore binding'):
+            governance.current(self.project, 'alpha')
+
+    def test_future_clock_warning_boundary_does_not_order_or_rewrite_history(self):
+        import requirement_http
+        from http_authority import JOURNAL_MAX_SKEW_SECONDS
+        timestamp = '2026-10-10T07:00:00Z'
+        instant = datetime.strptime(timestamp, '%Y-%m-%dT%H:%M:%SZ').replace(
+            tzinfo=timezone.utc).timestamp()
+        first = governance.entry(1, None, 'simple', OWNER, 'session', 'first', timestamp)
+        # A later revision can have an earlier timestamp; hashes/revisions govern.
+        second = governance.entry(2, first['sha256'], 'governed', OWNER, 'session',
+                                  'second', '2000-01-01T00:00:00Z')
+        record = dict(schema_version=1, project='alpha', revisions=[first, second])
+        path = self.project / governance.FILE
+        path.write_text(json.dumps(record), encoding='utf-8')
+        before = path.read_bytes()
+        authority = governance.current(self.project, 'alpha')
+        for difference, warned in ((JOURNAL_MAX_SKEW_SECONDS - 1, False),
+                                   (JOURNAL_MAX_SKEW_SECONDS, False),
+                                   (JOURNAL_MAX_SKEW_SECONDS + 1, True)):
+            with self.subTest(difference=difference), patch.object(
+                    governance.time, 'time', return_value=instant - difference):
+                result = requirement_http.read(self.project, 'alpha', ['governance'],
+                                              lambda args: self.fail('Unexpected native read'))
+                self.assertEqual({k: result[k] for k in authority}, authority)
+                self.assertEqual(bool(result.get('warnings')), warned)
+                if warned:
+                    self.assertEqual(result['warnings'][0]['revision'], 1)
+                    self.assertIn('host operator', result['warnings'][0]['message'])
+                    self.assertIn('clock and history', result['warnings'][0]['message'])
+                self.assertEqual(path.read_bytes(), before)
+        # A write on the behind-clock host still uses the exact revision/hash CAS.
+        changed = self.set_mode('simple', 'after-clock-warning')
+        self.assertEqual(changed['revision'], 3)
+        self.assertEqual(governance.snapshot(self.project, 'alpha')[governance.FILE]
+                         ['revisions'][:2], record['revisions'])
+
+    def test_restored_future_history_warns_boundedly_without_locking_owner_out(self):
+        entries = []
+        for number in range(1, 13):
+            entries.append(governance.entry(number, entries[-1]['sha256'] if entries else None,
+                'simple', OWNER, 'session', 'future-' + str(number), '2999-01-01T00:00:00Z'))
+        original = {governance.FILE: dict(schema_version=1, project='alpha', revisions=entries)}
+        restored = governance.restored_files(original, 'alpha', 'beta')
+        beta = self.root / 'projects' / 'beta'; beta.mkdir()
+        for name, value in restored.items():
+            (beta / name).write_text(json.dumps(value), encoding='utf-8')
+        before = {p.name: p.read_bytes() for p in beta.iterdir()}
+        result = governance.read_state(beta, 'beta', comparison_time=0)
+        self.assertEqual([w['revision'] for w in result['warnings']], list(range(1, 9)))
+        self.assertTrue(result['warnings_truncated'])
+        self.assertEqual({p.name: p.read_bytes() for p in beta.iterdir()}, before)
+        current = governance.current(beta, 'beta')
+        changed = governance.set_mode(beta, 'beta', 'governed', OWNER, 'restored-write',
+                                      current['revision'], current['sha256'])
+        self.assertEqual((changed['revision'], changed['mode']), (13, 'governed'))
+        governance.validate_evidence(beta, 'beta', {'project': 'alpha',
+            'governance': {k: entries[-1][k] for k in ('revision', 'sha256', 'mode')}})
 
     def test_default_creation_retry_and_both_mode_switches_preserve_history(self):
         first = self.initialize()

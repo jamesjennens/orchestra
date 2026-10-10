@@ -2718,6 +2718,15 @@ def validate_record_receipt(name,record):
     """
     from requirement_records import validate_receipt
     validate_receipt(record)
+    if name.startswith('.requirement-owner-requests/'):
+        from requirement_http import validate_receipt as validate_owner_receipt
+        validate_owner_receipt(record)
+        if 'owner_decision' in record and name != '.requirement-owner-requests/' + content_hash(
+                {'operation_id': record['owner_decision']['operation_id']}) + '.json':
+            raise ValueError('Owner decision receipt path mismatch')
+        if 'release_history' in record and name != '.requirement-owner-requests/' + content_hash(
+                {'operation_id': record['release_history'][0]['operation_id']}) + '.json':
+            raise ValueError('Owner release receipt path mismatch')
     if name.startswith('.proposal-requests/') and 'operation' in record and (
             not isinstance(record['operation'],str) or not record['operation'].strip()):
         raise ValueError('Invalid proposal receipt operation')

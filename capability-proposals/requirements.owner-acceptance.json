@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "operation_id": "capnew-df1f4890c026476e814d3f4927f6f7fd",
+  "key": "requirements.owner-acceptance",
+  "name": "Human owner acceptance binds exact content and supports account-bound replay",
+  "aliases": [
+    "owner accepts requirement",
+    "requirement acceptance evidence",
+    "lost owner answer replay",
+    "same owner new session retry",
+    "immutable requirement decision"
+  ],
+  "summary": "A signed-in project owner accepts an exact current draft in simple mode without joining the host operator allowlist. The service generates a native decision, immutable account/project/governance-bound evidence and an accepted revision. Historical accepted content remains separately readable. Request replay uses one consistent account-bound journal identity, including after a committed answer is lost and the same owner logs in again. The original result and server time replay without another effect; changed request content refuses. Current session authority and owner membership are checked before replay. Raw owner evidence comments remain reserved. Governed mode and machine credentials do not gain this owner acceptance route. Interrupted acceptance persists an optional validated owner_decision binding in the existing receipt immediately after the generated native ID is confirmed and before evidence. Recovery selects only that ID; mutable title, description, label and creator fields cannot choose a substitute. Missing/unreadable decisions and legacy or lost-ID receipts remain unknown without regeneration. Backup/restore preserves the optional binding.",
+  "requirements": [],
+  "anchors": [
+    "docs/REQUIREMENTS.md#editing-a-projects-requirements-in-the-web-interface"
+  ],
+  "code": [
+    "requirement_http.py::web_action",
+    "requirement_owner_records.py::existing_acceptances",
+    "http_authority.py::run_guarded"
+  ],
+  "tests": [
+    "tests/test_http_requirements_owner.py",
+    "tests/test_requirement_owner_records.py",
+    "tests/test_requirement_owner_real_bd.py"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "requirements",
+    "acceptance",
+    "replay"
+  ]
+}
