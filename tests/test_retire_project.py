@@ -68,6 +68,7 @@ class RetireCase(unittest.TestCase):
         self.slot = {}
         self.issues = {}
         self.server_databases = {}
+        self.server_database_rows = None
         self.server_database_count_fails = set()
         self.slot_fails = set()
         self.bd = []
@@ -87,13 +88,19 @@ class RetireCase(unittest.TestCase):
             raise self.server
         if query.startswith("SHOW DATABASES LIKE '"):
             name=query.split("'")[1]
-            return 'Database\n%s\n'%name if name in self.server_databases else 'Database\n'
+            if self.server_database_rows is not None:
+                return self.server_database_rows
+            matches=[database for database in self.server_databases
+                     if database.casefold()==name.casefold()]
+            return 'Database\n'+''.join(database+'\n' for database in matches)
         if query.startswith('SELECT COUNT(*) FROM `'):
             name=query.split('`')[1]
-            if name in self.server_database_count_fails:
+            actual=next((database for database in self.server_databases
+                         if database.casefold()==name.casefold()),None)
+            if any(database.casefold()==name.casefold() for database in self.server_database_count_fails):
                 raise subprocess.CalledProcessError(1,['dolt'],stderr='issues table unreadable')
             self.assertIn("WHERE id <> '%s-merge-slot';"%name,query)
-            return 'COUNT(*)\n%d\n'%self.server_databases[name]
+            return 'COUNT(*)\n%d\n'%self.server_databases[actual]
         return self.server
 
     def run_bd(self, root, name, args):
@@ -318,6 +325,58 @@ class RetireCase(unittest.TestCase):
         self.assertEqual(self.journal(),[])
         self.assertEqual(self.bd,[])
 
+    def test_case_insensitive_server_database_names_are_counted(self):
+        (self.root/'projects'/'alpha'/'.beads'/'metadata.json').unlink()
+        self.server_databases['ALPHA']=3
+
+        findings=admin.retire_findings(self.root,'alpha')
+        self.assertEqual((findings['server_database'],findings['server_database_issues']),
+                         ('present',3))
+        self.assertIn('same-named server database holds 3 issue(s)',
+                      '; '.join(admin.retire_blockers(findings)))
+        count_probe=next((query,timeout) for query,timeout in self.probes
+                         if query.startswith('SELECT COUNT(*) FROM `'))
+        self.assertEqual(count_probe[1],admin.RETIRE_PROBE_TIMEOUT)
+
+    def test_multiple_show_database_rows_are_treated_as_unreadable(self):
+        (self.root/'projects'/'alpha'/'.beads'/'metadata.json').unlink()
+        self.server_database_rows='Database\nalpha\nALPHA\n'
+
+        findings=admin.retire_findings(self.root,'alpha')
+        self.assertEqual((findings['server'],findings['server_database'],
+                          findings['server_database_issues']),('up','unreadable',None))
+        self.assertFalse(any(query.startswith('SELECT COUNT(*) FROM `') for query,_ in self.probes))
+        self.assertIn('same-named server database could not be checked for issues',
+                      '; '.join(admin.retire_blockers(findings)))
+        _,stderr,code=self.retire('alpha')
+        self.assertNotEqual(code,0)
+        self.assertIn('same-named server database could not be checked for issues',stderr)
+
+    def test_never_initialized_retirement_requires_force_when_server_is_unreachable(self):
+        path=self.root/'projects'/'epsilon'
+        path.mkdir()
+        self.server=subprocess.CalledProcessError(1,['dolt'],stderr='server unavailable')
+        before=tree(self.root)
+
+        findings=admin.retire_findings(self.root,'epsilon')
+        self.assertEqual((findings['metadata'],findings['server'],findings['bd']),
+                         ('absent','unreachable','unreachable'))
+        self.assertIn('could not be reached', '; '.join(admin.retire_blockers(findings)))
+        _,stderr,code=self.retire('epsilon')
+        self.assertNotEqual(code,0)
+        self.assertIn('--force to retire it anyway',stderr)
+        self.assertEqual(tree(self.root),before)
+
+    @moves
+    def test_force_retires_never_initialized_project_when_server_is_unreachable(self):
+        path=self.root/'projects'/'epsilon'
+        path.mkdir()
+        self.server=subprocess.CalledProcessError(1,['dolt'],stderr='server unavailable')
+
+        stdout,stderr,code=self.retire('epsilon',OPERATOR,'--force')
+        self.assertEqual(code,0,stderr)
+        self.assertFalse(path.exists())
+
     def test_an_unreadable_server_database_issue_count_requires_force(self):
         (self.root/'projects'/'alpha'/'.beads'/'metadata.json').unlink()
         self.server_databases['alpha']=3
@@ -493,12 +552,12 @@ class RestoreNoticeCase(unittest.TestCase):
         error = subprocess.CalledProcessError(1, ['dolt'], stderr='refused')
         partial = admin.restore_failure_notice('beta', error, 'partial')
         self.assertIn('holds a partial restore', partial)
-        self.assertIn('admin.py retire-project beta --actor OPERATOR --reason TEXT', partial)
+        self.assertIn('admin.py retire-project beta --actor OPERATOR --reason TEXT --force', partial)
         empty = admin.restore_failure_notice('beta', error, 'empty')
         self.assertIn('exists as an empty, working project: nothing was restored into it', empty)
         self.assertNotIn('partial', empty)
         self.assertIn('retire-project beta --actor OPERATOR --reason TEXT', empty)
-        self.assertNotIn('--force', empty)                           # an empty project needs no flag now
+        self.assertNotIn('--force', empty)                           # an initialized empty destination needs no flag
         # Review 01a10219: the destination can disappear, and every step has a notice.
         gone = admin.restore_failure_notice('beta', FileNotFoundError(2, 'No such file'), 'missing',
                                             step='re-point and coordination')
@@ -538,7 +597,7 @@ class RestoreNoticeCase(unittest.TestCase):
         self.assertIn('The directory projects/beta exists but the project was not initialized, so it is not a '
                       'working project', stopped)
         self.assertNotIn('empty, working project', stopped)
-        self.assertIn('admin.py retire-project beta --actor OPERATOR --reason TEXT', stopped)
+        self.assertIn('admin.py retire-project beta --actor OPERATOR --reason TEXT --force', stopped)
 
     def test_the_identity_step_runs_inside_the_termination_guard(self):
         seen = {}

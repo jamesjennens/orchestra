@@ -1286,13 +1286,16 @@ def project_metadata_state(root,name):
     return 'server' if project_server_metadata(root,name) is not None else 'unreadable'
 
 def server_database_exists(root,name):
-    """Whether the server has the exact database name for a project missing metadata."""
+    """Whether the server has a matching database for a project missing metadata."""
     validate_name(name)
     rows=list(csv.reader(io.StringIO(sql(root,"SHOW DATABASES LIKE '%s';"%name,
                                          timeout=RETIRE_PROBE_TIMEOUT))))
     if not rows or len(rows[0])!=1 or rows[0][0].strip().lower()!='database':
-        raise ValueError('unexpected SHOW DATABASES output')
-    return any(len(row)==1 and row[0]==name for row in rows[1:])
+        raise csv.Error('unexpected SHOW DATABASES output')
+    databases=rows[1:]
+    if len(databases)>1 or any(len(row)!=1 for row in databases):
+        raise csv.Error('unexpected SHOW DATABASES output')
+    return bool(databases and databases[0][0].casefold()==name.casefold())
 
 def server_database_issue_count(root,name):
     """Count Beads issues in a same-named server database."""
@@ -1623,7 +1626,8 @@ def restore_failure_notice(destination,error,state='partial',step='native restor
                                              ' during the %s step'%step)
     else:
         cause='the %s step failed'%step if step!='native restore' else 'the native restore failed'
-    retire=('admin.py retire-project %s --actor OPERATOR --reason TEXT'%destination)
+    force=' --force' if state in ('partial','uninitialized') else ''
+    retire=('admin.py retire-project %s --actor OPERATOR --reason TEXT%s'%(destination,force))
     if state=='missing':
         return ('restore-new did not complete: %s. The directory of project %s is no longer there (it was moved '
                 'or retired while the restore ran), so nothing more was written: no re-point, no coordination '
@@ -2398,8 +2402,10 @@ def retire_findings(root,name):
         try:
             exists=server_database_exists(root,name)
             server='up';server_database='present' if exists else 'absent'
+        except csv.Error:
+            server='up';server_database='unreadable'
         except (subprocess.CalledProcessError,subprocess.TimeoutExpired,OSError,ValueError,KeyError,TypeError,
-                csv.Error,RecursionError):
+                RecursionError):
             server='unreachable';server_database='unreadable'
         if server_database=='present':
             try:server_database_issues=server_database_issue_count(root,name)
