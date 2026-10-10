@@ -1610,7 +1610,7 @@ def _true_flag(flags, name):
 def _edge_ids(text):
     """The ids named by a ``dep add --file`` JSONL body, or raise ValueError."""
     import record_json
-    lines = [line for line in str(text).splitlines() if line.strip()]
+    lines = [line for line in str(text).split('\n') if line.strip()]
     if len(lines) > EDGE_LINES_MAX:
         raise ValueError('more than %d edges' % EDGE_LINES_MAX)
     found = []
