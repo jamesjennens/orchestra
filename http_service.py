@@ -1595,6 +1595,14 @@ class EndpointBackend:
             # failure means: 503, nothing was changed, the key stays free. Never 422 "the
             # request was rejected".
             raise cls._unread()
+        if isinstance(reply, dict) and reply.get('fault') == 'unreadable-rows':
+            # The export was read but holds a row that cannot be parsed: for the
+            # worker-credential name rule the whole tracker is then not read, because the
+            # unreadable row may be the row that holds the name (kittrial-5bb.221 r2). Not
+            # transient either: an operator must repair the row, so the caller gets the
+            # endpoint's own sentence naming the row ids and the repair, its own code, and
+            # never UNREAD's "try again shortly" (kittrial-5bb.243 item N7).
+            raise cls._rows_unreadable(reply.get('unreadable_rows'), reply.get('unreadable_total'))
         if isinstance(reply, dict) and reply.get('fault') == 'merge-slot':
             # The tracker was read but carries no merge-slot row: rows that came back without
             # it, or a readable tracker with no rows at all, the plain `bd init` shape
@@ -1666,6 +1674,38 @@ class EndpointBackend:
     def _merge_slot_missing(cls):
         failure = HttpError(503, 'merge_slot_missing', cls.MERGE_SLOT_MISSING)
         failure.nothing_done = True
+        return failure
+
+    #: Said when the tracker was read but holds a row that cannot be parsed: for the
+    #: worker-credential name rule the whole tracker is then not read (the unreadable row
+    #: may be the row that holds the name; kittrial-5bb.221 r2). Not transient: an operator
+    #: must repair the row. Its own code, so a caller can tell it from UNREAD. The endpoint's
+    #: own sentence, which names the row ids, is preferred over this fixed one
+    #: (kittrial-5bb.243 item N7).
+    ROWS_UNREADABLE = ("The project's tracker holds a row that cannot be read, so it was not read as a whole "
+                       "tracker: the unreadable row may be the row that holds a name. An operator must repair "
+                       "the row (for deeply nested metadata: bd update ID --unset-metadata KEY) if a second "
+                       "try gives the same answer, then try again.")
+
+    @classmethod
+    def _rows_unreadable(cls, ids=None, total=None):
+        # The answer is built from the fault's own fields, never from a stderr tail a row
+        # could shape (r2 review item 1): the endpoint sends the ids it named, already
+        # bounded to the tracker's id shape, and the total it counted, and the sentence is
+        # composed here, naming the ids and then 'and K more' as the endpoint's sentence
+        # does (r3 review item 2).
+        import actor_names
+        named = [i for i in (ids or ()) if isinstance(i, str) and actor_names.ROW_ID.fullmatch(i)][:actor_names.NAMED_ROWS_MAX]
+        count = total if isinstance(total, int) and total >= 0 else (len(named) if named else None)
+        failure = HttpError(503, 'unreadable_rows', cls.ROWS_UNREADABLE)
+        if named:
+            more = '' if count is None or count <= len(named) else ', and %d more' % (count - len(named))
+            failure = HttpError(503, 'unreadable_rows', cls.ROWS_UNREADABLE.replace(
+                'holds a row that cannot be read',
+                'holds unreadable row(s) %s%s' % (', '.join(named), more), 1))
+        failure.nothing_done = True
+        failure.unreadable_rows = named
+        failure.unreadable_total = count
         return failure
 
     #: Said when the endpoint reports that the server's configuration file cannot be read.

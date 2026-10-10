@@ -605,10 +605,17 @@ def main():
             found = {key: names.get(key, []) for key in ('sessions', 'operators', 'verifiers')}
             if rows:
                 import actor_names
-                if names.get('tracker') in ('unreadable', 'cut', 'exit1', 'words'):
-                    # The shapes endpoint.tracker_actors turns into a host fault: a cut line, a
-                    # bd that exited nonzero, or words that are not rows (kittrial-5bb.188 item 1;
-                    # revision-3 item 3(1)).
+                if names.get('tracker') in ('unreadable',):
+                    # The shape endpoint.tracker_actors answers with its own fault and sentence
+                    # since kittrial-5bb.243: a row that cannot be read beside real rows. The
+                    # stand-in raises the same exception class, so probes through it see the same
+                    # answer shape as the real endpoint (kittrial-5bb.243 r2 review item 3).
+                    raise actor_names.TrackerRowsUnreadable(i.get('id') for i in (names.get('unreadable-rows') or
+                                                                                  names.get('unreadable_rows') or []))
+                if names.get('tracker') in ('cut', 'exit1', 'words'):
+                    # The shapes endpoint.tracker_actors turns into the bare host fault: a cut
+                    # line, a bd that exited nonzero, or words that are not rows
+                    # (kittrial-5bb.188 item 1; revision-3 item 3(1)).
                     raise actor_names.TrackerUnreadable()
                 if names.get('tracker') in ('no-slot', 'empty'):
                     # Rows came back without the merge-slot row (`no-slot`), or the readable
@@ -673,6 +680,12 @@ def main():
             # As endpoint.main does: an export that could not be read is a host fault the
             # service reads as 503 "nothing was changed" (kittrial-5bb.188 item 1).
             answer['fault'] = 'tracker'
+        if isinstance(error, actor_names.TrackerRowsUnreadable):
+            # As endpoint.main does since kittrial-5bb.243: a row that cannot be read is
+            # its own fault, with the ids as a bounded field beside the sentence.
+            answer['fault'] = 'unreadable-rows'
+            answer['unreadable_rows'] = list(error.ids or ())
+            answer['unreadable_total'] = error.total
         if isinstance(error, actor_names.TrackerMergeSlotMissing):
             # A read without a merge slot is not transient: its own mark, so the service says
             # what to do (merge-create) rather than "try again shortly" (kittrial-5bb.202 item 1).

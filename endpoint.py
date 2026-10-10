@@ -445,8 +445,10 @@ def tracker_actors(root,path,before=None,own=()):
     from text nobody has read, and the whole-read proof must rest on a row that was read.
 
     A tracker that cannot be read raises ``actor_names.TrackerUnreadable`` -- a bd that
-    exits nonzero, an export that holds an unreadable row or a line that is not a row, or
-    text that is not rows at all --, and a read that came back without the
+    exits nonzero, or text that is not rows at all --, a read that came back holding a row
+    that cannot be parsed raises ``actor_names.TrackerRowsUnreadable`` (its own sentence
+    naming the row ids and the operator repair, never "try again shortly"; kittrial-5bb.243
+    item N7), and a read that came back without the
     project's merge slot raises ``actor_names.TrackerMergeSlotMissing``: every project this
     kit makes holds that slot, and a missing slot is what the merge-create operation
     repairs, so it must not be answered as the transient fault "try again shortly"
@@ -482,12 +484,20 @@ def tracker_actors(root,path,before=None,own=()):
         # bd could not answer, or answered something that is not rows: a host fault, never an
         # empty tracker and never a rejection of the caller's request.
         raise actor_names.TrackerUnreadable()
-    if any(not isinstance(row,dict) or row.get('malformed') for row in rows) \
-            or (not rows and text.strip()):
+    offending=[row for row in rows if not isinstance(row,dict) or row.get('malformed')]
+    read_any_row=any(isinstance(row,dict) and not row.get('malformed') for row in rows)
+    if offending and read_any_row:
         # One unreadable row refuses the whole read (not only its own names): the row may be
         # the one that holds the name, and an unreadable row's id never proves the slot
-        # (kittrial-5bb.221). Text came back, but it is not rows at all (``null``, which the
-        # row reader drops): the same failed read, not an empty tracker (kittrial-5bb.202).
+        # (kittrial-5bb.221). TrackerRowsUnreadable, not the bare fault: the row will not
+        # read again until an operator repairs it, so the answer names the row ids and the
+        # repair instead of "try again shortly" (kittrial-5bb.243 item N7).
+        raise actor_names.TrackerRowsUnreadable(
+            row.get('id') if isinstance(row, dict) else None for row in offending)
+    if offending or (not rows and text.strip()):
+        # Nothing rows-like came back at all: text that is not rows, the same failed read,
+        # not an empty tracker and not a row an operator can repair (kittrial-5bb.202 rev-3
+        # item 4: the transient fault, never the missing-slot answer).
         raise actor_names.TrackerUnreadable()
     if not any(is_merge_slot(row) for row in rows):
         # Zero rows (a plain `bd init`: the read succeeded and the tracker holds nothing,
@@ -1432,6 +1442,16 @@ def main():
             # and answers 503 "nothing was changed" (kittrial-5bb.188 item 1); `fault` is how
             # it tells a read the service may retry from a rejection.
             answer['fault']='tracker'
+        if isinstance(e,actor_names.TrackerRowsUnreadable):
+            # The export was read but holds a row that cannot be parsed: not transient, so
+            # its own mark and its own sentence naming the row ids and the operator repair
+            # (kittrial-5bb.243 item N7), beside the bare fault above for older readers.
+            # The ids ride as a field, bounded and checked by the exception itself, so the
+            # web service builds its answer from them and never from a stderr tail a row
+            # could shape (r2 review item 1).
+            answer['fault']='unreadable-rows'
+            answer['unreadable_rows']=list(e.ids or ())
+            answer['unreadable_total']=e.total
         if isinstance(e,actor_names.TrackerMergeSlotMissing):
             # The read came back without the merge slot (rows, or no rows at all): not
             # transient, so its own mark and its own sentence naming the merge-create repair
