@@ -232,6 +232,7 @@ class EndpointAttentionTests(fixes.EndpointCase):
         self.assertNotIn(task,[x['task'] for x in data['next_actions']])
         self.assertEqual(data['attention']['counts']['claimed'],0)
 
+    @patch.dict(os.environ, {'PYTHONUTF8': '1'})
     def test_only_undelivered_blocked_or_working_tasks_count_as_newer(self):
         blocked, working, delivered, approved = self.tasks
         for task in self.tasks:
