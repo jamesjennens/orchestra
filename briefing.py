@@ -57,10 +57,12 @@ REVERT_BRIEF_LIMIT=5
 # complete text, so a hostile description cannot make one answer unbounded.
 FULL_CONTEXT_BUDGET=20000
 FULL_FIELD_BUDGET=8000
-# C0/C1 controls other than tab and newline are rendered as the same \uXXXX escape the
-# JSON form already uses, so the fuller-context read cannot emit a raw ESC/BEL or a bare
-# carriage return that rewrites the reader's line.
-CONTROL_TEXT_RE=re.compile('[\x00-\x08\x0b-\x1f\x7f]')
+# Text that would rewrite or reorder what a reader sees: C0 controls other than tab and
+# newline, DEL, the C1 block, the Unicode line/paragraph separators (a bare separator
+# ends the line a reader is looking at) and the bidi controls (a right-to-left override
+# can reorder the answer on screen). Each is rendered as the same \uXXXX escape the JSON
+# form already uses, so the fuller-context read cannot emit a raw ESC/BEL/CR or hide text.
+CONTROL_TEXT_RE=re.compile('[\x00-\x08\x0b-\x1f\x7f-\x9f\u2028\u2029\u202a-\u202e\u2066-\u2069]')
 
 def token(data):return base64.urlsafe_b64encode(canonical_bytes(data)).decode().rstrip('=')
 
@@ -381,9 +383,10 @@ def clip(value,limit):
     return {'text':value[:limit],'omitted_chars':max(0,len(value)-limit)}
 
 def plain_text(value):
-    """Terminal-safe text: C0/C1 controls other than tab and newline become the same
-    \\uXXXX escape the JSON form already emits, so no answer carries a raw ESC/BEL or a
-    bare CR that rewrites the line a reader is looking at."""
+    """Terminal-safe text: C0/C1 controls (DEL included) other than tab and newline, the
+    Unicode line/paragraph separators and the bidi controls become the same \\uXXXX escape
+    the JSON form already emits, so no answer carries a raw ESC/BEL, a bare CR, a
+    separator that ends the reader's line, or a bidi override that reorders it."""
     return CONTROL_TEXT_RE.sub(lambda match:'\\u%04x'%ord(match.group()),str(value or ''))
 
 def encoded_size(text):

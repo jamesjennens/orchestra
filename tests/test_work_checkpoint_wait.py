@@ -123,6 +123,27 @@ class CheckpointWaitTests(unittest.TestCase):
         self.assertFalse(row['checkpoint_wait']['active'])
         self.assertEqual(row['checkpoint_wait']['total'], 1)
 
+    def test_a_closed_task_never_reads_as_an_active_owned_wait(self):
+        """kittrial-5bb.219 addition (b): pinned by a direct call, not through the queue.
+
+        `work.queue` cannot hand this function a closed row with a wait still active: a
+        closed task is listed only while its review is changes-requested,
+        awaiting-integration or error, and all of those are delivered, so `active` is
+        already false. The clause is therefore pinned here, where it is reachable, so a
+        mutant that drops it fails a test.
+        """
+        data = self.fixture()
+        row = data[0]
+        row['status'] = 'closed'
+        state = briefing.checkpoint_state(row, normalize=False)
+        wait = work.checkpoint_wait(row, 'alice/session', state)
+        self.assertEqual((wait['status'], wait['total'], wait['active']), ('recorded', 1, False))
+        # The same checkpoint on the same open row IS an active wait: closure is the
+        # difference the clause makes, and nothing else about the projection changes.
+        row['status'] = 'open'
+        state = briefing.checkpoint_state(row, normalize=False)
+        self.assertTrue(work.checkpoint_wait(row, 'alice/session', state)['active'])
+
 
 if __name__ == '__main__':
     unittest.main()

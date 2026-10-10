@@ -126,6 +126,12 @@ class EndpointAttentionTests(fixes.EndpointCase):
         action = data['next_actions'][0]
         self.assertEqual((action['priority'], action['requests'], action['review_state']),
                          (1, [request], 'changes-requested'))
+        # kittrial-5bb.249: the next-actions answer carries the same move sentence as the
+        # canonical `work --mine` row, so an agent is never left to read a state alone.
+        self.assertEqual(action['whose_move'], 'you')
+        self.assertEqual(action['next'],
+                         'This is your work now: 2 outstanding review items. Read `review %s`, deliver '
+                         'a revision that supersedes this contribution and respond to each item.' % first)
         self.assertEqual((data['attention']['state'], data['attention']['counts']['changes_requested'],
                           data['attention']['counts']['awaiting_review']), ('changes-requested', 1, 0))
         self.assertIn('1 contribution(s) have changes requested', data['attention']['summary'])
@@ -400,6 +406,9 @@ class EndpointAttentionTests(fixes.EndpointCase):
         self.assertEqual(read['tasks'][0], {
             'id': 'mine', 'title': 'm', 'status': 'in_progress', 'assignee': 'me', 'review_state': 'none',
             'contribution_id': None, 'pending_change_requests': [], 'open_items': 2, 'blocking_items':2,
+            # The canonical page says no item count here, so the move sentence falls back
+            # to the request ids it can see (kittrial-5bb.249).
+            'pending_review_items': None,
             'checkpoint_at': '2026-10-04T10:00:00Z', 'newer_activity': True})
         self.assertEqual(asked, [['--owner', 'me', '--limit', '100', '--offset', '0', '--json'],
                                  ['--owner', 'me', '--limit', '100', '--offset', '100', '--json']])
@@ -478,8 +487,11 @@ class InProcessAttentionTests(test_http_agents.AgentHarness):
         self.request('POST', '/v1/projects/%s/tasks/%s/claim' % (self.project, task), token=self.secret)
         actor = self.next()['agent']['actor']
         row = self.backend.agent_tasks(self.project, actor)['tasks'][0]
+        # `pending_review_items` is additive (kittrial-5bb.249): the canonical open-item
+        # count the move sentence needs, carried by both backends alike.
         self.assertEqual(sorted(row), ['assignee', 'blocking_items', 'checkpoint_at', 'contribution_id', 'id', 'newer_activity',
-                                       'open_items', 'pending_change_requests', 'review_state', 'status', 'title'])
+                                       'open_items', 'pending_change_requests', 'pending_review_items',
+                                       'review_state', 'status', 'title'])
         self.assertEqual(self.backend.agent_tasks(self.project)['tasks'], [row])   # unfiltered: every held task
 
     def test_actor_filter_excludes_somebody_elses_work(self):

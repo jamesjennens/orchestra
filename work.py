@@ -35,6 +35,61 @@ PENDING_REQUEST_IDS_MAX = 20
 # Compact owned-work context, not a recipient or authorization inference.
 CHECKPOINT_WAIT_ITEMS_MAX = 3
 
+#: The four values `whose_move` takes on a queue item (kittrial-5bb.249). `'you'` is the
+#: calling actor; the two middle values name the party that moves next. It answers the
+#: one question the queue's review-state field left a worker to guess.
+WHOSE_MOVE = ('you', 'reviewer', 'coordinator', 'unknown')
+UNKNOWN_MOVE_TEXT = 'Whose move this is cannot be told from the review state shown here.'
+
+
+def review_move(state, task, owned, named_reviewer=False, pending_items=0):
+    """`(whose_move, next)`: one plain sentence from the validated review state alone.
+
+    Caller-relative: `'you'` only when the next move is the calling actor's, so an
+    operator reading another lane's queue is never told the move is theirs, while a
+    named reviewer's own open review request is. Derived only from the review state the
+    item already shows plus the two facts the row already carries: whether the caller
+    holds it as a named reviewer, and how many blocking items are open. No title, no
+    comment and no actor is read as a claim about intent, and nothing is inferred from
+    a state this function does not name (that stays `'unknown'`).
+    """
+    name = str(task or 'the task')
+    items = max(0, int(pending_items or 0))
+    plural = 'item' if items == 1 else 'items'
+    if named_reviewer and state in ('awaiting-review', 'legacy-review-ready'):
+        return 'you', 'This is your review: read `review %s` and record your decision.' % name
+    if not owned:
+        return 'unknown', UNKNOWN_MOVE_TEXT
+    if state == 'changes-requested':
+        return 'you', ('This is your work now: %d outstanding review %s. Read `review %s`, deliver '
+                       'a revision that supersedes this contribution and respond to each item.'
+                       % (items, plural, name))
+    if state in ('awaiting-review', 'legacy-review-ready'):
+        return 'reviewer', "Nothing is for you to do: the next move is the reviewer's."
+    if state in ('awaiting-integration', 'approved'):
+        # `approved` is the web service's in-process name for the same state.
+        return 'coordinator', "Nothing is for you to do: the next move is the coordinator's."
+    if state in ('withdrawn', 'superseded') and items:
+        return 'you', ('This is your work now: %d outstanding review %s on a final contribution. '
+                       'Read `review %s` and deliver a new contribution that answers each item.'
+                       % (items, plural, name))
+    if state in (None, 'none'):
+        return 'you', ('This is your work: no contribution has been delivered yet. Read `review %s` '
+                       'for its current state and deliver one.' % name)
+    return 'unknown', UNKNOWN_MOVE_TEXT
+
+
+def waiting_move(next_action):
+    """`next` for a caller that waits for a person by its own current checkpoint.
+
+    The checkpoint's own wording is quoted, so the move sentence and the
+    `checkpoint_wait` block beside it read as one thing (kittrial-5bb.219 addition c).
+    """
+    text = next_action.get('text') if isinstance(next_action, dict) else next_action
+    if not text:
+        return None
+    return 'You are waiting for a person, by your own checkpoint: "%s"' % text
+
 
 def checkpoint_wait(row, actor, state, delivered=False):
     """Project the caller's latest validated checkpoint from the existing parse.
@@ -110,7 +165,7 @@ def help_payload(action='work'):
             'capability-offset': '>= %d' % WORK_OFFSET_MIN,
         }
         payload['output'] = {
-            'top_level': ['owner', 'total', 'items', 'next_offset', 'coverage', 'attention', 'guidance'],
+            'top_level': ['owner', 'total', 'your_move', 'items', 'next_offset', 'coverage', 'attention', 'guidance'],
             'guidance': 'guidance: the project\'s current standing guidance version (kittrial-5bb.99), '
                         'with present, version (null for unbound text), set_at, set_by (null when the audit record does not bind to '
                         'the text), repaired_by and repaired_at (only when a same-text repair kept that setter), '
@@ -138,7 +193,15 @@ def help_payload(action='work'):
                          'allowlist, paged by --capability-limit/--capability-offset',
             'item_identity': 'items[].task is the native task ID; items[].contribution_id is the '
                              'contribution comment ID, not a Git commit or latest_comment_id',
-            'item_fields': ['task', 'title', 'owner', 'status', 'review_state', 'contribution_id',
+            'item_move': 'items[].whose_move is you, reviewer, coordinator or unknown, relative to the '
+                         'calling actor, derived only from the validated review state the row already '
+                         'shows; items[].next is one plain sentence saying the same in words, and '
+                         'quotes the caller\'s own checkpoint when the caller waits for a person by '
+                         'it. Items where the move is the caller\'s sort first; top-level your_move '
+                         'carries their count for the filtered queue. Nothing is inferred from a title, a '
+                         'comment or an actor name.',
+            'item_fields': ['task', 'title', 'owner', 'status', 'review_state', 'whose_move', 'next',
+                            'contribution_id',
                             'commit', 'pending_review_items', 'pending_change_requests', 'open_items',
                             'blocking_items', 'checkpoint_at', 'newer_activity', 'checkpoint_wait',
                             'pending_handoff_requests',
@@ -380,7 +443,10 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
                           'recommended':False,'recommended_by':[],
                           'integration_disagreements':[],'integration_warnings':[],
                           'newer_activity_by_others':None,'newer_activity_own':None,
-                          'newer_activity_coverage':None,'unresolved_directions':None})
+                          'newer_activity_coverage':None,'unresolved_directions':None,
+                          # A malformed row shows no validated review state, so whose move it
+                          # is stays unknown rather than guessed (kittrial-5bb.249).
+                          'whose_move':'unknown','next':UNKNOWN_MOVE_TEXT})
             continue
         # The merge slot is an internal record (kittrial-5bb.113): on real bd it is a
         # row of type task, so the type alone never excluded it.
@@ -482,11 +548,17 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
         pending_change_requests=[]
         for pending in review.get('pending_requests',[]):
             if pending.get('request') not in pending_change_requests:pending_change_requests.append(pending.get('request'))
+        pending_items=len(review.get('pending_requests',[]))
+        # Whose move it is, and one plain sentence saying so (kittrial-5bb.249). Derived from
+        # the validated review state this row already shows; no further read.
+        move,move_text=review_move(state,row['id'],bool(actor) and row.get('assignee')==actor,
+                                   named_reviewer=review_request,pending_items=pending_items)
         items.append({'open_items':open_items,'blocking_items':blocking_items,
                       'checkpoint_at':checkpoint_at,'newer_activity':newer_activity,
                       'pending_change_requests':pending_change_requests[:PENDING_REQUEST_IDS_MAX],
                       'task':row['id'],'title':str(row.get('title',''))[:200],'owner':row.get('assignee'),'status':row.get('status'),'review_state':state,
-                      'contribution_id':contribution.get('comment_id'),'commit':contribution.get('commit'),'pending_review_items':len(review.get('pending_requests',[])),
+                      'whose_move':move,'next':move_text,
+                      'contribution_id':contribution.get('comment_id'),'commit':contribution.get('commit'),'pending_review_items':pending_items,
                       'pending_handoff_requests':handoff_requests,
                       'pending_handoff_total':handoff_total,
                       'pending_handoff_next_offset':a.handoff_offset+a.handoff_limit if a.handoff_offset+a.handoff_limit<handoff_total else None,
@@ -514,7 +586,10 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
                       # naming both facts and both scopes, and their rendered warnings.
                       'integration_disagreements':disagreements,'integration_warnings':integration_warnings})
     priority={'changes-requested':0,'error':1,'awaiting-review':2,'legacy-review-ready':2,'awaiting-integration':3}
-    items.sort(key=lambda r:(priority.get(r['review_state'],4),r['task']))
+    # Items where the next move is the CALLER's sort first (kittrial-5bb.249); inside each
+    # group the review-state order above is unchanged, so a revision request still leads
+    # the caller's own undelivered work.
+    items.sort(key=lambda r:(0 if r['whose_move']=='you' else 1,priority.get(r['review_state'],4),r['task']))
     coverage='Fresh current view; structured review takes precedence over legacy review-ready labels. Lifecycle facts remain independent; malformed handoff journals are surfaced as errors.'
     if malformed_named:
         coverage+=' Malformed issue rows: %s.'%(', '.join(malformed_named))
@@ -530,8 +605,23 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
         item['checkpoint_wait']=checkpoint_wait(task_rows.get(item['task'],{}),actor,
             checkpoint_states.get(item['task']),
             delivered=bool(item['contribution_id']) or item['review_state'] not in (None,'none'))
+        # (kittrial-5bb.219 addition c) Where the caller waits for a person by its own
+        # current checkpoint, the move sentence quotes that checkpoint's own words, and
+        # the move itself is not the caller's to make until the person answers.
+        if item['checkpoint_wait'].get('active'):
+            wait_text=waiting_move(item['checkpoint_wait'].get('next_action'))
+            if wait_text:
+                item['next']=wait_text
+                item['whose_move']='unknown'
         if item['task'] in task_rows:
             item.update(checkpoint_queue_fields(rows,task_rows[item['task']],checkpoint_states.get(item['task'])))
+    # The count of this answer's items where the next move is the caller's, read first.
+    # `items` holds the same row objects as the page above, so a displayed row already
+    # carries the checkpoint reconciliation and an undisplayed one keeps its move.
+    own_move=sum(1 for item in items if item['whose_move']=='you')
+    result={'owner':result['owner'],'total':result['total'],
+            'your_move':{'count':own_move,'text':'%d of your tasks need your action'%own_move},
+            **{key:value for key,value in result.items() if key not in ('owner','total')}}
     if journal is not None:
         # The standing guidance channel (kittrial-5bb.99): every work queue page
         # carries the current guidance version, so a worker that only runs `work`

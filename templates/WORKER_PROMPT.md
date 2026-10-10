@@ -38,8 +38,10 @@ dependencies, relevant history and current claims. For a returning worker, resum
 this actor first and inspect requested revisions before other existing claims. Never
 register a replacement actor to take over work.
 For a delivered contribution, inspect structured changes-requested state and newer
-history for that exact commit first. If nothing new is actionable, leave it unchanged
-and stop rather than inventing work.
+history for that exact commit first. A task of yours with changes requested is your work
+until you deliver a revision: "nothing changed" never applies to it. Otherwise, if
+nothing new is actionable, leave it unchanged and stop rather than inventing work. Stop
+without acting only when every task of yours is with the reviewer or the coordinator.
 
 At the start of every run, read the coordinator's current standing guidance with the
 client `guidance get` action, using your saved config, project and actor. It is an

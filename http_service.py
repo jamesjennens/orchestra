@@ -1056,6 +1056,9 @@ class InProcessBackend:
             rows.append({'id': task['id'], 'title': task.get('title'), 'status': task.get('status'),
                          'assignee': task.get('assignee'), 'review_state': review['state'],
                          'contribution_id': (review['contribution'] or {}).get('id'),
+                         # Open requested-change ITEMS (the canonical `pending_review_items`),
+                         # so the move sentence's N matches the canonical `work` row.
+                         'pending_review_items': review['open_requests'],
                          **self._agent_fields(task, review)})
         return {'tasks': rows, 'complete': True}
 
@@ -1280,6 +1283,9 @@ def own_queue_tasks(queue, actor=None):
                       'assignee':row.get('assignee'),'review_state':row.get('review_state'),
                       'contribution_id':(row.get('contribution') or {}).get('id'),
                       'pending_change_requests':list(fields.get('pending_change_requests') or [])[:20],
+                      # The canonical item count, so the move sentence says the same N as the
+                      # `work` row it came from (kittrial-5bb.249).
+                      'pending_review_items':row.get('open_requests'),
                       'open_items':fields.get('open_items',0),
                       'blocking_items':attention_blocking_items(fields),
                       'checkpoint_at':fields.get('checkpoint_at'),
@@ -2708,6 +2714,8 @@ class EndpointBackend:
                              'assignee': item.get('assignee'), 'review_state': item.get('review_state'),
                              'contribution_id': (item.get('contribution') or {}).get('id'),
                              'pending_change_requests': list(attention.get('pending_change_requests') or []),
+                             # The queue row's canonical open-item count (kittrial-5bb.249).
+                             'pending_review_items': item.get('open_requests'),
                              'open_items': attention.get('open_items',0),
                              'blocking_items':attention_blocking_items(attention),
                              'checkpoint_at': attention.get('checkpoint_at'),
@@ -2729,7 +2737,10 @@ class EndpointBackend:
                     continue
                 rows.append(dict({'id': row.get('task'), 'title': row.get('title'), 'status': row.get('status'),
                                   'assignee': row.get('owner'), 'review_state': row.get('review_state'),
-                                  'contribution_id': row.get('contribution_id')},
+                                  'contribution_id': row.get('contribution_id'),
+                                  # The canonical open-item count, so the move sentence's N
+                                  # matches the `work` row (kittrial-5bb.249).
+                                  'pending_review_items': row.get('pending_review_items')},
                                  **self._attention_fields(row)))
             offset = page.get('next_offset')
             if offset is None:
@@ -5364,6 +5375,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         review state and does not count as blocked, regardless of open items.
         """
         actor = agent.get('actor') or agent.get('id')
+        from work import review_move                                            # one move sentence for both answers (kittrial-5bb.249)
         counts = {'claimable': 0, 'claimed': 0, 'changes_requested': 0,
                   'awaiting_review': 0, 'blocked': 0, 'in_progress': 0, 'awaiting_integration': 0,
                   'review_errors': 0, 'checkpoint_errors': 0, 'read_errors': 0,
@@ -5414,6 +5426,17 @@ class ApiHandler(BaseHTTPRequestHandler):
                            'blocking_items':blocking_items,
                            'blocked_since': task.get('checkpoint_at') if blocked else None,
                            'newer_activity': task.get('newer_activity') if blocked or in_progress else None}
+                # Whose move it is, in the same words as the canonical `work --mine` row
+                # (kittrial-5bb.249): one helper, so the two answers cannot disagree. N is the
+                # canonical open-item count where the backend carries it. The named-reviewer
+                # case is not reachable here: these are the agent's own tasks.
+                item_count = task.get('pending_review_items')
+                if type(item_count) is not int or item_count < 0:
+                    item_count = len(details['requests'])
+                move, move_text = review_move(review, task.get('id'),
+                                              task.get('assignee') == actor,
+                                              pending_items=item_count)
+                details['whose_move'], details['next'] = move, move_text
                 if review == 'changes-requested':
                     own_actions.append(self._agent_action(
                         1, 'changes-requested', project_id, task,
