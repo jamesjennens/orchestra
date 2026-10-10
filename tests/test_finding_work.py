@@ -8,6 +8,7 @@ work is found". The order the text states for an agent is pinned here to the ord
 It also carries the short recurring prompts of kittrial-5bb.219 (its item 1).
 """
 import json
+import os
 import re
 import shutil
 import sys
@@ -128,9 +129,14 @@ class ServedTextTests(unittest.TestCase):
         actions = set(re.findall(r"\['([a-z]+)'\]", listed.group(1)))
         endpoint = (KIT / 'endpoint.py').read_text(encoding='utf-8')
         passed_on = set(re.findall(r"'([a-z]+)'", re.search(r"^ALLOWED=\{(.*?)\}", endpoint, re.M).group(1)))
-        commands = ['guidance get', 'guidance ack --version VERSION', 'work --mine', 'ready --json',
-                    'update TASK --claim --json', 'checkpoint TASK --file FILE', 'docs start', 'docs finding-work',
-                    'docs reviews']
+        # Extract command slots from the actual prose, including parenthesized
+        # commands; do not maintain a second list of what the prompt says.
+        arg = r'(?:--[a-z-]+|[A-Z][A-Z_]*)'
+        heads = '|'.join(map(re.escape, sorted(actions | passed_on, key=len, reverse=True)))
+        literal = '|'.join(map(re.escape, sorted(set(onboarding.DOCUMENTS) | {'get', 'ack', 'resume'}, key=len, reverse=True)))
+        commands = re.findall(r'\b((?:' + heads + r') (?:' + literal + r'|' + arg + r')(?: ' + arg + r')*)', prompt)
+        self.assertGreaterEqual(len(commands), 10, commands)
+        self.assertIn('session resume', commands)
         for command in commands:
             with self.subTest(command=command):
                 self.assertIn(command, prompt)
@@ -140,6 +146,33 @@ class ServedTextTests(unittest.TestCase):
         # The served name of docs/WORKER_START.md is `start`; `worker-start` is no document.
         self.assertEqual(onboarding.DOCUMENTS['start'], 'docs/WORKER_START.md')
         self.assertNotIn('worker-start', onboarding.DOCUMENTS)
+
+    def test_every_concrete_document_reference_is_catalogued(self):
+        count = 0
+        for name in NAMES:
+            text = onboarding.member_document(KIT, name)['text']
+            refs = re.findall(r'\bdocs ([a-z][a-z-]+)(?=[`.,;\n]| --)', text)
+            count += len(refs)
+            for ref in refs:
+                self.assertIn(ref, onboarding.DOCUMENTS, '%s names unserved docs %s' % (name, ref))
+        self.assertGreaterEqual(count, 8)
+
+    def test_guidance_limit_setup_visibility_and_activity_are_truthful(self):
+        doc = ' '.join((KIT / 'docs/FINDING_WORK.md').read_text(encoding='utf-8').split())
+        prompt = onboarding.member_document(KIT, 'poll-prompt-agent')['prompt']
+        guide = (KIT / 'web/js/agentSetup.js').read_text(encoding='utf-8')
+        self.assertIn('it cannot read the guidance yet. No route', doc)
+        self.assertIn('for owners and superusers only', doc)
+        self.assertIn('does not reach you over the web yet', prompt)
+        self.assertIn('does not reach you over this API yet', guide)
+        for text in (doc, prompt, guide):
+            self.assertIn('Blocked and in-progress tasks', text)
+            self.assertIn('reading acknowledges nothing', text.lower())
+            self.assertNotIn('does not carry comments yet', text)
+        self.assertIn('kittrial-5bb.114', doc)
+        self.assertIn('kittrial-5bb.207', doc)
+        self.assertIn("Without a checkpoint, an in-progress task's", doc)
+        self.assertIn('save its first checkpoint', doc)
 
     def test_the_first_prompt_is_served_as_it_is(self):
         document = onboarding.member_document(KIT, 'worker-prompt')
@@ -338,6 +371,84 @@ class EndpointOrderTests(test_agent_attention.EndpointAttentionTests):
 class RealStackOrderTests(held_stack.RealStackTests):
     """And through the real stack: the web service, the real endpoint.py, a real bd."""
 
+    @unittest.skipUnless(os.environ.get('ORCHESTRA_ATTENTION_SCALE') == '1',
+                         'set ORCHESTRA_ATTENTION_SCALE=1 for the282-task native activity fixture')
+    def test_flagged_task_is_not_hidden_by_282_owned_native_tasks(self):
+        import time
+        made = self.request('POST', '/v1/agents', {'name': 'Scale reader', 'projects': ['pp']},
+                            token=self.tokens['casey'])
+        self.assertEqual(201, made.status, made.data)
+        secret = made.data['credential']['secret']; actor = made.data['agent']['actor']
+        def native_ok(*args):
+            done = self.bd(*args)
+            self.assertEqual(0, done.returncode, done.stderr)
+            return done.stdout
+        owned = []
+        for index in range(282):
+            row = json.loads(native_ok('create', '--title', 'Owned scale %04d' % index,
+                                           '--assignee', actor, '--json'))
+            owned.append(row['id'])
+        for offset in range(0, len(owned), 50):
+            native_ok('update', *owned[offset:offset + 50], '--status', 'in_progress')
+        target = sorted(owned)[-1]; base = self.tasks + '/' + target
+        time.sleep(1.05)
+        before = self.request('GET', base + '/brief', token=secret)
+        self.assertEqual(200, before.status, before.data)
+        cp = self.request('POST', base + '/checkpoints', dict(schema_version=1, previous=None,
+            activity_cursor=before.data['activity_cursor'], intent='scale', acceptance='flag survives cap',
+            summary='working', next_action='read feedback', open_items=[], resolved=[]), token=secret)
+        self.assertEqual(201, cp.status, cp.data)
+        native_ok('comments', 'add', target, 'Direction at the far end', '--author', 'scale-coordinator')
+        for _ in range(2):
+            answer = self.request('GET', '/v1/agents/me/next', token=secret)
+            self.assertEqual(200, answer.status, answer.data)
+            data = answer.data; first = data['next_actions'][0]
+            self.assertEqual((target, True), (first['task'], first['newer_activity']))
+            self.assertEqual((282, 1), (data['attention']['counts']['claimed'], data['attention']['counts']['newer_activity']))
+            self.assertTrue(data['attention']['actions_truncated'])
+            self.assertFalse(data['attention']['own_tasks_truncated'])
+            brief = self.request('GET', first['links']['brief'], token=secret)
+            self.assertEqual(200, brief.status, brief.data)
+            self.assertGreaterEqual(brief.data['newer']['other_count'], 1)
+            print('NATIVE_FLAGGED_SCALE ' + json.dumps(dict(claimed=282, flagged=1,
+                  listed=len(data['next_actions']), first=first['task'], newer=brief.data['newer']['other_count'])), flush=True)
+
+    def test_in_progress_comment_reaches_the_agent_and_brief_on_the_real_stack(self):
+        import time
+        made = self.request('POST', '/v1/agents', {'name': 'Kestrel', 'working_directory': '/synthetic/kestrel', 'projects': ['pp']}, token=self.tokens['casey'])
+        self.assertEqual(201, made.status, made.data)
+        agent = made.data['credential']['secret']
+        task = self.new('progress comment'); base = '%s/%s' % (self.tasks, task)
+        self.assertEqual(200, self.claim('casey', task, token=agent).status)
+        time.sleep(1.05)  # Native timestamps have second precision; isolate the checkpoint.
+        before = self.request('GET', base + '/brief', token=agent)
+        self.assertEqual(200, before.status, before.data)
+        self.assertIn('newer', before.data)
+        cp = self.request('POST', base + '/checkpoints', {'schema_version': 1, 'previous': None,
+            'activity_cursor': before.data['activity_cursor'], 'intent': 'read feedback', 'acceptance': 'comment is visible',
+            'summary': 'working', 'next_action': 'continue', 'open_items': [], 'resolved': []}, token=agent)
+        self.assertEqual(201, cp.status, cp.data)
+        answer = rb.endpoint.execute(self.root, {'project': 'pp', 'actor': 'session-synthetic-coordinator', 'action': 'bd',
+            'args': ['comments', 'add', task, 'Review this <script> literally\u0085next line', '--json'], 'attachments': {}})
+        self.assertEqual(0, answer['returncode'], answer)
+        for _ in range(2):
+            current = self.request('GET', '/v1/agents/me/next', token=agent)
+            self.assertEqual(200, current.status, current.data)
+            action = next(x for x in current.data['next_actions'] if x['task'] == task)
+            self.assertEqual((action['kind'], action['newer_activity']), ('in-progress', True))
+            self.assertEqual(base, action['links']['task'])
+            brief = self.request('GET', action['links']['brief'], token=agent)
+            self.assertEqual(200, brief.status, brief.data)
+            self.assertGreaterEqual(brief.data['newer']['other_count'], 1)
+            self.assertLessEqual(len(brief.data['newer']['entries']), 5)
+            self.assertEqual(brief.data['checkpoint']['id'], cp.data['comment_id'])
+            self.assertEqual(action['links']['history'], brief.data['newer']['history'])
+            self.assertNotIn('history_new', brief.data['newer'])
+            self.assertNotIn('verify', brief.data['newer'])
+        history = self.request('GET', base + '/history?limit=100', token=agent)
+        self.assertEqual(200, history.status, history.data)
+        self.assertIn('Review this <script> literally', json.dumps(history.data, ensure_ascii=False))
+
     def test_own_feedback_comes_before_free_work_and_a_held_task_is_not_offered(self):
         made = self.request('POST', '/v1/agents', {'name': 'Kestrel', 'working_directory': '/home/x/kestrel', 'projects': ['pp']},
                             token=self.tokens['casey'])
@@ -433,6 +544,21 @@ class PageTests(Members):
                                         {'text': 'A REPLACE_ONE', 'left': ['REPLACE_ONE']},
                                         {'text': 'nothing here', 'left': []}, {'text': '', 'left': []}])
         self.assertEqual(seen['body'], 'First paragraph.\n\n## Next\n')
+        self.assertEqual(seen['once'], {'text': 'REPLACE_SERVER_URL visits https://office.example; 10 minutes', 'left': []})
+        placeholder = seen['placeholderAgent'][1]
+        self.assertIn('You are REPLACE_SERVER_URL, an Orchestra agent.', placeholder['text'])
+        self.assertIn('https://office.example/v1/agents/me/next', placeholder['text'])
+        self.assertEqual(placeholder['left'], 'REPLACE_INTERVAL')
+        for status, failure in seen['errors'].items():
+            with self.subTest(status=status):
+                self.assertEqual((failure['injected'], failure['partial'], failure['recovered']), (0, 0, True))
+                self.assertNotIn('whether this was saved', failure['before'])
+                self.assertNotIn('same button again without changing', failure['before'])
+                self.assertNotIn('<script>bad</script>', failure['before'])
+                self.assertIn('documents', failure['before'])
+        self.assertIn('update the installed kit', seen['errors']['404']['before'])
+        self.assertIn('No access', seen['errors']['403']['before'])
+        self.assertIn('Sign in again', seen['errors']['401']['before'])
 
     def test_the_page_is_reached_from_the_projects_navigation_by_every_member(self):
         app = (KIT / 'web' / 'js' / 'app.js').read_text(encoding='utf-8')
