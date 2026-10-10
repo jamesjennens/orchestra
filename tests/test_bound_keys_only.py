@@ -12,9 +12,11 @@ the setting absent or false, the line the wrapper launches is the same line as b
 unbound, and every other reader of the setting reads off.
 """
 import base64
+import builtins
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -43,6 +45,28 @@ CLIENT = '/srv/kit/endpoint.py'
 ROOT = '/srv/state'
 PYTHON = '/usr/bin/python3'
 
+#: The scratch home this WHOLE module reads through ``Path.home()``; no test of this module may
+#: open the runner's real ``~/.ssh/authorized_keys`` (kittrial-5bb.196 review, item 1: 38 opens
+#: of the runner's own key file). `bound_keys_only_switch`/`authorized_keys_listing` fall back
+#: to `Path.home()/.ssh/authorized_keys` when no file is passed, so the fallback is patched for
+#: every test here, and one guard test asserts no `authorized_keys` outside it is opened.
+SCRATCH_HOME = None
+_SCRATCH_HOME_PATCH = None
+
+
+def setUpModule():
+    global SCRATCH_HOME, _SCRATCH_HOME_PATCH
+    SCRATCH_HOME = Path(tempfile.mkdtemp(prefix='bound-keys-only-home-'))
+    (SCRATCH_HOME/'.ssh').mkdir()
+    (SCRATCH_HOME/'.ssh'/'authorized_keys').write_text('', encoding='utf-8')
+    _SCRATCH_HOME_PATCH = mock.patch.object(Path, 'home', return_value=SCRATCH_HOME)
+    _SCRATCH_HOME_PATCH.start()
+
+
+def tearDownModule():
+    _SCRATCH_HOME_PATCH.stop()
+    shutil.rmtree(SCRATCH_HOME, ignore_errors=True)
+
 
 def runtime(base, *projects):
     """A runtime root with initialized-looking projects."""
@@ -61,6 +85,48 @@ def write_settings(root, value=None, operators=(OPERATOR,)):
     if value is not None:
         document['bound_keys_only'] = value
     (root/'deployment.private.json').write_text(json.dumps(document), encoding='utf-8')
+
+
+def key_line_text(root, kit=None, bound='', extra='', comment='scratch'):
+    """One authorized_keys line whose forced command runs this kit's wrapper on ``root``."""
+    kit = KIT if kit is None else kit
+    return ('command="/usr/bin/python3 -E -s %s/ssh_forced_command.py --root %s --endpoint %s/endpoint.py%s%s",'
+            'restrict,no-pty ssh-ed25519 %s %s'
+            % (kit.as_posix(), root.as_posix(), kit.as_posix(), extra, bound, KEY_BODY, comment))
+
+
+class ScratchHomeGuardTests(unittest.TestCase):
+    """Item 1: no test of this module may read the runner's real key file.
+
+    The module patches ``Path.home`` for every test (``setUpModule``). This test drives the
+    default-path calls and records every file the module opens, so a future test or code change
+    that reaches the real ``~/.ssh/authorized_keys`` fails here rather than in somebody's CI.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = runtime(os.path.realpath(self.tmp.name), 'alpha')
+        write_settings(self.root, None)
+
+    def test_the_modules_default_path_is_the_scratch_home_and_nothing_else(self):
+        real_key = str(Path(os.path.expanduser('~')).resolve()/'.ssh'/'authorized_keys')
+        opened = []
+        real_open = builtins.open
+
+        def recording(file, *args, **kwargs):
+            opened.append(str(file))
+            return real_open(file, *args, **kwargs)
+
+        with mock.patch.object(builtins, 'open', recording):
+            admin.bound_keys_only_switch(self.root, 'status', OPERATOR)
+            admin.bound_keys_only_switch(self.root, 'on', OPERATOR)
+        keys = [name for name in opened if name.endswith('authorized_keys')]
+        self.assertTrue(keys, 'the default authorized_keys path was not exercised: %r' % opened)
+        for name in keys:
+            self.assertTrue(name.startswith(str(SCRATCH_HOME)), name)
+        # The runner's own default path is exactly what must never be opened.
+        self.assertNotIn(real_key, keys)
 
 
 class ReaderTests(unittest.TestCase):
@@ -120,15 +186,34 @@ class ReaderTests(unittest.TestCase):
                 self.assertIn(said, str(refused.exception))
 
     def test_a_settings_name_that_is_not_a_regular_file_is_refused(self):
+        """N09e: the not-a-regular-file refusal must not print the settings path again."""
         (self.root/'deployment.private.json').mkdir()
         with self.assertRaises(ValueError) as refused:
             forced.bound_keys_only(self.root)
         self.assertIn('not a regular file', str(refused.exception))
+        self.assertNotIn('deployment.private.json', str(refused.exception))
         # The host reader says UNKNOWN (not OFF) for the same shape, so setup-status cannot say
         # "the setting is off" while the wrapper refuses every key (item 2c).
         with self.assertRaises(admin.ConfigurationUnreadable) as refused:
             admin.bound_keys_only(self.root)
         self.assertIn('not a regular file', str(refused.exception))
+
+    def test_an_open_error_refuses_without_naming_the_path(self):
+        """N09c: the open-error message must keep the strerror, never the OSError with its path."""
+        write_settings(self.root, True)
+        real_open = builtins.open
+
+        def denied(file, *args, **kwargs):
+            if str(file).replace('\\', '/').endswith('deployment.private.json'):
+                raise PermissionError(13, 'Permission denied', str(file))
+            return real_open(file, *args, **kwargs)
+
+        with mock.patch.object(builtins, 'open', denied):
+            with self.assertRaises(ValueError) as refused:
+                forced.bound_keys_only(self.root)
+        self.assertIn('cannot read the installation setting', str(refused.exception))
+        self.assertIn('Permission denied', str(refused.exception))
+        self.assertNotIn('deployment.private.json', str(refused.exception))
 
     def test_a_stat_error_that_is_not_missing_refuses_both_readers(self):
         """M05e: a stat error other than "missing" must not read OFF (the fail-open the design forbids)."""
@@ -324,10 +409,12 @@ class WrapperSettingEndToEndTests(unittest.TestCase):
 class WrapperProcessTests(unittest.TestCase):
     """The wrapper as a real process, with stderr on a PIPE (kittrial-5bb.196 review, item 1).
 
-    On Python 3.6 to 3.8 stderr to a pipe is block-buffered, so a warning written just before
-    ``os.execvpe`` replaces the process never arrives unless it is flushed. These tests run the
-    wrapper the way sshd does - a fresh process, stderr a pipe - so they hold that flush here and
-    on the office interpreter.
+    These tests run the wrapper the way sshd does - a fresh process, stderr a pipe - and were the
+    round-1 answer for the 3.6-office case. They do NOT by themselves hold the flush on this
+    interpreter: on Python 3.9+ stderr to a pipe is line-buffered, and this module cannot be
+    imported on 3.6 (``admin.py`` needs 3.10), so the process alone cannot show it. The flush
+    itself is held by ``test_the_warning_and_a_refusal_flush_stderr``, which patches ``sys.stderr``
+    and counts the calls, on the running interpreter (kittrial-5bb.196 review, item 3a).
     """
 
     def setUp(self):
@@ -395,6 +482,48 @@ class WrapperProcessTests(unittest.TestCase):
         self.assertEqual(process.returncode, 2)
         self.assertIn(b'not valid JSON', process.stderr)
         self.assertNotIn(b'deployment.private.json', process.stderr)
+
+
+class _CountingStderr(io.StringIO):
+    """A stderr that records how many times it was flushed."""
+
+    def __init__(self):
+        super().__init__()
+        self.flushes = 0
+
+    def flush(self):
+        self.flushes += 1
+        super().flush()
+
+
+class FlushTests(unittest.TestCase):
+    """Item 3a: the two flushes are held by a test, on whatever interpreter runs the suite.
+
+    On Python 3.9+ stderr to a pipe is line-buffered, so the process tests cannot fail when a
+    flush is removed; and this module cannot be imported on 3.6 (``admin.py`` needs 3.10), so the
+    office interpreter cannot run it either. Patching ``sys.stderr`` with a counting object and
+    calling the two functions directly holds the flush itself, here, on every interpreter.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = runtime(os.path.realpath(self.tmp.name), 'alpha')
+
+    def test_the_warning_and_a_refusal_flush_stderr(self):
+        write_settings(self.root, 'on')
+        said = _CountingStderr()
+        with mock.patch.object(sys, 'stderr', said):
+            self.assertFalse(forced.bound_keys_only(self.root))
+        self.assertIn('not true or false', said.getvalue())
+        self.assertGreaterEqual(said.flushes, 1, 'the non-bool warning was not flushed')
+        # The refusal path flushes too, so a refusal never depends on CPython's exit-time flush
+        # and is complete before any later exec.
+        said = _CountingStderr()
+        with mock.patch.object(sys, 'stderr', said):
+            self.assertEqual(forced.refuse('a reason'), 2)
+        self.assertIn('a reason', said.getvalue())
+        self.assertGreaterEqual(said.flushes, 1, 'the refusal was not flushed')
 
 
 class SettingsCommandTests(unittest.TestCase):
@@ -524,6 +653,125 @@ class SettingsCommandTests(unittest.TestCase):
         self.assertEqual(kept[aside[0]], 'nonsense')
         self.assertIn('damaged', said.getvalue())
 
+    def test_a_damaged_audit_does_not_read_as_agreeing(self):
+        """N08b: a damaged audit is a disagreement, never "no history, everything agrees"."""
+        document = self.document()
+        document[admin.BOUND_KEYS_ONLY_AUDIT_KEY] = 'nonsense'
+        self.marker.write_text(json.dumps(document), encoding='utf-8')
+        said = io.StringIO()
+        with mock.patch.object(sys, 'stderr', said):
+            status = self.switch('status')
+        self.assertFalse(status['audit_readable'])
+        self.assertFalse(status['audit_agrees'])
+        self.assertEqual(status['audit_note'], 'damaged')
+        self.assertIn('damaged', said.getvalue())
+
+    def test_a_hand_set_value_with_no_audit_entry_says_no_entry(self):
+        """Item 4: nothing was recorded, so a hand-set on must not read as agreeing."""
+        document = self.document()
+        document[admin.BOUND_KEYS_ONLY_KEY] = True
+        self.marker.write_text(json.dumps(document), encoding='utf-8')
+        said = io.StringIO()
+        with mock.patch.object(sys, 'stderr', said):
+            status = self.switch('status')
+        self.assertTrue(status['bound_keys_only'])
+        self.assertIsNone(status['audit_agrees'])
+        self.assertEqual(status['audit_note'], 'no entry')
+        self.assertIn('no entry', said.getvalue())
+
+    def test_a_hostile_audit_field_is_escaped_and_bounded(self):
+        """Item 4: a hand-edited actor/at must not put ESC or 200 kB on the terminal."""
+        self.switch('on')
+        self.switch('off')
+        document = self.document()
+        document[admin.BOUND_KEYS_ONLY_KEY] = True           # stale against the last (off) entry
+        audit = document[admin.BOUND_KEYS_ONLY_AUDIT_KEY]
+        audit[-1]['actor'] = '\x1b[31m' + 'A' * 200000
+        audit[-1]['at'] = '2020-01-01\n\x07'
+        self.marker.write_text(json.dumps(document), encoding='utf-8')
+        said = io.StringIO()
+        with mock.patch.object(sys, 'stderr', said):
+            status = self.switch('status')
+        self.assertFalse(status['audit_agrees'])
+        text = said.getvalue()
+        self.assertNotIn('\x1b', text)
+        self.assertNotIn('\x07', text)
+        self.assertLess(len(text), 2000)
+        self.assertIn('\\x1b', text)                         # escaped, not silently dropped
+
+    def test_a_non_bool_value_warns_once_in_status(self):
+        """Item 6: `status` reads the setting twice; the warning must be printed once."""
+        write_settings(self.root, 'on')
+        said = io.StringIO()
+        with mock.patch.object(sys, 'stderr', said):
+            self.switch('status')
+        self.assertEqual(said.getvalue().count('not true or false'), 1)
+
+    def test_status_on_a_directory_or_fifo_says_unknown_not_not_installed(self):
+        """Item 4: a present but non-regular settings path is UNKNOWN, not "not installed"."""
+        self.marker.unlink()
+        self.marker.mkdir()
+        said = io.StringIO()
+        with mock.patch.object(sys, 'stderr', said):
+            status = self.switch('status')
+        self.assertIsNone(status['bound_keys_only'])
+        self.assertEqual(status['audit_note'], 'unknown')
+        self.assertIn('not a regular file', said.getvalue())
+        self.assertNotIn('not installed', said.getvalue())
+        with self.assertRaises(admin.ConfigurationUnreadable):
+            self.switch('on')
+
+    def test_a_non_operator_reads_no_authorized_keys_and_no_preview(self):
+        """N17: the preview (which opens the keys file) is read only AFTER the operator check."""
+        file = Path(self.tmp.name)/'authorized_keys'
+        file.write_text('', encoding='utf-8')
+        with mock.patch.object(admin, 'bound_keys_only_would_refuse',
+                               side_effect=AssertionError('read before the operator check')) as preview:
+            for action in ('status', 'on', 'off'):
+                with self.assertRaises(ValueError):
+                    admin.bound_keys_only_switch(self.root, action, 'mallory', str(file))
+        preview.assert_not_called()
+
+    def test_status_reports_the_preview(self):
+        """N11c: `status` must name the lines `on` would refuse, not None."""
+        file = Path(self.tmp.name)/'authorized_keys'
+        file.write_text(key_line_text(self.root) + '\n', encoding='utf-8')
+        status = admin.bound_keys_only_switch(self.root, 'status', OPERATOR, str(file))
+        self.assertEqual(status['would_be_refused'], [1])
+
+    def test_the_preview_is_read_before_the_flip_is_written(self):
+        """Item 1: read and build the list first, then flip, then print."""
+        events = []
+        real_preview = admin.authorized_keys_preview
+        real_write = admin.atomic_private_write
+
+        def preview(*args, **kwargs):
+            events.append('preview')
+            return real_preview(*args, **kwargs)
+
+        def write(*args, **kwargs):
+            events.append('write')
+            return real_write(*args, **kwargs)
+
+        file = Path(self.tmp.name)/'authorized_keys'
+        file.write_text(key_line_text(self.root) + '\n', encoding='utf-8')
+        with mock.patch.object(admin, 'authorized_keys_preview', preview), \
+                mock.patch.object(admin, 'atomic_private_write', write), \
+                mock.patch.object(sys, 'stderr', io.StringIO()):
+            admin.bound_keys_only_switch(self.root, 'on', OPERATOR, str(file))
+        self.assertEqual(events[:2], ['preview', 'write'])
+
+    def test_a_failing_preview_read_does_not_flip_the_setting(self):
+        """Item 1: a slow or failing read must not leave the setting on with nothing printed."""
+        def failing(*args, **kwargs):
+            raise OSError('the keys file is on a slow mount')
+
+        with mock.patch.object(admin, 'authorized_keys_preview', failing):
+            with self.assertRaises(OSError):
+                admin.bound_keys_only_switch(self.root, 'on', OPERATOR)
+        self.assertFalse(admin.bound_keys_only(self.root))
+        self.assertNotIn(admin.BOUND_KEYS_ONLY_KEY, self.document())
+
     def test_the_status_command_prints_what_the_reader_says(self):
         said = io.StringIO()
         with mock.patch.object(sys, 'argv', ['admin.py', '--root', str(self.root),
@@ -554,9 +802,12 @@ class ListingTests(unittest.TestCase):
         # `other_kit` is what the listing compares against itself.
         self.kit = Path(admin.__file__).resolve().parent
 
-    def line(self, projects=(), principal=None, body=KEY_BODY, comment='alex@laptop', root=None, kit=None):
+    def line(self, projects=(), principal=None, body=KEY_BODY, comment='alex@laptop', root=None, kit=None,
+             roots=None, endpoints=None, extra=''):
         root = self.root if root is None else root
         kit = self.kit if kit is None else kit
+        roots = [root] if roots is None else list(roots)
+        endpoints = [kit/'endpoint.py'] if endpoints is None else list(endpoints)
         bound = ''.join(' --project ' + name for name in projects)
         if principal is not None:
             bound += ' --principal ' + principal
@@ -565,9 +816,11 @@ class ListingTests(unittest.TestCase):
             marks.append('orchestra-projects=' + ','.join(projects))
         if principal is not None:
             marks.append('orchestra-principal=' + principal)
-        return ('command="/usr/bin/python3 -E -s %s/ssh_forced_command.py --root %s --endpoint %s/endpoint.py%s",'
+        root_part = ''.join(' --root ' + Path(item).as_posix() for item in roots)
+        endpoint_part = ''.join(' --endpoint ' + Path(item).as_posix() for item in endpoints)
+        return ('command="/usr/bin/python3 -E -s %s/ssh_forced_command.py%s%s%s%s",'
                 'restrict,no-pty,no-port-forwarding,no-agent-forwarding,no-X11-forwarding ssh-ed25519 %s %s'
-                % (kit.as_posix(), root.as_posix(), kit.as_posix(), bound, body,
+                % (kit.as_posix(), root_part, endpoint_part, extra, bound, body,
                    ' '.join([comment] + marks)))
 
     def listing(self, text):
@@ -643,6 +896,90 @@ class ListingTests(unittest.TestCase):
         self.assertTrue(flipped['changed'])
         self.assertEqual(flipped['would_be_refused'], [2, 3, 4])
         self.assertIn('2, 3, 4', said.getvalue())
+
+    def test_a_foreign_endpoint_does_not_move_the_line_out_of_this_kit(self):
+        """Item 2, the harness's lines 36 and 42: the WRAPPER, not an endpoint, decides."""
+        write_settings(self.root, True)
+        other = Path('/srv/other-kit')
+        text = '\n'.join([
+            self.line(endpoints=[other/'endpoint.py']),                            # 1 other kit's endpoint
+            self.line(endpoints=[other/'endpoint.py', self.kit/'endpoint.py']),    # 2 both endpoints
+        ]) + '\n'
+        listing = self.listing(text)
+        self.assertEqual(listing['would_be_refused'], [1, 2])
+        # `other_kit` still flags the foreign endpoint for the operator; it is not the SETTING's answer.
+        self.assertTrue(listing['lines'][0]['other_kit'])
+        self.assertEqual(listing['lines'][0]['endpoints'], [other.as_posix() + '/endpoint.py'])
+        note = next(note for note in listing['notes'] if note.startswith('bound_keys_only:'))
+        self.assertNotIn('are not reached', note)
+
+    def test_the_last_root_decides_like_the_wrappers_argument_parser(self):
+        """Item 2, the harness's lines 37 and 38: argparse takes the LAST --root."""
+        write_settings(self.root, True)
+        other_root = self.base/'other-root'
+        other_root.mkdir()
+        text = '\n'.join([
+            self.line(roots=[other_root, self.root]),   # 1 other first, this last: reached
+            self.line(roots=[self.root, other_root]),   # 2 this first, other last: not reached
+        ]) + '\n'
+        listing = self.listing(text)
+        self.assertEqual(listing['would_be_refused'], [1])
+        self.assertEqual(listing['lines'][0]['root'], self.root.as_posix())     # the LAST one
+        self.assertFalse(listing['lines'][0]['other_root'])
+        self.assertEqual(listing['lines'][1]['root'], other_root.as_posix())
+        self.assertTrue(listing['lines'][1]['other_root'])
+        note = next(note for note in listing['notes'] if note.startswith('bound_keys_only:'))
+        self.assertIn('line 2', note)
+        self.assertIn('not reached', note)
+
+    def test_lines_refused_for_another_reason_are_named_but_not_as_the_settings_doing(self):
+        """Item 2, the harness's lines 18, 20, 40, 41, 44: say refused, not "the setting refuses"."""
+        write_settings(self.root, True)
+        text = '\n'.join([
+            self.line(extra=' --proj alpha --princ lane:a'),             # 1 unknown abbreviations
+            self.line(extra=' --project alpha --principal='),            # 2 empty principal
+            self.line(extra=' --principal lane:a --principal lane:b'),   # 3 principal named twice
+            self.line(extra=' --project alpha --principal --x'),         # 4 flag-looking principal
+            self.line(extra=' --project alpha --project alpha'),         # 5 project named twice
+        ]) + '\n'
+        listing = self.listing(text)
+        self.assertEqual(listing['would_be_refused'], [1, 2, 3, 4, 5])
+        note = ' '.join(listing['notes'])
+        self.assertIn('lines 1, 2, 3, 4, 5 are refused whether the setting is on or off', note)
+        self.assertIn('the setting is not why they are refused', note)
+
+    def test_the_preview_names_at_most_the_stated_number_of_lines(self):
+        """Item 5: name at most N lines and say how many more."""
+        write_settings(self.root, None)
+        total = admin.WOULD_BE_REFUSED_NAMED_MAX + 5
+        listing = self.listing('\n'.join(self.line() for _ in range(total)) + '\n')
+        self.assertEqual(len(listing['would_be_refused']), admin.WOULD_BE_REFUSED_NAMED_MAX)
+        self.assertEqual(listing['would_be_refused_total'], total)
+        self.assertEqual(listing['would_be_refused_more'], 5)
+        self.assertIn('and 5 more', ' '.join(listing['notes']))
+        self.assertLess(len(json.dumps(listing['would_be_refused'])), 400)
+
+    def test_on_says_how_many_more_lines_it_would_refuse(self):
+        write_settings(self.root, None)
+        file = self.base/'authorized_keys'
+        total = admin.WOULD_BE_REFUSED_NAMED_MAX + 3
+        file.write_text('\n'.join(self.line() for _ in range(total)) + '\n', encoding='utf-8')
+        said = io.StringIO()
+        with mock.patch.object(sys, 'stderr', said):
+            flipped = admin.bound_keys_only_switch(self.root, 'on', OPERATOR, str(file))
+        self.assertEqual(len(flipped['would_be_refused']), admin.WOULD_BE_REFUSED_NAMED_MAX)
+        self.assertEqual(flipped['would_be_refused_more'], 3)
+        self.assertIn('and 3 more', said.getvalue())
+
+    def test_the_keys_file_read_is_bounded_and_says_so(self):
+        """Item 5: read at most the stated size; say the tail was not inspected."""
+        write_settings(self.root, None)
+        one = self.line() + '\n'
+        big = one * (admin.AUTHORIZED_KEYS_MAX_BYTES // len(one) + 2)
+        listing = self.listing(big)
+        self.assertTrue(listing['truncated'])
+        self.assertLessEqual(len(listing['would_be_refused']), admin.WOULD_BE_REFUSED_NAMED_MAX)
+        self.assertIn('Only the first %d bytes' % admin.AUTHORIZED_KEYS_MAX_BYTES, ' '.join(listing['notes']))
 
 
 @POSIX_SHELL
@@ -738,6 +1075,17 @@ class SetupStatusTests(unittest.TestCase):
         self.status()
         self.assertEqual({str(path): path.read_bytes() for path in self.root.rglob('*') if path.is_file()}, before)
 
+    def test_a_deeply_nested_settings_file_does_not_break_setup_status(self):
+        """Item 3b: the report answers null for the parts it cannot read, never RecursionError."""
+        (self.root/'deployment.private.json').write_text('[' * 200000, encoding='utf-8')
+        body = self.status()
+        self.assertIsNone(body['bound_keys_only']['enabled'])
+        self.assertIn('could not be read', body['bound_keys_only']['detail'])
+        # project_creation.server_usage reads the same file; the RecursionError must not escape
+        # (the sentence in docs/OPERATIONS.md says setup-status answers null with its reason).
+        self.assertIsNone(body['project_databases'])
+        self.assertIn('admin', body)
+
 
 class DocumentationTests(unittest.TestCase):
     """What the task asks to be said plainly is in the documents."""
@@ -757,13 +1105,22 @@ class DocumentationTests(unittest.TestCase):
                        'setup-status',
                        'silently stops refusing unbound',
                        'A damaged or unreadable `deployment.private.json` refuses a confined key',
-                       # The four revision-2 additions: the bounds, the preview, the audit cap, and
-                       # the two exceptions to "an installation that configures nothing" (item 4).
+                       # The revision-2 additions: the bounds, the preview, the audit cap, and the
+                       # two exceptions to "an installation that configures nothing" (item 4).
                        'reads at most the first 1 MiB',
                        'would_be_refused',
                        'keeping the last 20 flips',
                        'A line whose `--root` names a regular file is refused',
-                       'refuses every forced-command key even where the setting was never on'):
+                       'refuses every forced-command key even where the setting was never on',
+                       # The revision-3 additions of items 2, 3 and 4.
+                       '`audit_note` `no entry`',
+                       'after reading and building it and before it',
+                       'names at most 20 line numbers',
+                       'would_be_refused_more',
+                       'its LAST `--root`',
+                       'does not move the line out of this kit',
+                       'the setting is not why',
+                       'VALID `deployment.private.json` larger than 1 MiB'):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, text)
 

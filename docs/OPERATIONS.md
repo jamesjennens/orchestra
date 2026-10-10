@@ -329,12 +329,18 @@ python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime \
 
 The command has three actions: `status` prints the setting, the last recorded change, whether the
 two agree (`audit_agrees`, with a warning when an older kit or a hand edit changed one without the
-other) and the lines that turning it on would refuse; `on` and `off` flip it. Both `status` and
+other) and the lines that turning it on would refuse; `on` and `off` flip it. `audit_agrees` is
+`null` with `audit_note` `no entry` when no flip was ever recorded: a value hand-set to on with no
+audit entry does not read as agreeing, and `status` says so. Both `status` and
 `on` read the authorized_keys file named by `--file` (default this account's
 `~/.ssh/authorized_keys`) and report `would_be_refused`: the lines of this kit and this root that
 the setting refuses, or would refuse while it is off. So the operator sees what `on` is about to
-cut off before it happens, and `on` prints that list. It is operator-gated (`--actor` must be on
-the deployment operator allowlist) and every flip is recorded in the deployment document's
+cut off before it happens, and `on` prints that list - after reading and building it and before it
+writes the flip, so a slow or failing read of the keys file never leaves the setting on with
+nothing printed. The keys file is read at most its first 1 MiB, and `would_be_refused` names at most
+20 line numbers with `would_be_refused_more` (and an "and N more" in the note) saying how many more
+there are, so a hand-written file cannot flood the terminal. It is operator-gated (`--actor` must be
+on the deployment operator allowlist) and every flip is recorded in the deployment document's
 `bound_keys_only_audit`, with the value it replaced, keeping the last 20 flips; a flip that changes
 nothing writes nothing. `off` on a value that is not true or false is a real flip: it writes false,
 so the bad value and its warning do not stay in the file.
@@ -366,9 +372,14 @@ setting closes a forgotten line of the CURRENT kit; it does nothing about an old
 (`other_kit`, `names_release`) and, while the setting is on, it also puts under `attention` every
 line of THIS kit and THIS root that names no project or no principal, and its `bound_keys_only`
 field says which setting it read. Its `would_be_refused` field names those lines whether the
-setting is on or off, so it is the preview before `on`. A line that runs another kit's wrapper, or
-a line of another `--root`, is never counted as refused: this setting does not reach it (that line
-is served by the release or the root it names), and the note says so.
+setting is on or off, so it is the preview before `on`. The setting is decided by what the
+wrapper's own command line decides: the wrapper FILE the line runs and its LAST `--root` (its
+argparse takes the last when a line names it twice); an `--endpoint` argument that names another
+kit's file does not move the line out of this kit's reach. A line that runs another kit's wrapper,
+or whose last `--root` is another runtime, is never counted as refused: this setting does not reach
+it (that line is served by the release or the root it names), and the note says so. A named line
+the wrapper refuses for another reason (a bad or unknown argument, a binding named twice) is listed
+as refused with a sentence saying the setting is not why.
 
 `setup-status` reports the setting: the endpoint's read-only action carries a `bound_keys_only`
 block (`enabled` true or false, and `null` with its reason when the setting cannot be read - a
@@ -389,8 +400,8 @@ nothing is run. The operator's own unrestricted key does not run the wrapper and
 shell, so this can never lock the operator out. A value that is neither true nor false is read as
 off with a warning on stderr, as `review-writes` reads such a value for its own switch.
 
-**Two exceptions to "an installation that configures nothing behaves exactly as it did".** Both
-are deliberate, and both are covered by the recovery:
+**Three exceptions to "an installation that configures nothing behaves exactly as it did".** All
+three are deliberate, and all three are covered by the recovery:
 
 * **A damaged `deployment.private.json` refuses every forced-command key even where the setting
   was never on.** The forced command cannot see whether the setting is on, so it refuses rather
@@ -400,6 +411,13 @@ are deliberate, and both are covered by the recovery:
 * **A line whose `--root` names a regular file is refused** (the wrapper's reader cannot look up
   `deployment.private.json` under a regular file). **Recovery:** correct that line's `--root` to
   the runtime directory and print it again with `admin.py authorized-keys`.
+* **A VALID `deployment.private.json` larger than 1 MiB refuses every forced-command key even
+  where the setting was never on.** Both readers read at most the first 1 MiB and refuse a larger
+  file, because neither can tell whether the setting sits beyond the bound; so a valid but oversized
+  file refuses a confined key although `bound_keys_only` was never set. **Recovery:** bring the
+  file back under 1 MiB - the kit keeps a damaged audit list aside inside that file, which is the
+  only thing in this kit that grows it - and the confined keys work again; the operator's own
+  unrestricted key reaches a shell throughout.
 
 ### sshd settings the boundary needs
 
