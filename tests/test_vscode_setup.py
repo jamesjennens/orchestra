@@ -262,6 +262,28 @@ class CertificateFileShapesCase(unittest.TestCase):
         served = self.served(commented, self.leaf_key)
         self.assertEqual(der_of(self.leaf_pem), der_of(served))
 
+    def test_the_certificate_file_is_read_once_only(self):
+        # A mutant that builds a second context from the file survives without this (N3):
+        # create_server loads the chain once; service_certificate_pem must not read the file again.
+        original = ssl.SSLContext.load_cert_chain
+        calls = []
+        def counting(self, certfile=None, keyfile=None):
+            calls.append(certfile)
+            return original(self, certfile, keyfile)
+        self.addCleanup(setattr, ssl.SSLContext, 'load_cert_chain', original)
+        ssl.SSLContext.load_cert_chain = counting
+        state = unique_dir('vscode-once-')
+        self.addCleanup(shutil.rmtree, state, ignore_errors=True)
+        store = Store(state / 'state.json')
+        Service.bootstrap_superuser(store, ADMIN, PASSWORD)
+        service = Service(store)
+        httpd = create_server(service, http_service.InProcessBackend(service),
+                              host='127.0.0.1', port=0,
+                              certfile=str(self.leaf), keyfile=str(self.leaf_key))
+        self.addCleanup(httpd.server_close)
+        self.assertEqual([str(self.leaf)], calls, 'the --cert file must be read once, by the TLS loader')
+        self.assertEqual(der_of(self.leaf_pem), der_of(httpd.tls_certificate_pem))
+
     def test_a_context_with_no_certificate_can_produce_no_leaf(self):
         # The one way the route answers 404 with a working service: the handshake cannot be made.
         self.assertIsNone(service_certificate_pem(ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)))
@@ -648,6 +670,37 @@ class CredentialFileRewriteCase(unittest.TestCase):
                 self.assert_file_shape(path)
                 self.assertEqual(after_first, path.read_text(encoding='utf-8'))
 
+    def test_a_leftover_wide_new_file_never_holds_the_secret(self):
+        # The leading `rm -f` of the .new file is what keeps a leftover .new of an older, wider
+        # mode from holding the secret (kittrial-5bb.246 N2). Redirecting `>` into an existing
+        # file keeps its mode, so without the rm the temporary stays 644 while it holds the
+        # header line; a mutant without the rm survives. Run the command stopped before its own
+        # chmod (as the mode test above does) so the mode is the one the prefix left behind.
+        command = self.prompt_posix_command()
+        head, _, tail = command.partition(' && chmod 600')
+        self.assertNotEqual(command, head, 'the command no longer reaches its chmod step')
+        home = unique_dir('vscode-home-')
+        self.addCleanup(shutil.rmtree, home, ignore_errors=True)
+        path = home / '.orchestra-agent-kestrel.curlrc'
+        leftover = home / '.orchestra-agent-kestrel.curlrc.new'
+        path.write_text(self.HEADER + '\n', encoding='utf-8')
+        leftover.write_text('stale = "SECRET-XYZ-123"\n', encoding='utf-8')
+        leftover.chmod(0o644)
+        proc = subprocess.run([BASH, '-c', head + ' )'], env=dict(os.environ, HOME=str(home)),
+                              capture_output=True, text=True)
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertTrue(leftover.exists(), 'the stopped command left no temporary file to check')
+        self.assertEqual(0o600, leftover.stat().st_mode & 0o777,
+                         'a leftover mode-644 .new still holds the secret')
+        self.assertIn(self.HEADER, leftover.read_text(encoding='utf-8'))
+        # And the whole command leaves no file holding the secret wider than 600.
+        self.run_command(command, home)
+        self.assert_file_shape(path)
+        for candidate in home.iterdir():
+            data = candidate.read_text(encoding='utf-8', errors='replace')
+            if 'SECRET-XYZ-123' in data:
+                self.assertLessEqual(candidate.stat().st_mode & 0o777, 0o600, candidate.name)
+
     def test_the_command_leaves_a_missing_credential_file_alone(self):
         command = self.prompt_posix_command()
         home = unique_dir('vscode-home-')
@@ -708,6 +761,20 @@ class CredentialFileRewriteCase(unittest.TestCase):
 
 class TheDialogAndThePageCase(unittest.TestCase):
     """Static checks of what the page offers, where node may not be installed at all."""
+
+    def test_the_guide_says_what_the_credential_file_holds(self):
+        # After set-up step 6 it holds three lines (two comments and the header line), not one (N4).
+        setup = SETUP_JS.read_text(encoding='utf-8')
+        self.assertIn('It holds three lines: two comment lines (the server address and the certificate '
+                      'fingerprint) and then ${headerLine()}.', setup)
+        self.assertNotIn('It holds one line,', setup)
+
+    def test_the_prompt_says_what_happens_to_a_symlinked_credential_file(self):
+        # A mutant dropping the symlink sentence survives without this (N3).
+        setup = SETUP_JS.read_text(encoding='utf-8')
+        self.assertIn('If that credential file is a symlink, the rewrite replaces the symlink with a '
+                      'regular file and the old target keeps its own content: keep it a regular file.',
+                      setup)
 
     def test_the_dialog_says_what_is_written_and_what_is_left_to_the_person(self):
         agents = AGENTS_JS.read_text(encoding='utf-8')
