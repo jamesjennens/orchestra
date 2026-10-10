@@ -7174,7 +7174,7 @@ def main():
                                               '(run this before turning that rule on); writes nothing')
     a.add_argument('project')
     a.add_argument('--limit',type=int,default=None,
-                   help='list at most this many tasks, newest first as the export orders them; the counts cover '
+                   help='list at most this many tasks, in the order the export gives them; the counts cover '
                         'every task either way (default 200)')
     a=sub.add_parser('capability-verify',help='record verified capability checks (operator allowlist or verifiers list)')
     a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
