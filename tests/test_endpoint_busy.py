@@ -78,6 +78,24 @@ class EndpointTests(unittest.TestCase):
         (root / 'deployment.private.json').write_text(configuration, encoding='utf-8')
         return root
 
+    def test_add_project_with_a_missing_configuration_is_one_sentence_and_leaves_nothing(self):
+        """kittrial-5bb.173 item 1: FileNotFoundError must not traceback or leave projects/NAME."""
+        import admin
+        with mock.patch.object(admin, 'config', side_effect=FileNotFoundError(2, 'No such file or directory', 'deployment.private.json')):
+            with self.assertRaises(ValueError) as refused:
+                admin.require_creatable_project(Path('/srv/rt'), 'alpha')
+        self.assertIn('nothing was created', str(refused.exception))
+        self.assertIn('deployment.private.json', str(refused.exception))
+        self.assertNotIsInstance(refused.exception, FileNotFoundError)
+
+    def test_add_project_with_a_dangling_link_is_one_sentence_and_leaves_nothing(self):
+        """A dangling symlink is the same OSError as a missing file (kittrial-5bb.173 item 1)."""
+        import admin
+        with mock.patch.object(admin, 'config', side_effect=FileNotFoundError(2, 'No such file or directory', 'deployment.private.json')):
+            with self.assertRaises(ValueError) as refused:
+                admin.require_creatable_project(Path('/srv/rt'), 'alpha')
+        self.assertIn('nothing was created', str(refused.exception))
+
     def test_a_configuration_file_cut_short_refuses_a_write_before_anything_is_reserved(self):
         """Seen on real bd (kittrial-5bb.156): read first inside the guarded write, it left the operation
         "outcome unknown" with nothing written, and the same idempotency key answered that until it expired."""

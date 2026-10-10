@@ -1836,6 +1836,26 @@ class HeldLockTests(Case):
                                                          key='account-zoe-2'))
         self.assertEqual(self.said(answer), (503, 'busy', self.BUSY))
 
+    def test_a_non_timeout_reservation_failure_does_not_say_timed_out(self):
+        """kittrial-5bb.173 item 3: 124 after a reservation is not only a timeout.
+
+        run_guarded reports 124 for a real timeout AND for any other exception that followed
+        a possible write. The service's own sentence for the second must not claim a timeout.
+        """
+        from http_service import HttpError
+        timed = {'returncode': 124, 'stdout': '', 'stderr': 'Command timed out; mutation outcome may be uncertain.\n'}
+        failed = {'returncode': 124, 'stdout': '',
+                  'stderr': 'Effect raised after the reservation (OSError: disk full); '
+                            'outcome unknown. Reconcile canonical state before retrying.\n'}
+        with self.assertRaises(HttpError) as caught:
+            self.backend._checked(timed, 'bd')
+        self.assertEqual(str(caught.exception), 'Canonical command timed out; outcome may be unknown')
+        with self.assertRaises(HttpError) as caught:
+            self.backend._checked(failed, 'bd')
+        self.assertEqual(str(caught.exception),
+                         'Canonical command failed after it was reserved; outcome may be unknown')
+        self.assertNotIn('timed out', str(caught.exception))
+
     def test_an_outcome_the_endpoint_left_unknown_names_the_key_only_when_there_is_one(self):
         self.assertEqual(201, self.create(self.olive, 'alpha').status)
         real = self.backend._endpoint
