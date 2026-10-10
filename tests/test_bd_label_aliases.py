@@ -201,7 +201,7 @@ class RealBdLabelAliasTests(unittest.TestCase):
     def export_rows(self):
         result = self.bd('export', '--all')
         self.assertEqual(result.returncode, 0, result.stderr)
-        return [json.loads(line) for line in result.stdout.splitlines()
+        return [json.loads(line) for line in result.stdout.split('\n')
                 if line.strip()]
 
     def reserved_labels(self):

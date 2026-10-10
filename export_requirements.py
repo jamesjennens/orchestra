@@ -32,7 +32,7 @@ def parse_json(text):
 def read_export(path):
     """One filesystem read; no database queries or implicit refresh."""
     text = Path(path).read_text(encoding='utf-8-sig')
-    return [parse_json(line) for line in text.splitlines() if line.strip()]
+    return [parse_json(line) for line in text.split('\n') if line.strip()]
 
 
 def exact_reference(value):

@@ -443,9 +443,6 @@ def tracker_actors(root,path,before=None,own=()):
     751-level metadata, hid a row's author and a credential under that name was issued and
     wrote). A marked row never counts as the project's merge slot: its id can be recovered
     from text nobody has read, and the whole-read proof must rest on a row that was read.
-    (bd's answer being cut at U+0085 inside a string is kittrial-5bb.239's, on
-    record_json.loads_rows itself; until that lands, such a row refuses here exactly as on
-    main.)
 
     A tracker that cannot be read raises ``actor_names.TrackerUnreadable`` -- a bd that
     exits nonzero, or text that is not rows at all --, a read that came back holding a row

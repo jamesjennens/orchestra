@@ -1387,7 +1387,7 @@ class EndpointBackend:
                                ['list', '--limit', '1', '--json'], check_usable=False)
         if isinstance(reply, dict) and reply.get('returncode') == 2 \
                 and 'Unknown/uninitialized project' in (reply.get('stderr') or ''):
-            said = (reply.get('stderr') or '').strip().splitlines()[-1]
+            said = (reply.get('stderr') or '').strip().split('\n')[-1]
             marker = 'Unknown/uninitialized project: '
             if marker in said:
                 # It is on the host and is a creation that has not finished (or whose record is
@@ -1427,7 +1427,7 @@ class EndpointBackend:
             # The server's own configuration file cannot be read: the endpoint's line names the
             # file and the parser's words. Those are for the operator, in this service's log;
             # the person is told who to ask. Nothing was carried out.
-            said = (reply.get('stderr') or '').strip().splitlines()
+            said = (reply.get('stderr') or '').strip().split('\n')
             print('configuration: the endpoint could not read the deployment configuration for %s: %s'
                   % (action or 'a request', ascii(said[-1][:600]) if said else '(nothing)'), file=sys.stderr, flush=True)
             refused = HttpError(503, 'server_configuration', self.CONFIGURATION_UNREADABLE)
@@ -1585,7 +1585,7 @@ class EndpointBackend:
         if code == 126:
             # The endpoint re-validated live authority immediately before the effect
             # and refused it. Nothing was written.
-            detail = stderr.strip().splitlines()[-1][:200] if stderr.strip() else None
+            detail = stderr.strip().split('\n')[-1][:200] if stderr.strip() else None
             if (reply.get('authority_status') or 403) == 401:
                 raise unauthenticated(detail or 'Authentication is no longer valid')
             raise forbidden(detail or 'Authority was revoked before the canonical write')
@@ -1601,7 +1601,7 @@ class EndpointBackend:
             cls._log_busy(action, stderr)
             raise busy()
         if code:
-            said = stderr.strip().splitlines()[-1] if stderr.strip() else None
+            said = stderr.strip().split('\n')[-1] if stderr.strip() else None
             detail = said[:cls._detail_limit(action, said)] if said else None
             if code == 2:
                 if reply.get('refused') == 'not-found':
@@ -1675,7 +1675,7 @@ class EndpointBackend:
     @staticmethod
     def _log_busy(action, stderr):
         """Which lock, and how long: the endpoint's own line, for the operator, in the service log."""
-        said = (stderr or '').strip().splitlines()
+        said = (stderr or '').strip().split('\n')
         print('busy: the endpoint answered return code 75 for %s: %s'
               % (action or 'a request', ascii(said[-1][:400]) if said else '(nothing)'), file=sys.stderr, flush=True)
 
@@ -2433,7 +2433,7 @@ class EndpointBackend:
                                check_usable=False, timeout=self.create_timeout)
         if isinstance(reply, dict) and reply.get('returncode') == 75:
             import project_creation
-            said = (reply.get('stderr') or '').strip().splitlines()
+            said = (reply.get('stderr') or '').strip().split('\n')
             sentence = project_creation.busy_sentence(said[-1]) if said else None
             if sentence is None:
                 # A wait for a lock ran out before the creation's own code answered: the
@@ -2443,7 +2443,7 @@ class EndpointBackend:
             raise busy(sentence, retry_after=60)
         if isinstance(reply, dict) and reply.get('returncode') == 2:
             import project_creation
-            said = (reply.get('stderr') or '').strip().splitlines()
+            said = (reply.get('stderr') or '').strip().split('\n')
             sentence = project_creation.creation_sentence(said[-1]) if said else None
             if sentence is None:
                 # Not one of the creation's own sentences: an exception's text or a host path
@@ -2476,7 +2476,7 @@ class EndpointBackend:
                                ['clear'] if text is None else ['set'], attachments, operation_id=operation_id,
                                authority=authority, require_authority=True, route='projects.onboarding')
         if isinstance(reply, dict) and reply.get('returncode') == 2:
-            said = (reply.get('stderr') or '').strip().splitlines()
+            said = (reply.get('stderr') or '').strip().split('\n')
             sentence = said[-1][:400] if said else ''
             if not sentence.startswith('ValueError: '):
                 # Not a refusal of the text by the kit's own rules but a failure on the host (a
@@ -2512,7 +2512,7 @@ class EndpointBackend:
         if isinstance(reply, dict) and reply.get('returncode') == 2:
             # A failure on the host, not a refusal of the request: its line may name a host path
             # and an exception, and this list is shown on a page (kittrial-5bb.149).
-            said = (reply.get('stderr') or '').strip().splitlines()
+            said = (reply.get('stderr') or '').strip().split('\n')
             print('project-creations answered a failure: %s' % (ascii(said[-1][:400]) if said else '(nothing)'),
                   file=sys.stderr, flush=True)
             raise conflict(self.CREATIONS_UNREADABLE)
@@ -2892,7 +2892,7 @@ def _canonical_payload(stdout):
     try:
         return _parse_native(text)
     except ValueError:
-        for line in reversed(text.splitlines()):
+        for line in reversed(text.split('\n')):
             line = line.strip()
             if line[:1] in ('{', '['):
                 try:

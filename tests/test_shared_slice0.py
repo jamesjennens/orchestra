@@ -300,7 +300,7 @@ class SurfaceTests(unittest.TestCase):
             render(self.rows, views)
             texts = {path.relative_to(views).as_posix(): path.read_text(encoding='utf-8')
                      for path in views.rglob('*') if path.is_file()}
-            issues = [json.loads(line) for line in texts['issues.jsonl'].splitlines()]
+            issues = [json.loads(line) for line in texts['issues.jsonl'].split('\n') if line.strip()]
             self.assertEqual([row['id'] for row in issues], VISIBLE_IDS)
             self.assertEqual([c['id'] for c in issues[0]['comments']], [1])
             self.assertEqual(issues[3]['comments'], [])

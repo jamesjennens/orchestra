@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "operation_id": "export-lf-framing-20261009",
+  "key": "tracker.export-lf-framing",
+  "name": "LF framing preserves Unicode string data in tracker exports",
+  "aliases": ["tracker export row parsing", "Unicode line separators", "NEL in tracker comments"],
+  "summary": "Tracker exports and native JSONL results use LF as the physical row delimiter. Unicode NEL, line separator and paragraph separator inside valid JSON strings remain part of the same row; decoded titles, descriptions, comments and labels keep their text. CRLF remains accepted as JSON whitespace at the physical boundary. Shared row readers retain their existing nesting limits and malformed-row markers. Independent export readers and the credential name rule refuse at least what they refused for actually unreadable, cut or non-row output; an unreadable row never frees a held name. Non-LF row separators bd never writes are refused; empty or slotless trackers use main's merge-slot-missing refusal. This proposal is a delivery payload for review, not an accepted or activated index entry.",
+  "requirements": [],
+  "anchors": [],
+  "code": ["record_json.py::loads_rows", "native.py::json_stdout", "endpoint.py::tracker_actors", "activity.py::load_export", "export_requirements.py::read_export"],
+  "tests": ["tests/test_export_line_separators.py", "tests/test_export_line_separators_real_bd.py"],
+  "owner": "person:orchestra-coordinator",
+  "tags": ["tracker", "json", "unicode"]
+}
