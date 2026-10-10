@@ -110,8 +110,9 @@ class TrackerRowsUnreadable(TrackerUnreadable):
     :class:`TrackerUnreadable` answers with "try again shortly": an unreadable row stays
     unreadable until an operator repairs it, so it carries its own sentence naming the row
     ids and the repair. Rows nested up to 750 levels parse normally and their names count;
-    only what cannot be read lands here (kittrial-5bb.239 owns the line framing that a
-    U+0085 inside a string still trips on; until it lands, such a row lands here too).
+    only what cannot be read lands here (kittrial-5bb.239 framed the export at the line
+    feed alone, so a U+0085 inside a string no longer cuts a row; whatever its framing
+    still cannot read lands here).
     """
 
     MESSAGE = ("The project's tracker holds a row that cannot be read, so it was not read as a "
