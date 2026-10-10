@@ -13,13 +13,22 @@ function context(token) {
 }
 const owner = context(ownerToken);
 const viewer = context(viewerToken);
-const data = await owner.api.requirements(pid);
+let data = await owner.api.requirements(pid);
 let page = await view.brd(owner, { pid }, {}, data);
 if (!page.querySelector('form')) {
   const start = page.querySelectorAll('button').find((b) => b.textContent === 'Start requirements');
   assert.ok(start, page.textContent);
   await start.dispatch('click');
   page = await view.brd(owner, { pid }, {}, await owner.api.requirements(pid));
+}
+data = await owner.api.requirements(pid);
+if (data.jobs.length === 1) {
+  // Real empty/restored projects start with one parent. Check that case, then
+  // create the second choice through the API before testing the selector.
+  assert.ok(!page.querySelector('#requirement-parent'));
+  await owner.api.createTask(pid, { title: 'Browser parent choice', description: 'Second task for the parent selector.' });
+  data = await owner.api.requirements(pid);
+  page = await view.brd(owner, { pid }, {}, data);
 }
 assert.ok(page.textContent.includes('Add requirement or narrative'));
 const parentLabel = page.querySelectorAll('label').find(e=>e.attributes.for==='requirement-parent');
