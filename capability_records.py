@@ -652,7 +652,7 @@ def read_catalog(run):
         return record_json.mark_selected(KIND.shown(run, ids), set(ids), [TYPE_LABEL]), None
     wanted = set(ids)
     rows, lifecycle = [], []
-    for line in run(['export', '--all']).splitlines():
+    for line in run(['export', '--all']).split('\n'):
         if not line.strip():
             continue
         row = record_json.loads_row(line)

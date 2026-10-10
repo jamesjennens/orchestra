@@ -142,6 +142,9 @@ export function createApi(transport) {
     docs: () => call('GET', '/v1/docs'),
     doc: (name) => call('GET', `/v1/docs/${name}`),
     createAgent: (body) => mutate('POST', '/v1/agents', body),
+    // The service's own public certificate, for the My agents set-up dialog: a read with no log-in
+    // that only an https service with its own certificate answers (kittrial-5bb.203).
+    certificate: () => call('GET', '/v1/service/certificate'),
     updateAgent: (aid, body) => mutate('PATCH', `/v1/agents/${aid}`, body),
     agent: (aid) => call('GET', `/v1/agents/${aid}`),
     // A NEW credential for the agent; its secret is in this one response only.
@@ -159,6 +162,13 @@ export function createApi(transport) {
     addFeedback: (pid, body) => mutate('POST', `/v1/projects/${pid}/feedback`, body),
     requirements: (pid) => call('GET', `/v1/projects/${pid}/requirements`),
     requirement: (pid, rid) => call('GET', `/v1/projects/${pid}/requirements/${rid}`),
+    brd: (pid) => call('GET', `/v1/projects/${pid}/brd`),
+    createRequirement: (pid, body) => mutate('POST', `/v1/projects/${pid}/requirements`, body),
+    reviseRequirement: (pid, rid, body) => mutate('PATCH', `/v1/projects/${pid}/requirements/${rid}`, body),
+    acceptRequirement: (pid, rid, body) => mutate('POST', `/v1/projects/${pid}/requirements/${rid}/accept`, body),
+    requirementRecoveries: (pid) => call('GET', `/v1/projects/${pid}/requirements/recoveries`),
+    clearRequirementCreation: (pid, body) => mutate('POST', `/v1/projects/${pid}/requirements/recoveries/clear`, body),
+    setRequirementsGovernance: (pid, body) => mutate('PUT', `/v1/projects/${pid}/requirements/governance`, body),
     decisions: (pid) => call('GET', `/v1/projects/${pid}/decisions`),
     record: (pid, id) => call('GET', `/v1/projects/${pid}/records/${id}`),
     audit: (pid, params) => call('GET', `/v1/projects/${pid}/audit`, { params }),

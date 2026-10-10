@@ -703,6 +703,35 @@ class AdoptionTests(unittest.TestCase):
                 self.adopt(actor='ghost-actor')
             self.assertIn('Cannot read the tracker', str(refusal.exception))
 
+    def test_deep_tracker_rows_read_to_750_and_any_unreadable_row_refuses(self):
+        """kittrial-5bb.221 revision 2: project_actor_names read the export with a bare
+        json.loads per line. Rows nested to 750 levels read normally now (a name held by
+        one is adoptable), and one unreadable row refuses every adoption in the project as
+        a tracker that could not be read: the row may be the one that names the actor."""
+        deep65 = ('{"id": "t-65", "actor": "mid-author", "metadata": '
+                  + '{"a":' * 64 + '1' + '}' * 64 + '}')
+        deeper = ('{"id": "t-deeper", "actor": "deep-author", "metadata": '
+                  + '{"a":' * 750 + '1' + '}' * 750 + '}')
+        healthy = json.dumps({'id': 't-0', 'actor': 'alex/s1'})
+        with mock.patch.object(admin, 'run_bd', return_value='\n'.join((healthy, deep65)) + '\n'):
+            # A name held only by a row nested 65 levels parses and is adoptable.
+            self.assertTrue(self.adopt(actor='mid-author')['changed'])
+        write_registry(self.root/'projects'/'alpha')                  # clear owner entries between halves
+        with mock.patch.object(admin, 'run_bd', return_value='\n'.join((healthy, deep65, deeper)) + '\n'):
+            before = tree(self.root)
+            # One unreadable row: every adoption in the project is refused as unreadable,
+            # for the name the deep row held and for a healthy one alike.
+            for actor in ('deep-author', 'alex/s1', 'ghost-actor'):
+                with self.assertRaises(ValueError) as refusal:
+                    self.adopt(actor=actor)
+                self.assertIn('Cannot read the tracker', str(refusal.exception))
+                self.assertIn('unreadable row', str(refusal.exception))
+            self.assertEqual(tree(self.root), before)
+        # Without the unreadable row the healthy names are adoptable again.
+        write_registry(self.root/'projects'/'alpha')
+        with mock.patch.object(admin, 'run_bd', return_value=healthy + '\n'):
+            self.assertTrue(self.adopt(actor='alex/s1')['changed'])
+
     def test_an_operator_listed_name_owned_elsewhere_by_another_principal_is_refused(self):
         # An operator identity cannot contain a slash (recovery.identity), so the name that
         # can also be on the operator list is a plain one.

@@ -356,7 +356,10 @@ class AgentRestContractTests(AgentHarness):
         self.assertEqual('claimable-task', action['kind'])
         self.assertEqual(self.project, action['project'])
         self.assertIn('/v1/projects/%s/tasks/' % self.project, action['links']['task'])
-        self.assertEqual(action['links']['task'], action['links']['brief'])
+        self.assertEqual(action['links']['task'] + '/brief', action['links']['brief'])
+        linked = self.request('GET', action['links']['brief'], token=self.secret)
+        self.assertEqual(200, linked.status, linked.data)
+        self.assertIn('checkpoint', linked.data)
         self.assertEqual([self.project], [p['id'] for p in first.data['projects']])
         # A second task appears on the very next read: attention is computed at read
         # time, not by a cached/scheduled job.

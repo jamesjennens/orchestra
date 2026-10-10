@@ -282,7 +282,7 @@ def _capability_lookup(args,config,project,actor,out):
     try:
         result = request(config,project,actor,['find',options.phrase,'--limit',str(options.limit)],'capability')
         if result['returncode']:
-            raise RuntimeError((result.get('stderr') or '').strip().splitlines()[-1:] or ['endpoint refused'])
+            raise RuntimeError((result.get('stderr') or '').strip().split('\n')[-1:] or ['endpoint refused'])
         found = json.loads(result['stdout'])
     except (RuntimeError,ValueError,OSError) as error:
         payload['records'] = []
@@ -370,7 +370,7 @@ def _capability_check(args,config,project,actor,out):
                                                     '--pointers'],'capability')
             if result['returncode']:
                 raise ValueError('capability records unavailable: %s'
-                                 % ((result.get('stderr') or '').strip().splitlines() or ['endpoint refused'])[-1][:300])
+                                 % ((result.get('stderr') or '').strip().split('\n') or ['endpoint refused'])[-1][:300])
             page = json.loads(result['stdout'])
             items.extend(page.get('items') or []);offset = page.get('next_offset')
         if any('record_sha256' not in item for item in items):
@@ -461,7 +461,7 @@ def _capability_check(args,config,project,actor,out):
                 result = request(config,project,actor,['verify','--file',name],'capability')
                 if result['returncode']:
                     row['recorded'] = 'refused'
-                    row['refusal'] = ((result.get('stderr') or '').strip().splitlines() or ['endpoint refused'])[-1][:300]
+                    row['refusal'] = ((result.get('stderr') or '').strip().split('\n') or ['endpoint refused'])[-1][:300]
                 else:
                     answer = json.loads(result['stdout'])
                     row['recorded'] = 'already-recorded' if answer.get('reconciled') else 'recorded'
@@ -513,7 +513,7 @@ def main():
     if args[:1]==['refresh']:action='refresh';args=[]
     elif args[:1]==['view']:
         action='view';path=args[1] if len(args)>1 else 'CURRENT.md';args=[]
-    elif args[:1] in (['brief'],['history'],['checkpoint'],['onboard'],['docs'],['session'],['handoff'],['review'],['work'],['feedback'],['requirement'],['ref'],['capability'],['proposal'],['guidance'],['coordinator']):action=args.pop(0)
+    elif args[:1] in (['brief'],['history'],['checkpoint'],['onboard'],['docs'],['session'],['handoff'],['review'],['work'],['feedback'],['requirement'],['requirements'],['ref'],['capability'],['proposal'],['guidance'],['coordinator']):action=args.pop(0)
     result=request(json.loads(Path(a.config).read_text()),a.project,a.actor,args,action,path)
     output = result['stdout']
     # The server's time of a write that was carried out (kittrial-5bb.97): one line on standard

@@ -166,7 +166,7 @@ class ProposalCase(unittest.TestCase):
         return fields
 
     def rows(self):
-        return [json.loads(line) for line in self.native(['export', '--all']).splitlines()]
+        return [json.loads(line) for line in self.native(['export', '--all']).split('\n') if line.strip()]
 
     def plant(self, task, body, author):
         self.native.add_comment(task, body, author=author)

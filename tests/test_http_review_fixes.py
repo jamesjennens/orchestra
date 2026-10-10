@@ -3473,7 +3473,7 @@ class JournalBackupCase(unittest.TestCase):
         with self._patch.object(admin, 'run_bd', return_value='synced'):
             admin.backup_project(self.root, 'source')
 
-        def fake_add(root, name):
+        def fake_add(root, name, requirements_default=True):
             (root / 'projects' / name).mkdir(parents=True, exist_ok=True)
 
         argv = ['admin.py', '--root', str(self.root), 'restore-new', 'source', 'destination']
@@ -3518,7 +3518,7 @@ class JournalBackupCase(unittest.TestCase):
         snapshot.write_bytes(bytes(data))
         calls = []
 
-        def fake_add(root, name):
+        def fake_add(root, name, requirements_default=True):
             calls.append(('add_project', name))
             (root / 'projects' / name).mkdir(parents=True, exist_ok=True)
 

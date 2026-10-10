@@ -383,7 +383,7 @@ def dispatch(canonical, request, tmp, run=None):
         if len(args) > ANCHOR_READ_IDS_MAX or len(set(args)) != len(args):
             raise ValueError('anchors takes no arguments, or at most %d distinct task ids'
                              % ANCHOR_READ_IDS_MAX)
-        rows = [json.loads(line) for line in run(['export', '--all']).splitlines() if line.strip()]
+        rows = [json.loads(line) for line in run(['export', '--all']).split('\n') if line.strip()]
         if args:
             rows = [row for row in rows if row.get('id') in args]
         return envelope(0, json.dumps({'schema_version': 1, 'anchors': record_anchor_ids(rows)}) + '\n')
@@ -409,7 +409,7 @@ def dispatch(canonical, request, tmp, run=None):
         writes = reference_records.CONTRIBUTOR_OPERATIONS if action == 'ref' else records.WRITE_COMMANDS
         if args and args[0] in writes:
             raise ValueError('the canonical stub serves %s reads only' % action)
-        rows = [json.loads(line) for line in run(['export', '--all']).splitlines() if line.strip()]
+        rows = [json.loads(line) for line in run(['export', '--all']).split('\n') if line.strip()]
 
         def ref_run(argv):
             if argv[0] == 'export':
@@ -605,12 +605,24 @@ def main():
             found = {key: names.get(key, []) for key in ('sessions', 'operators', 'verifiers')}
             if rows:
                 import actor_names
-                if names.get('tracker') in ('unreadable', 'cut', 'exit1', 'words', 'no-slot'):
-                    # The shapes endpoint.tracker_actors turns into one host fault: an export
-                    # that answered no rows, a cut line, a bd that exited nonzero, words that
-                    # are not rows, or rows without the project's merge slot
+                if names.get('tracker') in ('unreadable',):
+                    # The shape endpoint.tracker_actors answers with its own fault and sentence
+                    # since kittrial-5bb.243: a row that cannot be read beside real rows. The
+                    # stand-in raises the same exception class, so probes through it see the same
+                    # answer shape as the real endpoint (kittrial-5bb.243 r2 review item 3).
+                    raise actor_names.TrackerRowsUnreadable(i.get('id') for i in (names.get('unreadable-rows') or
+                                                                                  names.get('unreadable_rows') or []))
+                if names.get('tracker') in ('cut', 'exit1', 'words'):
+                    # The shapes endpoint.tracker_actors turns into the bare host fault: a cut
+                    # line, a bd that exited nonzero, or words that are not rows
                     # (kittrial-5bb.188 item 1; revision-3 item 3(1)).
                     raise actor_names.TrackerUnreadable()
+                if names.get('tracker') in ('no-slot', 'empty'):
+                    # Rows came back without the merge-slot row (`no-slot`), or the readable
+                    # tracker holds no rows at all -- a plain `bd init` (`empty`): both are the
+                    # missing-slot shape naming the merge-create repair, not the transient fault
+                    # (kittrial-5bb.202 item 1 and rev-2).
+                    raise actor_names.TrackerMergeSlotMissing()
                 marks = [(str(item.get('name') or ''), actor_names.instant(item.get('when')))
                          for item in (names.get('author-rows') or names.get('author_rows') or [])
                          if isinstance(item, dict)]
@@ -665,9 +677,19 @@ def main():
         answer = envelope(2, stderr='%s: %s\n' % (type(error).__name__, error))
         import actor_names                    # a local import elsewhere in main() shadows the module name
         if isinstance(error, actor_names.TrackerUnreadable):
-            # As endpoint.main does: an export that answered no rows is a host fault the
+            # As endpoint.main does: an export that could not be read is a host fault the
             # service reads as 503 "nothing was changed" (kittrial-5bb.188 item 1).
             answer['fault'] = 'tracker'
+        if isinstance(error, actor_names.TrackerRowsUnreadable):
+            # As endpoint.main does since kittrial-5bb.243: a row that cannot be read is
+            # its own fault, with the ids as a bounded field beside the sentence.
+            answer['fault'] = 'unreadable-rows'
+            answer['unreadable_rows'] = list(error.ids or ())
+            answer['unreadable_total'] = error.total
+        if isinstance(error, actor_names.TrackerMergeSlotMissing):
+            # A read without a merge slot is not transient: its own mark, so the service says
+            # what to do (merge-create) rather than "try again shortly" (kittrial-5bb.202 item 1).
+            answer['fault'] = 'merge-slot'
     print(json.dumps(answer, ensure_ascii=False))
 
 

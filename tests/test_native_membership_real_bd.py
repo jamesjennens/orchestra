@@ -31,6 +31,10 @@ class NativeMembershipTests(unittest.TestCase):
         self.root = Path(ROOT)
         self.assertEqual((self.root/'.orchestra-test-runtime').read_text().strip(), 'synthetic test runtime')
         self.project = 'nm' + str(time.time_ns())[-16:]
+        import project_creation
+        project_creation.write_record(self.root, self.project, {
+            'project': self.project, 'by': project_creation.HOST, 'state': 'started',
+            'stage': None, 'started_at': datetime.datetime.now(datetime.timezone.utc).isoformat()})
         admin.initialize_project(self.root, self.project)
         self.path = self.root/'projects'/self.project
         self.epic = self.created('Job', ['--type', 'epic'])

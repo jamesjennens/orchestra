@@ -278,6 +278,23 @@ def merge_slot_missing(state):
 SLOT_DAMAGED=('The merge slot record is damaged: it is not available and names no holder. '
               'Run the merge-create operation, which repairs it, then try again.')
 
+def merge_slot_damaged(state):
+    """True when a native merge-slot check reports the damaged shape (kittrial-5bb.202).
+
+    A real state carries ``holder`` and ``waiters`` (either may be null): a free slot is
+    ``available: true`` with no holder, and a held slot is ``available: false`` WITH a
+    holder. The damaged row is ``available: false`` and names no holder (``SLOT_DAMAGED``),
+    whether the ``holder`` key is present and null or absent entirely: an answer that is
+    unavailable with ``waiters`` but NO ``holder`` key was refused as damaged before this
+    task and stayed refused (main's answer; the rev-1 tip let it through, review
+    `damaged-test-looser-than-main`). A state that is absent, empty or unparseable is NOT
+    damaged, it is missing (``merge_slot_missing``); the missing test comes first and a
+    missing shape (no ``holder`` AND no ``waiters``) is never damaged, so the two do not
+    overlap for a caller that tests missing first -- as every caller here does.
+    """
+    if merge_slot_missing(state):return False
+    return state.get('available') is False and not state.get('holder')
+
 def repair_merge_slot(run,slot):
     """Put a damaged merge slot row back in order; returns what was changed (kittrial-5bb.113 review).
 
@@ -395,7 +412,7 @@ def apply_native(p, actor, run, project):
         detail=''
         if isinstance(state,dict) and state.get('error'):detail=' (%s)' % state['error']
         raise ValueError('Merge slot does not exist for this project%s; run the merge-create operation to create it before checking, acquiring or releasing' % detail)
-    if state.get('available') is False and not state.get('holder'):raise ValueError(SLOT_DAMAGED)
+    if merge_slot_damaged(state):raise ValueError(SLOT_DAMAGED)
     context=load_json(context_path) if context_path.exists() else None
     if op=='merge-check':
         state['context']=context if context and context['holder']==state.get('holder') else None

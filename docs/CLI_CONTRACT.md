@@ -293,6 +293,22 @@ a bare string; treat `omitted_chars > 0` as "read `show`/`history` for the full 
 Opaque cursor fields (`activity_cursor`, `next_cursor`) are never excerpted: they are
 complete tokens.
 
+### `history`: additive keys (kittrial-5bb.8)
+
+The bounded history reads add keys to **every** history answer. They are additive: no
+released key changed shape or meaning, a released cursor still reads as oldest-first,
+and a released consumer that names the keys it knows is unaffected. `order`
+(`oldest-first`/`newest-first`), `kind` (`comment`/`event`/`null`), `since_checkpoint`
+(the baseline checkpoint's comment ID or `null`), `snapshot_entries` (entries in the
+snapshot), `total_entries` (entries the current selectors chose) and `omitted_entries`
+(`snapshot_entries - total_entries`) state what a bounded read hid. A
+checkpoint-relative read also carries `checkpoint_author` (excerpt object),
+`checkpoint_timestamp`, `checkpoint_coverage` (`snapshot`/`windowed`/`unknown`),
+`unverified_entries` and `checkpoint_note`, so a reader can tell from the answer alone
+whose checkpoint was the baseline and what it could not be shown. `brief --full` adds
+`full_context` with the same additive rule; its `omission_counts` are the compact
+read's clips and its `full_omitted_chars`/`truncated`/`complete` are the bound's own.
+
 `brief` and each `work` item also carry three additive lifecycle delivery fields
 (kittrial-5bb.107 item 7, rev2 item 6.1). `deployed_delivery` is the delivery a passed
 `deployed` fact belongs to, or `null` when the task has no trusted `deployed=passed`
@@ -420,7 +436,11 @@ than refusing a new lane, and the operator can drop stale acks with
 leaves a small local `.guidance-clear.json` record of who cleared it, when and the
 cleared version, which both status reads show; a `GUIDANCE.md` that is a symlink is refused, so that state needs a
 manual delete. A project with no guidance reads as `present: false`, never an
-error. Rolling a project back to an older kit has a documented
+error. Its JSON line now carries `changed` - `true` when text or a clear record was
+removed, `false` when there was nothing to clear, in which case it writes nothing and exits 0
+with `(nothing was set)` instead of the traceback it used to end with (kittrial-5bb.238 item 4);
+`coordinator guidance-clear` has answered that way since kittrial-5bb.195. Rolling a project
+back to an older kit has a documented
 [clear-first step](OPERATIONS.md#standing-guidance).
 
 The `reference-review` items:
@@ -1615,11 +1635,24 @@ installation that configures nothing is unchanged.
 as the same one-token `@attachment:N` attachment every other write uses; the server never reads
 a path out of the request. `guidance-set` and `set-onboarding` take plain text; `guidance-clear`
 and `guidance-status` take no payload; the rest take one JSON object. `reference-apply` and
-`capability-apply` carry only the payload `operation` values `accept` and `draft`; `retire`,
-`propose` and `revise` are refused before the library is called (`incorporated` is a proposal
-disposition reached with `proposal-review`/`proposal-decide`, not an entry-apply operation).
-`set-onboarding` records `set_by` in its answer and does not probe the text for endpoint paths.
-`guidance-status` takes the project's coordination lock, as the host command does.
+`capability-apply` carry only the payload `operation` value `accept`: through this route a record
+is accepted only after somebody proposed it as a draft (`ref propose` / `capability propose`), so
+every acceptance has a recorded proposal before it (the same actor may do both; that is not
+checked). `draft` - the direct accepted
+revision 1, which creates a key that did not exist already accepted on one party's own word -
+and `retire`, `propose` and `revise` are refused before the library is called, and nothing is
+written; a `draft` anywhere in an `items` batch refuses the whole batch. A batch item carries no
+`operation` of its own, whatever the value: the batch itself is the acceptance. A direct
+accepted revision 1 stays with the installation operator on the host. A payload with no
+`operation` behaves as on the host: `reference-apply` defaults to `accept`, and
+`capability-apply` is answered by the library's message, which names the operations the host
+carries. `set-onboarding` echoes `set_by` in its answer - the actor the server chose for the
+request - and records no attribution of its own (a request field `set_by` is ignored, the
+installation's log is the trace); a previous `ONBOARDING.md` that is not readable UTF-8 text is
+treated as changed, replaced, and reported in a sentence on stderr instead of a bare decoder
+error. It does not probe the text for endpoint paths. `guidance-status` takes the project's
+coordination lock, as the host command does. A `capability-verify` whose every item is already
+recorded wrote nothing and carries no `server_time`.
 
 **Refusals.** An unknown subcommand, or a host-only command named here, is refused with
 "Unknown coordinator command" and the list of the ten. A refused operation changes nothing.
@@ -1679,7 +1712,12 @@ it by failing.
 | `admin.py proposal-settings` | actor map / deciders | <= 200 actors, 100 namespaces / <= 50 |
 | `brief` | `--items-offset` | >= 0 |
 | `brief` | `--items-limit` | 1..100 (default 5; a checkpoint holds at most 100 open items) |
+| `brief` | `--full` `full_context` | <= 20,000 encoded bytes in total and <= 8,000 per field; `full_omitted_chars` names what the cap removed and `show TASK` keeps the complete text |
 | `history` | `--limit` | 1..20 |
+| `history` | `--recent` / `--last` | 1..20 (newest-first page size; the same option under two spellings, not combined with `--limit`; a refusal names `--recent`) |
+| `history` | `--kind` | `comment` or `event` |
+| `history` | `--since-checkpoint` | entries after the newest valid checkpoint, by anyone (no value) |
+| `history` | `--since-my-checkpoint` | the same read based on the calling actor's own newest valid checkpoint (no value) |
 | `history` | `--body-budget` | 256..8000 encoded bytes |
 | `review` | `items`/`resolutions` | 1..20 entries |
 | `review` | `summary` (contribute, approve, request-changes, request-review) | <= 1200 characters |
@@ -1906,3 +1944,33 @@ Plain CLI deploy is incremental and never automatically drops an uncarried task.
 See the exact two-step hotfix procedure and interim tracker state in
 [OPERATIONAL_WORKFLOW.md](OPERATIONAL_WORKFLOW.md).
 `checkpoint TASK --directions [--offset N] [--limit N] [--json]` returns full current digests for all outstanding directions, including entries outside stored evidence windows, in fresh pages (offset >= 0, limit 1..100, default 50). Fields: task, activity_cursor, total, items (id, digest, clipped author, timestamp), next_offset, coverage. Compare cursors across pages and restart on change. Only the current assignee can submit dispositions, and IDs/digests must match task history. See BRIEFINGS.md for legacy and reassignment baselines.
+
+## Requirements member reads
+
+The configured client prefix `b` supplies the project and saved actor. These
+commands read through the contributor endpoint without changing requirements,
+governance, acceptance evidence or lifecycle facts:
+
+```sh
+b requirements list
+b requirements get REQUIREMENT_ID
+b requirements brd
+b requirements governance
+b requirements snapshot > SNAPSHOT.json
+```
+
+`list` and `brd` return validated accepted content and any pending draft separately.
+An unreadable requirement remains visible by its ID; `get` refuses that row with
+an explicit error. `governance` returns the current mode, revision and hash.
+`snapshot` returns the validated governance files map for the existing host
+exporter's `--governance SNAPSHOT.json` input, including restore source binding
+when present. A snapshot is read evidence and grants no write authority.
+
+Owner editing, acceptance and mode switches are service-only operations for the
+signed-in human project owner. These read commands do not permit an SSH actor,
+worker credential or agent to invoke those writes. Existing host operator
+`requirement-apply` and `requirement-backfill` retain their operator checks and
+work in both simple and governed projects. Missing historical governance and
+restores from backups without governance remain governed; only a new durable
+creation intent opts into the simple provisioning default. See
+[REQUIREMENTS.md](REQUIREMENTS.md) for the trust boundary and export procedure.

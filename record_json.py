@@ -216,10 +216,13 @@ def loads_row(line):
 def loads_rows(lines):
     """Parse lines from tracker export (`bd export --all`) through `loads_row`.
 
-    Accepts a string (which it splits into lines) or an iterable of line strings.
+    Accepts an LF-delimited string or an iterable of physical line strings.
+    Unicode NEL/LS/PS inside JSON strings are data, not row boundaries. A CR
+    before LF is JSON whitespace at that boundary; the parser consumes it
+    without changing any decoded string. Escaped control characters stay data.
     """
     if isinstance(lines, str):
-        lines = lines.splitlines()
+        lines = lines.split('\n')
     rows = []
     for line in lines:
         if not line or not line.strip():

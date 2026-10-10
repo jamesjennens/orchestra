@@ -13,6 +13,18 @@ the operator path.
 
 ## 1. What the service is and is not
 
+### Requirements governance storage
+
+New creation intents opt into simple owner editing. Existing projects, old
+interrupted creations and backups without governance history stay governed.
+The project sidecars `.requirements-governance.json` and
+`.requirements-governance-source.json`, the `.requirement-owner-requests/`
+receipts and the outer operation journal are included in the same complete
+backup/restore set. Restore-new preserves historical hashes and source bindings
+before the destination merge slot is provisioned. Do not copy only the native
+database and omit those files. See [Requirements](REQUIREMENTS.md) for snapshot
+capture, owner authority, bearer/CSRF behavior and uncertain-write recovery.
+
 It is an authenticated adapter to canonical coordination data: browser sessions
 and project-scoped worker credentials gate every route, and organization is by
 project membership (`owner`, `contributor`, `viewer`) with a global superuser.
@@ -321,7 +333,7 @@ owner is taken to straight after registering and which stays reachable from the 
 project's owners and for superusers; anyone else gets `403`. Through the API it is
 `GET /v1/projects/{id}/setup`.
 
-Seven steps. Each has a state (`done`, `todo`, `optional`, `unknown`, `unavailable`,
+Eight steps. Each has a state (`done`, `todo`, `optional`, `unknown`, `unavailable`,
 `not-applicable`), who can do it, and either where it is done in the web interface or
 the exact command for the server. `remaining` counts the `todo` ones.
 
@@ -331,6 +343,7 @@ the exact command for the server. `remaining` counts the `todo` ones.
 | Repository location recorded | the project's `repository` field | an owner, on the setup page |
 | A first task defined | the task list (the project's merge slot row is not a task) | any member who may write tasks |
 | A personal agent granted the project | the enabled agents granted this project | each member, for their own agent |
+| A usable merge slot | the host's own read of the project's merge slot | an operator: the `merge-create` coordination operation, through `coordination.py` |
 | Guidance set | the host | an operator: `PYTHON KIT/admin.py --root ROOT set-guidance NAME --actor OPERATOR --file FILE` |
 | Onboarding set | the host | an operator: `PYTHON KIT/admin.py --root ROOT set-onboarding NAME --file FILE` |
 | Covered by a scheduled backup | the host | an operator: a command that runs a backup now, and the `ExecStart` line for a schedule |
@@ -1242,11 +1255,44 @@ project's rows is one `bd export --all` for that project (one bd process against
 running database), paid once per issue attempt and never by an ordinary write: see
 "Credentials that already have such a name" below. **An answer that is not a whole
 tracker is a host fault, not a tracker with no names** (kittrial-5bb.188 review of item 1;
-revision-3 item 3(1)): every project this kit makes holds at least the merge slot, so a
-`bd export --all` that exits 0 and prints nothing, a line cut short, a nonzero exit, text
-that is not rows, or rows **without the merge-slot row** answers **503 `unavailable`**,
-"The tracker could not be read just now. Nothing was changed; try again shortly.", and the
-idempotency key is free. The same broken answer at use is the same 503, never 422. A
+revision-3 item 3(1)), and the three shapes of it are told apart:
+- **The read came back without the project's merge-slot row** -- rows **but no
+  `PROJECT-merge-slot` row**, or a readable tracker with **no rows at all** (a plain
+  `bd init`, whose `bd export --all` exits 0 and prints nothing) -- answers **503
+  `merge_slot_missing`** (kittrial-5bb.202): "The project's tracker holds no merge slot
+  row, so it was not read as a whole tracker. An operator must run the merge-create
+  operation, which creates the slot, then try again." It is not transient: retrying does
+  not help until an operator has run the coordination `merge-create` operation, the same
+  repair `admin.py --root RUNTIME merge-slot-report` names. Nothing is kept: the
+  idempotency key stays free.
+- **The read came back holding a row that cannot be read** -- nested past the row bound
+  (750 levels), unparseable, a line cut short mid-row, a 5,000-digit number, or a line
+  that is not a JSON object beside real rows -- answers **503 `unreadable_rows`**
+  (kittrial-5bb.221 r2; kittrial-5bb.243 item N7) with its own sentence naming the row
+  ids and the repair: "The project's tracker holds unreadable row(s) ID..., so it was not
+  read as a whole tracker: the unreadable row may be the row that holds a name. An
+  operator must repair the row (for deeply nested metadata: bd update ID
+  --unset-metadata KEY) if a second try gives the same answer, then try again." Not
+  transient either -- the row stays unreadable until an operator repairs it, so the
+  answer never says "try again shortly" -- but a cut export or an error line among the
+  rows can be a passing bd fault, so the repair is asked for only after a second try
+  gives the same answer. At most five ids of the tracker's id shape are named, then
+  "and K more"; an id not of that shape is counted, never printed (kittrial-5bb.243 r2
+  review item 1). Nothing is kept: the idempotency key stays free. Why the whole read refuses: rows nested up to 750 levels parse
+  normally and their names count, but an UNREADABLE row may be the row that holds the
+  name, and a name the tracker might hold must not become issuable or writable through a
+  worker credential; hiding the row must not free the name.
+- **The tracker could not be read at all** -- a nonzero `bd` exit, text that is present
+  but is not rows at all, or a project whose metadata records no Dolt server
+  coordinates -- is the host fault: **503 `unavailable`**, "The tracker could not be read
+  just now. Nothing was changed; try again shortly.", and the idempotency key is free.
+A transient fault that makes `bd` print nothing with exit 0 is indistinguishable from the
+plain `bd init` shape at the export, so it gets the `merge_slot_missing` answer too; it is
+still a refusal (nothing is written, no mark is kept, the idempotency key stays free), and
+the set-up step and the read-only `merge-slot-report` tell the two apart, because they read
+the slot itself and answer `unknown`/`unreadable` for a project they cannot read where a
+genuinely slotless one is `missing`.
+The same answer at use is the same 503, never 422. A
 superuser may pass `"allow_actor": true` together with `"allow_actor_reason"` -- 1 to 500
 characters saying WHY, which must pass the kit's plain-text rule (`guidance`'s: no control,
 bidi, zero-width, C1, tag or variation-selector character; a tab, newline or carriage
@@ -1290,7 +1336,15 @@ written by the service, which owns the state; there is no route that changes a c
 (`PATCH`/`PUT` are 404) and the issue route takes no such field, so the keeping cannot be
 reached from a request. A **concurrent first write** may run the export twice; both
 answer the same way and write the same mark, so the outcome is idempotent. An export that
-answers no rows at all is the host fault above: 503, nothing written, and no mark kept. A
+answers no rows at all is the **missing-slot** answer above, not the host fault: 503
+`merge_slot_missing`, nothing written, and no mark kept. An export that holds a row that
+cannot be read is the **unreadable-rows** answer above, at use exactly as at issue: 503
+`unreadable_rows`, nothing written, and no mark kept -- the settle reads the same export.
+The transient `unavailable` answer is the last shape -- a nonzero `bd` exit, or text that is
+not rows at all -- and a project whose metadata records no Dolt server coordinates is that
+shape too, because bd would fall back to an embedded database there (kittrial-5bb.202
+rev-3 item 3(b): this line said "the host fault above", which the empty-project decision of
+revision 2 had changed). A
 credential the settle marked refused is shown as refused in the owner's list even though
 that list reads no rows from the host: it reads the stored `actor_rows_refused` mark
 (revision-3 item 3(3)).
@@ -1362,7 +1416,18 @@ an earlier kit under a plain name the project was already using is listed as ref
 while the rows a credential wrote itself are not held against it. For a name that does
 not collide, `tracker_rows` still says whether the tracker holds rows under it: what a
 credential under that name wrote, or an actor from before sessions were registered. That
-is worth a look when nobody remembers issuing it.
+is worth a look when nobody remembers issuing it. An export that holds a row that cannot
+be read (nested past 750 levels, unparseable, a line cut short, a line that is not a
+JSON object) makes `tracker_rows` null for EVERY credential of that project -- the whole
+tracker was not read, because the unreadable row may be the row that holds a name
+(kittrial-5bb.221 r2) -- and each such item carries `unreadable_rows` naming the row ids
+(kittrial-5bb.243 item N5). Beside that null, `refused_when_it_writes` is null too -- but
+only when `collides` is null: a name a cheap rule refuses (a session, a list, the service's
+own namespace) is refused at every write without reading any tracker, so it stays true and
+is not also counted as unjudged. The command's closing sentence counts the credentials no
+rule could judge (`could_not_be_judged`, a field of the printed report), names the unreadable
+rows when an id is printable (at most five, then "and K more"), and says per project which
+thing happened: how many rows are unreadable, or which of bd's three non-answers arrived.
 
 **Who may ask whether a name is taken.** The endpoint's `actor-standing` answers a
 caller with the rule word only (`null`, or which rule) and never the host's names, no
@@ -1737,6 +1802,67 @@ header from it with `-K`, so no shell expansion ever puts the secret in the
 process list either. A lost secret is replaced, never re-shown: `POST
 /v1/agents/{id}/credentials` issues a new one (the old credential works until revoked
 with `POST /v1/agents/{id}/credentials/{credential}/revoke`).
+
+#### The service's own certificate route, and the set-up dialog (kittrial-5bb.203)
+
+A service started with `--cert`/`--key` serves its own public leaf certificate at
+`GET /v1/service/certificate` **without a log-in**: the answer is
+`{"certificate": "<PEM>", "sha256": "<fingerprint>"}`, where the fingerprint is the SHA-256 of the
+certificate's DER as uppercase hex pairs joined by colons — the same string
+`openssl x509 -in <the certificate file> -noout -fingerprint -sha256` prints and the VS Code bridge
+extension shows before it trusts the server. What is served is the certificate the TLS handshake
+presents first, taken from the loaded TLS context: after `load_cert_chain` the service makes one
+in-memory handshake against that very context (`ssl.MemoryBIO` and `wrap_bio`, no socket, standard
+library) and keeps `getpeercert(binary_form=True)`, the DER of exactly the certificate a real client
+receives first, re-encoded here as the kit's own PEM. The `--cert` file is never read a second time
+and no armour is pattern-matched, so nothing OpenSSL does not itself load can reach the answer, and
+the private key is never served (a key's DER base64 inside `CERTIFICATE` armour, indented or after a
+line that merely ends with the armour, is invisible to the loader and to this route alike). A
+`TRUSTED CERTIFICATE` or `X509 CERTIFICATE` label, an older certificate kept above the real one and a
+comment that merely names the armour lines cannot make the route answer a certificate the handshake
+does not present. There is no size cap and no
+per-block cap any more — the route decodes nothing — so a 64 MB file does not make every anonymous
+GET answer 64 MB: the answer is one leaf, about 1.2 kB. A service without its own certificate —
+plain HTTP, or the first-install tunnel — and a context against which the in-memory handshake cannot
+be made answer the ordinary `404`: nothing is served there, never a `500` and never the raw file, and
+neither case keeps the service from starting.
+
+The My agents set-up dialog reads that route, shows the fingerprint and offers a Save button. It
+does **not** write the VS Code workspace settings and does not save a certificate for the
+extension: since extension 0.9.0 the extension shows the server certificate's fingerprint on first
+contact and asks the person to trust it, and its own "Orchestra Bridge: Set up" command writes the
+workspace settings itself from the credential file's `# server = ADDRESS` line. So the set-up
+prompt writes:
+
+- the two files in `.orchestra/`, and the `.gitignore` line when the folder is a Git repository;
+- into the credential file, as its first lines, `# server = <address>` (the address the page itself
+  was loaded from, not the configured public address, which may be a name that does not resolve on
+  that network) and, when the service has its own certificate,
+  `# server certificate sha256 = <fingerprint>`. The prompt's command *rewrites* the file: it
+  removes any earlier copy of those lines and puts each on its own line ending with a newline, so a
+  second set-up changes nothing and the dialog's Notepad path — whose file has no final newline —
+  cannot glue a comment onto the `header = ...` line. The secret is never printed and never put on a
+  command line: the POSIX command runs in a subshell under `umask 077`, so the same-directory
+  temporary file that receives the header line is created mode 600 from its first byte (before this
+  fix it was created with the umask's mode and held the secret until its `chmod 600`), and then moved
+  over the original; the PowerShell command runs in its own scope (`& { ... }`), so the variable that
+  held the file's content does not stay in the session. Both forms leave the file ending with a
+  newline. If the credential file is a symlink, the move replaces the symlink with a regular file and
+  the old target keeps its own content: keep the credential file a regular file. Nothing is printed,
+  and `curl -K` reads the result as before.
+
+The dialog's certificate block says what comparing the fingerprint proves and what it does not: the
+page and the fingerprint come over the same connection, so a third party who can serve the page
+serves his own certificate and his own fingerprint, and the comparison only shows the extension
+reached the same endpoint the browser did. The independent source is the operator reading the value
+on the server itself: `openssl x509 -in <the certificate file> -noout -fingerprint -sha256`.
+
+Nothing in any of it holds the secret: the prompt sends the agent to the secret only through
+`curl -K`. The same prompt is written for an agent that reviews other agents' deliveries, and it
+names the window's role (`worker` or `reviewer`) so the person chooses the same in the extension's
+own set-up. What the person still does once is said in the dialog: install the extension, run
+"Orchestra Bridge: Set up" (and compare the fingerprint it shows), reload the window, click the
+first wake.
 
 **What an agent may do is kept on the agent, and a new credential carries exactly that**
 (kittrial-5bb.208). The agent record holds its `scopes`: written when the agent is made
@@ -2352,7 +2478,12 @@ line separately and unconfined.
   (3.10 cannot parse about a thousand levels, 3.13 parses several thousand), and it is
   the rule the endpoint's own readers get with kittrial-5bb.141, from the same
   constant. The service takes an answer of the tracker that holds such a row apart row
-  by row, so one such row does not fail the rest:
+  by row, so one such row does not fail the rest -- EXCEPT for the worker-credential
+  name rule (kittrial-5bb.221 r2, kittrial-5bb.243): its read of the tracker names
+  authors and assignees, and an unreadable row may be the row that holds the name, so
+  for THAT read any unreadable row refuses the whole project's read (503
+  `unreadable_rows` above), and hiding a row must not free a name. Rows nested up to
+  750 levels parse normally and their names count on every reader, that rule included:
   - `GET /v1/projects/{id}/tasks` answers 200 with every readable row. The other is in
     `items` as `{"id", "status": "unknown", "unreadable": true, "malformed": true,
     "error": "Malformed issue row"}`: its id and nothing else of it (not its title,
@@ -2522,7 +2653,7 @@ line separately and unconfined.
     `requests`, the request-changes record ids), `blocked` (2: the latest checkpoint
     lists an open `blocker` or `dependency` on undelivered work; with `open_items`,
     `blocking_items`, `blocked_since` and `newer_activity`),
-    `in-progress` (3: claimed, not closed, nothing delivered yet), then
+    `in-progress` (3: claimed, not closed, nothing delivered yet, with `newer_activity`), then
     review work and `claimable-task` (4, see below), then `awaiting-review` and `awaiting-integration` (5).
     `review-error` (priority 2) names the malformed state and asks an operator to reconcile it;
     other own states get `review-state`, naming the state and who acts next. Neither
@@ -2606,7 +2737,17 @@ line separately and unconfined.
       nothing for it to do until the review is decided.
   - **Order within a priority is part of the contract; the numbers are not.**
     `review-recommended`, `to-review` and `claimable-task` all carry priority 4 and
-    are listed in that order, and within a kind by project and then by task. No kind was renumbered when these two were added. A
+    are listed in that order. Within `in-progress`, actions with `newer_activity: true`
+    come first, before the 50-action cap; other ties are by project and then task.
+    `counts.newer_activity` counts observed owned undelivered tasks with confirmed
+    newer activity, including blocked tasks, even when not all actions are listed.
+    The summary names that count; with incomplete own reads it says "at least N".
+    A task without a checkpoint has an unknown (`null`) flag, not confirmed silence.
+    The linked `/brief` preserves bounded newer counts, references, omissions and
+    coverage; its `newer.history` is the authorized task `/history` route. SSH-only
+    `history_new` and `verify` commands are omitted. Read history to reconcile unknown
+    coverage; reading acknowledges nothing.
+    No kind was renumbered when these two were added. A
     client relies on the order of `next_actions` and on the kind names.
   - **Why the two waiting kinds are last.** An agent, and anything that wakes it,
     takes the first action. The agent can do nothing about a contribution that waits

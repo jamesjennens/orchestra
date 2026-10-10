@@ -1578,12 +1578,21 @@ def restore_destination_state(root,destination):
     slot=destination+'-merge-slot'
     return 'empty' if all(isinstance(row,dict) and row.get('id')==slot for row in rows) else 'partial'
 
-def restore_failure_notice(destination,error,state='partial',step='native restore'):
+#: The name ``finish_restore`` gives the step that provisions the clone's merge slot, so
+#: ``restore_failure_notice`` can say what is true after it fails (kittrial-5bb.202 rev-2).
+MERGE_SLOT_STEP='merge-slot provisioning'
+
+def restore_failure_notice(destination,error,state='partial',step='native restore',merge_slot=None):
     """What an operator must do after the native step of ``restore-new`` did not complete.
 
     ``state`` is ``restore_destination_state``'s answer: the notice says "partial" only
     when the destination is partial (kittrial-5bb.82 review). ``step`` names the step
     that stopped: every step after the destination starts to exist prints this notice.
+    ``merge_slot`` is ``project_merge_slot_state``'s answer for the destination, read AFTER
+    a failure of the provisioning step: the step now runs after the re-point, the
+    coordination sidecar and the journals, so the notice may say those are in place, and it
+    must not call the slot unprovisioned or "named missing by the report" unless this fresh
+    read of the clone actually says so (kittrial-5bb.202 review of revision 2, F1).
     """
     if isinstance(error,subprocess.TimeoutExpired):
         cause='the native restore reached its %d s ceiling and its client was stopped'%RESTORE_TIMEOUT
@@ -1604,11 +1613,43 @@ def restore_failure_notice(destination,error,state='partial',step='native restor
                 'may or may not have been created. Do not use it as a tracker. Retire it (%s) and run '
                 'restore-new again into another unused destination name; the source backup was not modified.'
                 %(cause,destination,retire))
-    if state=='empty':
+    if state=='empty' and step!=MERGE_SLOT_STEP:
         return ('restore-new did not complete: %s. Project %s exists as an empty, working project: nothing '
                 'was restored into it (and its coordination sidecar, journals and operation journal were NOT '
                 'restored). Do not use it as a tracker. Retire it (%s) and run restore-new again into another '
                 'unused destination name; the source backup was not modified.'%(cause,destination,retire))
+    if step==MERGE_SLOT_STEP:
+        # This step runs LAST, after the re-point, the coordination sidecar and the journals
+        # (kittrial-5bb.202 rev-3 item 1, review F1): so the clone really does hold the
+        # restored tracker, its own backup target and its journals here, and the notice says
+        # that. Whether the slot itself is there is re-read from the clone (``merge_slot``)
+        # rather than assumed: the step can fail on its own check with a slot that came with
+        # the source, and then "not provisioned" and "the report names it missing" would both
+        # be untrue (the reviewer measured exactly that; merge-check rc 0, report healthy).
+        # This branch comes BEFORE the "empty, working project" one on purpose: a clone from an
+        # empty slotless source reads as that shape (bd lists no rows at all), and the generic
+        # sentence there would then claim the sidecar and journals were NOT restored, which is
+        # exactly what the reordering made false.
+        in_place=('Project %s exists and holds the restored tracker: its data, its re-pointed backup target and '
+                  'its journals are in place, and a backup of it taken now is expected to succeed.'%destination)
+        where=(merge_slot or {}).get('state')
+        detail=(merge_slot or {}).get('detail')
+        if where in ('missing','damaged'):
+            return ('restore-new did not complete: %s. %s Its merge slot is still %s: %s Run the merge-create '
+                    'coordination operation for %s, or retire it (%s) and run restore-new again into another '
+                    'unused destination name; the source backup was not modified.'
+                    %(cause,in_place,where,detail or 'the host read it as unusable.',destination,retire))
+        if where=='healthy':
+            return ('restore-new did not complete: %s. %s Its merge slot reads healthy, so the failure was in the '
+                    '%s step and not in the slot: nothing is left to mend, and merge-check and the read-only '
+                    'merge-slot-report are expected to agree. Confirm with merge-check before using it, or retire '
+                    'it (%s) and run restore-new again into another unused destination name; the source backup was '
+                    'not modified.'%(cause,in_place,MERGE_SLOT_STEP,retire))
+        return ('restore-new did not complete: %s. %s Whether it has a usable merge slot could not be read: the '
+                'same fault stopped the %s step, so this notice does not claim it is missing. Run merge-check for '
+                '%s, or the read-only merge-slot-report, and if it names the merge-create operation run that; else '
+                'retire it (%s) and run restore-new again into another unused destination name. The source backup '
+                'was not modified.'%(cause,in_place,MERGE_SLOT_STEP,destination,retire))
     return ('restore-new did not complete: %s. Project %s exists but holds a partial restore (its '
             'coordination sidecar, journals and operation journal were NOT restored). Preserve it for '
             'inspection, do not use or back it up as a tracker, and run restore-new again into another '
@@ -1927,6 +1968,19 @@ def backup_now_command(root):
     """The command that backs up every project of this runtime now."""
     return host_command(root,'backup','--all')
 
+def coordination_command(root,*words):
+    """A host coordination command as the service user pastes it: interpreter, the installed
+    kit's ``coordination.py``, then ``words``.
+
+    ``coordination.py`` is ``admin.py``'s sibling and takes ``--config`` (the operator's own
+    client configuration), not ``--root``, so it has its own beginning. The set-up page's
+    merge-slot step shows one for the merge-create operation (kittrial-5bb.202 review item 4).
+    """
+    import shlex
+    python=install_current_path(sys.executable)
+    module=install_current_path(Path(__file__).resolve().with_name('coordination.py'))
+    return ' '.join(shlex.quote(str(word)) for word in (python,module,*words))
+
 def schedule_text(root):
     """The two things an operator needs for backups, each under its own label: the command
     that runs one now, and the line a schedule's unit file carries (which is NOT a command)."""
@@ -2080,6 +2134,40 @@ def scheduled_backup_covers(root,name):
         return any(service in enabled for service in covering)
     return None if unreadable else False
 
+def project_merge_slot_state(root,name,path=None):
+    """The project's merge slot as the host reads it, for the setup page and the report.
+
+    Read-only (kittrial-5bb.202 item 2). ``healthy`` (bd reports a free or held slot),
+    ``missing`` (bd reports no slot for this project), ``damaged`` (the row is there but it
+    is not available and names no holder) or ``unknown`` (nothing was read: the metadata
+    does not record the Dolt server coordinates, where bd would create an embedded database
+    and answer nothing, or bd could not run or answer). ``detail`` is a sentence for a
+    person; for missing and damaged it names the merge-create operation and uses the kit's
+    existing words (``coordination.merge_slot_missing``, ``SLOT_DAMAGED``), and it is None
+    for a healthy or unreadable slot.
+    """
+    from coordination import merge_slot_damaged,merge_slot_missing,SLOT_DAMAGED
+    path=project_dir(root,name) if path is None else Path(path)
+    # bd is never run without the server coordinates: it would fall back to an embedded
+    # database and CREATE .beads/embeddeddolt here (see project_metadata_state).
+    try:
+        metadata=json.loads((path/'.beads'/'metadata.json').read_text(encoding='utf-8'))
+    except (OSError,ValueError,UnicodeError):
+        metadata=None
+    keys=('dolt_server_host','dolt_server_port','dolt_server_user','dolt_database')
+    if not isinstance(metadata,dict) or not all(metadata.get(key) for key in keys):
+        return {'state':'unknown','detail':None}
+    try:
+        state=json.loads(run_bd(root,name,['merge-slot','check','--json']) or 'null')
+    except (subprocess.CalledProcessError,subprocess.TimeoutExpired,OSError,ValueError,TypeError,RecursionError):
+        return {'state':'unknown','detail':None}
+    if merge_slot_missing(state):
+        return {'state':'missing','detail':'Merge slot does not exist for this project; run the merge-create '
+                                           'operation to create it.'}
+    if merge_slot_damaged(state):
+        return {'state':'damaged','detail':SLOT_DAMAGED}
+    return {'state':'healthy','detail':None}
+
 def project_setup_status(root,name,path=None):
     """What the host knows about one project's setup, for the web setup page.
 
@@ -2141,6 +2229,9 @@ def project_setup_status(root,name,path=None):
     # The words every host command of this runtime begins with, for the steps an operator
     # does on the server.
     result['admin']=host_command(root)
+    # The same for a coordination command (``coordination.py``, which takes ``--config``):
+    # the merge-slot step's merge-create command begins this way (kittrial-5bb.202 rev-2).
+    result['coordination']=coordination_command(root)
     # Why the schedule could not be checked, when it could not: this process runs under
     # the runtime's scoped home and was not told the account's own home (the service was
     # started without a usable HOME), or a unit file could not be read.
@@ -2155,6 +2246,9 @@ def project_setup_status(root,name,path=None):
     except (ValueError,OSError):
         pass
     result['backup']=backup
+    # The project's merge slot, so the setup page can name a missing or damaged one as a
+    # step (kittrial-5bb.202 item 2). Unknown when bd cannot say; never a write.
+    result['merge_slot']=project_merge_slot_state(root,name,path)
     # How full the server is (kittrial-5bb.118 part 2 revision): every project database on it
     # counts, and every bd write gets slower as they grow. The web service shows it to a
     # superuser only.
@@ -2289,7 +2383,7 @@ RETIRE_JOURNAL='journal.jsonl'
 #: The receipt journals whose ``pending`` entries are reservations still in flight.
 RESERVATION_JOURNALS=('.coordination-requests','.requirement-requests','.handoff-requests',
                       '.reference-requests','.proposal-requests','.capability-requests',
-                      '.open-item-requests')
+                      '.open-item-requests','.requirement-owner-requests')
 
 def retired_entries(root):
     """``[(project name, entry directory name)]`` for every retired project, sorted.
@@ -2576,6 +2670,21 @@ def require_creatable_project(root,name):
     require_bd_init_tools(root)
     return path
 
+def initialize_requirements_governance(root,name):
+    """Only a durable, unfinished creation may install the new-project default."""
+    import project_creation
+    import requirement_governance
+    record=project_creation.read_record(root,name)
+    if record is None or record['state'] not in ('started','incomplete'):
+        raise ValueError('Requirements governance initialization needs an unfinished project creation')
+    if record.get('requirements_governance') != 'simple':
+        return requirement_governance.current(project_dir(root,name),name)
+    # Host creations predate operation_id; their durable start identity is stable
+    # across finish-project, unlike the mutable stage and last-error fields.
+    operation=record.get('operation_id') or content_hash({
+        'project':name,'by':record['by'],'started_at':record['started_at']})
+    return requirement_governance.initialize(project_dir(root,name),name,record['by'],operation)
+
 def initialize_project(root,name,stage=None):
     """The work of ``add-project``: database, settings, backup target, merge slot, first backup.
 
@@ -2607,6 +2716,8 @@ def initialize_project(root,name,stage=None):
     at('configure')
     for key,value in PROJECT_SETTINGS:
         run_bd(root,name,['config','set',key,value])
+    at('requirements-governance')
+    initialize_requirements_governance(root,name)
     at('backup-target')
     run_bd(root,name,['backup','init',str(root/'backups'/name)])
     at('merge-slot')
@@ -2624,13 +2735,14 @@ def finish_project_steps(root,name):
     if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
     for key,value in PROJECT_SETTINGS:
         run_bd(root,name,['config','set',key,value])
+    initialize_requirements_governance(root,name)
     target=root/'backups'/name
     if not (target.is_dir() and any(target.iterdir())):
         run_bd(root,name,['backup','init',str(target)])
     provision_merge_slot(root,name)
     backup_project(root,name)
 
-def add_project(root,name):
+def add_project(root,name,requirements_default=True):
     """Initialize one project, provision its merge slot and back it up once.
 
     The operator's route keeps the same creation record the web route keeps
@@ -2651,7 +2763,11 @@ def add_project(root,name):
     """
     import project_creation
     try:
-        project_creation.host_create(root,name,initialize_project,require_creatable_project)
+        if requirements_default:
+            project_creation.host_create(root,name,initialize_project,require_creatable_project)
+        else:
+            project_creation.host_create(root,name,initialize_project,require_creatable_project,
+                                         requirements_default=False)
     except ValueError as error:
         # A name held by a creation that stopped is not a dead end: the record names the
         # commands that act on it (kittrial-5bb.176).
@@ -2678,7 +2794,7 @@ def backup_lock(root,name):
 # kittrial-5bb.126 (open items design, slice 0) adds `.open-item-requests`, which no
 # kit writes yet either. The host-issued `.owner-answers` journal is not a receipt
 # journal: see OWNER_ANSWERS_JOURNAL.
-RECORD_JOURNALS=('.reference-requests','.proposal-requests','.capability-requests','.open-item-requests')
+RECORD_JOURNALS=('.reference-requests','.proposal-requests','.capability-requests','.open-item-requests','.requirement-owner-requests')
 #: The host-issued owner answer and owner decision journal of the open items design
 #: (kittrial-5bb.126, slice 0). Nothing writes it yet. It is backed up when present and
 #: validated by its reader's own validator, open_items.validate_owner_entry, exactly
@@ -2697,6 +2813,15 @@ def validate_record_receipt(name,record):
     """
     from requirement_records import validate_receipt
     validate_receipt(record)
+    if name.startswith('.requirement-owner-requests/'):
+        from requirement_http import validate_receipt as validate_owner_receipt
+        validate_owner_receipt(record)
+        if 'owner_decision' in record and name != '.requirement-owner-requests/' + content_hash(
+                {'operation_id': record['owner_decision']['operation_id']}) + '.json':
+            raise ValueError('Owner decision receipt path mismatch')
+        if 'release_history' in record and name != '.requirement-owner-requests/' + content_hash(
+                {'operation_id': record['release_history'][0]['operation_id']}) + '.json':
+            raise ValueError('Owner release receipt path mismatch')
     if name.startswith('.proposal-requests/') and 'operation' in record and (
             not isinstance(record['operation'],str) or not record['operation'].strip()):
         raise ValueError('Invalid proposal receipt operation')
@@ -2706,8 +2831,8 @@ def validate_coordination_files(files):
     if not isinstance(files,dict):raise ValueError('Invalid coordination files map')
     for name,record in files.items():
         quarantine = isinstance(name,str) and re.fullmatch(r'\.feedback\.jsonl\.(?:[a-f0-9]{16}|[a-f0-9]{64})\.incomplete',name)
-        journal = isinstance(name,str) and re.fullmatch(r'(?:\.coordination-requests|\.handoffs|\.handoff-requests|\.handoff-recoveries|\.requirement-requests|\.requirement-backfills|\.integration-reverts|\.reference-requests|\.proposal-requests|\.capability-requests|\.open-item-requests|\.owner-answers)/[a-f0-9]{64}\.json',name)
-        if name not in ('.merge-context.json','ONBOARDING.md','GUIDANCE.md','.guidance.json','.guidance-clear.json','.sessions.json','.feedback.jsonl') and not quarantine and not journal:raise ValueError('Invalid coordination backup path')
+        journal = isinstance(name,str) and re.fullmatch(r'(?:\.coordination-requests|\.handoffs|\.handoff-requests|\.handoff-recoveries|\.requirement-requests|\.requirement-owner-requests|\.requirement-backfills|\.integration-reverts|\.reference-requests|\.proposal-requests|\.capability-requests|\.open-item-requests|\.owner-answers)/[a-f0-9]{64}\.json',name)
+        if name not in ('.merge-context.json','ONBOARDING.md','GUIDANCE.md','.guidance.json','.guidance-clear.json','.sessions.json','.feedback.jsonl','.requirements-governance.json','.requirements-governance-source.json') and not quarantine and not journal:raise ValueError('Invalid coordination backup path')
         if not isinstance(record,dict):raise ValueError('Invalid coordination record')
         if name=='.sessions.json':
             from sessions import validate
@@ -2766,6 +2891,8 @@ def validate_coordination_files(files):
         if quarantine:
             from feedback import validate_quarantine_record
             validate_quarantine_record(name,record)
+    from requirement_governance import validate_files as validate_governance_files
+    validate_governance_files(files)
     # The guidance text and its audit record are one generation: a backup that
     # carries the text but not the matching record (or a record whose version is not
     # the hash of the text) is refused rather than restored as a mismatched pair
@@ -3176,6 +3303,8 @@ def backup_project(root,name):
         fcntl.flock(lock,fcntl.LOCK_EX)
         atomic(bundle,{'schema_version':1,'status':'pending'})
         files={}
+        from requirement_governance import snapshot as governance_snapshot
+        files.update(governance_snapshot(path,name))
         if (path/'.coordination-requests').is_symlink() or (path/'.merge-context.json').is_symlink():raise ValueError('Coordination paths must not be symlinks')
         for record in sorted((path/'.coordination-requests').glob('*.json')):
             if record.is_symlink():raise ValueError('Coordination receipt must not be a symlink')
@@ -3406,6 +3535,29 @@ def initialized_projects(root):
         if not re.fullmatch(r'[a-z][a-z0-9]{1,23}',path.name):continue
         if (path/'.beads'/'metadata.json').is_file():found.append(path.name)
     return sorted(found)
+
+def merge_slot_report(root,names=None):
+    """Read-only report of the projects whose merge slot is not healthy (kittrial-5bb.202 item 4).
+
+    Every initialized project of this runtime (or the ones named) is read once through
+    ``project_merge_slot_state``, which never writes. A project is listed under exactly one
+    of ``missing``, ``damaged``, ``unreadable`` or ``healthy``. ``missing``/``damaged`` name
+    the merge-create repair in the project's ``detail``; ``unreadable`` is a project whose
+    slot could not be read at all. Returns ``(report, healthy)``: ``healthy`` is true only
+    when at least one project was read and every one of them is healthy, so a caller can use
+    it as a gate. No lock and no write: bd runs only for a project whose metadata records
+    the Dolt server coordinates.
+    """
+    report={}
+    for name in (names or initialized_projects(root)):
+        report[name]=project_merge_slot_state(root,name)
+    groups={state:sorted(name for name,entry in report.items() if entry['state']==state)
+            for state in ('missing','damaged','unknown','healthy')}
+    return ({'schema_version':1,'projects':report,
+             'missing':groups['missing'],'damaged':groups['damaged'],
+             'unreadable':groups['unknown'],'healthy':groups['healthy'],
+             'not_healthy':sorted(groups['missing']+groups['damaged']+groups['unknown'])},
+            bool(report) and not groups['missing'] and not groups['damaged'] and not groups['unknown'])
 
 def _revoked_list(found,limit):
     """One revocation list: the first `limit` entries, or every entry when limit is None.
@@ -4415,6 +4567,8 @@ def restore_coordination(root,source,destination,restore_operators=False,restore
     if files is None:
         print('Legacy backup has no coordination journal. Reconcile outstanding child requests and merge ownership before accepting writes.')
         return False
+    from requirement_governance import restored_files as restored_governance_files
+    files=restored_governance_files(files,source,destination)
     if using_last_complete_sidecar(root,source):
         print('The canonical coordination sidecar backups/%s.coordination.json is not complete, so this restore '
               'uses the durable last-complete copy %s (the previous complete generation, restored with the '
@@ -5239,17 +5393,26 @@ def project_actor_names(root,project,path):
     rather than adopted into a fictitious owner (kittrial-5bb.194 review, finding 10). The
     tracker is read because the actors this command exists for are the legacy ones: they
     predate the registry and are visible only in the rows they wrote. A tracker that cannot
-    be read is a refusal, never "the name is unknown".
+    be read is a refusal, never "the name is unknown". Rows are parsed with the row bound
+    of kittrial-5bb.141 (``record_json.loads_rows``, ``ROW_NESTING_MAX`` 750): rows nested
+    up to 750 levels read normally, and ANY row that cannot be parsed -- unparseable text,
+    deeper than 750, a line cut short -- refuses the whole command as a tracker that could
+    not be read, exactly as before (kittrial-5bb.221 revision 2): the unreadable row may be
+    the one that names the actor, and a name that cannot be shown to be held must not be
+    adopted either.
     """
     from sessions import read_registry, owner_map, used_actors
     data=read_registry(path)
     names={record['actor'] for record in data['records'].values()}|set(owner_map(data))
     try:
-        text=run_bd(root,project,['export','--all'])
-        rows=[json.loads(line) for line in text.splitlines() if line.strip()]
+        rows=record_json.loads_rows(run_bd(root,project,['export','--all']))
     except (subprocess.SubprocessError,OSError,ValueError,RecursionError):
         raise ValueError('Cannot read the tracker of project %s to check whether that actor exists there; '
                          'nothing was changed'%project) from None
+    if any(not isinstance(row,dict) or row.get('malformed') for row in rows):
+        raise ValueError('Cannot read the tracker of project %s: it holds unreadable row(s) (nested deeper '
+                         'than the row bound or not parseable), so the names it holds cannot be told; '
+                         'nothing was changed'%project)
     names|=used_actors(rows)
     return names
 
@@ -6227,7 +6390,19 @@ def credential_actors(root,state_path,service_namespace=None):
     with ``waived``, ``waived_by_username``, ``waived_at``, ``waived_reason`` and an
     ``actor_allowed`` sentence -- because it writes. Rows inside an earlier same-name,
     same-owner credential's lifetime are not held either (item 3). An export that answers no
-    rows is said as ``tracker_rows`` null, not false: the tracker was not read.
+    rows is said as ``tracker_rows`` null, not false: the tracker was not read. The rows are
+    parsed with the row bound of kittrial-5bb.141 (``record_json.loads_rows``,
+    ``ROW_NESTING_MAX`` 750): rows nested up to 750 levels read normally, and an export that
+    holds ANY unreadable row is one the tracker could not be read from -- ``tracker_rows``
+    null for every credential of that project, with the unreadable row ids named beside it
+    (``unreadable_rows``), so an operator sees there is something unread rather than "no
+    such rows" (kittrial-5bb.221 revision 2). Beside such a null, ``refused_when_it_writes``
+    is null too -- but only when ``collides`` is null: a name a cheap rule refuses (a session,
+    a list, the service's own namespace) is refused at every write without reading any
+    tracker, so it stays true and is not counted as unjudged. The command's closing sentence
+    counts the credentials no rule could judge (``could_not_be_judged``, a field of the
+    report), names the unreadable rows when an id is printable, and says per project which
+    thing happened (kittrial-5bb.243 item N5; r3 review items 1 and 3).
     ``service_namespace`` is the namespace the web service was started with (its
     ``--actor-namespace``), when the operator says so: a credential named under it is refused
     at use too (kittrial-5bb.188 item 3).
@@ -6257,12 +6432,43 @@ def credential_actors(root,state_path,service_namespace=None):
                 found['on_host']=True
                 found['sessions']=registered_actors(path)
                 try:
-                    rows=[json.loads(line) for line in run_bd(root,name,['export','--all']).splitlines() if line.strip()]
-                    if not any(isinstance(row,dict) for row in rows):
-                        raise ValueError('the export answered no rows')
+                    text=run_bd(root,name,['export','--all'])
+                    rows=record_json.loads_rows(text)
+                    unreadable=[row.get('id') if isinstance(row,dict) else None
+                                for row in rows if not isinstance(row,dict) or row.get('malformed')]
+                    if unreadable:
+                        # kittrial-5bb.221 revision 2: an unreadable row may be the row that holds the
+                        # name, so no name of this project can be judged; said as null with the row ids
+                        # named, never as "no such rows". The ids an operator sees are bounded and
+                        # checked like the 503 sentence's, and the count is a field too, so the JSON
+                        # says it, not only stderr (kittrial-5bb.243 r2 review item 2). WHY the tracker
+                        # was not read is a field as well, said as the thing that happened -- r3 item 1.
+                        given=[i for i in unreadable if isinstance(i,str) and i]
+                        named=[i for i in given if actor_names.ROW_ID.fullmatch(i)][:actor_names.NAMED_ROWS_MAX]
+                        found['unreadable_rows']=named
+                        found['unreadable_total']=len(given)
+                        found['not_read_reason']='it holds %d unreadable row(s)'%len(given)
+                        raise ValueError('the export holds %d unreadable row(s)'%len(given))
+                    if not rows:
+                        # Which of the three happened, in the operator's words (r3 review item 1):
+                        # bd answered nothing, bd answered the word null, or rows did not come.
+                        found['not_read_reason']=('bd answered nothing (exit 0)' if not text.strip()
+                                                  else 'bd answered null' if text.strip()=='null'
+                                                  else 'the export answered no rows')
+                        raise ValueError('the export answered no rows, or something that is not rows')
+                    # A listing, and main's answer here: an export that answered nothing is
+                    # ``tracker_rows`` null ("the tracker was not read"), never false ("the
+                    # tracker has no names"), which an operator would take as a read. This read
+                    # does NOT run the merge-slot decision ``endpoint.tracker_actors`` runs, so
+                    # the empty-project decision does not reach it (kittrial-5bb.202 review of
+                    # revision 2, F3: revision 2 had changed it to false).
                     found['marks']=actor_names.tracker_marks(rows)
-                except (subprocess.CalledProcessError,OSError,ValueError,RecursionError):
+                except subprocess.CalledProcessError:
                     found['marks']=None                # the tracker could not be read: said as null, not as "no rows"
+                    found['not_read_reason']='bd failed (exit not 0)'
+                except (OSError,ValueError,RecursionError):
+                    found['marks']=None                # the tracker could not be read: said as null, not as "no rows"
+                    found.setdefault('not_read_reason','bd could not be read')
             projects[name]=found
         return projects[name]
     out=[]
@@ -6289,7 +6495,12 @@ def credential_actors(root,state_path,service_namespace=None):
             reason=None
         item={'credential':identifier,'project':name,'project_on_host':host['on_host'],'label':credential.get('label'),
               'actor':namespace,'collides':reason,'revoked':bool(credential.get('revoked')),
-              'refused_when_it_writes':reason is not None,
+              # kittrial-5bb.243 item N5, r2 item 2(a): beside a tracker that could not be
+              # read, a name NO cheap rule refuses is "not read" (null, like tracker_rows:
+              # the name may be anybody's), never a False that reads as "it may write". A
+              # name a cheap rule refuses (a session, a list, the service namespace) IS
+              # refused at every write without reading any tracker: true was right.
+              'refused_when_it_writes':None if host['marks'] is None and reason is None else reason is not None,
               'tracker_rows':None if host['marks'] is None else actor_names.head(namespace) in {n for n,_ in host['marks']},
               'issued_by':credential.get('user_id'),'issued_by_username':issuer.get('username'),
               'created_at':moment(credential.get('created_at')),'last_used':moment(credential.get('last_used')),
@@ -6302,10 +6513,27 @@ def credential_actors(root,state_path,service_namespace=None):
             item['waived_reason']=waived.get('reason')
             item['actor_allowed']='allowed by %s on %s' % (issuer.get('username') or waived.get('by') or 'a superuser',
                                                             item['waived_at'] or 'an unrecorded date')
+        if host.get('unreadable_rows') is not None:
+            # kittrial-5bb.221 revision 2: this project's tracker holds unreadable row(s), so
+            # tracker_rows is null (could not be read) and the row ids are named, so an
+            # operator sees there is something unread rather than "no such rows". The ids are
+            # bounded and checked (kittrial-5bb.243 r2 review item 2), and the count says how
+            # many there are in all.
+            item['unreadable_rows']=host['unreadable_rows']
+            item['unreadable_total']=host.get('unreadable_total',len(host['unreadable_rows']))
+        if host.get('not_read_reason') is not None:
+            # WHY the tracker was not read, in the operator's words (r3 review item 1).
+            item['tracker_not_read']=host['not_read_reason']
         out.append(item)
     colliding=[item for item in out if item['collides'] is not None and not item['revoked']]
+    unjudged=[item for item in out if item.get('tracker_rows') is None and item.get('project_on_host')
+              and item.get('collides') is None]
     return {'schema_version':1,'state':str(source),'worker_credentials_with_a_name':len(out),
-            'colliding_and_not_revoked':len(colliding),'credentials':out}
+            'colliding_and_not_revoked':len(colliding),
+            # Only names NO rule could judge: a name a cheap rule refuses (a session, a list,
+            # the service's own namespace) is refused at every write without reading any
+            # tracker, so it is not also counted as unjudged (r3 review item 3a).
+            'could_not_be_judged':len(unjudged),'credentials':out}
 
 class _OnceFlag(argparse.Action):
     """A flag that may be given at most once.
@@ -6506,6 +6734,9 @@ def main():
     a=sub.add_parser('open-item-label-check',help='read only, at deploy time: list the projects whose rows already carry '
                                                  'the label open-item or an open-item: label (exit 1 when any does, or '
                                                  'cannot be read)')
+    a.add_argument('projects',nargs='*',metavar='project')
+    a=sub.add_parser('merge-slot-report',help='read only: the projects whose merge slot is missing, damaged or cannot '
+                                              'be read, with the merge-create repair (exit 1 when any is not healthy)')
     a.add_argument('projects',nargs='*',metavar='project')
     a=sub.add_parser('backup-status')
     a.add_argument('--require-complete',action='store_true',dest='require_complete',
@@ -6713,11 +6944,39 @@ def main():
     elif args.command=='service':print(service(root,args.action))
     elif args.command=='credential-actors':
         report=credential_actors(root,args.state,getattr(args,'service_namespace',None))
+        # kittrial-5bb.243 r3 review item 1: the count is part of the report the JSON prints,
+        # set inside credential_actors, so it reaches stdout -- not recomputed after the print.
         print(json.dumps(report,indent=2,sort_keys=True))
         if report['colliding_and_not_revoked']:
             print('%d worker credential(s) write under a name that is somebody else\'s on this host. Each is refused '
                   'when it writes; its owner revokes it in the web interface and issues one under another name. '
                   'Nothing was changed by this command.'%report['colliding_and_not_revoked'],file=sys.stderr)
+        # kittrial-5bb.243 item N5: the count of credentials no rule could judge -- their
+        # project's tracker could not be read and no cheap rule refused the name -- beside the
+        # colliding count, saying per project WHAT happened: how many rows are unreadable (ids
+        # named only when at least one is printable, bounded and checked like the 503
+        # sentence's), or which of bd's three non-answers arrived (r3 review item 1).
+        not_read=[item for item in report['credentials'] if item.get('tracker_not_read')]
+        if not_read:
+            # The reason a tracker was not read belongs to the PROJECT, so it is said once
+            # per project, however many credentials of it there are.
+            by_project={}
+            for item in not_read:
+                by_project.setdefault(item.get('project'), item)
+            def said_of(project):
+                item = by_project[project]
+                if item.get('unreadable_rows'):
+                    named=', '.join(item['unreadable_rows'])
+                    total=item.get('unreadable_total', len(item['unreadable_rows']))
+                    more=' and %d more' % (total - len(item['unreadable_rows'])) \
+                        if total > len(item['unreadable_rows']) else ''
+                    return '%s: %s (%s%s)' % (project, item['tracker_not_read'], named, more)
+                return '%s: %s' % (project, item['tracker_not_read'])
+            said='; '.join(said_of(project) for project in sorted(by_project))
+            print('%d worker credential(s) could not be judged: the tracker of their project could not be read, '
+                  'so their names may be anybody\'s (%s). An operator repairs the tracker (for deeply nested '
+                  'metadata: bd update ID --unset-metadata KEY) if a second run says the same; nothing was '
+                  'changed by this command.'% (report['could_not_be_judged'], said),file=sys.stderr)
     elif args.command=='record-store':
         try:
             report=record_store_reset(args.state) if args.reset_high_water \
@@ -7139,6 +7398,27 @@ def main():
         report,clean=open_item_label_check(root,args.projects)
         print(json.dumps(report,sort_keys=True))
         if not clean:raise SystemExit(1)
+    elif args.command=='merge-slot-report':
+        report,healthy=merge_slot_report(root,args.projects)
+        print(json.dumps(report,sort_keys=True))
+        if not healthy:
+            # stdout stays one JSON document; the plain sentences go to stderr. The
+            # merge-create repair is named only for the projects that are missing or
+            # damaged: an unreadable one (a dropped database, a stopped server, a name
+            # that is no project) is not mended by it, so it is told what is true
+            # instead (kittrial-5bb.202 review item 4; review F5).
+            names=report['not_healthy']
+            print('merge-slot-report: %d project(s) do not have a healthy merge slot: %s.'
+                  %(len(names),', '.join(names)),file=sys.stderr)
+            repairable=report['missing']+report['damaged']
+            if repairable:
+                print('An operator runs the merge-create coordination operation for %s (a missing or damaged '
+                      'slot), then re-runs this report.'%', '.join(repairable),file=sys.stderr)
+            if report['unreadable']:
+                print('The merge slot of %s could not be read at all, and no merge-create run mends that: check '
+                      'the project\'s database, its Dolt server coordinates and the name itself first.'
+                      %', '.join(report['unreadable']),file=sys.stderr)
+            raise SystemExit(1)
     elif args.command=='backup-status':
         record=read_backup_status(root)
         # Retired projects are not part of the gate; they are listed so an operator can
@@ -7253,26 +7533,37 @@ def main():
             (root/'backups').mkdir(exist_ok=True)
             restoring=restore_lock_path(root,args.destination).open('a')
             fcntl.flock(restoring,fcntl.LOCK_EX)
-            step='add-project'
+            # ``step`` is a one-word holder: ``finish_restore`` names the provisioning step
+            # inside itself, so a failure there prints the provisioning notice and not the
+            # re-point's (kittrial-5bb.202 review item 4, review F8).
+            step=['add-project']
             try:
                 # SIGTERM is an exception for the whole of what follows, not only inside
                 # the native restore: a stop during add-project (or the re-point) used to
                 # end the process with no notice at all (review 01a1026a).
                 with signal_termination_guard():
-                    add_project(root,args.destination)
+                    add_project(root,args.destination,requirements_default=False)
                     # The native restore runs through the Dolt SQL client (no bd ~10 s read
                     # timeout), in its own process group, and adopts the restored project
                     # identity; a destination without server metadata keeps `bd backup restore`.
-                    step='native restore'
+                    step[0]='native restore'
                     print(native_restore(root,args.project,args.destination))
-                    step='re-point and coordination'
-                    warning=finish_restore(root,args,snapshot)
+                    step[0]='re-point and coordination'
+                    warning=finish_restore(root,args,snapshot,step)
             except BaseException as error:
                 # add-project's own refusals (a populated or retired destination) are raised
                 # before it creates anything: they need no notice about a leftover project.
-                if not (step=='add-project' and isinstance(error,ValueError)):
-                    print(restore_failure_notice(args.destination,error,
-                                                 restore_destination_state(root,args.destination),step=step),
+                if not (step[0]=='add-project' and isinstance(error,ValueError)):
+                    destination_state=restore_destination_state(root,args.destination)
+                    # The provisioning notice says what the clone now holds, so read the slot
+                    # from the clone itself (read-only) instead of assuming the step's failure
+                    # means a missing slot (kittrial-5bb.202 rev-3 item 1, review F1). Its
+                    # "empty, working project" shape is included: a clone from an empty slotless
+                    # source reads that way, and it still needs the provisioning notice.
+                    slot=(project_merge_slot_state(root,args.destination)
+                          if step[0]==MERGE_SLOT_STEP and destination_state in ('partial','empty') else None)
+                    print(restore_failure_notice(args.destination,error,destination_state,step=step[0],
+                                                 merge_slot=slot),
                           file=sys.stderr)
                 raise
             finally:
@@ -7309,8 +7600,16 @@ def native_only_note(root,args,damaged):
               'was restored from %s'%journal.relative_to(root).as_posix() if getattr(args,'journal_restored',False)
               else 'was not restored: the backup has no operation-journal snapshot'))
 
-def finish_restore(root,args,snapshot):
-    """What ``restore-new`` does after the native restore: re-point, sidecar, journals."""
+def finish_restore(root,args,snapshot,step=None):
+    """What ``restore-new`` does after the native restore: re-point, sidecar, journals, slot.
+
+    ``step`` is the caller's one-word holder, when it has one: the merge-slot provisioning
+    step names itself in it, so a failure there prints its own notice rather than the
+    re-point's (kittrial-5bb.202 review item 4, review F8). A caller that passes none (the
+    focused tests) gets the same work with no naming.
+    """
+    def at(name):
+        if isinstance(step,list) and step:step[0]=name
     # The native restore brings the SOURCE project's backup configuration with the
     # restored database: `.beads/dolt-backup.json` and the restored `dolt_backups`
     # row both still name `backups/<source>`. Left there, `backup <destination>`
@@ -7321,6 +7620,7 @@ def finish_restore(root,args,snapshot):
     # already-configured destination in place; validate_backup_target refuses any
     # clone that was not re-pointed this way.
     run_bd(root,args.destination,['backup','init',str(root/'backups'/args.destination)])
+    at('re-point and coordination')
     # The deployment authority merges come last (kittrial-5bb.142): they are the only step
     # that waits on the deployment lock, and a refusal there must leave a complete restore.
     # --without-coordination (kittrial-5bb.152): no coordination files, no authority; the
@@ -7331,6 +7631,16 @@ def finish_restore(root,args,snapshot):
     args.journal_restored=restored is not None
     if restored is None:
         print('Backup has no operation-journal snapshot; the restored project starts with an empty identity journal.')
+    # The native restore replaced the destination's rows with the SOURCE database's, so a
+    # source made before the slot was provisioned leaves the clone without a merge slot.
+    # This is a way of making a project that the kit controls, so close it here: provision the
+    # slot idempotently, AFTER the re-point, the coordination sidecar and the journals, so a
+    # failure here leaves everything else the clone needs in place and only the slot to mend
+    # (kittrial-5bb.202 item 3; rev-3 item 1, review F1: it ran BEFORE them and the notice
+    # then claimed journals that were never restored). It still runs for a native-only
+    # restore, whose journal step above is kept.
+    at(MERGE_SLOT_STEP)
+    provision_merge_slot(root,args.destination)
     if getattr(args,'native_only',None) is not None:
         return None
     if not sidecar:

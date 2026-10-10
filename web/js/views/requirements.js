@@ -3,6 +3,7 @@
 import { h, time } from '../dom.js';
 import { pageHead, empty } from '../ui.js';
 import { markdown, section, mentions } from '../md.js';
+import * as ownerView from './owner_requirements.js';
 
 const STATE = { accepted: ['Accepted', 'ok'], draft: ['Draft', 'warn'], proposed: ['Proposed', 'accent'], rejected: ['Rejected', 'crit'] };
 const stateChip = (s) => { const [label, tone] = STATE[s] || [s, '']; return h('span', { class: 'chip ' + tone }, label); };
@@ -26,6 +27,7 @@ function linker(ctx, pid, known, keys = {}) {
 
 export async function brd(ctx, { pid }) {
   const [project, data] = await Promise.all([ctx.api.project(pid), ctx.api.requirements(pid)]);
+  if (data.governance) return ownerView.brd(ctx, { pid }, project, data);
   if (!data.baseline) {
     return h('div', { class: 'stack' }, pageHead({ crumbs: crumbs(ctx, project, [{ label: 'Requirements' }]), title: 'Requirements' }),
       h('div', { class: 'panel' }, empty('No requirements baseline yet', 'When the team records requirements and publishes a baseline, the business requirements document appears here.')));
@@ -77,6 +79,7 @@ export async function brd(ctx, { pid }) {
 
 export async function requirement(ctx, { pid, rid }) {
   const [project, data] = await Promise.all([ctx.api.project(pid), ctx.api.requirement(pid, rid)]);
+  if (data.current) return ownerView.requirement(ctx, { pid, rid }, project, data);
   const r = data.requirement;
   const known = new Set(data.known || []);
   const link = linker(ctx, pid, known, data.keys);

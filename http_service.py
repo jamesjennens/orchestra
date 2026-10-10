@@ -1020,7 +1020,8 @@ class InProcessBackend:
                 # honestly unknown rather than inferred from the review state.
                 'lifecycle': {}, 'depends_on': [],
                 # This backend keeps no activity cursor; its checkpoints need none.
-                'activity_cursor': None}
+                'activity_cursor': None,
+                'newer': self._agent_activity_summary(task, checkpoints[-1]) if checkpoints else None}
 
     #: The disposable backend is cheap to read and tests expect fresh reads.
     READ_CACHE_SECONDS = 0
@@ -1085,6 +1086,34 @@ class InProcessBackend:
         at=checkpoint.get('created_at')
         return bool(at and any(r.get('created_at','')>at and r.get('actor')!=task.get('assignee')
                                for r in self.state.get('contributions',{}).get(task['id'],[])))
+
+    def _agent_activity_summary(self, task, checkpoint):
+        """Bounded event references for the disposable backend, without digest claims.
+
+        The native backend supplies its canonical summary instead. This model has
+        no per-entry checkpoint digests, so imported/evicted history stays unknown.
+        Reading this projection never incorporates or acknowledges an event.
+        """
+        from briefing import NEWER_MAX, clip
+        events = [e for e in self.state.get('events') or [] if e.get('task') == task['id']]
+        anchors = [i for i, e in enumerate(events) if e.get('action') == 'checkpoint-added'
+                   and e.get('actor') == checkpoint.get('actor')
+                   and e.get('time', '') >= checkpoint.get('created_at', '')]
+        if not anchors:
+            return {'coverage': 'unknown', 'own_count': None, 'other_count': None,
+                    'entries': [], 'omitted': None,
+                    'note': 'Checkpoint event history is unavailable; read task history.'}
+        remaining = events[anchors[-1] + 1:]
+        others = [e for e in remaining if e.get('actor') != task.get('assignee')]
+        authors = sorted({e.get('actor') for e in others if e.get('actor')})
+        return {'coverage': 'unknown', 'own_count': len(remaining) - len(others),
+                'other_count': len(others),
+                'other_authors': {'items': [clip(a, 96) for a in authors[:NEWER_MAX]],
+                                  'omitted': max(0, len(authors) - NEWER_MAX)},
+                'entries': [{'kind': e.get('action'), 'timestamp': e.get('time'),
+                             'author': clip(e.get('actor') or '', 96)} for e in remaining[:NEWER_MAX]],
+                'omitted': max(0, len(remaining) - NEWER_MAX),
+                'note': 'Event history has no per-entry digests. Reading clears nothing; reconcile with task history.'}
 
     def review_queue(self, project_id):
         """Every task with current work, highest-attention review states first.
@@ -1387,7 +1416,7 @@ class EndpointBackend:
                                ['list', '--limit', '1', '--json'], check_usable=False)
         if isinstance(reply, dict) and reply.get('returncode') == 2 \
                 and 'Unknown/uninitialized project' in (reply.get('stderr') or ''):
-            said = (reply.get('stderr') or '').strip().splitlines()[-1]
+            said = (reply.get('stderr') or '').strip().split('\n')[-1]
             marker = 'Unknown/uninitialized project: '
             if marker in said:
                 # It is on the host and is a creation that has not finished (or whose record is
@@ -1427,7 +1456,7 @@ class EndpointBackend:
             # The server's own configuration file cannot be read: the endpoint's line names the
             # file and the parser's words. Those are for the operator, in this service's log;
             # the person is told who to ask. Nothing was carried out.
-            said = (reply.get('stderr') or '').strip().splitlines()
+            said = (reply.get('stderr') or '').strip().split('\n')
             print('configuration: the endpoint could not read the deployment configuration for %s: %s'
                   % (action or 'a request', ascii(said[-1][:600]) if said else '(nothing)'), file=sys.stderr, flush=True)
             refused = HttpError(503, 'server_configuration', self.CONFIGURATION_UNREADABLE)
@@ -1559,15 +1588,33 @@ class EndpointBackend:
         stderr = (reply.get('stderr') or '') if isinstance(reply, dict) else ''
         stdout = (reply.get('stdout') or '') if isinstance(reply, dict) else ''
         if isinstance(reply, dict) and reply.get('fault') == 'tracker':
-            # The endpoint's export yielded no rows, so the project's tracker was not read
-            # (kittrial-5bb.188 item 1). The endpoint marks it a host fault, and the
-            # `reading` path above already decides what such a failure means: 503, nothing
-            # was changed, the key stays free. Never 422 "the request was rejected".
+            # The endpoint could not read the project's tracker: a nonzero bd exit, a line cut
+            # short, text that is not rows, or a project whose metadata records no server
+            # coordinates (kittrial-5bb.188 item 1; kittrial-5bb.202 rev-3 item 2). The endpoint
+            # marks it a host fault, and the `reading` path above already decides what such a
+            # failure means: 503, nothing was changed, the key stays free. Never 422 "the
+            # request was rejected".
             raise cls._unread()
+        if isinstance(reply, dict) and reply.get('fault') == 'unreadable-rows':
+            # The export was read but holds a row that cannot be parsed: for the
+            # worker-credential name rule the whole tracker is then not read, because the
+            # unreadable row may be the row that holds the name (kittrial-5bb.221 r2). Not
+            # transient either: an operator must repair the row, so the caller gets the
+            # endpoint's own sentence naming the row ids and the repair, its own code, and
+            # never UNREAD's "try again shortly" (kittrial-5bb.243 item N7).
+            raise cls._rows_unreadable(reply.get('unreadable_rows'), reply.get('unreadable_total'))
+        if isinstance(reply, dict) and reply.get('fault') == 'merge-slot':
+            # The tracker was read but carries no merge-slot row: rows that came back without
+            # it, or a readable tracker with no rows at all, the plain `bd init` shape
+            # (kittrial-5bb.202 item 1 and rev-2's empty-project decision). It is not the
+            # transient tracker fault: trying again never helps and only an operator's
+            # merge-create puts the row back, so the caller gets that sentence and its own
+            # code, never UNREAD's "try again shortly".
+            raise cls._merge_slot_missing()
         if code == 126:
             # The endpoint re-validated live authority immediately before the effect
             # and refused it. Nothing was written.
-            detail = stderr.strip().splitlines()[-1][:200] if stderr.strip() else None
+            detail = stderr.strip().split('\n')[-1][:200] if stderr.strip() else None
             if (reply.get('authority_status') or 403) == 401:
                 raise unauthenticated(detail or 'Authentication is no longer valid')
             raise forbidden(detail or 'Authority was revoked before the canonical write')
@@ -1583,7 +1630,7 @@ class EndpointBackend:
             cls._log_busy(action, stderr)
             raise busy()
         if code:
-            said = stderr.strip().splitlines()[-1] if stderr.strip() else None
+            said = stderr.strip().split('\n')[-1] if stderr.strip() else None
             detail = said[:cls._detail_limit(action, said)] if said else None
             if code == 2:
                 if reply.get('refused') == 'not-found':
@@ -1615,6 +1662,52 @@ class EndpointBackend:
         failure.nothing_done = True
         return failure
 
+    #: Said when the tracker was read but carries no merge-slot row: rows without it, or no rows
+    #: at all (kittrial-5bb.202 item 1; rev-3 item 3(c) corrected "rows came back but").
+    #: Not transient: the row will not appear by retrying, and only an operator's merge-create
+    #: puts it back. Its own code, so a caller can tell it from UNREAD.
+    MERGE_SLOT_MISSING = ("The project's tracker holds no merge slot row, so it was not read as a whole "
+                          "tracker. An operator must run the merge-create operation, which creates the "
+                          "slot, then try again.")
+
+    @classmethod
+    def _merge_slot_missing(cls):
+        failure = HttpError(503, 'merge_slot_missing', cls.MERGE_SLOT_MISSING)
+        failure.nothing_done = True
+        return failure
+
+    #: Said when the tracker was read but holds a row that cannot be parsed: for the
+    #: worker-credential name rule the whole tracker is then not read (the unreadable row
+    #: may be the row that holds the name; kittrial-5bb.221 r2). Not transient: an operator
+    #: must repair the row. Its own code, so a caller can tell it from UNREAD. The endpoint's
+    #: own sentence, which names the row ids, is preferred over this fixed one
+    #: (kittrial-5bb.243 item N7).
+    ROWS_UNREADABLE = ("The project's tracker holds a row that cannot be read, so it was not read as a whole "
+                       "tracker: the unreadable row may be the row that holds a name. An operator must repair "
+                       "the row (for deeply nested metadata: bd update ID --unset-metadata KEY) if a second "
+                       "try gives the same answer, then try again.")
+
+    @classmethod
+    def _rows_unreadable(cls, ids=None, total=None):
+        # The answer is built from the fault's own fields, never from a stderr tail a row
+        # could shape (r2 review item 1): the endpoint sends the ids it named, already
+        # bounded to the tracker's id shape, and the total it counted, and the sentence is
+        # composed here, naming the ids and then 'and K more' as the endpoint's sentence
+        # does (r3 review item 2).
+        import actor_names
+        named = [i for i in (ids or ()) if isinstance(i, str) and actor_names.ROW_ID.fullmatch(i)][:actor_names.NAMED_ROWS_MAX]
+        count = total if isinstance(total, int) and total >= 0 else (len(named) if named else None)
+        failure = HttpError(503, 'unreadable_rows', cls.ROWS_UNREADABLE)
+        if named:
+            more = '' if count is None or count <= len(named) else ', and %d more' % (count - len(named))
+            failure = HttpError(503, 'unreadable_rows', cls.ROWS_UNREADABLE.replace(
+                'holds a row that cannot be read',
+                'holds unreadable row(s) %s%s' % (', '.join(named), more), 1))
+        failure.nothing_done = True
+        failure.unreadable_rows = named
+        failure.unreadable_total = count
+        return failure
+
     #: Said when the endpoint reports that the server's configuration file cannot be read.
     CONFIGURATION_UNREADABLE = ("The server's configuration cannot be read, so this request was not carried out. "
                                 'Ask an operator of the server to look.')
@@ -1622,7 +1715,7 @@ class EndpointBackend:
     @staticmethod
     def _log_busy(action, stderr):
         """Which lock, and how long: the endpoint's own line, for the operator, in the service log."""
-        said = (stderr or '').strip().splitlines()
+        said = (stderr or '').strip().split('\n')
         print('busy: the endpoint answered return code 75 for %s: %s'
               % (action or 'a request', ascii(said[-1][:400]) if said else '(nothing)'), file=sys.stderr, flush=True)
 
@@ -1942,6 +2035,33 @@ class EndpointBackend:
     def reference(self, project_id, key):
         """One entry through `ref get`; an unknown or unfinished key is a 404."""
         return self._ref_read(project_id, ['get', caller_arg(key, 'key')], missing=True)
+
+    def requirements_read(self, project_id, args):
+        reply=self._endpoint('requirements',project_id,self.actor_namespace+'/read',args)
+        if isinstance(reply,dict) and reply.get('returncode')==2 and 'Requirement was not found' in (reply.get('stderr') or ''):
+            raise not_found('Requirement not found')
+        return self._checked(reply, reading=True)
+
+    def owner_requirements(self, principal, project_id, action, fields, key, task=None):
+        operation_id=self._result_key(principal,project_id,'requirements.'+action,key,task)
+        authority=authority_request(principal,project_id,CAP_PROJECT_ADMIN,now=self.service._expiry_now())
+        args=[action]+([task] if task is not None else [])
+        attachment={'payload':{'flag':'--file','text':json.dumps(fields,ensure_ascii=False)}}
+        reply=self._endpoint('owner-requirements',project_id,principal.user_id,args,attachment,
+                             operation_id=operation_id,authority=authority,require_authority=True,
+                             route='requirements.'+action)
+        if isinstance(reply,dict) and reply.get('returncode')==2:
+            detail=reply.get('stderr') or ''
+            if ('Requirements changed. Reload and try again.' in detail
+                    or 'Operation identity reused with a different request' in detail):
+                raise conflict('Requirements changed. Reload and try again.')
+        return self._checked(reply)
+
+    def owner_requirement_recoveries(self, principal, project_id):
+        authority=authority_request(principal,project_id,CAP_PROJECT_ADMIN,now=self.service._expiry_now())
+        reply=self._endpoint('owner-requirements',project_id,principal.user_id,['recoveries'],
+                             authority=authority,require_authority=True,route='requirements.recoveries')
+        return self._checked(reply,reading=True)
 
     def proposal_read(self, project_id, args, missing=False):
         """One read-only `proposal get|list|mine` through the endpoint (.58 slice 1b).
@@ -2267,7 +2387,10 @@ class EndpointBackend:
                 # the canonical brief; without it here an agent could not write a first
                 # checkpoint from the brief alone (kittrial-5bb.113).
                 'activity_cursor': data.get('activity_cursor'),
-                'warnings': data.get('warnings') or []}
+                'warnings': data.get('warnings') or [],
+                # The canonical brief already bounds refs, authors and omissions;
+                # preserve its coverage/unknown counts rather than infer from time.
+                'newer': data.get('newer')}
 
     def _open_items_in_full(self, project_id, task_id, checkpoint_id, unresolved):
         """Every open item of the current checkpoint, as recorded, or None when they could not all be read.
@@ -2380,7 +2503,7 @@ class EndpointBackend:
                                check_usable=False, timeout=self.create_timeout)
         if isinstance(reply, dict) and reply.get('returncode') == 75:
             import project_creation
-            said = (reply.get('stderr') or '').strip().splitlines()
+            said = (reply.get('stderr') or '').strip().split('\n')
             sentence = project_creation.busy_sentence(said[-1]) if said else None
             if sentence is None:
                 # A wait for a lock ran out before the creation's own code answered: the
@@ -2390,7 +2513,7 @@ class EndpointBackend:
             raise busy(sentence, retry_after=60)
         if isinstance(reply, dict) and reply.get('returncode') == 2:
             import project_creation
-            said = (reply.get('stderr') or '').strip().splitlines()
+            said = (reply.get('stderr') or '').strip().split('\n')
             sentence = project_creation.creation_sentence(said[-1]) if said else None
             if sentence is None:
                 # Not one of the creation's own sentences: an exception's text or a host path
@@ -2423,7 +2546,7 @@ class EndpointBackend:
                                ['clear'] if text is None else ['set'], attachments, operation_id=operation_id,
                                authority=authority, require_authority=True, route='projects.onboarding')
         if isinstance(reply, dict) and reply.get('returncode') == 2:
-            said = (reply.get('stderr') or '').strip().splitlines()
+            said = (reply.get('stderr') or '').strip().split('\n')
             sentence = said[-1][:400] if said else ''
             if not sentence.startswith('ValueError: '):
                 # Not a refusal of the text by the kit's own rules but a failure on the host (a
@@ -2459,7 +2582,7 @@ class EndpointBackend:
         if isinstance(reply, dict) and reply.get('returncode') == 2:
             # A failure on the host, not a refusal of the request: its line may name a host path
             # and an exception, and this list is shown on a page (kittrial-5bb.149).
-            said = (reply.get('stderr') or '').strip().splitlines()
+            said = (reply.get('stderr') or '').strip().split('\n')
             print('project-creations answered a failure: %s' % (ascii(said[-1][:400]) if said else '(nothing)'),
                   file=sys.stderr, flush=True)
             raise conflict(self.CREATIONS_UNREADABLE)
@@ -2839,7 +2962,7 @@ def _canonical_payload(stdout):
     try:
         return _parse_native(text)
     except ValueError:
-        for line in reversed(text.splitlines()):
+        for line in reversed(text.split('\n')):
             line = line.strip()
             if line[:1] in ('{', '['):
                 try:
@@ -5171,7 +5294,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                   'task': task_id, 'title': task.get('title'),
                   'status': task.get('status'), 'review_state': task.get('review_state'),
                   'assignee': task.get('assignee'), 'reason': reason,
-                  'links': {'task': base, 'brief': base, 'history': base + '/history',
+                  'links': {'task': base, 'brief': base + '/brief', 'history': base + '/history',
                             'project': '/v1/projects/%s' % project_id}}
         action.update(extra)
         return action
@@ -5233,8 +5356,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         for a reviewer or, once approved, for integration (5): the agent can do nothing
         about those, so they never sit ahead of work the agent can do. ``in_progress`` counts own open tasks with no
         contribution that are NOT blocked. A blocked action
-        carries ``blocked_since`` (when the checkpoint was written) and
-        ``newer_activity`` (whether another actor wrote after it), so an
+        carries ``blocked_since`` (when the checkpoint was written). Blocked and
+        in-progress actions carry ``newer_activity`` (whether another actor wrote
+        activity the checkpoint did not incorporate), so an
         agent can leave a blocked task with nothing new alone instead of re-reading it
         and writing another checkpoint on every wake. Delivered work follows its
         review state and does not count as blocked, regardless of open items.
@@ -5243,7 +5367,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         counts = {'claimable': 0, 'claimed': 0, 'changes_requested': 0,
                   'awaiting_review': 0, 'blocked': 0, 'in_progress': 0, 'awaiting_integration': 0,
                   'review_errors': 0, 'checkpoint_errors': 0, 'read_errors': 0,
-                  'review_recommended': 0, 'to_review': 0}
+                  'review_recommended': 0, 'to_review': 0, 'newer_activity': 0}
         own_actions = []
         claimable_actions = []
         review_actions = []
@@ -5283,12 +5407,13 @@ class ApiHandler(BaseHTTPRequestHandler):
                 counts['awaiting_integration'] += integrating
                 counts['blocked'] += blocked
                 counts['in_progress'] += in_progress
+                counts['newer_activity'] += (blocked or in_progress) and task.get('newer_activity') is True
                 counts['review_errors'] += review=='error'
                 counts['checkpoint_errors'] += unreadable and review!='error' and not delivered
                 details = {'requests': list(task.get('pending_change_requests') or [])[:20], 'open_items': open_items,
                            'blocking_items':blocking_items,
                            'blocked_since': task.get('checkpoint_at') if blocked else None,
-                           'newer_activity': task.get('newer_activity') if blocked else None}
+                           'newer_activity': task.get('newer_activity') if blocked or in_progress else None}
                 if review == 'changes-requested':
                     own_actions.append(self._agent_action(
                         1, 'changes-requested', project_id, task,
@@ -5348,7 +5473,9 @@ class ApiHandler(BaseHTTPRequestHandler):
             truncated = True
             actions_truncated = True
         actions = own_actions + review_actions + claimable_actions
-        actions.sort(key=lambda a: (a['priority'], self.AGENT_KIND_ORDER.get(a['kind'], 0), a['project'], a['task']))
+        actions.sort(key=lambda a: (a['priority'], self.AGENT_KIND_ORDER.get(a['kind'], 0),
+                                   0 if a['kind'] == 'in-progress' and a.get('newer_activity') is True else 1,
+                                   a['project'], a['task']))
         if len(actions) > AGENT_ACTION_LIMIT:
             actions = actions[:AGENT_ACTION_LIMIT]
             truncated = True
@@ -5375,7 +5502,10 @@ class ApiHandler(BaseHTTPRequestHandler):
             state = 'idle'
         return {'state': state, 'summary': self._agent_summary(
                     state, counts, snapshot_truncated, own_tasks_truncated)
-                    + self._agent_review_summary(counts, snapshot_truncated),
+                    + self._agent_review_summary(counts, snapshot_truncated)
+                    + ((' %s%d owned undelivered task(s) have newer activity; read their linked briefs and history.'
+                        % ('at least ' if own_tasks_truncated else '', counts['newer_activity']))
+                       if counts['newer_activity'] else ''),
                 'counts': counts, 'actions': actions, 'truncated': truncated,
                 'snapshot_truncated':snapshot_truncated,'own_tasks_truncated':own_tasks_truncated,
                 'actions_truncated':actions_truncated,
@@ -5625,6 +5755,92 @@ class ApiHandler(BaseHTTPRequestHandler):
     def references_get(self, ctx):
         self._project(ctx, CAP_READ)
         return 200, self.backend.reference(ctx.params['pid'], ctx.params['key'])
+
+    # -- direct owner requirements, slice A -------------------------------------
+    def _requirements_backend(self):
+        if not hasattr(self.backend,'requirements_read') or not hasattr(self.backend,'owner_requirements'):
+            raise not_implemented('Requirements editing needs the canonical tracker backend')
+
+    def _requirements_owner(self, ctx):
+        pid=ctx.params['pid']
+        self._project(ctx,CAP_PROJECT_ADMIN)
+        if (ctx.principal.via!='session' or ctx.principal.credential_id or ctx.principal.agent_id
+                or self.service.state.get('memberships',{}).get(pid,{}).get(ctx.principal.user_id)!='owner'):
+            raise forbidden('Requirements editing needs the signed-in project owner')
+
+    def _requirements_write(self, ctx, action, status=200):
+        self._requirements_backend()
+        self._requirements_owner(ctx)
+        fields,operation_id=self._proposal_body(ctx,{
+            'create':('kind','parent','title','description','key'),
+            'revise':('expected_revision','expected_sha256','title','description'),
+            'accept':('expected_revision','expected_sha256'),
+            'release':('original_operation_id','expected_receipt_sha256','reason'),
+            'governance':('mode','expected_revision','expected_sha256')}[action],'Requirements')
+        import requirement_http
+        try: requirement_http.checked_body(fields,action)
+        except ValueError as error: raise invalid(str(error))
+        if operation_id is not None:
+            raise invalid('Use the Idempotency-Key header for requirements writes')
+        pid=ctx.params['pid']
+        def write():
+            result=self.backend.owner_requirements(ctx.principal,pid,action,fields,
+                                                    ctx.idempotency_key or ctx.request_id,ctx.params.get('rid'))
+            return result,result
+        return self._mutate(ctx,'requirements.'+action,pid,write,status=status,
+                            capability=CAP_PROJECT_ADMIN,serialize=False,canonical=True)
+
+    @route('GET', r'/v1/projects/(?P<pid>'+ID+r')/requirements/governance')
+    def requirements_governance_read(self,ctx):
+        self._requirements_backend(); self._project(ctx,CAP_READ)
+        return 200,self.backend.requirements_read(ctx.params['pid'],['governance'])
+
+    @route('GET', r'/v1/projects/(?P<pid>'+ID+r')/requirements/recoveries')
+    def requirements_recoveries(self,ctx):
+        self._requirements_backend(); self._requirements_owner(ctx)
+        return 200,self.backend.owner_requirement_recoveries(ctx.principal,ctx.params['pid'])
+
+    @route('POST', r'/v1/projects/(?P<pid>'+ID+r')/requirements/recoveries/clear')
+    def requirements_clear_creation(self,ctx):
+        return self._requirements_write(ctx,'release')
+
+    @route('PUT', r'/v1/projects/(?P<pid>'+ID+r')/requirements/governance')
+    def requirements_governance_write(self,ctx):
+        return self._requirements_write(ctx,'governance')
+
+    @route('GET', r'/v1/projects/(?P<pid>'+ID+r')/requirements')
+    def requirements_list(self,ctx):
+        self._requirements_backend(); self._project(ctx,CAP_READ)
+        result=dict(self.backend.requirements_read(ctx.params['pid'],['list']))
+        result['can_edit']=(ctx.principal.via=='session' and not ctx.principal.agent_id
+                            and self.service.state.get('memberships',{}).get(ctx.params['pid'],{}).get(ctx.principal.user_id)=='owner')
+        return 200,result
+
+    @route('POST', r'/v1/projects/(?P<pid>'+ID+r')/requirements')
+    def requirements_create(self,ctx):
+        return self._requirements_write(ctx,'create',status=201)
+
+    @route('GET', r'/v1/projects/(?P<pid>'+ID+r')/requirements/(?P<rid>'+ID+r')')
+    def requirements_get(self,ctx):
+        self._requirements_backend(); self._project(ctx,CAP_READ)
+        result=dict(self.backend.requirements_read(ctx.params['pid'],['get',ctx.params['rid']]))
+        result['governance']=self.backend.requirements_read(ctx.params['pid'],['governance'])
+        result['can_edit']=(ctx.principal.via=='session' and not ctx.principal.agent_id
+                            and self.service.state.get('memberships',{}).get(ctx.params['pid'],{}).get(ctx.principal.user_id)=='owner')
+        return 200,result
+
+    @route('PATCH', r'/v1/projects/(?P<pid>'+ID+r')/requirements/(?P<rid>'+ID+r')')
+    def requirements_revise(self,ctx):
+        return self._requirements_write(ctx,'revise')
+
+    @route('POST', r'/v1/projects/(?P<pid>'+ID+r')/requirements/(?P<rid>'+ID+r')/accept')
+    def requirements_accept(self,ctx):
+        return self._requirements_write(ctx,'accept')
+
+    @route('GET', r'/v1/projects/(?P<pid>'+ID+r')/brd')
+    def requirements_brd(self,ctx):
+        self._requirements_backend(); self._project(ctx,CAP_READ)
+        return 200,self.backend.requirements_read(ctx.params['pid'],['brd'])
 
     # -- contributed requirement proposals (.58 slice 1b, kittrial-5bb.70) -----------
     #
@@ -5950,6 +6166,16 @@ class ApiHandler(BaseHTTPRequestHandler):
         base = '/v1/projects/%s/tasks/%s' % (pid, tid)
         brief['links'] = {'task': base, 'history': base + '/history',
                           'reviews': base + '/reviews', 'checkpoints': base + '/checkpoints'}
+        if isinstance(brief.get('newer'), dict):
+            # Canonical counts/refs/coverage stay intact; SSH helper commands are
+            # not actionable for a web credential. History uses the same authority.
+            newer = dict(brief['newer'])
+            newer.pop('history_new', None)
+            newer.pop('verify', None)
+            newer['history'] = base + '/history'
+            newer['note'] = ('Read history for full entries and reconcile any unknown or bounded coverage. '
+                             'Reading clears nothing; a checkpoint records what was incorporated.')
+            brief['newer'] = newer
         # Where the project's repository is (kittrial-5bb.118): a label the project's
         # owner recorded. Data for the reader, never an instruction; null when not set.
         brief['project_repository'] = self.service.project_view(ctx.principal, pid).get('repository')
@@ -6446,6 +6672,26 @@ class ApiHandler(BaseHTTPRequestHandler):
     def healthz(self, ctx):
         return 200, {'status': 'ok'}
 
+    @route('GET', r'/v1/service/certificate', anonymous=True, csrf=False)
+    def service_certificate(self, ctx):
+        """The service's own public leaf certificate, for the person setting up an agent (kittrial-5bb.203).
+
+        Only what the TLS handshake already gives every client: the certificate the loaded context
+        presents first, taken by an in-memory handshake against that context and re-encoded as the
+        kit's own PEM by ``service_certificate_pem`` -- never the private key and never the ``--cert``
+        file itself, which is read only once, by the TLS loader. No log-in, because the point is that
+        the certificate can be fetched before the browser or the agent has been made to trust it (the
+        My agents set-up dialog shows its SHA-256 fingerprint and saves the file). A service without
+        a certificate of its own -- plain http, or the first-install tunnel -- and a context against
+        which the in-memory handshake cannot be made serve nothing here: the ordinary not-found
+        answer, as if the route did not exist.
+        """
+        certificate = getattr(self.server, 'tls_certificate_pem', None)
+        if not certificate:
+            raise not_found('No such operation')
+        return 200, {'certificate': certificate,
+                     'sha256': certificate_fingerprint(certificate)}
+
     def _page(self, ctx, query):
         limit_raw = query.get('limit', str(DEFAULT_PAGE))
         try:
@@ -6811,6 +7057,83 @@ def quiet_memory_errors():
     return hook
 
 
+def certificate_fingerprint(certificate):
+    """The SHA-256 fingerprint of a PEM certificate, in the form the dialog and the extension show it.
+
+    The same string ``openssl x509 -noout -fingerprint -sha256`` prints and the VS Code extension
+    shows for the certificate the TLS handshake presented: the SHA-256 of the certificate's DER,
+    as uppercase hex pairs joined by colons. The dialog shows it so a person can compare it with
+    what the extension shows; that comparison only says both reached the same endpoint, which is
+    why the docs also name the independent check on the server itself (see
+    ``docs/HTTP_DEPLOYMENT.md``, "The service's own certificate ...").
+
+    Only the FIRST certificate of the text is used. The route's own PEM (``service_certificate_pem``)
+    holds exactly one certificate -- the one the handshake presents -- so this is that one.
+    Anything that is not a certificate block is refused.
+    """
+    match = re.search(r'-----BEGIN CERTIFICATE-----(.*?)-----END CERTIFICATE-----',
+                      str(certificate or ''), re.S)
+    if not match:
+        raise ValueError('not a PEM certificate')
+    try:
+        der = base64.b64decode(''.join(match.group(1).split()), validate=True)
+    except (binascii.Error, ValueError):
+        raise ValueError('not a PEM certificate: its body is not base64') from None
+    return ':'.join('%02X' % byte for byte in hashlib.sha256(der).digest())
+
+
+def service_certificate_pem(context):
+    """The certificate the given TLS context presents first, as PEM, or ``None``.
+
+    One in-memory handshake against the very ``ssl.SSLContext`` ``load_cert_chain`` filled: the
+    client's ``getpeercert(binary_form=True)`` is the DER of exactly the certificate a real client
+    receives first, so the route can serve nothing the handshake would not present (kittrial-5bb.203
+    review 01a12488, items 1 and 2). ``ssl.MemoryBIO`` keeps it off the network: no socket is opened,
+    and the ``--cert`` file is NOT read again -- the TLS loader read it once, exactly as main does.
+    Whatever the loader itself ignores is therefore irrelevant here: armour that does not start a
+    line (indented, or after a line that merely ends with it), a ``TRUSTED CERTIFICATE`` or
+    ``X509 CERTIFICATE`` label, an older certificate kept above the real one and a comment that
+    merely names the armour lines cannot make the route answer anything else. There is no size cap
+    and no per-block cap: this decodes nothing, so the answer is one leaf, about 1.2 kB, whatever the
+    file's size.
+
+    ``None`` when the handshake cannot be made at all (a context with no certificate of its own, a
+    pair that cannot complete): the service still starts and the route answers the ordinary 404,
+    never a 500 and never the raw file.
+    """
+    try:
+        client = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        client.check_hostname = False
+        client.verify_mode = ssl.CERT_NONE
+        c_in, c_out = ssl.MemoryBIO(), ssl.MemoryBIO()
+        s_in, s_out = ssl.MemoryBIO(), ssl.MemoryBIO()
+        client_side = client.wrap_bio(c_in, c_out, server_side=False)
+        server_side = context.wrap_bio(s_in, s_out, server_side=True)
+        for _ in range(20):
+            done = 0
+            for side in (client_side, server_side):
+                try:
+                    side.do_handshake()
+                    done += 1
+                except (ssl.SSLWantReadError, ssl.SSLWantWriteError):
+                    pass
+            s_in.write(c_out.read())
+            c_in.write(s_out.read())
+            if done == 2:
+                der = client_side.getpeercert(binary_form=True)
+                break
+        else:
+            return None
+    except (ssl.SSLError, OSError, ValueError):
+        return None
+    if not der:
+        return None
+    encoded = base64.b64encode(der).decode('ascii')
+    lines = [encoded[at:at + 64] for at in range(0, len(encoded), 64)]
+    return ('-----BEGIN CERTIFICATE-----\n' + '\n'.join(lines)
+            + '\n-----END CERTIFICATE-----\n')
+
+
 def create_server(service, backend, *, host='127.0.0.1', port=0, trusted_proxies=(),
                   max_body=MAX_BODY_BYTES, certfile=None, keyfile=None,
                   allow_plaintext_non_loopback=False, web_root=DEFAULT_WEB_ROOT,
@@ -6821,11 +7144,18 @@ def create_server(service, backend, *, host='127.0.0.1', port=0, trusted_proxies
         raise ValueError('Refusing plaintext on a non-loopback interface; supply TLS or '
                          'explicitly allow disposable plaintext')
     context = None
+    certificate = None
     if certfile:
         # Before anything is bound: a certificate or key that cannot be used stops the start.
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.minimum_version = ssl.TLSVersion.TLSv1_2
         context.load_cert_chain(certfile, keyfile)
+        # What the handshake actually presents, for GET /v1/service/certificate
+        # (kittrial-5bb.203 review 01a12488, items 1 and 2): one in-memory handshake against this
+        # very context, so the route can never answer with anything but the certificate a client
+        # receives first. The file is not read again and no armour is pattern-matched; a context the
+        # handshake cannot be made against leaves the route answering 404, not the start failing.
+        certificate = service_certificate_pem(context)
     if ':' in host:
         server_class = type('GuardedServer6', (GuardedServer,), {'address_family': __import__('socket').AF_INET6})
     else:
@@ -6836,6 +7166,9 @@ def create_server(service, backend, *, host='127.0.0.1', port=0, trusted_proxies
                                                      web_root=web_root))
     # The TLS context is the connection's (ApiHandler.setup): the listening socket stays plain.
     httpd.tls_context = context
+    # The public certificate this listener serves, for GET /v1/service/certificate: None when the
+    # service has no certificate of its own (plain http, or the first-install tunnel).
+    httpd.tls_certificate_pem = certificate
     if client_seconds is not None:
         httpd.client_seconds = client_seconds
     if connection_limit is not None:

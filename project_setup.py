@@ -49,6 +49,23 @@ def fill(status, label, words, note, replace):
                  ('PYTHON', 'KIT', 'RUNTIME_ROOT') + tuple(replace))
 
 
+def fill_coordination(status, label, words, note, replace):
+    """A coordination command with words to replace, from the host's own beginning.
+
+    ``coordination.py`` is a sibling of ``admin.py`` and takes ``--config`` (the operator's
+    own client configuration), not ``--root``, so it has its own beginning and the host
+    reports it as ``coordination`` beside ``admin`` (kittrial-5bb.202 review item 4: the
+    merge-slot step said host steps show a command and carried none). A host that does not say
+    how its coordination commands begin, or no host at all, names the words to replace."""
+    prefix = status.get('coordination') if isinstance(status, dict) else None
+    if isinstance(prefix, str) and prefix.strip():
+        return entry('shell-fill', label, prefix + ' ' + words, note, replace)
+    return entry('shell-fill', label, 'PYTHON KIT/coordination.py ' + words,
+                 note + ' This server did not say how its commands begin: PYTHON is the interpreter the kit runs '
+                        'under and KIT the installed kit.',
+                 ('PYTHON', 'KIT') + tuple(replace))
+
+
 def is_merge_slot(row, project_id=None):
     """The project's merge slot row: an internal record, not a task.
 
@@ -156,6 +173,37 @@ def steps(handler, principal, project_id):
 
     status, reason = host_status(backend, project_id)
     name = project_id
+
+    def merge_slot(block):
+        # The host's own read of the project's merge slot (kittrial-5bb.202 item 2). A project
+        # with NO slot row cannot issue a worker credential and needs an operator to run the
+        # merge-create coordination operation; a DAMAGED slot still issues one (201, as on
+        # main), it is listed here because merge-create repairs it (kittrial-5bb.202 review
+        # item 4: the old comment said a damaged slot cannot issue a credential, and it can).
+        state = block.get('state')
+        if state == 'healthy':
+            return 'done', 'The project has a usable merge slot.'
+        if state in ('missing', 'damaged'):
+            return 'todo', (block.get('detail') or
+                            'Run the merge-create operation, which creates or repairs it, then try again.')
+        return 'unknown', 'The server could not say whether the project has a usable merge slot.'
+
+    result.append(host_step(
+        'merge-slot', 'Make sure the project has a usable merge slot',
+        # The host's key is ``merge_slot``; host_step looks a step up by its id, so hand it a
+        # one-key status. A service that predates the field says unknown, not "no host".
+        None if status is None else {'merge-slot': status.get('merge_slot')},
+        reason, merge_slot, None,
+        # The page says host steps show a command (kittrial-5bb.200); merge-create is a
+        # coordination operation, so this is the coordination.py invocation with the payload
+        # in the note (kittrial-5bb.202 review item 4).
+        [fill_coordination(status, 'Run the merge-create operation (a shell command, on the server)',
+                           '--config CLIENT_CONFIG --project %s --actor OPERATOR --file MERGE_JSON' % name,
+                           'Replace CLIENT_CONFIG with your coordination client configuration, OPERATOR with your '
+                           'name on the operator list and MERGE_JSON with the path of a file holding '
+                           '{"operation":"merge-create"}. The operation creates the slot, or repairs a damaged one.',
+                           ('CLIENT_CONFIG', 'OPERATOR', 'MERGE_JSON'))],
+        None))
     result.append(host_step(
         'guidance', 'Set the standing guidance every worker reads', status, reason,
         lambda block: ({'set': ('done', 'Set%s.' % (' on %s' % block['set_at'][:10] if block.get('set_at') else '')),

@@ -575,7 +575,7 @@ class RestoreNoticeCase(unittest.TestCase):
         # notice is printed for a stop during add-project too.
         seen = {}
 
-        def add_project(root, name):
+        def add_project(root, name, requirements_default=True):
             seen['handler'] = signal.getsignal(signal.SIGTERM)
             (root / 'projects' / name).mkdir(parents=True)
             raise admin.TerminatedBySignal(signal.SIGTERM)
