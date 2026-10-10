@@ -88,7 +88,9 @@ class OwnerHttpTests(EndpointCase):
         self.assertEqual(failed.status, 503, failed.data)
         listing = self.request('GET', self.base + '/requirements/recoveries', token=self.owner_token)
         self.assertEqual(listing.status, 200, listing.data)
-        return fields, listing.data['items'][0]
+        operation = self.backend._result_key(self.service.authenticate(self.owner_token),
+                                             self.project, 'requirements.create', key, None)
+        return fields, next(x for x in listing.data['items'] if x['operation_id'] == operation)
 
     @staticmethod
     def recovery_body(item):
@@ -132,6 +134,118 @@ class OwnerHttpTests(EndpointCase):
         self.assertEqual(changed.status, 422, changed.data)
         self.assertEqual(self.request('POST', self.base + '/requirements', fields,
                                      token=new_token, key='new-creation').status, 201)
+
+    def test_clear_requires_the_exact_current_receipt_hash_before_any_effect(self):
+        from requirements import content_hash
+        _, item = self.failed_creation('hash-guard-create')
+        path = self.path / requirements.JOURNAL / (content_hash({'operation_id': item['operation_id']}) + '.json')
+        original = path.read_bytes()
+        before = len(self.backend.native.writes())
+        body = self.recovery_body(item)
+        refused = self.request('POST', self.base + '/requirements/recoveries/clear',
+            dict(body, expected_receipt_sha256='0' * 64), token=self.owner_token, key='wrong-clear-hash')
+        self.assertEqual(refused.status, 422, refused.data)
+        self.assertIn('reload', str(refused.data).lower())
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(len(self.backend.native.writes()), before)
+        cleared = self.request('POST', self.base + '/requirements/recoveries/clear',
+            body, token=self.owner_token, key='right-clear-hash')
+        self.assertEqual(cleared.status, 200, cleared.data)
+        self.assertTrue(cleared.data['released'])
+        self.assertEqual(len(self.backend.native.writes()), before)
+
+    def test_one_damaged_recovery_receipt_does_not_hide_other_creations_or_paths(self):
+        from requirements import content_hash
+        _, damaged = self.failed_creation('a-damaged')
+        _, healthy = self.failed_creation('b-healthy')
+        path = self.path / requirements.JOURNAL / (content_hash({'operation_id': damaged['operation_id']}) + '.json')
+        path.write_text('{not valid JSON', encoding='utf-8')
+        listing = self.request('GET', self.base + '/requirements/recoveries', token=self.owner_token)
+        self.assertEqual(listing.status, 200, listing.data)
+        items = {x['operation_id']: x for x in listing.data['items']}
+        self.assertFalse(items[damaged['operation_id']]['can_clear'])
+        self.assertTrue(items[healthy['operation_id']]['can_clear'])
+        self.assertNotIn(str(self.path), json.dumps(listing.data))
+        self.assertEqual((listing.data['listed'], listing.data['total'], listing.data['truncated']), (2, 2, False))
+        refused = self.request('POST', self.base + '/requirements/recoveries/clear',
+            self.recovery_body(damaged), token=self.owner_token, key='damaged-clear')
+        self.assertEqual(refused.status, 422, refused.data)
+        self.assertNotIn(str(self.path), json.dumps(refused.data))
+        # Operating-system errors can carry a private filename too.
+        load = requirements.load_json
+        def unreadable(candidate):
+            if Path(candidate) == path:
+                raise OSError('private-server-path-sentinel /private/server/receipt.json')
+            return load(candidate)
+        with mock.patch.object(requirements, 'load_json', unreadable):
+            listing = self.request('GET', self.base + '/requirements/recoveries', token=self.owner_token)
+            refused = self.request('POST', self.base + '/requirements/recoveries/clear',
+                self.recovery_body(damaged), token=self.owner_token, key='unreadable-clear')
+        self.assertEqual(listing.status, 200, listing.data)
+        self.assertNotIn('private-server-path-sentinel', json.dumps(listing.data))
+        self.assertNotIn('private-server-path-sentinel', json.dumps(refused.data))
+
+    def test_recovery_work_is_bounded_and_shares_one_complete_native_read(self):
+        from http_authority import OperationJournal
+        from requirements import content_hash
+        _, first = self.failed_creation('bounded-first')
+        original_path = self.path / requirements.JOURNAL / (content_hash({'operation_id': first['operation_id']}) + '.json')
+        receipt = original_path.read_text()
+        journal = OperationJournal(journal_path(self.path))
+        original = journal.lookup(first['operation_id'])
+        # Populate actual request-journal rows and receipts in this disposable
+        # project; discovery, count and HTTP projection are production paths.
+        for n in range(24):
+            operation = 'bounded-pending-' + str(n)
+            journal._actor = original['actor']; journal._route = original['route']
+            journal.reserve(operation, original['request_hash'], original['principal'])
+            journal.mark_unknown(operation)
+            path = self.path / requirements.JOURNAL / (content_hash({'operation_id': operation}) + '.json')
+            path.write_text(receipt)
+        for repeat in range(2):
+            start = len(self.backend.native.calls)
+            listing = self.request('GET', self.base + '/requirements/recoveries', token=self.owner_token)
+            self.assertEqual(listing.status, 200, listing.data)
+            self.assertEqual((listing.data['listed'], listing.data['total'], listing.data['truncated']), (20, 25, True))
+            self.assertEqual(len(listing.data['items']), 20)
+            self.assertTrue(all(x['can_clear'] for x in listing.data['items']))
+            calls = self.backend.native.calls[start:]
+            self.assertEqual(sum(x[0] == 'export' for x in calls), 1, calls)
+            self.assertEqual(sum(x[0] == 'list' for x in calls), 1, calls)
+
+    def test_an_incomplete_native_read_is_not_reused_as_an_absence_proof(self):
+        self.failed_creation('incomplete-first'); self.failed_creation('incomplete-second')
+        call = type(self.backend.native).__call__
+        def missing(native, args):
+            if args[0] == 'list':
+                native.calls.append(list(args)); return '[]'
+            return call(native, args)
+        start = len(self.backend.native.calls)
+        with mock.patch.object(type(self.backend.native), '__call__', missing):
+            listing = self.request('GET', self.base + '/requirements/recoveries', token=self.owner_token)
+        self.assertEqual(listing.status, 200, listing.data)
+        self.assertEqual(len(listing.data['items']), 2)
+        self.assertFalse(any(x['can_clear'] for x in listing.data['items']))
+        self.assertEqual(sum(x[0] == 'export' for x in self.backend.native.calls[start:]), 1)
+
+    def test_recovery_panel_error_keeps_the_document_and_edit_controls_usable(self):
+        from test_http_web import run_node_module
+        node = shutil.which('node')
+        if not node:
+            self.skipTest('Node.js is required for page behavior checks')
+        item = self.create_requirement('panel-keeps-document')
+        from http_authority import OperationJournal
+        with mock.patch.object(OperationJournal, 'pending_owner_creates_snapshot',
+                               side_effect=OSError('private-server-path-sentinel /private/server/journal')):
+            reply = self.request('GET', self.base + '/requirements/recoveries', token=self.owner_token)
+            self.assertNotIn('private-server-path-sentinel', json.dumps(reply.data))
+            root = Path(__file__).resolve().parents[1]
+            output = run_node_module(self, node, 'await import(process.argv[1])',
+                (root/'tests/web_owner_recovery_failure.mjs').as_uri(),
+                (root/'web/js/api.js').as_uri(), (root/'web/js/views/owner_requirements.js').as_uri(),
+                'http://127.0.0.1:' + str(self.port), self.project, self.owner_token)
+        self.assertEqual(output.returncode, 0, output.stderr)
+        self.assertTrue(json.loads(output.stdout)['documentStillUsable'])
 
     def test_allocated_even_empty_native_row_refuses_owner_clear_with_next_action(self):
         fields = dict(kind='requirement', parent='job-1', title='Allocated', description='No comment.')
@@ -620,6 +734,17 @@ class OwnerHttpTests(EndpointCase):
         self.assertFalse(owner_records.existing_acceptances(row))
         self.assertEqual(len(self.backend.native.writes()), before)
         self.assertEqual(sum(r['issue_type'] == 'decision' for r in self.backend.native.rows), 1)
+
+        # Reload the still-readable draft and use a fresh key; the old uncertain
+        # identity is never completed or silently bound to a guessed decision.
+        fresh = self.request('GET', self.base + '/requirements/' + first['id'], token=self.owner_token)
+        self.assertEqual(fresh.status, 200, fresh.data)
+        self.assertIn('Reload', str(recovered.data))
+        accepted = self.request('POST', route, self.expected(fresh.data['current']),
+                                token=self.owner_token, key='fresh-after-reload')
+        self.assertEqual(accepted.status, 200, accepted.data)
+        self.assertEqual(accepted.data['acceptance_state'], 'accepted')
+        self.assertEqual(sum(r['issue_type'] == 'decision' for r in self.backend.native.rows), 2)
 
     def test_closed_fields_and_idempotency_conflict_do_not_write(self):
         first = self.create_requirement()

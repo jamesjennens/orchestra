@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "operation_id": "capnew-c795bdbd32c54e40aa86640be419fc01",
+  "operation_id": "caprev-cc6d22511fde40efa387981ae17e2773",
   "key": "requirements.owner-drafts",
   "name": "Human project owners create and edit requirements drafts",
   "aliases": [
@@ -10,7 +10,7 @@
     "contributor replace owner draft",
     "propose a requirements change"
   ],
-  "summary": "In simple mode a signed-in project owner creates requirement or narrative content under an existing task and edits it through the requirements API. Editing accepted text creates a separate draft while preserving accepted history and exact references. Current session authority, project ownership and revision/hash checks gate writes. Machine credentials, agents and superusers without owner membership cannot use owner editing controls. Contributor replacement of a validated human owner pending draft is refused in simple mode, including interrupted retries; contributors propose a change instead. Contributor drafts remain revisable, and governed and host operator policies retain their existing authority. The same owner may clear only a failed create with a validated pending revision-1 receipt and no recorded or allocated native row, after complete native absence reads under current project/authority locks. The original receipt and release audit remain; allocated or uncertain rows require original retry or host operator reconciliation. A released identity cannot allocate again.",
+  "summary": "In simple mode a signed-in project owner creates requirement or narrative drafts under an existing task and edits accepted text while preserving history. Current session, owner membership and revision/hash checks gate writes; machine credentials and non-owner superusers gain no authority. Contributors cannot replace a validated human pending owner draft, including interrupted retries; they propose a change. Governed and host operator policies remain unchanged. Only the original owner can clear a validated pending revision-1 create with no allocated native row, under current locks and an exact receipt hash. The receipt and audit remain; released identities cannot allocate again. Recovery lists at most 20 items with exact listed, total and truncated fields, sharing one complete validated export and native membership read per request. Damaged receipts are isolated, recovery errors hide server paths and panel failure leaves the requirements document usable.",
   "requirements": [],
   "anchors": [
     "docs/REQUIREMENTS.md#editing-a-projects-requirements-in-the-web-interface"
@@ -18,7 +18,8 @@
   "code": [
     "requirement_http.py::apply",
     "requirement_http.py::web_action",
-    "requirement_records.py::apply_native"
+    "requirement_records.py::apply_native",
+    "requirement_http.py::recovery_projection"
   ],
   "tests": [
     "tests/test_http_requirements_owner.py",
@@ -30,5 +31,8 @@
     "requirements",
     "owner",
     "drafts"
-  ]
+  ],
+  "operation": "revise",
+  "revision": 3,
+  "expected_sha256": "130707549adbaeda9b4591aab035729689135a4b185e0cb6a229427e24333813"
 }

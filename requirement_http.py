@@ -17,6 +17,28 @@ from coordination import atomic, identifier
 from requirements import canonical_bytes, content_hash, load_json
 
 JOURNAL = '.requirement-owner-requests'
+RECOVERY_READ_ERROR = 'Failed creation recovery is unreadable. Ask the host operator to reconcile it.'
+RECOVERY_WRITE_ERROR = 'Failed creation recovery could not be completed. Reload; if it still fails, ask the host operator.'
+EMPTY_CREATION_ERROR = ('Cannot clear this failed creation. Retry the original creation; '
+                        'if it still fails, ask the host operator to reconcile it.')
+RECOVERY_PUBLIC_ERRORS = {
+    EMPTY_CREATION_ERROR,
+    EMPTY_CREATION_ERROR + ' Native absence cannot be proved from this read.',
+    EMPTY_CREATION_ERROR + ' A native row already carries this request.',
+    'Failed creation recovery changed; reload before trying again',
+    'No failed creation was found; ask the host operator to reconcile it',
+    'Only the owner account that attempted this creation can clear it',
+    'The original creation identity cannot be verified; ask the host operator',
+    'The original creation is not recoverable; ask the host operator',
+    'This failed creation needs host operator reconciliation.',
+    RECOVERY_READ_ERROR, RECOVERY_WRITE_ERROR,
+}
+
+
+def recovery_error(error, message=RECOVERY_READ_ERROR):
+    """Only our fixed public sentences may cross this recovery boundary."""
+    text = str(error)
+    return text if text in RECOVERY_PUBLIC_ERRORS else message
 
 
 def validate_receipt(receipt):
@@ -61,28 +83,32 @@ def receipt_sha256(receipt):
     return hashlib.sha256(canonical_bytes(receipt)).hexdigest()
 
 
-def empty_creation(receipt, context, operation_id, run):
-    """Prove no native row was allocated; caller holds both canonical locks."""
-    validate_receipt(receipt)
-    message = ('Cannot clear this failed creation. Retry the original creation; '
-               'if it still fails, ask the host operator to reconcile it.')
-    if (receipt.get('actor') != context.account_id or receipt['status'] != 'pending'
-            or receipt.get('operation') != 'draft' or receipt.get('revision') != 1
-            or receipt.get('id') is not None or receipt.get('created')
-            or receipt.get('acceptance') is not None or 'owner_decision' in receipt):
-        raise ValueError(message)
+def creation_request_labels(run):
+    """One complete export/membership proof and request index per read."""
     rows = records.read_rows(run)
     ids = record_json.native_ids(run)
     row_ids = [row.get('id') for row in rows]
     if (any(not isinstance(value, str) or not value for value in row_ids)
             or len(row_ids) != len(set(row_ids)) or set(row_ids) != ids
-            # Pinned bd omits labels entirely on ordinary unlabeled rows.
-            # A present null/non-list value still cannot prove absence.
             or any(row.get('malformed') or not isinstance(row.get('labels', []), list)
                    or any(not isinstance(label, str) for label in row.get('labels', [])) for row in rows)):
-        raise ValueError(message + ' Native absence cannot be proved from this read.')
+        raise ValueError(EMPTY_CREATION_ERROR + ' Native absence cannot be proved from this read.')
+    return {label for row in rows for label in row.get('labels', []) if label.startswith('request:')}
+
+
+def empty_creation(receipt, context, operation_id, run, native_labels=None):
+    """Prove no native row was allocated; caller holds both canonical locks."""
+    validate_receipt(receipt)
+    message = EMPTY_CREATION_ERROR
+    if (receipt.get('actor') != context.account_id or receipt['status'] != 'pending'
+            or receipt.get('operation') != 'draft' or receipt.get('revision') != 1
+            or receipt.get('id') is not None or receipt.get('created')
+            or receipt.get('acceptance') is not None or 'owner_decision' in receipt):
+        raise ValueError(message)
+    if native_labels is None:
+        native_labels = creation_request_labels(run)
     label = 'request:' + content_hash({'operation_id': operation_id})
-    if any(label in row.get('labels', []) for row in rows):
+    if label in native_labels:
         raise ValueError(message + ' A native row already carries this request.')
 
 
@@ -91,22 +117,22 @@ def recovery_projection(project_path, context, run):
     path = project_path / JOURNAL
     if path.is_symlink():
         raise ValueError('Owner recovery receipts need host operator repair')
-    if not path.exists():
-        return {'items': [], 'truncated': False}
     journal = OperationJournal(journal_path(project_path))
-    candidates = journal.pending_owner_creates('owner-account:' + context.account_id)
+    snapshot = journal.pending_owner_creates_snapshot('owner-account:' + context.account_id)
+    candidates = snapshot['items']
     items = []
-    for entry in candidates[:20]:
+    native_labels = None
+    native_error = None
+    native_loaded = False
+    for entry in candidates:
         operation = entry['operation_id']
-        receipt = core.receipt_path(path, content_hash({'operation_id': operation}), 'requirement')
-        if not receipt.is_file():
-            continue
-        saved = validate_receipt(load_json(receipt))
-        if saved.get('actor') != context.account_id or saved.get('operation') != 'draft':
-            continue
-        item = {'operation_id': operation, 'expected_receipt_sha256': receipt_sha256(saved),
-                'can_clear': False}
+        item = {'operation_id': operation, 'can_clear': False}
         try:
+            receipt = core.receipt_path(path, content_hash({'operation_id': operation}), 'requirement')
+            saved = validate_receipt(load_json(receipt))
+            if saved.get('actor') != context.account_id or saved.get('operation') != 'draft':
+                raise ValueError(RECOVERY_READ_ERROR)
+            item['expected_receipt_sha256'] = receipt_sha256(saved)
             if journal.expired(entry):
                 raise ValueError('This failed creation needs host operator reconciliation.')
             if saved['status'] == 'released' and 'release_history' in saved:
@@ -115,12 +141,21 @@ def recovery_projection(project_path, context, run):
                     raise ValueError('This failed creation needs host operator reconciliation.')
                 item.update(expected_receipt_sha256=audit['prior_receipt_sha256'], reason=audit['reason'])
             else:
-                empty_creation(saved, context, operation, run)
+                if not native_loaded:
+                    native_loaded = True
+                    try:
+                        native_labels = creation_request_labels(run)
+                    except (ValueError, OSError) as error:
+                        native_error = recovery_error(error)
+                if native_error:
+                    raise ValueError(native_error)
+                empty_creation(saved, context, operation, run, native_labels=native_labels)
             item['can_clear'] = True
-        except ValueError as error:
-            item['message'] = str(error)
+        except (ValueError, OSError) as error:
+            item['message'] = recovery_error(error)
         items.append(item)
-    return {'items': items, 'truncated': len(candidates) > 20}
+    return {'items': items, 'listed': len(items), 'total': snapshot['total'],
+            'truncated': snapshot['total'] > len(items)}
 
 
 def release_creation(project_path, context, body, run, runner):
@@ -411,7 +446,8 @@ def apply(project_path, context, action, body, operation_id, run, task=None):
         raise ValueError('Failed creation was cleared. Start a new creation with a new operation ID.')
     if action == 'accept' and prior and prior['status'] == 'pending' and 'owner_decision' not in prior:
         raise ValueError('Pending requirement acceptance has no recorded decision binding; '
-                         'keep this operation unknown and ask the host operator to reconcile it')
+                         'do not retry this key. Reload the requirement and accept again with a new key. '
+                         'For a legacy interrupted acceptance, edit the draft and accept the new revision.')
     if task is not None:
         row = records.find(records.read_rows(run), task)
         for evidence in owner_records.existing_acceptances(row).values():
@@ -421,6 +457,20 @@ def apply(project_path, context, action, body, operation_id, run, task=None):
 
 
 def web_action(root, project_path, project, request, authority_config, runner, guarded_write):
+    """Keep private failure details inside the two recovery endpoints."""
+    recovery = request.get('args') in (['recoveries'], ['release'])
+    try:
+        answer = _web_action(root, project_path, project, request, authority_config, runner, guarded_write)
+    except (ValueError, OSError) as error:
+        if not recovery:
+            raise
+        raise ValueError(recovery_error(error, RECOVERY_WRITE_ERROR)) from None
+    if recovery and answer.get('returncode') and answer.get('stderr'):
+        answer = dict(answer, stderr=recovery_error(answer['stderr'], RECOVERY_WRITE_ERROR))
+    return answer
+
+
+def _web_action(root, project_path, project, request, authority_config, runner, guarded_write):
     """Endpoint adapter; caller holds project lock, guarded_write holds authority lock."""
     from http_authority import OperationJournal, journal_path, operation_hash, principal_key, stamp_write
     # Stable account identity applies only to this checked owner adapter; keep

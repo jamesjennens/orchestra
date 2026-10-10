@@ -477,7 +477,7 @@ class OwnerEvidenceTests(unittest.TestCase):
         http.validate_receipt(legacy)  # Exact-base receipts are still valid.
         receipt.write_text(json.dumps(legacy))
         original = receipt.read_bytes()
-        with self.assertRaisesRegex(ValueError, 'no recorded decision binding.*host operator'):
+        with self.assertRaisesRegex(ValueError, 'no recorded decision binding.*Reload'):
             self.accept(item)
         self.assertEqual(len(self.native.writes()), before)
         self.assertEqual(receipt.read_bytes(), original)
@@ -494,6 +494,26 @@ class OwnerEvidenceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'no recorded decision binding'):
             self.accept(item)
         self.assertEqual(len(self.native.writes()), before)
+
+    def test_legacy_unbound_acceptance_can_accept_a_new_draft_without_finishing_old_key(self):
+        item, receipt, saved = self.interrupted_acceptance()
+        legacy = dict(saved); del legacy['owner_decision']
+        receipt.write_text(json.dumps(legacy))
+        original = receipt.read_bytes()
+        with self.assertRaisesRegex(ValueError, 'no recorded decision binding.*Reload'):
+            self.accept(item)
+        fresh = http.read(self.path, 'alpha', ['get', item['id']], self.native)
+        draft = fresh['current']
+        changed = http.apply(self.path, self.context, 'revise', {
+            'expected_revision': draft['revision'], 'expected_sha256': draft['sha256'],
+            'description': 'A new draft after the legacy interrupted acceptance.'},
+            'legacy-new-draft', self.native, item['id'])
+        accepted = self.accept(changed, 'legacy-new-accept')
+        self.assertEqual(accepted['acceptance_state'], 'accepted')
+        self.assertEqual(http.read(self.path, 'alpha', ['get', item['id']], self.native)['accepted']['sha256'],
+                         accepted['sha256'])
+        self.assertEqual(receipt.read_bytes(), original)
+        self.assertNotIn('owner_decision', json.loads(original))
 
     def test_missing_bound_decision_after_evidence_still_keeps_revision_pending(self):
         item = self.create()
