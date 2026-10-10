@@ -674,6 +674,59 @@ def review_workflow_writes(root, strict=False, warnings=None):
                 print('WARNING: ' + message,file=sys.stderr)
     return enabled
 
+#: The key of the installation setting that accepts bound keys only, and the key of its short
+#: operator audit list, in the same deployment.private.json (kittrial-5bb.196, slice 4 of
+#: docs/COORDINATORS_PER_PROJECT_DESIGN.md).
+BOUND_KEYS_ONLY_KEY='bound_keys_only'
+BOUND_KEYS_ONLY_AUDIT_KEY='bound_keys_only_audit'
+
+def bound_keys_only(root, warnings=None):
+    """The per-installation setting that accepts bound keys only (kittrial-5bb.196, slice 4).
+
+    `deployment.private.json`'s `bound_keys_only` is the single source. Absent or false means
+    OFF, so a fresh install, an installation that never turned it on and one that turned it
+    back off read identically. A value that is neither true nor false is read as OFF with a
+    warning, for the reason `review_workflow_writes` does it (kittrial-5bb.110 item 2): raising
+    would fail `work` and `brief` for every actor of the installation. A file that cannot be
+    read as the deployment configuration raises :class:`ConfigurationUnreadable`, as it does
+    for every other reader of that file.
+
+    The setting is ENFORCED by `ssh_forced_command.py`: with it on, the forced command of an
+    authorized_keys line refuses a line that names no project or no principal. The wrapper
+    cannot import this module (it must start on any interpreter the account has) and has its
+    own reader of the same key; tests/test_bound_keys_only.py pins the two together.
+    """
+    enabled=False
+    marker=root/'deployment.private.json'
+    if marker.is_file():
+        value=deployment_document(marker).get(BOUND_KEYS_ONLY_KEY)
+        if isinstance(value,bool):
+            enabled=value
+        elif value is not None:
+            message=('deployment %s is %r, not true or false; reading it as off (the forced command '
+                     'does NOT refuse a line without a project or a principal)'
+                     %(BOUND_KEYS_ONLY_KEY,value))
+            if warnings is not None:
+                warnings.append('WARNING: '+message)
+            else:
+                print('WARNING: '+message,file=sys.stderr)
+    return enabled
+
+#: What `setup-status` says about that setting (kittrial-5bb.196). The setting belongs to the
+#: installation, so every project reports the same words, and the sentence is what an operator
+#: needs to know before turning it on or after reading that it is on. The plainest statement of
+#: what the setting cannot do (a line printed before this kit) is in docs/OPERATIONS.md.
+BOUND_KEYS_ONLY_DETAIL_ON=('This installation accepts bound keys only: the forced command refuses an '
+    'authorized_keys line that names no project or no principal. It does nothing about a line printed before '
+    'this kit, which runs the release it names and does not know the setting: clean authorized_keys by hand, '
+    'and `admin.py authorized-keys-list` flags the lines to look at.')
+BOUND_KEYS_ONLY_DETAIL_OFF=('This installation accepts a line that names no project or no principal as before '
+    '(the setting is off). Once every line is bound, `admin.py bound-keys-only on --actor OPERATOR` turns it '
+    'on and the forced command then refuses such a line; a line printed before this kit keeps running the '
+    'release it names and is not refused by it.')
+BOUND_KEYS_ONLY_DETAIL_UNKNOWN=('The installation setting for bound keys only could not be read; an operator '
+    'must look at deployment.private.json on the server.')
+
 #: The key of the checkpoint switch's audit list inside deployment.private.json, and the
 #: prefix a damaged value is kept aside under (kittrial-5bb.131).
 CHECKPOINT_AUDIT_KEY='checkpoint_provenance_audit'
@@ -1069,6 +1122,77 @@ def review_writes_command(root, actor, action):
         atomic_private_write(marker,json.dumps(cfg))
         write_review_writes_audit(root,enabled,actor,previous,entries=review_writes_audit(root))
     return {'review_workflow_writes':review_workflow_writes(root),'changed':True},warnings
+
+
+def bound_keys_only_audit(cfg):
+    """``(entries, damage)`` for the bound-keys-only switch audit in a deployment document.
+
+    The entries have exactly the shape ``checkpoint-provenance-writes`` writes (actor, at,
+    action, previous, enabled), so one validator decides both lists; anything else is
+    ``([], reason)`` and the reason names what is there, never its content.
+    """
+    value=cfg.get(BOUND_KEYS_ONLY_AUDIT_KEY,[])
+    if not isinstance(value,list):
+        return [],'%s is a %s, not a list of records'%(BOUND_KEYS_ONLY_AUDIT_KEY,type(value).__name__)
+    for index,item in enumerate(value):
+        if not checkpoint_audit_entry(item):
+            return [],'entry %d of %s is not a record of the shape the switch writes'%(index,BOUND_KEYS_ONLY_AUDIT_KEY)
+    return value,None
+
+
+def bound_keys_only_switch(root,action,actor):
+    """Read or flip ``bound_keys_only`` with its operator audit (kittrial-5bb.196, slice 4).
+
+    The actor must be on the deployment operator allowlist, as for the two rollout switches: a
+    contributor that reaches a host command line cannot turn the installation's key rule on or
+    off. A flip holds the deployment switch lock across the whole read-modify-write of
+    deployment.private.json (both switches rewrite that file), writes nothing when it changes
+    nothing, and keeps a damaged audit list aside as
+    ``bound_keys_only_audit_damaged_<UTC stamp>`` before it starts a fresh one, exactly as
+    ``checkpoint-provenance-writes`` does.
+    """
+    marker=root/'deployment.private.json'
+    if not marker.is_file():raise ValueError('Deployment is not installed; run install first')
+    from recovery import identity
+    actor=identity(actor,'Invalid actor identity')
+    if actor not in operators(root,strict=True):
+        raise ValueError('bound-keys-only requires an actor on the deployment operator allowlist')
+    if action not in ('status','on','off'):raise ValueError('Invalid bound-keys-only switch action')
+    if action=='status':
+        current=bound_keys_only(root)
+        audit,damage=bound_keys_only_audit(config(root))
+        if damage is not None:
+            print('WARNING: the bound-keys-only switch audit is damaged (%s); it reads as an empty history. '
+                  'The next on/off keeps it aside in deployment.private.json under %s_damaged_<UTC stamp> and '
+                  'starts a fresh list.'%(damage,BOUND_KEYS_ONLY_AUDIT_KEY),file=sys.stderr)
+        return dict(bound_keys_only=current,audit=audit[-1] if audit else None,audit_history=audit,
+                    audit_records=len(audit),audit_readable=damage is None,changed=False)
+    enabled=action=='on'
+    with review_writes_lock(root):
+        current=bound_keys_only(root)
+        cfg=config(root)
+        audit,damage=bound_keys_only_audit(cfg)
+        if enabled==current:
+            # A flip that changes nothing writes nothing: the history records changes, and a
+            # repeated `on` cannot rewrite the file or set a damaged audit aside.
+            return dict(bound_keys_only=current,audit_records=len(audit),audit_readable=damage is None,
+                        changed=False)
+        if damage is not None:
+            kept='%s_damaged_%s'%(BOUND_KEYS_ONLY_AUDIT_KEY,utc_stamp().replace(':','').replace('-',''))
+            suffix=1
+            while kept+('' if suffix==1 else '_%d'%suffix) in cfg:suffix+=1
+            kept+=('' if suffix==1 else '_%d'%suffix)
+            cfg[kept]=cfg.pop(BOUND_KEYS_ONLY_AUDIT_KEY)
+            print('WARNING: the bound-keys-only switch audit was damaged (%s); it is kept aside in '
+                  'deployment.private.json as %s and this flip starts a fresh list.'%(damage,kept),file=sys.stderr)
+        # OFF is the absent key, so an installation that never turned it on and one that turned
+        # it back off read identically (the rule `review-writes` follows).
+        if enabled:cfg[BOUND_KEYS_ONLY_KEY]=True
+        else:cfg.pop(BOUND_KEYS_ONLY_KEY,None)
+        cfg[BOUND_KEYS_ONLY_AUDIT_KEY]=audit+[dict(actor=actor,at=utc_stamp(),action=action,
+                                                   previous=current,enabled=enabled)]
+        atomic_private_write(marker,json.dumps(cfg))
+    return dict(bound_keys_only=enabled,audit_records=len(audit)+1,audit_readable=True,changed=True)
 
 
 def stored_operators(cfg):
@@ -2191,6 +2315,16 @@ def project_setup_status(root,name,path=None):
     # The project's merge slot, so the setup page can name a missing or damaged one as a
     # step (kittrial-5bb.202 item 2). Unknown when bd cannot say; never a write.
     result['merge_slot']=project_merge_slot_state(root,name,path)
+    # The installation setting that accepts bound keys only (kittrial-5bb.196, slice 4). It is
+    # one setting for the whole installation, reported here because this is where the setup
+    # page and an operator ask; `enabled` is None with its own sentence when the file cannot be
+    # read, so this part never fails the others (kittrial-5bb.118).
+    try:
+        enabled=bound_keys_only(root)
+        result['bound_keys_only']={'enabled':enabled,
+                                   'detail':BOUND_KEYS_ONLY_DETAIL_ON if enabled else BOUND_KEYS_ONLY_DETAIL_OFF}
+    except (OSError,ValueError):
+        result['bound_keys_only']={'enabled':None,'detail':BOUND_KEYS_ONLY_DETAIL_UNKNOWN}
     # How full the server is (kittrial-5bb.118 part 2 revision): every project database on it
     # counts, and every bd write gets slower as they grow. The web service shows it to a
     # superuser only.
@@ -5119,26 +5253,45 @@ def authorized_keys_listing(root,file=None):
                or entry.get('unknown_projects') or entry.get('names_release') or entry['kind']=='unreadable'
                or entry.get('principal_repeated') or entry.get('principal_ill_formed')
                or entry.get('project_repeated')]
+    # The installation setting that accepts bound keys only (kittrial-5bb.196, slice 4). While
+    # it is on, a line that runs this kit's wrapper and names no project or no principal is
+    # refused by the wrapper, so it is one more line an operator must look at: the migration
+    # cleans authorized_keys by hand, and this is the command that names the lines. An
+    # unrestricted key or another program does not run the wrapper and is not flagged for this.
+    # A settings file that cannot be read says `unknown` (None) instead of failing this read.
+    try:setting=bound_keys_only(root)
+    except (OSError,ValueError):setting=None
+    refused=[entry['line'] for entry in lines
+             if setting and entry.get('kind') in ('bound','confined')
+             and (not entry.get('projects') or not entry.get('principal'))]
+    attention=sorted(set(attention+refused))
+    notes=['unrestricted: the key has this account\'s shell and is outside every rule of the kit, on every project.',
+           'confined: the key runs only the endpoint and may name any project and any actor.',
+           'bound: the key runs only the endpoint and only for its projects and/or its principal - the '
+           '`projects` and `principal` fields say which. A principal-bound line is `bound`, not `confined`.',
+           'principal-bound: counted separately for the lines that name a principal, so a line bound only to '
+           'a principal is not read as merely confined.',
+           'principal_ill_formed: the line names a principal that is not `lane:NAME` or `person:NAME`; the '
+           'wrapper refuses every request of that key. principal_repeated: the line names more than one '
+           'principal (the wrapper refuses it). Both are under attention and must be reprinted.',
+           'project_repeated: the line names the same project twice (`--project pa --project pa`); the '
+           'wrapper refuses the line. It is under attention and must be reprinted.',
+           'other_kit: the line runs a wrapper or an endpoint that is not this kit\'s file. Such a line is '
+           'served by that other kit, whatever its text says: a kit older than this one binds nothing. '
+           'Print the line again with this kit (authorized-keys) and replace it.',
+           'names_release: the line is this kit today but names its release folder, so after the next '
+           'upgrade it is other_kit. Print it again; it then goes through install/current.',
+           'other_root: the line serves another runtime than --root (or names none); its projects were not looked up here.']
+    if setting:
+        notes.append('bound_keys_only: this installation accepts bound keys only, so the forced command refuses '
+                     'a line of this kit that names no project or no principal%s. Print each such line again with '
+                     'authorized-keys --project ... --principal ... and replace it. A line that runs a wrapper of '
+                     'another kit is not refused by this setting at all: that kit does not know it.'
+                     %(' (line%s %s)'%('s' if len(refused)!=1 else '',', '.join(str(number) for number in refused))
+                       if refused else ' (no line here is such a line)'))
+    notes.append('This command reads the file and changes nothing.')
     return {'schema_version':1,'file':str(path),'root':str(root),'kit':str(kit),'lines':lines,'summary':summary,
-            'attention':attention,
-            'notes':['unrestricted: the key has this account\'s shell and is outside every rule of the kit, on every project.',
-                     'confined: the key runs only the endpoint and may name any project and any actor.',
-                     'bound: the key runs only the endpoint and only for its projects and/or its principal - the '
-                     '`projects` and `principal` fields say which. A principal-bound line is `bound`, not `confined`.',
-                     'principal-bound: counted separately for the lines that name a principal, so a line bound only to '
-                     'a principal is not read as merely confined.',
-                     'principal_ill_formed: the line names a principal that is not `lane:NAME` or `person:NAME`; the '
-                     'wrapper refuses every request of that key. principal_repeated: the line names more than one '
-                     'principal (the wrapper refuses it). Both are under attention and must be reprinted.',
-                     'project_repeated: the line names the same project twice (`--project pa --project pa`); the '
-                     'wrapper refuses the line. It is under attention and must be reprinted.',
-                     'other_kit: the line runs a wrapper or an endpoint that is not this kit\'s file. Such a line is '
-                     'served by that other kit, whatever its text says: a kit older than this one binds nothing. '
-                     'Print the line again with this kit (authorized-keys) and replace it.',
-                     'names_release: the line is this kit today but names its release folder, so after the next '
-                     'upgrade it is other_kit. Print it again; it then goes through install/current.',
-                     'other_root: the line serves another runtime than --root (or names none); its projects were not looked up here.',
-                     'This command reads the file and changes nothing.']}
+            'attention':attention,'bound_keys_only':setting,'notes':notes}
 
 def authorized_keys(root,key_file,role='both',python=None,comment=None,projects=None,principal=None):
     """Print the installable lines for one public key as JSON (see authorized_key_lines).
@@ -5157,6 +5310,15 @@ def authorized_keys(root,key_file,role='both',python=None,comment=None,projects=
     if (projects or principal is not None) and role=='operator':
         raise ValueError('--project and --principal bind the confined contributor line; an unrestricted operator '
                          'key has a shell and cannot be bound to projects or to a principal')
+    if role in ('contributor','both') and (not projects or principal is None) and bound_keys_only(root):
+        # This installation set `bound-keys-only`: the forced command refuses such a line, so
+        # printing it would hand the operator a line that cannot work (kittrial-5bb.196).
+        missing=' and '.join('no %s'%name for name,given in (('--project',bool(projects)),
+                                                            ('--principal',principal is not None)) if not given)
+        raise ValueError('This installation accepts bound keys only (deployment.private.json '
+                         'bound_keys_only is true), so a confined line must name at least one --project and one '
+                         '--principal, and this one names %s. Nothing was printed; add them, or print only '
+                         'the unrestricted operator line with --role operator.'%missing)
     path=Path(key_file)
     lines=authorized_key_lines(root,kit,*public_key_line(path.read_text(encoding='utf-8-sig'),str(path)),
                                comment=comment,python=python,projects=projects,principal=principal)
@@ -6575,6 +6737,11 @@ def main():
     a=sub.add_parser('checkpoint-provenance-writes',help='operator-audited reader-first checkpoint rollout switch; OFF by default, existing provenance tasks refuse legacy writes')
     a.add_argument('action',choices=['status','on','off'])
     a.add_argument('--actor',required=True,help='an actor on the deployment operator allowlist')
+    a=sub.add_parser('bound-keys-only',help='read or set the per-installation setting that accepts bound keys '
+                     'only: the forced command then refuses an authorized_keys line that names no project or no '
+                     'principal (OFF by default; operator allowlist, audited)')
+    a.add_argument('action',choices=['status','on','off'])
+    a.add_argument('--actor',required=True,help='an actor on the deployment operator allowlist')
     a=sub.add_parser('capability-verify',help='record verified capability checks (operator allowlist or verifiers list)')
     a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('authorized-keys',help='print the confined contributor and unrestricted operator authorized_keys lines for one public key')
@@ -7242,6 +7409,8 @@ def main():
         print(json.dumps({'verifiers':current}))
     elif args.command=='checkpoint-provenance-writes':
         print(json.dumps(checkpoint_provenance_switch(root,args.action,args.actor)))
+    elif args.command=='bound-keys-only':
+        print(json.dumps(bound_keys_only_switch(root,args.action,args.actor)))
     elif args.command=='review-writes':
         result,warnings=review_writes_command(root,args.actor,args.action)
         for line in warnings:print(line,file=sys.stderr)

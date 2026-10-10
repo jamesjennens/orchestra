@@ -314,6 +314,64 @@ refuses every such key. The same applies to a coordination-sidecar backup taken 
 adoption. [OFFICE_SERVICE.md](OFFICE_SERVICE.md) repeats this beside "Binary pins on
 rollback".
 
+### Accept bound keys only
+
+An installation can be set to accept bound keys only, so a line that leaves a key bound to
+nothing - no project to reach, or no principal whose actors it may be - is refused by the forced
+command before the endpoint runs (kittrial-5bb.196; slice 4 of
+[COORDINATORS_PER_PROJECT_DESIGN.md](COORDINATORS_PER_PROJECT_DESIGN.md), and Migration steps 6
+and 7):
+
+```sh
+python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime \
+  bound-keys-only on --actor OPERATOR
+```
+
+The command has three actions: `status` prints the setting, the last recorded change and whether
+the two agree; `on` and `off` flip it. It is operator-gated (`--actor` must be on the deployment
+operator allowlist) and every flip is recorded in the deployment document's
+`bound_keys_only_audit`, with the value it replaced; a flip that changes nothing writes nothing.
+The setting itself is one key, `bound_keys_only`, in `deployment.private.json`; absent or false
+is off, so an installation that configures nothing behaves exactly as it did, and a fresh install
+and one that turned the setting back off read identically.
+
+With it on, a line that names no `--project` or no `--principal` is answered on stderr with exit
+status 2, the missing part is named, and nothing is run - `ssh -T HOST` on such a key answers
+this too. A line that names both is served exactly as before, and `admin.py authorized-keys`
+refuses to print a contributor line that the setting would refuse (`--role operator` still prints
+the unrestricted line: a shell is outside this setting). What the setting does not touch: an
+unrestricted key, another program's `command=`, a project's rules, and rules 1 and 2.
+
+**What it does not do, said plainly.** A line printed before an upgrade names the wrapper and the
+endpoint of the release it was printed from, by absolute path, and on an office installation that
+path carries the release. Such a line runs THAT release's wrapper and endpoint - which know
+nothing of this setting, or of rules 1 to 3 - against the live runtime, for as long as that
+release's directory is there, and nothing in the new kit can refuse it. **Clean
+`authorized_keys` by hand**: remove or reprint every line that points at another release. The
+setting closes a forgotten line of the CURRENT kit; it does nothing about an older release's.
+`admin.py authorized-keys-list` flags each line that points at a kit other than the installed one
+(`other_kit`, `names_release`) and, while the setting is on, it also puts under `attention` every
+line of this kit that names no project or no principal, and its `bound_keys_only` field says
+which setting it read.
+
+`setup-status` reports the setting: the endpoint's read-only action carries a `bound_keys_only`
+block (`enabled` true or false, and `null` when the file cannot be read, each with a sentence).
+An endpoint older than this kit does not carry the block at all.
+
+**Before an upgrade or a rollback.** The printed lines name the release, so after every upgrade
+of an office installation print and install them again (`authorized-keys`), as Migration step 6
+says. A kit older than this one does not know the setting at all: rolling back to it silently
+stops refusing unbound lines although `bound_keys_only` is still true in
+`deployment.private.json`. It reads that file otherwise as before, and when this kit is back the
+setting applies again.
+
+**A damaged or unreadable `deployment.private.json` refuses a confined key.** The wrapper cannot
+tell whether the setting is on, so it refuses every call of a forced-command key (exit status 2,
+naming the file) until an operator repairs or removes the file; nothing is run. The operator's own
+unrestricted key does not run the wrapper and still reaches a shell, so this can never lock the
+operator out. A value that is neither true nor false is read as off with a warning on stderr, as
+`review-writes` reads such a value for its own switch.
+
 ### sshd settings the boundary needs
 
 The forced command closes what the key can run; two sshd settings decide what the client can

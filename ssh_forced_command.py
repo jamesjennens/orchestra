@@ -51,6 +51,14 @@ The contract, deliberately narrow:
   registration, which makes the new actor that principal's. A line with no ``--principal``
   starts the endpoint exactly as before, and looks at no owner. A line that names a principal
   twice is refused, like a project named twice.
+* An installation may accept BOUND KEYS ONLY (kittrial-5bb.196, slice 4 of
+  ``docs/COORDINATORS_PER_PROJECT_DESIGN.md``). The setting is one key,
+  ``bound_keys_only``, in the runtime's own ``deployment.private.json`` (the file ``--root``
+  names; it cannot come from the connection, and nothing of the line carries it). With it
+  true, a line that names no project or no principal is refused here, before the endpoint is
+  selected or run: the line cannot say which projects it may use or whose actors it may be,
+  and the setting exists so that such a line is not served. A line that names both is served
+  exactly as before, and with the setting false or absent nothing changes at all.
 * The endpoint is exec'd with a minimal, explicit environment: ``PATH``, ``HOME``, the
   locale variables (``LANG``, ``LC_*``), and the variables this kit sets for the endpoint
   itself (none today). Everything else the session carried - ``PYTHONPATH``, ``BASH_ENV``,
@@ -66,10 +74,12 @@ the ``--root`` the old command line carried is refused here. See
 ``docs/OPERATIONS.md`` ("Confine contributor keys with a forced command").
 """
 import argparse
+import json
 import os
 import posixpath  # the paths here are the server's POSIX paths, whatever platform runs the tests
 import re
 import shlex
+import stat
 import sys
 from pathlib import Path
 
@@ -96,6 +106,13 @@ PRINCIPAL_NAME = re.compile(r'(?:lane|person):[A-Za-z0-9][A-Za-z0-9_.-]{0,94}')
 # HOME for the account's own files, and the locale so text handling matches the terminal.
 LOCALE_NAMES = ('LANG',)
 LOCALE_PREFIX = 'LC_'
+# The runtime's own settings file, and the key in it of the installation setting that accepts
+# bound keys only (kittrial-5bb.196, slice 4). ``admin.py`` reads the same file and the same
+# key for its `bound-keys-only` command and for `setup-status`; this wrapper cannot import it
+# (it must start on any interpreter the account has), so it has this small reader of its own,
+# pinned against the host reader by tests/test_bound_keys_only.py.
+SETTINGS_FILE = 'deployment.private.json'
+BOUND_KEYS_ONLY = 'bound_keys_only'
 
 
 def default_endpoint():
@@ -217,6 +234,53 @@ def child_environment(environment=None):
     return forwarded
 
 
+def bound_keys_only(root):
+    """Whether the installation at ``root`` accepts bound keys only (kittrial-5bb.196).
+
+    Read from ``<root>/deployment.private.json``, the file ``admin.py bound-keys-only on``
+    writes: the setting is the installation's, ``--root`` is fixed by the authorized_keys line
+    and never by the connection, and the wrapper's own argv cannot carry it (the line's
+    ``--project``/``--principal`` are exactly what the setting is about).
+
+    OFF is the absent key, so an installation that configures nothing reads as it always did
+    and a fresh install and a rolled-back one read identically. A value that is neither true
+    nor false reads as OFF with a warning on stderr: the same rule ``admin.py``'s
+    ``review_workflow_writes`` follows for its own switch (kittrial-5bb.110 item 2), so one
+    mistyped value cannot refuse every key of the installation. A settings file that cannot be
+    read as the kit's configuration - not a regular file, unreadable, not text, not JSON, not a
+    JSON object - is refused instead: the wrapper cannot tell whether the setting is on, and
+    reading that as OFF would silently drop the installation's rule. The operator's own
+    unrestricted key does not run this wrapper, so this can never lock an operator out.
+    """
+    marker = posixpath.join(root, SETTINGS_FILE)
+    try:
+        mode = os.stat(marker).st_mode
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        raise ValueError('cannot read the installation setting %s: %s' % (marker, error)) from None
+    if not stat.S_ISREG(mode):
+        raise ValueError('the installation setting %s is not a regular file' % marker)
+    try:
+        document = json.loads(Path(marker).read_text(encoding='utf-8'))
+    except (OSError, UnicodeError) as error:
+        raise ValueError('cannot read the installation setting %s: %s' % (marker, error)) from None
+    except RecursionError:
+        raise ValueError('the installation setting %s nests too deeply to read' % marker) from None
+    except ValueError:
+        raise ValueError('the installation setting %s is not valid JSON' % marker) from None
+    if not isinstance(document, dict):
+        raise ValueError('the installation setting %s is not a JSON object' % marker)
+    value = document.get(BOUND_KEYS_ONLY)
+    if isinstance(value, bool):
+        return value
+    if value is not None:
+        sys.stderr.write('%sWARNING: deployment %s is %s, not true or false, so this installation is '
+                         'NOT refusing a line without a project or a principal; correct the value in %s\n'
+                         % (REFUSAL, BOUND_KEYS_ONLY, _echo(value), marker))
+    return False
+
+
 def _echo(value):
     text = repr(value)
     return text if len(text) <= ECHO_LIMIT else text[:ECHO_LIMIT] + '...'
@@ -259,6 +323,20 @@ def main(argv=None):
         root, endpoints, python = configured(args)
         projects = _projects(args.project)
         principal = _principal(args.principal)
+        # An installation set to accept bound keys only (kittrial-5bb.196) refuses a line that
+        # names no project or no principal, before anything of the connection is looked at (so
+        # an `ssh -T HOST` check answers this setting too) and before any program runs. It is
+        # read from the runtime the line itself names, so a line printed before the setting was
+        # turned on is refused as well.
+        if bound_keys_only(root):
+            missing = ' and '.join('no %s' % name for name, given in (('--project', bool(projects)),
+                                                                      ('--principal', principal is not None))
+                                   if not given)
+            if missing:
+                return refuse('this installation accepts bound keys only, so an authorized_keys line must '
+                              'name at least one project and one principal; this line names %s. Print the '
+                              'line again with this kit (admin.py authorized-keys --project NAME --principal '
+                              'lane:NAME) and replace it. Nothing was run' % missing)
         try:
             tokens = shlex.split(os.environ.get('SSH_ORIGINAL_COMMAND', ''))
         except ValueError as error:

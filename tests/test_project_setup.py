@@ -378,8 +378,8 @@ class HostStatusTests(unittest.TestCase):
 
     def test_a_bare_project(self):
         status = self.status()
-        self.assertEqual(sorted(status), ['admin', 'backup', 'coordination', 'creation_record', 'guidance',
-                                          'merge_slot', 'onboarding',
+        self.assertEqual(sorted(status), ['admin', 'backup', 'bound_keys_only', 'coordination', 'creation_record',
+                                          'guidance', 'merge_slot', 'onboarding',
                                           'project', 'project_databases', 'schema_version'])
         # The metadata records no Dolt server coordinates, so bd was not run (it would create
         # an embedded database) and the slot is unknown, never guessed (kittrial-5bb.202 item 2).
