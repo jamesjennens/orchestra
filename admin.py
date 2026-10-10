@@ -6767,12 +6767,17 @@ def credential_actors(root,state_path,service_namespace=None):
                         # checked like the 503 sentence's, and the count is a field too, so the JSON
                         # says it, not only stderr (kittrial-5bb.243 r2 review item 2). WHY the tracker
                         # was not read is a field as well, said as the thing that happened -- r3 item 1.
-                        given=[i for i in unreadable if isinstance(i,str) and i]
-                        named=[i for i in given if actor_names.ROW_ID.fullmatch(i)][:actor_names.NAMED_ROWS_MAX]
+                        # EVERY unreadable row is counted, not only those with a non-empty
+                        # string id: an error line, a number or a list among the rows is an
+                        # unreadable row with no id, and counting only the id-bearing ones
+                        # answered '0 unreadable row(s)' beside a project refused for exactly
+                        # that (kittrial-5bb.247 NEW-1). The named ids are a subset.
+                        named=[i for i in unreadable if isinstance(i,str) and i
+                               and actor_names.ROW_ID.fullmatch(i)][:actor_names.NAMED_ROWS_MAX]
                         found['unreadable_rows']=named
-                        found['unreadable_total']=len(given)
-                        found['not_read_reason']='it holds %d unreadable row(s)'%len(given)
-                        raise ValueError('the export holds %d unreadable row(s)'%len(given))
+                        found['unreadable_total']=len(unreadable)
+                        found['not_read_reason']='it holds %d unreadable row(s)'%len(unreadable)
+                        raise ValueError('the export holds %d unreadable row(s)'%len(unreadable))
                     if not rows:
                         # Which of the three happened, in the operator's words (r3 review item 1):
                         # bd answered nothing, bd answered the word null, or rows did not come.
@@ -7288,7 +7293,10 @@ def main():
         # named only when at least one is printable, bounded and checked like the 503
         # sentence's), or which of bd's three non-answers arrived (r3 review item 1).
         not_read=[item for item in report['credentials'] if item.get('tracker_not_read')]
-        if not_read:
+        if not_read and report['could_not_be_judged']:
+            # Only when a credential could not be judged (kittrial-5bb.247 NEW-2): when every
+            # not-read credential was refused by a cheap rule, the refused sentence above
+            # already covers them, and '0 ... could not be judged' would say what is not so.
             # The reason a tracker was not read belongs to the PROJECT, so it is said once
             # per project, however many credentials of it there are.
             by_project={}
