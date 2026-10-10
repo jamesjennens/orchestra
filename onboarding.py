@@ -47,8 +47,10 @@ START_LIMIT = 8000
 #: that is not the document (a log, a dump, a device), which the endpoint would otherwise
 #: read and send without limit. One megabyte is eight times the longest document today
 #: (CLI_CONTRACT.md, 118 KB) and half of what one request or answer may carry on the wire
-#: (2 MB), so an answer always fits. tests/test_document_catalog.py fails when a catalogued
-#: document is missing, empty or over its bound, so a document cannot outgrow it unnoticed.
+#: the request limit (2 MB; client.py MAX_WIRE) -- there is no answer cap of that size, and
+#: a 1 MB document can be several MB once a JSON envelope encodes it. The bound is on the
+#: file, not on what an answer may carry. tests/test_document_catalog.py fails when a
+#: catalogued document is missing, empty or over its bound, so a document cannot outgrow it unnoticed.
 #: The limit this replaces, 64,000 bytes, was one number for the kit's documents and for
 #: text people write; REVIEWS.md and CLI_CONTRACT.md outgrew it and were refused on every
 #: installation (kittrial-5bb.151).
@@ -232,6 +234,28 @@ def read_kit_document(kit, name):
     return read_document(kit, DOCUMENTS[name], KIT_DOCUMENT_LIMIT, kit_document=name)
 
 
+def catalog_status(kit, project_path=None):
+    """Every catalogued name as served (with its size) or refused (with its sentence).
+
+    One read for release live verification (kittrial-5bb.153 item 4): the generated
+    live-verify script can ask for every name at once and see which are served and
+    which are refused, instead of only ``onboard``. ``project`` is included when
+    ``project_path`` is given. Never raises for a name: a refusal is a row.
+    """
+    names = (['project'] if project_path is not None else []) + list(DOCUMENTS)
+    rows = []
+    for name in names:
+        try:
+            if name == 'project':
+                text = read_document(project_path, 'ONBOARDING.md', PROJECT_LIMIT)
+            else:
+                text = read_kit_document(kit, name)
+            rows.append({'name': name, 'served': True, 'bytes': len(text.encode('utf-8-sig'))})
+        except (ValueError, OSError) as error:
+            rows.append({'name': name, 'served': False, 'refused': str(error)})
+    return rows
+
+
 def prompt_of(text):
     """The prompt a document carries, or None: everything between its first line that is
     exactly ```text and its LAST line that is exactly ```.
@@ -311,6 +335,9 @@ def execute(kit, project_path, project, actor, action, args, endpoint=None):
     catalog = '\n'.join('  docs '+key for key in ['project', *DOCUMENTS])
     if action == 'docs':
         if not args:return 'Installed onboarding documents (use your existing client prefix):\n'+catalog+'\n'
+        if args == ['--status']:
+            import json
+            return json.dumps({'documents': catalog_status(kit, project_path)}, ensure_ascii=False, indent=2) + '\n'
         if len(args) != 1 or args[0] not in {'project', *DOCUMENTS}:
             raise ValueError('Unknown document; run docs for the fixed catalog')
         if args[0] == 'project':return read_document(project_path, 'ONBOARDING.md', PROJECT_LIMIT)
@@ -318,7 +345,9 @@ def execute(kit, project_path, project, actor, action, args, endpoint=None):
     if action != 'onboard' or args:raise ValueError('Use onboard without arguments')
     # Read both before constructing output: never return a plausible but incomplete start.
     entry = read_document(project_path, 'ONBOARDING.md', PROJECT_LIMIT)
-    start = read_document(kit, DOCUMENTS['start'], START_LIMIT)
+    # The start document is a file the kit ships (kittrial-5bb.153 item 1): over its
+    # bound it is an installation fault, not something an operator can shorten.
+    start = read_document(kit, DOCUMENTS['start'], START_LIMIT, kit_document='start')
     metadata = report(kit)
     in_use = Path(endpoint).resolve() if endpoint is not None else Path(kit).resolve()/'endpoint.py'
     return (f'# Orchestra onboarding\n\nProject: {project}\nSession actor: {actor}\n'
