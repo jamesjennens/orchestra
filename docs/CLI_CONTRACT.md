@@ -1944,3 +1944,33 @@ Plain CLI deploy is incremental and never automatically drops an uncarried task.
 See the exact two-step hotfix procedure and interim tracker state in
 [OPERATIONAL_WORKFLOW.md](OPERATIONAL_WORKFLOW.md).
 `checkpoint TASK --directions [--offset N] [--limit N] [--json]` returns full current digests for all outstanding directions, including entries outside stored evidence windows, in fresh pages (offset >= 0, limit 1..100, default 50). Fields: task, activity_cursor, total, items (id, digest, clipped author, timestamp), next_offset, coverage. Compare cursors across pages and restart on change. Only the current assignee can submit dispositions, and IDs/digests must match task history. See BRIEFINGS.md for legacy and reassignment baselines.
+
+## Requirements member reads
+
+The configured client prefix `b` supplies the project and saved actor. These
+commands read through the contributor endpoint without changing requirements,
+governance, acceptance evidence or lifecycle facts:
+
+```sh
+b requirements list
+b requirements get REQUIREMENT_ID
+b requirements brd
+b requirements governance
+b requirements snapshot > SNAPSHOT.json
+```
+
+`list` and `brd` return validated accepted content and any pending draft separately.
+An unreadable requirement remains visible by its ID; `get` refuses that row with
+an explicit error. `governance` returns the current mode, revision and hash.
+`snapshot` returns the validated governance files map for the existing host
+exporter's `--governance SNAPSHOT.json` input, including restore source binding
+when present. A snapshot is read evidence and grants no write authority.
+
+Owner editing, acceptance and mode switches are service-only operations for the
+signed-in human project owner. These read commands do not permit an SSH actor,
+worker credential or agent to invoke those writes. Existing host operator
+`requirement-apply` and `requirement-backfill` retain their operator checks and
+work in both simple and governed projects. Missing historical governance and
+restores from backups without governance remain governed; only a new durable
+creation intent opts into the simple provisioning default. See
+[REQUIREMENTS.md](REQUIREMENTS.md) for the trust boundary and export procedure.

@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from export_requirements import adapt, read_export, reference, revision_comment, selection_from_manifest
+from export_requirements import REVISION_PREFIX, adapt, read_export, reference, revision_comment, selection_from_manifest
 from requirement_impact import analyze
 from requirements import content_hash
 from publish_brd import publish
@@ -56,6 +56,13 @@ class ExportTests(unittest.TestCase):
     def test_requires_explicit_revision_comments(self):
         m=baseline();rows=exported(m);rows[0]['comments']=[]
         with self.assertRaisesRegex(ValueError,'missing'):adapt(rows,selection_from_manifest(m))
+
+    def test_unselected_damaged_content_does_not_break_a_healthy_export(self):
+        manifest = baseline(); rows = exported(manifest)
+        rows.append({'id':'unselected-broken', 'comments':[{'id':'bad','text':REVISION_PREFIX+'{broken'}]})
+        self.assertEqual(adapt(rows, selection_from_manifest(manifest))['manifest'], manifest)
+        rows[0]['comments'][1]['text'] = REVISION_PREFIX+'{broken'
+        with self.assertRaises(ValueError): adapt(rows, selection_from_manifest(manifest))
 
     def test_conflicting_revision_rejected_even_when_original_selected(self):
         m=baseline();rows=exported(m);r=copy.deepcopy(m['narrative'][0]);r['description']='changed';r['sha256']=content_hash(r)

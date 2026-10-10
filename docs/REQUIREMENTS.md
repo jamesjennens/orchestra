@@ -4,6 +4,74 @@ The validator and publisher operate over explicit structured snapshots. Beads re
 
 The [BRD](BRD.md) and [source snapshot](requirements-baseline.json) are draft-0.1. They are not an accepted specification. The [contract](REQUIREMENTS_CONTRACT.md) records the implemented boundary and the disposition of the independent review.
 
+## Editing a project's requirements in the web interface
+
+In simple mode, a signed-in project owner opens **Requirements**, edits the text
+and saves a draft. **Accept** records the owner's decision for that content.
+Editing accepted text creates a new draft; the earlier accepted content remains
+available to existing exact references. The business requirements document is a
+read-only view of the records, including narrative, requirements
+and decisions. Every project member, including viewers, can read it.
+
+Newly provisioned projects start in simple mode. Existing projects with no
+governance history remain governed. An owner can switch modes from the page;
+changing modes preserves history and never accepts a draft automatically.
+Credentials, agents and superusers without owner membership cannot use these
+editing controls. The host's governed publication commands below retain their
+existing operator authority.
+
+The service stores immutable revision comments, server-generated owner decision
+evidence and a hash-chained governance sidecar. Backup/restore includes the
+governance history and operation receipts. A restore under a new project name
+retains historical hashes and validated source ranges rather than rewriting
+decisions. A retry after an interrupted write checks the exact original receipt
+and uses a separately guarded recovery operation; uncertainty without a matching
+receipt remains unresolved. Recovery is bound to the human account, so the same
+owner can log in again and retry the same key. Current session authority and owner
+membership are checked under the authority lock before any replay or effect.
+
+The generated document shows the last accepted text first. A newer draft is a
+separate pending edit. Its Decisions section uses immutable acceptance evidence,
+not editable native decision titles. An unreadable requirement is marked by ID;
+healthy requirements remain readable and an affected acceptance is never trusted.
+On an empty project, **Start requirements** creates a parent task through the
+ordinary authorized task route, then the owner can add content on this page.
+
+The authority store and project files are trusted server storage. A shell that
+can modify them can bypass these checks; forced contributor keys cannot. Human
+session cookies need CSRF protection on writes. A human session explicitly sent
+as an Authorization bearer does not need CSRF: browsers do not attach that header
+automatically. This does not give service credentials or agent tokens owner rights.
+The host's operator requirement-apply/backfill routes remain available in both
+modes and keep their operator allowlist and exact evidence requirements.
+
+This slice supplies direct editing and acceptance. Withdrawal, supersession,
+baseline controls, downloadable baseline comparisons and proposal/room acceptance
+controls await their separate releases.
+
+For the existing host export command, selections containing owner acceptance
+also supply `--governance SNAPSHOT.json`: a captured files map containing
+`.requirements-governance.json` and, after a restore under another name,
+`.requirements-governance-source.json`. The exporter validates the same history
+and project binding as the live reader and retains those files in its provenance.
+Historical acceptance does not depend on today's membership or mode.
+
+Read the current records or capture that files map with the same kit's client:
+
+```sh
+python client.py --config client.local.json --project example --actor reader -- requirements list
+python client.py --config client.local.json --project example --actor reader -- requirements get REQUIREMENT_ID
+python client.py --config client.local.json --project example --actor reader -- requirements brd
+python client.py --config client.local.json --project example --actor reader -- requirements governance
+python client.py --config client.local.json --project example --actor reader -- requirements snapshot > SNAPSHOT.json
+```
+
+These commands only read. Existing projects and restores from backups without a
+governance sidecar remain governed. A creation started before this release also
+remains governed when resumed; only a durable new creation intent opts into simple
+mode. Restore preserves source governance and acceptance hashes and records the
+destination lineage for decisions made after restoring under a new name.
+
 ## Validate and publish a draft
 
 From the kit directory, using Python 3.10 or newer:

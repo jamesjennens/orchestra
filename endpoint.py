@@ -782,6 +782,30 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             return guarded_write(root,request,journal_path(path),work_effect,
                                authority_config=authority_config,
                                require_authority=require_authority,runner=runner)
+    if action=='requirements':
+        from requirement_http import read as read_requirements
+        run_warnings=[]
+        def run(argv):
+            stdout,warnings=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
+            if warnings:run_warnings.append(warnings)
+            return stdout
+        with (path/'.coordination.lock').open('a') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            result=read_requirements(path,name,request.get('args',[]),run,configured_operators(root))
+        return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
+    if action=='owner-requirements':
+        from requirement_http import web_action
+        run_warnings=[]
+        def run(argv):
+            stdout,warnings=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
+            if warnings:run_warnings.append(warnings)
+            return stdout
+        runner=NativeRunner(run)
+        with (path/'.coordination.lock').open('a') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            answer=web_action(root,path,name,request,authority_config,runner,guarded_write)
+        answer['stderr']=answer.get('stderr','')+''.join(run_warnings)
+        return answer
     if action=='set-onboarding':
         # An owner sets the project's onboarding text from the web interface
         # (kittrial-5bb.118 part 2). Service-only; see onboarding.web_action.
