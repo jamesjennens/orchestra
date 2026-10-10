@@ -293,6 +293,22 @@ a bare string; treat `omitted_chars > 0` as "read `show`/`history` for the full 
 Opaque cursor fields (`activity_cursor`, `next_cursor`) are never excerpted: they are
 complete tokens.
 
+### `history`: additive keys (kittrial-5bb.8)
+
+The bounded history reads add keys to **every** history answer. They are additive: no
+released key changed shape or meaning, a released cursor still reads as oldest-first,
+and a released consumer that names the keys it knows is unaffected. `order`
+(`oldest-first`/`newest-first`), `kind` (`comment`/`event`/`null`), `since_checkpoint`
+(the baseline checkpoint's comment ID or `null`), `snapshot_entries` (entries in the
+snapshot), `total_entries` (entries the current selectors chose) and `omitted_entries`
+(`snapshot_entries - total_entries`) state what a bounded read hid. A
+checkpoint-relative read also carries `checkpoint_author` (excerpt object),
+`checkpoint_timestamp`, `checkpoint_coverage` (`snapshot`/`windowed`/`unknown`),
+`unverified_entries` and `checkpoint_note`, so a reader can tell from the answer alone
+whose checkpoint was the baseline and what it could not be shown. `brief --full` adds
+`full_context` with the same additive rule; its `omission_counts` are the compact
+read's clips and its `full_omitted_chars`/`truncated`/`complete` are the bound's own.
+
 `brief` and each `work` item also carry three additive lifecycle delivery fields
 (kittrial-5bb.107 item 7, rev2 item 6.1). `deployed_delivery` is the delivery a passed
 `deployed` fact belongs to, or `null` when the task has no trusted `deployed=passed`
@@ -1696,7 +1712,12 @@ it by failing.
 | `admin.py proposal-settings` | actor map / deciders | <= 200 actors, 100 namespaces / <= 50 |
 | `brief` | `--items-offset` | >= 0 |
 | `brief` | `--items-limit` | 1..100 (default 5; a checkpoint holds at most 100 open items) |
+| `brief` | `--full` `full_context` | <= 20,000 encoded bytes in total and <= 8,000 per field; `full_omitted_chars` names what the cap removed and `show TASK` keeps the complete text |
 | `history` | `--limit` | 1..20 |
+| `history` | `--recent` / `--last` | 1..20 (newest-first page size; the same option under two spellings, not combined with `--limit`; a refusal names `--recent`) |
+| `history` | `--kind` | `comment` or `event` |
+| `history` | `--since-checkpoint` | entries after the newest valid checkpoint, by anyone (no value) |
+| `history` | `--since-my-checkpoint` | the same read based on the calling actor's own newest valid checkpoint (no value) |
 | `history` | `--body-budget` | 256..8000 encoded bytes |
 | `review` | `items`/`resolutions` | 1..20 entries |
 | `review` | `summary` (contribute, approve, request-changes, request-review) | <= 1200 characters |
