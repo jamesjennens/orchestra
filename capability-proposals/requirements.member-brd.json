@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "operation_id": "capnew-2c8495a3fc8b40998fcbdf2acaf56a22",
+  "key": "requirements.member-brd",
+  "name": "Every project member reads accepted requirements and their pending edits",
+  "aliases": ["member business requirements document", "viewer requirements page", "accepted and pending revision", "accept pending edit", "requirements parent task"],
+  "summary": "Every signed-in project member, including viewers, reads the business requirements document and requirement history. The page shows last accepted content and its revision separately from a newer pending draft. Decisions use immutable acceptance evidence rather than editable native titles. Simple-mode owners see task parent selection and explicit Accept draft or Accept pending edit actions. Viewers have no editing controls. Unreadable requirements are marked by ID while healthy content remains readable. Offline exports use the native row nesting bound and isolate unrelated deep rows; selected unreadable records and missing, duplicate or unprovable row identities refuse, while record comment validation keeps its stricter bound.",
+  "requirements": [],
+  "anchors": ["docs/REQUIREMENTS.md#editing-a-projects-requirements-in-the-web-interface"],
+  "code": ["requirement_http.py::read", "export_requirements.py::read_export"],
+  "tests": ["tests/test_http_requirements_owner.py", "tests/web_owner_requirements.mjs", "tests/test_requirement_workflow.py", "tests/test_requirement_owner_real_bd.py"],
+  "owner": "person:orchestra-coordinator",
+  "tags": ["requirements", "brd", "web"]
+}

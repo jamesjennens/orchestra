@@ -17,22 +17,95 @@ META = ('schema_version', 'baseline', 'state', 'canonical_project', 'job',
 
 
 def parse_json(text):
-    def unique(pairs):
-        result = {}
-        for key, value in pairs:
-            if key in result:
-                raise ValueError('duplicate JSON field: ' + key)
-            result[key] = value
-        return result
-    value = record_json.loads(text, object_pairs_hook=unique)
+    value = record_json.loads(text, object_pairs_hook=_unique)
     canonical_bytes(value)
     return value
+
+
+def _unique(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError('duplicate JSON field: ' + key)
+        result[key] = value
+    return result
+
+
+def _unreadable_identity(text):
+    """Prove one top-level string ID without decoding an over-limit row.
+
+    The native marker's regex may match a nested ID or the first of two IDs.
+    An offline export has no native membership query to settle that ambiguity.
+    Scan strings and brackets iteratively; incomplete framing or another ID
+    refuses the export rather than hiding a potentially selected record.
+    """
+    stack, ids = [], []
+    index = 0
+    if not text.strip().startswith('{'):
+        raise ValueError('Unreadable export row has no provable issue ID')
+    while index < len(text):
+        char = text[index]
+        if char == '"':
+            start = index; index += 1
+            while index < len(text):
+                if text[index] == '\\':
+                    index += 2
+                elif text[index] == '"':
+                    index += 1; break
+                else:
+                    index += 1
+            else:
+                raise ValueError('Unreadable export row has incomplete string framing')
+            value = json.loads(text[start:index])
+            after = index
+            while after < len(text) and text[after].isspace():
+                after += 1
+            if stack == ['{'] and value == 'id' and text[after:after+1] == ':':
+                after += 1
+                while after < len(text) and text[after].isspace():
+                    after += 1
+                if text[after:after+1] != '"':
+                    raise ValueError('Unreadable export row has no provable string issue ID')
+                try:
+                    identity, _ = json.JSONDecoder().raw_decode(text, after)
+                except (ValueError, RecursionError):
+                    raise ValueError('Unreadable export row has no provable issue ID') from None
+                ids.append(identity)
+            continue
+        if char in '[{':
+            stack.append(char)
+        elif char in ']}':
+            if not stack or stack.pop() != ( '{' if char == '}' else '[' ):
+                raise ValueError('Unreadable export row has incomplete container framing')
+            if not stack and text[index+1:].strip():
+                raise ValueError('Unreadable export row has trailing data')
+        index += 1
+    if stack or len(ids) != 1 or not isinstance(ids[0], str) or not ids[0].strip():
+        raise ValueError('Unreadable export row has missing, duplicate or unprovable issue ID')
+    return ids[0]
 
 
 def read_export(path):
     """One filesystem read; no database queries or implicit refresh."""
     text = Path(path).read_text(encoding='utf-8-sig')
-    return [parse_json(line) for line in text.split('\n') if line.strip()]
+    rows = []
+    for line in text.split('\n'):
+        if not line.strip():
+            continue
+        row = record_json.loads_row(line)
+        if isinstance(row, dict) and row.get('malformed'):
+            if record_json.nesting(line, record_json.ROW_NESTING_MAX) <= record_json.ROW_NESTING_MAX:
+                # Preserve the offline export's syntax/duplicate-field refusal.
+                # A parser recursion failure is the other native unreadable case.
+                try:
+                    json.loads(line, object_pairs_hook=_unique)
+                except RecursionError:
+                    pass
+            row['id'] = _unreadable_identity(line)
+        else:
+            row = json.loads(line, object_pairs_hook=_unique)
+        rows.append(row)
+    return rows
 
 
 def exact_reference(value):

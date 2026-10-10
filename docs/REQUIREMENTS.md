@@ -7,7 +7,8 @@ The [BRD](BRD.md) and [source snapshot](requirements-baseline.json) are draft-0.
 ## Editing a project's requirements in the web interface
 
 In simple mode, a signed-in project owner opens **Requirements**, edits the text
-and saves a draft. **Accept** records the owner's decision for that content.
+and saves a draft. **Accept draft** or **Accept pending edit** records the owner's
+decision for that exact revision.
 Editing accepted text creates a new draft; the earlier accepted content remains
 available to existing exact references. The business requirements document is a
 read-only view of the records, including narrative, requirements
@@ -20,6 +21,12 @@ Credentials, agents and superusers without owner membership cannot use these
 editing controls. The host's governed publication commands below retain their
 existing operator authority.
 
+In simple mode, contributors cannot replace a pending draft written by the
+project owner, including an edit of accepted text. They propose a change for the
+owner instead. Contributor drafts remain revisable; governed mode keeps the
+existing contributor revision policy. Retries check the current mode and the
+validated latest revision before writing.
+
 The service stores immutable revision comments, server-generated owner decision
 evidence and a hash-chained governance sidecar. Backup/restore includes the
 governance history and operation receipts. A restore under a new project name
@@ -29,6 +36,23 @@ and uses a separately guarded recovery operation; uncertainty without a matching
 receipt remains unresolved. Recovery is bound to the human account, so the same
 owner can log in again and retry the same key. Current session authority and owner
 membership are checked under the authority lock before any replay or effect.
+
+If a creation fails before any native row is allocated, the owner who attempted
+it can use **Clear failed creation**, give a reason, and start a new creation.
+The original attempt and its release audit are retained. An allocated row, even
+an empty one, cannot be cleared here: retry the original creation and, if that
+still fails, ask the host operator to reconcile it.
+
+An interrupted acceptance uses its recorded generated decision ID. Editable
+native titles, descriptions, labels and creator metadata cannot substitute a
+different decision. A missing or unreadable recorded decision, or an older
+pending attempt without a durable binding, stays unknown and needs host operator
+reconciliation. Retrying does not generate another decision.
+
+Governance reads warn when an entry is more than the existing 24-hour clock skew
+bound ahead of the host clock. Ask the host operator to check the clock and
+history. Reads and writes continue; revision numbers and hashes order authority,
+and the service does not rewrite the stored history.
 
 The generated document shows the last accepted text first. A newer draft is a
 separate pending edit. Its Decisions section uses immutable acceptance evidence,

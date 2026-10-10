@@ -8,6 +8,7 @@ const displayText = (text) => String(text || '').replace(/[\u0000-\u0008\u000b\u
   (c) => `[U+${c.codePointAt(0).toString(16).toUpperCase().padStart(4, '0')}]`);
 const state = (record) => h('span', { class: 'chip ' + (record.acceptance_state === 'accepted' ? 'ok' : 'warn') },
   record.acceptance_state === 'accepted' ? 'Accepted' : 'Draft');
+const revision = (record) => `${record.acceptance_state === 'accepted' ? 'Accepted' : 'Draft'} revision ${record.revision}`;
 
 function editor(ctx, pid, item, parent, done) {
   const record = item?.current;
@@ -43,8 +44,9 @@ export async function brd(ctx, { pid }, project, data) {
     return h('section', { class: 'panel' },
     h('div', { class: 'panel-head' }, h('h2', { class: 'small' },
       h('a', { href: ctx.href(`/p/${pid}/requirements/${item.id}`) }, displayText(record.title))), state(record)),
+    h('p', { class: 'small panel-body' }, revision(record)),
     h('div', { class: 'panel-body', style: 'white-space:pre-wrap;unicode-bidi:plaintext' }, displayText(record.description)),
-    item.accepted && item.pending_draft ? h('details', { class: 'panel-body' }, h('summary', null, 'Pending edit'),
+    item.accepted && item.pending_draft ? h('details', { class: 'panel-body' }, h('summary', null, `Pending edit · revision ${item.pending_draft.revision}`),
       h('h3', null, displayText(item.pending_draft.title)), h('p', { style: 'white-space:pre-wrap;unicode-bidi:plaintext' }, displayText(item.pending_draft.description))) : null);
   };
   const modeMessage = h('p', { role: 'status', class: 'small' });
@@ -55,7 +57,7 @@ export async function brd(ctx, { pid }, project, data) {
       ctx.go(`/p/${pid}/requirements`);
     } catch (error) { modeMessage.textContent = describe(error); button.disabled = false; }
   } }, simple ? 'Use governed requirements' : 'Enable simple editing') : null;
-  // Parent is an existing canonical job, never a guessed id. The owner selects
+  // Parent is an existing canonical task, never a guessed id. The owner selects
   // it only when adding new content; accepted text needs no setup dialogue.
   let add = null;
   if (owner && simple) {
@@ -67,7 +69,7 @@ export async function brd(ctx, { pid }, project, data) {
     if (jobs.length) {
       parent.addEventListener('change', show); show();
       add = h('details', { class: 'panel' }, h('summary', null, 'Add requirement or narrative'),
-        h('div', { class: 'panel-body stack' }, jobs.length > 1 ? h('label', { for: 'requirement-parent' }, 'Job', parent) : null, holder));
+        h('div', { class: 'panel-body stack' }, jobs.length > 1 ? h('label', { for: 'requirement-parent' }, 'Task', parent) : null, holder));
     } else add = h('button', { type: 'button', onclick: async (event) => {
       const button = event.currentTarget || event.target; button.disabled = true;
       try {
@@ -77,15 +79,37 @@ export async function brd(ctx, { pid }, project, data) {
     } }, 'Start requirements');
   }
   const document = await ctx.api.brd(pid);
+  let recovery = null;
+  if (owner && simple) {
+    const failed = await ctx.api.requirementRecoveries(pid);
+    recovery = (failed.items || []).length ? h('section', { class: 'panel stack' },
+      h('h2', null, 'Failed creations'),
+      h('p', null, 'Clear a failed creation only when no requirement was written. Then start a new creation.'),
+      failed.items.map((item) => {
+        const message = h('p', { role: 'status' }, item.message || 'No requirement was written.');
+        if (!item.can_clear) return message;
+        const reason = h('input', { maxlength: 1000, required: true, value: item.reason || '' });
+        const button = h('button', { type: 'submit' }, 'Clear failed creation');
+        return h('form', { class: 'stack', onsubmit: async (event) => {
+          event.preventDefault(); if (button.disabled) return; button.disabled = true;
+          try {
+            await ctx.api.clearRequirementCreation(pid, { original_operation_id: item.operation_id,
+              expected_receipt_sha256: item.expected_receipt_sha256, reason: reason.value });
+            ctx.go(`/p/${pid}/requirements`);
+          } catch (error) { message.textContent = describe(error); button.disabled = false; }
+        } }, h('label', null, 'Why clear this failed creation?', reason), button, message);
+      }), failed.truncated ? h('p', null, 'More failed creations may remain. Refresh after clearing these.') : null) : null;
+  }
   return h('div', { class: 'stack' }, pageHead({ title: 'Business requirements',
     lede: 'The current document, generated from the project’s requirement records.' }),
   h('div', { class: 'actions' }, mode, modeMessage),
+  (data.governance.warnings || []).map((warning) => h('p', { class: 'banner', role: 'status' }, warning.message)),
   !simple ? h('p', { class: 'banner' }, 'This project uses governed requirements.') : null,
   data.items.filter((item) => item.kind === 'brd-section').map(card),
   data.items.filter((item) => item.kind === 'requirement').map(card),
   data.items.filter((item) => item.unreadable).map(card),
-  !data.items.length ? h('p', null, 'No requirements yet.') : null, add,
-  h('section', { class: 'panel' }, h('h2', null, 'Decisions'), (document.decisions || []).map((d) => h('p', null, displayText(d.title)))));
+  !data.items.length ? h('p', null, 'No requirements yet.') : null, add, recovery,
+  h('section', { class: 'panel' }, h('h2', null, 'Decisions'), (document.decisions || []).map((d) => h('p', null, `${displayText(d.title)} · revision ${d.revision}`))));
 }
 
 export async function requirement(ctx, { pid, rid }, project, data) {
@@ -97,13 +121,16 @@ export async function requirement(ctx, { pid, rid }, project, data) {
       const button = event.currentTarget || event.target; button.disabled = true;
       try { await ctx.api.acceptRequirement(pid, rid, expected(record)); ctx.go(`/p/${pid}/requirements/${rid}`); }
       catch (error) { message.textContent = describe(error); button.disabled = false; }
-    } }, 'Accept') : null;
+    } }, data.accepted && data.pending_draft ? 'Accept pending edit' : 'Accept draft') : null;
   return h('div', { class: 'stack' }, pageHead({ title: displayText(main.title),
     crumbs: [{ label: 'Requirements', href: ctx.href(`/p/${pid}/requirements`) }] }),
   h('div', { class: 'actions' }, state(main), accept, message),
+  h('p', { class: 'small' }, revision(main)),
   h('div', { class: 'panel-body', style: 'white-space:pre-wrap;unicode-bidi:plaintext' }, displayText(main.description)),
-  data.accepted && data.pending_draft ? h('h2', null, 'Pending edit') : null,
+  data.accepted && data.pending_draft ? h('h2', null, `Pending edit · revision ${record.revision}`) : null,
   data.can_edit && data.governance.mode === 'simple'
     ? editor(ctx, pid, data, null, async () => ctx.go(`/p/${pid}/requirements/${rid}`))
-    : data.accepted && data.pending_draft ? h('div', { class: 'panel-body', style: 'white-space:pre-wrap;unicode-bidi:plaintext' }, displayText(record.description)) : null);
+    : data.accepted && data.pending_draft ? h('section', null,
+      h('h3', null, displayText(record.title)),
+      h('div', { class: 'panel-body', style: 'white-space:pre-wrap;unicode-bidi:plaintext' }, displayText(record.description))) : null);
 }

@@ -27,10 +27,12 @@ records already carrying the `requirement`/`brd-section` type label (or records
 this command created). The operator may accept revision 1 on an untyped task
 with no prior revisions and F3 evidence. `revise` is bound to the record's
 existing kind and key: cross-kind changes and key swaps are refused before any
-native write. Revise follows the trusted-team
-model: any contributor actor may revise any draft (see
-docs/REQUIREMENTS_INTEGRATION.md); the actor string is an attribution, not an
-authenticated owner identity.
+native write. In governed mode, any contributor actor may revise a draft (see
+docs/REQUIREMENTS_INTEGRATION.md). In simple mode, a draft whose latest validated
+revision was written by a human owner is protected from contributor replacement;
+contributors propose a change instead. This check also applies when resuming a
+pending operation. The actor string is attribution, not an authenticated owner
+identity.
 
 Idempotency is native-first. A created record carries `request:<hash>` and
 `request-content:<hash>` labels (the create-child convention), and the revision
@@ -668,7 +670,36 @@ def apply_native(payload, actor, run, project, operator=False, operators=None):
     The steps are the shared keyed-record core's (keyed_records.apply_native)
     with this module's REQUIREMENT spec.
     """
-    return core.apply_native(payload, actor, run, project, SPEC, operator=operator,
+    spec = SPEC
+    if not operator:
+        # The caller holds the project lock. Recheck mode and the exact latest
+        # revision at the effect boundary, including retries of pending writes.
+        # Native author attribution is reserved for the service's human writer;
+        # mutable issue titles, labels and creator fields cannot establish it.
+        def selectable(row, payload, operator, existing):
+            _require_selectable(row, payload, operator, existing)
+            latest = latest_revision(existing)
+            if latest is None or latest['acceptance_state'] != 'draft':
+                return
+            from requirement_owner_records import HUMAN, existing_acceptances as owner_acceptances
+            body = revision_comment(latest)
+            if not any(isinstance(comment, dict) and comment.get('text') == body
+                       and HUMAN.fullmatch(str(comment.get('author', '')))
+                       for comment in row.get('comments') or []):
+                return
+            import requirement_governance as governance
+            name = Path(project).name
+            if governance.current(project, name)['mode'] != 'simple':
+                return
+            for evidence in owner_acceptances(row).values():
+                governance.validate_evidence(project, name, evidence)
+            raise ValueError('This pending requirement edit belongs to the project owner. '
+                             'Propose a change instead of replacing it.')
+
+        values = {name: getattr(SPEC, name) for name in core.RecordSpec.VALUES + core.RecordSpec.HOOKS}
+        values['require_selectable'] = selectable
+        spec = core.RecordSpec(**values)
+    return core.apply_native(payload, actor, run, project, spec, operator=operator,
                              operators=operators)
 
 

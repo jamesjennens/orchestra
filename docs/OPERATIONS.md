@@ -36,6 +36,20 @@ a project; use the [requirements snapshot command](REQUIREMENTS.md) for offline
 owner-evidence export. Operator requirement-apply/backfill authority remains
 unchanged in both modes.
 
+**Rollback and restore of simple requirements.** The predecessor kit can restore
+a backup of a project that has never had these sidecars. It refuses a backup
+containing `.requirements-governance.json`, `.requirement-owner-requests/` or
+`.requirements-governance-source.json` with `Invalid coordination backup path`.
+Restore those backups with this kit or a newer compatible kit. A backup taken
+by that predecessor omits these files: its restored project is governed, and
+owner-accepted requirements cannot be read because their governance history is
+missing. Keep the current kit's complete backup when rolling back; an older
+kit's successful backup does not preserve owner requirement authority.
+The optional `owner_decision` binding in an existing owner request receipt does
+not change this predecessor restore limit. Current backups preserve and validate
+the binding; an interrupted legacy acceptance without one remains unknown and
+needs host operator reconciliation.
+
 Configure the [server-owned project entry point](ONBOARDING.md) so new workers can start from an empty directory using a single SSH onboarding command. Its private instructions are included in coordination sidecar backups.
 
 Install Python 3.10+ and OpenSSH on their machine. Configure an SSH alias `beads-team` for the server/service account with their own key; verify the server host key on first connection. Confirm an ordinary `ssh beads-team` works before using the noninteractive client.

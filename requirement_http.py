@@ -5,6 +5,7 @@ own validated hooks to the same native mutation engine; operator=True is never
 used to impersonate host authority.
 """
 import json
+import hashlib
 from dataclasses import dataclass
 
 import keyed_records as core
@@ -12,10 +13,156 @@ import requirement_governance as governance
 import requirement_owner_records as owner_records
 import requirement_records as records
 import record_json
-from coordination import identifier
-from requirements import content_hash
+from coordination import atomic, identifier
+from requirements import canonical_bytes, content_hash, load_json
 
 JOURNAL = '.requirement-owner-requests'
+
+
+def validate_receipt(receipt):
+    """Legacy receipts remain valid; optional decision bindings are strict."""
+    core.validate_receipt(receipt)
+    if 'owner_decision' in receipt:
+        binding = owner_records.validate(receipt['owner_decision'])
+        if (binding['account_id'] != receipt.get('actor')
+                or binding['id'] != receipt.get('id')
+                or binding['revision'] != receipt.get('revision')
+                or receipt.get('operation') != 'revise'):
+            raise ValueError('Owner decision does not match its receipt')
+        if receipt.get('acceptance') is not None:
+            expected = dict(binding['decision'], record_sha256=binding['record_sha256'])
+            if receipt['acceptance'] != expected:
+                raise ValueError('Owner decision conflicts with completed acceptance')
+    if 'release_history' in receipt:
+        history = receipt['release_history']
+        if (receipt['status'] != 'released' or receipt.get('id') is not None
+                or receipt.get('operation') != 'draft' or receipt.get('revision') != 1
+                or not isinstance(history, list) or len(history) != 1
+                or 'owner_decision' in receipt or receipt.get('acceptance') is not None):
+            raise ValueError('Invalid empty owner creation release')
+        audit = history[0]
+        fields = {'schema_version', 'project', 'account_id', 'operation_id',
+                  'prior_receipt_sha256', 'reason', 'at', 'sha256'}
+        if not isinstance(audit, dict) or set(audit) != fields or type(audit['schema_version']) is not int or audit['schema_version'] != 1:
+            raise ValueError('Invalid owner creation release audit')
+        governance.project_name(audit['project']); identifier(audit['operation_id'])
+        governance.digest(audit['prior_receipt_sha256']); governance.digest(audit['sha256'])
+        if (audit['account_id'] != receipt.get('actor')
+                or not isinstance(audit['account_id'], str)
+                or not owner_records.HUMAN.fullmatch(audit['account_id'])
+                or not isinstance(audit['reason'], str) or not 1 <= len(audit['reason'].strip()) <= 1000
+                or not isinstance(audit['at'], str) or not audit['at'].strip()
+                or content_hash(audit) != audit['sha256']):
+            raise ValueError('Invalid owner creation release audit binding')
+    return receipt
+
+
+def receipt_sha256(receipt):
+    return hashlib.sha256(canonical_bytes(receipt)).hexdigest()
+
+
+def empty_creation(receipt, context, operation_id, run):
+    """Prove no native row was allocated; caller holds both canonical locks."""
+    validate_receipt(receipt)
+    message = ('Cannot clear this failed creation. Retry the original creation; '
+               'if it still fails, ask the host operator to reconcile it.')
+    if (receipt.get('actor') != context.account_id or receipt['status'] != 'pending'
+            or receipt.get('operation') != 'draft' or receipt.get('revision') != 1
+            or receipt.get('id') is not None or receipt.get('created')
+            or receipt.get('acceptance') is not None or 'owner_decision' in receipt):
+        raise ValueError(message)
+    rows = records.read_rows(run)
+    ids = record_json.native_ids(run)
+    row_ids = [row.get('id') for row in rows]
+    if (any(not isinstance(value, str) or not value for value in row_ids)
+            or len(row_ids) != len(set(row_ids)) or set(row_ids) != ids
+            # Pinned bd omits labels entirely on ordinary unlabeled rows.
+            # A present null/non-list value still cannot prove absence.
+            or any(row.get('malformed') or not isinstance(row.get('labels', []), list)
+                   or any(not isinstance(label, str) for label in row.get('labels', [])) for row in rows)):
+        raise ValueError(message + ' Native absence cannot be proved from this read.')
+    label = 'request:' + content_hash({'operation_id': operation_id})
+    if any(label in row.get('labels', []) for row in rows):
+        raise ValueError(message + ' A native row already carries this request.')
+
+
+def recovery_projection(project_path, context, run):
+    from http_authority import OperationJournal, journal_path
+    path = project_path / JOURNAL
+    if path.is_symlink():
+        raise ValueError('Owner recovery receipts need host operator repair')
+    if not path.exists():
+        return {'items': [], 'truncated': False}
+    journal = OperationJournal(journal_path(project_path))
+    candidates = journal.pending_owner_creates('owner-account:' + context.account_id)
+    items = []
+    for entry in candidates[:20]:
+        operation = entry['operation_id']
+        receipt = core.receipt_path(path, content_hash({'operation_id': operation}), 'requirement')
+        if not receipt.is_file():
+            continue
+        saved = validate_receipt(load_json(receipt))
+        if saved.get('actor') != context.account_id or saved.get('operation') != 'draft':
+            continue
+        item = {'operation_id': operation, 'expected_receipt_sha256': receipt_sha256(saved),
+                'can_clear': False}
+        try:
+            if journal.expired(entry):
+                raise ValueError('This failed creation needs host operator reconciliation.')
+            if saved['status'] == 'released' and 'release_history' in saved:
+                audit = saved['release_history'][0]
+                if audit['project'] != context.project or audit['operation_id'] != operation:
+                    raise ValueError('This failed creation needs host operator reconciliation.')
+                item.update(expected_receipt_sha256=audit['prior_receipt_sha256'], reason=audit['reason'])
+            else:
+                empty_creation(saved, context, operation, run)
+            item['can_clear'] = True
+        except ValueError as error:
+            item['message'] = str(error)
+        items.append(item)
+    return {'items': items, 'truncated': len(candidates) > 20}
+
+
+def release_creation(project_path, context, body, run, runner):
+    """Retain an audited terminal receipt, then close the original uncertain intent."""
+    from http_authority import OperationJournal, journal_path, stamp_write
+    operation = body['original_operation_id']
+    path = core.receipt_path(core.journal_dir(project_path, JOURNAL),
+                             content_hash({'operation_id': operation}), 'requirement')
+    if not path.is_file():
+        raise ValueError('No failed creation was found; ask the host operator to reconcile it')
+    saved = validate_receipt(load_json(path))
+    if saved.get('actor') != context.account_id:
+        raise ValueError('Only the owner account that attempted this creation can clear it')
+    journal = OperationJournal(journal_path(project_path)); entry = journal.lookup(operation)
+    if (entry is None or entry.get('principal') != 'owner-account:' + context.account_id
+            or entry.get('route') != 'requirements.create'):
+        raise ValueError('The original creation identity cannot be verified; ask the host operator')
+    if saved['status'] == 'released' and 'release_history' in saved:
+        audit = saved['release_history'][0]
+        if (audit['project'] != context.project or audit['operation_id'] != operation
+                or audit['reason'] != body['reason']
+                or audit['prior_receipt_sha256'] != body['expected_receipt_sha256']):
+            raise ValueError('Failed creation recovery changed; reload before trying again')
+    else:
+        if entry.get('state') not in ('unknown', 'in_progress') or journal.expired(entry):
+            raise ValueError('The original creation is not recoverable; ask the host operator')
+        if receipt_sha256(saved) != body['expected_receipt_sha256']:
+            raise ValueError('Failed creation recovery changed; reload before trying again')
+        empty_creation(saved, context, operation, run)
+        audit = dict(schema_version=1, project=context.project, account_id=context.account_id,
+                     operation_id=operation, prior_receipt_sha256=body['expected_receipt_sha256'],
+                     reason=body['reason'], at=core.now())
+        audit['sha256'] = content_hash(audit)
+        saved = dict(saved, status='released', release_history=[audit])
+        validate_receipt(saved); runner.wrote = True; atomic(path, saved)
+    # The retained released receipt also refuses any reuse after journal expiry.
+    if entry.get('state') in ('unknown', 'in_progress'):
+        runner.wrote = True; journal._actor = entry.get('actor'); journal._route = entry['route']
+        journal.complete(operation, stamp_write({'returncode': 2, 'stdout': '',
+            'stderr': 'Failed creation was cleared without a native write. Start a new creation.'}),
+            entry['request_hash'], entry['principal'])
+    return {'released': True, 'audit': audit}
 
 
 @dataclass(frozen=True)
@@ -31,13 +178,17 @@ def owner_context(project_path, project, request, authority_config, simple=True)
     Called under run_guarded's authority lock. A preflight may call it too, but
     that cannot replace this effect-time check. Never use caller store/lock paths.
     """
-    from http_authority import read_state
+    from http_authority import file_lock, read_state
     from project_creation import service_descriptor
     descriptor = service_descriptor(request, authority_config, 'owner-requirements')
     if (descriptor.get('project') != project or descriptor.get('credential_id') is not None
             or not owner_records.HUMAN.fullmatch(request['actor'])):
         raise ValueError('Requirements editing needs the signed-in project owner')
-    state = read_state(authority_config.store)
+    # The preflight runs before run_guarded takes this lock. On Windows an
+    # open authority reader prevents the service's atomic state replacement.
+    # Share its existing lock; effect-time calls already hold it re-entrantly.
+    with file_lock(authority_config.lock):
+        state = read_state(authority_config.store)
     account = descriptor['user_id']
     if state.get('memberships', {}).get(project, {}).get(account) != 'owner':
         raise ValueError('Requirements editing needs the signed-in project owner')
@@ -51,10 +202,16 @@ def checked_body(body, action):
     allowed = {'create': {'kind', 'parent', 'title', 'description', 'key'},
                'revise': {'expected_revision', 'expected_sha256', 'title', 'description'},
                'accept': {'expected_revision', 'expected_sha256'},
+               'release': {'original_operation_id', 'expected_receipt_sha256', 'reason'},
                'governance': {'mode', 'expected_revision', 'expected_sha256'}}
     if action not in allowed or not isinstance(body, dict) or set(body) - allowed[action]:
         raise ValueError('Unsupported requirements fields or action')
-    if action != 'create':
+    if action == 'release':
+        identifier(body.get('original_operation_id')); governance.digest(body.get('expected_receipt_sha256'))
+        if (not isinstance(body.get('reason'), str) or not 1 <= len(body['reason'].strip()) <= 1000
+                or '\0' in body['reason']):
+            raise ValueError('Explain why this failed creation should be cleared (1 to 1000 characters)')
+    elif action != 'create':
         if 'expected_sha256' not in body:
             raise ValueError('Expected requirements hash is required; reload and try again')
         expected = body.get('expected_revision')
@@ -71,7 +228,7 @@ def checked_body(body, action):
     return dict(body)
 
 
-def _spec(context, body, action, operation_id):
+def _spec(context, body, action, operation_id, prior=None, run=None):
     """Closed content hooks; authority and generated fields are never payload fields."""
     values = {name: getattr(records.SPEC, name) for name in core.RecordSpec.VALUES + core.RecordSpec.HOOKS}
     values.update(journal=JOURNAL, acceptance_prefix=owner_records.ACCEPTANCE_PREFIX,
@@ -109,25 +266,38 @@ def _spec(context, body, action, operation_id):
             return None
         if record['revision'] in host:
             raise ValueError('Requirements changed. Reload and try again.')
-        prior = prior_owner.get(record['revision'])
-        if prior is not None:
-            if (prior['account_id'] != context.account_id or prior['project'] != context.project
-                    or prior['operation_id'] != operation_id
-                    or prior['record_sha256'] != record['sha256']
-                    or prior['governance'] != context.governance):
+        prior_evidence = prior_owner.get(record['revision'])
+        if prior_evidence is not None:
+            if (prior_evidence['account_id'] != context.account_id or prior_evidence['project'] != context.project
+                    or prior_evidence['operation_id'] != operation_id
+                    or prior_evidence['record_sha256'] != record['sha256']
+                    or prior_evidence['governance'] != context.governance):
                 raise ValueError('Requirements changed. Reload and try again.')
-            stage['at'] = prior['at']
-            decision = prior['decision']['decision_id']
+            stage['at'] = prior_evidence['at']
+            decision = prior_evidence['decision']['decision_id']
         else:
             stage['at'] = core.now()
             # A placeholder only during zero-write preflight; it is replaced by
             # the generated native decision before any evidence is written.
             decision = 'pending-' + content_hash({'operation_id': operation_id})[:24]
+        if prior and 'owner_decision' in prior:
+            binding = prior['owner_decision']
+            if (binding['project'] != context.project or binding['operation_id'] != operation_id
+                    or binding['governance'] != context.governance
+                    or binding['record_sha256'] != record['sha256']
+                    or binding['id'] != record['id'] or binding['revision'] != record['revision']):
+                raise ValueError('Owner decision binding does not match this acceptance')
+            stage['at'] = binding['at']
+            decision = binding['decision']['decision_id']
+            native_decision = records.find(records.read_rows(run), decision)
+            if native_decision is None or native_decision.get('malformed'):
+                raise ValueError('Recorded requirement decision is missing or unreadable; '
+                                 'keep this operation unknown and ask the host operator to reconcile it')
         return {'record_sha256': record['sha256'], 'decision_id': decision,
                 'owners': [context.account_id], 'approvers': [context.account_id],
                 'policy': 'any-owner', 'evidence': decision}
 
-    def before_evidence(run, task, revision, record, actor, bound):
+    def before_evidence(run, task, revision, record, actor, bound, receipt):
         identity = content_hash({'owner_requirement_decision': operation_id})
         label = 'owner-requirement-decision:' + identity
         title = 'Accept requirement ' + task
@@ -135,17 +305,13 @@ def _spec(context, body, action, operation_id):
                        'The project owner accepted this content in simple mode.\n\n'
                        '## Alternatives Considered\nLeave it as a draft.\n\n'
                        'Requirement: %s revision %d sha256 %s\n' % (task, revision, record['sha256']))
-        rows = records.read_rows(run)
-        matches = [row for row in rows if label in (row.get('labels') or [])]
-        if len(matches) > 1:
-            raise ValueError('Ambiguous generated requirement decision; reconcile the operation')
-        if matches:
-            decision = matches[0]
-            if (decision.get('issue_type') != 'decision' or decision.get('title') != title
-                    or decision.get('description') != description
-                    or decision.get('created_by') != actor):
-                raise ValueError('Generated requirement decision does not match this operation')
-            decision_id = decision['id']
+        saved = validate_receipt(load_json(receipt))
+        if 'owner_decision' in saved:
+            decision_id = saved['owner_decision']['decision']['decision_id']
+            decision = records.find(records.read_rows(run), decision_id)
+            if decision is None or decision.get('malformed'):
+                raise ValueError('Recorded requirement decision is missing or unreadable; '
+                                 'keep this operation unknown and ask the host operator to reconcile it')
         else:
             args = ['create', '--title', title, '--description', description, '--type', 'decision',
                     '--no-inherit-labels', '--labels', label, '--json']
@@ -154,7 +320,19 @@ def _spec(context, body, action, operation_id):
             if not isinstance(decision, dict) or not decision.get('id'):
                 raise ValueError('Generated decision outcome is uncertain; reconcile the operation')
             decision_id = decision['id']
+            identifier(decision_id)
+            saved['owner_decision'] = owner_records.acceptance(
+                context.project, record, actor, operation_id, context.governance,
+                decision_id, stage['at'])
+            validate_receipt(saved)
+            atomic(receipt, saved)
         return dict(bound, decision_id=decision_id, evidence=decision_id)
+
+    def receipt_metadata(receipt):
+        if receipt is None:
+            return {}
+        validate_receipt(receipt)
+        return {'owner_decision': receipt['owner_decision']} if 'owner_decision' in receipt else {}
 
     def acceptance_evidence(bound, task, revision, record, actor):
         evidence = owner_records.acceptance(context.project, record, actor, operation_id,
@@ -169,6 +347,7 @@ def _spec(context, body, action, operation_id):
     values.update(validate=validate, build_record=build, check_acceptance=check_acceptance,
                   require_selectable=lambda row, payload, operator, existing: records.require_typed(row, payload),
                   acceptance_evidence=acceptance_evidence, before_evidence=before_evidence,
+                  receipt_metadata=receipt_metadata,
                   live_acceptances=lambda row, operators: owner_records.existing_acceptances(row), result=result)
     return core.RecordSpec(**values)
 
@@ -225,12 +404,20 @@ def apply(project_path, context, action, body, operation_id, run, task=None):
                     'sha256': latest['sha256'], 'acceptance_state': 'accepted',
                     'created': False, 'reconciled': True}
     payload = _payload(action, body, operation_id, run, task)
+    receipt = core.receipt_path(core.journal_dir(project_path, JOURNAL),
+                                content_hash({'operation_id': operation_id}), 'requirement')
+    prior = validate_receipt(load_json(receipt)) if receipt.exists() else None
+    if prior and prior['status'] == 'released':
+        raise ValueError('Failed creation was cleared. Start a new creation with a new operation ID.')
+    if action == 'accept' and prior and prior['status'] == 'pending' and 'owner_decision' not in prior:
+        raise ValueError('Pending requirement acceptance has no recorded decision binding; '
+                         'keep this operation unknown and ask the host operator to reconcile it')
     if task is not None:
         row = records.find(records.read_rows(run), task)
         for evidence in owner_records.existing_acceptances(row).values():
             governance.validate_evidence(project_path, context.project, evidence)
     return core.apply_native(payload, context.account_id, run, project_path,
-                             _spec(context, body, action, operation_id))
+                             _spec(context, body, action, operation_id, prior, run))
 
 
 def web_action(root, project_path, project, request, authority_config, runner, guarded_write):
@@ -242,7 +429,15 @@ def web_action(root, project_path, project, request, authority_config, runner, g
     account_key = lambda built, trusted: principal_key(built, trusted, account_identity=True)
     from export_requirements import parse_json
     args = request.get('args')
-    if (not isinstance(args, list) or not args or args[0] not in ('create', 'revise', 'accept', 'governance')
+    if args == ['recoveries']:
+        def read_effect():
+            context = owner_context(project_path, project, request, authority_config)
+            return {'returncode': 0, 'stdout': json.dumps(recovery_projection(project_path, context, runner)) + '\n', 'stderr': ''}
+        return guarded_write(root, request, journal_path(project_path), read_effect,
+                             authority_config=authority_config, require_authority=True, runner=runner,
+                             account_identity=True, identity_check=lambda: owner_context(
+                                 project_path, project, request, authority_config))
+    if (not isinstance(args, list) or not args or args[0] not in ('create', 'revise', 'accept', 'governance', 'release')
             or len(args) != (2 if args[0] in ('revise', 'accept') else 1)):
         raise ValueError('Unsupported owner requirements action')
     action = args[0]
@@ -266,6 +461,8 @@ def web_action(root, project_path, project, request, authority_config, runner, g
             result = governance.set_mode(project_path, project, body.get('mode'), context.account_id,
                                          operation_id, body['expected_revision'], body['expected_sha256'])
             runner.wrote = True
+        elif action == 'release':
+            result = release_creation(project_path, context, body, runner, runner)
         else:
             result = apply(project_path, context, action, body, operation_id, runner,
                            task=args[1] if len(args) == 2 else None)
@@ -303,6 +500,8 @@ def web_action(root, project_path, project, request, authority_config, runner, g
                     or match['revision'] != body['expected_revision'] + 1
                     or match['previous_sha256'] != body['expected_sha256']):
                 raise ValueError('No matching governance change was confirmed; keep the original operation unknown')
+        elif action == 'release':
+            pass  # release_creation revalidates the retained audit and original identity.
         else:
             from requirements import load_json
             payload = _payload(action, body, operation_id, runner, args[1] if len(args) == 2 else None)
@@ -348,7 +547,7 @@ def web_action(root, project_path, project, request, authority_config, runner, g
 def read(project_path, project, args, run, operators=None):
     """One read-only native snapshot; current content and exact historical refs."""
     if args == ['governance']:
-        return governance.current(project_path, project)
+        return governance.read_state(project_path, project)
     if args == ['snapshot']:
         return governance.snapshot(project_path, project)
     if not isinstance(args, list) or args[:1] not in (['list'], ['brd'], ['get']):
@@ -408,7 +607,7 @@ def read(project_path, project, args, run, operators=None):
         if found.get('unreadable'):
             raise ValueError(found['message'])
         return found
-    result = {'project': project, 'governance': governance.current(project_path, project),
+    result = {'project': project, 'governance': governance.read_state(project_path, project),
               'items': items, 'total': len(items),
               'jobs': [{'id': row['id'], 'title': row.get('title', '')}
                        for row in rows if row.get('issue_type') in ('epic', 'job', 'task')
