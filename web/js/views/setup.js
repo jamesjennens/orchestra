@@ -98,14 +98,23 @@ function stepItem(ctx, pid, item, redraw) {
   else if (route) body.push(h('p', { class: 'small' }, h('a', { href: ctx.href(route) }, 'Open')));
   // Text to copy; nothing on this page runs it. Each entry says what it is: a shell command, a shell
   // command with words to replace, or a line of a unit file, which is not a command (kittrial-5bb.200).
-  const entries = Array.isArray(item.commands) && item.commands.length ? item.commands
+  // A null entry is ignored, never dereferenced (kittrial-5bb.220 F5).
+  const raw = Array.isArray(item.commands) && item.commands.length ? item.commands
     : (item.command ? [{ kind: 'shell', label: 'Command', text: item.command, note: null }] : []);
+  const entries = raw.filter((one) => one && typeof one === 'object');
   for (const one of entries) {
     const line = one.kind === 'unit-line';
+    // A fill-in command (shell-fill) runs only after its words are replaced: mark its button and
+    // name the words beside it, so it is not mistaken for one that runs as shown (kittrial-5bb.220 F5).
+    const words = (Array.isArray(one.replace) && one.replace.filter((w) => w)) || [];
+    const fill = one.kind === 'shell-fill' || words.length > 0;
     body.push(h('div', { class: 'stack', 'data-command': one.kind },
       h('p', { class: 'small' }, h('strong', null, one.label)),
       h('pre', { class: 'json' }, one.text),
-      h('div', null, copyButton(line ? 'Copy line' : 'Copy command', one.text, { what: line ? 'Line' : 'Command' })),
+      h('div', { class: 'row' },
+        copyButton(line ? 'Copy line' : (fill ? 'Copy command (fill in first)' : 'Copy command'),
+          one.text, { what: line ? 'Line' : 'Command' }),
+        words.length ? h('span', { class: 'small muted' }, 'Replace first: ' + words.join(', ')) : null),
       one.note ? h('p', { class: 'small muted' }, one.note) : null));
   }
   if (item.note) body.push(h('p', { class: 'small muted' }, item.note));

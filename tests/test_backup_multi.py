@@ -16,7 +16,7 @@ import sys
 import tempfile
 import types
 import unittest
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -469,8 +469,25 @@ class ValidateBackupStatusCase(unittest.TestCase):
                     admin.validate_backup_status(record)
 
 
+def use_posix_unit_source(testcase):
+    """Build the unit line from POSIX literals, whatever the runner is.
+
+    On Windows ``sys.executable`` and the kit's own file path hold backslashes, which
+    :func:`admin.systemd_quote` refuses (rightly), so the line cannot be built there. This
+    patches the ONE function that supplies both the interpreter and the module
+    (kittrial-5bb.220 review 3 items 2 and 3), so the tests stay platform-independent.
+    """
+    source = patch.object(admin, 'install_current_path',
+                          side_effect=lambda path: PurePosixPath('/usr/bin/python3')
+                          if Path(str(path)).name.lower().startswith('python')
+                          else PurePosixPath('/opt/kit') / Path(str(path)).name)
+    source.start()
+    testcase.addCleanup(source.stop)
+
+
 class ScheduledCoverageGuidanceCase(unittest.TestCase):
     def setUp(self):
+        use_posix_unit_source(self)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name) / 'runtime'
@@ -492,6 +509,15 @@ class ScheduledCoverageGuidanceCase(unittest.TestCase):
             ['[Unit]', 'Description=Backup', '', '[Service]', 'Type=oneshot', *execstarts]) + '\n',
             encoding='utf-8')
         return path
+
+    def write_timer(self, unit='beads-backup.service'):
+        """Enable a beads-*backup*.timer for ``unit`` in timers.target.wants (kittrial-5bb.220 F4)."""
+        name = unit.replace('.service', '.timer')
+        path = self.units / name
+        path.write_text('[Timer]\nOnCalendar=daily\nUnit=%s\n' % unit, encoding='utf-8')
+        wants = self.units / 'timers.target.wants'
+        wants.mkdir(parents=True, exist_ok=True)
+        (wants / name).write_text(path.read_text(encoding='utf-8'), encoding='utf-8')
 
     def admin_line(self, root, *projects):
         # A systemd ExecStart line carries a POSIX path, so render the root with
@@ -541,6 +567,10 @@ class ScheduledCoverageGuidanceCase(unittest.TestCase):
     def test_unit_using_all_is_reported_as_already_covering_every_project(self):
         self.write_unit(self.line('--all'))
         covered, message = admin.scheduled_backup_coverage(self.root, 'second')
+        self.assertFalse(covered)                 # no enabled timer yet
+        self.assertIn('no enabled beads-*backup*.timer', message)
+        self.write_timer()
+        covered, message = admin.scheduled_backup_coverage(self.root, 'second')
         self.assertTrue(covered)
         self.assertIn('cover every project', message)
         self.assertIn('no change is needed', message)
@@ -556,6 +586,9 @@ class ScheduledCoverageGuidanceCase(unittest.TestCase):
         self.assertIn('do not cover second', message)
         self.assertIn('do not back up this runtime', message)
         self.assertIn('backup --all', message)
+        # The not-covered branch names the line to install, under its label (kittrial-5bb.220 F3).
+        self.assertIn('ExecStart=', message)
+        self.assertIn('not a shell command', message)
 
     def test_an_unreadable_unit_is_reported_unconfirmed_not_fine(self):
         self.unit.write_text('[Service]\n', encoding='utf-8')
@@ -564,6 +597,9 @@ class ScheduledCoverageGuidanceCase(unittest.TestCase):
         self.assertFalse(covered)
         self.assertIn('could not be read', message)
         self.assertIn('second', message)
+        # The unreadable-units branch names the line to install, under its label (kittrial-5bb.220 F3).
+        self.assertIn('ExecStart=', message)
+        self.assertIn('not a shell command', message)
 
     def test_bare_backup_with_no_project_is_reported_as_no_coverage(self):
         self.write_unit('ExecStart=/usr/bin/python3 /opt/orchestra/admin.py --root %s backup'
@@ -580,6 +616,7 @@ class ScheduledCoverageGuidanceCase(unittest.TestCase):
 
     def test_a_differently_named_backup_unit_is_read(self):
         self.write_unit(self.line('--all'), name='beads-example-backup.service')
+        self.write_timer(unit='beads-example-backup.service')
         covered, message = admin.scheduled_backup_coverage(self.root, 'second')
         self.assertTrue(covered)
         self.assertIn('beads-example-backup.service', message)
@@ -677,6 +714,7 @@ class ScheduledCoverageGuidanceCase(unittest.TestCase):
 
     def test_add_project_states_when_the_schedule_already_covers_every_project(self):
         self.write_unit(self.line('--all'))
+        self.write_timer()
         output = io.StringIO()
         with patch.object(admin, 'config', return_value={'port': 13317}), \
                 patch.object(admin, 'run_bd', return_value=''), \
@@ -685,6 +723,23 @@ class ScheduledCoverageGuidanceCase(unittest.TestCase):
         text = output.getvalue()
         self.assertIn('cover every project', text)
         self.assertIn('no change is needed', text)
+
+    def test_add_project_does_not_stop_half_way_when_no_unit_line_can_be_printed(self):
+        """kittrial-5bb.220 review 2 item 2a: a $ in the install path must not cut the report short."""
+        output = io.StringIO()
+        with patch.object(admin, 'config', return_value={'port': 13317}), \
+                patch.object(admin, 'run_bd', return_value=''), \
+                patch.object(admin, 'backup_project'), \
+                patch.object(admin, 'worker_client_setup', return_value='WORKER CONFIG HERE'), \
+                patch.object(admin, 'install_current_path',
+                             side_effect=lambda path: Path('/srv/a$b/' + Path(str(path)).name)), \
+                contextlib.redirect_stdout(output):
+            admin.add_project(self.root, 'newproject')
+        text = output.getvalue()
+        self.assertIn('Created project newproject', text)
+        self.assertIn('No line for a schedule can be printed for this installation', text)
+        self.assertIn('can name the path', text)          # the reason, naming the path
+        self.assertIn('WORKER CONFIG HERE', text)         # everything else still printed
 
     def test_add_project_does_not_steer_off_a_longsync_wrapper(self):
         self.write_unit(self.wrapper_line(), name='beads-example-backup.service')
