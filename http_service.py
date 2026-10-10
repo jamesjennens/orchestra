@@ -6569,14 +6569,16 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     @route('GET', r'/v1/service/certificate', anonymous=True, csrf=False)
     def service_certificate(self, ctx):
-        """The service's own public certificate, for the person setting up an agent (kittrial-5bb.203).
+        """The service's own public leaf certificate, for the person setting up an agent (kittrial-5bb.203).
 
-        Only what the TLS handshake already gives every client: the public certificate, never the
-        key, and no log-in, because the point is that the certificate can be fetched before the
-        browser or the agent has been made to trust it (the My agents set-up dialog shows its
-        SHA-256 fingerprint and saves the file). A service without its own certificate — plain http,
-        or the first-install tunnel — serves nothing here: the ordinary not-found answer, as if the
-        route did not exist.
+        Only what the TLS handshake already gives every client: the leaf certificate, re-encoded
+        by the kit from the loaded file's first CERTIFICATE block -- never the key and never the
+        file itself (``service_certificate_pem``). No log-in, because the point is that the
+        certificate can be fetched before the browser or the agent has been made to trust it (the
+        My agents set-up dialog shows its SHA-256 fingerprint and saves the file). A service
+        without a certificate of its own -- plain http, or the first-install tunnel -- and a
+        certificate file that cannot produce a leaf serve nothing here: the ordinary not-found
+        answer, as if the route did not exist.
         """
         certificate = getattr(self.server, 'tls_certificate_pem', None)
         if not certificate:
@@ -6954,9 +6956,10 @@ def certificate_fingerprint(certificate):
 
     The same string ``openssl x509 -noout -fingerprint -sha256`` prints and the VS Code extension
     shows for the certificate the TLS handshake presented: the SHA-256 of the certificate's DER,
-    as uppercase hex pairs joined by colons. A careful person compares the two before trusting an
-    office install's own certificate (kittrial-5bb.203); the dialog's Save button saves the very
-    PEM this is computed from, so the two cannot drift.
+    as uppercase hex pairs joined by colons. The dialog shows it so a person can compare it with
+    what the extension shows; that comparison only says both reached the same endpoint, which is
+    why the docs also name the independent check on the server itself (see
+    ``docs/HTTP_DEPLOYMENT.md``, "The service's own certificate ...").
 
     Only the FIRST certificate of the text is used: that is the leaf the handshake presents, and a
     chain after it does not change it. Anything that is not a certificate block is refused.
@@ -6970,6 +6973,48 @@ def certificate_fingerprint(certificate):
     except (binascii.Error, ValueError):
         raise ValueError('not a PEM certificate: its body is not base64') from None
     return ':'.join('%02X' % byte for byte in hashlib.sha256(der).digest())
+
+
+#: How much of the file ``--cert`` names is read to find the leaf. The TLS loader may read the
+#: whole file (a certificate followed by 64 MB of text is a start that works), but the anonymous
+#: route must not: it answers with one re-encoded leaf, whatever the file's size (kittrial-5bb.203).
+MAX_CERTIFICATE_FILE_BYTES = 1 << 20
+#: The most base64 one certificate block may hold. A leaf is about 1.6 kB; 64 kB is far past any
+#: real certificate and keeps one absurd block from being decoded and served.
+MAX_CERTIFICATE_BLOCK_BASE64 = 1 << 16
+
+
+def service_certificate_pem(certfile):
+    """The leaf public certificate to serve at ``GET /v1/service/certificate``, or ``None``.
+
+    The file the TLS context loaded is read as BYTES: a certificate file is not necessarily UTF-8
+    (a Latin-1 comment beside the block is fine for the loader), and reading it must never keep
+    the service from starting. Only the FIRST ``-----BEGIN CERTIFICATE-----`` block is used --
+    the leaf the handshake presents -- and it is decoded to DER and re-encoded here, so the answer
+    is the kit's own canonical PEM and never an echo of the file. A private key in the same file
+    (a combined PEM is a supported start), a ``TRUSTED CERTIFICATE`` block, ``openssl x509 -text``
+    prose, bag attributes and comments cannot reach it. ``None`` when no leaf can be produced: the
+    route then answers the ordinary 404, exactly as a service with no certificate of its own does.
+    """
+    try:
+        with open(certfile, 'rb') as handle:
+            data = handle.read(MAX_CERTIFICATE_FILE_BYTES + 1)
+    except OSError:
+        return None
+    match = re.search(rb'-----BEGIN CERTIFICATE-----(.*?)-----END CERTIFICATE-----', data, re.S)
+    if not match:
+        return None
+    body = b''.join(match.group(1).split())
+    if not body or len(body) > MAX_CERTIFICATE_BLOCK_BASE64:
+        return None
+    try:
+        der = base64.b64decode(body, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    encoded = base64.b64encode(der).decode('ascii')
+    lines = [encoded[at:at + 64] for at in range(0, len(encoded), 64)]
+    return ('-----BEGIN CERTIFICATE-----\n' + '\n'.join(lines)
+            + '\n-----END CERTIFICATE-----\n')
 
 
 def create_server(service, backend, *, host='127.0.0.1', port=0, trusted_proxies=(),
@@ -6988,10 +7033,11 @@ def create_server(service, backend, *, host='127.0.0.1', port=0, trusted_proxies
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.minimum_version = ssl.TLSVersion.TLSv1_2
         context.load_cert_chain(certfile, keyfile)
-        # What the handshake will present, kept to serve at GET /v1/service/certificate
-        # (kittrial-5bb.203): read once, from the same file that was just loaded, so the
-        # fingerprint the dialog shows is of the certificate this process is serving.
-        certificate = Path(certfile).read_text(encoding='utf-8')
+        # What the handshake will present, for GET /v1/service/certificate (kittrial-5bb.203):
+        # the leaf re-encoded from the file's BYTES, so the route never echoes the file (a
+        # combined PEM's private key, a 64 MB tail, comments) and never raises -- a file that
+        # cannot produce a leaf leaves the route answering 404, not the start failing.
+        certificate = service_certificate_pem(certfile)
     if ':' in host:
         server_class = type('GuardedServer6', (GuardedServer,), {'address_family': __import__('socket').AF_INET6})
     else:

@@ -1831,9 +1831,8 @@ const reopened = m.secretlessPayload({ agent: { id: 'agent_1', name: 'Kestrel', 
     owner_display_name: 'Olive', working_directory: 'C:\\k', projects: ['p1'],
     credentials: [{ id: 'c1', label: 'x', revoked: false }] } }, 'http://127.0.0.1:9');
 const q = m.secretlessPayload(mock, 'http://fallback');
-// kittrial-5bb.203: the VS Code workspace settings the prompt writes, taken from the prompt's own
-// last JSON block, so what the agent is told to write is what is checked.
-const blockOf = (text) => JSON.parse(text.split('~~~json\n').slice(-1)[0].split('\n~~~')[0]);
+// kittrial-5bb.203 review 01a12408 item 2: the prompt writes no VS Code settings and carries no
+// certificate; item 3a: the address (and fingerprint) become the credential file's own content.
 const plain = m.setupPrompt(p, { bridgeServer: 'https://office.example.invalid:7443' });
 const certificate = { certificate: '-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n', sha256: 'AB:CD' };
 const withCert = m.setupPrompt(p, { role: 'reviewer', bridgeServer: 'https://office.example.invalid:7443', certificate });
@@ -1852,14 +1851,16 @@ console.log(JSON.stringify({
   promptNamesFile: m.setupPrompt(p).includes('%USERPROFILE%\\.orchestra-agent-kestrel.curlrc'),
   placeholder: m.headerLine(), real: m.headerLine('S3'),
   tests: m.testCommands(p),
-  settingsPlain: blockOf(plain), settingsCert: blockOf(withCert),
-  settingsLeak: JSON.stringify(blockOf(withCert)).includes('SECRET-XYZ-123'),
+  promptWritesSettings: /settings\.json|orchestraBridge|caFile/.test(withCert),
+  promptCarriesPem: withCert.includes('MIIB'),
+  promptAddressLine: withCert.includes('# server = https://office.example.invalid:7443'),
+  promptFingerprintLine: withCert.includes('# server certificate sha256 = AB:CD'),
+  workerRoleSaid: plain.includes('role is worker'),
+  reviewerRoleSaid: withCert.includes('role is reviewer'),
   commentLines: m.credentialCommentLines('https://office.example.invalid:7443', 'AB:CD'),
-  merged: m.mergeSettings('{\n  "editor.tabSize": 2\n}', { 'orchestraBridge.enabled': true }),
-  kept: m.mergeSettings('{"a": 1}', {}).text,
-  refused: m.mergeSettings('{\n  // a comment\n  "a": 1\n}', { 'a': 2 }),
-  absent: m.mergeSettings('', { 'a': 1 }),
   certFile: m.certificateFile('Kestrel (agent of Olive)'),
+  rewrite: m.credentialFileCommand(m.secretFile('Kestrel'),
+    m.credentialCommentLines('https://office.example.invalid:7443', 'AB:CD')).posix,
   paths: [m.destinationPath(p.workingDirectory, m.CONFIG_PATH), m.destinationPath('/home/j/x/', m.GUIDE_PATH),
           m.destinationPath('D:', m.CONFIG_PATH), m.destinationPath('', m.CONFIG_PATH)],
   ignore: [m.gitignoreAppend('node_modules'), m.gitignoreAppend('a\r\n'), m.gitignoreAppend('/.orchestra\n'),
@@ -1894,28 +1895,20 @@ console.log(JSON.stringify({
             {'path': '.orchestra\\agent.json', 'relative': True}], result['paths'])
         self.assertEqual(['\n.orchestra/\n', '.orchestra/\r\n', '', '', '.orchestra/\n'],
                          result['ignore'])
-        # kittrial-5bb.203: the settings block the prompt writes, and that the credential never
-        # reaches it. The address is the page's, the role is the one asked for, and the
-        # certificate (with caFile naming the file beside the credential) only when there is one.
-        self.assertEqual({
-            'orchestraBridge.serverUrl': 'https://office.example.invalid:7443',
-            'orchestraBridge.agentName': 'kestrel',
-            'orchestraBridge.enabled': True,
-            'orchestraBridge.onWork': 'prefill',
-            'orchestraBridge.role': 'worker',
-            'orchestraBridge.projects': ['p1']}, result['settingsPlain'])
-        self.assertEqual(dict(result['settingsPlain'], **{
-            'orchestraBridge.role': 'reviewer', 'orchestraBridge.caFile': '~/.orchestra-agent-kestrel.crt'}),
-            result['settingsCert'])
-        self.assertEqual(False, result['settingsLeak'])
+        # kittrial-5bb.203 review 01a12408: the prompt writes NO VS Code settings and carries no
+        # certificate (item 2); the address and fingerprint lines become the credential file's own
+        # content by a rewrite, not an append (item 3a); the credential never reaches any of it.
+        self.assertEqual(False, result['promptWritesSettings'])
+        self.assertEqual(False, result['promptCarriesPem'])
+        self.assertEqual(True, result['promptAddressLine'])
+        self.assertEqual(True, result['promptFingerprintLine'])
+        self.assertEqual(True, result['workerRoleSaid'])
+        self.assertEqual(True, result['reviewerRoleSaid'])
         self.assertEqual(['# server = https://office.example.invalid:7443',
                           '# server certificate sha256 = AB:CD'], result['commentLines'])
-        # Merging changes nothing that was already there; a file that is not valid JSON is left alone.
-        self.assertEqual({'text': '{\n  "editor.tabSize": 2,\n  "orchestraBridge.enabled": true\n}\n',
-                          'refused': False, 'created': False}, result['merged'])
-        self.assertEqual('{\n  "a": 1\n}\n', result['kept'])
-        self.assertEqual({'text': None, 'refused': True, 'created': False}, result['refused'])
-        self.assertEqual({'text': '{\n  "a": 1\n}\n', 'refused': False, 'created': True}, result['absent'])
+        self.assertIn('grep -vE', result['rewrite'])
+        self.assertIn('chmod 600', result['rewrite'])
+        self.assertIn('mv ', result['rewrite'])
         self.assertEqual({'name': '.orchestra-agent-kestrel-agent-of-olive.crt',
                           'windows': '%USERPROFILE%\\.orchestra-agent-kestrel-agent-of-olive.crt',
                           'powershell': '$env:USERPROFILE\\.orchestra-agent-kestrel-agent-of-olive.crt',

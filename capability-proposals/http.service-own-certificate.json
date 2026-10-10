@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "operation_id": "capnew-78e8a894267c9d4a014882d6004a2c3c",
+  "key": "http.service-own-certificate",
+  "name": "The service serves its own leaf certificate at an anonymous route, and the set-up dialog shows its fingerprint",
+  "aliases": [
+    "service certificate route",
+    "GET /v1/service/certificate",
+    "server certificate fingerprint in the set-up dialog",
+    "anonymous certificate endpoint"
+  ],
+  "summary": "A service started with --cert/--key answers GET /v1/service/certificate without a log-in with {\"certificate\": \"<PEM>\", \"sha256\": \"<fingerprint>\"}: the certificate is the LEAF re-encoded by the kit from the loaded file's first CERTIFICATE block, and the fingerprint is that leaf's SHA-256 DER hash in the colon form openssl x509 -noout -fingerprint -sha256 prints. The route never echoes the file. A combined key-and-certificate PEM (a supported start), a TRUSTED CERTIFICATE block, an openssl x509 -text dump, bag attributes and comments cannot reach the answer, and the private key is never served. The file is read as bytes (a Latin-1 comment must not stop the service) and the read is capped (1 MiB of file, 64 kB of base64 per block); a file with no leaf leaves the service running with the route answering the ordinary 404, as plain http and the tunnel do. The set-up dialog reads the route, shows the fingerprint and offers a Save button, and says what comparing it proves and does not; the set-up prompt writes no VS Code settings and no certificate file, and puts the '# server = ADDRESS' line (and the fingerprint) into the credential file's own content, idempotently, each on its own line.",
+  "requirements": [],
+  "anchors": [
+    "docs/HTTP_DEPLOYMENT.md#the-services-own-certificate-route-and-the-set-up-dialog-kittrial-5bb203",
+    "docs/HTTP_TRANSPORT_DESIGN.md#bounded-route-and-operation-contract"
+  ],
+  "code": [
+    "http_service.py::ApiHandler.service_certificate",
+    "http_service.py::service_certificate_pem",
+    "http_service.py::certificate_fingerprint",
+    "http_service.py::create_server"
+  ],
+  "tests": [
+    "tests/test_vscode_setup.py",
+    "tests/test_http_web.py"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "http",
+    "tls",
+    "web",
+    "agents"
+  ]
+}

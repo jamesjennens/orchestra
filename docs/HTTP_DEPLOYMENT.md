@@ -1762,42 +1762,54 @@ process list either. A lost secret is replaced, never re-shown: `POST
 /v1/agents/{id}/credentials` issues a new one (the old credential works until revoked
 with `POST /v1/agents/{id}/credentials/{credential}/revoke`).
 
-#### The service's own certificate, and the VS Code window's settings (kittrial-5bb.203)
+#### The service's own certificate route, and the set-up dialog (kittrial-5bb.203)
 
-A service started with `--cert`/`--key` serves its own public certificate at
+A service started with `--cert`/`--key` serves its own public leaf certificate at
 `GET /v1/service/certificate` **without a log-in**: the answer is
 `{"certificate": "<PEM>", "sha256": "<fingerprint>"}`, where the fingerprint is the SHA-256 of the
 leaf certificate's DER as uppercase hex pairs joined by colons — the same string
-`openssl x509 -in cert.pem -noout -fingerprint -sha256` prints and the VS Code bridge extension
-shows before it trusts the server, so a person can compare the two. It gives only what the TLS
-handshake already gives (the public certificate, never the key), and a service without its own
-certificate — plain HTTP, or the first-install tunnel — answers the ordinary `404`: nothing is
-served there.
+`openssl x509 -in <the certificate file> -noout -fingerprint -sha256` prints and the VS Code bridge
+extension shows before it trusts the server. The route never echoes the file `--cert` names: it
+reads that file as bytes (a non-UTF-8, Latin-1 comment beside the block must not stop the service),
+keeps only the first `-----BEGIN CERTIFICATE-----` block — the leaf the handshake presents — and
+re-encodes it. A combined key-and-certificate PEM (a supported start), a `TRUSTED CERTIFICATE`
+block, an `openssl x509 -text` dump, bag attributes and comments cannot reach the answer, and the
+private key is never served. The read is capped (1 MiB of file, 64 kB of base64 per block), so a
+64 MB file does not make every anonymous GET answer 64 MB: the answer is one leaf, about 1.2 kB. A
+service without its own certificate — plain HTTP, or the first-install tunnel — and a certificate
+file that cannot produce a leaf answer the ordinary `404`: nothing is served there, and neither
+case keeps the service from starting.
 
-The My agents set-up dialog reads that route, shows the fingerprint with a Save button, and its
-set-up prompt writes what the Orchestra Bridge extension reads:
+The My agents set-up dialog reads that route, shows the fingerprint and offers a Save button. It
+does **not** write the VS Code workspace settings and does not save a certificate for the
+extension: since extension 0.9.0 the extension shows the server certificate's fingerprint on first
+contact and asks the person to trust it, and its own "Orchestra Bridge: Set up" command writes the
+workspace settings itself from the credential file's `# server = ADDRESS` line. So the set-up
+prompt writes:
 
-- `.vscode/settings.json`, merged into whatever is already there and changing nothing else:
-  `orchestraBridge.serverUrl` (the address the page itself was loaded from, not the configured
-  public address, which may be a name that does not resolve on that network),
-  `orchestraBridge.agentName` (the slug), `orchestraBridge.enabled` `true`,
-  `orchestraBridge.onWork` (`prefill`: the prompt is typed into Copilot Chat, never sent),
-  `orchestraBridge.role` (`worker` or `reviewer`), and `orchestraBridge.projects` with the one
-  project whose code is in that window (the prompt leaves `REPLACE_PROJECT_ID` when the agent is
-  granted several: one folder and one window per project). A file that is not valid JSON is left
-  exactly as it is, with a sentence, instead of being guessed at.
-- In https mode with the service's own certificate: that certificate saved beside the credential
-  file (`%USERPROFILE%\.orchestra-agent-<name>.crt`, `~/.orchestra-agent-<name>.crt`) and
-  `orchestraBridge.caFile` naming it with the `~` form the extension expands itself.
-- Two comment lines appended to the credential file, which curl ignores: `# server = <address>`
-  (the extension's own rule reads the address from it, so nobody types it) and
-  `# server certificate sha256 = <fingerprint>`.
+- the two files in `.orchestra/`, and the `.gitignore` line when the folder is a Git repository;
+- into the credential file, as its first lines, `# server = <address>` (the address the page itself
+  was loaded from, not the configured public address, which may be a name that does not resolve on
+  that network) and, when the service has its own certificate,
+  `# server certificate sha256 = <fingerprint>`. The prompt's command *rewrites* the file: it
+  removes any earlier copy of those lines and puts each on its own line ending with a newline, so a
+  second set-up changes nothing and the dialog's Notepad path — whose file has no final newline —
+  cannot glue a comment onto the `header = ...` line. The secret is never printed and never put on a
+  command line: the POSIX command writes a mode-600 temporary file and moves it over the original,
+  and `curl -K` reads the result as before.
 
-Nothing in any of it holds the secret: the settings name the credential file, and the prompt
-sends the agent to the secret only through `curl -K`. The same prompt and settings are written for
-an agent that reviews other agents' deliveries, with `orchestraBridge.role` set to `reviewer`.
-What the person still does once is said in the dialog: install the extension, reload the window,
-click the first wake.
+The dialog's certificate block says what comparing the fingerprint proves and what it does not: the
+page and the fingerprint come over the same connection, so a third party who can serve the page
+serves his own certificate and his own fingerprint, and the comparison only shows the extension
+reached the same endpoint the browser did. The independent source is the operator reading the value
+on the server itself: `openssl x509 -in <the certificate file> -noout -fingerprint -sha256`.
+
+Nothing in any of it holds the secret: the prompt sends the agent to the secret only through
+`curl -K`. The same prompt is written for an agent that reviews other agents' deliveries, and it
+names the window's role (`worker` or `reviewer`) so the person chooses the same in the extension's
+own set-up. What the person still does once is said in the dialog: install the extension, run
+"Orchestra Bridge: Set up" (and compare the fingerprint it shows), reload the window, click the
+first wake.
 
 **What an agent may do is kept on the agent, and a new credential carries exactly that**
 (kittrial-5bb.208). The agent record holds its `scopes`: written when the agent is made

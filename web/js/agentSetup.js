@@ -10,13 +10,9 @@
 export const CONFIG_PATH = '.orchestra/agent.json';
 export const GUIDE_PATH = '.orchestra/AGENT.md';
 export const GITIGNORE_LINE = '.orchestra/';
-//: The VS Code workspace file the Orchestra Bridge extension reads (kittrial-5bb.203).
-export const VSCODE_SETTINGS_PATH = '.vscode/settings.json';
-//: What the extension does with new work. "prefill" wakes the agent and types the prompt into
-//: Copilot Chat without sending it: the person still presses Enter, and the first wake after a
-//: reload is asked for anyway. Nothing is ever sent into a chat unasked.
-export const BRIDGE_ON_WORK = 'prefill';
-//: The extension's two roles: one window is one role.
+//: The extension's two roles: one window is one role. The prompt names the role so the person
+//: chooses the same in the extension's own "Orchestra Bridge: Set up"; the kit itself writes no
+//: workspace settings (kittrial-5bb.203 review 01a12408, item 2).
 export const BRIDGE_ROLES = Object.freeze(['worker', 'reviewer']);
 
 const plain = (name) => String(name || '').replace(/\s*\(agent[^)]*\)$/, '');
@@ -48,9 +44,10 @@ export function headerLine(secretValue = SECRET_PLACEHOLDER) {
   return `header = "Authorization: Bearer ${secretValue}"`;
 }
 
-// Where the service's own certificate is saved for the extension: beside the credential file in
-// the user profile, never in the agent's folder or the repository. orchestraBridge.caFile names it
-// with the `~` form, which the extension itself expands on every platform (its own rule).
+// Where the service's own certificate is saved for the person who clicks the dialog's Save button:
+// beside the credential file in the user profile, never in the agent's folder or the repository.
+// The kit does not name it in any setting any more (kittrial-5bb.203 review 01a12408, item 2): the
+// extension shows the server's fingerprint on first contact and asks the person to trust it.
 export function certificateFile(name) {
   const file = `.orchestra-agent-${slug(name)}.crt`;
   return Object.freeze({
@@ -61,51 +58,38 @@ export function certificateFile(name) {
   });
 }
 
-// The comment lines the extension and a careful person read out of the credential file
-// (coordinator note of 2026-10-08): curl ignores comment lines, so they cost nothing there.
-// The extension's own rule for the address line is `^#\s*server\s*=\s*(https?://\S+)\s*$`, so the
-// address stands alone on its line and the fingerprint gets a line of its own.
+// The comment lines the extension and a careful person read out of the credential file. curl
+// ignores comment lines, so they cost nothing there. The extension's own rule for the address is
+// `^#\s*server\s*=\s*(https?://\S+)\s*$`, so the address stands alone on its line and the
+// fingerprint gets a line of its own.
 export function credentialCommentLines(server, fingerprint) {
   const lines = [`# server = ${server}`];
   if (fingerprint) lines.push(`# server certificate sha256 = ${fingerprint}`);
   return lines;
 }
 
-// The workspace settings the bridge extension reads, as plain JSON (never a secret: the extension
-// reads the secret from the credential file in the user profile).
-// `projects` is the one project whose code is in that window; with several projects the prompt
-// leaves the kit's usual REPLACE_PROJECT_ID placeholder and says so, because empty means "every
-// project the agent is granted" to the extension (coordinator note of 2026-10-08).
-export function bridgeSettings(payload, { role = 'worker', server, projects, caFile = null } = {}) {
-  const granted = Array.isArray(projects) ? projects : payload.projects;
-  const settings = {
-    'orchestraBridge.serverUrl': server || payload.server,
-    'orchestraBridge.agentName': slug(payload.name),
-    'orchestraBridge.enabled': true,
-    'orchestraBridge.onWork': BRIDGE_ON_WORK,
-    'orchestraBridge.role': BRIDGE_ROLES.includes(role) ? role : 'worker',
-    'orchestraBridge.projects': granted.length === 1 ? [granted[0]] : granted.length ? ['REPLACE_PROJECT_ID'] : [],
-  };
-  if (caFile) settings['orchestraBridge.caFile'] = caFile;
-  return settings;
+// The command that makes the credential file's content exactly those comment lines followed by
+// whatever it already held (its one `header = "Authorization: Bearer ..."` line). It is a rewrite,
+// not an append: any earlier comment line is removed first, so a second set-up replaces it instead
+// of adding a second copy, and each comment ends with a newline, so the dialog's Notepad path --
+// which saves no final newline -- cannot glue a comment onto the header line (the extension's rule
+// then matches nothing; kittrial-5bb.203 review 01a12408, item 3a). The POSIX form writes a
+// same-directory temporary file, restricts it to its owner, and moves it over the original, so the
+// secret is never printed and never reaches a command line or a process argument list.
+const CREDENTIAL_COMMENT_PATTERN = "'^#[[:space:]]*server([[:space:]]+certificate[[:space:]]+sha256)?[[:space:]]*='";
+const POWERSHELL_COMMENT_PATTERN = "'(?m)^#[ \\t]*server([ \\t]+certificate[ \\t]+sha256)?[ \\t]*=[^\\r\\n]*\\r?\\n?'";
+export function credentialFileCommand(file, comments) {
+  const quoted = comments.map((line) => `'${line}'`).join(' ');
+  const powershellText = comments.map((line) => line.replace(/`/g, '``').replace(/\$/g, '`$').replace(/"/g, '`"'))
+    .join('`r`n') + '`r`n';
+  const powershell = '$p="' + file.powershell + '"; $c=[IO.File]::ReadAllText($p); '
+    + '$c=[Text.RegularExpressions.Regex]::Replace($c,' + POWERSHELL_COMMENT_PATTERN + ",''); "
+    + '[IO.File]::WriteAllText($p,"' + powershellText + '" + $c)';
+  const posix = `printf '%s\\n' ${quoted} > ${file.posix}.new && `
+    + `grep -vE ${CREDENTIAL_COMMENT_PATTERN} ${file.posix} >> ${file.posix}.new && `
+    + `chmod 600 ${file.posix}.new && mv ${file.posix}.new ${file.posix} || rm -f ${file.posix}.new`;
+  return Object.freeze({ powershell, posix });
 }
-
-// Merge those keys into whatever .vscode/settings.json already holds, changing nothing else.
-// A file that is not valid JSON (VS Code also accepts comments, which JSON.parse does not) is
-// left exactly as it is, with a sentence: guessing at a person's settings is worse than stopping.
-export function mergeSettings(existingText, addition) {
-  const body = String(existingText === null || existingText === undefined ? '' : existingText);
-  if (!body.trim()) return { text: JSON.stringify(addition, null, 2) + '\n', refused: false, created: true };
-  let current;
-  try { current = JSON.parse(body); } catch (error) { current = undefined; }
-  if (!current || typeof current !== 'object' || Array.isArray(current)) {
-    return { text: null, refused: true, created: false };
-  }
-  return { text: JSON.stringify({ ...current, ...addition }, null, 2) + '\n', refused: false, created: false };
-}
-
-//: Said when .vscode/settings.json is there but is not valid JSON: the file is left alone.
-export const SETTINGS_REFUSED_SENTENCE = 'The existing .vscode/settings.json is not valid JSON, so it was left exactly as it is; nothing was written into it.';
 
 // Commands that prove the stored secret works (they never contain it).
 export function testCommands(payload) {
@@ -193,23 +177,22 @@ export function resumePrompt(name) {
 
 // What the owner pastes into the agent's chat once, in the agent's folder, to set it up.
 //
-// Beyond the two small files in .orchestra/, the prompt now writes what the VS Code bridge
-// extension reads (kittrial-5bb.203): the workspace settings, the service's own certificate
-// beside the credential file with orchestraBridge.caFile naming it, and the address and
-// fingerprint as comment lines in the credential file (curl ignores comments; the extension
-// reads the address from them, so nothing is typed). `role` is the extension's role for the
-// window (worker or reviewer); `certificate` is the service's own PEM with its fingerprint, or
-// null when the service has none (plain http, or the first-install tunnel).
-export function setupPrompt(payload, { role = 'worker', certificate = null, bridgeServer = null,
-  projects = null, caFile = null } = {}) {
-  const pem = typeof certificate === 'string' ? certificate : (certificate && certificate.certificate) || null;
+// Beyond the two small files in .orchestra/, the prompt makes the credential file's content what
+// the VS Code bridge extension reads (kittrial-5bb.203): the `# server = ADDRESS` line (and the
+// fingerprint line when the service has its own certificate) become the file's first lines, each
+// on its own line, replacing any earlier copy. It writes NO workspace settings: since extension
+// 0.9.0 the extension's own "Orchestra Bridge: Set up" command writes them from that address line
+// and shows the server certificate's fingerprint for the person to compare, so no certificate
+// file and no bridge setting naming one is part of the set-up at all (coordinator decision on
+// review 01a12408, item 2). `role` names what this window does (the extension's worker or
+// reviewer) so the person picks the same there; `certificate` is the route's answer
+// (GET /v1/service/certificate) or null when the service has none (plain http, the tunnel).
+export function setupPrompt(payload, { role = 'worker', certificate = null, bridgeServer = null } = {}) {
   const fingerprint = (certificate && certificate.sha256) || null;
-  const file = payload.certificateFile || certificateFile(payload.name);
-  const granted = Array.isArray(projects) ? projects : payload.projects;
   const address = bridgeServer || payload.server;
   const comments = credentialCommentLines(address, fingerprint);
-  const settings = bridgeSettings(payload, { role, server: address, projects: granted,
-    caFile: pem ? (caFile || file.posix) : null });
+  const command = credentialFileCommand(payload.secretFile, comments);
+  const roleWord = BRIDGE_ROLES.includes(role) ? role : 'worker';
   const steps = [
     `Set up this folder for the Orchestra agent "${payload.name}".`,
     '',
@@ -224,31 +207,21 @@ export function setupPrompt(payload, { role = 'worker', certificate = null, brid
     '~~~',
     `4. If this folder is a git repository and its .gitignore does not already list ${GITIGNORE_LINE}, add the line ${GITIGNORE_LINE} to .gitignore. Do not change any other file.`,
     `5. Your secret is not in this message. I keep it in ${payload.secretFile.windows} (on macOS/Linux ${payload.secretFile.posix}); you hand that file to curl with -K, as AGENT.md says. Never open, print or copy that file, and never write the secret to a file, a commit or a command line.`,
-    `6. This folder is opened in VS Code: merge these settings into ${VSCODE_SETTINGS_PATH}, creating that file if it does not exist. Keep every setting already in it exactly as it is and change nothing else in the file; the secret never goes into any settings file. If the file exists and is not valid JSON, leave it exactly as it is and say so instead of guessing.`,
-    '~~~json',
-    JSON.stringify(settings, null, 2),
+    `6. Make the credential file ${payload.secretFile.windows} (macOS/Linux ${payload.secretFile.posix}) hold these comment lines as its FIRST lines, each on its own line ending with a newline, followed by whatever it already held (its header line):`,
     '~~~',
-  ];
-  if (granted.length > 1) {
-    steps.push(`   This agent is granted ${granted.length} projects (${granted.join(', ')}), and a window is woken only for the projects it names: put the project whose code is in THIS folder in place of REPLACE_PROJECT_ID. Use one folder and one VS Code window per project.`);
-  } else if (!granted.length) {
-    steps.push('   This agent has no project yet: grant it one on the Agents page and set orchestraBridge.projects in this window to it.');
-  }
-  if (pem) {
-    steps.push(
-      `7. This service presents its own certificate (https). Save it beside the credential file as ${file.windows} on Windows, ${file.posix} on macOS/Linux, with exactly this content:`,
-      '~~~pem',
-      pem.trimEnd(),
-      '~~~',
-      `   That is the same certificate the settings above name in orchestraBridge.caFile, and the fingerprint ${fingerprint || '(not shown)'} is what the extension shows when it asks whether to trust it: compare the two. It is the public certificate only, what the TLS handshake already gives; it holds no key and no secret.`);
-  }
-  steps.push(
-    `${pem ? 8 : 7}. Add these comment lines at the end of the credential file (curl ignores comment lines, and the extension reads the address from the first one, so nobody types it). Append to the file without opening, printing or copying what it already holds:`,
+    ...comments,
+    '~~~',
+    '   Run exactly one of these commands. Each one rewrites the file in place -- it never prints or copies what the file holds -- and removes any earlier copy of these comment lines first, so running it a second time leaves exactly the same content:',
+    `   - PowerShell: ${command.powershell}`,
+    `   - macOS/Linux: ${command.posix}`,
+    '   The first line is the address the extension reads, so nobody types it. If the credential file does not exist yet, stop here and ask me for step 1 of the dialog first.',
+    `7. This window's role is ${roleWord}: when you run "Orchestra Bridge: Set up" in VS Code, choose ${roleWord} (the extension's own set-up writes the workspace settings from the address line above; the kit writes no settings file).`,
+    `Then continue: ${resumePrompt(payload.name)}`,
     '',
-    `   - PowerShell: Add-Content -LiteralPath "${payload.secretFile.powershell}" -Value ${comments.map((line) => `'${line}'`).join(',')}`,
-    `   - macOS/Linux: printf '%s\\n' ${comments.map((line) => `'${line}'`).join(' ')} >> ${payload.secretFile.posix}`,
-    '');
-  steps.push(`Then continue: ${resumePrompt(payload.name)}`, '');
+  ];
+  if (fingerprint) {
+    steps.push(`The service's own certificate fingerprint is ${fingerprint}. The extension shows it when it first reaches this server; compare it with the value the operator reads on the server itself, as the dialog says.`, '');
+  }
   return steps.join('\n');
 }
 

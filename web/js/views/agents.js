@@ -286,10 +286,10 @@ export async function list(ctx) {
 
 export const SETUP_INTRO = 'Set up the agent’s folder in one of two ways: Save to agent folder, or paste the setup prompt into the agent’s chat. Copy path is only for saving the files by hand.';
 export const SETUP_PROMPT_LABEL = 'Copy setup prompt (creates the files)';
-// What the prompt writes, in one line (kittrial-5bb.203 scope 2), and the one thing left to the
-// person (scope 4).
-export const SETUP_WRITES_LINE = 'The prompt writes .orchestra/agent.json and .orchestra/AGENT.md, merges the VS Code bridge settings into .vscode/settings.json (this page’s address, the agent name, watching on, that folder’s project and what the agent does there), adds .orchestra/ to an existing .gitignore, and — when the service uses its own certificate — saves that certificate beside your credential file and names it. It changes nothing else, and no secret ever goes into a settings file.';
-export const SETUP_ONCE_LINE = 'What is still yours, once: install the Orchestra Bridge extension in VS Code, reload the window, and click the first wake. Nothing is typed into a chat before you do.';
+// What the prompt writes, in one line (kittrial-5bb.203 review 01a12408, item 2: no workspace
+// settings and no certificate file any more), and the one thing left to the person.
+export const SETUP_WRITES_LINE = 'The prompt writes .orchestra/agent.json and .orchestra/AGENT.md, adds .orchestra/ to an existing .gitignore, and puts the address (and, when the service has its own certificate, its fingerprint) as comment lines into your credential file, replacing any earlier copy. It changes nothing else, and it writes no workspace settings: the extension’s own “Orchestra Bridge: Set up” command writes those from that address line. No secret ever leaves the credential file.';
+export const SETUP_ONCE_LINE = 'What is still yours, once: install the Orchestra Bridge extension in VS Code, run “Orchestra Bridge: Set up” in the agent’s folder (it writes the workspace settings from your credential file’s address line and shows the server certificate’s fingerprint when the service has one — compare it), reload the window, and click the first wake. Nothing is typed into a chat before you do.';
 
 const canSaveToFolder = () => typeof window.showDirectoryPicker === 'function' && Boolean(window.isSecureContext);
 
@@ -301,7 +301,8 @@ async function agentCertificate(ctx) {
 }
 
 // Saves that certificate as a file, in one click. The bytes are the ones the fingerprint above was
-// computed from, and the setup prompt saves the same file beside the credential file.
+// computed from. This is for the person: the kit writes no setting that names it (review
+// 01a12408, item 2), because the extension asks the person to trust the server on first contact.
 function saveCertificate(certificate, file) {
   const blob = new Blob([certificate.certificate], { type: 'application/x-pem-file' });
   const url = URL.createObjectURL(blob);
@@ -313,12 +314,12 @@ function saveCertificate(certificate, file) {
   toast('Certificate saved as ' + file.name);
 }
 
-// Writes .orchestra/agent.json and .orchestra/AGENT.md into a folder the user picks, merges the
-// bridge settings into an existing-or-new .vscode/settings.json (changing nothing already there),
-// and appends .orchestra/ to an EXISTING .gitignore that lacks it. Creates or rewrites nothing
-// else. `files` is [[name, text], ...] built from the secretless payload; `addition` is the bridge
-// settings object for that workspace.
-async function saveSetupFiles(files, addition = null) {
+// Writes .orchestra/agent.json and .orchestra/AGENT.md into a folder the user picks and appends
+// .orchestra/ to an EXISTING .gitignore that lacks it. Creates or rewrites nothing else: the VS
+// Code workspace settings are the extension's own "Orchestra Bridge: Set up" command's work since
+// extension 0.9.0 (kittrial-5bb.203 review 01a12408, item 2). `files` is [[name, text], ...] built
+// from the secretless payload.
+async function saveSetupFiles(files) {
   let root;
   try {
     root = await window.showDirectoryPicker({ id: 'orchestra-agent', mode: 'readwrite' });
@@ -349,30 +350,12 @@ async function saveSetupFiles(files, addition = null) {
   }
   dir = dir || await root.getDirectoryHandle('.orchestra', { create: true });
   const written = [];
-  const notes = [];
   for (const [name, text] of files) {
     const handle = await dir.getFileHandle(name, { create: true });
     const out = await handle.createWritable();
     await out.write(text);
     await out.close();
     written.push('.orchestra/' + name);
-  }
-  if (addition) {
-    let vscode = null;
-    try { vscode = await root.getDirectoryHandle('.vscode'); } catch (error) { if (!missing(error)) throw error; }
-    let settings = null;
-    if (vscode) { try { settings = await vscode.getFileHandle('settings.json'); } catch (error) { if (!missing(error)) throw error; } }
-    const current = settings ? await (await settings.getFile()).text() : '';
-    const merged = setupText.mergeSettings(current, addition);
-    if (merged.refused) notes.push(setupText.SETTINGS_REFUSED_SENTENCE);
-    else {
-      vscode = vscode || await root.getDirectoryHandle('.vscode', { create: true });
-      const handle = await vscode.getFileHandle('settings.json', { create: true });
-      const out = await handle.createWritable();
-      await out.write(merged.text);
-      await out.close();
-      written.push(setupText.VSCODE_SETTINGS_PATH + (merged.created ? '' : ' (merged)'));
-    }
   }
   let ignore = null;
   try { ignore = await root.getFileHandle('.gitignore'); } catch (error) { if (!missing(error)) throw error; }
@@ -387,7 +370,7 @@ async function saveSetupFiles(files, addition = null) {
       written.push('.gitignore (added .orchestra/)');
     }
   }
-  return { written, notes, folder: root.name };
+  return { written, folder: root.name };
 }
 
 function fileBlock(title, text, folder, relative) {
@@ -517,14 +500,11 @@ function setupDialog(ctx, source, { secret = null, certificate = null } = {}) {
   const folder = payload.workingDirectory;
   const where = folder ? h('code', { class: 'path' }, folder) : 'the agent’s folder';
   // The address the extension must use is the one this page is connected to, not the configured
-  // public address, which may be a name that does not resolve from this person's network
-  // (coordinator note of 2026-10-08).
+  // public address, which may be a name that does not resolve from this person's network.
   const bridgeServer = location.origin;
-  const caFile = certificate ? payload.certificateFile.posix : null;
   let role = 'worker';
-  const settingsFor = (chosen) => setupText.bridgeSettings(payload, { role: chosen, server: bridgeServer, caFile });
-  const prompt = setupText.setupPrompt(payload, { role, certificate, bridgeServer, caFile });
-  const promptText = (chosen) => setupText.setupPrompt(payload, { role: chosen, certificate, bridgeServer, caFile });
+  const prompt = setupText.setupPrompt(payload, { role, certificate, bridgeServer });
+  const promptText = (chosen) => setupText.setupPrompt(payload, { role: chosen, certificate, bridgeServer });
 
   const status = h('p', { class: 'small', role: 'status', hidden: true });
   let save;
@@ -535,11 +515,11 @@ function setupDialog(ctx, source, { secret = null, certificate = null } = {}) {
         button.disabled = true;
         status.hidden = true;
         try {
-          const result = await saveSetupFiles(files, settingsFor(role));
+          const result = await saveSetupFiles(files);
           if (!result.cancelled) {
             status.className = 'small';
             status.setAttribute('role', 'status');
-            status.textContent = `Saved in ${result.folder}: ${result.written.join(', ')}.` + (result.notes || []).map((note) => ' ' + note).join('');
+            status.textContent = `Saved in ${result.folder}: ${result.written.join(', ')}.`;
             status.hidden = false;
             toast('Setup files saved');
           }
@@ -554,13 +534,14 @@ function setupDialog(ctx, source, { secret = null, certificate = null } = {}) {
           button.disabled = false;
         }
       } }, 'Save to agent folder…'),
-      h('span', { class: 'small muted', id: 'setup-save-hint' }, 'Pick ', where, '. Writes .orchestra/agent.json and .orchestra/AGENT.md, merges the bridge settings into .vscode/settings.json, and adds .orchestra/ to an existing .gitignore. The secret is never saved.'));
+      h('span', { class: 'small muted', id: 'setup-save-hint' }, 'Pick ', where, '. Writes .orchestra/agent.json and .orchestra/AGENT.md and adds .orchestra/ to an existing .gitignore. The VS Code settings are the extension’s own “Orchestra Bridge: Set up” command’s work. The secret is never saved.'));
   } else {
     save = h('p', { class: 'small muted', role: 'note' }, 'Saving directly needs Edge or Chrome on an https or localhost address. Use the copy buttons below instead.');
   }
 
-  // One line about what is written, the role this window's agent takes (the extension's worker or
-  // reviewer), and — when the service has its own certificate — its fingerprint with a Save button.
+  // The role this window's agent takes (the extension's worker or reviewer: the prompt names it so
+  // the person chooses the same in the extension's own set-up), and — when the service has its own
+  // certificate — its fingerprint with a Save button and what comparing it does and does not prove.
   const roleChoice = h('label', { class: 'small', for: 'setup-role' }, 'What this agent does in this window: ',
     h('select', { id: 'setup-role', onchange: (event) => { role = event.target.value; drawPrompt(promptText(role)); } },
       h('option', { value: 'worker' }, 'works on tasks and answers reviews'),
@@ -570,12 +551,13 @@ function setupDialog(ctx, source, { secret = null, certificate = null } = {}) {
       copyButton('Copy', certificate.sha256, { ariaLabel: 'Copy the certificate fingerprint', what: 'Fingerprint' }),
       h('button', { type: 'button', onclick: () => saveCertificate(certificate, payload.certificateFile) }, 'Save certificate')),
     h('p', { class: 'small' }, 'SHA-256 fingerprint: ', h('code', { class: 'path', 'data-fingerprint': certificate.sha256 }, certificate.sha256)),
-    h('p', { class: 'small muted' }, 'The extension shows the same string before it trusts this server: compare the two. This is the public certificate only — what the TLS handshake already gives — and the setup prompt saves it beside your credential file and names it in orchestraBridge.caFile.')) : null;
+    h('p', { class: 'small muted' }, 'In VS Code run “Orchestra Bridge: Set up”: it will show this fingerprint when it first reaches the server — compare it before you trust it.'),
+    h('p', { class: 'small muted' }, 'What that comparison proves: the extension reached the same endpoint this page did. What it does not: this page and this string came over the same connection, so anyone who can serve this page can serve his own certificate and his own fingerprint. The independent source is you, on the server: run openssl x509 -in <the certificate file> -noout -fingerprint -sha256 there and compare that value.')) : null;
 
   const promptBody = h('div', { class: 'stack' });
   const drawPrompt = (text) => promptBody.replaceChildren(
     h('div', { class: 'copy-row' }, h('h4', { class: 'small' }, 'Or let the agent do it'), copyButton(SETUP_PROMPT_LABEL, text, { what: 'Setup prompt' })),
-    h('p', { class: 'small muted' }, 'Paste this into the agent’s own chat, opened in its folder. It creates both files, merges the bridge settings, updates .gitignore in a Git repository, then continues. It does not contain the secret.'),
+    h('p', { class: 'small muted' }, 'Paste this into the agent’s own chat, opened in its folder. It creates both files, updates .gitignore in a Git repository, puts the address into your credential file, then continues. It writes no VS Code settings and does not contain the secret.'),
     h('details', null, h('summary', null, 'Show the prompt'), h('pre', { class: 'json' }, text)));
   drawPrompt(prompt);
   const promptSection = h('section', { class: 'setup-block', 'aria-label': 'Setup prompt' }, promptBody);
@@ -596,7 +578,7 @@ function setupDialog(ctx, source, { secret = null, certificate = null } = {}) {
           h('p', { class: 'setup-intro' }, SETUP_INTRO),
           h('p', { class: 'small' }, 'The folder gets two small files, ', h('code', null, setupText.CONFIG_PATH), ' and ', h('code', null, setupText.GUIDE_PATH),
             ', in ', where, '. Keep .orchestra/ out of Git. Neither file holds the secret; they only name the file from step 1.'),
-          h('p', { class: 'small', 'data-writes': setupText.VSCODE_SETTINGS_PATH }, SETUP_WRITES_LINE),
+          h('p', { class: 'small', 'data-writes': 'setup' }, SETUP_WRITES_LINE),
           roleChoice,
           certificateBlock,
           h('section', { class: 'setup-block', 'aria-label': 'Save the setup files' }, save, status),
