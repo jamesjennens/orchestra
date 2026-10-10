@@ -5775,6 +5775,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             'create':('kind','parent','title','description','key'),
             'revise':('expected_revision','expected_sha256','title','description'),
             'accept':('expected_revision','expected_sha256'),
+            'withdraw':('expected_revision','expected_sha256','expected_state_sha256','reason'),
+            'supersede':('expected_revision','expected_sha256','expected_state_sha256','reason','successor'),
             'release':('original_operation_id','expected_receipt_sha256','reason'),
             'governance':('mode','expected_revision','expected_sha256')}[action],'Requirements')
         import requirement_http
@@ -5783,6 +5785,12 @@ class ApiHandler(BaseHTTPRequestHandler):
         if operation_id is not None:
             raise invalid('Use the Idempotency-Key header for requirements writes')
         pid=ctx.params['pid']
+        if action in ('withdraw','supersede'):
+            # The service may return a completed request before invoking the
+            # canonical adapter. Check mode here too; the adapter repeats it
+            # under the project/authority locks for every new effect/recovery.
+            if self.backend.requirements_read(pid,['governance'])['mode']!='simple':
+                raise invalid('This project uses governed requirements. Ask its owner to enable simple editing.')
         def write():
             result=self.backend.owner_requirements(ctx.principal,pid,action,fields,
                                                     ctx.idempotency_key or ctx.request_id,ctx.params.get('rid'))
@@ -5836,6 +5844,14 @@ class ApiHandler(BaseHTTPRequestHandler):
     @route('POST', r'/v1/projects/(?P<pid>'+ID+r')/requirements/(?P<rid>'+ID+r')/accept')
     def requirements_accept(self,ctx):
         return self._requirements_write(ctx,'accept')
+
+    @route('POST', r'/v1/projects/(?P<pid>'+ID+r')/requirements/(?P<rid>'+ID+r')/withdraw')
+    def requirements_withdraw(self,ctx):
+        return self._requirements_write(ctx,'withdraw')
+
+    @route('POST', r'/v1/projects/(?P<pid>'+ID+r')/requirements/(?P<rid>'+ID+r')/supersede')
+    def requirements_supersede(self,ctx):
+        return self._requirements_write(ctx,'supersede')
 
     @route('GET', r'/v1/projects/(?P<pid>'+ID+r')/brd')
     def requirements_brd(self,ctx):

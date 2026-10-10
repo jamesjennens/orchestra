@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "operation_id": "capnew-requirements-owner-terminal-v1",
+  "key": "requirements.owner-terminal-states",
+  "name": "Human owner withdrawal and exact supersession preserve requirement history",
+  "aliases": ["withdraw requirement", "supersede requirement", "terminal requirement history"],
+  "summary": "A signed-in human project owner in simple mode may withdraw a current accepted requirement with a reason or supersede it with an exact active accepted successor in the same project. Immutable author-bound state and reason evidence plus an exact durable receipt support interrupted recovery without duplicate native events. Current owner membership and mode are rechecked before replay and effect. Terminal records cannot be edited or reactivated; member views retain acceptance, history, reason and exact replacement while excluding terminal or unknown records from active selection. Historical exact references and export manifest bytes remain unchanged. Native evidence and governance source lineage survive backup/restore. The preceding reader refuses terminal evidence; projects without terminal records retain preceding-release compatibility.",
+  "requirements": [],
+  "anchors": ["docs/REQUIREMENTS.md#withdraw-or-supersede-an-accepted-requirement"],
+  "code": ["requirement_terminal.py::apply", "requirement_owner_records.py::state_ledger", "requirement_http.py::read", "http_service.py::requirements_withdraw", "web/js/views/owner_requirements.js::requirement"],
+  "tests": ["tests/test_requirement_terminal.py", "tests/test_http_requirement_terminal.py", "tests/test_requirement_owner_real_bd.py", "tests/web_requirement_terminal.mjs"],
+  "owner": "person:orchestra-coordinator",
+  "tags": ["requirements", "history", "replay"]
+}

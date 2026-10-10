@@ -43,6 +43,46 @@ The original attempt and its release audit are retained. An allocated row, even
 an empty one, cannot be cleared here: retry the original creation and, if that
 still fails, ask the host operator to reconcile it.
 
+### Withdraw or supersede an accepted requirement
+
+In simple mode, the signed-in project owner can withdraw a currently accepted
+requirement with a reason, or supersede it with another currently active accepted
+requirement in the same project. Pending drafts and narrative sections cannot be
+terminal targets. The replacement is pinned by its ID, revision and content hash.
+It is never substituted into existing references automatically.
+
+The page requires confirmation before either action: **This cannot be undone in
+the browser. If this is a mistake, create a new requirement. The old wording and
+history remain available.** There is no reactivation route. Governed mode has no
+withdrawal or supersession command in this release; changing mode never removes
+a recorded terminal state. The governed operator acceptance and publication
+commands retain their existing authority and cannot reactivate a terminal record.
+
+Acceptance and status are separate. Terminal records retain their immutable
+accepted revisions and decisions. A member can read the reason, author, timestamp,
+exact replacement and revision history. Reverse “Supersedes” links are derived
+from the old record's pointer. A failed or conflicting transition reads as
+**Status unknown**, and stays out of current active selection. Retry its exact
+original request; an unproved receipt or effect needs host operator reconciliation.
+
+| Consumer | Terminal requirement behavior |
+| --- | --- |
+| Requirements list, detail and generated BRD | Retain accepted content and history; display status separately. Current `active_ids` excludes terminal and unknown records. The BRD groups them separately. |
+| Work and brief | Native requirement tasks stay visible with their status labels. A terminal transition neither closes work nor changes checkpoints, blockers or lifecycle facts. |
+| Proposal traceability | Exact old content remains readable; it no longer qualifies as the content accepted today for incorporation. |
+| Capability links | An explicit historical revision remains linkable. A link without a revision requires a currently active record. |
+| Offline export and publication | Explicit historical selections retain their manifest bytes and acceptance. Provenance includes the validated state/reason pair and governance lineage; terminal status does not delete historical content. |
+| Impact analysis and worker launch contracts | Operate on explicitly selected immutable manifests and exact references. Terminal status does not rewrite a manifest, silently retarget work, or remove a launch requirement. A changed active selection needs a new reviewed manifest and reassessment. |
+
+Backup/restore carries native evidence, the exact request receipts and governance
+source ranges. It preserves terminal hashes when the project is restored under a
+new name. Projects with no terminal records remain compatible with the preceding
+release. A project with terminal evidence requires this release or a later one:
+the preceding reader refuses the newly activated state family. Do not roll such
+a project back and infer activity from old labels, or strip evidence to make it
+readable. Restore a pre-transition backup if a rollback is required. Named
+baselines and Markdown download/comparison are a separate later delivery.
+
 An interrupted acceptance uses its recorded generated decision ID. Editable
 native titles, descriptions, labels and creator metadata cannot substitute a
 different decision. A missing or unreadable recorded decision, or an older
