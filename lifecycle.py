@@ -220,12 +220,12 @@ def lifecycle_authors_rule(dimension,actor,assignee,operators=None,enforce=False
     """The one place slices 6 and 7 judge who may write which fact.
 
     Raises ValueError when ``enforce`` is true and the rule does not allow the
-    actor; appends the preview to ``warnings`` (or prints it to stderr) when it is
-    false and the rule does not allow the actor, because the decision on
-    kittrial-5bb.106 asks for the refusal to be reported as a warning while the
-    setting is off. Returns True when the actor is allowed. A refusal and the
-    warning that previews it can never disagree: both come from
-    ``dimension_authority``.
+    actor; when it is false and the rule does not allow the actor, appends the
+    preview to ``warnings`` (the list the transport reports on stderr) and lets the
+    write through, because the decision on kittrial-5bb.106 asks for the refusal to
+    be reported as a warning while the setting is off. Returns True when the actor
+    is allowed. A refusal and the warning that previews it can never disagree: both
+    come from ``dimension_authority``.
     """
     allowed,reason=dimension_authority(dimension,actor,assignee,operators)
     if allowed:return True
