@@ -320,8 +320,13 @@ def repair_merge_slot(run,slot):
     if changes:run(['update',slot,*changes,'--json'])
     return fixed,wanted
 
-def apply_native(p, actor, run, project):
-    """Caller holds canonical project lock. Journals belong to runtime, never Git."""
+def apply_native(p, actor, run, project, operators=None, coordinator_writes=False):
+    """Caller holds canonical project lock. Journals belong to runtime, never Git.
+
+    ``coordinator_writes`` is the per-installation setting of slice 7
+    (``admin.coordinator_rules``, supplied by the endpoint; OFF by default), and
+    ``operators`` the installation's operator allowlist it is judged against.
+    """
     if not isinstance(p,dict):raise ValueError('Expected object')
     op=p.get('operation')
     if op=='create-child':
@@ -399,6 +404,19 @@ def apply_native(p, actor, run, project):
         raise ValueError('Invalid merge request fields for %s: %s. merge-acquire takes operation, task and target; '
                          'merge-create, merge-check and merge-release take only operation. The holder is always '
                          'the request actor.'%(op,'; '.join(details)))
+    if op=='merge-acquire' and coordinator_writes:
+        # Slice 7 (kittrial-5bb.197): taking the merge slot is a listed actor of the
+        # project's, when the installation turned the rule on. Judged before the slot
+        # is read or reserved, so a refusal writes nothing. The import is local
+        # because review_workflow imports this module.
+        import sessions
+        from review_workflow import listed_operator_actor,named_rule_actor
+        if not listed_operator_actor(actor,operators,sessions.owners(project)):
+            raise ValueError('merge-acquire refused: the installation setting coordinator_writes is on, so only a '
+                             'listed operator of this project may take the merge slot (or an actor of a listed '
+                             "operator's principal), and %s is neither. An operator turns the rule off with "
+                             '`admin.py coordinator-rules off --rule coordinator_writes --actor OPERATOR`.'
+                             %named_rule_actor(actor))
     context_path=project/'.merge-context.json'
     if op=='merge-create':
         # Creates the slot, or says it exists; either way a damaged row is put right.

@@ -10,7 +10,12 @@ commands a confined coordinator runs through the endpoint (kittrial-5bb.195; see
 "A confined coordinator runs the acceptance commands through the endpoint" in
 [OPERATIONS.md](OPERATIONS.md)); and slice 4, the installation setting that
 accepts bound keys only (kittrial-5bb.196; see "Accept bound keys only" in
-[OPERATIONS.md](OPERATIONS.md)). The rest of this note describes the design and
+[OPERATIONS.md](OPERATIONS.md)); and slices 6 and 7 (kittrial-5bb.197; see "The
+coordinator rules" in [OPERATIONS.md](OPERATIONS.md)), except that the second
+refusal of rule 3 - `reviewed` and `integrated` refused unless another principal
+approved the contribution - is NOT built: the setting `independent_approval` as
+shipped refuses only the self-approval (the contribution's author and the task's
+assignee). The rest of this note describes the design and
 the state of main when it was written, not what is built.**
 
 **For an installation where nobody but its owner is to have SSH (the office),
@@ -478,9 +483,15 @@ safe than before. The order is the one the review recommended.
    `docs/REVIEWS.md` and what `work` and `brief` show for a contribution that
    waits for somebody else. It takes its list of facts from the decision on
    kittrial-5bb.106 and is built with it, not before it.
+   *Built by kittrial-5bb.197 as the installation rule `independent_approval`, the
+   SELF-APPROVAL half only: an approval from the contribution's author or the
+   task's assignee is refused. The second refusal (a principal other than the
+   author and assignee must have approved before `reviewed`/`integrated` may be
+   recorded) is NOT built.*
 7. **Coordinator-only writes**, if James wants them (question 3): approval and
    taking the merge slot only for a listed actor of the project. Also with
    kittrial-5bb.106.
+   *Built by kittrial-5bb.197 as the installation rule `coordinator_writes`.*
 8. **The web interface** shows who coordinates a project.
 
 Slices 1, 2 and 6 are the design asked for. Not sized: a per-project operator

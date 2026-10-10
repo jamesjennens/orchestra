@@ -28,7 +28,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from admin import ConfigurationUnreadable,deployment_document,deployment_password,environment,project_dir,root_path,operators as configured_operators,verifiers as configured_verifiers,review_workflow_writes as configured_review_writes
+from admin import ConfigurationUnreadable,deployment_document,deployment_password,environment,project_dir,root_path,operators as configured_operators,verifiers as configured_verifiers,review_workflow_writes as configured_review_writes,coordinator_rules as configured_coordinator_rules
 import bd_refusals
 import native
 from coordination import is_merge_slot, merge_slot_sentence
@@ -776,12 +776,23 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
         # failing every work/review action (kittrial-5bb.110 item 2).
         switch_warnings=[]
         review_writes=configured_review_writes(root,warnings=switch_warnings)
+        rules=configured_coordinator_rules(root,warnings=switch_warnings)
         run_warnings.extend(switch_warnings)
+        # The principal rule of slice 7 needs the project's actor -> principal map, and
+        # only when the rule is on: an installation that configures nothing reads no
+        # registry here (kittrial-5bb.197).
+        owners=None
+        if rules['coordinator_writes']:
+            import sessions
+            owners=sessions.owners(path)
         def work_effect():
             result=work_execute(path,actor,action,args,request.get('attachments',{}),runner,
                                 operators=configured_operators(root),
                                 verifiers=configured_verifiers(root),
-                                review_writes=review_writes)
+                                review_writes=review_writes,
+                                independent_approval=rules['independent_approval'],
+                                coordinator_writes=rules['coordinator_writes'],
+                                owners=owners)
             # A handoff request and a decline are recorded in the kit's handoff journal and move
             # nothing in bd, so the runner saw no write; they are writes all the same (review
             # of kittrial-5bb.97). One that was already recorded (`reconciled`) wrote nothing.
@@ -1257,12 +1268,22 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             if warnings:run_warnings.append(warnings)
             return stdout
         runner=NativeRunner(run)
+        # Slices 6 and 7 (kittrial-5bb.197): the three rules are read once, from the
+        # installation's own file, and an installation that configures nothing reads
+        # them all as OFF. A malformed value reads as OFF with a warning, as
+        # review_workflow_writes does, rather than failing every lifecycle write.
+        switch_warnings=[]
+        rules=configured_coordinator_rules(root,warnings=switch_warnings)
+        run_warnings.extend(switch_warnings)
         def lifecycle_effect():
             if action=='lifecycle':result=apply_native(payload,actor,runner,
-                                                       operators=configured_operators(root),journal=path)
+                                                       operators=configured_operators(root),journal=path,
+                                                       lifecycle_authors=rules['lifecycle_authors'],
+                                                       warnings=run_warnings)
             elif action=='coordinate':
                 from coordination import apply_native as coordinate
-                result=coordinate(payload,actor,runner,path)
+                result=coordinate(payload,actor,runner,path,operators=configured_operators(root),
+                                  coordinator_writes=rules['coordinator_writes'])
             else:
                 from requirement_records import apply_native as requirement_apply
                 result=requirement_apply(payload,actor,runner,path)

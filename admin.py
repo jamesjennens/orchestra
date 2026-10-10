@@ -674,6 +674,152 @@ def review_workflow_writes(root, strict=False, warnings=None):
                 print('WARNING: ' + message,file=sys.stderr)
     return enabled
 
+# ---------------------------------------------------------------------------
+# Slices 6 and 7 of docs/COORDINATORS_PER_PROJECT_DESIGN.md (kittrial-5bb.197) and
+# the decisions recorded on kittrial-5bb.106: three per-installation rules, each
+# OFF until an installation turns it on.
+#
+#   lifecycle_authors    - who may record which lifecycle fact (part a)
+#   independent_approval - nobody passes their own work, the self-approval half (part b)
+#   coordinator_writes   - approval and the merge slot only for a listed actor (part c)
+#
+# Each is its own boolean in `deployment.private.json`; absent or false means OFF,
+# so a fresh install and an installation that configures nothing behave exactly as
+# before. `admin.py coordinator-rules` reads and flips them (operator allowlist,
+# audited); `admin.py lifecycle-authors PROJECT` is the read-only preview of (a).
+# The endpoint supplies the values to the write paths; `lifecycle.py` and
+# `review_workflow.py` never read this file themselves.
+# ---------------------------------------------------------------------------
+COORDINATOR_RULE_KEYS=('lifecycle_authors','independent_approval','coordinator_writes')
+COORDINATOR_RULES_AUDIT_KEY='coordinator_rules_audit'
+#: The audit list keeps the last N flips, as `review-writes` and `bound-keys-only` bound theirs.
+COORDINATOR_RULES_AUDIT_MAX=20
+COORDINATOR_RULE_HELP={'lifecycle_authors':'record reviewed, integrated, deployed, live-verified, enabled, live and '
+                                           'a release deploy only as a listed operator, and implemented, tested and '
+                                           'the task scope only as the assignee or a listed operator',
+                       'independent_approval':'refuse an approval from the contribution\'s author or the task\'s assignee',
+                       'coordinator_writes':'allow only a listed actor of the project to approve a contribution or '
+                                            'take the merge slot'}
+
+
+def coordinator_rules(root,warnings=None):
+    """The three slices 6/7 rules at once, read once; absent or false means OFF.
+
+    A value that is neither true nor false is read as OFF with a warning, as
+    `review_workflow_writes` is (kittrial-5bb.110 item 2): raising here would fail
+    every review and every lifecycle write on the installation while the other
+    readers kept answering. There is deliberately no `ORCHESTRA_*` fallback: these
+    are deployment rules, not authority lists.
+    """
+    values={key:False for key in COORDINATOR_RULE_KEYS}
+    marker=root/'deployment.private.json'
+    if marker.is_file():
+        document=deployment_document(marker)
+        for key in COORDINATOR_RULE_KEYS:
+            value=document.get(key)
+            if isinstance(value,bool):values[key]=value
+            elif value is not None:
+                message=('deployment %s is %r, not true or false; reading it as off (the rule refuses nothing)'
+                         %(key,value))
+                if warnings is not None:warnings.append('WARNING: '+message)
+                else:print('WARNING: '+message,file=sys.stderr)
+    return values
+
+
+def coordinator_rule(root,key,warnings=None):
+    """One of the three slices 6/7 rules by name."""
+    if key not in COORDINATOR_RULE_KEYS:raise ValueError('Unknown coordinator rule %s'%key)
+    return coordinator_rules(root,warnings)[key]
+
+
+def coordinator_rules_audit(cfg):
+    """``(entries, damage)`` for the coordinator-rules audit in a deployment document."""
+    entries=cfg.get(COORDINATOR_RULES_AUDIT_KEY)
+    if entries is None:return [],None
+    if not isinstance(entries,list):return [],'not a list'
+    kept=[]
+    for position,entry in enumerate(entries):
+        if (isinstance(entry,dict) and set(entry)=={'at','actor','rule','action','previous'}
+                and all(isinstance(entry.get(key),str) for key in ('at','actor','rule','action'))
+                and isinstance(entry.get('previous'),bool)):
+            kept.append(entry)
+            continue
+        return kept,'entry %d is not a coordinator-rules audit entry'%(position+1)
+    return kept,None
+
+
+def coordinator_rules_switch(root,action,rule,actor):
+    """Read or flip one slices 6/7 rule, with its operator audit.
+
+    Only an actor on the deployment operator allowlist may read or flip: the decision
+    on kittrial-5bb.106 is an operator's. A flip holds `review_writes_lock` across the
+    whole read-modify-write of `deployment.private.json`, as the other deployment
+    switches do, so two simultaneous flips cannot lose each other. A flip that changes
+    nothing writes nothing. A damaged audit is warned about and started afresh with the
+    damaged value kept aside under a dated key, as the checkpoint switch does.
+    """
+    from recovery import identity
+    marker=root/'deployment.private.json'
+    if not marker.is_file():raise ValueError('Deployment is not installed; run install first')
+    actor=identity(actor,'Invalid actor identity')
+    if actor not in operators(root,strict=True):
+        raise ValueError('coordinator-rules requires an actor on the deployment operator allowlist')
+    if action not in ('status','on','off'):raise ValueError('Invalid coordinator-rules action')
+    if action=='status':
+        audit,damage=coordinator_rules_audit(config(root))
+        if damage is not None:
+            print('WARNING: the coordinator-rules audit is damaged (%s); it reads as an empty history. The next '
+                  'on/off keeps it aside in deployment.private.json under %s_damaged_<UTC stamp> and starts a '
+                  'fresh list.'%(damage,COORDINATOR_RULES_AUDIT_KEY),file=sys.stderr)
+        return dict(coordinator_rules=coordinator_rules(root),audit=audit[-1] if audit else None,
+                    audit_records=len(audit),audit_readable=damage is None,changed=False,rule=rule)
+    if rule not in COORDINATOR_RULE_KEYS:
+        raise ValueError('coordinator-rules %s requires --rule with one of: %s'
+                         %(action,', '.join(COORDINATOR_RULE_KEYS)))
+    enabled=action=='on'
+    with review_writes_lock(root):
+        current=coordinator_rules(root)[rule]
+        cfg=config(root)
+        audit,damage=coordinator_rules_audit(cfg)
+        if enabled==current:
+            return dict(coordinator_rules=coordinator_rules(root),audit=audit[-1] if audit else None,
+                        audit_records=len(audit),audit_readable=damage is None,changed=False,rule=rule)
+        if damage is not None:
+            kept='%s_damaged_%s'%(COORDINATOR_RULES_AUDIT_KEY,utc_stamp().replace(':','').replace('-',''))
+            suffix=1
+            while kept+('' if suffix==1 else '_%d'%suffix) in cfg:suffix+=1
+            kept+=('' if suffix==1 else '_%d'%suffix)
+            cfg[kept]=cfg.pop(COORDINATOR_RULES_AUDIT_KEY)
+            print('WARNING: the coordinator-rules audit was damaged (%s); it is kept aside in '
+                  'deployment.private.json as %s and this flip starts a fresh list.'%(damage,kept),file=sys.stderr)
+        if enabled:cfg[rule]=True
+        else:cfg.pop(rule,None)
+        cfg[COORDINATOR_RULES_AUDIT_KEY]=(audit+[dict(actor=actor,at=utc_stamp(),rule=rule,action=action,
+                                                      previous=current)])[-COORDINATOR_RULES_AUDIT_MAX:]
+        atomic_private_write(marker,json.dumps(cfg))
+    return dict(coordinator_rules=coordinator_rules(root),audit_records=min(len(audit)+1,COORDINATOR_RULES_AUDIT_MAX),
+                audit_readable=True,changed=True,rule=rule)
+
+
+def lifecycle_authors_command(root,project,limit=None):
+    """``admin.py lifecycle-authors PROJECT``: the read-only preview of part (a).
+
+    Writes nothing and reads the project's own export with the reader every other
+    lifecycle read uses, so it can be run before `lifecycle_authors` is turned on
+    (the decision on kittrial-5bb.106). It is a host command: the shell is already
+    authority over the installation, so it takes no `--actor` and gates nothing.
+    """
+    import lifecycle
+    if limit is None:limit=lifecycle.AUTHORS_REPORT_TASK_LIMIT
+    if not isinstance(limit,int) or isinstance(limit,bool) or limit<0:raise ValueError('Invalid --limit')
+    def run(argv):return run_bd(root,project,argv)
+    rows=lifecycle.read_event_rows(run)
+    report=lifecycle.lifecycle_authors_report(rows,operators(root),limit=limit)
+    report['project']=project
+    report['setting']={'lifecycle_authors':coordinator_rule(root,'lifecycle_authors')}
+    return report
+
+
 #: The key of the installation setting that accepts bound keys only, and the key of its short
 #: operator audit list, in the same deployment.private.json (kittrial-5bb.196, slice 4 of
 #: docs/COORDINATORS_PER_PROJECT_DESIGN.md).
@@ -7013,6 +7159,23 @@ def main():
     a.add_argument('--file',default=None,help='the authorized_keys file to preview (default: '
                    '~/.ssh/authorized_keys of this account): status and on name the lines of this kit and this '
                    'root that the setting refuses or would refuse')
+    a=sub.add_parser('coordinator-rules',help='read or set the three per-installation rules of the coordinators '
+                                              'design, slices 6 and 7: who may record which lifecycle fact, nobody '
+                                              'passes their own work, and approval and the merge slot only for a '
+                                              'listed actor of the project (all OFF by default; an installation '
+                                              'that configures nothing behaves exactly as before)')
+    a.add_argument('action',choices=['status','on','off'])
+    a.add_argument('--rule',default=None,choices=list(COORDINATOR_RULE_KEYS),
+                   help='which rule to flip (required for on/off): '
+                        +'; '.join('%s: %s'%(key,COORDINATOR_RULE_HELP[key]) for key in COORDINATOR_RULE_KEYS))
+    a.add_argument('--actor',required=True,help='an actor on the deployment operator allowlist')
+    a=sub.add_parser('lifecycle-authors',help='read-only: every recorded lifecycle fact of a project, the actor who '
+                                              'recorded it, and whether the lifecycle_authors rule would refuse it '
+                                              '(run this before turning that rule on); writes nothing')
+    a.add_argument('project')
+    a.add_argument('--limit',type=int,default=None,
+                   help='list at most this many tasks, newest first as the export orders them; the counts cover '
+                        'every task either way (default 200)')
     a=sub.add_parser('capability-verify',help='record verified capability checks (operator allowlist or verifiers list)')
     a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('authorized-keys',help='print the confined contributor and unrestricted operator authorized_keys lines for one public key')
@@ -7695,6 +7858,10 @@ def main():
         result,warnings=review_writes_command(root,args.actor,args.action)
         for line in warnings:print(line,file=sys.stderr)
         print(json.dumps(result))
+    elif args.command=='coordinator-rules':
+        print(json.dumps(coordinator_rules_switch(root,args.action,args.rule,args.actor)))
+    elif args.command=='lifecycle-authors':
+        print(json.dumps(lifecycle_authors_command(root,args.project,args.limit)))
     elif args.command=='authorized-keys':
         authorized_keys(root,args.key_file,args.role,args.python,args.comment,args.project,args.principal)
     elif args.command=='authorized-keys-list':

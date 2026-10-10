@@ -430,6 +430,65 @@ three are deliberate, and all three are covered by the recovery:
   only thing in this kit that grows it - and the confined keys work again; the operator's own
   unrestricted key reaches a shell throughout.
 
+### The coordinator rules: who may write which fact, and who may approve
+
+Slices 6 and 7 of [COORDINATORS_PER_PROJECT_DESIGN.md](COORDINATORS_PER_PROJECT_DESIGN.md)
+(kittrial-5bb.197), from the decisions recorded on kittrial-5bb.106. Three
+**per-installation** rules live in `deployment.private.json`, each absent or false = OFF, so
+**an installation that configures nothing behaves exactly as it did before**:
+
+| Key | With it ON |
+|---|---|
+| `lifecycle_authors` | the lifecycle action accepts `implemented`, `tested` and the task's `lifecycle-scope` only from the task's **assignee** or a listed operator, and `reviewed`, `integrated`, `deployed`, `live-verified`, `enabled`, `live` and a release deploy only from a **listed operator** |
+| `independent_approval` | `review approve` is refused when the approver is the **contribution's author** or the **task's assignee** (the same name-based comparison the follow-on gate uses: case-folded, a `/`-namespace suffix dropped) |
+| `coordinator_writes` | `review approve` and `coordination merge-acquire` (taking the merge slot) are refused unless the actor is on the operator allowlist, or belongs to the **same principal** as an actor on it (the project's session-registry `owners` map). Workers still contribute, respond, recommend and request changes |
+
+```sh
+python3 admin.py coordinator-rules status --actor OPERATOR
+python3 admin.py coordinator-rules on  --rule lifecycle_authors --actor OPERATOR
+python3 admin.py coordinator-rules off --rule coordinator_writes --actor OPERATOR
+python3 admin.py lifecycle-authors PROJECT          # read-only preview of part (a)
+```
+
+**Turn `lifecycle_authors` on from evidence, not from hope.** Read
+`admin.py lifecycle-authors PROJECT` first: it writes nothing, reads the project's own
+export with the reader every other lifecycle read uses, and prints, for every recorded
+trusted fact, the actor who recorded it and whether the rule would allow it
+(`counts.would_be_refused` and `counts.tasks_with_would_be_refused`; at most
+`task_limit` tasks are listed and `truncated` says when there are more). **While the
+setting is OFF the write is not refused**: the same write succeeds exactly as before and
+the refusal that would apply is reported as a `WARNING:` line on stderr (the decision on
+kittrial-5bb.106 asks for exactly this, so the warning and the report can be read before
+it is turned on). A fact that an unlisted actor recorded while the rule was off is not
+rewritten and still reads as recorded: nothing is migrated, and the rule applies to the
+next write.
+
+**The two approval rules refuse before any native write** and name the rule and the
+setting in the sentence, so nothing is recorded and the retry is the same operation. An
+already-approved record written by the author stays readable and still counts as an
+approval for the readers: nothing is migrated. `coordinator_writes` reads the project's
+session registry **only when it is on**; with it off no registry is read and no
+principal is consulted.
+
+**Where the rules are already enforced.** `independent_approval` and `coordinator_writes`
+are endpoint settings for the review write path (the host route). The web route has its
+own authority model and is unchanged ([WEB_COORDINATOR_DESIGN.md](WEB_COORDINATOR_DESIGN.md)).
+
+**Recovery.** A rule is turned off by the same command (`... off --rule NAME`), effective
+from the next request: the endpoint reads the file on every request. Removing the key
+altogether, or the whole setting, is the same as off. A value that is neither true nor
+false is read as OFF with a warning on stderr, as `review-writes` reads such a value for
+its own switch. The flips are audited under this installation's
+`coordinator_rules_audit` list in `deployment.private.json` (who, when, which rule, which
+action, the value replaced; the last 20 are kept), written under the same
+`.review-writes.lock` as the other deployment switches.
+
+**What is NOT here.** The rest of the design's rule 3 - that `reviewed` and `integrated`
+are refused unless a principal *other than* the contribution's author and assignee
+approved that contribution - is **not built**. `independent_approval` as shipped refuses
+only the self-approval (the author and the assignee). Do not read the setting as the whole
+of rule 3.
+
 ### sshd settings the boundary needs
 
 The forced command closes what the key can run; two sshd settings decide what the client can
@@ -551,6 +610,8 @@ history](#malformed-structured-history) (`void-record`).
 | `review-writes status\|on\|off --actor OPERATOR` | read or set the per-installation switch that allows **writing** the new review-workflow record shapes (`withdraw`, `request-review`, `resolve-item`, `decline-review`, an item `severity`, a request-changes `summary`). Readers in this kit understand those shapes either way; with the switch off (the default) a write of one is refused before any native write. See [Review-workflow write switch](#review-workflow-write-switch) | the deployment operator allowlist, checked before any write; `deployment.private.json` is the only source (there is no environment fallback) |
 | `checkpoint-provenance-writes status\|on\|off --actor OPERATOR` | read or set the per-installation switch that allows **writing** checkpoint provenance and direction dispositions (acknowledge, resolve, supersede). Readers in this kit understand them either way; with the switch off (the default) a checkpoint that asks for them is refused before any native write. See [Checkpoint provenance write switch](#checkpoint-provenance-write-switch) | the deployment operator allowlist, checked before any write; `deployment.private.json` is the only source |
 | `bound-keys-only status\|on\|off --actor OPERATOR [--file AUTHORIZED_KEYS]` | read or set the per-installation setting that **accepts bound keys only**: with it on, the forced command of an `authorized_keys` line refuses a line that names no project or no principal, and `setup-status` reports it. `status` and `on` report `would_be_refused` (the lines of this kit and this root the setting refuses, or would refuse while it is off), read from `--file` or `~/.ssh/authorized_keys`. Off is the default and the absent key, so an installation that configures nothing behaves as before. See [Accept bound keys only](#accept-bound-keys-only) | the deployment operator allowlist, checked before any write; `deployment.private.json` is the only source |
+| `coordinator-rules status\|on\|off [--rule lifecycle_authors\|independent_approval\|coordinator_writes] --actor OPERATOR` | read or set the three per-installation rules of the coordinators design, slices 6 and 7 (kittrial-5bb.197): who may record which lifecycle fact, that nobody passes their own work, and that approval and the merge slot belong to a listed actor of the project. `status` reports all three, or the one named by `--rule`. Off is the default and the absent key, so an installation that configures nothing behaves as before. `--rule` is required for `on`/`off`. See [The coordinator rules](#the-coordinator-rules-who-may-write-which-fact-and-who-may-approve) | the deployment operator allowlist, checked before any write; `deployment.private.json` is the only source (there is no environment fallback) |
+| `lifecycle-authors PROJECT [--limit N]` | read-only: for every recorded trusted lifecycle fact of the project, the actor who recorded it, whether the `lifecycle_authors` rule would allow it (`allowed`, `would_be_refused`, `reason`) and the totals (`counts.would_be_refused`), plus whether the setting is currently on. Run it **before** turning `lifecycle_authors` on. It writes nothing and takes no `--actor`: shell access to the service account is already authority over the installation. At most `--limit` tasks (default 200) are listed and `truncated` says when there are more | none: read-only |
 | `proposal-review PROJECT --actor OPERATOR --file review.json` | record a coordinator disposition on a requirement proposal. The payload is `{schema_version, operation_id, key, previous, proposal_sha256, to_state, ...}`: `previous` is the `disposition_comment_id` and `proposal_sha256` the `sha256` that `proposal get` returned, so a stale read is refused before any write. `to_state` is `under-review` (the claim), `rejected` (with `reason`), `duplicate-of` (with `duplicate_of`), `needs-info` (with `question`), `escalated-to-owner` (with `escalation: {question, owner_identity, due_by}`) or `incorporated` (with `incorporation`, checked against the requirement record) | the deployment operator allowlist, checked before any read; the actor must be mapped to a person and must not be the submitter |
 | `proposal-decide PROJECT --actor OPERATOR --file decision.json` | record the owner decision on an escalated proposal: `to_state` `approved` or `rejected` (with `reason`), and `decision: {decision_id}` naming an existing native decision issue. Never a requirement id | the allowlist; the decider must be a different person than the escalator and must not be the submitter |
 | `proposal-settings PROJECT --actor OPERATOR [--map-actor ACTOR --to IDENTITY] [--namespace NAME --to IDENTITY] [--unmap-actor ACTOR] [--unmap-namespace NAME] [--add-decider IDENTITY] [--remove-decider IDENTITY]` | with no change, print the contribution settings; otherwise write the next settings record, composed from the current one and bound to its hash | the allowlist |
@@ -657,7 +718,7 @@ operations the host carries, `retire` included, not the one this route does.
 **What stays with the installation operator.** `proposal-settings`, `capability-retire`,
 `capability-alias-propose`/`-reject`, `void-record`, `revert-record`, every `*-reconcile`,
 `anchor-release`, `remove-creation`, `retire-project`, the backups, the switch commands
-(`review-writes`, `checkpoint-provenance-writes`, `bound-keys-only`) and the operator and
+(`review-writes`, `checkpoint-provenance-writes`, `bound-keys-only`, `coordinator-rules`) and the operator and
 verifier list commands are **not** reachable through this surface, for anybody: they remain
 `admin.py` host commands.
 The action refuses any name it does not know and names the ones it does.

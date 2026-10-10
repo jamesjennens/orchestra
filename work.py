@@ -574,7 +574,12 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
             limit=a.capability_limit,offset=a.capability_offset)
     return result
 
-def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None,review_writes=None):
+def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None,review_writes=None,
+            independent_approval=False,coordinator_writes=False,owners=None):
+    """``independent_approval``, ``coordinator_writes`` and ``owners`` are the slices
+    6 and 7 settings and the project's actor -> principal map (kittrial-5bb.197),
+    supplied by the endpoint; all default OFF/absent, so nothing changes for an
+    installation that configures nothing."""
     # Help is recognised anywhere as a standalone token and never touches the
     # native export, the coordination lock or an attachment.
     if help_requested(args):
@@ -620,7 +625,8 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
         return recommend(rows,task,actor,payload,run,operators=operators,journal=path)
     from review_workflow import execute as review
     result=review(rows,task,actor,payload,run, operators=operators, journal=path,
-                  review_writes=review_writes)
+                  review_writes=review_writes, independent_approval=independent_approval,
+                  coordinator_writes=coordinator_writes, owners=owners)
     if payload.get('operation')=='request-changes':
         # Retry repairs a label update interrupted after the durable review comment.
         run(['update',task,'--remove-label','review-ready','--json'])
