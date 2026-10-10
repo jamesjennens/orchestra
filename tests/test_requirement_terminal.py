@@ -77,8 +77,9 @@ class TerminalTests(unittest.TestCase):
 
     def test_stale_self_draft_narrative_and_terminal_successors_refuse_without_effects(self):
         first = self.accepted(); second = self.accepted('second'); narrative = self.accepted('narrative','brd-section')
+        active = self.accepted('active-target')
         self.act(second, operation='withdraw-second')
-        for target in (first, second, narrative, dict(first,id='missing'), dict(second,sha256='0'*64)):
+        for target in (first, second, narrative, dict(first,id='missing'), dict(active,sha256='0'*64),dict(active,revision=1)):
             before = copy.deepcopy(self.native.rows); writes = len(self.native.writes())
             with self.assertRaises(ValueError):
                 self.act(first, 'supersede', 'bad-'+target['id'], successor={key:target[key] for key in ('id','revision','sha256')})
