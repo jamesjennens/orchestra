@@ -9,6 +9,49 @@ const displayText = (text) => String(text || '').replace(/[\u0000-\u0008\u000b\u
 const state = (record) => h('span', { class: 'chip ' + (record.acceptance_state === 'accepted' ? 'ok' : 'warn') },
   record.acceptance_state === 'accepted' ? 'Accepted' : 'Draft');
 const revision = (record) => `${record.acceptance_state === 'accepted' ? 'Accepted' : 'Draft'} revision ${record.revision}`;
+const active = (item) => !item.requirement_state || item.requirement_state === 'active';
+function terminalStatus(ctx, pid, item) {
+  if (active(item)) return null;
+  const successor = item.state?.superseded_by;
+  return h('section', { class: 'banner' }, h('strong', null,
+    item.requirement_state === 'unknown' ? 'Status unknown' : item.requirement_state === 'withdrawn' ? 'Withdrawn' : 'Superseded'),
+  h('p', null, item.state_message || displayText(item.reason?.reason)),
+  successor ? h('p', null, 'Replaced by ', h('a', { href: ctx.href(`/p/${pid}/requirements/${successor.id}`) }, successor.id),
+    ` · revision ${successor.revision}`, h('code', null, successor.sha256)) : null,
+  item.state ? h('p', { class: 'small' }, `Recorded by ${item.state.account_id} · ${item.state.at}`) : null);
+}
+
+function terminalForm(ctx, pid, item, candidates) {
+  const reason = h('textarea', { rows: 3, maxlength: 1000, required: true });
+  const target = h('select', null, h('option', { value: '' }, 'Withdraw without replacement'),
+    candidates.map((candidate, index) => h('option', { value: String(index + 1) },
+      `${displayText(candidate.current.title)} · ${candidate.id} · revision ${candidate.current.revision}`)));
+  const reference = h('p', { class: 'small' });
+  const confirm = h('input', { type: 'checkbox', required: true });
+  const button = h('button', { type: 'submit' }, 'Confirm withdrawal or supersession');
+  const message = h('p', { role: 'status' });
+  target.addEventListener('change', () => {
+    const candidate = candidates[Number(target.value) - 1];
+    reference.textContent = candidate ? `${candidate.id} · revision ${candidate.current.revision} · ${candidate.current.sha256}` : '';
+    confirm.checked = false;
+  });
+  return h('details', { class: 'panel' }, h('summary', null, 'Withdraw or supersede'),
+    h('form', { class: 'panel-body stack', onsubmit: async (event) => {
+      event.preventDefault(); if (button.disabled || !confirm.checked || !reason.value.trim()) return;
+      button.disabled = true;
+      const body = { ...expected(item.current), expected_state_sha256: item.state?.sha256 || null, reason: reason.value };
+      try {
+        const candidate = candidates[Number(target.value) - 1];
+        if (target.value && !candidate) throw new Error('Reload before selecting a replacement.');
+        if (candidate) await ctx.api.supersedeRequirement(pid, item.id, { ...body, successor: {
+          id: candidate.id, revision: candidate.current.revision, sha256: candidate.current.sha256 } });
+        else await ctx.api.withdrawRequirement(pid, item.id, body);
+        ctx.go(`/p/${pid}/requirements/${item.id}`);
+      } catch (error) { message.textContent = describe(error); button.disabled = false; }
+    } }, h('p', null, 'This cannot be undone in the browser. If this is a mistake, create a new requirement. The old wording and history remain available.'),
+    h('label', null, 'Replacement', target), reference, h('label', null, 'Reason', reason),
+    h('label', null, confirm, ' I understand this cannot be undone in the browser.'), button, message));
+}
 
 function editor(ctx, pid, item, parent, done) {
   const record = item?.current;
@@ -44,6 +87,7 @@ export async function brd(ctx, { pid }, project, data) {
     return h('section', { class: 'panel' },
     h('div', { class: 'panel-head' }, h('h2', { class: 'small' },
       h('a', { href: ctx.href(`/p/${pid}/requirements/${item.id}`) }, displayText(record.title))), state(record)),
+    terminalStatus(ctx, pid, item),
     h('p', { class: 'small panel-body' }, revision(record)),
     h('div', { class: 'panel-body', style: 'white-space:pre-wrap;unicode-bidi:plaintext' }, displayText(record.description)),
     item.accepted && item.pending_draft ? h('details', { class: 'panel-body' }, h('summary', null, `Pending edit · revision ${item.pending_draft.revision}`),
@@ -112,7 +156,10 @@ export async function brd(ctx, { pid }, project, data) {
   (data.governance.warnings || []).map((warning) => h('p', { class: 'banner', role: 'status' }, warning.message)),
   !simple ? h('p', { class: 'banner' }, 'This project uses governed requirements.') : null,
   data.items.filter((item) => item.kind === 'brd-section').map(card),
-  data.items.filter((item) => item.kind === 'requirement').map(card),
+  data.items.filter((item) => item.kind === 'requirement' && active(item)).map(card),
+  data.items.some((item) => item.kind === 'requirement' && !active(item)) ? h('section', { class: 'stack' },
+    h('h2', null, 'Withdrawn, superseded or unverified requirements'),
+    data.items.filter((item) => item.kind === 'requirement' && !active(item)).map(card)) : null,
   data.items.filter((item) => item.unreadable).map(card),
   !data.items.length ? h('p', null, 'No requirements yet.') : null, add, recovery,
   h('section', { class: 'panel' }, h('h2', null, 'Decisions'), (document.decisions || []).map((d) => h('p', null, `${displayText(d.title)} · revision ${d.revision}`))));
@@ -122,7 +169,16 @@ export async function requirement(ctx, { pid, rid }, project, data) {
   const record = data.current;
   const main = data.accepted || record;
   const message = h('p', { role: 'status' });
-  const accept = data.can_edit && data.governance.mode === 'simple' && record.acceptance_state !== 'accepted'
+  const editable = data.can_edit && data.governance.mode === 'simple' && active(data);
+  let terminal = null;
+  if (editable && data.kind === 'requirement' && record.acceptance_state === 'accepted' && !data.pending_draft) {
+    try {
+      const listing = await ctx.api.requirements(pid);
+      terminal = terminalForm(ctx, pid, data, listing.items.filter((item) => item.id !== rid && active(item)
+        && item.kind === 'requirement' && item.current?.acceptance_state === 'accepted' && !item.pending_draft));
+    } catch (error) { terminal = h('p', { role: 'status' }, 'Replacement choices could not be read. Reload before withdrawing or superseding.'); }
+  }
+  const accept = editable && record.acceptance_state !== 'accepted'
     ? h('button', { type: 'button', class: 'primary', onclick: async (event) => {
       const button = event.currentTarget || event.target; button.disabled = true;
       try { await ctx.api.acceptRequirement(pid, rid, expected(record)); ctx.go(`/p/${pid}/requirements/${rid}`); }
@@ -131,12 +187,19 @@ export async function requirement(ctx, { pid, rid }, project, data) {
   return h('div', { class: 'stack' }, pageHead({ title: displayText(main.title),
     crumbs: [{ label: 'Requirements', href: ctx.href(`/p/${pid}/requirements`) }] }),
   h('div', { class: 'actions' }, state(main), accept, message),
+  terminalStatus(ctx, pid, data),
   h('p', { class: 'small' }, revision(main)),
   h('div', { class: 'panel-body', style: 'white-space:pre-wrap;unicode-bidi:plaintext' }, displayText(main.description)),
   data.accepted && data.pending_draft ? h('h2', null, `Pending edit · revision ${record.revision}`) : null,
-  data.can_edit && data.governance.mode === 'simple'
+  editable
     ? editor(ctx, pid, data, null, async () => ctx.go(`/p/${pid}/requirements/${rid}`))
     : data.accepted && data.pending_draft ? h('section', null,
       h('h3', null, displayText(record.title)),
-      h('div', { class: 'panel-body', style: 'white-space:pre-wrap;unicode-bidi:plaintext' }, displayText(record.description))) : null);
+      h('div', { class: 'panel-body', style: 'white-space:pre-wrap;unicode-bidi:plaintext' }, displayText(record.description))) : null,
+  terminal,
+  h('details', null, h('summary', null, 'Revision history'), (data.history || []).map((entry) => h('section', null,
+    h('h3', null, revision(entry)), h('p', null, displayText(entry.title)),
+    h('p', { style: 'white-space:pre-wrap;unicode-bidi:plaintext' }, displayText(entry.description))))),
+  (data.supersedes || []).length ? h('p', null, 'Supersedes ', data.supersedes.map((old) =>
+    h('a', { href: ctx.href(`/p/${pid}/requirements/${old.id}`) }, `${old.id} · revision ${old.revision}`))) : null);
 }

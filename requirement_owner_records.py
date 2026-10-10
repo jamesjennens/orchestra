@@ -13,6 +13,7 @@ from requirement_governance import digest, project_name
 
 ACCEPTANCE_PREFIX = 'Kind: requirement-owner-acceptance-v1\n'
 STATE_PREFIX = 'Kind: requirement-owner-state-v1\n'
+REASON_PREFIX = 'Kind: requirement-owner-state-reason-v1\n'
 HUMAN = re.compile(r'usr_[0-9a-f]{16}\Z')
 ACCEPTANCE_FIELDS = {'schema_version', 'project', 'id', 'revision', 'record_sha256',
                      'account_id', 'at', 'operation_id', 'governance', 'decision',
@@ -124,3 +125,99 @@ def existing_acceptances(row):
         return True
     return existing_ledger(row, ACCEPTANCE_PREFIX, parse, 'requirement',
                            'owner acceptance', 'revision', keep=author_bound)
+
+
+REASON_FIELDS = {'schema_version', 'project', 'id', 'state_sha256', 'account_id',
+                 'at', 'operation_id', 'reason', 'sha256'}
+TERMINAL_LABELS = {'requirement:withdrawn', 'requirement:superseded'}
+
+
+def validate_reason(record):
+    if (not isinstance(record, dict) or set(record) != REASON_FIELDS
+            or type(record['schema_version']) is not int or record['schema_version'] != 1):
+        raise ValueError('Invalid owner requirement state reason fields')
+    project_name(record['project']); identifier(record['id']); identifier(record['operation_id'])
+    digest(record['state_sha256']); digest(record['sha256'])
+    if not isinstance(record['account_id'], str) or not HUMAN.fullmatch(record['account_id']):
+        raise ValueError('State reason needs a human account')
+    if not isinstance(record['at'], str) or not record['at'].strip():
+        raise ValueError('State reason needs a timestamp')
+    if (not isinstance(record['reason'], str) or not 1 <= len(record['reason'].strip()) <= 1000
+            or '\0' in record['reason']):
+        raise ValueError('State reason must contain 1 to 1000 characters')
+    if content_hash(record) != record['sha256']:
+        raise ValueError('Owner requirement state reason hash mismatch')
+    return record
+
+
+def reason_body(record):
+    return REASON_PREFIX + canonical_bytes(validate_reason(record)).decode('utf-8')
+
+
+def parse_reason(text):
+    if not isinstance(text, str) or not text.startswith(REASON_PREFIX):
+        return None
+    try:
+        from export_requirements import parse_json
+        record = validate_reason(parse_json(text[len(REASON_PREFIX):]))
+        return record if reason_body(record) == text else None
+    except (ValueError, TypeError, KeyError, UnicodeError):
+        return None
+
+
+def terminal_evidence(project, record, account, operation, mode, state, successor, reason, at):
+    evidence = dict(schema_version=1, project=project, id=record['id'], revision=record['revision'],
+                    record_sha256=record['sha256'], previous_state_sha256=None, state=state,
+                    superseded_by=successor, account_id=account, at=at,
+                    operation_id=operation, governance=dict(mode))
+    evidence['sha256'] = content_hash(evidence); validate(evidence, state=True)
+    explanation = dict(schema_version=1, project=project, id=record['id'],
+                       state_sha256=evidence['sha256'], account_id=account, at=at,
+                       operation_id=operation, reason=reason)
+    explanation['sha256'] = content_hash(explanation); validate_reason(explanation)
+    return evidence, explanation
+
+
+def state_ledger(row, allow_partial=False):
+    """Immutable terminal evidence; labels cannot manufacture or undo a state.
+
+    A missing reason is an interrupted transition, never an active requirement.
+    Only the writer recovering its exact receipt may inspect that partial pair.
+    """
+    from keyed_records import existing_ledger
+    from requirement_records import existing_revisions
+    from reserved_comments import _reserved_prefix_view
+    for comment in row.get('comments') or []:
+        text = comment.get('text', '') if isinstance(comment, dict) else ''
+        view = _reserved_prefix_view(text) if isinstance(text, str) else ''
+        if view.startswith(('Kind: requirement-owner-state-', 'Kind: requirement-owner-state-v')):
+            if view != text or not text.startswith((STATE_PREFIX, REASON_PREFIX)):
+                raise ValueError('Malformed or unsupported owner terminal evidence')
+    def author_bound(comment, record):
+        if comment.get('author') != record['account_id']:
+            raise ValueError('Owner state native author does not match the human account')
+        return True
+    states = existing_ledger(row, STATE_PREFIX, lambda text: parse(text, state=True),
+                             'requirement', 'owner state', 'sha256', keep=author_bound)
+    reasons = existing_ledger(row, REASON_PREFIX, parse_reason, 'requirement',
+                              'owner state reason', 'state_sha256', keep=author_bound)
+    if len(states) > 1 or set(reasons) - set(states):
+        raise ValueError('Conflicting owner requirement terminal evidence')
+    if not states:
+        if TERMINAL_LABELS.intersection(row.get('labels') or []):
+            raise ValueError('Terminal requirement label has no validated state evidence')
+        return None, None
+    evidence = next(iter(states.values()))
+    revisions = existing_revisions(row)
+    record = revisions.get(evidence['revision'])
+    if (record is None or record['sha256'] != evidence['record_sha256']
+            or record['acceptance_state'] != 'accepted'
+            or max(revisions) != evidence['revision'] or evidence['previous_state_sha256'] is not None):
+        raise ValueError('Terminal state must bind the unchanged latest accepted revision')
+    reason = reasons.get(evidence['sha256'])
+    if reason is None:
+        if not allow_partial:
+            raise ValueError('Requirement terminal transition is incomplete; retry its original request')
+    elif (any(reason[key] != evidence[key] for key in ('project', 'id', 'account_id', 'at', 'operation_id'))):
+        raise ValueError('Requirement state reason conflicts with its state evidence')
+    return evidence, reason
