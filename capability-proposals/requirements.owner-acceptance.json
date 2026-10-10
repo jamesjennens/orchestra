@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "operation_id": "caprev-2a0f9b1eda524d64a6e44311f0d09851",
+  "operation_id": "caprev-c15a87bf286b49ee908ed228b290347f",
   "key": "requirements.owner-acceptance",
   "name": "Human owner acceptance binds exact content and supports account-bound replay",
   "aliases": [
@@ -10,7 +10,7 @@
     "same owner new session retry",
     "immutable requirement decision"
   ],
-  "summary": "A signed-in project owner accepts exact current content in simple mode without host operator membership. A generated native decision binds immutable account/project/governance evidence and an accepted revision. Account-bound request replay returns the original result and server time without another effect, after rechecking current authority and membership; changed content refuses. Raw owner evidence remains reserved; governed mode and machine credentials gain no owner acceptance authority. Interrupted acceptance persists a validated optional owner_decision receipt binding after the native ID is confirmed and before evidence. Recovery uses that ID, never mutable discovery metadata. Missing or unreadable bound decisions and unbound legacy or lost-ID operations remain unknown. The owner may reload and accept with a fresh key, or edit a readable legacy draft and accept its new revision, without finishing the old operation. Backup/restore preserves bindings.",
+  "summary": "A signed-in project owner accepts exact current requirements content in simple mode without operator membership. Native decisions bind account/project/governance, revision and content hash; replay rechecks live authority. Confirmed decision bindings survive interrupted evidence writes; missing bindings remain unknown and cannot fabricate success. The page offers reload and Accept, or edit a legacy draft and accept its new revision. Validated native attribution for the current pending wording appears beside Accept, including after a governance mode switch; actor spelling does not establish account identity. Returned acceptance evidence names the accepted revision and hash even after a later draft. Raw evidence is reserved; governed and machine credential policies remain unchanged. Backup/restore retains bindings.",
   "requirements": [],
   "anchors": [
     "docs/REQUIREMENTS.md#editing-a-projects-requirements-in-the-web-interface"
@@ -23,7 +23,8 @@
   "tests": [
     "tests/test_http_requirements_owner.py",
     "tests/test_requirement_owner_records.py",
-    "tests/test_requirement_owner_real_bd.py"
+    "tests/test_requirement_owner_real_bd.py",
+    "tests/test_owner_recovery_second.py"
   ],
   "owner": "person:orchestra-coordinator",
   "tags": [
@@ -31,6 +32,6 @@
     "acceptance",
     "replay"
   ],
-  "revision": 3,
-  "expected_sha256": "550092b2209c0ec4847456d382473fc39ffd02ca4d01972c3767f552758d9f56"
+  "revision": 5,
+  "expected_sha256": "93e75bf2a9857f333a952372138d14fdd1fcb957833812376c842dbd652a565e"
 }

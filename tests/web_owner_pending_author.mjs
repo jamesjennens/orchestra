@@ -1,0 +1,13 @@
+import './web_dom_shim.mjs';
+import assert from 'node:assert/strict';
+const [url, raw] = process.argv.slice(2);
+const { requirement } = await import(url);
+const data = JSON.parse(raw);
+const ctx = { href: p => '#' + p, api: {}, setDirty() {}, go() {} };
+const page = await requirement(ctx, { pid: 'alpha', rid: data.id }, {}, data);
+const button = page.querySelectorAll('button').find(b => b.textContent === 'Accept draft');
+assert.ok(button, page.textContent);
+assert.ok(button.parentNode.textContent.includes('Pending wording author: <contributor>[U+202E]usr_aaaaaaaaaaaaaaaa'));
+assert.equal(page.querySelectorAll('contributor').length, 0);
+assert.ok(!page.textContent.includes('\u202e'));
+console.log('Pending author is escaped, bounded native attribution next to Accept.');

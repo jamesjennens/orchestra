@@ -36,7 +36,7 @@ a project; use the [requirements snapshot command](REQUIREMENTS.md) for offline
 owner-evidence export. Operator requirement-apply/backfill authority remains
 unchanged in both modes.
 
-**Rollback and restore of simple requirements.** The release before slice A can restore
+**Rollback and restore of simple requirements.** A release predating owner requirements editing can restore
 a backup of a project that has never had these sidecars. It refuses a backup
 containing `.requirements-governance.json`, `.requirement-owner-requests/` or
 `.requirements-governance-source.json` with `Invalid coordination backup path`.
@@ -46,7 +46,7 @@ owner-accepted requirements cannot be read because their governance history is
 missing. Keep the current kit's complete backup when rolling back; an older
 kit's successful backup does not preserve owner requirement authority.
 The optional `owner_decision` binding in an existing owner request receipt does
-not change this restore limit for the release before slice A. Current backups preserve
+not change this restore limit for a release predating owner requirements editing. Current backups preserve
 and validate the binding. An interrupted acceptance without a binding keeps the
 old operation unknown; the owner reloads the requirement and accepts again with a
 new request key. For a legacy interrupted acceptance with a readable draft, the owner edits that

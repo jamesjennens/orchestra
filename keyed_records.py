@@ -86,6 +86,9 @@ class RecordSpec:
         # Optional adapter recovery fields survive both pending and complete
         # writes. The adapter validates them; ordinary record receipts are unchanged.
         self.receipt_metadata = values.pop('receipt_metadata', lambda receipt: {})
+        # Service adapters can require bounded regular-file receipt reads;
+        # ordinary host record adapters retain their existing reader.
+        self.read_receipt = values.pop('read_receipt', load_json)
         missing = [name for name in self.VALUES + self.HOOKS if name not in values]
         extra = sorted(set(values) - set(self.VALUES + self.HOOKS))
         if missing or extra:
@@ -416,7 +419,7 @@ def apply_native(payload, actor, run, project, spec, operator=False, operators=N
     digest = content_hash({'actor': actor, 'payload': payload})
     journal = journal_dir(project, spec.journal)
     receipt = receipt_path(journal, identity, spec.noun)
-    prior = load_json(receipt) if receipt.exists() else None
+    prior = spec.read_receipt(receipt) if receipt.exists() else None
     state = prior_state(prior, digest, actor)
     reusable = state == 'reusable'
     reconciled = state == 'same'
@@ -455,7 +458,8 @@ def apply_native(payload, actor, run, project, spec, operator=False, operators=N
             # reserves nothing and cannot burn the ID.
             run(args + ['--dry-run'])
             atomic(receipt, {'sha256': digest, 'status': 'pending', 'actor': actor,
-                             'operation': payload['operation'], 'revision': revision})
+                             'operation': payload['operation'], 'revision': revision,
+                             **spec.receipt_metadata(prior)})
             try:
                 raw = run(args)
             except (ValueError, OSError) as refusal:
@@ -469,7 +473,8 @@ def apply_native(payload, actor, run, project, spec, operator=False, operators=N
             task = issue['id']
             created = True
             atomic(receipt, {'sha256': digest, 'status': 'pending', 'actor': actor, 'id': task,
-                             'created': True, 'operation': payload['operation'], 'revision': revision})
+                             'created': True, 'operation': payload['operation'], 'revision': revision,
+                             **spec.receipt_metadata(spec.read_receipt(receipt))})
             spec.after_create(run, task)
             rows = spec.read_created(run, task, payload)
     row = find(rows, task)
@@ -523,7 +528,7 @@ def apply_native(payload, actor, run, project, spec, operator=False, operators=N
         # so every refusal above reserves nothing.
         atomic(receipt, {'sha256': digest, 'status': 'pending', 'actor': actor, 'id': task,
                          'created': created, 'operation': payload['operation'], 'revision': revision,
-                         **spec.receipt_metadata(prior)})
+                         **spec.receipt_metadata(spec.read_receipt(receipt) if created else prior)})
     # A crash between creating an anchor and its first record leaves an ordinary
     # row; the same operation's retry reaches this point and finishes it.
     spec.prepare_row(run, row)
@@ -554,7 +559,7 @@ def apply_native(payload, actor, run, project, spec, operator=False, operators=N
     if bound is not None:
         complete['acceptance'] = bound
         complete['acceptance_record'] = True
-    complete.update(spec.receipt_metadata(load_json(receipt)))
+    complete.update(spec.receipt_metadata(spec.read_receipt(receipt)))
     atomic(receipt, complete)
     return spec.result(payload, task, revision, record, created, reconciled, bound, comment_id)
 
@@ -600,7 +605,7 @@ def reconcile(project, operation_id, actor, reason, disposition, run, spec, issu
     receipt = receipt_path(journal, identity, noun)
     if not receipt.exists():
         raise ValueError('No %s operation receipt exists for that operation ID' % noun)
-    prior = load_json(receipt)
+    prior = spec.read_receipt(receipt)
     if not isinstance(prior, dict) or not isinstance(prior.get('status'), str):
         raise ValueError('Malformed %s receipt; inspect before reconciling' % noun)
     at = now()

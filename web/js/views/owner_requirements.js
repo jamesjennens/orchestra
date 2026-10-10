@@ -89,7 +89,9 @@ export async function brd(ctx, { pid }, project, data) {
         h('p', { class: 'small' }, `${failed.listed ?? failed.items.length} of ${failed.total ?? failed.items.length} failed creations listed.`),
         failed.items.map((item) => {
           const message = h('p', { role: 'status' }, item.message || 'No requirement was written.');
-          if (!item.can_clear) return message;
+          const metadata = h('div', null, item.title ? h('h3', null, displayText(item.title)) : null,
+            item.at ? h('p', { class: 'small' }, `Creation attempted at ${displayText(item.at)}`) : null);
+          if (!item.can_clear) return h('div', null, metadata, message);
           const reason = h('input', { maxlength: 1000, required: true, value: item.reason || '' });
           const button = h('button', { type: 'submit' }, 'Clear failed creation');
           return h('form', { class: 'stack', onsubmit: async (event) => {
@@ -99,7 +101,7 @@ export async function brd(ctx, { pid }, project, data) {
                 expected_receipt_sha256: item.expected_receipt_sha256, reason: reason.value });
               ctx.go(`/p/${pid}/requirements`);
           } catch (error) { message.textContent = describe(error); button.disabled = false; }
-        } }, h('label', null, 'Why clear this failed creation?', reason), button, message);
+        } }, metadata, h('label', null, 'Why clear this failed creation?', reason), button, message);
       }), failed.truncated ? h('p', null, 'More failed creations remain. Refresh after clearing these.') : null) : null;
     } catch (error) {
       recovery = h('section', { class: 'panel' }, h('h2', null, 'Failed creations'),
@@ -122,6 +124,9 @@ export async function requirement(ctx, { pid, rid }, project, data) {
   const record = data.current;
   const main = data.accepted || record;
   const message = h('p', { role: 'status' });
+  const author = data.pending_draft ? h('span', { class: 'small' },
+    data.pending_author ? `Pending wording author: ${displayText(data.pending_author.text)}${data.pending_author.omitted_chars ? '…' : ''}`
+      : 'Pending wording author could not be confirmed.') : null;
   const accept = data.can_edit && data.governance.mode === 'simple' && record.acceptance_state !== 'accepted'
     ? h('button', { type: 'button', class: 'primary', onclick: async (event) => {
       const button = event.currentTarget || event.target; button.disabled = true;
@@ -130,7 +135,7 @@ export async function requirement(ctx, { pid, rid }, project, data) {
     } }, data.accepted && data.pending_draft ? 'Accept pending edit' : 'Accept draft') : null;
   return h('div', { class: 'stack' }, pageHead({ title: displayText(main.title),
     crumbs: [{ label: 'Requirements', href: ctx.href(`/p/${pid}/requirements`) }] }),
-  h('div', { class: 'actions' }, state(main), accept, message),
+  h('div', { class: 'actions' }, state(main), author, accept, message),
   h('p', { class: 'small' }, revision(main)),
   h('div', { class: 'panel-body', style: 'white-space:pre-wrap;unicode-bidi:plaintext' }, displayText(main.description)),
   data.accepted && data.pending_draft ? h('h2', null, `Pending edit · revision ${record.revision}`) : null,
