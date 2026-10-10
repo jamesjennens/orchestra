@@ -113,6 +113,10 @@ LOCALE_PREFIX = 'LC_'
 # pinned against the host reader by tests/test_bound_keys_only.py.
 SETTINGS_FILE = 'deployment.private.json'
 BOUND_KEYS_ONLY = 'bound_keys_only'
+# The most of the settings file the wrapper reads. The file is the operator's, but it is read on
+# EVERY connection; a huge one (kittrial-5bb.196 review: a 50 MB file cost 115 MB of memory) must
+# not be read whole. admin.py's reader of the same setting uses the same bound, pinned by a test.
+SETTINGS_MAX_BYTES = 1024 * 1024
 
 
 def default_endpoint():
@@ -251,6 +255,11 @@ def bound_keys_only(root):
     JSON object - is refused instead: the wrapper cannot tell whether the setting is on, and
     reading that as OFF would silently drop the installation's rule. The operator's own
     unrestricted key does not run this wrapper, so this can never lock an operator out.
+
+    Everything this function says to the CONNECTING contributor names "the installation setting"
+    and neither the settings file's server path nor the value it found: stderr here reaches the
+    remote caller, and the path names the deployment and the value is echoed back to them
+    (kittrial-5bb.196 review, finding 13). The operator's own host commands keep both.
     """
     marker = posixpath.join(root, SETTINGS_FILE)
     try:
@@ -258,26 +267,39 @@ def bound_keys_only(root):
     except FileNotFoundError:
         return False
     except OSError as error:
-        raise ValueError('cannot read the installation setting %s: %s' % (marker, error)) from None
+        raise ValueError('cannot read the installation setting: %s'
+                         % (getattr(error, 'strerror', None) or error)) from None
     if not stat.S_ISREG(mode):
-        raise ValueError('the installation setting %s is not a regular file' % marker)
+        raise ValueError('the installation setting is not a regular file')
     try:
-        document = json.loads(Path(marker).read_text(encoding='utf-8'))
-    except (OSError, UnicodeError) as error:
-        raise ValueError('cannot read the installation setting %s: %s' % (marker, error)) from None
+        with open(marker, 'rb') as handle:
+            raw = handle.read(SETTINGS_MAX_BYTES + 1)
+    except OSError as error:
+        raise ValueError('cannot read the installation setting: %s'
+                         % (getattr(error, 'strerror', None) or error)) from None
+    if len(raw) > SETTINGS_MAX_BYTES:
+        raise ValueError('the installation setting is larger than the %d bytes this wrapper reads; '
+                         'an operator must correct it' % SETTINGS_MAX_BYTES)
+    try:
+        document = json.loads(raw.decode('utf-8'))
+    except UnicodeError:
+        raise ValueError('the installation setting is not readable text') from None
     except RecursionError:
-        raise ValueError('the installation setting %s nests too deeply to read' % marker) from None
+        raise ValueError('the installation setting nests too deeply to read') from None
     except ValueError:
-        raise ValueError('the installation setting %s is not valid JSON' % marker) from None
+        raise ValueError('the installation setting is not valid JSON') from None
     if not isinstance(document, dict):
-        raise ValueError('the installation setting %s is not a JSON object' % marker)
+        raise ValueError('the installation setting is not a JSON object')
     value = document.get(BOUND_KEYS_ONLY)
     if isinstance(value, bool):
         return value
     if value is not None:
-        sys.stderr.write('%sWARNING: deployment %s is %s, not true or false, so this installation is '
-                         'NOT refusing a line without a project or a principal; correct the value in %s\n'
-                         % (REFUSAL, BOUND_KEYS_ONLY, _echo(value), marker))
+        # Flushed before os.execvpe replaces this process: on Python 3.6 to 3.8 stderr to a pipe
+        # is block-buffered and the warning would never arrive (kittrial-5bb.196 review, finding 1).
+        sys.stderr.write('%sWARNING: the installation setting for bound keys only is not true or false, '
+                         'so this installation is NOT refusing a line without a project or a principal; '
+                         'an operator must correct it\n' % REFUSAL)
+        sys.stderr.flush()
     return False
 
 
@@ -314,6 +336,9 @@ def endpoint_argv(python, endpoint, root, projects=(), principal=None):
 
 def refuse(reason):
     sys.stderr.write(REFUSAL + reason + '\n')
+    # Flushed here too, so no refusal depends on CPython's exit-time flush and a refusal is
+    # complete before any later exec (kittrial-5bb.196 review, finding 1).
+    sys.stderr.flush()
     return EXIT_REFUSED
 
 

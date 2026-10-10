@@ -679,6 +679,14 @@ def review_workflow_writes(root, strict=False, warnings=None):
 #: docs/COORDINATORS_PER_PROJECT_DESIGN.md).
 BOUND_KEYS_ONLY_KEY='bound_keys_only'
 BOUND_KEYS_ONLY_AUDIT_KEY='bound_keys_only_audit'
+#: The most of `deployment.private.json` the bound-keys-only reader reads, the same bound the
+#: forced command uses (kittrial-5bb.196 review, item 4a). The file is the operator's, but every
+#: connection reads it, so a huge one must not be read whole.
+BOUND_KEYS_ONLY_MAX_BYTES=1024*1024
+#: The audit list keeps the last N flips, as `review-writes` keeps `REVIEW_WRITES_AUDIT_MAX`
+#: (kittrial-5bb.196 review, item 4b): an unbounded list grew to 101 KB after 1,001 flips and
+#: `status` printed all of it. `status` reports the cap.
+BOUND_KEYS_ONLY_AUDIT_MAX=20
 
 def bound_keys_only(root, warnings=None):
     """The per-installation setting that accepts bound keys only (kittrial-5bb.196, slice 4).
@@ -691,6 +699,13 @@ def bound_keys_only(root, warnings=None):
     read as the deployment configuration raises :class:`ConfigurationUnreadable`, as it does
     for every other reader of that file.
 
+    A path that is there but is not a regular file - a directory, a fifo, a symlink loop, a
+    symlink to a non-regular file - or that cannot be stat'd also raises, so `setup-status` says
+    UNKNOWN with its reason instead of reading OFF while the forced command refuses every key
+    (kittrial-5bb.196 review, item 2c). A missing file (or a dangling symlink) stays OFF, which
+    is what the wrapper reads too. The reader reads at most `BOUND_KEYS_ONLY_MAX_BYTES` and
+    refuses a larger file (item 4a).
+
     The setting is ENFORCED by `ssh_forced_command.py`: with it on, the forced command of an
     authorized_keys line refuses a line that names no project or no principal. The wrapper
     cannot import this module (it must start on any interpreter the account has) and has its
@@ -698,18 +713,34 @@ def bound_keys_only(root, warnings=None):
     """
     enabled=False
     marker=root/'deployment.private.json'
-    if marker.is_file():
-        value=deployment_document(marker).get(BOUND_KEYS_ONLY_KEY)
-        if isinstance(value,bool):
-            enabled=value
-        elif value is not None:
-            message=('deployment %s is %r, not true or false; reading it as off (the forced command '
-                     'does NOT refuse a line without a project or a principal)'
-                     %(BOUND_KEYS_ONLY_KEY,value))
-            if warnings is not None:
-                warnings.append('WARNING: '+message)
-            else:
-                print('WARNING: '+message,file=sys.stderr)
+    try:
+        info=os.stat(str(marker))
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        raise ConfigurationUnreadable('Deployment configuration %s cannot be read: %s'
+                                      %(marker,error.strerror or error)) from None
+    if not stat.S_ISREG(info.st_mode):
+        raise ConfigurationUnreadable('Deployment configuration %s is not a regular file'%marker)
+    if info.st_size>BOUND_KEYS_ONLY_MAX_BYTES:
+        raise ConfigurationUnreadable('Deployment configuration %s is larger than the %d bytes the '
+                                      'bound-keys-only setting reads'
+                                      %(marker,BOUND_KEYS_ONLY_MAX_BYTES))
+    try:
+        document=deployment_document(marker)
+    except RecursionError:
+        raise ConfigurationUnreadable('Deployment configuration %s nests too deeply to read'%marker) from None
+    value=document.get(BOUND_KEYS_ONLY_KEY)
+    if isinstance(value,bool):
+        enabled=value
+    elif value is not None:
+        message=('deployment %s is %r, not true or false; reading it as off (the forced command '
+                 'does NOT refuse a line without a project or a principal)'
+                 %(BOUND_KEYS_ONLY_KEY,value))
+        if warnings is not None:
+            warnings.append('WARNING: '+message)
+        else:
+            print('WARNING: '+message,file=sys.stderr)
     return enabled
 
 #: What `setup-status` says about that setting (kittrial-5bb.196). The setting belongs to the
@@ -1140,7 +1171,7 @@ def bound_keys_only_audit(cfg):
     return value,None
 
 
-def bound_keys_only_switch(root,action,actor):
+def bound_keys_only_switch(root,action,actor,file=None):
     """Read or flip ``bound_keys_only`` with its operator audit (kittrial-5bb.196, slice 4).
 
     The actor must be on the deployment operator allowlist, as for the two rollout switches: a
@@ -1150,6 +1181,14 @@ def bound_keys_only_switch(root,action,actor):
     nothing, and keeps a damaged audit list aside as
     ``bound_keys_only_audit_damaged_<UTC stamp>`` before it starts a fresh one, exactly as
     ``checkpoint-provenance-writes`` does.
+
+    ``status`` reports ``audit_agrees``: whether the value and the last recorded flip agree, the
+    comparison ``review-writes`` makes (item 2b). ``off`` on a value that is not a bool is a real
+    flip that writes false, not a no-op that leaves the bad value in the file (item 2d). Both
+    ``status`` and a flip to ``on`` report ``would_be_refused``: the lines of this kit and this
+    root that the setting refuses (or would refuse while it is off), read from ``file`` or
+    ``~/.ssh/authorized_keys`` (item 4c). The audit list keeps the last
+    ``BOUND_KEYS_ONLY_AUDIT_MAX`` flips (item 4b).
     """
     marker=root/'deployment.private.json'
     if not marker.is_file():raise ValueError('Deployment is not installed; run install first')
@@ -1161,21 +1200,39 @@ def bound_keys_only_switch(root,action,actor):
     if action=='status':
         current=bound_keys_only(root)
         audit,damage=bound_keys_only_audit(config(root))
+        last=audit[-1] if audit else None
+        # The switch and its audit are written together by a flip, so they disagree only when
+        # something else changed one of them: an older kit or a hand edit. A damaged audit is a
+        # disagreement too, not "no history, everything agrees" (the review-writes rule).
+        agrees=damage is None and (last is None or last['enabled']==current)
+        if last is not None and not agrees:
+            print('WARNING: deployment %s is %s but the recorded audit history last says %s (set by %s at '
+                  '%s); the setting was changed without recording it here (an older kit or a hand edit), so '
+                  'the audit is stale'
+                  %(BOUND_KEYS_ONLY_KEY,'on' if current else 'off','on' if last['enabled'] else 'off',
+                    last['actor'],last['at']),file=sys.stderr)
         if damage is not None:
             print('WARNING: the bound-keys-only switch audit is damaged (%s); it reads as an empty history. '
                   'The next on/off keeps it aside in deployment.private.json under %s_damaged_<UTC stamp> and '
                   'starts a fresh list.'%(damage,BOUND_KEYS_ONLY_AUDIT_KEY),file=sys.stderr)
-        return dict(bound_keys_only=current,audit=audit[-1] if audit else None,audit_history=audit,
-                    audit_records=len(audit),audit_readable=damage is None,changed=False)
+        return dict(bound_keys_only=current,audit=last,audit_history=audit,audit_records=len(audit),
+                    audit_readable=damage is None,audit_agrees=agrees,audit_max=BOUND_KEYS_ONLY_AUDIT_MAX,
+                    would_be_refused=bound_keys_only_would_refuse(root,file),changed=False)
     enabled=action=='on'
     with review_writes_lock(root):
-        current=bound_keys_only(root)
         cfg=config(root)
+        current=bound_keys_only(root)
         audit,damage=bound_keys_only_audit(cfg)
-        if enabled==current:
+        # `off` must also be a real flip when the file holds a value that is not a bool: reading it
+        # as off makes `on`==`off` a no-op that leaves the bad value and its warning in place.
+        stale_value=BOUND_KEYS_ONLY_KEY in cfg and not isinstance(cfg.get(BOUND_KEYS_ONLY_KEY),bool)
+        if enabled==current and not (not enabled and stale_value):
             # A flip that changes nothing writes nothing: the history records changes, and a
-            # repeated `on` cannot rewrite the file or set a damaged audit aside.
+            # repeated `on` cannot rewrite the file or set a damaged audit aside. The report still
+            # tells the truth about whether the value and the last recorded flip agree.
+            last=audit[-1] if audit else None
             return dict(bound_keys_only=current,audit_records=len(audit),audit_readable=damage is None,
+                        audit_agrees=damage is None and (last is None or last['enabled']==current),
                         changed=False)
         if damage is not None:
             kept='%s_damaged_%s'%(BOUND_KEYS_ONLY_AUDIT_KEY,utc_stamp().replace(':','').replace('-',''))
@@ -1189,10 +1246,21 @@ def bound_keys_only_switch(root,action,actor):
         # it back off read identically (the rule `review-writes` follows).
         if enabled:cfg[BOUND_KEYS_ONLY_KEY]=True
         else:cfg.pop(BOUND_KEYS_ONLY_KEY,None)
-        cfg[BOUND_KEYS_ONLY_AUDIT_KEY]=audit+[dict(actor=actor,at=utc_stamp(),action=action,
-                                                   previous=current,enabled=enabled)]
+        cfg[BOUND_KEYS_ONLY_AUDIT_KEY]=(audit+[dict(actor=actor,at=utc_stamp(),action=action,
+                                                    previous=current,enabled=enabled)])[-BOUND_KEYS_ONLY_AUDIT_MAX:]
         atomic_private_write(marker,json.dumps(cfg))
-    return dict(bound_keys_only=enabled,audit_records=len(audit)+1,audit_readable=True,changed=True)
+        records=len(cfg[BOUND_KEYS_ONLY_AUDIT_KEY])
+    result=dict(bound_keys_only=enabled,audit_records=records,audit_readable=True,
+                audit_agrees=True,changed=True)
+    if enabled:
+        preview=bound_keys_only_would_refuse(root,file)
+        result['would_be_refused']=preview
+        if preview:
+            print('WARNING: turning this setting on now refuses %d authorized_keys line(s) of this kit and this '
+                  'root: %s. Print each such line again with `admin.py authorized-keys --project ... '
+                  '--principal ...` and replace it.'
+                  %(len(preview),', '.join(str(number) for number in preview)),file=sys.stderr)
+    return result
 
 
 def stored_operators(cfg):
@@ -2323,7 +2391,9 @@ def project_setup_status(root,name,path=None):
         enabled=bound_keys_only(root)
         result['bound_keys_only']={'enabled':enabled,
                                    'detail':BOUND_KEYS_ONLY_DETAIL_ON if enabled else BOUND_KEYS_ONLY_DETAIL_OFF}
-    except (OSError,ValueError):
+    except (OSError,ValueError,RecursionError):
+        # A deeply nested file must say unknown with a reason, not raise here (kittrial-5bb.196
+        # review, item 3). RecursionError is not a ValueError.
         result['bound_keys_only']={'enabled':None,'detail':BOUND_KEYS_ONLY_DETAIL_UNKNOWN}
     # How full the server is (kittrial-5bb.118 part 2 revision): every project database on it
     # counts, and every bd write gets slower as they grow. The web service shows it to a
@@ -5260,10 +5330,19 @@ def authorized_keys_listing(root,file=None):
     # unrestricted key or another program does not run the wrapper and is not flagged for this.
     # A settings file that cannot be read says `unknown` (None) instead of failing this read.
     try:setting=bound_keys_only(root)
-    except (OSError,ValueError):setting=None
-    refused=[entry['line'] for entry in lines
-             if setting and entry.get('kind') in ('bound','confined')
-             and (not entry.get('projects') or not entry.get('principal'))]
+    except (OSError,ValueError,RecursionError):setting=None
+    # Only lines of THIS kit and THIS root can be refused by this setting. A line of another kit
+    # is served by the wrapper it names, which does not know the setting; a line of another root
+    # is decided by that root's own file. The review (item 2a) found the old list counted them as
+    # "refused" although they were served; they are reported as lines this setting does not reach.
+    def _unbound(entry):
+        return (entry.get('kind') in ('bound','confined')
+                and (not entry.get('projects') or not entry.get('principal')))
+    would_be_refused=[entry['line'] for entry in lines
+                      if not entry.get('other_kit') and not entry.get('other_root') and _unbound(entry)]
+    not_reached=[entry['line'] for entry in lines
+                 if (entry.get('other_kit') or entry.get('other_root')) and _unbound(entry)]
+    refused=would_be_refused if setting else []
     attention=sorted(set(attention+refused))
     notes=['unrestricted: the key has this account\'s shell and is outside every rule of the kit, on every project.',
            'confined: the key runs only the endpoint and may name any project and any actor.',
@@ -5284,14 +5363,39 @@ def authorized_keys_listing(root,file=None):
            'other_root: the line serves another runtime than --root (or names none); its projects were not looked up here.']
     if setting:
         notes.append('bound_keys_only: this installation accepts bound keys only, so the forced command refuses '
-                     'a line of this kit that names no project or no principal%s. Print each such line again with '
-                     'authorized-keys --project ... --principal ... and replace it. A line that runs a wrapper of '
-                     'another kit is not refused by this setting at all: that kit does not know it.'
+                     'a line of this kit and this root that names no project or no principal%s. Print each such '
+                     'line again with authorized-keys --project ... --principal ... and replace it. A line that '
+                     'runs a wrapper of another kit or of another root is not refused by this setting at all: it '
+                     'does not reach it%s.'
                      %(' (line%s %s)'%('s' if len(refused)!=1 else '',', '.join(str(number) for number in refused))
-                       if refused else ' (no line here is such a line)'))
+                       if refused else ' (no line here is such a line)',
+                       ' (lines %s are not reached)'%', '.join(str(number) for number in not_reached)
+                       if not_reached else ''))
+    else:
+        # The preview before `on` (kittrial-5bb.196 review, item 4c): with the setting off nothing
+        # is refused, but the operator must see what turning it on would cut off, all at once.
+        notes.append('would_be_refused: the setting is off, so nothing is refused today; `admin.py '
+                     'bound-keys-only on --actor OPERATOR` would refuse the line(s) of this kit and this root '
+                     'that name no project or no principal%s. Print each such line again with authorized-keys '
+                     '--project ... --principal ... and replace it before turning the setting on.'
+                     %(' (line%s %s)'%('s' if len(would_be_refused)!=1 else '',
+                                       ', '.join(str(number) for number in would_be_refused))
+                       if would_be_refused else ' (no line here is such a line)'))
     notes.append('This command reads the file and changes nothing.')
     return {'schema_version':1,'file':str(path),'root':str(root),'kit':str(kit),'lines':lines,'summary':summary,
-            'attention':attention,'bound_keys_only':setting,'notes':notes}
+            'attention':attention,'bound_keys_only':setting,'would_be_refused':would_be_refused,'notes':notes}
+
+def bound_keys_only_would_refuse(root,file=None):
+    """The line numbers ``bound_keys_only on`` would refuse, or None if the file cannot be read.
+
+    Read-only, for the ``status`` report and for ``on`` itself (kittrial-5bb.196 review, item 4c):
+    the operator sees what turning the setting on cuts off before it happens. Only lines of this
+    kit and this root are returned; a line of another kit or root is not reached by the setting.
+    """
+    try:
+        return authorized_keys_listing(root,file)['would_be_refused']
+    except (OSError,ValueError,RecursionError):
+        return None
 
 def authorized_keys(root,key_file,role='both',python=None,comment=None,projects=None,principal=None):
     """Print the installable lines for one public key as JSON (see authorized_key_lines).
@@ -6742,6 +6846,9 @@ def main():
                      'principal (OFF by default; operator allowlist, audited)')
     a.add_argument('action',choices=['status','on','off'])
     a.add_argument('--actor',required=True,help='an actor on the deployment operator allowlist')
+    a.add_argument('--file',default=None,help='the authorized_keys file to preview (default: '
+                   '~/.ssh/authorized_keys of this account): status and on name the lines of this kit and this '
+                   'root that the setting refuses or would refuse')
     a=sub.add_parser('capability-verify',help='record verified capability checks (operator allowlist or verifiers list)')
     a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('authorized-keys',help='print the confined contributor and unrestricted operator authorized_keys lines for one public key')
@@ -7410,7 +7517,7 @@ def main():
     elif args.command=='checkpoint-provenance-writes':
         print(json.dumps(checkpoint_provenance_switch(root,args.action,args.actor)))
     elif args.command=='bound-keys-only':
-        print(json.dumps(bound_keys_only_switch(root,args.action,args.actor)))
+        print(json.dumps(bound_keys_only_switch(root,args.action,args.actor,args.file)))
     elif args.command=='review-writes':
         result,warnings=review_writes_command(root,args.actor,args.action)
         for line in warnings:print(line,file=sys.stderr)

@@ -9,7 +9,7 @@
     "an authorized_keys line without a project or a principal is refused",
     "coordinators per project slice 4"
   ],
-  "summary": "One installation setting: deployment.private.json's bound_keys_only, absent or false meaning off, so nothing changes where nothing is configured. admin.py bound-keys-only status|on|off --actor OPERATOR is operator-gated, holds the deployment config lock, writes nothing when nothing changes, and appends an audit entry to bound_keys_only_audit, a damaged list kept aside as bound_keys_only_audit_damaged_<stamp>. With it on, ssh_forced_command.py reads the runtime's own settings file and refuses, before selecting or running anything, a line naming no --project or no --principal: exit status 2, the missing part named, nothing run; a line naming both is launched as before. A settings file that cannot be read refuses every forced-command key, naming the file; a value that is neither true nor false reads as off with a warning. setup-status reports a bound_keys_only block (enabled true/false/null with a sentence); authorized-keys refuses to print a line the setting would refuse (--role operator unaffected); authorized-keys-list reports the setting and flags such lines. A line printed before an upgrade runs another release's wrapper, which knows nothing of it; an older kit ignores the key.",
+  "summary": "One installation setting: deployment.private.json's bound_keys_only, absent or false meaning off, so a bare installation is unchanged. admin.py bound-keys-only status|on|off --actor OPERATOR [--file FILE] is operator-gated, holds the deployment config lock, writes nothing when nothing changes, and appends to bound_keys_only_audit, keeping the last 20 flips. status reports audit_agrees and would_be_refused - the lines of this kit and root the setting refuses, or would refuse while off - and on prints that list. With it on, ssh_forced_command.py reads the runtime's own settings file (at most 1 MiB) and refuses, before selecting or running anything, a line naming no --project or no --principal: exit 2, the missing part named, nothing run; a line naming both runs as before. A settings file that cannot be read refuses every forced-command key, saying the installation setting could not be read (no path or value to the contributor); a non-bool value reads as off with a flushed warning. setup-status reports a bound_keys_only block; authorized-keys refuses to print a line the setting would refuse; authorized-keys-list flags such lines and names other-kit or other-root lines as not reached.",
   "requirements": [],
   "anchors": [
     "docs/OPERATIONS.md#accept-bound-keys-only"
@@ -18,6 +18,7 @@
     "admin.py::bound_keys_only",
     "admin.py::bound_keys_only_switch",
     "admin.py::bound_keys_only_audit",
+    "admin.py::bound_keys_only_would_refuse",
     "admin.py::project_setup_status",
     "admin.py::authorized_keys",
     "admin.py::authorized_keys_listing",
