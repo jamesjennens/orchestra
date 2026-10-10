@@ -1876,6 +1876,64 @@ class RealEndpointCase(unittest.TestCase):
         self.assertNotIn('x' * 10, str(only_hostile))
         self.assertIn('a row that cannot be read', str(only_hostile))
 
+    def test_the_web_answer_says_and_k_more_with_the_right_k(self):
+        """kittrial-5bb.247 (M19): a thousand unreadable rows answer with five named ids and
+        'and 995 more' in the message -- a mutant that drops the K or the total must fail."""
+        import http_service
+        ids = ['probe-%d' % number for number in range(1000)]
+        with self.assertRaises(http_service.HttpError) as failed:
+            http_service.EndpointBackend._checked(
+                {'returncode': 2, 'stdout': '', 'stderr': '', 'fault': 'unreadable-rows',
+                 'unreadable_rows': ids[:5], 'unreadable_total': 1000},
+                'actor-standing', reading=True)
+        self.assertIn('and 995 more', failed.exception.message)
+        self.assertEqual(1000, failed.exception.unreadable_total)
+        # Fewer unnamed than the cap names nothing further; K is right at the edge too.
+        with self.assertRaises(http_service.HttpError) as edge:
+            http_service.EndpointBackend._checked(
+                {'returncode': 2, 'stdout': '', 'stderr': '', 'fault': 'unreadable-rows',
+                 'unreadable_rows': ids[:5], 'unreadable_total': 6},
+                'actor-standing', reading=True)
+        self.assertIn('and 1 more', edge.exception.message)
+        self.assertEqual(6, edge.exception.unreadable_total)
+
+    def test_the_endpoint_envelope_carries_the_total(self):
+        """kittrial-5bb.247 (M21): the endpoint's fault envelope carries unreadable_total
+        beside the ids, so the service can say 'and K more' from fields."""
+        deeper = ('{"id": "probe-a", "created_by": "x", "created_at": "2026-01-01T00:00:00Z",'
+                  ' "metadata": ' + '{"a":' * 750 + '1' + '}' * 750 + '}')
+        deeper_too = ('{"id": "probe-b", "created_by": "y", "created_at": "2026-01-01T00:00:00Z",'
+                      ' "metadata": ' + '{"a":' * 750 + '1' + '}' * 750 + '}')
+        self._whole_tracker_script(deeper, deeper_too)
+        answer = self.write('worker-a', self.credential('worker-a', rows_checked=False,
+                                                        created_at='2026-10-07T00:00:00Z'), 'total-field')
+        self.assertEqual((2, 'unreadable-rows'), (answer['returncode'], answer.get('fault')), answer)
+        self.assertEqual(2, answer['unreadable_total'])
+        self.assertEqual(['probe-a', 'probe-b'], answer['unreadable_rows'])
+
+    def test_a_bd_that_failed_is_not_said_to_have_answered_nothing(self):
+        """kittrial-5bb.247 (M22): the three non-answers are told apart -- bd exiting nonzero
+        is 'bd failed (exit not 0)', never 'bd answered nothing' (a mutant that lumps them
+        must fail here)."""
+        import admin
+        path = self.tmp / 'state.json'
+        path.write_text(json.dumps({'users': {}, 'credentials': {
+            'cred_w': {'user_id': 'usr_a', 'project_id': 'probe', 'label': 'w', 'actor': 'worker-a',
+                       'revoked': False, 'created_at': '2026-10-01T00:00:00Z'}}}), encoding='utf-8')
+        import subprocess as real_subprocess
+        failure = real_subprocess.CalledProcessError(1, 'bd')
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(admin, 'run_bd', side_effect=failure), \
+                mock.patch.object(sys, 'argv', ['admin.py', '--root', str(self.root), 'credential-actors',
+                                                '--state', str(path)]), \
+                redirect_stdout(out), redirect_stderr(err):
+            admin.main()
+        report = json.loads(out.getvalue())
+        self.assertEqual('bd failed (exit not 0)', report['credentials'][0]['tracker_not_read'])
+        self.assertIn('bd failed (exit not 0)', err.getvalue())
+        self.assertNotIn('answered nothing', err.getvalue())
+        self.assertEqual(1, report['could_not_be_judged'])
+
     def test_the_command_line_also_counts_what_could_not_be_judged(self):
         """kittrial-5bb.243 item N5: the closing sentence names the credentials that could
         not be judged at all, with the unreadable row ids, beside the colliding count."""
