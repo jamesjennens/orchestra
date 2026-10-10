@@ -178,13 +178,17 @@ def owner_context(project_path, project, request, authority_config, simple=True)
     Called under run_guarded's authority lock. A preflight may call it too, but
     that cannot replace this effect-time check. Never use caller store/lock paths.
     """
-    from http_authority import read_state
+    from http_authority import file_lock, read_state
     from project_creation import service_descriptor
     descriptor = service_descriptor(request, authority_config, 'owner-requirements')
     if (descriptor.get('project') != project or descriptor.get('credential_id') is not None
             or not owner_records.HUMAN.fullmatch(request['actor'])):
         raise ValueError('Requirements editing needs the signed-in project owner')
-    state = read_state(authority_config.store)
+    # The preflight runs before run_guarded takes this lock. On Windows an
+    # open authority reader prevents the service's atomic state replacement.
+    # Share its existing lock; effect-time calls already hold it re-entrantly.
+    with file_lock(authority_config.lock):
+        state = read_state(authority_config.store)
     account = descriptor['user_id']
     if state.get('memberships', {}).get(project, {}).get(account) != 'owner':
         raise ValueError('Requirements editing needs the signed-in project owner')

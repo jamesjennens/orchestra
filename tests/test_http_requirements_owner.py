@@ -309,6 +309,68 @@ class OwnerHttpTests(EndpointCase):
         self.assertEqual(len(owner_records.existing_acceptances(row)), 1)
         self.assertEqual(sum(r['issue_type']=='decision' for r in self.backend.native.rows), 1)
 
+    def test_owner_preflight_reader_cannot_overlap_another_requests_state_replacement(self):
+        from concurrent.futures import ThreadPoolExecutor
+        import threading
+        import http_authority
+        first = self.create_requirement()
+        route = self.base + '/requirements/' + first['id'] + '/accept'
+        armed = threading.Event(); armed.set()
+        opened = threading.Event(); release = threading.Event()
+        reader_open = threading.Event(); overlapping_write = threading.Event()
+        second_save = threading.Event()
+        read = http_authority.read_state
+        save = self.service.store.save
+        write = self.service.store._write
+
+        def hold_reader(path):
+            if not armed.is_set():
+                return read(path)
+            armed.clear()
+            with Path(path).open('r', encoding='utf-8') as handle:
+                state = json.load(handle)
+                reader_open.set(); opened.set()
+                try:
+                    if not release.wait(10):
+                        raise RuntimeError('Synthetic reader was not released')
+                finally:
+                    reader_open.clear()
+            return state
+
+        def observe_save(*args, **kwargs):
+            if reader_open.is_set():
+                second_save.set()
+            return save(*args, **kwargs)
+
+        def observe_write():
+            if reader_open.is_set():
+                overlapping_write.set()
+            return write()
+
+        def accept(number):
+            return self.request('POST', route, self.expected(first), token=self.owner_token,
+                                key='reader-accept-' + str(number))
+
+        with mock.patch.object(http_authority, 'read_state', hold_reader), \
+                mock.patch.object(self.service.store, 'save', observe_save), \
+                mock.patch.object(self.service.store, '_write', observe_write):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                one = pool.submit(accept, 1)
+                try:
+                    self.assertTrue(opened.wait(10), 'First request did not open the authority file')
+                    two = pool.submit(accept, 2)
+                    self.assertTrue(second_save.wait(10), 'Second request did not attempt to save state')
+                    # Keep the reader open while the competing save attempts
+                    # its replacement. A correctly locked save must wait here.
+                    overlapping_write.wait(.5)
+                finally:
+                    release.set()
+                responses = [one.result(), two.result()]
+        self.assertFalse(overlapping_write.is_set(), 'State replacement raced an open owner preflight reader')
+        self.assertEqual(sorted(r.status for r in responses), [200, 409], [r.data for r in responses])
+        self.assertEqual(len(owner_records.existing_acceptances(self.backend.native.row(first['id']))), 1)
+        self.assertEqual(sum(r['issue_type'] == 'decision' for r in self.backend.native.rows), 1)
+
     def test_owner_narrative_uses_the_same_acceptance_and_member_read_path(self):
         created = self.request('POST', self.base+'/requirements', {
             'kind':'brd-section', 'parent':'job-1', 'title':'Purpose',
