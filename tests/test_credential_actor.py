@@ -1934,6 +1934,64 @@ class RealEndpointCase(unittest.TestCase):
         self.assertNotIn('answered nothing', err.getvalue())
         self.assertEqual(1, report['could_not_be_judged'])
 
+    def test_rows_without_an_id_are_counted_as_unreadable_rows(self):
+        """kittrial-5bb.247 r2, review item 1, pinning NEW-1: an error line, a bare number
+        and a list among the rows are unreadable rows with no id, counted beside the one
+        that has an id. Must fail if admin.py counts only id-bearing rows again."""
+        import admin
+        path = self.tmp / 'state.json'
+        path.write_text(json.dumps({'users': {}, 'credentials': {
+            'cred_w': {'user_id': 'usr_a', 'project_id': 'probe', 'label': 'w', 'actor': 'worker-a',
+                       'revoked': False, 'created_at': '2026-10-01T00:00:00Z'}}}), encoding='utf-8')
+        healthy = json.dumps({'id': 'probe-1', 'created_by': 'opus-worker-lane',
+                              'created_at': '2026-01-01T00:00:00Z', 'updated_at': '2026-01-01T00:00:00Z'})
+        with_id = ('{"id": "probe-deep", "created_by": "deep-author", "created_at": "2026-01-01T00:00:00Z",'
+                   ' "metadata": ' + '{"a":' * 750 + '1' + '}' * 750 + '}')
+        shapes = (
+            ('an error line', 'bd: the database is locked, try again'),
+            ('a bare number', '2026'),
+            ('a list among the rows', '[{"id": "probe-vic", "created_by": "vic", "created_at": "2026-01-01T00:00:00Z"}]'),
+        )
+        for label, line in shapes:
+            with self.subTest(shape=label):
+                with mock.patch.object(admin, 'run_bd',
+                                       return_value='\n'.join((healthy, with_id, line)) + '\n'):
+                    report = admin.credential_actors(self.root, path)
+                item = report['credentials'][0]
+                # Every unreadable row is counted - the two with no id and the one with.
+                self.assertEqual(2, item['unreadable_total'])
+                self.assertEqual('it holds 2 unreadable row(s)', item['tracker_not_read'])
+                # Only the printable id is named.
+                self.assertEqual(['probe-deep'], item['unreadable_rows'])
+                self.assertIsNone(item['tracker_rows'])
+
+    def test_no_sentence_about_zero_credentials_that_could_not_be_judged(self):
+        """kittrial-5bb.247 r2, review item 2, pinning NEW-2: when the only credential beside
+        an unread tracker is refused by a cheap rule, could_not_be_judged is 0 and the
+        closing sentence is not printed. Must fail if the condition is 'if not_read:'
+        again."""
+        import admin
+        path = self.tmp / 'state.json'
+        path.write_text(json.dumps({'users': {}, 'credentials': {
+            'cred_web': {'user_id': 'usr_a', 'project_id': 'probe', 'label': 'web', 'actor': 'http',
+                         'revoked': False, 'created_at': '2026-10-01T00:00:00Z'}}}), encoding='utf-8')
+        deeper = ('{"id": "probe-deeper", "created_by": "deep-author", "created_at": "2026-01-01T00:00:00Z",'
+                  ' "updated_at": "2026-01-01T00:00:00Z", "metadata": ' + '{"a":' * 750 + '1' + '}' * 750 + '}')
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(admin, 'run_bd', return_value=deeper + '\n'), \
+                mock.patch.object(sys, 'argv', ['admin.py', '--root', str(self.root), 'credential-actors',
+                                                '--state', str(path), '--service-namespace', 'web']), \
+                redirect_stdout(out), redirect_stderr(err):
+            admin.main()
+        report = json.loads(out.getvalue())
+        self.assertEqual(0, report['could_not_be_judged'])
+        self.assertEqual(actor_names.SERVICE, report['credentials'][0]['collides'])
+        self.assertTrue(report['credentials'][0]['refused_when_it_writes'])
+        self.assertEqual('it holds 1 unreadable row(s)', report['credentials'][0]['tracker_not_read'])
+        # The refused sentence is said; the could-not-be-judged sentence is not.
+        self.assertIn('1 worker credential(s) write under a name', err.getvalue())
+        self.assertNotIn('could not be judged', err.getvalue())
+
     def test_the_command_line_also_counts_what_could_not_be_judged(self):
         """kittrial-5bb.243 item N5: the closing sentence names the credentials that could
         not be judged at all, with the unreadable row ids, beside the colliding count."""
