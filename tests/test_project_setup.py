@@ -676,6 +676,8 @@ class HostStatusTests(unittest.TestCase):
         """
         return admin.scheduled_backup_execstart(self.root).replace(str(self.root), self.root.as_posix())
 
+    @unittest.skipIf(sys.platform == 'win32', 'a unit line naming a Windows runtime root is not read back as this '
+                     'runtime (the product runs on Linux); the timer rule is tested on the POSIX runners')
     def test_a_timer_covers_only_the_unit_it_names(self):
         """kittrial-5bb.220 review 2 item 5 (n06, n07): an enabled timer covers its unit, not any unit."""
         self.unit(self.runtime_unit_line())            # beads-backup.service covers alpha
