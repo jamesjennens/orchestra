@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "operation_id": "capnew-df1f4890c026476e814d3f4927f6f7fd",
+  "operation_id": "caprev-2a0f9b1eda524d64a6e44311f0d09851",
   "key": "requirements.owner-acceptance",
   "name": "Human owner acceptance binds exact content and supports account-bound replay",
   "aliases": [
@@ -10,7 +10,7 @@
     "same owner new session retry",
     "immutable requirement decision"
   ],
-  "summary": "A signed-in project owner accepts an exact current draft in simple mode without joining the host operator allowlist. The service generates a native decision, immutable account/project/governance-bound evidence and an accepted revision. Historical accepted content remains separately readable. Request replay uses one consistent account-bound journal identity, including after a committed answer is lost and the same owner logs in again. The original result and server time replay without another effect; changed request content refuses. Current session authority and owner membership are checked before replay. Raw owner evidence comments remain reserved. Governed mode and machine credentials do not gain this owner acceptance route. Interrupted acceptance persists an optional validated owner_decision binding in the existing receipt immediately after the generated native ID is confirmed and before evidence. Recovery selects only that ID; mutable title, description, label and creator fields cannot choose a substitute. Missing/unreadable decisions and legacy or lost-ID receipts remain unknown without regeneration. Backup/restore preserves the optional binding.",
+  "summary": "A signed-in project owner accepts exact current content in simple mode without host operator membership. A generated native decision binds immutable account/project/governance evidence and an accepted revision. Account-bound request replay returns the original result and server time without another effect, after rechecking current authority and membership; changed content refuses. Raw owner evidence remains reserved; governed mode and machine credentials gain no owner acceptance authority. Interrupted acceptance persists a validated optional owner_decision receipt binding after the native ID is confirmed and before evidence. Recovery uses that ID, never mutable discovery metadata. Missing or unreadable bound decisions and unbound legacy or lost-ID operations remain unknown. The owner may reload and accept with a fresh key, or edit a readable legacy draft and accept its new revision, without finishing the old operation. Backup/restore preserves bindings.",
   "requirements": [],
   "anchors": [
     "docs/REQUIREMENTS.md#editing-a-projects-requirements-in-the-web-interface"
@@ -30,5 +30,7 @@
     "requirements",
     "acceptance",
     "replay"
-  ]
+  ],
+  "revision": 3,
+  "expected_sha256": "550092b2209c0ec4847456d382473fc39ffd02ca4d01972c3767f552758d9f56"
 }

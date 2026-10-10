@@ -67,7 +67,7 @@ SSH remains the default configuration:
 {"host":"beads-team","python":"<INSTALL_ROOT>/current/python-runtime/<PATH>","endpoint":"<INSTALL_ROOT>/current/kit/endpoint.py","root":"<RUNTIME_ROOT>"}
 ```
 
-`host` is an SSH alias or `user@host` that resolves **from your machine**: a server's own host name may not resolve from another network. An endpoint started with an interpreter that is too old says so and does nothing, and the client shows it: `SSH failed (2); ... endpoint.py needs Python 3.10 or newer and was started with Python 3.6.8 (/usr/bin/python3). Nothing was carried out. Set "python" in the client configuration ...`. `client.py`, `admin.py` and `office_service.py` say the same of themselves.
+`host` is an SSH alias or `user@host` that resolves **from your machine**: a server's own host name may not resolve from another network. An endpoint started with an interpreter that is too old says so and does nothing, and the client shows it: `SSH: endpoint.py needs Python 3.10 or newer and was started with Python 3.6.8 (/usr/bin/python3). Nothing was carried out. Set "python" in the client configuration ...`. Twenty programs of the kit say the same of themselves: `endpoint.py`, `client.py`, `admin.py`, `office_service.py`, `http_service.py`, `tools/office_verify.py`, `capabilities.py`, `http_client.py`, `lifecycle.py`, `coordination.py`, `requirement_records.py`, `setup_assistant.py`, `worker.py`, `worker_gate.py`, `tools/http_rev3_probe.py`, `tools/http_rev4_probe.py`, `tools/http_rev5_probe.py`, `tools/http_security_probe.py`, `tools/strict_canonical_endpoint.py` and `tools/demonstrate_review_targeting.py`.
 
 For a terminal already on the Linux coordination server, explicitly select local transport:
 

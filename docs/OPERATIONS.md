@@ -36,7 +36,7 @@ a project; use the [requirements snapshot command](REQUIREMENTS.md) for offline
 owner-evidence export. Operator requirement-apply/backfill authority remains
 unchanged in both modes.
 
-**Rollback and restore of simple requirements.** The predecessor kit can restore
+**Rollback and restore of simple requirements.** The release before slice A can restore
 a backup of a project that has never had these sidecars. It refuses a backup
 containing `.requirements-governance.json`, `.requirement-owner-requests/` or
 `.requirements-governance-source.json` with `Invalid coordination backup path`.
@@ -46,9 +46,20 @@ owner-accepted requirements cannot be read because their governance history is
 missing. Keep the current kit's complete backup when rolling back; an older
 kit's successful backup does not preserve owner requirement authority.
 The optional `owner_decision` binding in an existing owner request receipt does
-not change this predecessor restore limit. Current backups preserve and validate
-the binding; an interrupted legacy acceptance without one remains unknown and
-needs host operator reconciliation.
+not change this restore limit for the release before slice A. Current backups preserve
+and validate the binding. An interrupted acceptance without a binding keeps the
+old operation unknown; the owner reloads the requirement and accepts again with a
+new request key. For a legacy interrupted acceptance with a readable draft, the owner edits that
+draft and accepts the new revision. Unreadable history still needs host operator
+reconciliation.
+Neither action completes the unbound old operation or invents its decision.
+
+The failed-creation recovery panel lists at most 20 of the current owner's pending
+creations and reports the exact total and whether more remain. A request needing an absence proof reads
+one native export and one complete native membership list, then reuses the validated
+request-label index for those items. An unreadable receipt affects its own item;
+an unreadable native absence proof refuses clearing. The clear action checks a
+fresh absence proof and the exact receipt hash under the existing locks.
 
 Configure the [server-owned project entry point](ONBOARDING.md) so new workers can start from an empty directory using a single SSH onboarding command. Its private instructions are included in coordination sidecar backups.
 
@@ -1340,13 +1351,13 @@ What it does:
 - **What holds a retired name is the directory, not the journal.** A name is refused for a new project (`add-project`, `restore-new`, a creation from the web interface) because `retired/NAME-<UTC stamp>` exists; that list of directories is the only thing read. `retired/journal.jsonl` is an audit trail for people: the kit appends to it and never reads it, so a broken or missing journal unprotects no name and stops nothing. Do not rename or remove a `retired/NAME-<UTC stamp>` directory: its database is still on the server, and without the directory the name could be used again and would adopt it.
 
 `--force` is needed when the project looks like a working tracker, holds the merge slot, or has pending reservations. The checks fail closed: what cannot be read is treated as the dangerous answer. The refusal names what it found:
-- **It looks like a working tracker:** bd reads the project and it holds issues. The state of its backups does not matter; a healthy project whose last backup failed is still a healthy project.
-- **Nothing could be checked:** the Dolt server (or bd itself) could not be reached, or the server did not answer the probe within 15 seconds (a frozen server does not make the command hang with its locks held). The project may be a healthy tracker, so this needs `--force` too. Start the server and retry instead when you can.
+- **It looks like a working tracker:** bd reads the project and it holds issues, or metadata is absent while the same-named server database holds issues. The state of its backups does not matter; a healthy project whose last backup failed is still a healthy project.
+- **Nothing could be checked:** the Dolt server (or bd itself) could not be reached, or the server did not answer the probe within 15 seconds (a frozen server does not make the command hang with its locks held). If a same-named database exists but its issue count cannot be read, that is also treated as unknown. The project may be a healthy tracker, so this needs `--force` too. Start the server and retry instead when you can.
 - **Its `.beads/metadata.json` is there but unusable:** it cannot be opened, is not JSON, or does not record the Dolt server. The kit cannot tell what the project is, so this needs `--force`. bd is never run on such a project: without the server coordinates bd would fall back to an embedded database, create `.beads/embeddeddolt` inside the project and report it as empty.
 - **The merge slot** is held, or bd reads the project but could not read its slot.
 - **Reservations:** pending receipts in its request journals, or receipts that could not be read.
 
-A project a stopped restore left behind needs no flag: the server answers and bd rejects the project. An empty project that bd reads (what a restore that failed before writing leaves) needs no flag either, and neither does a directory that was never initialized (no `.beads/metadata.json`: what a stop during the `add-project` step leaves).
+A project a stopped restore left behind needs no flag: the server answers and bd rejects the project. An empty project that bd reads (what a restore that failed before writing leaves) needs no flag either. A directory that was never initialized (no `.beads/metadata.json`: what a stop during the `add-project` step leaves) needs no flag when no same-named server database exists or that database contains no issues.
 
 "bd rejects the project" is any refusal by bd while the server answers. By design that also covers a project whose recorded `project_id` or `dolt_database` was changed by hand so that it no longer matches its database: bd refuses it exactly as it refuses a partial restore, the kit cannot tell the two apart, and it retires with no flag. Nothing is deleted, and moving the directory back undoes it.
 

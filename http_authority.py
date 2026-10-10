@@ -1702,13 +1702,24 @@ class OperationJournal:
         This is only discovery. The adapter must validate the inner receipt and
         prove native absence under its project and authority locks before release.
         """
+        return self.pending_owner_creates_snapshot(principal, limit=21)['items']
+
+    def pending_owner_creates_snapshot(self, principal, limit=20):
+        """Bounded candidates and their exact total from one read snapshot."""
+        if type(limit) is not int or not 1 <= limit <= 21:
+            raise ValueError("Owner creation discovery limit must be between 1 and 21")
         self._ensure_store()
         with self._connection() as connection:
+            connection.execute('BEGIN')
+            total = connection.execute(
+                "SELECT COUNT(*) FROM operations WHERE principal = ? AND route = 'requirements.create' "
+                "AND state IN ('unknown', 'in_progress')", (principal,)).fetchone()[0]
             rows = connection.execute(
                 "SELECT * FROM operations WHERE principal = ? AND route = 'requirements.create' "
-                "AND state IN ('unknown', 'in_progress') ORDER BY operation_id LIMIT 21",
-                (principal,)).fetchall()
-        return [dict(self._row_record(row), operation_id=row['operation_id']) for row in rows]
+                "AND state IN ('unknown', 'in_progress') ORDER BY operation_id LIMIT ?",
+                (principal, limit)).fetchall()
+        return {'items': [dict(self._row_record(row), operation_id=row['operation_id']) for row in rows],
+                'total': total}
 
     # -- mutations -------------------------------------------------------------
     def reserve(self, operation_id, request_hash, principal):

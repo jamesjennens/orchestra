@@ -12,6 +12,14 @@ validators, so the same probe reports ``closed: false`` on the pre-fix revision 
 Findings: 1 canonical-protocol, 2 canonical-lost-result, 3 canonical-revocation,
 4 live-membership, 5 idempotency-atomicity, 6 attachment-loss.
 """
+import sys
+if sys.version_info < (3, 10):
+    # Before every other import, and in syntax Python 3.6 reads: an older interpreter failed in
+    # an import further down, with a traceback that hid the cause (kittrial-5bb.191).
+    sys.stderr.write('http_rev3_probe.py needs Python 3.10 or newer and was started with Python %d.%d.%d (%s). '
+                     'Nothing was carried out. Run it with Python 3.10 or newer.\n'
+                     % (sys.version_info[0], sys.version_info[1], sys.version_info[2], sys.executable))
+    sys.exit(2)
 import argparse
 import base64
 import http.client
@@ -19,7 +27,6 @@ import json
 import os
 import secrets
 import shutil
-import sys
 import threading
 from pathlib import Path
 

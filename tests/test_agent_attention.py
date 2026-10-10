@@ -232,6 +232,33 @@ class EndpointAttentionTests(fixes.EndpointCase):
         self.assertNotIn(task,[x['task'] for x in data['next_actions']])
         self.assertEqual(data['attention']['counts']['claimed'],0)
 
+    @patch.dict(os.environ, {'PYTHONUTF8': '1'})
+    def test_only_undelivered_blocked_or_working_tasks_count_as_newer(self):
+        blocked, working, delivered, approved = self.tasks
+        for task in self.tasks:
+            self.claim(task)
+            self.checkpoint(task, [dict(id='wait', kind='blocker', text='Await plan review.', source='plan')]
+                            if task == blocked else [])
+        self.contribute(delivered)
+        contribution = self.contribute(approved)
+        self.review(self.people['blair'], approved, 'approve', previous=contribution,
+                    contribution=contribution, summary='Accepted')
+        for task in self.tasks:
+            self.native('blair')(['comments', 'add', task, 'New direction after the checkpoint.'])
+        data = self.next()
+        self.assertEqual(data['attention']['counts']['newer_activity'], 2)
+        actions = {x['task']: x for x in data['next_actions']}
+        self.assertTrue(actions[blocked]['newer_activity'])
+        self.assertTrue(actions[working]['newer_activity'])
+        for task in (delivered, approved):
+            self.assertIsNone(actions[task]['newer_activity'])
+        # Authorized brief reads confirm the delivered tasks have newer activity;
+        # exclusion must happen in attention's current undelivered state rule.
+        for task in (delivered, approved):
+            brief = self.request('GET', self.base(task)+'/brief', token=self.secret)
+            self.assertEqual(brief.status, 200, brief.data)
+            self.assertTrue(brief.data['checkpoint']['newer_activity'])
+
     def test_own_records_stay_quiet_but_other_actor_comment_wakes(self):
         task=self.tasks[0];self.claim(task)
         self.checkpoint(task,[dict(id='q',kind='blocker',text='Need a key.',source='build')])

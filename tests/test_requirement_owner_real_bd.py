@@ -28,8 +28,9 @@ class NativeOwnerTests(fixture.RealBdLabelAliasTests):
         real = self.bd_path.with_name('bd-real')
         shutil.copy(self.bd_path, real)
         self.bd_path.write_text(
-            '#!/usr/bin/env python3\nimport os,sys,subprocess\nfrom pathlib import Path\n'
+            '#!/usr/bin/env python3\nimport os,sys,subprocess,json\nfrom pathlib import Path\n'
             'p=Path(sys.argv[0]); args=sys.argv[1:]; real=p.with_name("bd-real")\n'
+            'with p.with_name("native-calls.jsonl").open("a") as log: log.write(json.dumps(args)+"\\n")\n'
             'def once(name):\n'
             ' marker=p.with_name(name)\n'
             ' if not marker.exists(): return False\n'
@@ -256,9 +257,66 @@ class NativeOwnerTests(fixture.RealBdLabelAliasTests):
             self.assertEqual(listing.status, 200, listing.data)
             self.assertEqual(len(listing.data['items']), 1)
             empty = listing.data['items'][0]; self.assertTrue(empty['can_clear'], empty)
+            # The production discovery journal holds 25 synthetic owner
+            # intents; real bd supplies the complete export/membership proof.
+            import time
+            from http_authority import OperationJournal, journal_path
+            receipt_path = self.project/requirement_http.JOURNAL/(content_hash(
+                {'operation_id': empty['operation_id']})+'.json')
+            receipt_bytes = receipt_path.read_bytes()
+            journal = OperationJournal(journal_path(self.project))
+            origin = journal.lookup(empty['operation_id'])
+            synthetic = []
+            for n in range(24):
+                operation = 'synthetic-bounded-' + str(n)
+                journal._actor = origin['actor']; journal._route = origin['route']
+                journal.reserve(operation, origin['request_hash'], origin['principal'])
+                journal.mark_unknown(operation)
+                path = self.project/requirement_http.JOURNAL/(content_hash({'operation_id':operation})+'.json')
+                path.write_bytes(receipt_bytes); synthetic.append((operation, path))
+            calls_path = self.bd_path.with_name('native-calls.jsonl')
+            for repeat in range(2):
+                start = len(calls_path.read_text().splitlines())
+                clock = time.perf_counter()
+                bounded = harness.request('GET', base+'/requirements/recoveries', token=token)
+                elapsed = time.perf_counter() - clock
+                self.assertEqual(bounded.status, 200, bounded.data)
+                self.assertEqual((bounded.data['listed'], bounded.data['total'], bounded.data['truncated']),
+                                 (20, 25, True))
+                self.assertTrue(all(i['can_clear'] for i in bounded.data['items']))
+                calls = [json.loads(line) for line in calls_path.read_text().splitlines()[start:]]
+                self.assertEqual(sum('export' in args for args in calls), 1, calls)
+                self.assertEqual(sum('list' in args for args in calls), 1, calls)
+                print('NATIVE_RECOVERY_COUNTS ' + json.dumps(dict(repeat=repeat, seconds=elapsed,
+                    native_rows=len(before_empty), listed=20, total=25, export=1, membership=1)), flush=True)
+            damaged_operation, damaged_path = synthetic[0]
+            damaged_path.write_text('{damaged JSON')
+            isolated = harness.request('GET', base+'/requirements/recoveries', token=token)
+            self.assertEqual(isolated.status, 200, isolated.data)
+            damaged = next(i for i in isolated.data['items'] if i['operation_id']==damaged_operation)
+            self.assertFalse(damaged['can_clear'])
+            self.assertTrue(any(i['can_clear'] for i in isolated.data['items']))
+            self.assertNotIn(str(self.project), json.dumps(isolated.data))
+            refused = harness.request('POST', base+'/requirements/recoveries/clear', dict(
+                original_operation_id=damaged_operation, expected_receipt_sha256='0'*64,
+                reason='Damaged receipts cannot be cleared.'), token=token, key='native-damaged-clear')
+            self.assertEqual(refused.status, 422, refused.data)
+            self.assertNotIn(str(self.project), json.dumps(refused.data))
+            # Remove only these synthetic discovery intents after asserting
+            # isolation, so the existing real recovery flow stays independent.
+            for operation, path in synthetic:
+                journal.complete(operation, {'returncode':2,'stdout':'','stderr':'synthetic fixture complete'},
+                                 origin['request_hash'], origin['principal'])
+                path.unlink()
             clear_body = dict(original_operation_id=empty['operation_id'],
                               expected_receipt_sha256=empty['expected_receipt_sha256'],
                               reason='Complete native reads prove no row was written.')
+            refused = harness.request('POST', base+'/requirements/recoveries/clear',
+                dict(clear_body, expected_receipt_sha256='0'*64), token=token, key='native-wrong-clear-hash')
+            self.assertEqual(refused.status, 422, refused.data)
+            self.assertIn('reload', str(refused.data).lower())
+            self.assertEqual(receipt_path.read_bytes(), receipt_bytes)
+            self.assertEqual(self.rows(), before_empty)
             cleared = harness.request('POST', base+'/requirements/recoveries/clear', clear_body,
                                       token=token, key='native-empty-clear')
             self.assertEqual(cleared.status, 200, cleared.data)
@@ -349,6 +407,17 @@ class NativeOwnerTests(fixture.RealBdLabelAliasTests):
             self.assertIn('no recorded decision binding', str(lost_retry.data))
             self.assertEqual(self.rows(), before_lost)
             self.assertFalse(owner.existing_acceptances(next(r for r in before_lost if r['id']==lost.data['id'])))
+            self.assertIn('Reload', str(lost_retry.data))
+            current = harness.request('GET', base+'/requirements/'+lost.data['id'], token=token)
+            self.assertEqual(current.status, 200, current.data)
+            fresh_accept = harness.request('POST', lost_route, expected(current.data['current']),
+                                          token=token, key='native-lost-fresh-accept')
+            self.assertEqual(fresh_accept.status, 200, fresh_accept.data)
+            self.assertEqual(fresh_accept.data['acceptance_state'], 'accepted')
+            pending_lost = [load_json(p) for p in (self.project/requirement_http.JOURNAL).glob('*.json')
+                            if load_json(p).get('id')==lost.data['id'] and load_json(p).get('status')=='pending']
+            self.assertEqual(len(pending_lost), 1)
+            self.assertNotIn('owner_decision', pending_lost[0])
             partial = harness.request('POST', base+'/requirements', {
                 'kind':'requirement', 'parent':job, 'title':'Recoverable owner content',
                 'description':'The evidence survives an interrupted revision.'},

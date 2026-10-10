@@ -81,24 +81,30 @@ export async function brd(ctx, { pid }, project, data) {
   const document = await ctx.api.brd(pid);
   let recovery = null;
   if (owner && simple) {
-    const failed = await ctx.api.requirementRecoveries(pid);
-    recovery = (failed.items || []).length ? h('section', { class: 'panel stack' },
-      h('h2', null, 'Failed creations'),
-      h('p', null, 'Clear a failed creation only when no requirement was written. Then start a new creation.'),
-      failed.items.map((item) => {
-        const message = h('p', { role: 'status' }, item.message || 'No requirement was written.');
-        if (!item.can_clear) return message;
-        const reason = h('input', { maxlength: 1000, required: true, value: item.reason || '' });
-        const button = h('button', { type: 'submit' }, 'Clear failed creation');
-        return h('form', { class: 'stack', onsubmit: async (event) => {
-          event.preventDefault(); if (button.disabled) return; button.disabled = true;
-          try {
-            await ctx.api.clearRequirementCreation(pid, { original_operation_id: item.operation_id,
-              expected_receipt_sha256: item.expected_receipt_sha256, reason: reason.value });
-            ctx.go(`/p/${pid}/requirements`);
+    try {
+      const failed = await ctx.api.requirementRecoveries(pid);
+      recovery = (failed.items || []).length ? h('section', { class: 'panel stack' },
+        h('h2', null, 'Failed creations'),
+        h('p', null, 'Clear a failed creation only when no requirement was written. Then start a new creation.'),
+        h('p', { class: 'small' }, `${failed.listed ?? failed.items.length} of ${failed.total ?? failed.items.length} failed creations listed.`),
+        failed.items.map((item) => {
+          const message = h('p', { role: 'status' }, item.message || 'No requirement was written.');
+          if (!item.can_clear) return message;
+          const reason = h('input', { maxlength: 1000, required: true, value: item.reason || '' });
+          const button = h('button', { type: 'submit' }, 'Clear failed creation');
+          return h('form', { class: 'stack', onsubmit: async (event) => {
+            event.preventDefault(); if (button.disabled) return; button.disabled = true;
+            try {
+              await ctx.api.clearRequirementCreation(pid, { original_operation_id: item.operation_id,
+                expected_receipt_sha256: item.expected_receipt_sha256, reason: reason.value });
+              ctx.go(`/p/${pid}/requirements`);
           } catch (error) { message.textContent = describe(error); button.disabled = false; }
         } }, h('label', null, 'Why clear this failed creation?', reason), button, message);
-      }), failed.truncated ? h('p', null, 'More failed creations may remain. Refresh after clearing these.') : null) : null;
+      }), failed.truncated ? h('p', null, 'More failed creations remain. Refresh after clearing these.') : null) : null;
+    } catch (error) {
+      recovery = h('section', { class: 'panel' }, h('h2', null, 'Failed creations'),
+        h('p', { role: 'status' }, 'Failed creations could not be read. Reload; if it still fails, ask the host operator.'));
+    }
   }
   return h('div', { class: 'stack' }, pageHead({ title: 'Business requirements',
     lede: 'The current document, generated from the project’s requirement records.' }),
