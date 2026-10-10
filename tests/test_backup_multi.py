@@ -16,7 +16,7 @@ import sys
 import tempfile
 import types
 import unittest
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -469,8 +469,25 @@ class ValidateBackupStatusCase(unittest.TestCase):
                     admin.validate_backup_status(record)
 
 
+def use_posix_unit_source(testcase):
+    """Build the unit line from POSIX literals, whatever the runner is.
+
+    On Windows ``sys.executable`` and the kit's own file path hold backslashes, which
+    :func:`admin.systemd_quote` refuses (rightly), so the line cannot be built there. This
+    patches the ONE function that supplies both the interpreter and the module
+    (kittrial-5bb.220 review 3 items 2 and 3), so the tests stay platform-independent.
+    """
+    source = patch.object(admin, 'install_current_path',
+                          side_effect=lambda path: PurePosixPath('/usr/bin/python3')
+                          if Path(str(path)).name.lower().startswith('python')
+                          else PurePosixPath('/opt/kit') / Path(str(path)).name)
+    source.start()
+    testcase.addCleanup(source.stop)
+
+
 class ScheduledCoverageGuidanceCase(unittest.TestCase):
     def setUp(self):
+        use_posix_unit_source(self)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name) / 'runtime'

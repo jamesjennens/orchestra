@@ -332,7 +332,7 @@ def steps(handler, principal, project_id):
                          'backup-schedule --note NOTE --actor OPERATOR',
                          'Replace NOTE with one line of at most 300 characters and OPERATOR with your name on the '
                          'server\'s operator list. The statement is about the whole runtime and never expires; the '
-                         'server does not check it. Every set and clear is kept in backups/backup-schedule-log.jsonl.',
+                         'server does not check it. Every set and clear is kept in a log on the server.',
                          ('NOTE', 'OPERATOR')))
     result.append(host_step('backup', 'Make sure a scheduled backup covers this project', status, reason, backup,
                             None, commands, None))

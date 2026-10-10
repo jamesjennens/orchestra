@@ -3940,11 +3940,15 @@ BACKUP_SCHEDULE_LOG_NAME='backup-schedule-log.jsonl'
 BACKUP_SCHEDULE_LOG_MAX=100
 
 def backup_schedule_log(root):
-    """The recorded set and clear history, oldest first, as a read-only list of entries."""
+    """The recorded set and clear history, oldest first, as a read-only list of entries.
+
+    A log holding bytes that are not UTF-8 is no log (its lines cannot be read), never an
+    error for a caller that only wants the history (kittrial-5bb.220 review 3 item 4).
+    """
     path=root/'backups'/BACKUP_SCHEDULE_LOG_NAME
     if path.is_symlink() or not path.is_file():return []
     try:lines=path.read_text(encoding='utf-8').splitlines()
-    except OSError:return []
+    except (OSError,ValueError):return []
     entries=[]
     for line in lines[-BACKUP_SCHEDULE_LOG_MAX:]:
         if not line.strip():continue
@@ -3956,8 +3960,10 @@ def backup_schedule_log(root):
 def _append_backup_schedule_log(root,entry):
     """Append one set or clear line, keeping only the newest ``BACKUP_SCHEDULE_LOG_MAX``.
 
-    A convenience log, never a gate: a log that cannot be written does not fail the command
-    that recorded the note.
+    A convenience log, never a gate: a log that cannot be read or written does not fail the
+    command that recorded the note. A log holding bytes that are not UTF-8 cannot be read
+    line by line, so the damaged file is kept aside and a new log started rather than
+    failing every later set and clear (kittrial-5bb.220 review 3 item 4).
     """
     backups=root/'backups'
     if backups.is_symlink() or not backups.is_dir():return
@@ -3966,8 +3972,10 @@ def _append_backup_schedule_log(root,entry):
     lines=[]
     try:
         if path.is_file():lines=[line for line in path.read_text(encoding='utf-8').splitlines() if line.strip()]
-    except OSError:
+    except (OSError,ValueError):
         lines=[]
+        try:path.replace(path.with_name(path.name+'.damaged'))
+        except OSError:pass
     lines.append(json.dumps(entry,sort_keys=True,ensure_ascii=True))
     try:atomic_private_write(path,'\n'.join(lines[-BACKUP_SCHEDULE_LOG_MAX:])+'\n')
     except (OSError,ValueError):pass

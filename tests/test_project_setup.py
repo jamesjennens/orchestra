@@ -7,7 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from unittest.mock import patch
 
 KIT = Path(__file__).resolve().parents[1]
@@ -26,6 +26,22 @@ STEP_IDS = ['members', 'repository', 'first-task', 'agent', 'merge-slot', 'guida
 
 def by_id(body):
     return {item['id']: item for item in body['steps']}
+
+
+def use_posix_unit_source(testcase):
+    """Build the unit line from POSIX literals, whatever the runner is.
+
+    On Windows ``sys.executable`` and the kit's own file path hold backslashes, which
+    :func:`admin.systemd_quote` refuses (rightly), so the line cannot be built there. This
+    patches the ONE function that supplies both the interpreter and the module
+    (kittrial-5bb.220 review 3 items 2 and 3), so the tests stay platform-independent.
+    """
+    source = patch.object(admin, 'install_current_path',
+                          side_effect=lambda path: PurePosixPath('/usr/bin/python3')
+                          if Path(str(path)).name.lower().startswith('python')
+                          else PurePosixPath('/opt/kit') / Path(str(path)).name)
+    source.start()
+    testcase.addCleanup(source.stop)
 
 
 def backup_step_from(block):
@@ -383,6 +399,7 @@ class HostStatusTests(unittest.TestCase):
     """admin.project_setup_status: what the host reports, and nothing more."""
 
     def setUp(self):
+        use_posix_unit_source(self)
         self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name) / 'runtime'
         self.project = self.root / 'projects' / 'alpha'
@@ -566,6 +583,20 @@ class HostStatusTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'backups directory'):
             admin.write_backup_schedule_note(Path(self.tmp.name) / 'no-runtime', 'note', 'operator-1')
 
+    def test_a_damaged_log_is_no_log_and_does_not_fail_the_command(self):
+        """kittrial-5bb.220 review 3 item 4(a): a log that is not UTF-8 fails neither a set nor a clear."""
+        admin.write_backup_schedule_note(self.root, 'first', 'operator-1')
+        log = self.root / 'backups' / admin.BACKUP_SCHEDULE_LOG_NAME
+        log.write_bytes(b'\xff\xfe\x80')
+        # Reading the history is no crash, and a later set still works and keeps the damaged file aside.
+        self.assertEqual(admin.backup_schedule_log(self.root), [])
+        admin.write_backup_schedule_note(self.root, 'second', 'operator-2')
+        self.assertEqual([(entry['action'], entry['by']) for entry in admin.backup_schedule_log(self.root)],
+                         [('set', 'operator-2')])
+        self.assertTrue(list((self.root / 'backups').glob(admin.BACKUP_SCHEDULE_LOG_NAME + '.damaged*')))
+        # A later clear reads the new log and works too.
+        self.assertTrue(admin.clear_backup_schedule_note(self.root, 'operator-2'))
+
     def test_a_hand_made_note_with_wrong_field_types_is_no_note(self):
         """kittrial-5bb.220 review 2 item 3: one bad file must not take the whole set-up page down."""
         path = self.root / 'backups' / admin.BACKUP_SCHEDULE_NOTE_NAME
@@ -582,9 +613,9 @@ class HostStatusTests(unittest.TestCase):
                 self.assertIsNone(backup['elsewhere'])
 
     def test_a_symlinked_or_oversized_note_is_ignored(self):
-        """kittrial-5bb.220 review 2 item 5: a symlinked note, and one past the file-size limit, are no note."""
+        """kittrial-5bb.220 review 3 item 4(b): a symlinked note, and one past the file-size limit, are no note."""
         real = self.root / 'real-note.json'
-        real.write_text(json.dumps({'schema_version': 1, 'note': 'x', 'recorded_by': 'op',
+        real.write_text(json.dumps({'schema_version': 1, 'note': 'x', 'recorded_by': 'operator-1',
                                     'recorded_at': '2026-10-08T09:00:00Z'}), encoding='utf-8')
         link = self.root / 'backups' / admin.BACKUP_SCHEDULE_NOTE_NAME
         try:
@@ -593,8 +624,18 @@ class HostStatusTests(unittest.TestCase):
             self.skipTest('symlink creation is not available')
         self.assertIsNone(admin.read_backup_schedule_note(self.root))
         link.unlink()
-        link.write_text('{"schema_version":1,"note":"' + 'x' * admin.BACKUP_SCHEDULE_NOTE_FILE_MAX + '"}',
+        # Valid but for its size: the fields are the expected strings, so only the size limit
+        # can be what refuses it (review 3 item 4b).
+        link.write_text(json.dumps({'schema_version': 1, 'note': 'x' * admin.BACKUP_SCHEDULE_NOTE_FILE_MAX,
+                                    'recorded_by': 'operator-1', 'recorded_at': '2026-10-08T09:00:00Z'}),
                         encoding='utf-8')
+        self.assertGreater(link.stat().st_size, admin.BACKUP_SCHEDULE_NOTE_FILE_MAX)
+        self.assertIsNone(admin.read_backup_schedule_note(self.root))
+
+    def test_a_note_written_without_an_actor_is_refused(self):
+        """kittrial-5bb.220 review 3 item 4(b) (n12): the actor is required."""
+        with self.assertRaisesRegex(ValueError, 'Name the operator'):
+            admin.write_backup_schedule_note(self.root, 'a note', '')
         self.assertIsNone(admin.read_backup_schedule_note(self.root))
 
     def test_a_note_ending_in_a_full_stop_does_not_print_two(self):
@@ -626,12 +667,21 @@ class HostStatusTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'not a server-side configured operator'):
                 admin.main()
 
+    def runtime_unit_line(self):
+        """The unit line for this runtime, with the root POSIX so it reads back on every platform.
+
+        A systemd unit line carries a POSIX path, and shlex parses a native Windows path's
+        backslashes as escapes; the runtime root is rendered POSIX so the line is read back
+        (kittrial-5bb.220 review 3 item 3).
+        """
+        return admin.scheduled_backup_execstart(self.root).replace(str(self.root), self.root.as_posix())
+
     def test_a_timer_covers_only_the_unit_it_names(self):
         """kittrial-5bb.220 review 2 item 5 (n06, n07): an enabled timer covers its unit, not any unit."""
-        self.unit(admin.scheduled_backup_execstart(self.root))            # beads-backup.service covers alpha
-        # An enabled timer for another unit, and one whose file name differs but whose Unit= is the
-        # covering service: only the latter is coverage (the timer's Unit= is what counts).
-        self.timer(name='beads-other.timer', unit='beads-other.service')
+        self.unit(self.runtime_unit_line())            # beads-backup.service covers alpha
+        # An enabled timer for another unit, and one whose file name differs from the service
+        # but whose Unit= names it: only the latter is coverage (n06, n07).
+        self.timer(name='beads-other-backup.timer', unit='beads-other.service')
         self.assertEqual(self.status()['backup']['scheduled'], 'not-covered')
         self.timer(name='beads-x-backup.timer', unit='beads-backup.service')
         self.assertEqual(self.status()['backup']['scheduled'], 'covered')
@@ -639,7 +689,7 @@ class HostStatusTests(unittest.TestCase):
     def test_coverage_says_so_when_no_unit_line_can_be_printed(self):
         """kittrial-5bb.220 review 2 item 2a: a $ path does not break the report; it says why, naming it."""
         with patch.object(admin, 'install_current_path',
-                          side_effect=lambda path: Path('/srv/a$b/' + Path(str(path)).name)):
+                          side_effect=lambda path: PurePosixPath('/srv/a$b')):
             covered, message = admin.scheduled_backup_coverage(self.root, 'alpha')
         self.assertFalse(covered)
         self.assertIn('No line for a schedule can be printed for this installation', message)
@@ -848,6 +898,7 @@ class EndpointSetupTests(fixes.EndpointCase):
 
     def setUp(self):
         super().setUp()
+        use_posix_unit_source(self)
         self.admin = self.admin_token()
         self.project = self.create_project(self.admin, 'Alpha')
         self.path = self.canonical_root / self.project
@@ -876,8 +927,16 @@ class EndpointSetupTests(fixes.EndpointCase):
                 self.assertIn('Replace ', one['note'])
                 self.assertIn(word, one['note'])
         self.assertIn(steps['backup']['state'], ('todo', 'done', 'unknown'))
-        self.assertEqual([one['kind'] for one in steps['backup']['commands']] if steps['backup']['state'] != 'done' else
-                         ['shell', 'unit-line', 'shell'], ['shell', 'unit-line', 'shell', 'shell-fill'])
+        if steps['backup']['state'] != 'done':
+            kinds = [one['kind'] for one in steps['backup']['commands']]
+            # The endpoint process builds the unit line from its own interpreter. A POSIX host
+            # prints the line; a host whose interpreter path holds a backslash (Windows) cannot
+            # print one and says why. The check is the host's honest answer, not one runner's
+            # (kittrial-5bb.220 review 3 items 2 and 3).
+            self.assertIn(kinds, (['shell', 'unit-line', 'shell', 'shell-fill'],
+                                  ['shell', 'shell', 'shell-fill']), kinds)
+            if 'unit-line' not in kinds:
+                self.assertIn('No line for a schedule can be printed', steps['backup']['detail'])
         # Guidance is the operator's alone. Onboarding an owner may set on the page, or the operator on the server.
         self.assertEqual((steps['guidance']['who'], steps['onboarding']['who']), ('operator', 'owner-or-operator'))
         self.assertIn('cannot do this step', steps['guidance']['note'])
