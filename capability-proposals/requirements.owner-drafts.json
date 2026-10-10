@@ -32,7 +32,6 @@
     "owner",
     "drafts"
   ],
-  "operation": "revise",
   "revision": 3,
   "expected_sha256": "130707549adbaeda9b4591aab035729689135a4b185e0cb6a229427e24333813"
 }

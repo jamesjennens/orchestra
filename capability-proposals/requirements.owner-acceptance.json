@@ -31,7 +31,6 @@
     "acceptance",
     "replay"
   ],
-  "operation": "revise",
   "revision": 3,
   "expected_sha256": "550092b2209c0ec4847456d382473fc39ffd02ca4d01972c3767f552758d9f56"
 }
