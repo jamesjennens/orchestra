@@ -379,13 +379,17 @@ class RealStackOrderTests(held_stack.RealStackTests):
                             token=self.tokens['casey'])
         self.assertEqual(201, made.status, made.data)
         secret = made.data['credential']['secret']; actor = made.data['agent']['actor']
+        def native_ok(*args):
+            done = self.bd(*args)
+            self.assertEqual(0, done.returncode, done.stderr)
+            return done.stdout
         owned = []
         for index in range(282):
-            row = json.loads(self.native_ok('create', '--title', 'Owned scale %04d' % index,
+            row = json.loads(native_ok('create', '--title', 'Owned scale %04d' % index,
                                            '--assignee', actor, '--json'))
             owned.append(row['id'])
         for offset in range(0, len(owned), 50):
-            self.native_ok('update', *owned[offset:offset + 50], '--status', 'in_progress')
+            native_ok('update', *owned[offset:offset + 50], '--status', 'in_progress')
         target = sorted(owned)[-1]; base = self.tasks + '/' + target
         time.sleep(1.05)
         before = self.request('GET', base + '/brief', token=secret)
@@ -394,7 +398,7 @@ class RealStackOrderTests(held_stack.RealStackTests):
             activity_cursor=before.data['activity_cursor'], intent='scale', acceptance='flag survives cap',
             summary='working', next_action='read feedback', open_items=[], resolved=[]), token=secret)
         self.assertEqual(201, cp.status, cp.data)
-        self.native_ok('comments', 'add', target, 'Direction at the far end', '--author', 'scale-coordinator')
+        native_ok('comments', 'add', target, 'Direction at the far end', '--author', 'scale-coordinator')
         for _ in range(2):
             answer = self.request('GET', '/v1/agents/me/next', token=secret)
             self.assertEqual(200, answer.status, answer.data)
