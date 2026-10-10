@@ -73,21 +73,28 @@ export function credentialCommentLines(server, fingerprint) {
 // not an append: any earlier comment line is removed first, so a second set-up replaces it instead
 // of adding a second copy, and each comment ends with a newline, so the dialog's Notepad path --
 // which saves no final newline -- cannot glue a comment onto the header line (the extension's rule
-// then matches nothing; kittrial-5bb.203 review 01a12408, item 3a). The POSIX form writes a
-// same-directory temporary file, restricts it to its owner, and moves it over the original, so the
-// secret is never printed and never reaches a command line or a process argument list.
+// then matches nothing; kittrial-5bb.203 review 01a12408, item 3a). The POSIX form runs in a
+// subshell under `umask 077`, so the same-directory temporary file is created mode 600 from the
+// first byte -- it never holds the secret while it is group- or world-readable (review 01a12488,
+// item 3) -- and moves it over the original, so the secret is never printed and never reaches a
+// command line or a process argument list. The PowerShell form runs in its own scope (`& { ... }`)
+// so the `$c` that held the file's content does not stay in the session (review 01a12488, item 3).
+// Both forms leave the file ending with a newline, whatever the file held before (Notepad saves no
+// final newline; review 01a12488, item 4). If the credential file is a symlink, the move replaces
+// the symlink with a regular file and the old target keeps its own content (review 01a12488, item 3).
 const CREDENTIAL_COMMENT_PATTERN = "'^#[[:space:]]*server([[:space:]]+certificate[[:space:]]+sha256)?[[:space:]]*='";
 const POWERSHELL_COMMENT_PATTERN = "'(?m)^#[ \\t]*server([ \\t]+certificate[ \\t]+sha256)?[ \\t]*=[^\\r\\n]*\\r?\\n?'";
 export function credentialFileCommand(file, comments) {
   const quoted = comments.map((line) => `'${line}'`).join(' ');
   const powershellText = comments.map((line) => line.replace(/`/g, '``').replace(/\$/g, '`$').replace(/"/g, '`"'))
     .join('`r`n') + '`r`n';
-  const powershell = '$p="' + file.powershell + '"; $c=[IO.File]::ReadAllText($p); '
+  const powershell = '& { $p="' + file.powershell + '"; $c=[IO.File]::ReadAllText($p); '
     + '$c=[Text.RegularExpressions.Regex]::Replace($c,' + POWERSHELL_COMMENT_PATTERN + ",''); "
-    + '[IO.File]::WriteAllText($p,"' + powershellText + '" + $c)';
-  const posix = `printf '%s\\n' ${quoted} > ${file.posix}.new && `
+    + 'if ($c -and -not $c.EndsWith("`n")) { $c = $c + "`r`n" } '
+    + '[IO.File]::WriteAllText($p,"' + powershellText + '" + $c) }';
+  const posix = `( umask 077; rm -f ${file.posix}.new; printf '%s\\n' ${quoted} > ${file.posix}.new && `
     + `grep -vE ${CREDENTIAL_COMMENT_PATTERN} ${file.posix} >> ${file.posix}.new && `
-    + `chmod 600 ${file.posix}.new && mv ${file.posix}.new ${file.posix} || rm -f ${file.posix}.new`;
+    + `chmod 600 ${file.posix}.new && mv ${file.posix}.new ${file.posix} || rm -f ${file.posix}.new )`;
   return Object.freeze({ powershell, posix });
 }
 
@@ -136,7 +143,7 @@ export function agentGuide(payload) {
     '',
     '## Your secret',
     '',
-    `Your owner keeps your secret in a curl config file in their user profile: ${file.windows} on Windows, ${file.posix} on macOS/Linux. It holds one line, ${headerLine()}. Hand that file to curl with -K on every call. Never open, print or copy that file, and never put the secret on a command line, in this folder, in a commit or in any other file.`,
+    `Your owner keeps your secret in a curl config file in their user profile: ${file.windows} on Windows, ${file.posix} on macOS/Linux. It holds one line, ${headerLine()}. Hand that file to curl with -K on every call. Apart from the set-up step that rewrote that one file in place to put the comment lines above the header line (nothing was shown), never open, print or copy it, and never put the secret on a command line, in this folder, in a commit or in any other file.`,
     '',
     '## Every call',
     '',
@@ -205,16 +212,16 @@ export function setupPrompt(payload, { role = 'worker', certificate = null, brid
     '~~~markdown',
     agentGuide(payload).trimEnd(),
     '~~~',
-    `4. If this folder is a git repository and its .gitignore does not already list ${GITIGNORE_LINE}, add the line ${GITIGNORE_LINE} to .gitignore. Do not change any other file.`,
-    `5. Your secret is not in this message. I keep it in ${payload.secretFile.windows} (on macOS/Linux ${payload.secretFile.posix}); you hand that file to curl with -K, as AGENT.md says. Never open, print or copy that file, and never write the secret to a file, a commit or a command line.`,
+    `4. If this folder is a git repository and its .gitignore does not already list ${GITIGNORE_LINE}, add the line ${GITIGNORE_LINE} to .gitignore. Do not change any other file in this folder.`,
+    `5. Your secret is not in this message. I keep it in ${payload.secretFile.windows} (on macOS/Linux ${payload.secretFile.posix}); you hand that file to curl with -K, as AGENT.md says. Never open, print or copy that file, and never write the secret to a file, a commit or a command line -- with the single exception of step 6: that one command reads the credential file only to rewrite that same file in place, and it shows nothing.`,
     `6. Make the credential file ${payload.secretFile.windows} (macOS/Linux ${payload.secretFile.posix}) hold these comment lines as its FIRST lines, each on its own line ending with a newline, followed by whatever it already held (its header line):`,
     '~~~',
     ...comments,
     '~~~',
-    '   Run exactly one of these commands. Each one rewrites the file in place -- it never prints or copies what the file holds -- and removes any earlier copy of these comment lines first, so running it a second time leaves exactly the same content:',
+    '   Run exactly one of these commands. That command is the one exception to step 5: it reads the credential file only to rewrite that same file in place -- nothing is printed and the secret is copied nowhere else -- and it removes any earlier copy of these comment lines first, so running it a second time leaves exactly the same content:',
     `   - PowerShell: ${command.powershell}`,
     `   - macOS/Linux: ${command.posix}`,
-    '   The first line is the address the extension reads, so nobody types it. If the credential file does not exist yet, stop here and ask me for step 1 of the dialog first.',
+    '   The first line is the address the extension reads, so nobody types it. If that credential file is a symlink, the rewrite replaces the symlink with a regular file and the old target keeps its own content: keep it a regular file. If the credential file does not exist yet, stop here and ask me for step 1 of the dialog first.',
     `7. This window's role is ${roleWord}: when you run "Orchestra Bridge: Set up" in VS Code, choose ${roleWord} (the extension's own set-up writes the workspace settings from the address line above; the kit writes no settings file).`,
     `Then continue: ${resumePrompt(payload.name)}`,
     '',

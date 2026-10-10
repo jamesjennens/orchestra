@@ -1767,18 +1767,24 @@ with `POST /v1/agents/{id}/credentials/{credential}/revoke`).
 A service started with `--cert`/`--key` serves its own public leaf certificate at
 `GET /v1/service/certificate` **without a log-in**: the answer is
 `{"certificate": "<PEM>", "sha256": "<fingerprint>"}`, where the fingerprint is the SHA-256 of the
-leaf certificate's DER as uppercase hex pairs joined by colons — the same string
+certificate's DER as uppercase hex pairs joined by colons — the same string
 `openssl x509 -in <the certificate file> -noout -fingerprint -sha256` prints and the VS Code bridge
-extension shows before it trusts the server. The route never echoes the file `--cert` names: it
-reads that file as bytes (a non-UTF-8, Latin-1 comment beside the block must not stop the service),
-keeps only the first `-----BEGIN CERTIFICATE-----` block — the leaf the handshake presents — and
-re-encodes it. A combined key-and-certificate PEM (a supported start), a `TRUSTED CERTIFICATE`
-block, an `openssl x509 -text` dump, bag attributes and comments cannot reach the answer, and the
-private key is never served. The read is capped (1 MiB of file, 64 kB of base64 per block), so a
-64 MB file does not make every anonymous GET answer 64 MB: the answer is one leaf, about 1.2 kB. A
-service without its own certificate — plain HTTP, or the first-install tunnel — and a certificate
-file that cannot produce a leaf answer the ordinary `404`: nothing is served there, and neither
-case keeps the service from starting.
+extension shows before it trusts the server. What is served is the certificate the TLS handshake
+presents first, taken from the loaded TLS context: after `load_cert_chain` the service makes one
+in-memory handshake against that very context (`ssl.MemoryBIO` and `wrap_bio`, no socket, standard
+library) and keeps `getpeercert(binary_form=True)`, the DER of exactly the certificate a real client
+receives first, re-encoded here as the kit's own PEM. The `--cert` file is never read a second time
+and no armour is pattern-matched, so nothing OpenSSL does not itself load can reach the answer, and
+the private key is never served (a key's DER base64 inside `CERTIFICATE` armour, indented or after a
+line that merely ends with the armour, is invisible to the loader and to this route alike). A
+`TRUSTED CERTIFICATE` or `X509 CERTIFICATE` label, an older certificate kept above the real one and a
+comment that merely names the armour lines cannot make the route answer a certificate the handshake
+does not present. There is no size cap and no
+per-block cap any more — the route decodes nothing — so a 64 MB file does not make every anonymous
+GET answer 64 MB: the answer is one leaf, about 1.2 kB. A service without its own certificate —
+plain HTTP, or the first-install tunnel — and a context against which the in-memory handshake cannot
+be made answer the ordinary `404`: nothing is served there, never a `500` and never the raw file, and
+neither case keeps the service from starting.
 
 The My agents set-up dialog reads that route, shows the fingerprint and offers a Save button. It
 does **not** write the VS Code workspace settings and does not save a certificate for the
@@ -1795,7 +1801,13 @@ prompt writes:
   removes any earlier copy of those lines and puts each on its own line ending with a newline, so a
   second set-up changes nothing and the dialog's Notepad path — whose file has no final newline —
   cannot glue a comment onto the `header = ...` line. The secret is never printed and never put on a
-  command line: the POSIX command writes a mode-600 temporary file and moves it over the original,
+  command line: the POSIX command runs in a subshell under `umask 077`, so the same-directory
+  temporary file that receives the header line is created mode 600 from its first byte (before this
+  fix it was created with the umask's mode and held the secret until its `chmod 600`), and then moved
+  over the original; the PowerShell command runs in its own scope (`& { ... }`), so the variable that
+  held the file's content does not stay in the session. Both forms leave the file ending with a
+  newline. If the credential file is a symlink, the move replaces the symlink with a regular file and
+  the old target keeps its own content: keep the credential file a regular file. Nothing is printed,
   and `curl -K` reads the result as before.
 
 The dialog's certificate block says what comparing the fingerprint proves and what it does not: the

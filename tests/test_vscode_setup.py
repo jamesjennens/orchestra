@@ -1,17 +1,21 @@
-"""kittrial-5bb.203 review 01a12408: the certificate route, the fingerprint and the set-up prompt.
+"""kittrial-5bb.203 reviews 01a12408 and 01a12488: the certificate route, the fingerprint and the prompt.
 
 Three surfaces:
 
 * the service's own public leaf certificate at ``GET /v1/service/certificate``, served without a
   log-in by an https service that was given a certificate, with nothing served by a plain-http
-  one, and never anything but the leaf (item 1: a combined key-and-certificate PEM, a chain, a
-  64 MB file, an ``openssl x509 -text`` dump, a ``TRUSTED CERTIFICATE`` block and a block-like
-  comment must not change what the route answers, and a Latin-1 comment must not stop the
-  service from starting -- item 3b);
+  one, and never anything but what the TLS handshake presents first: the answer is taken from one
+  in-memory handshake against the loaded ``ssl.SSLContext`` (review 01a12488, items 1 and 2), so the
+  ``--cert`` file is not read a second time and no armour is pattern-matched. A combined key-and-
+  certificate PEM, a chain, a 64 MB file, an ``openssl x509 -text`` dump, a ``TRUSTED CERTIFICATE``
+  or ``X509 CERTIFICATE`` label, an old certificate kept above the real one, a block-like comment and
+  a key's DER inside ``CERTIFICATE`` armour all leave the answer exactly the handshake's first
+  certificate -- and a context the handshake cannot be made against answers 404, never 500;
 * the My agents dialog's set-up prompt (``web/js/agentSetup.js``): the two files in
   ``.orchestra/``, the ``# server = ADDRESS`` (and fingerprint) lines written into the credential
-  file's own content, idempotently, and NO ``.vscode/settings.json`` and no certificate file
-  (item 2: the extension's own "Orchestra Bridge: Set up" writes the settings from that address);
+  file's own content, idempotently, under ``umask 077`` in a subshell (review 01a12488, item 3),
+  and NO ``.vscode/settings.json`` and no certificate file (item 2: the extension's own
+  "Orchestra Bridge: Set up" writes the settings from that address);
 * the fingerprint in the dialog and the docs: what comparing it proves and what it does not.
 
 The fingerprint is checked against ``openssl x509 -noout -fingerprint -sha256`` where openssl
@@ -39,8 +43,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import http_service  # noqa: E402
 from http_auth import Service, Store  # noqa: E402
-from http_service import (MAX_CERTIFICATE_FILE_BYTES, certificate_fingerprint,  # noqa: E402
-                          create_server, service_certificate_pem)
+from http_service import (certificate_fingerprint, create_server,  # noqa: E402
+                          service_certificate_pem)
 from test_office_listener import OPENSSL, self_signed  # noqa: E402
 from test_http_service import unique_dir  # noqa: E402
 from test_http_web import WEB, run_node_module  # noqa: E402
@@ -97,6 +101,42 @@ def make_cert(directory, stem, name):
     return cert, key
 
 
+def relabel(certificate, label):
+    """The same certificate block under another label OpenSSL accepts (``TRUSTED CERTIFICATE``)."""
+    return (certificate.replace('BEGIN CERTIFICATE', 'BEGIN ' + label)
+            .replace('END CERTIFICATE', 'END ' + label))
+
+
+def server_context(certfile, keyfile=None):
+    """The TLS context ``create_server`` fills: ``load_cert_chain`` and the same minimum version.
+
+    What the route serves is asked of THIS object, so the test asks the same question the service
+    does (kittrial-5bb.203 review 01a12488, items 1 and 2).
+    """
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    context.load_cert_chain(str(certfile), str(keyfile) if keyfile else None)
+    return context
+
+
+def key_in_certificate_armour(key_path, indent='', first_line=''):
+    """The key file's base64 body re-wrapped in ``CERTIFICATE`` armour (reviewer shapes j2 and j3).
+
+    OpenSSL reads armour only at the start of a line, so a block whose ``BEGIN`` line is indented
+    (``indent='  '``) or merely ends a line that says something else (``first_line='note '``) is
+    invisible to the loader -- while a regex that searched anywhere in a line saw it and served the
+    private key (review 01a12488, item 1).
+    """
+    body = ''.join(re.findall(r'-----BEGIN [A-Z ]+-----(.*?)-----END [A-Z ]+-----',
+                              Path(key_path).read_text(encoding='ascii'), re.S)[0].split())
+    lines = [body[at:at + 64] for at in range(0, len(body), 64)]
+    block = [indent + '-----BEGIN CERTIFICATE-----'] + [indent + line for line in lines] \
+        + [indent + '-----END CERTIFICATE-----']
+    if first_line:
+        block[0] = first_line + '-----BEGIN CERTIFICATE-----'
+    return '\n'.join(block) + '\n'
+
+
 class CertificateFingerprintCase(unittest.TestCase):
     """The helper itself: the shape the extension shows, and a refusal that is not a certificate."""
 
@@ -115,7 +155,11 @@ class CertificateFingerprintCase(unittest.TestCase):
 
 
 class CertificateFileShapesCase(unittest.TestCase):
-    """``service_certificate_pem``: every shape of file ``--cert`` may name (item 1, no socket)."""
+    """``service_certificate_pem``: what the loaded context presents, for every ``--cert`` shape.
+
+    The file is never read here -- ``server_context`` is what the TLS loader filled, and the answer
+    is one in-memory handshake against it (review 01a12488, items 1 and 2). No socket is opened.
+    """
 
     def setUp(self):
         if not OPENSSL:
@@ -125,6 +169,7 @@ class CertificateFileShapesCase(unittest.TestCase):
         self.leaf, self.leaf_key = make_cert(self.tmp, 'leaf', 'leaf.example.invalid')
         self.middle, _ = make_cert(self.tmp, 'middle', 'middle.example.invalid')
         self.root_cert, _ = make_cert(self.tmp, 'root', 'root.example.invalid')
+        self.old_cert, _ = make_cert(self.tmp, 'old', 'old.example.invalid')
         self.leaf_pem = self.leaf.read_text(encoding='ascii')
 
     def write(self, name, data):
@@ -132,8 +177,12 @@ class CertificateFileShapesCase(unittest.TestCase):
         path.write_bytes(data if isinstance(data, bytes) else data.encode('utf-8'))
         return path
 
+    def served(self, certfile, keyfile=None):
+        """The PEM the route would serve for this start-up shape."""
+        return service_certificate_pem(server_context(certfile, keyfile))
+
     def test_separate_files_serve_the_leaf_re_encoded_by_the_kit(self):
-        served = service_certificate_pem(str(self.leaf))
+        served = self.served(self.leaf, self.leaf_key)
         self.assertEqual(der_of(self.leaf_pem), der_of(served))
         self.assertEqual(1, len(pem_blocks(served)))
         self.assertNotIn('PRIVATE KEY', served)
@@ -143,7 +192,7 @@ class CertificateFileShapesCase(unittest.TestCase):
         for name, combined in (('keyfirst.pem', key + self.leaf_pem),
                                ('certfirst.pem', self.leaf_pem + key)):
             with self.subTest(name=name):
-                served = service_certificate_pem(str(self.write(name, combined)))
+                served = self.served(self.write(name, combined))
                 self.assertEqual(der_of(self.leaf_pem), der_of(served))
                 self.assertNotIn('PRIVATE KEY', served)
                 self.assertNotIn(base64.b64encode(b'PRIVATE KEY').decode(), served)
@@ -151,7 +200,7 @@ class CertificateFileShapesCase(unittest.TestCase):
     def test_the_same_combined_file_as_certificate_and_key_serves_no_key(self):
         key = self.leaf_key.read_text(encoding='ascii')
         combined = self.write('both.pem', key + self.leaf_pem)
-        served = service_certificate_pem(str(combined))     # create_server passes it as both
+        served = self.served(combined, combined)            # create_server passes it as both
         self.assertEqual(der_of(self.leaf_pem), der_of(served))
         self.assertNotIn('PRIVATE KEY', served)
 
@@ -161,65 +210,74 @@ class CertificateFileShapesCase(unittest.TestCase):
         chain = self.write('chain.pem', self.leaf_pem
                            + self.middle.read_text(encoding='ascii')
                            + self.root_cert.read_text(encoding='ascii'))
-        served = service_certificate_pem(str(chain))
+        served = self.served(chain, self.leaf_key)
         self.assertEqual(der_of(self.leaf_pem), der_of(served))
         self.assertNotEqual(der_of(served, 0), der_of(self.root_cert.read_text(encoding='ascii')))
         self.assertEqual(colon_fingerprint(self.leaf_pem), certificate_fingerprint(served))
 
-    def test_a_huge_file_is_read_only_up_to_the_cap_and_serves_one_leaf(self):
+    def test_a_huge_file_starts_and_serves_the_handshake_leaf(self):
         huge = self.write('huge.pem', self.leaf_pem + '# filler\n' * (64 * ONE_MIB // 9))
         self.assertGreater(huge.stat().st_size, 64 * ONE_MIB)
-        served = service_certificate_pem(str(huge))
+        served = self.served(huge, self.leaf_key)
         self.assertEqual(der_of(self.leaf_pem), der_of(served))
         self.assertLess(len(served), 8192)                 # never as large as the file
 
-    def test_a_certificate_beyond_the_read_cap_cannot_be_produced(self):
-        beyond = self.write('beyond.pem', '# filler\n' * ((MAX_CERTIFICATE_FILE_BYTES + ONE_MIB) // 9)
-                            + self.leaf_pem)
-        self.assertGreater(beyond.stat().st_size, MAX_CERTIFICATE_FILE_BYTES)
-        self.assertIsNone(service_certificate_pem(str(beyond)))
+    def test_a_file_larger_than_the_old_read_cap_still_serves_the_handshake_leaf(self):
+        # The old route read at most 1 MiB (reviewer shape l3) and answered 404 for this file. It no
+        # longer reads the file at all, so the answer is the handshake's leaf (review 01a12488, item 4:
+        # the caps are gone -- say which).
+        big = self.write('comments.pem', ('# ordinary filler ' + '.' * 76 + '\n') * 21000 + self.leaf_pem)
+        self.assertGreater(big.stat().st_size, ONE_MIB)
+        self.assertEqual(der_of(self.leaf_pem), der_of(self.served(big, self.leaf_key)))
+
+    def test_a_block_larger_than_the_old_per_block_cap_is_never_decoded(self):
+        # The old route refused a block past 64 kB of base64; nothing is decoded now. The block here
+        # is invisible to OpenSSL (indented) and irrelevant to the answer, whatever its size.
+        huge_block = key_in_certificate_armour(self.leaf_key, indent='  ') * 260
+        served = self.served(self.write('bigblock.pem', huge_block + self.leaf_pem), self.leaf_key)
+        self.assertEqual(der_of(self.leaf_pem), der_of(served))
 
     def test_an_openssl_text_dump_is_never_echoed(self):
         text = subprocess.run([OPENSSL, 'x509', '-in', str(self.leaf), '-noout', '-text'],
                               capture_output=True, text=True, check=True).stdout
         dumped = self.write('text.pem', text + self.leaf_pem)
-        served = service_certificate_pem(str(dumped))
+        served = self.served(dumped, self.leaf_key)
         self.assertEqual(der_of(self.leaf_pem), der_of(served))
         self.assertNotIn('Certificate:', served)
         self.assertNotIn('Signature Algorithm', served)
         self.assertNotIn(text.strip()[:40], served)
 
-    def test_a_trusted_certificate_block_cannot_produce_a_leaf(self):
-        trusted = self.write('trusted.pem', self.leaf_pem.replace('BEGIN CERTIFICATE', 'BEGIN TRUSTED CERTIFICATE')
-                             .replace('END CERTIFICATE', 'END TRUSTED CERTIFICATE'))
-        self.assertIsNone(service_certificate_pem(str(trusted)))
+    def test_a_trusted_certificate_leaf_is_served_as_the_handshake_presents_it(self):
+        # Corrected: the old test asserted 404 here, pinning the mismatch the reviewer found
+        # (tests/test_vscode_setup.py:192 -> review 01a12488, item 2). OpenSSL accepts this label,
+        # so the handshake presents it and the route must serve it.
+        trusted = self.write('trusted.pem', relabel(self.leaf_pem, 'TRUSTED CERTIFICATE'))
+        served = self.served(trusted, self.leaf_key)
+        self.assertEqual(der_of(self.leaf_pem), der_of(served))
+        self.assertNotIn('PRIVATE KEY', served)
 
-    def test_a_block_like_comment_first_cannot_produce_a_leaf(self):
+    def test_a_block_like_comment_before_the_block_does_not_change_what_is_served(self):
+        # Corrected the same way: `:197` asserted 404 although the handshake presents a good leaf.
         commented = self.write('comment.pem', BLOCK_LIKE_COMMENT + self.leaf_pem)
-        self.assertIsNone(service_certificate_pem(str(commented)))
+        served = self.served(commented, self.leaf_key)
+        self.assertEqual(der_of(self.leaf_pem), der_of(served))
+
+    def test_a_context_with_no_certificate_can_produce_no_leaf(self):
+        # The one way the route answers 404 with a working service: the handshake cannot be made.
+        self.assertIsNone(service_certificate_pem(ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)))
 
     def test_a_latin1_comment_is_read_without_failing(self):
         latin = self.write('latin1.pem', b'# Zertifikat f\xfcr B\xfcro\n' + self.leaf_pem.encode('ascii'))
-        served = service_certificate_pem(str(latin))
+        served = self.served(latin, self.leaf_key)
         self.assertEqual(der_of(self.leaf_pem), der_of(served))
 
     def test_crlf_line_ends_are_fine(self):
         crlf = self.write('crlf.pem', self.leaf_pem.replace('\n', '\r\n'))
-        self.assertEqual(der_of(self.leaf_pem), der_of(service_certificate_pem(str(crlf))))
-
-    def test_a_file_that_is_not_there_yields_nothing(self):
-        self.assertIsNone(service_certificate_pem(str(self.tmp / 'not-there.pem')))
-
-    @unittest.skipUnless(os.name == 'posix', 'file modes are a POSIX property')
-    def test_an_unreadable_file_yields_nothing_instead_of_raising(self):
-        path = self.write('unreadable.pem', self.leaf_pem)
-        os.chmod(path, 0)
-        self.addCleanup(os.chmod, path, 0o600)
-        self.assertIsNone(service_certificate_pem(str(path)))
+        self.assertEqual(der_of(self.leaf_pem), der_of(self.served(crlf, self.leaf_key)))
 
 
 class CertificateRouteCase(unittest.TestCase):
-    """A real TLS listener: the route answers anonymously, and only ever with the leaf."""
+    """A real TLS listener: the route answers anonymously with the handshake's first certificate."""
 
     def setUp(self):
         if not OPENSSL:
@@ -229,6 +287,7 @@ class CertificateRouteCase(unittest.TestCase):
         self.leaf, self.leaf_key = make_cert(self.tmp, 'leaf', 'leaf.example.invalid')
         self.middle, _ = make_cert(self.tmp, 'middle', 'middle.example.invalid')
         self.root_cert, _ = make_cert(self.tmp, 'root', 'root.example.invalid')
+        self.old_cert, _ = make_cert(self.tmp, 'old', 'old.example.invalid')
         self.leaf_pem = self.leaf.read_text(encoding='ascii')
 
     def write(self, name, data):
@@ -236,8 +295,8 @@ class CertificateRouteCase(unittest.TestCase):
         path.write_bytes(data if isinstance(data, bytes) else data.encode('utf-8'))
         return path
 
-    def serve(self, certfile, keyfile=None, tls=True):
-        """A real listener on 127.0.0.1, https with the given files or plain http when not tls."""
+    def serve_server(self, certfile, keyfile=None, tls=True):
+        """The real listener ``create_server`` made, for a test that must change something on it."""
         state = unique_dir('vscode-state-')
         self.addCleanup(shutil.rmtree, state, ignore_errors=True)
         store = Store(state / 'state.json')
@@ -250,10 +309,14 @@ class CertificateRouteCase(unittest.TestCase):
         thread = threading.Thread(target=httpd.serve_forever, daemon=True)
         thread.start()
         self.addCleanup(lambda: (httpd.shutdown(), httpd.server_close(), thread.join(timeout=5)))
-        return httpd.server_address[1]
+        return httpd
+
+    def serve(self, certfile, keyfile=None, tls=True):
+        """A real listener on 127.0.0.1, https with the given files or plain http when not tls."""
+        return self.serve_server(certfile, keyfile, tls).server_address[1]
 
     def request(self, tls, port, path, cert=None, method='GET', body=None, headers=None):
-        """Return (status, body, peer DER): the peer certificate is the handshake's own leaf."""
+        """Return (status, body, peer DER): the peer certificate is the handshake's own first one."""
         if tls:
             context = (ssl.create_default_context(cafile=str(cert)) if cert
                        else ssl._create_unverified_context())
@@ -280,7 +343,8 @@ class CertificateRouteCase(unittest.TestCase):
         answer = self.answer(status, body)
         self.assertEqual(der_of(self.leaf_pem), der_of(answer['certificate']))
         self.assertNotIn('PRIVATE KEY', answer['certificate'])
-        self.assertEqual(colon_of_der(peer), answer['sha256'])              # the handshake's own leaf
+        self.assertEqual(peer, der_of(answer['certificate']))               # the handshake's own first
+        self.assertEqual(colon_of_der(peer), answer['sha256'])
         self.assertEqual(self.openssl_fingerprint(self.leaf_pem), answer['sha256'])
         key = self.leaf_key.read_text(encoding='ascii')
         self.assertNotIn(key.strip(), body.decode())
@@ -323,16 +387,65 @@ class CertificateRouteCase(unittest.TestCase):
         status, body, peer = self.request(True, port, '/v1/service/certificate')
         answer = self.answer(status, body)
         self.assertEqual(der_of(self.leaf_pem), der_of(answer['certificate']))
+        self.assertEqual(peer, der_of(answer['certificate']))
         self.assertEqual(colon_of_der(peer), answer['sha256'])
         self.assertEqual(colon_fingerprint(self.leaf_pem), answer['sha256'])
+
+    def shapes_that_used_to_serve_the_key_or_the_wrong_certificate(self):
+        """The reviewer's j2, j3, h2, h3, i2, i3 files, built here from fresh certificates."""
+        leaf_key = self.leaf_key
+        return {
+            # j2/j3: the private key's DER base64 inside CERTIFICATE armour, where OpenSSL does not
+            # read armour -- indented, or after a line that merely ends with it. The old route served
+            # the KEY for these two (review 01a12488, item 1).
+            'j2': (self.write('j2.pem', key_in_certificate_armour(leaf_key, indent='  ') + self.leaf_pem), leaf_key),
+            'j3': (self.write('j3.pem', key_in_certificate_armour(leaf_key, first_line='note ') + self.leaf_pem), leaf_key),
+            # h2/h3: a leaf under a label OpenSSL accepts but the old regex did not, before a chain.
+            'h2': (self.write('h2.pem', relabel(self.leaf_pem, 'TRUSTED CERTIFICATE')
+                              + self.middle.read_text(encoding='ascii')
+                              + self.root_cert.read_text(encoding='ascii')), leaf_key),
+            'h3': (self.write('h3.pem', relabel(self.leaf_pem, 'X509 CERTIFICATE')
+                              + self.middle.read_text(encoding='ascii')
+                              + self.root_cert.read_text(encoding='ascii')), leaf_key),
+            # i2: one comment line that merely names both armour lines (served 12 bytes of nothing).
+            'i2': (self.write('i2.pem', '# a -----BEGIN CERTIFICATE----- line then data then '
+                              '-----END CERTIFICATE----- line\n' + self.leaf_pem), leaf_key),
+            # i3: an old certificate kept indented above the real one (served the OLD one).
+            'i3': (self.write('i3.pem', '# the certificate we used before (kept for reference):\n'
+                              + ''.join('    ' + line + '\n'
+                                        for line in self.old_cert.read_text(encoding='ascii').splitlines())
+                              + self.leaf_pem), leaf_key),
+        }
+
+    def test_the_shapes_that_used_to_serve_the_key_or_the_wrong_certificate(self):
+        """j2, j3, h2, h3, i2, i3 served by the running service: what the handshake presents.
+
+        Every one of these made the delivered pattern-matching route answer 200 with the private key
+        or with a certificate the handshake does not present (review 01a12488, items 1 and 2). In each
+        served case the served DER and the route's fingerprint are compared with the first certificate
+        of a real handshake against that same running service.
+        """
+        for name, (path, key) in self.shapes_that_used_to_serve_the_key_or_the_wrong_certificate().items():
+            with self.subTest(shape=name):
+                port = self.serve(path, key)
+                status, body, peer = self.request(True, port, '/v1/service/certificate')
+                answer = self.answer(status, body)
+                self.assertNotIn('PRIVATE KEY', body.decode())
+                self.assertEqual(der_of(self.leaf_pem), der_of(answer['certificate']),
+                                 '%s: the served certificate is not the handshake leaf' % name)
+                self.assertEqual(peer, der_of(answer['certificate']),
+                                 '%s: served != the first certificate of the real handshake' % name)
+                self.assertEqual(colon_of_der(peer), answer['sha256'], name)
+                self.assertEqual(colon_fingerprint(self.leaf_pem), answer['sha256'], name)
 
     def test_a_huge_file_starts_and_answers_one_small_leaf(self):
         huge = self.write('huge.pem', self.leaf_pem + '# filler\n' * (64 * ONE_MIB // 9))
         port = self.serve(huge, self.leaf_key)
-        status, body, _ = self.request(True, port, '/v1/service/certificate')
+        status, body, peer = self.request(True, port, '/v1/service/certificate')
         answer = self.answer(status, body)
         self.assertLess(len(body), 8192)
         self.assertEqual(der_of(self.leaf_pem), der_of(answer['certificate']))
+        self.assertEqual(peer, der_of(answer['certificate']))
 
     def test_a_latin1_comment_file_starts_and_serves_the_leaf(self):
         latin = self.write('latin1.pem', b'# Zertifikat f\xfcr B\xfcro\n' + self.leaf_pem.encode('ascii'))
@@ -340,17 +453,18 @@ class CertificateRouteCase(unittest.TestCase):
         status, body, _ = self.request(True, port, '/v1/service/certificate')
         self.assertEqual(der_of(self.leaf_pem), der_of(self.answer(status, body)['certificate']))
 
-    def test_a_file_that_cannot_produce_a_leaf_answers_404_not_500(self):
-        trusted = self.write('trusted.pem', self.leaf_pem.replace('BEGIN CERTIFICATE', 'BEGIN TRUSTED CERTIFICATE')
-                             .replace('END CERTIFICATE', 'END TRUSTED CERTIFICATE'))
-        commented = self.write('comment.pem', BLOCK_LIKE_COMMENT + self.leaf_pem)
-        for name, path in (('trusted', trusted), ('comment-like-block', commented)):
-            with self.subTest(name=name):
-                port = self.serve(path, self.leaf_key)
-                status, body, _ = self.request(True, port, '/v1/service/certificate')
-                self.assertEqual(404, status, body)         # never 500
-                status, body, _ = self.request(True, port, '/healthz')
-                self.assertEqual(200, status, body)         # the service is up
+    def test_a_context_the_handshake_cannot_be_made_against_answers_404_not_500(self):
+        # The route's 404: a service whose TLS context could present no certificate still starts and
+        # answers nothing there (review 01a12488, item 2).
+        httpd = self.serve_server(self.leaf, self.leaf_key)
+        port = httpd.server_address[1]
+        status, body, _ = self.request(True, port, '/v1/service/certificate')
+        self.assertEqual(200, status, body)                 # before: the handshake's leaf
+        httpd.tls_certificate_pem = None
+        status, body, _ = self.request(True, port, '/v1/service/certificate')
+        self.assertEqual(404, status, body)                 # never 500, never the raw file
+        status, body, _ = self.request(True, port, '/healthz')
+        self.assertEqual(200, status, body)                 # the service is up
 
     def test_a_plain_http_service_serves_nothing_there(self):
         port = self.serve(self.leaf, self.leaf_key, tls=False)
@@ -435,14 +549,18 @@ console.log(JSON.stringify({
         result = self.run_script()
         posix, powershell = result['posixCommand'], result['powershellCommand']
         self.assertIsNotNone(posix)
-        self.assertTrue(posix.startswith("printf '%s\\n'"), posix)
-        # A rewrite: remove any earlier comment line, keep the header line, and re-enter the file
-        # through a mode-600 temporary file (item 3a). A plain `>>` append is what M8 was.
+        # A rewrite, in a subshell under umask 077 so the temporary file that holds the header line
+        # is never group- or world-readable (review 01a12488, item 3). A plain `>>` append is M8.
+        self.assertTrue(posix.startswith('( umask 077; '), posix)
+        self.assertIn("printf '%s\\n'", posix)
         self.assertIn('grep -vE', posix)
         self.assertIn('chmod 600', posix)
         self.assertIn('mv ', posix)
         self.assertIn('.orchestra-agent-kestrel.curlrc.new', posix)   # only the temp file is appended to
         self.assertIsNotNone(powershell)
+        # The PowerShell form runs in its own scope, so $c does not stay in the session (item 3).
+        self.assertTrue(powershell.startswith('& { '), powershell)
+        self.assertTrue(powershell.endswith(' }'), powershell)
         self.assertIn('Regex]::Replace', powershell)
         self.assertIn('WriteAllText', powershell)
         self.assertNotIn('Add-Content', powershell)          # the old append-every-time command
@@ -450,7 +568,12 @@ console.log(JSON.stringify({
 
 
 class CredentialFileRewriteCase(unittest.TestCase):
-    """The prompt's own POSIX command, run twice against a Notepad-style file (item 3a)."""
+    """The prompt's own POSIX command, run twice against a Notepad-style file (items 3a and 3).
+
+    The three POSIX runs need node (the command is read out of the real module) AND a POSIX shell
+    with a real HOME: they are skipped on koopa (no node) and on Windows (WSL's bash is not this
+    test's filesystem), so they happen only in CI's two ubuntu jobs (review 01a12488, item 4).
+    """
 
     HEADER = 'header = "Authorization: Bearer SECRET-XYZ-123"'
 
@@ -458,7 +581,8 @@ class CredentialFileRewriteCase(unittest.TestCase):
         """The prompt's own two rewrite commands, read out of the real module under node."""
         node = shutil.which('node')
         if not node:
-            self.skipTest('node is not installed; SetupPromptCase carries the static rule')
+            self.skipTest('needs node to read the prompt\'s own command out of web/js/agentSetup.js; '
+                          'runs only in the ubuntu CI jobs, which have node and a shell')
         script = ("const m = await import(process.argv[1]);"
                   "const p = m.secretlessPayload({agent:{id:'a',name:'Kestrel',projects:['p1']}},"
                   "'https://ignored.example.invalid');"
@@ -474,11 +598,12 @@ class CredentialFileRewriteCase(unittest.TestCase):
     def prompt_posix_command(self):
         commands = self.prompt_commands()
         if os.name != 'posix' or not BASH:
-            # On Windows `bash` is the WSL stub, whose HOME and filesystem are not this test's;
-            # the authoritative run of the prompt's own line is the Linux one.
-            self.skipTest('the POSIX command is run where a POSIX shell and HOME are the real ones')
+            # Needs node (above) AND a POSIX shell with a real HOME. On Windows `bash` is the WSL
+            # stub, whose HOME and filesystem are not this test's, and Koopa has no node: these three
+            # runs happen only in CI's two ubuntu jobs (review 01a12488, item 4).
+            self.skipTest('needs node and a POSIX shell with a real HOME; runs only in the two ubuntu CI jobs')
         command = commands['posix']
-        self.assertTrue(command.startswith("printf '%s\\n'"), command)
+        self.assertTrue(command.startswith('( umask 077; '), command)
         return command
 
     def prompt_powershell_command(self):
@@ -486,7 +611,7 @@ class CredentialFileRewriteCase(unittest.TestCase):
         if os.name != 'nt' or not POWERSHELL:
             self.skipTest('the PowerShell command is run where PowerShell is the real one')
         command = commands['powershell']
-        self.assertTrue(command.startswith('$p='), command)
+        self.assertTrue(command.startswith('& { $p='), command)
         return command
 
     def run_command(self, command, home):
@@ -495,7 +620,8 @@ class CredentialFileRewriteCase(unittest.TestCase):
 
     def assert_file_shape(self, path):
         text = path.read_text(encoding='utf-8')
-        lines = text.split('\n')
+        # PowerShell writes CRLF; sh writes LF. Both must satisfy the same shape (review item 4).
+        lines = [line.rstrip('\r') for line in text.split('\n')]
         address = [line for line in lines if re.fullmatch(r'#\s*server\s*=\s*https?://\S+', line)]
         fingerprint = [line for line in lines if re.fullmatch(r'#\s*server certificate sha256 = \S+', line)]
         self.assertEqual(1, len(address), text)
@@ -504,6 +630,8 @@ class CredentialFileRewriteCase(unittest.TestCase):
         # an append onto it produced `header = "..."# server = ...` on one line (review item 3a).
         self.assertIn(self.HEADER, lines, text)
         self.assertEqual([], [line for line in lines if self.HEADER in line and line != self.HEADER], text)
+        # And the Notepad file must come out WITH a final newline, in both forms (review item 4).
+        self.assertTrue(text.endswith('\n'), repr(text[-40:]))
 
     def test_the_command_is_idempotent_and_survives_a_missing_final_newline(self):
         command = self.prompt_posix_command()
@@ -527,6 +655,28 @@ class CredentialFileRewriteCase(unittest.TestCase):
         path = home / '.orchestra-agent-kestrel.curlrc'
         self.run_command(command, home)
         self.assertFalse(path.exists())                     # nothing half-written
+        self.assertFalse((home / '.orchestra-agent-kestrel.curlrc.new').exists())
+
+    @unittest.skipUnless(os.name == 'posix', 'the temporary file\'s mode is a POSIX property')
+    def test_the_temporary_file_is_never_group_or_world_readable(self):
+        # The reviewer stopped the command before its own `chmod 600` and found the file mode 664
+        # while it held the header line with the secret (their F2, ev/05-follow-posix.txt). Here the
+        # command's own prefix -- everything up to the chmod, with the subshell closed -- is run, and
+        # the file it wrote the header line into must already be mode 600 (review 01a12488, item 3).
+        command = self.prompt_posix_command()
+        head, _, _ = command.partition(' && chmod 600')
+        self.assertNotEqual(command, head, 'the command no longer reaches its chmod step')
+        home = unique_dir('vscode-home-')
+        self.addCleanup(shutil.rmtree, home, ignore_errors=True)
+        path = home / '.orchestra-agent-kestrel.curlrc'
+        path.write_text(self.HEADER + '\n', encoding='utf-8')
+        proc = subprocess.run([BASH, '-c', head + ' )'], env=dict(os.environ, HOME=str(home)),
+                              capture_output=True, text=True)
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        temporary = home / '.orchestra-agent-kestrel.curlrc.new'
+        self.assertTrue(temporary.exists(), 'the stopped command left no temporary file to check')
+        self.assertEqual(0o600, temporary.stat().st_mode & 0o777)
+        self.assertIn(self.HEADER, temporary.read_text(encoding='utf-8'))
 
     def test_the_powershell_command_is_idempotent_too(self):
         command = self.prompt_powershell_command()
@@ -617,13 +767,44 @@ class TheDialogAndThePageCase(unittest.TestCase):
         self.assertIn('grep -vE', rewrite)
         self.assertIn('chmod 600', rewrite)
         self.assertIn('Regex]::Replace', rewrite)
+        # Review 01a12488 item 3: the POSIX temp file is created under umask 077 and the PowerShell
+        # form keeps $c in its own scope.
+        self.assertIn('( umask 077; ', rewrite)
+        self.assertIn('& { $p=', rewrite)
         self.assertIsNone(re.search(r'\bsecret\b|\bcredential\b', re.sub(r"'[^']*'", "''", rewrite)))
         prompt = re.search(r'export function setupPrompt\(payload, \{.*?\n\}', setup, re.S).group(0)
         self.assertIn('The first line is the address the extension reads, so nobody types it', prompt)
-        self.assertIn('it never prints or copies what the file holds', prompt)
+        # The steps no longer contradict each other: step 5 names the step-6 command as its one
+        # exception and step 6 says exactly what that command does (review 01a12488, item 3).
+        self.assertIn('the single exception of step 6', prompt)
+        self.assertIn('the one exception to step 5', prompt)
+        self.assertIn('nothing is printed and the secret is copied nowhere else', prompt)
+        self.assertIn('Do not change any other file in this folder', prompt)
+        self.assertNotIn('it never prints or copies what the file holds', prompt)
         self.assertIn('the kit writes no settings file', prompt)
         self.assertNotIn('settings.json', prompt)
         self.assertNotIn('caFile', prompt)
+
+    def test_the_docs_say_what_is_served_and_the_temporary_files_mode(self):
+        # Review 01a12488, item 4: the sentences the code and the old summary made untrue.
+        docs = (ROOT / 'docs' / 'HTTP_DEPLOYMENT.md').read_text(encoding='utf-8')
+        self.assertIn('the certificate the TLS handshake\npresents first, taken from the loaded TLS context', docs)
+        self.assertIn('the private key is never served', docs)
+        self.assertIn('There is no size cap and no\nper-block cap', docs)
+        self.assertIn('umask 077', docs)
+        self.assertIn('mode 600', docs)
+        self.assertIn('symlink', docs)
+        design = (ROOT / 'docs' / 'HTTP_TRANSPORT_DESIGN.md').read_text(encoding='utf-8')
+        self.assertNotIn('read capped at 1 MiB', design)
+        self.assertIn('the certificate the handshake presents first', design)
+        proposal = json.loads((ROOT / 'capability-proposals' /
+                               'http.service-own-certificate.json').read_text(encoding='utf-8'))
+        summary = proposal['summary']
+        self.assertIn('the one the TLS handshake presents first', summary)
+        self.assertIn('the private key is never served', summary)
+        self.assertIn('no size or per-block cap', summary)
+        self.assertIn('umask 077', summary)
+        self.assertLessEqual(len(summary), 1200)
 
     def test_the_route_table_lists_the_certificate_route(self):
         design = (ROOT / 'docs' / 'HTTP_TRANSPORT_DESIGN.md').read_text(encoding='utf-8')
