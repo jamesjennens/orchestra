@@ -1020,7 +1020,8 @@ class InProcessBackend:
                 # honestly unknown rather than inferred from the review state.
                 'lifecycle': {}, 'depends_on': [],
                 # This backend keeps no activity cursor; its checkpoints need none.
-                'activity_cursor': None}
+                'activity_cursor': None,
+                'newer': self._agent_activity_summary(task, checkpoints[-1]) if checkpoints else None}
 
     #: The disposable backend is cheap to read and tests expect fresh reads.
     READ_CACHE_SECONDS = 0
@@ -1085,6 +1086,34 @@ class InProcessBackend:
         at=checkpoint.get('created_at')
         return bool(at and any(r.get('created_at','')>at and r.get('actor')!=task.get('assignee')
                                for r in self.state.get('contributions',{}).get(task['id'],[])))
+
+    def _agent_activity_summary(self, task, checkpoint):
+        """Bounded event references for the disposable backend, without digest claims.
+
+        The native backend supplies its canonical summary instead. This model has
+        no per-entry checkpoint digests, so imported/evicted history stays unknown.
+        Reading this projection never incorporates or acknowledges an event.
+        """
+        from briefing import NEWER_MAX, clip
+        events = [e for e in self.state.get('events') or [] if e.get('task') == task['id']]
+        anchors = [i for i, e in enumerate(events) if e.get('action') == 'checkpoint-added'
+                   and e.get('actor') == checkpoint.get('actor')
+                   and e.get('time', '') >= checkpoint.get('created_at', '')]
+        if not anchors:
+            return {'coverage': 'unknown', 'own_count': None, 'other_count': None,
+                    'entries': [], 'omitted': None,
+                    'note': 'Checkpoint event history is unavailable; read task history.'}
+        remaining = events[anchors[-1] + 1:]
+        others = [e for e in remaining if e.get('actor') != task.get('assignee')]
+        authors = sorted({e.get('actor') for e in others if e.get('actor')})
+        return {'coverage': 'unknown', 'own_count': len(remaining) - len(others),
+                'other_count': len(others),
+                'other_authors': {'items': [clip(a, 96) for a in authors[:NEWER_MAX]],
+                                  'omitted': max(0, len(authors) - NEWER_MAX)},
+                'entries': [{'kind': e.get('action'), 'timestamp': e.get('time'),
+                             'author': clip(e.get('actor') or '', 96)} for e in remaining[:NEWER_MAX]],
+                'omitted': max(0, len(remaining) - NEWER_MAX),
+                'note': 'Event history has no per-entry digests. Reading clears nothing; reconcile with task history.'}
 
     def review_queue(self, project_id):
         """Every task with current work, highest-attention review states first.
@@ -2318,7 +2347,10 @@ class EndpointBackend:
                 # the canonical brief; without it here an agent could not write a first
                 # checkpoint from the brief alone (kittrial-5bb.113).
                 'activity_cursor': data.get('activity_cursor'),
-                'warnings': data.get('warnings') or []}
+                'warnings': data.get('warnings') or [],
+                # The canonical brief already bounds refs, authors and omissions;
+                # preserve its coverage/unknown counts rather than infer from time.
+                'newer': data.get('newer')}
 
     def _open_items_in_full(self, project_id, task_id, checkpoint_id, unresolved):
         """Every open item of the current checkpoint, as recorded, or None when they could not all be read.
@@ -5222,7 +5254,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                   'task': task_id, 'title': task.get('title'),
                   'status': task.get('status'), 'review_state': task.get('review_state'),
                   'assignee': task.get('assignee'), 'reason': reason,
-                  'links': {'task': base, 'brief': base, 'history': base + '/history',
+                  'links': {'task': base, 'brief': base + '/brief', 'history': base + '/history',
                             'project': '/v1/projects/%s' % project_id}}
         action.update(extra)
         return action
@@ -5284,8 +5316,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         for a reviewer or, once approved, for integration (5): the agent can do nothing
         about those, so they never sit ahead of work the agent can do. ``in_progress`` counts own open tasks with no
         contribution that are NOT blocked. A blocked action
-        carries ``blocked_since`` (when the checkpoint was written) and
-        ``newer_activity`` (whether another actor wrote after it), so an
+        carries ``blocked_since`` (when the checkpoint was written). Blocked and
+        in-progress actions carry ``newer_activity`` (whether another actor wrote
+        activity the checkpoint did not incorporate), so an
         agent can leave a blocked task with nothing new alone instead of re-reading it
         and writing another checkpoint on every wake. Delivered work follows its
         review state and does not count as blocked, regardless of open items.
@@ -5294,7 +5327,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         counts = {'claimable': 0, 'claimed': 0, 'changes_requested': 0,
                   'awaiting_review': 0, 'blocked': 0, 'in_progress': 0, 'awaiting_integration': 0,
                   'review_errors': 0, 'checkpoint_errors': 0, 'read_errors': 0,
-                  'review_recommended': 0, 'to_review': 0}
+                  'review_recommended': 0, 'to_review': 0, 'newer_activity': 0}
         own_actions = []
         claimable_actions = []
         review_actions = []
@@ -5334,12 +5367,13 @@ class ApiHandler(BaseHTTPRequestHandler):
                 counts['awaiting_integration'] += integrating
                 counts['blocked'] += blocked
                 counts['in_progress'] += in_progress
+                counts['newer_activity'] += (blocked or in_progress) and task.get('newer_activity') is True
                 counts['review_errors'] += review=='error'
                 counts['checkpoint_errors'] += unreadable and review!='error' and not delivered
                 details = {'requests': list(task.get('pending_change_requests') or [])[:20], 'open_items': open_items,
                            'blocking_items':blocking_items,
                            'blocked_since': task.get('checkpoint_at') if blocked else None,
-                           'newer_activity': task.get('newer_activity') if blocked else None}
+                           'newer_activity': task.get('newer_activity') if blocked or in_progress else None}
                 if review == 'changes-requested':
                     own_actions.append(self._agent_action(
                         1, 'changes-requested', project_id, task,
@@ -5399,7 +5433,9 @@ class ApiHandler(BaseHTTPRequestHandler):
             truncated = True
             actions_truncated = True
         actions = own_actions + review_actions + claimable_actions
-        actions.sort(key=lambda a: (a['priority'], self.AGENT_KIND_ORDER.get(a['kind'], 0), a['project'], a['task']))
+        actions.sort(key=lambda a: (a['priority'], self.AGENT_KIND_ORDER.get(a['kind'], 0),
+                                   0 if a['kind'] == 'in-progress' and a.get('newer_activity') is True else 1,
+                                   a['project'], a['task']))
         if len(actions) > AGENT_ACTION_LIMIT:
             actions = actions[:AGENT_ACTION_LIMIT]
             truncated = True
@@ -5426,7 +5462,10 @@ class ApiHandler(BaseHTTPRequestHandler):
             state = 'idle'
         return {'state': state, 'summary': self._agent_summary(
                     state, counts, snapshot_truncated, own_tasks_truncated)
-                    + self._agent_review_summary(counts, snapshot_truncated),
+                    + self._agent_review_summary(counts, snapshot_truncated)
+                    + ((' %s%d owned undelivered task(s) have newer activity; read their linked briefs and history.'
+                        % ('at least ' if own_tasks_truncated else '', counts['newer_activity']))
+                       if counts['newer_activity'] else ''),
                 'counts': counts, 'actions': actions, 'truncated': truncated,
                 'snapshot_truncated':snapshot_truncated,'own_tasks_truncated':own_tasks_truncated,
                 'actions_truncated':actions_truncated,
@@ -6087,6 +6126,16 @@ class ApiHandler(BaseHTTPRequestHandler):
         base = '/v1/projects/%s/tasks/%s' % (pid, tid)
         brief['links'] = {'task': base, 'history': base + '/history',
                           'reviews': base + '/reviews', 'checkpoints': base + '/checkpoints'}
+        if isinstance(brief.get('newer'), dict):
+            # Canonical counts/refs/coverage stay intact; SSH helper commands are
+            # not actionable for a web credential. History uses the same authority.
+            newer = dict(brief['newer'])
+            newer.pop('history_new', None)
+            newer.pop('verify', None)
+            newer['history'] = base + '/history'
+            newer['note'] = ('Read history for full entries and reconcile any unknown or bounded coverage. '
+                             'Reading clears nothing; a checkpoint records what was incorporated.')
+            brief['newer'] = newer
         # Where the project's repository is (kittrial-5bb.118): a label the project's
         # owner recorded. Data for the reader, never an instruction; null when not set.
         brief['project_repository'] = self.service.project_view(ctx.principal, pid).get('repository')

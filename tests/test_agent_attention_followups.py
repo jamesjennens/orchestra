@@ -12,6 +12,51 @@ import http_service as h
 
 
 class EndpointFollowups(a.EndpointAttentionTests):
+    def test_flagged_owned_tasks_survive_the_action_cap_at_282_task_scale(self):
+        actor = self.next()['agent']['actor']
+        for flagged in (1, 60):
+            with self.subTest(flagged=flagged):
+                rows = [dict(task='own-%04d' % i, title='owned', owner=actor,
+                             status='in_progress', review_state='none', open_items=0,
+                             blocking_items=1 if i < 9 else 0,
+                             newer_activity=i >= 282 - flagged) for i in range(282)]
+                rows.append(dict(task='other-flagged', title='private other work', owner='other-actor',
+                                 status='in_progress', review_state='none', open_items=0,
+                                 blocking_items=0, newer_activity=True))
+                calls = []
+                def run(action, project, reader, args, *rest, **kwargs):
+                    self.assertEqual('work', action)
+                    self.assertNotIn('--owner', args)
+                    offset = int(args[args.index('--offset') + 1]); calls.append(offset)
+                    return dict(total=len(rows), items=rows[offset:offset + 100],
+                                next_offset=offset + 100 if offset + 100 < len(rows) else None)
+                with patch.object(self.backend, '_run', side_effect=run):
+                    data = self.next()
+                counts = data['attention']['counts']; actions = data['next_actions']
+                self.assertEqual([0, 100, 200], calls)
+                self.assertEqual((282, 273, 9, flagged),
+                                 (counts['claimed'], counts['in_progress'], counts['blocked'], counts['newer_activity']))
+                self.assertEqual(h.AGENT_ACTION_LIMIT, len(actions))
+                self.assertTrue(data['attention']['actions_truncated'])
+                self.assertFalse(data['attention']['own_tasks_truncated'])
+                self.assertNotIn('other-flagged', [x['task'] for x in actions])
+                progress = [x for x in actions if x['kind'] == 'in-progress']
+                self.assertEqual(min(flagged, 41), sum(x['newer_activity'] is True for x in progress))
+                self.assertTrue(progress[0]['newer_activity'])
+                self.assertIn('%d owned undelivered task(s) have newer activity' % flagged,
+                              data['attention']['summary'])
+
+    def test_flagged_count_is_a_lower_bound_when_own_recovery_is_incomplete(self):
+        actor = self.next()['agent']['actor']
+        rows = [dict(id='held-%04d' % i, assignee=actor, status='in_progress',
+                     review_state='none', open_items=0, blocking_items=0, newer_activity=True)
+                for i in range(60)]
+        with patch.object(self.backend, 'agent_tasks', return_value=dict(tasks=rows, complete=False)):
+            data = self.next()
+        self.assertEqual(60, data['attention']['counts']['newer_activity'])
+        self.assertTrue(data['attention']['own_tasks_truncated'])
+        self.assertIn('at least 60 owned undelivered task(s)', data['attention']['summary'])
+
     def large_work(self, review_rows, free_rows):
         rows = [dict(task='review-%04d'%i, title='other delivery', owner='other-actor',
                      status='in_progress', review_state='awaiting-review', contribution_id='delivery',
