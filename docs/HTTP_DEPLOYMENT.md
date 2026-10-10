@@ -1250,10 +1250,13 @@ revision-3 item 3(1)), and the three shapes of it are told apart:
   ids and the repair: "The project's tracker holds unreadable row(s) ID..., so it was not
   read as a whole tracker: the unreadable row may be the row that holds a name. An
   operator must repair the row (for deeply nested metadata: bd update ID
-  --unset-metadata KEY; for a row split by its own text: re-enter the text), then try
-  again." Not transient either -- the row stays unreadable until an operator repairs it,
-  so the answer never says "try again shortly" -- and nothing is kept: the idempotency
-  key stays free. Why the whole read refuses: rows nested up to 750 levels parse
+  --unset-metadata KEY) if a second try gives the same answer, then try again." Not
+  transient either -- the row stays unreadable until an operator repairs it, so the
+  answer never says "try again shortly" -- but a cut export or an error line among the
+  rows can be a passing bd fault, so the repair is asked for only after a second try
+  gives the same answer. At most five ids of the tracker's id shape are named, then
+  "and K more"; an id not of that shape is counted, never printed (kittrial-5bb.243 r2
+  review item 1). Nothing is kept: the idempotency key stays free. Why the whole read refuses: rows nested up to 750 levels parse
   normally and their names count, but an UNREADABLE row may be the row that holds the
   name, and a name the tracker might hold must not become issuable or writable through a
   worker credential; hiding the row must not free the name.

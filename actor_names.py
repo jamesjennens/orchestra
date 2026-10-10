@@ -94,6 +94,14 @@ class TrackerMergeSlotMissing(ValueError):
         super().__init__(message or self.MESSAGE)
 
 
+#: The shape of an id the unreadable-rows sentence will print: a tracker id, never text a
+#: row's own body chose (a newline, an escape sequence, a bidi override or a 10,000-character
+#: id must not become the 503 message). The same shape record_json recovers ids with.
+ROW_ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,160}\Z')
+#: How many unreadable row ids the sentence names; the rest are counted, not printed.
+NAMED_ROWS_MAX = 5
+
+
 class TrackerRowsUnreadable(TrackerUnreadable):
     """The export was read, but it holds a row that cannot be (kittrial-5bb.221 r2, .243).
 
@@ -112,21 +120,34 @@ class TrackerRowsUnreadable(TrackerUnreadable):
     ids and the repair. Rows nested up to 750 levels parse normally and their names count;
     only what cannot be read lands here (kittrial-5bb.239 framed the export at the line
     feed alone, so a U+0085 inside a string no longer cuts a row; whatever its framing
-    still cannot read lands here).
+    still cannot read lands here). A cut export or an error line among the rows can also
+    be a passing bd fault, so the sentence asks for a second try before the repair.
+
+    The ids it names are bounded and checked (:data:`NAMED_ROWS_MAX`, :data:`ROW_ID`): an
+    error body must stay short and plain whatever the rows hold, so at most five ids of
+    the tracker's id shape are printed, then "and K more"; an id that is not of that shape
+    is counted, never printed. ``ids`` carries exactly what the sentence names.
     """
 
     MESSAGE = ("The project's tracker holds a row that cannot be read, so it was not read as a "
                "whole tracker: the unreadable row may be the row that holds a name. An operator "
                "must repair the row (for deeply nested metadata: bd update ID --unset-metadata "
-               "KEY; for a row split by its own text: re-enter the text), then try again.")
+               "KEY) if a second try gives the same answer, then try again.")
 
     def __init__(self, ids=(), message=None):
-        # The sentence travels with the exception, naming the unreadable rows when their ids
-        # could be recovered; a bare `raise TrackerRowsUnreadable()` still names the repair.
-        self.ids = tuple(i for i in ids if isinstance(i, str) and i) or None
+        # The sentence travels with the exception, naming at most NAMED_ROWS_MAX unreadable
+        # rows whose ids match the tracker's id shape, then counting the rest; a bare
+        # `raise TrackerRowsUnreadable()` still names the repair. `ids` is what was named,
+        # so the web service can build its answer from fields instead of a stderr tail.
+        given = [i for i in ids if isinstance(i, str) and i]
+        named = [i for i in given if ROW_ID.fullmatch(i)][:NAMED_ROWS_MAX]
+        more = len(given) - len(named)
+        self.ids = tuple(named) if named else None
+        self.total = len(given)
         if message is None and self.ids:
+            named_text = ', '.join(named) + (', and %d more' % more if more else '')
             message = self.MESSAGE.replace('a row that cannot be read',
-                                           'unreadable row(s) %s' % ', '.join(self.ids), 1)
+                                           'unreadable row(s) %s' % named_text, 1)
         super(TrackerUnreadable, self).__init__(message or self.MESSAGE)
 
 

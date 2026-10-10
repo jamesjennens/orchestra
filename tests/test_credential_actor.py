@@ -528,6 +528,28 @@ class IssueCase(HostNames, fixes.EndpointCase):
         for name in ('alice', 'ops-lead', 'verity', SESSION_A):
             self.assertNotIn(name, json.dumps(refused.data))
 
+    def test_the_superuser_waiver_does_not_cross_an_unreadable_row(self):
+        """kittrial-5bb.243 r2 review item 3: `allow_actor` waives the ROW rule only -- the
+        tracker is still read to bound the rows, and a row that cannot be read still
+        refuses the issue. A mutant that lets the waiver skip the read must fail here."""
+        self.project()
+        self.host(tracker='unreadable', unreadable_rows=[{'id': 'probe-deep'}])
+        admin = self.admin_token()
+        refused = self.request('POST', self.credentials,
+                               {'actor': 'opus-worker-lane', 'allow_actor': True,
+                                'allow_actor_reason': 'the lane owns this name'}, token=admin, key='waiver-1')
+        self.assertEqual(503, refused.status, refused.data)
+        self.assertEqual('unreadable_rows', refused.data['error']['code'])
+        self.assertIn('probe-deep', message(refused))
+        self.assertIn('second try', message(refused))
+        self.assertEqual([], [c for c in self.listed_without_asking() if c.get('actor') == 'opus-worker-lane'])
+        # And the key is not spent: with the tracker readable again the same key issues.
+        self.host(authors=['opus-worker-lane'])
+        allowed = self.request('POST', self.credentials,
+                               {'actor': 'opus-worker-lane', 'allow_actor': True,
+                                'allow_actor_reason': 'the lane owns this name'}, token=admin, key='waiver-1')
+        self.assertEqual(201, allowed.status, allowed.data)
+
     def test_a_name_the_trackers_rows_already_hold_is_refused_and_a_superuser_may_allow_it(self):
         """kittrial-5bb.188 items 1 and 4 at issue: the reviewer's `opus-worker-lane` case."""
         self.project()
@@ -716,12 +738,15 @@ class IssueCase(HostNames, fixes.EndpointCase):
         self.assertEqual(actor_names.ROWS, refused.data['error']['detail']['rule'])
 
     def test_an_export_that_answers_no_rows_issues_nothing(self):
-        """kittrial-5bb.188 item 1 at issue: nothing was changed, and the key stays free."""
+        """kittrial-5bb.188 item 1 at issue: nothing was changed, and the key stays free.
+        Since kittrial-5bb.243 the unreadable-row shape is its own 503 (unreadable_rows);
+        nothing is issued and the key stays free exactly the same."""
         self.project()
         self.host(tracker='unreadable')
         refused = self.request('POST', self.credentials, {'actor': 'lane-empty'}, token=self.alex, key='empty-key-1')
         self.assertEqual(503, refused.status, refused.data)
-        self.assertIn('Nothing was changed', message(refused))
+        self.assertEqual('unreadable_rows', refused.data['error']['code'])
+        self.assertIn('second try', message(refused))
         self.assertEqual([], self.listed_without_asking())
         self.host()
         self.assertEqual(201, self.request('POST', self.credentials, {'actor': 'lane-empty'},
@@ -1043,6 +1068,12 @@ class UseCase(HostNames, fixes.EndpointCase):
                     self.assertIn('merge-create', said)
                     self.assertNotIn('try again shortly', said)
                     self.assertEqual('merge_slot_missing', refused.data['error']['code'])
+                elif mode == 'unreadable':
+                    # kittrial-5bb.243: a row that cannot be read is its own non-transient
+                    # answer, naming the repair after a second try.
+                    self.assertIn('second try', said)
+                    self.assertNotIn('try again shortly', said)
+                    self.assertEqual('unreadable_rows', refused.data['error']['code'])
                 else:
                     self.assertIn('Nothing was changed', said)
                     self.assertEqual('unavailable', refused.data['error']['code'])
@@ -1452,6 +1483,45 @@ class RealEndpointCase(unittest.TestCase):
                 self.assertNotIn('try again shortly', answer['stderr'])
                 self.assertIn('--unset-metadata', answer['stderr'])
 
+    def test_the_unreadable_row_ids_are_bounded_and_checked(self):
+        """kittrial-5bb.243 r2 review item 1: a thousand unreadable rows name five ids and
+        count the rest, an id not of the tracker's shape is never printed, and the web
+        answer is built from the fault's fields, not from a stderr tail a row shaped."""
+        thousand = ['{"id": "probe-%d", "created_by": "x", "metadata": %s}' % (i, '[' * 900 + ']' * 900)
+                    for i in range(1000)]
+        hostile = ('{"id": "' + 'x' * 500 + '\\n\\r\\u202e", "created_by": "y", "metadata": '
+                   + '[' * 900 + ']' * 900 + '}')
+        with self.subTest(answer='a thousand rows'):
+            self._whole_tracker_script(*thousand)
+            raised = None
+            try:
+                self.endpoint.tracker_actors(self.root, self.project)
+            except actor_names.TrackerRowsUnreadable as error:
+                raised = error
+            self.assertIsNotNone(raised)
+            self.assertEqual(5, len(raised.ids))
+            self.assertLess(len(str(raised)), 600)
+            self.assertIn('and 995 more', str(raised))
+            answer = self.write('worker-a', self.credential('worker-a', rows_checked=False,
+                                                            created_at='2026-10-07T00:00:00Z'), 'thousand')
+            self.assertEqual((2, 'unreadable-rows'), (answer['returncode'], answer.get('fault')), answer)
+            self.assertEqual(5, len(answer['unreadable_rows']))
+            self.assertLess(len(answer['stderr']), 600)
+        with self.subTest(answer='a hostile id'):
+            self._whole_tracker_script(hostile)
+            raised = None
+            try:
+                self.endpoint.tracker_actors(self.root, self.project)
+            except actor_names.TrackerRowsUnreadable as error:
+                raised = error
+            self.assertIsNotNone(raised)
+            self.assertIsNone(raised.ids)               # not of the tracker's id shape: counted, not printed
+            self.assertNotIn('x' * 50, str(raised))
+            import http_service
+            failure = http_service.EndpointBackend._rows_unreadable(['x' * 500 + '\\n' + '\\u202e'])
+            self.assertNotIn('x' * 50, failure.message)  # built from fields, never a stderr tail
+            self.assertEqual('unreadable_rows', failure.code)
+
     def test_one_row_nested_65_levels_is_read_and_its_names_count(self):
         """kittrial-5bb.221: the 64-level comment guard refused the whole project's read on
         one row nested 65 levels. The row bound of kittrial-5bb.141 (750) applies: this row
@@ -1831,23 +1901,33 @@ class TrackerFaultTests(unittest.TestCase):
         sentence = ("TrackerRowsUnreadable: The project's tracker holds unreadable row(s) pp-9, so it was "
                     "not read as a whole tracker: the unreadable row may be the row that holds a name. "
                     "An operator must repair the row (for deeply nested metadata: bd update ID "
-                    "--unset-metadata KEY; for a row split by its own text: re-enter the text), "
-                    "then try again.\n")
+                    "--unset-metadata KEY) if a second try gives the same answer, then try again.\n")
         for reading in (True, False):
             with self.subTest(reading=reading):
                 with self.assertRaises(http_service.HttpError) as failed:
                     http_service.EndpointBackend._checked(
-                        {'returncode': 2, 'stdout': '', 'stderr': sentence, 'fault': 'unreadable-rows'},
-                        'actor-standing', reading=reading)
+                        {'returncode': 2, 'stdout': '', 'stderr': sentence, 'fault': 'unreadable-rows',
+                         'unreadable_rows': ['pp-9']}, 'actor-standing', reading=reading)
                 error = failed.exception
                 self.assertEqual((503, True), (error.status, getattr(error, 'nothing_done', False)))
                 self.assertEqual('unreadable_rows', error.code)
                 self.assertIn('pp-9', error.message)
                 self.assertIn('--unset-metadata', error.message)
+                self.assertIn('second try', error.message)
                 self.assertNotIn('try again shortly', error.message)
+                self.assertNotIn('re-enter the text', error.message)
                 self.assertNotEqual(http_service.EndpointBackend.UNREAD, error.message)
                 self.assertNotEqual('unavailable', error.code)
-        # With no sentence to carry, the fixed one answers, still its own code.
+        # The message is built from the fault's fields: the ids ride as a field, and a
+        # stderr tail shaped like a row's body never becomes the message (r2 review item 1).
+        with self.assertRaises(http_service.HttpError) as failed:
+            http_service.EndpointBackend._checked(
+                {'returncode': 2, 'stdout': '', 'stderr': '', 'fault': 'unreadable-rows',
+                 'unreadable_rows': ['pp-9']}, 'actor-standing', reading=True)
+        self.assertEqual((503, 'unreadable_rows'), (failed.exception.status, failed.exception.code))
+        self.assertIn('pp-9', failed.exception.message)
+        self.assertEqual(['pp-9'], failed.exception.unreadable_rows)
+        # With no ids at all, the fixed one answers, still its own code.
         with self.assertRaises(http_service.HttpError) as failed:
             http_service.EndpointBackend._checked(
                 {'returncode': 2, 'stdout': '', 'stderr': '', 'fault': 'unreadable-rows'},

@@ -1573,7 +1573,7 @@ class EndpointBackend:
             # transient either: an operator must repair the row, so the caller gets the
             # endpoint's own sentence naming the row ids and the repair, its own code, and
             # never UNREAD's "try again shortly" (kittrial-5bb.243 item N7).
-            raise cls._rows_unreadable(stderr)
+            raise cls._rows_unreadable(reply.get('unreadable_rows'), stderr)
         if isinstance(reply, dict) and reply.get('fault') == 'merge-slot':
             # The tracker was read but carries no merge-slot row: rows that came back without
             # it, or a readable tracker with no rows at all, the plain `bd init` shape
@@ -1655,17 +1655,29 @@ class EndpointBackend:
     #: (kittrial-5bb.243 item N7).
     ROWS_UNREADABLE = ("The project's tracker holds a row that cannot be read, so it was not read as a whole "
                        "tracker: the unreadable row may be the row that holds a name. An operator must repair "
-                       "the row, then try again.")
+                       "the row (for deeply nested metadata: bd update ID --unset-metadata KEY) if a second "
+                       "try gives the same answer, then try again.")
+
+    #: The id shape the unreadable-rows answer prints, and how many: the same bound and
+    #: check actor_names.TrackerRowsUnreadable applies, so a row body never becomes the
+    #: error message (kittrial-5bb.243 r2 review item 1).
 
     @classmethod
-    def _rows_unreadable(cls, stderr=''):
-        # The endpoint's stderr carries 'TrackerRowsUnreadable: <sentence naming the ids>';
-        # that sentence is the answer when it arrived, the fixed one otherwise.
-        said = stderr.strip().splitlines()[-1].strip() if stderr.strip() else ''
-        if said.startswith('TrackerRowsUnreadable:'):
-            said = said.split(': ', 1)[1].strip()
-        failure = HttpError(503, 'unreadable_rows', said or cls.ROWS_UNREADABLE)
+    def _rows_unreadable(cls, ids=None, stderr=''):
+        # The answer is built from the fault's own fields, never from a stderr tail a row
+        # could shape (r2 review item 1): the endpoint sends the ids it named, already
+        # bounded to the tracker's id shape, and the sentence is composed here. The stderr
+        # tail is only a legacy fallback for an endpoint that sends none.
+        import actor_names
+        named = [i for i in (ids or ()) if isinstance(i, str) and actor_names.ROW_ID.fullmatch(i)][:actor_names.NAMED_ROWS_MAX]
+        message = cls.ROWS_UNREADABLE
+        if named:
+            message = cls.ROWS_UNREADABLE.replace(
+                'holds a row that cannot be read',
+                'holds unreadable row(s) %s' % ', '.join(named), 1)
+        failure = HttpError(503, 'unreadable_rows', message)
         failure.nothing_done = True
+        failure.unreadable_rows = named
         return failure
 
     #: Said when the endpoint reports that the server's configuration file cannot be read.

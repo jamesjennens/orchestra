@@ -2055,8 +2055,10 @@ def descriptor_actor_denial(request, authority_config, reserved):
             # The export was read but holds a row that cannot be parsed: its own mark and its
             # own sentence naming the row ids and the operator repair, never "try again
             # shortly" (kittrial-5bb.243 item N7). This arm is BEFORE the bare fault's
-            # because the exception subclasses it.
-            return _envelope(2, stderr='%s\n' % rows_unreadable, fault='unreadable-rows')
+            # because the exception subclasses it. The ids ride as a bounded, checked field
+            # for the service, never as a stderr tail (r2 review item 1).
+            return _envelope(2, stderr='%s\n' % rows_unreadable, fault='unreadable-rows',
+                             unreadable_rows=list(rows_unreadable.ids or ()))
         except actor_names.TrackerUnreadable as unreadable:
             # Not a refusal of the request: the tracker could not be read (item 1).
             return _envelope(2, stderr='%s\n' % unreadable, fault='tracker')

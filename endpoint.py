@@ -1422,7 +1422,11 @@ def main():
             # The export was read but holds a row that cannot be parsed: not transient, so
             # its own mark and its own sentence naming the row ids and the operator repair
             # (kittrial-5bb.243 item N7), beside the bare fault above for older readers.
+            # The ids ride as a field, bounded and checked by the exception itself, so the
+            # web service builds its answer from them and never from a stderr tail a row
+            # could shape (r2 review item 1).
             answer['fault']='unreadable-rows'
+            answer['unreadable_rows']=list(e.ids or ())
         if isinstance(e,actor_names.TrackerMergeSlotMissing):
             # The read came back without the merge slot (rows, or no rows at all): not
             # transient, so its own mark and its own sentence naming the merge-create repair
