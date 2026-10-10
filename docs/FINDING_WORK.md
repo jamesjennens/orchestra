@@ -37,10 +37,13 @@ its last checkpoint.
 
 **Agent:** `GET /v1/agents/me/next`. The reply lists its own tasks first: changes
 requested, then a task blocked by its last checkpoint, then a task in progress.
-Not there yet for an agent: a comment written on a task it has **in progress** is not
-flagged in that reply, and the task's brief over the web carries no comments (a comment
-on a task it left **blocked** is flagged). Until it is, an agent that expects word from
-its coordinator reads the task's history: `GET /v1/projects/PROJECT/tasks/TASK/history`.
+Blocked and in-progress tasks carry `newer_activity`: whether another actor wrote
+activity its last checkpoint did not incorporate. No checkpoint or uncertain history
+stays unknown. Read the linked task brief before acting: its `newer` summary gives
+bounded entry references, counts and coverage. Read the task's history for the full
+comments: `GET /v1/projects/PROJECT/tasks/TASK/history`. Reading acknowledges nothing.
+This is the current-attention read (kittrial-5bb.114); it does not wait for activity or
+deliver a wake notification (the separate kittrial-5bb.207).
 
 ### 3. Only when none of its own tasks needs action: the ready list
 
@@ -85,8 +88,8 @@ workers.
 Every worker over SSH reads it at the start of its next run and acknowledges the
 version it read.
 
-**In the web interface today: no.** The set-up page shows whether guidance is set. It
-cannot set it, and an agent with a web credential does not receive it (planned:
+**In the web interface today: no.** The set-up page, for owners and superusers only,
+shows whether guidance is set. It cannot set it, and an agent with a web credential does not receive it (planned:
 kittrial-5bb.212).
 
 **The command today,** on the server, by an operator: `admin.py --root ROOT
@@ -106,9 +109,10 @@ task page. Giving a task to somebody else is not there yet (planned: kittrial-5b
 
 For a worker over SSH it shows as newer activity when the worker next reads its own
 tasks (`work --mine`, `brief TASK --json`). For an agent with a web credential it is
-flagged only on a task the agent left blocked; on a task in progress the agent must
-read the task's history to see it (see step 2 above). So do not rely on a comment alone
-to reach a web agent that is busy: assign, or request changes on what it delivered.
+flagged on both blocked and in-progress tasks in the next-action reply, and the linked
+brief carries the newer summary (see step 2 above). The agent reads the full history
+to learn what the comments say. A delivered task follows its review state; request
+changes on its contribution for review feedback.
 
 **In the web interface today: no.** The task page shows the task's history. Writing a
 comment over the web is not there yet (planned: kittrial-5bb.211). A review that

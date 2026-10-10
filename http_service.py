@@ -1020,7 +1020,8 @@ class InProcessBackend:
                 # honestly unknown rather than inferred from the review state.
                 'lifecycle': {}, 'depends_on': [],
                 # This backend keeps no activity cursor; its checkpoints need none.
-                'activity_cursor': None}
+                'activity_cursor': None,
+                'newer': self._agent_activity_summary(task, checkpoints[-1]) if checkpoints else None}
 
     #: The disposable backend is cheap to read and tests expect fresh reads.
     READ_CACHE_SECONDS = 0
@@ -1085,6 +1086,34 @@ class InProcessBackend:
         at=checkpoint.get('created_at')
         return bool(at and any(r.get('created_at','')>at and r.get('actor')!=task.get('assignee')
                                for r in self.state.get('contributions',{}).get(task['id'],[])))
+
+    def _agent_activity_summary(self, task, checkpoint):
+        """Bounded event references for the disposable backend, without digest claims.
+
+        The native backend supplies its canonical summary instead. This model has
+        no per-entry checkpoint digests, so imported/evicted history stays unknown.
+        Reading this projection never incorporates or acknowledges an event.
+        """
+        from briefing import NEWER_MAX, clip
+        events = [e for e in self.state.get('events') or [] if e.get('task') == task['id']]
+        anchors = [i for i, e in enumerate(events) if e.get('action') == 'checkpoint-added'
+                   and e.get('actor') == checkpoint.get('actor')
+                   and e.get('time', '') >= checkpoint.get('created_at', '')]
+        if not anchors:
+            return {'coverage': 'unknown', 'own_count': None, 'other_count': None,
+                    'entries': [], 'omitted': None,
+                    'note': 'Checkpoint event history is unavailable; read task history.'}
+        remaining = events[anchors[-1] + 1:]
+        others = [e for e in remaining if e.get('actor') != task.get('assignee')]
+        authors = sorted({e.get('actor') for e in others if e.get('actor')})
+        return {'coverage': 'unknown', 'own_count': len(remaining) - len(others),
+                'other_count': len(others),
+                'other_authors': {'items': [clip(a, 96) for a in authors[:NEWER_MAX]],
+                                  'omitted': max(0, len(authors) - NEWER_MAX)},
+                'entries': [{'kind': e.get('action'), 'timestamp': e.get('time'),
+                             'author': clip(e.get('actor') or '', 96)} for e in remaining[:NEWER_MAX]],
+                'omitted': max(0, len(remaining) - NEWER_MAX),
+                'note': 'Event history has no per-entry digests. Reading clears nothing; reconcile with task history.'}
 
     def review_queue(self, project_id):
         """Every task with current work, highest-attention review states first.
@@ -2291,7 +2320,10 @@ class EndpointBackend:
                 # the canonical brief; without it here an agent could not write a first
                 # checkpoint from the brief alone (kittrial-5bb.113).
                 'activity_cursor': data.get('activity_cursor'),
-                'warnings': data.get('warnings') or []}
+                'warnings': data.get('warnings') or [],
+                # The canonical brief already bounds refs, authors and omissions;
+                # preserve its coverage/unknown counts rather than infer from time.
+                'newer': data.get('newer')}
 
     def _open_items_in_full(self, project_id, task_id, checkpoint_id, unresolved):
         """Every open item of the current checkpoint, as recorded, or None when they could not all be read.
@@ -5257,8 +5289,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         for a reviewer or, once approved, for integration (5): the agent can do nothing
         about those, so they never sit ahead of work the agent can do. ``in_progress`` counts own open tasks with no
         contribution that are NOT blocked. A blocked action
-        carries ``blocked_since`` (when the checkpoint was written) and
-        ``newer_activity`` (whether another actor wrote after it), so an
+        carries ``blocked_since`` (when the checkpoint was written). Blocked and
+        in-progress actions carry ``newer_activity`` (whether another actor wrote
+        activity the checkpoint did not incorporate), so an
         agent can leave a blocked task with nothing new alone instead of re-reading it
         and writing another checkpoint on every wake. Delivered work follows its
         review state and does not count as blocked, regardless of open items.
@@ -5312,7 +5345,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 details = {'requests': list(task.get('pending_change_requests') or [])[:20], 'open_items': open_items,
                            'blocking_items':blocking_items,
                            'blocked_since': task.get('checkpoint_at') if blocked else None,
-                           'newer_activity': task.get('newer_activity') if blocked else None}
+                           'newer_activity': task.get('newer_activity') if blocked or in_progress else None}
                 if review == 'changes-requested':
                     own_actions.append(self._agent_action(
                         1, 'changes-requested', project_id, task,

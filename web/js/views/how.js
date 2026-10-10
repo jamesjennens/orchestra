@@ -7,7 +7,7 @@
 // (the server address, the project, the names of the reader's own agents) and says which are
 // left to replace. No prompt contains a secret: the page never has one.
 import { h, copyButton } from '../dom.js';
-import { pageHead, errorState } from '../ui.js';
+import { pageHead } from '../ui.js';
 import { markdown } from '../md.js';
 import * as setupText from '../agentSetup.js';
 
@@ -16,13 +16,29 @@ export const PROMPTS = { agent: 'poll-prompt-agent', first: 'worker-prompt', wor
 
 // Puts the values the page knows into a prompt. Returns the text and the named values still to replace.
 export function fill(prompt, values) {
-  let text = String(prompt || '');
-  for (const [name, value] of Object.entries(values || {})) {
-    if (typeof value === 'string' && value) text = text.split(name).join(value);
-  }
   const left = [];
-  for (const found of text.match(/\bREPLACE_[A-Z][A-Z_]*[A-Z]\b/g) || []) if (!left.includes(found)) left.push(found);
+  const text = String(prompt || '').replace(/\bREPLACE_[A-Z][A-Z_]*[A-Z]\b/g, (name) => {
+    const value = Object.hasOwn(values || {}, name) ? values[name] : null;
+    if (typeof value === 'string' && value) return value;
+    if (!left.includes(name)) left.push(name);
+    return name;
+  });
   return { text, left };
+}
+
+// These are document reads: failure cannot leave a write awaiting confirmation.
+export function documentError(error, retry) {
+  const status = error && error.status;
+  const message = status === 401 ? 'Your session has ended. Sign in again to read the documents.' :
+    status === 403 ? 'You do not have access to these documents.' :
+    status === 404 || status === 501 ? 'This server does not provide the work-finding documents. Ask its operator to update the installed kit.' :
+    status === 0 ? 'The server could not be reached. Try loading the documents again.' :
+    'The work-finding documents could not be loaded. Try again; if this continues, ask the operator to check the installed kit.';
+  return h('div', { class: 'panel' }, h('div', { class: 'empty', role: 'alert' },
+    h('strong', null, status === 403 ? 'No access' : 'Could not load the documents'),
+    h('p', null, message),
+    error && error.requestId ? h('p', { class: 'small mono' }, 'Request ' + error.requestId) : null,
+    retry ? h('button', { type: 'button', onclick: retry }, 'Try again') : null));
 }
 
 // The document without its first heading: the page has its own title.
@@ -54,7 +70,7 @@ export async function page(ctx, { pid }) {
     try {
       [how, prompts] = await Promise.all([ctx.api.doc(DOCUMENT),
         Promise.all(Object.values(PROMPTS).map((name) => ctx.api.doc(name)))]);
-    } catch (error) { host.replaceChildren(head(), errorState(error, draw)); return; }
+    } catch (error) { host.replaceChildren(head(), documentError(error, draw)); return; }
     // The reader's own agents that work in this project. A reader who has none still sees the prompt.
     try { agents = ((await ctx.api.agents()).items || []); } catch { agents = []; }
     const mine = agents.filter((a) => a && ctx.me && a.owner === ctx.me.id && a.enabled !== false

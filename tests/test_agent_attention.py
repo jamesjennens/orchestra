@@ -7,6 +7,7 @@ stub (the real ``work.queue``, ``review_workflow`` and ``briefing``) and, in a s
 form, over the in-process backend.
 """
 import json
+import os
 import secrets
 import sys
 import unittest
@@ -242,6 +243,51 @@ class EndpointAttentionTests(fixes.EndpointCase):
         action=next(x for x in self.next()['next_actions'] if x['task']==task)
         self.assertTrue(action['newer_activity'])
 
+    @patch.dict(os.environ, {'PYTHONUTF8': '1'})
+    def test_in_progress_activity_and_web_summary_are_read_only(self):
+        task = self.tasks[0]; self.claim(task)
+        self.assertIsNone(next(x for x in self.next()['next_actions'] if x['task'] == task)['newer_activity'])
+        self.assertIsNone(self.request('GET', self.base(task) + '/brief', token=self.secret).data['newer'])
+        self.checkpoint(task, [])
+        actor = self.next()['agent']['actor']
+        self.native(actor)(['comments', 'add', task, 'Own progress.'])
+        action = next(x for x in self.next()['next_actions'] if x['task'] == task)
+        self.assertEqual((action['kind'], action['newer_activity']), ('in-progress', False))
+        self.native('blair')(['comments', 'add', task, '<script>read this</script>\u0085second line'])
+        canonical_before = (self.canonical_root / 'canonical.json').read_bytes()
+        for _ in range(2):
+            action = next(x for x in self.next()['next_actions'] if x['task'] == task)
+            self.assertEqual((action['kind'], action['priority'], action['newer_activity']), ('in-progress', 3, True))
+            web = self.request('GET', self.base(task) + '/brief', token=self.secret)
+            self.assertEqual(200, web.status, web.data)
+            summary = web.data['newer']
+            self.assertGreaterEqual(summary['own_count'], 1)
+            self.assertGreaterEqual(summary['other_count'], 1)
+            self.assertEqual(summary['coverage'], 'unknown')  # digest capture remains off
+            self.assertLessEqual(len(summary['entries']), 5)
+            self.assertIn('Reading clears nothing', summary['note'])
+        self.assertEqual(canonical_before, (self.canonical_root / 'canonical.json').read_bytes())
+
+    @patch.dict(os.environ, {'PYTHONUTF8': '1'})
+    def test_canonical_newer_omissions_and_unknown_are_preserved(self):
+        task = self.tasks[0]; self.claim(task); self.checkpoint(task, [])
+        for i in range(9):
+            self.native('blair')(['comments', 'add', task, 'Direction %d' % i])
+        canonical = self.backend._run('brief', self.project, 'reader', [task, '--json'])
+        summary = self.request('GET', self.base(task) + '/brief', token=self.secret).data['newer']
+        self.assertEqual(summary, canonical['newer'])
+        self.assertGreater(summary['omitted'], 0)
+        self.assertEqual(len(summary['entries']), 5)
+        self.assertEqual(summary['coverage'], 'unknown')
+        run = self.backend._run
+        for value in (None, {'coverage': 'windowed', 'own_count': 0, 'other_count': None,
+                            'entries': [], 'omitted': 13, 'unverified_count': 19}):
+            def bounded(action, *args, **kwargs):
+                data = run(action, *args, **kwargs)
+                return dict(data, newer=value) if action == 'brief' else data
+            with patch.object(self.backend, '_run', side_effect=bounded):
+                self.assertEqual(self.request('GET', self.base(task) + '/brief', token=self.secret).data['newer'], value)
+
     def test_malformed_review_reports_operator_action_instead_of_empty_work(self):
         task=self.tasks[0];self.claim(task)
         self.native('blair')(['comments','add',task,'Kind: contribution-review-v1\n{'])
@@ -436,6 +482,24 @@ class InProcessAttentionTests(test_http_agents.AgentHarness):
         self.assertEqual(changed.status,200,changed.data)
         action=next(x for x in self.next()['next_actions'] if x['task']==task)
         self.assertTrue(self.backend.agent_tasks(self.project)['tasks'][0]['newer_activity'])
+
+    def test_in_progress_edits_have_a_bounded_summary_without_acknowledgement(self):
+        task = self.task('working'); base = '/v1/projects/%s/tasks/%s' % (self.project, task)
+        self.request('POST', base + '/claim', token=self.secret)
+        cp = self.request('POST', base + '/checkpoints', {'previous': None, 'summary': 'working', 'open_items': []}, token=self.secret)
+        self.assertEqual(201, cp.status, cp.data)
+        for i in range(8):
+            version = self.backend.state['tasks'][task]['version']
+            answer = self.request('PATCH', base, {'description': 'owner update %d <img>' % i, 'version': version}, token=self.alex)
+            self.assertEqual(200, answer.status, answer.data)
+        before = json.dumps(self.backend.state, sort_keys=True)
+        for _ in range(2):
+            action = next(x for x in self.next()['next_actions'] if x['task'] == task)
+            self.assertEqual((action['kind'], action['newer_activity']), ('in-progress', True))
+            summary = self.request('GET', base + '/brief', token=self.secret).data['newer']
+            self.assertEqual((summary['other_count'], len(summary['entries']), summary['omitted']), (8, 5, 3))
+            self.assertEqual(summary['coverage'], 'unknown')
+        self.assertEqual(before, json.dumps(self.backend.state, sort_keys=True))
 
     def test_every_other_open_review_state_names_who_acts_next(self):
         task=self.task('held');actor=self.next()['agent']['actor']

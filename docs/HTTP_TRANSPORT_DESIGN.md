@@ -204,6 +204,12 @@ own machine and pull work over the API without SSH or shared directories.
   Action kind names are the contract; numeric priority values are relative sorting
   hints and may change. Other own review states still receive an action naming
   their state and who acts next, including an operator action for malformed history.
+  Blocked and in-progress actions expose `newer_activity` from the current-work
+  projection: external activity not incorporated by the latest checkpoint. Missing
+  checkpoint or uncertain history stays unknown. The linked brief's additive
+  `newer` field retains the canonical bounded summary and its coverage/omissions;
+  no read incorporates activity or acknowledges a direction. This current read is
+  separate from a held request or wake notification.
   A replacement contribution does not answer outstanding review items: submit
   structured responses against the current contribution as well.
   There is no scheduler, background job, poller or timer: the owner resumes the
@@ -414,7 +420,7 @@ call; it does not authorize direct database access. Protected mutation rows requ
 | `PATCH /v1/projects/{id}` | Owner or superuser, session only | Exactly `{"repository": value}`; shape-checked, no password, at most 300 characters | Idempotent; audited as `projects.repository` without the value; `null` clears it |
 | `GET /v1/projects/{id}/members` | Project member (any role), superuser, the project's own worker credential; a non-member gets `404` | Membership checked before the read | Keyless read; cursor bound to principal/project/query; `200`, `401/404/409/422`; account `disabled`/`superuser` flags only for project administrators | Membership relation (public account fields only) |
 | `GET /v1/projects/{id}/worker-credentials` | Owner or superuser (project administration); contributors, viewers and credentials `403`, non-members `404` | Membership checked before the read | Keyless read; cursor as above; metadata only, never the secret or its hash; agent credentials are listed on the agent routes | Credential registry |
-| `GET /v1/projects/{id}/tasks/{task}/brief` (additive: `activity_cursor`, `checkpoint_template`; see HTTP_DEPLOYMENT "What an agent needs to write a checkpoint") | Project member; viewer may read | Membership checked before the canonical read | Keyless read; `200`, `401/404`; reading acknowledges nothing | Canonical `bd show` + `brief --json` (checkpoint, review projection, lifecycle, dependencies) |
+| `GET /v1/projects/{id}/tasks/{task}/brief` (additive: `activity_cursor`, `checkpoint_template`, `newer`; see HTTP_DEPLOYMENT "What an agent needs to write a checkpoint") | Project member; viewer may read | Membership checked before the canonical read | Keyless read; `200`, `401/404`; reading acknowledges nothing; canonical newer summary retains bounded refs, omitted counts and unknown/windowed coverage | Canonical `bd show` + `brief --json` (checkpoint, review projection, lifecycle, dependencies, newer activity) |
 | `GET /v1/projects/{id}/queue` | Project member; viewer may read (every row is already visible in the task list) | Membership checked before the canonical read | Keyless read; optional `state`; cursor as above; `complete: false` when the bounded canonical walk stopped early | Canonical `work` queue |
 | `GET /v1/me/work` | Browser/session principal only; credentials `403` | Walks the caller's own memberships (bounded), re-authorizing each project live; `to_review` only where the caller holds approval; `agent_prompts` (one per agent the caller owns) tailored by the caller's live capabilities per project, never containing a secret | Keyless read; `truncated` and `unavailable` report partial reads | Canonical `work` queue per project, personal agent registry |
 | `GET /v1/accounts/lookup?username=&project=` | Session principal with project administration on `project` | Exact, case-insensitive username; missing, partial and disabled accounts give one `404`; at most 20 lookups per principal per 10 minutes | Keyless read; `200` `{id, username, display_name}`, `403/404/422/429`; each authorized lookup is audited on the project with a digest of the name | Account registry |

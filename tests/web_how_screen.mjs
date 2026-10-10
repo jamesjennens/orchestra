@@ -11,10 +11,11 @@ const { createApi } = await import(apiUrl);
 const view = await import(howUrl);
 
 let failing = null;
+let failStatus = 503;
 function person(spec) {
   const [name, id, token] = spec.split('=');
   const transport = async (method, path, headers, body) => {
-    if (failing && path.includes(failing)) return { status: 503, data: { error: { code: 'unavailable', message: 'The document could not be read.' } } };
+    if (failing && path.includes(failing)) return { status: failStatus, data: { request_id: '<img src=x onerror=bad>', error: { code: 'unavailable', message: '<script>bad</script>' } } };
     const response = await fetch(base + path, { method, headers: { ...headers, Authorization: 'Bearer ' + token }, body });
     const text = await response.text();
     let data = null;
@@ -57,6 +58,20 @@ failing = '/v1/docs/poll-prompt';
   out.unreadable = { panels: page.all((e) => e.tagName === 'SECTION' && e.attributes['data-panel']).length, text: page.textContent };
 }
 failing = null;
+out.errors = {};
+for (const status of [503, 404, 403, 401, 0]) {
+  failing = '/v1/docs/'; failStatus = status;
+  const page = await view.page(who.alex, { pid: project });
+  const before = page.textContent;
+  const injected = page.all((e) => ['SCRIPT', 'IMG'].includes(e.tagName)).length;
+  const partial = page.all((e) => e.attributes['data-panel']).length;
+  failing = null;
+  await page.all((e) => e.tagName === 'BUTTON' && e.textContent === 'Try again')[0].dispatch('click');
+  out.errors[status] = { before, injected, partial, recovered: Boolean(page.all((e) => e.attributes['data-panel'] === 'how').length) };
+}
+const placeholderAgent = { ...who.alex, api: { ...who.alex.api,
+  agents: async () => ({ items: [{ id: 'agent-placeholder', owner: who.alex.me.id, display_name: 'REPLACE_SERVER_URL', projects: [project] }] }) } };
+out.placeholderAgent = seen(await view.page(placeholderAgent, { pid: project })).agentBlocks;
 // 4. What the page puts into a prompt, and what it leaves.
 out.fill = [
   view.fill('A REPLACE_ONE b REPLACE_TWO c REPLACE_ONE', { REPLACE_ONE: 'x' }),
@@ -64,5 +79,7 @@ out.fill = [
   view.fill('nothing here', { REPLACE_ONE: 'x' }),
   view.fill(null, null),
 ];
+out.once = view.fill('REPLACE_AGENT_NAME visits REPLACE_SERVER_URL; REPLACE_INTERVAL', {
+  REPLACE_AGENT_NAME: 'REPLACE_SERVER_URL', REPLACE_SERVER_URL: 'https://office.example', REPLACE_INTERVAL: '10 minutes' });
 out.body = view.body('# Title\n\nFirst paragraph.\n\n## Next\n');
 console.log(JSON.stringify(out).replace(/[^\x00-\x7f]/g, (c) => '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0')));
