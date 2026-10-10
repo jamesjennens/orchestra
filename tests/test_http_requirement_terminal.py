@@ -126,6 +126,22 @@ class TerminalHttpTests(EndpointCase):
         self.assertEqual(len(self.backend.native.writes()),before)
         self.assertEqual(self.request('GET',self.base+'/requirements/'+item['id'],token=token).data['accepted']['sha256'],item['sha256'])
 
+    def test_completed_replay_rechecks_owner_removed_after_mode_preflight(self):
+        item=self.accepted(); done=self.transition(item,key='late-cached-replay')
+        self.assertEqual(done.status,200,done.data); before=len(self.backend.native.writes())
+        read=self.backend.requirements_read
+        def remove_after_read(project,args):
+            result=read(project,args)
+            if args==['governance']:
+                self.service.state['users'][self.account]['superuser']=True
+                self.service.state['memberships'][self.project][self.account]='contributor'
+                self.service.store.save()
+            return result
+        self.backend.requirements_read=remove_after_read
+        replay=self.transition(item,key='late-cached-replay')
+        self.assertEqual(replay.status,422,replay.data)
+        self.assertEqual(len(self.backend.native.writes()),before)
+
     def test_interrupted_reason_exact_recovery_and_conflicting_request_keep_one_pair(self):
         item=self.accepted(); self.backend.native.fail_comment_prefix=owner.REASON_PREFIX
         failed=self.transition(item,key='lost-reason'); self.assertEqual(failed.status,503,failed.data)

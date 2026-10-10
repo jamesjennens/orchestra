@@ -5786,9 +5786,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             raise invalid('Use the Idempotency-Key header for requirements writes')
         pid=ctx.params['pid']
         if action in ('withdraw','supersede'):
-            # The service may return a completed request before invoking the
-            # canonical adapter. Check mode here too; the adapter repeats it
-            # under the project/authority locks for every new effect/recovery.
+            # Give immediate mode advice; the canonical adapter repeats the
+            # check under the project/authority locks, including exact replays.
             if self.backend.requirements_read(pid,['governance'])['mode']!='simple':
                 raise invalid('This project uses governed requirements. Ask its owner to enable simple editing.')
         def write():
@@ -5796,7 +5795,11 @@ class ApiHandler(BaseHTTPRequestHandler):
                                                     ctx.idempotency_key or ctx.request_id,ctx.params.get('rid'))
             return result,result
         return self._mutate(ctx,'requirements.'+action,pid,write,status=status,
-                            capability=CAP_PROJECT_ADMIN,serialize=False,canonical=True)
+                            capability=CAP_PROJECT_ADMIN,serialize=False,canonical=True,
+                            # Terminal replay authority belongs to the canonical
+                            # owner adapter. Its durable identity still deduplicates
+                            # effects; a service response must not bypass that check.
+                            idempotent=action not in ('withdraw','supersede'))
 
     @route('GET', r'/v1/projects/(?P<pid>'+ID+r')/requirements/governance')
     def requirements_governance_read(self,ctx):
