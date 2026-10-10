@@ -676,6 +676,9 @@ def apply_native(payload, actor, run, project, operator=False, operators=None):
     The steps are the shared keyed-record core's (keyed_records.apply_native)
     with this module's REQUIREMENT spec.
     """
+    # Reject invalid caller shapes before receipt discovery or guarded execution
+    # can translate an attribute error into an uncertain write outcome.
+    validate_payload(payload, operator=operator)
     from requirement_terminal import pending_ids
     pending, uncertain = pending_ids(Path(project), Path(project).name)
     if uncertain or payload.get('task') in pending:
