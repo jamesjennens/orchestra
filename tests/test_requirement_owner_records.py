@@ -540,6 +540,16 @@ class OwnerEvidenceTests(unittest.TestCase):
         receipt = json.loads(path.read_text())
         before = path.read_bytes()
         http.empty_creation(receipt, self.context, 'new-requirement', self.native)
+        # Captured pinned bd export/list shape: ordinary unlabeled task rows
+        # omit labels. Missing is empty; present damaged labels are unknown.
+        unlabeled = self.native.rows[0]
+        prior_labels = unlabeled.pop('labels')
+        http.empty_creation(receipt, self.context, 'new-requirement', self.native)
+        for invalid in (None, 'request:anything', [None]):
+            unlabeled['labels'] = invalid
+            with self.subTest(labels=invalid), self.assertRaisesRegex(ValueError, 'absence cannot be proved'):
+                http.empty_creation(receipt, self.context, 'new-requirement', self.native)
+        unlabeled['labels'] = prior_labels
         # An ID-less or truncated read cannot prove that a request is absent.
         def incomplete(args):
             if args[0] == 'list':

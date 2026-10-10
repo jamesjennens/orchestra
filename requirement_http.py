@@ -76,11 +76,13 @@ def empty_creation(receipt, context, operation_id, run):
     row_ids = [row.get('id') for row in rows]
     if (any(not isinstance(value, str) or not value for value in row_ids)
             or len(row_ids) != len(set(row_ids)) or set(row_ids) != ids
-            or any(row.get('malformed') or not isinstance(row.get('labels'), list)
-                   or any(not isinstance(label, str) for label in row['labels']) for row in rows)):
+            # Pinned bd omits labels entirely on ordinary unlabeled rows.
+            # A present null/non-list value still cannot prove absence.
+            or any(row.get('malformed') or not isinstance(row.get('labels', []), list)
+                   or any(not isinstance(label, str) for label in row.get('labels', [])) for row in rows)):
         raise ValueError(message + ' Native absence cannot be proved from this read.')
     label = 'request:' + content_hash({'operation_id': operation_id})
-    if any(label in row['labels'] for row in rows):
+    if any(label in row.get('labels', []) for row in rows):
         raise ValueError(message + ' A native row already carries this request.')
 
 
