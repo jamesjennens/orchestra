@@ -2060,7 +2060,8 @@ def descriptor_actor_denial(request, authority_config, reserved):
             # because the exception subclasses it. The ids ride as a bounded, checked field
             # for the service, never as a stderr tail (r2 review item 1).
             return _envelope(2, stderr='%s\n' % rows_unreadable, fault='unreadable-rows',
-                             unreadable_rows=list(rows_unreadable.ids or ()))
+                             unreadable_rows=list(rows_unreadable.ids or ()),
+                             unreadable_total=rows_unreadable.total)
         except actor_names.TrackerUnreadable as unreadable:
             # Not a refusal of the request: the tracker could not be read (item 1).
             return _envelope(2, stderr='%s\n' % unreadable, fault='tracker')

@@ -685,6 +685,7 @@ def main():
             # its own fault, with the ids as a bounded field beside the sentence.
             answer['fault'] = 'unreadable-rows'
             answer['unreadable_rows'] = list(error.ids or ())
+            answer['unreadable_total'] = error.total
         if isinstance(error, actor_names.TrackerMergeSlotMissing):
             # A read without a merge slot is not transient: its own mark, so the service says
             # what to do (merge-create) rather than "try again shortly" (kittrial-5bb.202 item 1).

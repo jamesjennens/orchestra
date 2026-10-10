@@ -6242,9 +6242,12 @@ def credential_actors(root,state_path,service_namespace=None):
     null for every credential of that project, with the unreadable row ids named beside it
     (``unreadable_rows``), so an operator sees there is something unread rather than "no
     such rows" (kittrial-5bb.221 revision 2). Beside such a null, ``refused_when_it_writes``
-    is null too -- not read, never a False that reads as "it may write" -- and the command's
-    closing sentence counts those credentials and names the unreadable rows
-    (kittrial-5bb.243 item N5).
+    is null too -- but only when ``collides`` is null: a name a cheap rule refuses (a session,
+    a list, the service's own namespace) is refused at every write without reading any
+    tracker, so it stays true and is not counted as unjudged. The command's closing sentence
+    counts the credentials no rule could judge (``could_not_be_judged``, a field of the
+    report), names the unreadable rows when an id is printable, and says per project which
+    thing happened (kittrial-5bb.243 item N5; r3 review items 1 and 3).
     ``service_namespace`` is the namespace the web service was started with (its
     ``--actor-namespace``), when the operator says so: a credential named under it is refused
     at use too (kittrial-5bb.188 item 3).
@@ -6283,13 +6286,20 @@ def credential_actors(root,state_path,service_namespace=None):
                         # name, so no name of this project can be judged; said as null with the row ids
                         # named, never as "no such rows". The ids an operator sees are bounded and
                         # checked like the 503 sentence's, and the count is a field too, so the JSON
-                        # says it, not only stderr (kittrial-5bb.243 r2 review item 2).
+                        # says it, not only stderr (kittrial-5bb.243 r2 review item 2). WHY the tracker
+                        # was not read is a field as well, said as the thing that happened -- r3 item 1.
                         given=[i for i in unreadable if isinstance(i,str) and i]
                         named=[i for i in given if actor_names.ROW_ID.fullmatch(i)][:actor_names.NAMED_ROWS_MAX]
                         found['unreadable_rows']=named
                         found['unreadable_total']=len(given)
+                        found['not_read_reason']='it holds %d unreadable row(s)'%len(given)
                         raise ValueError('the export holds %d unreadable row(s)'%len(given))
-                    if not rows or not any(isinstance(row,dict) for row in rows):
+                    if not rows:
+                        # Which of the three happened, in the operator's words (r3 review item 1):
+                        # bd answered nothing, bd answered the word null, or rows did not come.
+                        found['not_read_reason']=('bd answered nothing (exit 0)' if not text.strip()
+                                                  else 'bd answered null' if text.strip()=='null'
+                                                  else 'the export answered no rows')
                         raise ValueError('the export answered no rows, or something that is not rows')
                     # A listing, and main's answer here: an export that answered nothing is
                     # ``tracker_rows`` null ("the tracker was not read"), never false ("the
@@ -6298,8 +6308,12 @@ def credential_actors(root,state_path,service_namespace=None):
                     # the empty-project decision does not reach it (kittrial-5bb.202 review of
                     # revision 2, F3: revision 2 had changed it to false).
                     found['marks']=actor_names.tracker_marks(rows)
-                except (subprocess.CalledProcessError,OSError,ValueError,RecursionError):
+                except subprocess.CalledProcessError:
                     found['marks']=None                # the tracker could not be read: said as null, not as "no rows"
+                    found['not_read_reason']='bd failed (exit not 0)'
+                except (OSError,ValueError,RecursionError):
+                    found['marks']=None                # the tracker could not be read: said as null, not as "no rows"
+                    found.setdefault('not_read_reason','bd could not be read')
             projects[name]=found
         return projects[name]
     out=[]
@@ -6352,10 +6366,19 @@ def credential_actors(root,state_path,service_namespace=None):
             # many there are in all.
             item['unreadable_rows']=host['unreadable_rows']
             item['unreadable_total']=host.get('unreadable_total',len(host['unreadable_rows']))
+        if host.get('not_read_reason') is not None:
+            # WHY the tracker was not read, in the operator's words (r3 review item 1).
+            item['tracker_not_read']=host['not_read_reason']
         out.append(item)
     colliding=[item for item in out if item['collides'] is not None and not item['revoked']]
+    unjudged=[item for item in out if item.get('tracker_rows') is None and item.get('project_on_host')
+              and item.get('collides') is None]
     return {'schema_version':1,'state':str(source),'worker_credentials_with_a_name':len(out),
-            'colliding_and_not_revoked':len(colliding),'credentials':out}
+            'colliding_and_not_revoked':len(colliding),
+            # Only names NO rule could judge: a name a cheap rule refuses (a session, a list,
+            # the service's own namespace) is refused at every write without reading any
+            # tracker, so it is not also counted as unjudged (r3 review item 3a).
+            'could_not_be_judged':len(unjudged),'credentials':out}
 
 class _OnceFlag(argparse.Action):
     """A flag that may be given at most once.
@@ -6759,36 +6782,39 @@ def main():
     elif args.command=='service':print(service(root,args.action))
     elif args.command=='credential-actors':
         report=credential_actors(root,args.state,getattr(args,'service_namespace',None))
+        # kittrial-5bb.243 r3 review item 1: the count is part of the report the JSON prints,
+        # set inside credential_actors, so it reaches stdout -- not recomputed after the print.
         print(json.dumps(report,indent=2,sort_keys=True))
         if report['colliding_and_not_revoked']:
             print('%d worker credential(s) write under a name that is somebody else\'s on this host. Each is refused '
                   'when it writes; its owner revokes it in the web interface and issues one under another name. '
                   'Nothing was changed by this command.'%report['colliding_and_not_revoked'],file=sys.stderr)
-        # kittrial-5bb.243 item N5: the count of credentials that could not be judged at all --
-        # their project's tracker could not be read -- beside the colliding count, with the
-        # unreadable row ids named where the cause is an unreadable row, so an operator sees
-        # there is something unread rather than "no such rows". The count is in the JSON too,
-        # the ids are bounded and checked like the 503 sentence's, and the reason says what
-        # happened (unreadable rows, or a tracker bd would not answer) -- r2 review item 2.
-        not_read=[item for item in report['credentials']
-                  if item.get('tracker_rows') is None and item.get('project_on_host')]
-        report['could_not_be_judged']=len(not_read)
+        # kittrial-5bb.243 item N5: the count of credentials no rule could judge -- their
+        # project's tracker could not be read and no cheap rule refused the name -- beside the
+        # colliding count, saying per project WHAT happened: how many rows are unreadable (ids
+        # named only when at least one is printable, bounded and checked like the 503
+        # sentence's), or which of bd's three non-answers arrived (r3 review item 1).
+        not_read=[item for item in report['credentials'] if item.get('tracker_not_read')]
         if not_read:
-            unreadable={item['project']:item for item in not_read
-                        if item.get('unreadable_rows') is not None}
-            def said_of(project, item):
-                named=', '.join(item['unreadable_rows'])
-                total=item.get('unreadable_total', len(item['unreadable_rows']))
-                return '%s: unreadable row(s) %s%s' % (project, named,
-                                                       ' and %d more' % (total - len(item['unreadable_rows']))
-                                                       if total > len(item['unreadable_rows']) else '')
-            said='; '.join(said_of(project, item) for project, item in sorted(unreadable.items()))
+            # The reason a tracker was not read belongs to the PROJECT, so it is said once
+            # per project, however many credentials of it there are.
+            by_project={}
+            for item in not_read:
+                by_project.setdefault(item.get('project'), item)
+            def said_of(project):
+                item = by_project[project]
+                if item.get('unreadable_rows'):
+                    named=', '.join(item['unreadable_rows'])
+                    total=item.get('unreadable_total', len(item['unreadable_rows']))
+                    more=' and %d more' % (total - len(item['unreadable_rows'])) \
+                        if total > len(item['unreadable_rows']) else ''
+                    return '%s: %s (%s%s)' % (project, item['tracker_not_read'], named, more)
+                return '%s: %s' % (project, item['tracker_not_read'])
+            said='; '.join(said_of(project) for project in sorted(by_project))
             print('%d worker credential(s) could not be judged: the tracker of their project could not be read, '
-                  'so their names may be anybody\'s%s. An operator repairs the tracker (for deeply nested '
+                  'so their names may be anybody\'s (%s). An operator repairs the tracker (for deeply nested '
                   'metadata: bd update ID --unset-metadata KEY) if a second run says the same; nothing was '
-                  'changed by this command.'
-                  % (len(not_read), ' (%s)' % said if said
-                     else ' (bd did not answer, or answered no rows)'),file=sys.stderr)
+                  'changed by this command.'% (report['could_not_be_judged'], said),file=sys.stderr)
     elif args.command=='record-store':
         try:
             report=record_store_reset(args.state) if args.reset_high_water \

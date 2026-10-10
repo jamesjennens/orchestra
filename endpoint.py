@@ -1451,6 +1451,7 @@ def main():
             # could shape (r2 review item 1).
             answer['fault']='unreadable-rows'
             answer['unreadable_rows']=list(e.ids or ())
+            answer['unreadable_total']=e.total
         if isinstance(e,actor_names.TrackerMergeSlotMissing):
             # The read came back without the merge slot (rows, or no rows at all): not
             # transient, so its own mark and its own sentence naming the merge-create repair

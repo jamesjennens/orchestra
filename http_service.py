@@ -1602,7 +1602,7 @@ class EndpointBackend:
             # transient either: an operator must repair the row, so the caller gets the
             # endpoint's own sentence naming the row ids and the repair, its own code, and
             # never UNREAD's "try again shortly" (kittrial-5bb.243 item N7).
-            raise cls._rows_unreadable(reply.get('unreadable_rows'), stderr)
+            raise cls._rows_unreadable(reply.get('unreadable_rows'), reply.get('unreadable_total'))
         if isinstance(reply, dict) and reply.get('fault') == 'merge-slot':
             # The tracker was read but carries no merge-slot row: rows that came back without
             # it, or a readable tracker with no rows at all, the plain `bd init` shape
@@ -1687,26 +1687,25 @@ class EndpointBackend:
                        "the row (for deeply nested metadata: bd update ID --unset-metadata KEY) if a second "
                        "try gives the same answer, then try again.")
 
-    #: The id shape the unreadable-rows answer prints, and how many: the same bound and
-    #: check actor_names.TrackerRowsUnreadable applies, so a row body never becomes the
-    #: error message (kittrial-5bb.243 r2 review item 1).
-
     @classmethod
-    def _rows_unreadable(cls, ids=None, stderr=''):
+    def _rows_unreadable(cls, ids=None, total=None):
         # The answer is built from the fault's own fields, never from a stderr tail a row
         # could shape (r2 review item 1): the endpoint sends the ids it named, already
-        # bounded to the tracker's id shape, and the sentence is composed here. The stderr
-        # tail is only a legacy fallback for an endpoint that sends none.
+        # bounded to the tracker's id shape, and the total it counted, and the sentence is
+        # composed here, naming the ids and then 'and K more' as the endpoint's sentence
+        # does (r3 review item 2).
         import actor_names
         named = [i for i in (ids or ()) if isinstance(i, str) and actor_names.ROW_ID.fullmatch(i)][:actor_names.NAMED_ROWS_MAX]
-        message = cls.ROWS_UNREADABLE
+        count = total if isinstance(total, int) and total >= 0 else (len(named) if named else None)
+        failure = HttpError(503, 'unreadable_rows', cls.ROWS_UNREADABLE)
         if named:
-            message = cls.ROWS_UNREADABLE.replace(
+            more = '' if count is None or count <= len(named) else ', and %d more' % (count - len(named))
+            failure = HttpError(503, 'unreadable_rows', cls.ROWS_UNREADABLE.replace(
                 'holds a row that cannot be read',
-                'holds unreadable row(s) %s' % ', '.join(named), 1)
-        failure = HttpError(503, 'unreadable_rows', message)
+                'holds unreadable row(s) %s%s' % (', '.join(named), more), 1))
         failure.nothing_done = True
         failure.unreadable_rows = named
+        failure.unreadable_total = count
         return failure
 
     #: Said when the endpoint reports that the server's configuration file cannot be read.

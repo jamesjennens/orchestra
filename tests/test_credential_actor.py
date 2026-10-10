@@ -1825,6 +1825,57 @@ class RealEndpointCase(unittest.TestCase):
         self.assertEqual('the lane owns it', item['waived_reason'])
         self.assertEqual(0, report['colliding_and_not_revoked'])
 
+    def test_a_cheap_rule_refusal_stays_true_beside_an_unread_tracker(self):
+        """kittrial-5bb.243 r3 review item 3(a), pinning r2 item 2(a): a name the service's
+        own namespace (or any cheap rule) refuses is refused at every write without reading
+        any tracker, so beside an unread tracker collides still says the rule,
+        refused_when_it_writes stays true, and the credential is counted in the refused
+        sentence only -- never also as could-not-be-judged."""
+        import admin
+        path = self.tmp / 'state.json'
+        path.write_text(json.dumps({'users': {}, 'credentials': {
+            'cred_web': {'user_id': 'usr_a', 'project_id': 'probe', 'label': 'web', 'actor': 'http',
+                         'revoked': False, 'created_at': '2026-10-01T00:00:00Z'},
+            'cred_free': {'user_id': 'usr_a', 'project_id': 'probe', 'label': 'free', 'actor': 'worker-a',
+                          'revoked': False, 'created_at': '2026-10-01T00:00:00Z'}}}), encoding='utf-8')
+        deeper = ('{"id": "probe-deeper", "created_by": "deep-author", "created_at": "2026-01-01T00:00:00Z",'
+                  ' "updated_at": "2026-01-01T00:00:00Z", "metadata": ' + '{"a":' * 750 + '1' + '}' * 750 + '}')
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(admin, 'run_bd', return_value=deeper + '\n'), \
+                mock.patch.object(sys, 'argv', ['admin.py', '--root', str(self.root), 'credential-actors',
+                                                '--state', str(path), '--service-namespace', 'web']), \
+                redirect_stdout(out), redirect_stderr(err):
+            admin.main()
+        report = json.loads(out.getvalue())
+        found = {item['credential']: item for item in report['credentials']}
+        self.assertEqual((actor_names.SERVICE, True),
+                         (found['cred_web']['collides'], found['cred_web']['refused_when_it_writes']))
+        self.assertIsNone(found['cred_web']['tracker_rows'])
+        self.assertIsNone(found['cred_free']['collides'])
+        self.assertIsNone(found['cred_free']['refused_when_it_writes'])
+        # Only the truly-unjudged name is counted; the refused one is not also among them.
+        self.assertEqual(1, report['could_not_be_judged'])
+        self.assertIn('1 worker credential(s) could not be judged', err.getvalue())
+        self.assertIn('probe: it holds 1 unreadable row(s) (probe-deeper)', err.getvalue())
+        self.assertEqual(1, err.getvalue().count('unreadable row(s)'))   # once per project, not per credential
+        # And the count reached stdout, as a field of the printed report.
+        self.assertIn('"could_not_be_judged": 1', out.getvalue())
+
+    def test_the_exception_prints_no_id_that_is_not_of_the_trackers_shape(self):
+        """kittrial-5bb.243 r3 review item 3(b): the row reader drops a hostile id early, so
+        the exception's own shape check is pinned directly -- a mutant removing it must
+        fail here."""
+        hostile = 'x' * 500 + '\n\r\u202e'
+        built = actor_names.TrackerRowsUnreadable([hostile, 'probe-2'])
+        self.assertEqual(('probe-2',), built.ids)          # the shaped one is named
+        self.assertEqual(2, built.total)                   # the hostile one is still counted
+        self.assertNotIn('x' * 10, str(built))             # and never printed
+        only_hostile = actor_names.TrackerRowsUnreadable([hostile])
+        self.assertIsNone(only_hostile.ids)
+        self.assertEqual(1, only_hostile.total)
+        self.assertNotIn('x' * 10, str(only_hostile))
+        self.assertIn('a row that cannot be read', str(only_hostile))
+
     def test_the_command_line_also_counts_what_could_not_be_judged(self):
         """kittrial-5bb.243 item N5: the closing sentence names the credentials that could
         not be judged at all, with the unreadable row ids, beside the colliding count."""
@@ -1844,7 +1895,8 @@ class RealEndpointCase(unittest.TestCase):
                 redirect_stdout(out), redirect_stderr(err):
             admin.main()
         self.assertIn('1 worker credential(s) could not be judged', err.getvalue())
-        self.assertIn('unreadable row(s) probe-deeper', err.getvalue())
+        self.assertIn('probe: it holds 1 unreadable row(s) (probe-deeper)', err.getvalue())
+        self.assertEqual(1, err.getvalue().count('unreadable row(s)'))   # once per project, not per credential
         self.assertIn('--unset-metadata', err.getvalue())
         self.assertNotIn('could not be judged', out.getvalue())
 

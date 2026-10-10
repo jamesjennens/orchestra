@@ -1411,10 +1411,13 @@ be read (nested past 750 levels, unparseable, a line cut short, a line that is n
 JSON object) makes `tracker_rows` null for EVERY credential of that project -- the whole
 tracker was not read, because the unreadable row may be the row that holds a name
 (kittrial-5bb.221 r2) -- and each such item carries `unreadable_rows` naming the row ids
-(kittrial-5bb.243 item N5). Beside that null, `refused_when_it_writes` is null too -- not
-read, never a false that reads as "it may write" -- and the command's closing sentence
-counts how many credentials could not be judged and names the unreadable rows, beside
-the colliding count.
+(kittrial-5bb.243 item N5). Beside that null, `refused_when_it_writes` is null too -- but
+only when `collides` is null: a name a cheap rule refuses (a session, a list, the service's
+own namespace) is refused at every write without reading any tracker, so it stays true and
+is not also counted as unjudged. The command's closing sentence counts the credentials no
+rule could judge (`could_not_be_judged`, a field of the printed report), names the unreadable
+rows when an id is printable (at most five, then "and K more"), and says per project which
+thing happened: how many rows are unreadable, or which of bd's three non-answers arrived.
 
 **Who may ask whether a name is taken.** The endpoint's `actor-standing` answers a
 caller with the rule word only (`null`, or which rule) and never the host's names, no
