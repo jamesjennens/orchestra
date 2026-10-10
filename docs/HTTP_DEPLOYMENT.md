@@ -13,6 +13,18 @@ the operator path.
 
 ## 1. What the service is and is not
 
+### Requirements governance storage
+
+New creation intents opt into simple owner editing. Existing projects, old
+interrupted creations and backups without governance history stay governed.
+The project sidecars `.requirements-governance.json` and
+`.requirements-governance-source.json`, the `.requirement-owner-requests/`
+receipts and the outer operation journal are included in the same complete
+backup/restore set. Restore-new preserves historical hashes and source bindings
+before the destination merge slot is provisioned. Do not copy only the native
+database and omit those files. See [Requirements](REQUIREMENTS.md) for snapshot
+capture, owner authority, bearer/CSRF behavior and uncertain-write recovery.
+
 It is an authenticated adapter to canonical coordination data: browser sessions
 and project-scoped worker credentials gate every route, and organization is by
 project membership (`owner`, `contributor`, `viewer`) with a global superuser.

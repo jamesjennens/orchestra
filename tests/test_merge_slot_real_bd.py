@@ -179,8 +179,8 @@ class MergeSlotRealBdTests(rb.RealBdLabelAliasTests):
         state = {'restored': False}
         real_add, real_provision = admin.add_project, admin.provision_merge_slot
 
-        def add(root, name):
-            real_add(root, name)
+        def add(root, name, requirements_default=True):
+            real_add(root, name, requirements_default=requirements_default)
             state['restored'] = True
 
         def provision(root, name):

@@ -83,19 +83,32 @@ def revision_comment(record):
     return REVISION_PREFIX + canonical_bytes(record).decode('utf-8')
 
 
-def adapt(rows, selection, acceptance=None, previous=None, previous_acceptance=None):
+def adapt(rows, selection, acceptance=None, previous=None, previous_acceptance=None, governance=None):
     expected = set(META) | {'narrative', 'requirements', 'context_ids', 'blocking_ids'}
     if not isinstance(selection, dict) or set(selection) != expected:
         raise ValueError('selection has missing or unknown fields')
     issues, revisions, locations = {}, {}, {}
     if not isinstance(rows, list):
         raise ValueError('export must be a list of issues')
+    # Malformed content costs only its explicitly selected row. Identity and
+    # duplicate-id validation still covers the entire export.
+    selected_rows = set()
+    for group in ('narrative', 'requirements'):
+        if not isinstance(selection[group], list):
+            raise ValueError(group + ' selection must be a list')
+        selected_rows.update(exact_reference(ref)[0] for ref in selection[group])
+    if previous is not None:
+        selected_rows.update(r['id'] for r in previous['narrative'] + previous['requirements'])
     for row in rows:
         if not isinstance(row, dict) or not isinstance(row.get('id'), str) or not row['id']:
             raise ValueError('export row must have an issue id')
         if row['id'] in issues:
             raise ValueError('duplicate issue id: ' + row['id'])
         issues[row['id']] = row
+        if row['id'] not in selected_rows:
+            continue
+        if row.get('malformed'):
+            raise ValueError('selected requirement row cannot be read: ' + row['id'])
         comments = row.get('comments', [])
         if comments is None:
             comments = []
@@ -134,6 +147,19 @@ def adapt(rows, selection, acceptance=None, previous=None, previous_acceptance=N
             record = revisions.get((rid, rev))
             if record is None or record['sha256'] != digest:
                 raise ValueError('selected revision missing or mismatched: ' + rid)
+            # Owner evidence is carried in source_issues with its exact native
+            # author. A claimed acceptance cannot be published on a label alone.
+            from requirement_records import resolved_acceptance
+            accepted = resolved_acceptance(issues[rid], record)
+            if record['acceptance_state'] == 'accepted' and not accepted:
+                raise ValueError('selected acceptance evidence missing or mismatched: ' + rid)
+            from requirement_owner_records import existing_acceptances as owner_acceptances
+            owner = owner_acceptances(issues[rid]).get(rev)
+            if owner is not None:
+                if governance is None:
+                    raise ValueError('owner acceptance export needs its captured requirements governance snapshot')
+                from requirement_governance import validate_evidence_files
+                validate_evidence_files(governance, selection['canonical_project'], owner)
             manifest[group].append(record)
             selected_ids.append(rid)
             sources.append({'reference': ref, 'comment_ids': sorted(locations[(rid, rev)])})
@@ -159,6 +185,11 @@ def adapt(rows, selection, acceptance=None, previous=None, previous_acceptance=N
                   'export_sha256': content_hash({'issues': rows}),
                   'selection': selection, 'sources': sources,
                   'source_issues': [issues[rid] for rid in included]}
+    if governance is not None:
+        from requirement_governance import validate_files, FILE, SOURCE_FILE
+        validate_files(governance, selection['canonical_project'])
+        provenance['requirements_governance'] = {key: governance[key] for key in (FILE, SOURCE_FILE)
+                                               if key in governance}
     return {'manifest': manifest, 'provenance': provenance}
 
 
@@ -169,13 +200,15 @@ def main(argv=None):
     parser.add_argument('--acceptance')
     parser.add_argument('--previous')
     parser.add_argument('--previous-acceptance')
+    parser.add_argument('--governance', help='captured governance sidecar files map for owner acceptance')
     parser.add_argument('--publish', help='also publish the reconstructed manifest to this directory')
     args = parser.parse_args(argv)
     try:
         result = adapt(read_export(args.export), load_json(args.selection),
                        load_json(args.acceptance) if args.acceptance else None,
                        load_json(args.previous) if args.previous else None,
-                       load_json(args.previous_acceptance) if args.previous_acceptance else None)
+                       load_json(args.previous_acceptance) if args.previous_acceptance else None,
+                       load_json(args.governance) if args.governance else None)
         if args.publish:
             from publish_brd import publish
             result['publication'] = str(publish(result['manifest'], args.publish,

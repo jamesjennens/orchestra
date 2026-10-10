@@ -80,6 +80,9 @@ class RecordSpec:
              'apply_labels', 'result')
 
     def __init__(self, **values):
+        # A validated adapter may need a server-generated decision issue before
+        # its evidence comment. Existing host adapters have no such step.
+        self.before_evidence = values.pop('before_evidence', None)
         missing = [name for name in self.VALUES + self.HOOKS if name not in values]
         extra = sorted(set(values) - set(self.VALUES + self.HOOKS))
         if missing or extra:
@@ -520,6 +523,9 @@ def apply_native(payload, actor, run, project, spec, operator=False, operators=N
     # A crash between creating an anchor and its first record leaves an ordinary
     # row; the same operation's retry reaches this point and finishes it.
     spec.prepare_row(run, row)
+    if bound is not None and evidence_body is not None and spec.before_evidence is not None:
+        bound = spec.before_evidence(run, task, revision, record, actor, bound)
+        _, evidence_body = spec.acceptance_evidence(bound, task, revision, record, actor)
     # Acceptance evidence is written BEFORE the accepted revision comment and the
     # accepted state label: with the evidence first, an uncertain evidence write
     # leaves the record reading as unaccepted, and the pending receipt is completed
