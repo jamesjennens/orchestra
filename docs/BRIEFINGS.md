@@ -27,6 +27,24 @@ An old task without a structured checkpoint reports its current position and unr
 
 ## Publish a checkpoint
 
+`work --mine` also returns `items[].checkpoint_wait`, so the owned queue printed
+after host worker `resume` carries the worker's authored wait and next action.
+This is read-only context from that exact actor's latest validated checkpoint,
+not inferred recipient information or proof of authority. `status` is `recorded`,
+`none` (no own checkpoint), `unknown` (unreadable or invalid history), or
+`not-owned` (a row shown to another reader). `checkpoint` and `author` identify
+the source. `is_current` is false when a newer checkpoint by another actor exists;
+`active` is false when no wait remains, or for historical, closed or delivered review work. Review state
+still takes precedence over the authored next action.
+
+The projection includes only blocker/dependency items, at most three, with exact
+`total` and `omitted` counts. Text/source/next action are objects with `text` and
+`omitted_chars`: controls are escaped before clipping to 400/240/600 characters.
+Questions, decisions and corrections do not become waits. Missing person wording
+stays missing; do not guess it from task titles or actor names. Use `brief TASK`
+for the current full unresolved-item page and reconcile before acting. Reads
+acknowledge nothing and add no native query to the owned work read.
+
 Read `brief --json`, reconcile relevant history and repository state, and save a UTF-8 JSON file using [the template](../templates/CHECKPOINT.json). Set `previous` to the current checkpoint's `comment_id` (or null for the first checkpoint) and copy the briefing's top-level `activity_cursor`. Fill in the real source commit and branch, or leave them empty when unknown.
 
 When new writes are enabled (see compatibility below), provenance is server-bound and round-trips: do not hand-craft incorporated digests. Omit them and the server computes and binds the exact snapshot provenance, or fetch the supported map with `checkpoint TASK --provenance` (returns the current `activity_cursor` and `provenance`) and embed the returned `provenance` verbatim — a missing, extra or altered map is rejected, so fabricated maps cannot be asserted. The first enabled record keeps an exact digest window, a bounded truncated-digest map for older entries and a chain hash. Subsequent enabled records store only new or changed evidence from those bounded maps (`provenance.delta: true`); unchanged evidence remains in the linked history. Each candidate map contains up to 200 exact and 300 truncated digests before the size fit, and the server shrinks the window as needed so the final serialized comment (including its Kind prefix) always fits the 80 KB cap; the same cap is enforced on read, so an accepted write always reads back.

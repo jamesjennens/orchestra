@@ -5,6 +5,7 @@ directory and the real session parser on every platform. The scoped import
 helper never leaves a Windows lock stand-in in discovery's module cache.
 """
 import json
+import io
 import subprocess
 import sys
 import tempfile
@@ -18,6 +19,9 @@ sys.path[:0] = [str(KIT), str(KIT / 'tests')]
 from test_reference_wiring import _endpoint_module
 import sessions
 import reserved_comments
+import client
+import worker
+import briefing
 
 
 class EndpointMembershipSessionTests(unittest.TestCase):
@@ -83,6 +87,54 @@ class EndpointMembershipSessionTests(unittest.TestCase):
         before = (self.path / '.sessions.json').read_bytes()
         self.assertEqual(self.session(['show', self.actor])['session']['actor'], self.actor)
         self.assertEqual((self.path / '.sessions.json').read_bytes(), before)
+
+    def test_host_resume_and_client_owned_work_show_the_authored_wait(self):
+        from test_briefing import rows, checkpoint
+        (self.path/'ONBOARDING.md').write_text('Synthetic project onboarding.', encoding='utf-8')
+        (self.root/'deployment.private.json').write_text(json.dumps({'password':'synthetic-fixture'}), encoding='utf-8')
+        data = rows()
+        data[0].update(id='example-task', assignee=self.actor)
+        p = checkpoint(rows(), task='example-task', open_items=[dict(id='verify', kind='dependency',
+            text='Waiting for person:coordinator to verify the acknowledged plan.', source='plan-comment')],
+            next_action='Read the plan answer before starting the approved implementation.')
+        p['activity_cursor'] = briefing.activity_cursor(briefing.snapshot(data, 'example', 'example-task'))
+        data[0]['comments'].append(dict(id='cp', author=self.actor, created_at='2026-10-01T00:00:00Z',
+            text=briefing.PREFIX+json.dumps(p)))
+        exported = '\n'.join(json.dumps(row) for row in data)+'\n'
+        calls = []
+        def native(args, env):
+            calls.append(list(args))
+            self.assertEqual(args, ['export', '--all'])
+            return subprocess.CompletedProcess(args, 0, exported, '')
+        def transport(cfg, project, actor, args, action='bd', *rest):
+            self.assertEqual((project, actor), ('example', self.actor))
+            return self.request(action, args)
+        with patch.object(self.endpoint.native, 'run', side_effect=native), \
+             patch.object(worker, 'request', side_effect=transport), \
+             patch.object(sys, 'argv', ['worker.py', '--root', str(self.root), '--project', 'example',
+                         '--actor', self.actor, 'resume']), \
+             patch('sys.stdout', new_callable=io.StringIO) as stdout, \
+             patch('sys.stderr', new_callable=io.StringIO):
+            self.assertEqual(worker.main(), 0)
+            output = stdout.getvalue()
+            self.assertIn('Waiting for person:coordinator to verify the acknowledged plan.', output)
+            self.assertIn('Read the plan answer before starting', output)
+            self.assertIn('Owned work (revision requests first)', output)
+        config = self.root / 'client.json'
+        config.write_text('{}', encoding='utf-8')
+        with patch.object(self.endpoint.native, 'run', side_effect=native), \
+             patch.object(client, 'request', side_effect=transport), \
+             patch.object(sys, 'argv', ['client.py', '--config', str(config), '--project', 'example',
+                         '--actor', self.actor, '--', 'work', '--mine', '--json']), \
+             patch('sys.stdout', new_callable=io.StringIO) as stdout, \
+             patch('sys.stderr', new_callable=io.StringIO):
+            self.assertEqual(client.main(), 0)
+            wait = json.loads(stdout.getvalue())['items'][0]['checkpoint_wait']
+            self.assertEqual((wait['checkpoint'], wait['author'], wait['active']), ('cp', self.actor, True))
+        self.assertEqual(calls, [['export', '--all'], ['export', '--all']])
+        self.assertEqual(len(self.registry()['records']), 1)
+        self.assertEqual(len(self.registry()['resumes']), 1)
+        self.assertEqual(data[0]['comments'][-1]['text'], briefing.PREFIX+json.dumps(p))
 
     def test_run_start_answers_after_the_event_write_and_retry_reuses_it(self):
         run, event = str(uuid.uuid4()), str(uuid.uuid4())
