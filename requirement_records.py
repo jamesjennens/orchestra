@@ -327,6 +327,7 @@ def resolved_acceptance(row, record, operators=None):
     Older host-only snapshots retain their declared v1 acceptance semantics.
     """
     from requirement_owner_records import ACCEPTANCE_PREFIX as owner_prefix, STATE_PREFIX, HUMAN, parse
+    from reserved_comments import _reserved_prefix_view
     owner_claim = False
     for comment in row.get('comments') or []:
         body = comment.get('text', '') if isinstance(comment, dict) else ''
@@ -336,8 +337,11 @@ def resolved_acceptance(row, record, operators=None):
             claimed = parse_requirement_record(body)
             if claimed is not None and claimed['revision'] == record['revision']:
                 owner_claim = True
-        if isinstance(body, str) and body.startswith('Kind: requirement-owner-'):
+        view = _reserved_prefix_view(body) if isinstance(body, str) else ''
+        if view.startswith('Kind: requirement-owner-'):
             owner_claim = True
+            if view != body:
+                raise ValueError('Malformed owner requirement evidence')
             if not body.startswith((owner_prefix, STATE_PREFIX)):
                 raise ValueError('Unsupported owner requirement evidence')
             if body.startswith(STATE_PREFIX):

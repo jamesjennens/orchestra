@@ -90,12 +90,25 @@ def adapt(rows, selection, acceptance=None, previous=None, previous_acceptance=N
     issues, revisions, locations = {}, {}, {}
     if not isinstance(rows, list):
         raise ValueError('export must be a list of issues')
+    # Malformed content costs only its explicitly selected row. Identity and
+    # duplicate-id validation still covers the entire export.
+    selected_rows = set()
+    for group in ('narrative', 'requirements'):
+        if not isinstance(selection[group], list):
+            raise ValueError(group + ' selection must be a list')
+        selected_rows.update(exact_reference(ref)[0] for ref in selection[group])
+    if previous is not None:
+        selected_rows.update(r['id'] for r in previous['narrative'] + previous['requirements'])
     for row in rows:
         if not isinstance(row, dict) or not isinstance(row.get('id'), str) or not row['id']:
             raise ValueError('export row must have an issue id')
         if row['id'] in issues:
             raise ValueError('duplicate issue id: ' + row['id'])
         issues[row['id']] = row
+        if row['id'] not in selected_rows:
+            continue
+        if row.get('malformed'):
+            raise ValueError('selected requirement row cannot be read: ' + row['id'])
         comments = row.get('comments', [])
         if comments is None:
             comments = []

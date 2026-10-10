@@ -203,6 +203,7 @@ class StopTests(Host):
         (self.root / 'projects' / 'alpha').mkdir()            # an empty directory, as add-project resumes
         self.assertEqual([item['state'] for item in pc.attention(self.root)], ['stalled'])
         self.assertEqual(self.create(limit=1)['status'], 'created')
+        self.assertNotIn('requirements_governance', pc.read_record(self.root, 'alpha'))
         self.assertEqual(pc.attention(self.root), [])
 
 
@@ -595,7 +596,8 @@ class AddProjectStillTests(unittest.TestCase):
             (root / 'projects').mkdir()
             pc.write_record(root, 'alpha', {'project': 'alpha', 'by': pc.HOST,
                                           'state': 'started', 'stage': None,
-                                          'started_at': '2030-01-01T00:00:00Z'})
+                                          'started_at': '2030-01-01T00:00:00Z',
+                                          'requirements_governance': 'simple'})
             try:
                 admin.initialize_project(root, 'alpha', seen.append)
                 import requirement_governance

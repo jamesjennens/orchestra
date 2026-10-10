@@ -5699,7 +5699,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         pid=ctx.params['pid']
         def write():
             result=self.backend.owner_requirements(ctx.principal,pid,action,fields,
-                                                    ctx.idempotency_key,ctx.params.get('rid'))
+                                                    ctx.idempotency_key or ctx.request_id,ctx.params.get('rid'))
             return result,result
         return self._mutate(ctx,'requirements.'+action,pid,write,status=status,
                             capability=CAP_PROJECT_ADMIN,serialize=False,canonical=True)

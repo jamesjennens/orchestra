@@ -111,8 +111,10 @@ class GovernanceTests(unittest.TestCase):
             stored = second_restore[governance.FILE]['revisions'][revision - 1]
             governance.validate_evidence(gamma, 'gamma', {'project': project,
                 'governance': {k: stored[k] for k in ('revision', 'sha256', 'mode')}})
+            governance.validate_evidence(gamma, 'gamma', {'project': 'gamma',
+                'governance': {k: stored[k] for k in ('revision', 'sha256', 'mode')}})
             with self.assertRaisesRegex(ValueError, 'different project'):
-                governance.validate_evidence(gamma, 'gamma', {'project': 'gamma',
+                governance.validate_evidence(gamma, 'gamma', {'project': 'unrelated',
                     'governance': {k: stored[k] for k in ('revision', 'sha256', 'mode')}})
         with self.assertRaisesRegex(ValueError, 'different project'):
             governance.restored_files(original, 'other', 'beta')
@@ -126,9 +128,44 @@ class GovernanceTests(unittest.TestCase):
             admin.initialize_requirements_governance(self.root, 'alpha')
         project_creation.write_record(self.root, 'alpha', {
             'project': 'alpha', 'by': OWNER, 'operation_id': 'creation-alpha',
-            'state': 'incomplete', 'stage': 'configure', 'started_at': '2030-01-01T00:00:00Z'})
+            'state': 'incomplete', 'stage': 'configure', 'started_at': '2030-01-01T00:00:00Z',
+            'requirements_governance': 'simple'})
         self.assertEqual(admin.initialize_requirements_governance(self.root, 'alpha')['mode'], 'simple')
         self.assertEqual(admin.initialize_requirements_governance(self.root, 'alpha')['revision'], 1)
+
+    def test_legacy_creation_and_restore_intent_never_install_simple_default(self):
+        legacy = {'project': 'alpha', 'by': OWNER, 'operation_id': 'creation-alpha',
+                  'state': 'incomplete', 'stage': 'configure', 'started_at': '2030-01-01T00:00:00Z'}
+        project_creation.write_record(self.root, 'alpha', legacy)
+        self.assertEqual(admin.initialize_requirements_governance(self.root, 'alpha')['mode'], 'governed')
+        self.assertFalse((self.project/governance.FILE).exists())
+        made = []
+        def initialize(root, name, stage):
+            directory = root/'projects'/name; directory.mkdir(parents=True)
+            made.append(admin.initialize_requirements_governance(root, name))
+        project_creation.host_create(self.root, 'beta', initialize, lambda *args: None,
+                                     requirements_default=False)
+        self.assertEqual(made[0], {'revision': 0, 'sha256': None, 'mode': 'governed'})
+        self.assertNotIn('requirements_governance', project_creation.read_record(self.root, 'beta'))
+
+    def test_same_mode_is_noop_but_stale_hash_is_refused(self):
+        first = self.initialize(); before = (self.project/governance.FILE).read_bytes()
+        self.assertEqual(self.set_mode('simple'), first)
+        self.assertEqual((self.project/governance.FILE).read_bytes(), before)
+        with self.assertRaisesRegex(ValueError, 'changed'):
+            governance.set_mode(self.project, 'alpha', 'simple', OWNER, 'stale', 1, '0'*64)
+
+    def test_invalid_time_and_damaged_file_do_not_disclose_server_path(self):
+        self.initialize(); record = governance.snapshot(self.project, 'alpha')[governance.FILE]
+        for at in ('yesterday', '2030-02-30T00:00:00Z', '2030-01-01T25:00:00Z'):
+            bad = copy.deepcopy(record); bad['revisions'][0]['at'] = at
+            bad['revisions'][0]['sha256'] = content_hash(bad['revisions'][0])
+            with self.subTest(at=at), self.assertRaisesRegex(ValueError, 'valid UTC'):
+                governance.validate(bad)
+        (self.project/governance.FILE).write_text('{broken')
+        with self.assertRaises(ValueError) as refused:
+            governance.current(self.project, 'alpha')
+        self.assertNotIn(str(self.project), str(refused.exception))
 
     def test_symlink_refusal_does_not_modify_target(self):
         outside = self.root / 'outside'; outside.write_text('unchanged')

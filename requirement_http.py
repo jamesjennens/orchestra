@@ -33,7 +33,7 @@ def owner_context(project_path, project, request, authority_config, simple=True)
     """
     from http_authority import read_state
     from project_creation import service_descriptor
-    descriptor = service_descriptor(request, authority_config, 'set-onboarding')
+    descriptor = service_descriptor(request, authority_config, 'owner-requirements')
     if (descriptor.get('project') != project or descriptor.get('credential_id') is not None
             or not owner_records.HUMAN.fullmatch(request['actor'])):
         raise ValueError('Requirements editing needs the signed-in project owner')
@@ -209,6 +209,21 @@ def apply(project_path, context, action, body, operation_id, run, task=None):
     identifier(operation_id)
     if action == 'governance':
         raise ValueError('Governance uses its separate owner action')
+    if action == 'accept':
+        row = records.find(records.read_rows(run), task)
+        revisions = records.existing_revisions(row) if row else {}
+        latest = revisions.get(max(revisions)) if revisions else None
+        if (latest and latest['revision'] == body['expected_revision']
+                and latest['sha256'] == body['expected_sha256']
+                and latest['acceptance_state'] == 'accepted'):
+            evidence = owner_records.existing_acceptances(row).get(latest['revision'])
+            if not records.resolved_acceptance(row, latest):
+                raise ValueError('Requirement acceptance cannot be verified')
+            if evidence:
+                governance.validate_evidence(project_path, context.project, evidence)
+            return {'id': task, 'kind': records.existing_kind(row), 'revision': latest['revision'],
+                    'sha256': latest['sha256'], 'acceptance_state': 'accepted',
+                    'created': False, 'reconciled': True}
     payload = _payload(action, body, operation_id, run, task)
     if task is not None:
         row = records.find(records.read_rows(run), task)
@@ -221,6 +236,10 @@ def apply(project_path, context, action, body, operation_id, run, task=None):
 def web_action(root, project_path, project, request, authority_config, runner, guarded_write):
     """Endpoint adapter; caller holds project lock, guarded_write holds authority lock."""
     from http_authority import OperationJournal, journal_path, operation_hash, principal_key, stamp_write
+    # Stable account identity applies only to this checked owner adapter; keep
+    # the actual session descriptor intact for every live authority recheck.
+    account_hash = lambda built, trusted: operation_hash(built, trusted, account_identity=True)
+    account_key = lambda built, trusted: principal_key(built, trusted, account_identity=True)
     from export_requirements import parse_json
     args = request.get('args')
     if (not isinstance(args, list) or not args or args[0] not in ('create', 'revise', 'accept', 'governance')
@@ -236,6 +255,10 @@ def web_action(root, project_path, project, request, authority_config, runner, g
     # Service-only session shape and ordinary refusals precede reservation. The
     # membership check is repeated inside the effect under the authority lock.
     owner_context(project_path, project, request, authority_config, simple=action != 'governance')
+    def identity_check():
+        # Check current owner membership under the authority lock even when a
+        # journal replay returns without calling the effect.
+        return owner_context(project_path, project, request, authority_config, simple=action != 'governance')
 
     def effect():
         context = owner_context(project_path, project, request, authority_config, simple=action != 'governance')
@@ -250,12 +273,13 @@ def web_action(root, project_path, project, request, authority_config, runner, g
     journal = OperationJournal(journal_path(project_path))
     prior = journal.lookup(operation_id)
     answer = guarded_write(root, request, journal_path(project_path), effect,
-                           authority_config=authority_config, require_authority=True, runner=runner)
+                           authority_config=authority_config, require_authority=True, runner=runner,
+                           account_identity=True, identity_check=identity_check)
     if (answer.get('returncode') != 124 or prior is None
             or prior.get('state') not in ('unknown', 'in_progress')
             or journal.expired(prior)
-            or prior.get('principal') != principal_key(request, True)
-            or prior.get('request_hash') != operation_hash(request, True)):
+            or prior.get('principal') != account_key(request, True)
+            or prior.get('request_hash') != account_hash(request, True)):
         return answer
 
     # A retry does not release or re-run the unknown outer operation. Reconcile
@@ -268,8 +292,8 @@ def web_action(root, project_path, project, request, authority_config, runner, g
         entry = journal.lookup(operation_id)
         if (entry is None or entry.get('state') not in ('unknown', 'in_progress')
                 or journal.expired(entry)
-                or entry.get('principal') != principal_key(request, True)
-                or entry.get('request_hash') != operation_hash(request, True)):
+                or entry.get('principal') != account_key(request, True)
+                or entry.get('request_hash') != account_hash(request, True)):
             raise ValueError('Requirements recovery identity changed; ask the project owner to reconcile it')
         if action == 'governance':
             stored = governance.snapshot(project_path, project).get(governance.FILE, {})
@@ -293,11 +317,11 @@ def web_action(root, project_path, project, request, authority_config, runner, g
                 raise ValueError('Requirement recovery receipt does not match this exact owner request')
         completed = stamp_write(effect())  # exact native receipt, same time on future replay
         journal._actor = request['actor']; journal._route = request.get('route')
-        journal.complete(operation_id, completed, operation_hash(request, True), principal_key(request, True))
+        journal.complete(operation_id, completed, account_hash(request, True), account_key(request, True))
         return completed
 
     recovery = dict(request, operation_id='owner-recover-' + content_hash({
-        'original': operation_id, 'request_sha256': operation_hash(request, True)})[:40],
+        'original': operation_id, 'request_sha256': account_hash(request, True)})[:40],
         route='requirements-recovery')
     # An interrupted recovery remains unknown too. Never rerun that identity:
     # a later attempt gets its own deterministic successor and must again prove
@@ -308,68 +332,86 @@ def web_action(root, project_path, project, request, authority_config, runner, g
         interrupted = journal.lookup(recovery['operation_id'])
         if interrupted is None or interrupted.get('state') not in ('unknown', 'in_progress'):
             break
-        if (journal.expired(interrupted) or interrupted.get('principal') != principal_key(recovery, True)
-                or interrupted.get('request_hash') != operation_hash(recovery, True)):
+        if (journal.expired(interrupted) or interrupted.get('principal') != account_key(recovery, True)
+                or interrupted.get('request_hash') != account_hash(recovery, True)):
             return answer  # preserve the conflicting or expired uncertainty
         recovery['operation_id'] = 'owner-recover-' + content_hash({
             'original': operation_id, 'previous': recovery['operation_id'],
-            'request_sha256': operation_hash(request, True)})[:40]
+            'request_sha256': account_hash(request, True)})[:40]
     else:
         return answer
     return guarded_write(root, recovery, journal_path(project_path), reconcile,
-                         authority_config=authority_config, require_authority=True, runner=runner)
+                         authority_config=authority_config, require_authority=True, runner=runner,
+                         account_identity=True, identity_check=identity_check)
 
 
 def read(project_path, project, args, run, operators=None):
     """One read-only native snapshot; current content and exact historical refs."""
     if args == ['governance']:
         return governance.current(project_path, project)
+    if args == ['snapshot']:
+        return governance.snapshot(project_path, project)
     if not isinstance(args, list) or args[:1] not in (['list'], ['brd'], ['get']):
         raise ValueError('Use requirements list, get ID, governance or brd')
     if len(args) != (2 if args[0] == 'get' else 1):
         raise ValueError('Unexpected requirements read argument')
-    rows = record_json.classify(records.read_rows(run), run, ['requirement', 'brd-section'])
-    items = []
+    labels = ['requirement', 'brd-section']
+    rows = record_json.classify(records.read_rows(run), run, labels, types=labels)
+    items, decisions = [], []
     for row in rows:
-        if not records.TYPE_LABELS.intersection(row.get('labels') or []):
+        if not (records.TYPE_LABELS.intersection(row.get('labels') or [])
+                or row.get('issue_type') in labels or record_json.selected(row, labels, labels)):
             continue
-        # An unreadable anchor never turns into guessed content from its title.
-        if row.get('malformed'):
-            raise ValueError('A requirement record cannot be read; ask the project owner to reconcile it')
-        kind = records.existing_kind(row)
-        revisions = records.existing_revisions(row)
-        for evidence in owner_records.existing_acceptances(row).values():
-            governance.validate_evidence(project_path, project, evidence)
-        if not revisions:
-            continue  # an interrupted create has no content to display
-        latest = revisions[max(revisions)]
-        history = []
-        for number in sorted(revisions):
-            record = revisions[number]
-            accepted = records.resolved_acceptance(row, record, operators)
-            if record['acceptance_state'] == 'accepted' and not accepted:
-                raise ValueError('Requirement acceptance cannot be verified; ask the project owner to reconcile it')
-            history.append(dict(record))
-        evidence = records.existing_acceptances(row, operators)
-        items.append({'id': row['id'], 'kind': kind, 'current': history[-1],
-                      'history': history, 'acceptance': evidence.get(latest['revision'])})
-    items.sort(key=lambda item: (item['kind'], item['current'].get('key', ''), item['id']))
+        try:
+            if row.get('malformed'):
+                raise ValueError('native row is unreadable')
+            kind = records.existing_kind(row)
+            revisions = records.existing_revisions(row)
+            for evidence in owner_records.existing_acceptances(row).values():
+                governance.validate_evidence(project_path, project, evidence)
+            if not revisions:
+                raise ValueError('content was not confirmed; retry the original creation request')
+            history, accepted_history = [], []
+            for number in sorted(revisions):
+                record = revisions[number]
+                accepted = records.resolved_acceptance(row, record, operators)
+                if record['acceptance_state'] == 'accepted' and not accepted:
+                    raise ValueError('acceptance cannot be verified')
+                history.append(dict(record))
+                if accepted:
+                    accepted_history.append(dict(record))
+            evidence = records.existing_acceptances(row, operators)
+            latest = history[-1]
+            accepted = accepted_history[-1] if accepted_history else None
+            items.append({'id': row['id'], 'kind': kind, 'current': latest,
+                          'accepted': accepted, 'pending_draft': latest if latest['acceptance_state'] == 'draft' else None,
+                          'history': history, 'acceptance': evidence.get(latest['revision'])})
+            for record in accepted_history:
+                proof = evidence.get(record['revision'])
+                if proof is not None:
+                    decisions.append({'id': proof['decision']['decision_id'], 'requirement_id': row['id'],
+                                      'title': 'Accepted ' + record['title'], 'revision': record['revision']})
+        except (ValueError, TypeError, KeyError):
+            # The affected row stays visible by proved id. Never promote a bad
+            # acceptance, infer text from mutable fields, or hide healthy rows.
+            items.append({'id': row['id'], 'kind': 'unreadable', 'unreadable': True,
+                          'message': 'Requirement %s cannot be read or its acceptance cannot be verified; ask the project owner to reconcile it' % row['id'],
+                          'current': None, 'accepted': None, 'pending_draft': None, 'history': []})
+    items.sort(key=lambda item: (item['kind'], (item['current'] or {}).get('key', ''), item['id']))
     if args[0] == 'get':
-        found = [item for item in items if item['id'] == args[1]]
-        if not found:
+        found = next((item for item in items if item['id'] == args[1]), None)
+        if found is None:
             raise ValueError('Requirement was not found')
-        return found[0]
+        if found.get('unreadable'):
+            raise ValueError(found['message'])
+        return found
     result = {'project': project, 'governance': governance.current(project_path, project),
               'items': items, 'total': len(items),
               'jobs': [{'id': row['id'], 'title': row.get('title', '')}
-                       for row in rows if row.get('issue_type') in ('epic', 'job')
+                       for row in rows if row.get('issue_type') in ('epic', 'job', 'task')
+                       and not records.TYPE_LABELS.intersection(row.get('labels') or [])
+                       and 'gt:slot' not in (row.get('labels') or [])
                        and not row.get('malformed')]}
     if args[0] == 'brd':
-        result['questions'] = [{'id': row['id'], 'title': row.get('title', ''),
-                                'description': row.get('description', '')}
-                               for row in rows if row.get('issue_type') == 'question'
-                               and row.get('status') != 'closed' and not row.get('malformed')]
-        result['decisions'] = [{'id': row['id'], 'title': row.get('title', ''),
-                                'description': row.get('description', '')}
-                               for row in rows if row.get('issue_type') == 'decision' and not row.get('malformed')]
+        result['decisions'] = decisions
     return result

@@ -5,6 +5,7 @@ belongs to the service adapter; neither this file nor its absence grants rights.
 """
 import re
 import time
+from datetime import datetime
 from pathlib import Path
 
 from coordination import atomic, identifier
@@ -60,8 +61,12 @@ def validate(record):
             raise ValueError('Requirements governance needs an actor')
         if entry['via'] == 'session' and not re.fullmatch(r'usr_[0-9a-f]{16}', entry['actor']):
             raise ValueError('Requirements governance needs a human account')
-        if not isinstance(entry['at'], str) or not entry['at'].strip():
-            raise ValueError('Requirements governance needs a timestamp')
+        try:
+            if not isinstance(entry['at'], str) or not re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z', entry['at']):
+                raise ValueError()
+            datetime.strptime(entry['at'], '%Y-%m-%dT%H:%M:%SZ')
+        except ValueError:
+            raise ValueError('Requirements governance needs a valid UTC timestamp') from None
         identifier(entry['operation_id'])
         if entry['operation_id'] in operations:
             raise ValueError('Requirements governance repeats an operation')
@@ -75,7 +80,7 @@ def validate(record):
 
 def validate_source(binding, governance):
     validate(governance)
-    if (not isinstance(binding, dict) or set(binding) != SOURCE_FIELDS
+    if (not isinstance(binding, dict) or set(binding) not in (SOURCE_FIELDS, SOURCE_FIELDS | {'restored_projects'})
             or type(binding.get('schema_version')) is not int or binding['schema_version'] != 1):
         raise ValueError('Invalid requirements governance restore binding')
     for name in ('project', 'source_project', 'restored_from'):
@@ -102,6 +107,13 @@ def validate_source(binding, governance):
         previous = origin['through_revision']
     if previous != number or origins[0]['project'] != governance['project']:
         raise ValueError('Requirements governance source ranges do not cover the restored history')
+    projects = binding.get('restored_projects', [binding['restored_from'], binding['project']])
+    if (not isinstance(projects, list) or not projects or any(not isinstance(p, str) for p in projects)
+            or len(set(projects)) != len(projects)
+            or binding['project'] not in projects or binding['restored_from'] not in projects):
+        raise ValueError('Invalid requirements governance restored projects')
+    for project in projects:
+        project_name(project)
     return binding
 
 
@@ -131,7 +143,10 @@ def snapshot(directory, project):
     for name in (FILE, SOURCE_FILE):
         path = safe_path(directory, name)
         if path.exists():
-            files[name] = load_json(path)
+            try:
+                files[name] = load_json(path)
+            except (ValueError, OSError):
+                raise ValueError('Requirements governance cannot be read; ask the project owner to reconcile it') from None
     validate_files(files, project)
     return files
 
@@ -169,7 +184,13 @@ def validate_evidence_files(files, project, evidence):
     if binding and number <= binding['revision']:
         identity = next(origin['project'] for origin in binding['origins']
                         if number <= origin['through_revision'])
-    if evidence['project'] != identity:
+    # Server-created decisions after a restore bind the destination even when
+    # it still uses an unchanged source governance entry. Preserve that lineage
+    # on further restores as well as the original entry's identity.
+    identities = {identity, project}
+    if binding:
+        identities.update(binding.get('restored_projects', [binding['restored_from'], binding['project']]))
+    if evidence['project'] not in identities:
         raise ValueError('Owner requirement evidence belongs to a different project')
 
 
@@ -224,6 +245,8 @@ def set_mode(directory, project, mode, actor, operation_id, expected_revision, e
             return {name: prior[name] for name in ('revision', 'sha256', 'mode')}
     if state['revision'] != expected_revision or state['sha256'] != expected_sha256:
         raise ValueError('Requirements changed. Reload and try again.')
+    if state['mode'] == mode:
+        return state
     updated = dict(record, revisions=record['revisions'] + [entry(
         state['revision'] + 1, state['sha256'], mode, actor, 'session', operation_id)])
     validate(updated)
@@ -249,5 +272,8 @@ def restored_files(files, source, destination):
                                'source_project': record['project'], 'restored_from': source,
                                'revision': len(record['revisions']), 'sha256': content_hash(record),
                                'origins': origins}
+        result[SOURCE_FILE]['restored_projects'] = sorted(set(
+            (binding.get('restored_projects', [binding['restored_from'], source]) if binding else [source])
+            + [source, destination]))
     validate_files(result, destination)
     return result

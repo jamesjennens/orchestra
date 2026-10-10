@@ -36,7 +36,8 @@ class OwnerBackend(EndpointBackend):
             if action == 'requirements':
                 return {'returncode': 0, 'stdout': json.dumps(requirements.read(
                     path, project, args, self.native)), 'stderr': ''}
-            self.service.store.save()
+            # State is persisted by the HTTP service. Writing it again here
+            # would race two fixture requests on the same temporary file.
             if self.before_owner:
                 hook = self.before_owner; self.before_owner = None; hook()
             self.native.actor = actor
@@ -224,6 +225,95 @@ class OwnerHttpTests(EndpointCase):
         replay = self.request('POST', route, self.expected(first), token=self.owner_token, key='partial-accept')
         self.assertEqual(replay.data, completed.data)
         self.assertEqual(len(self.backend.native.writes()), before)
+
+    def test_new_login_recovers_the_same_account_unknown_acceptance(self):
+        first = self.create_requirement(); route = self.base+'/requirements/'+first['id']+'/accept'
+        self.backend.native.fail_comment_prefix = records.REVISION_PREFIX
+        failed = self.request('POST', route, self.expected(first), token=self.owner_token, key='new-login-recovery')
+        self.assertEqual(failed.status, 503, failed.data)
+        new_token = self.login('alex', 'alex-password-1')[0]
+        self.assertNotEqual(new_token, self.owner_token)
+        self.backend.native.fail_comment_prefix = None
+        recovered = self.request('POST', route, self.expected(first), token=new_token, key='new-login-recovery')
+        self.assertEqual(recovered.status, 200, recovered.data)
+        self.assertEqual(sum(r['issue_type']=='decision' for r in self.backend.native.rows), 1)
+        self.assertEqual(len(owner_records.existing_acceptances(self.backend.native.row(first['id']))), 1)
+        before = len(self.backend.native.writes())
+        self.assertEqual(self.request('POST', route, self.expected(first), token=new_token,
+                                     key='new-login-recovery').data, recovered.data)
+        self.assertEqual(len(self.backend.native.writes()), before)
+
+    def test_keyless_edits_are_distinct_requests_and_latest_acceptance_is_noop(self):
+        first = self.create_requirement(); route = self.base+'/requirements/'+first['id']
+        one = self.request('PATCH', route, dict(self.expected(first), title='First edit'), token=self.owner_token)
+        self.assertEqual(one.status, 200, one.data)
+        two = self.request('PATCH', route, dict(self.expected(one.data), title='Second edit'), token=self.owner_token)
+        self.assertEqual(two.status, 200, two.data)
+        accepted = self.request('POST', route+'/accept', self.expected(two.data), token=self.owner_token)
+        self.assertEqual(accepted.status, 200, accepted.data)
+        before = len(self.backend.native.writes())
+        repeated = self.request('POST', route+'/accept', self.expected(accepted.data), token=self.owner_token)
+        self.assertEqual(repeated.status, 200, repeated.data)
+        self.assertEqual(repeated.data['sha256'], accepted.data['sha256'])
+        self.assertEqual(len(self.backend.native.writes()), before)
+
+    def test_owner_is_checked_inside_effect_with_authority_lock_held(self):
+        import contextlib
+        import http_authority
+        first = self.create_requirement(); before = len(self.backend.native.writes())
+        original_context = requirements.owner_context
+        original_lock = http_authority.file_lock
+        held, checks = [], []
+        @contextlib.contextmanager
+        def observe_lock(*args, **kwargs):
+            with original_lock(*args, **kwargs):
+                held.append(True)
+                try: yield
+                finally: held.pop()
+        def observe_context(*args, **kwargs):
+            context = original_context(*args, **kwargs)
+            checks.append(bool(held))
+            if len(checks) == 2:
+                # Keep generic project.admin authority, but revoke the narrower
+                # owner membership after the replay check and before effect.
+                self.service.state['users'][self.account]['superuser'] = True
+                self.service.state['memberships'][self.project][self.account] = 'contributor'
+                self.service.store.save()
+            return context
+        with mock.patch.object(http_authority, 'file_lock', observe_lock), \
+                mock.patch.object(requirements, 'owner_context', observe_context):
+            denied = self.request('POST', self.base+'/requirements/'+first['id']+'/accept',
+                                 self.expected(first), token=self.owner_token, key='effect-check')
+        self.assertEqual(denied.status, 422, denied.data)
+        self.assertEqual(checks, [False, True])
+        self.assertEqual(len(self.backend.native.writes()), before)
+
+    def test_client_at_is_refused_and_same_mode_stale_hash_does_not_noop(self):
+        first = self.create_requirement(); before = len(self.backend.native.writes())
+        refused = self.request('POST', self.base+'/requirements/'+first['id']+'/accept',
+            dict(self.expected(first), at='2030-01-01T00:00:00Z'), token=self.owner_token, key='client-at')
+        self.assertEqual(refused.status, 422, refused.data)
+        self.assertEqual(len(self.backend.native.writes()), before)
+        state = governance.current(self.path, self.project)
+        same = self.request('PUT', self.base+'/requirements/governance',
+            dict(self.expected(state), mode='simple'), token=self.owner_token, key='same-mode')
+        self.assertEqual(same.status, 200, same.data)
+        self.assertEqual({key: same.data[key] for key in state}, state)
+        stale = self.request('PUT', self.base+'/requirements/governance',
+            dict(self.expected(state), expected_sha256='0'*64, mode='simple'),
+            token=self.owner_token, key='stale-same-mode')
+        self.assertEqual(stale.status, 409, stale.data)
+
+    def test_cookie_needs_csrf_but_explicit_human_bearer_does_not(self):
+        first = self.create_requirement(); route = self.base+'/requirements/'+first['id']
+        token, csrf, _ = self.login('alex', 'alex-password-1')
+        body = dict(self.expected(first), title='Cookie edit')
+        refused = self.request('PATCH', route, body, cookie='orchestra_session='+token, key='cookie-missing-csrf')
+        self.assertEqual(refused.status, 403, refused.data)
+        edited = self.request('PATCH', route, body, cookie='orchestra_session='+token, csrf=csrf, key='cookie-csrf')
+        self.assertEqual(edited.status, 200, edited.data)
+        bearer = self.request('PATCH', route, dict(self.expected(edited.data), title='Bearer edit'), token=token, key='bearer-edit')
+        self.assertEqual(bearer.status, 200, bearer.data)
 
     def test_unknown_owner_request_without_matching_receipt_cannot_be_recovered(self):
         first = self.create_requirement()

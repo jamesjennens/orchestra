@@ -37,6 +37,18 @@ class NativeOwnerTests(fixture.RealBdLabelAliasTests):
         if slot.returncode:
             made = self.bd('create', 'Merge Slot', '--id', 'pp-merge-slot', '--labels', 'gt:slot', '--json')
             self.assertEqual(made.returncode, 0, made.stderr)
+        # The existing fixture has no governance sidecar: capture that old
+        # backup before any owner records or parent tasks exist.
+        (root/'backups').mkdir(exist_ok=True)
+        initialized = self.bd('backup', 'init', str(root/'backups'/'pp'))
+        self.assertEqual(initialized.returncode, 0, initialized.stderr)
+        for command in (['backup','pp'], ['restore-new','pp','legacy']):
+            done = subprocess.run([sys.executable, str(KIT/'admin.py'), '--root', str(root), *command],
+                env=fixture.admin.environment(root), capture_output=True, text=True, timeout=120)
+            self.assertEqual(done.returncode, 0, done.stdout+'\n'+done.stderr)
+        self.assertEqual(governance.current(root/'projects'/'legacy', 'legacy'),
+                         {'revision':0, 'sha256':None, 'mode':'governed'})
+        self.assertFalse((root/'projects'/'legacy'/governance.FILE).exists())
         made = self.bd('create', 'Owner job', '--type', 'epic', '--json')
         self.assertEqual(made.returncode, 0, made.stderr)
         job = json.loads(made.stdout)['id']
@@ -54,6 +66,10 @@ class NativeOwnerTests(fixture.RealBdLabelAliasTests):
             self.assertEqual(registered.status, 201, registered.data)
             self.assertEqual(harness.request('PUT', '/v1/projects/pp/members/'+account,
                                            {'role': 'owner'}, token=admin).status, 200)
+            registered = harness.request('POST', '/v1/projects', {'project_id':'legacy','name':'Old backup'}, token=admin)
+            self.assertEqual(registered.status, 201, registered.data)
+            self.assertEqual(harness.request('PUT','/v1/projects/legacy/members/'+account,
+                                           {'role':'owner'}, token=admin).status, 200)
             self.assertNotIn(account, fixture.admin.operators(self.root))
             base = '/v1/projects/pp'
             mode = harness.request('GET', base+'/requirements/governance', token=token)
@@ -68,6 +84,17 @@ class NativeOwnerTests(fixture.RealBdLabelAliasTests):
                 'kind': 'requirement', 'parent': job, 'title': '<script>Owner text</script>',
                 'description': 'An edit box and Accept.'}, token=token, key='native-owner-create')
             self.assertEqual(created.status, 201, created.data)
+            # LF-only parsing retains a valid NEL in owner text and comments.
+            nel = harness.request('POST', base+'/requirements', {'kind':'requirement','parent':job,
+                'title':'NEL\u0085requirement','description':'Before\u0085after'}, token=token, key='native-nel-create')
+            self.assertEqual(nel.status, 201, nel.data)
+            nel_accept = harness.request('POST', base+'/requirements/'+nel.data['id']+'/accept',
+                {'expected_revision':nel.data['revision'],'expected_sha256':nel.data['sha256']},
+                token=token, key='native-nel-accept')
+            self.assertEqual(nel_accept.status, 200, nel_accept.data)
+            nel_detail = harness.request('GET', base+'/requirements/'+nel.data['id'], token=token)
+            self.assertEqual(nel_detail.status, 200, nel_detail.data)
+            self.assertEqual(nel_detail.data['accepted']['description'], 'Before\u0085after')
             first = created.data; route = base+'/requirements/'+first['id']
             expected = lambda item: {'expected_revision': item['revision'], 'expected_sha256': item['sha256']}
             accepted = harness.request('POST', route+'/accept', expected(first), token=token, key='native-owner-accept')
@@ -86,6 +113,12 @@ class NativeOwnerTests(fixture.RealBdLabelAliasTests):
             replay = harness.request('POST', route+'/accept', expected(first), token=token, key='native-owner-accept')
             self.assertEqual(replay.data, accepted.data)
             self.assertEqual(next(r for r in self.rows() if r['id']==first['id']), original)
+            before = self.rows()
+            for suffix in ('acceptance-v1 ', 'acceptance-v1\r{}', 'acceptance-v2\n{}', 'xyz-v1'):
+                with self.assertRaisesRegex(ValueError, 'Refusing raw'):
+                    fixture.endpoint.execute(root, {'project':'pp','actor':'alice','action':'bd',
+                        'args':['comments','add',first['id'],'Kind: requirement-owner-'+suffix,'--json']})
+            self.assertEqual(self.rows(), before)
             viewer_id = harness.create_account(admin, 'viewer', 'viewer-password-1')
             viewer = harness.login('viewer', 'viewer-password-1')[0]
             self.assertEqual(harness.request('PUT', base+'/members/'+viewer_id,
@@ -108,7 +141,7 @@ class NativeOwnerTests(fixture.RealBdLabelAliasTests):
             self.assertEqual(self.rows(), before)
             viewer_document = harness.request('GET', base+'/brd', token=viewer)
             self.assertEqual(viewer_document.status, 200, viewer_document.data)
-            self.assertEqual(viewer_document.data['items'][0]['current']['sha256'], accepted.data['sha256'])
+            self.assertEqual(next(i for i in viewer_document.data['items'] if i['id']==first['id'])['current']['sha256'], accepted.data['sha256'])
             # Both machine kinds remain unavailable to ordinary native contributors.
             for prefix in (owner.ACCEPTANCE_PREFIX, owner.STATE_PREFIX):
                 with self.assertRaises(ValueError):
@@ -136,8 +169,6 @@ class NativeOwnerTests(fixture.RealBdLabelAliasTests):
             governance.validate_evidence(self.project, 'pp', evidence)
             # Run the shipped owner and viewer pages against this real endpoint.
             node = shutil.which('node')
-            if not node:
-                self.fail('Node.js is required for the configured native page proof')
             enabled = harness.request('PUT', base+'/requirements/governance',
                 dict(expected(governed.data), mode='simple'), token=token, key='native-page-simple')
             self.assertEqual(enabled.status, 200, enabled.data)
@@ -187,6 +218,8 @@ class NativeOwnerTests(fixture.RealBdLabelAliasTests):
             pending = next(r for r in self.rows() if r['id']==partial.data['id'])
             self.assertEqual(set(records.existing_revisions(pending)), {1})
             self.assertEqual(set(owner.existing_acceptances(pending)), {2})
+            fresh = harness.login('owner', 'owner-password-1')[0]
+            self.assertNotEqual(fresh, token); token = fresh
             recovered = harness.request('POST', partial_route, expected(partial.data),
                                         token=token, key='native-partial-accept')
             self.assertEqual(recovered.status, 200, recovered.data)
@@ -197,18 +230,33 @@ class NativeOwnerTests(fixture.RealBdLabelAliasTests):
                                      token=token, key='native-partial-accept')
             self.assertEqual(replay.data, recovered.data)
             self.assertEqual(next(r for r in self.rows() if r['id']==partial.data['id']), finished)
-            from test_http_web import run_node_module
-            page = run_node_module(self, node, 'await import(process.argv[1])',
-                (KIT/'tests'/'web_owner_requirements.mjs').as_uri(),
-                (KIT/'web'/'js'/'api.js').as_uri(), (KIT/'web'/'js'/'views'/'owner_requirements.js').as_uri(),
-                'http://127.0.0.1:'+str(harness.port), 'pp', token, viewer)
-            self.assertEqual(page.returncode, 0, page.stderr)
-            self.assertTrue(all(json.loads(page.stdout).values()), page.stdout)
+            with self.subTest(probe='owner and viewer browser pages'):
+                if not node:
+                    self.skipTest('Node.js is unavailable for the browser probe')
+                from test_http_web import run_node_module
+                page = run_node_module(self, node, 'await import(process.argv[1])',
+                    (KIT/'tests'/'web_owner_requirements.mjs').as_uri(),
+                    (KIT/'web'/'js'/'api.js').as_uri(), (KIT/'web'/'js'/'views'/'owner_requirements.js').as_uri(),
+                    'http://127.0.0.1:'+str(harness.port), 'pp', token, viewer)
+                self.assertEqual(page.returncode, 0, page.stderr)
+                self.assertTrue(all(json.loads(page.stdout).values()), page.stdout)
+                legacy = harness.request('GET','/v1/projects/legacy/requirements', token=token)
+                self.assertEqual(legacy.status, 200, legacy.data)
+                self.assertEqual(legacy.data['jobs'], [])
+                enabled_legacy = harness.request('PUT','/v1/projects/legacy/requirements/governance',
+                    dict(expected(legacy.data['governance']), mode='simple'), token=token, key='legacy-enable')
+                self.assertEqual(enabled_legacy.status, 200, enabled_legacy.data)
+                self.assertEqual(harness.request('PUT','/v1/projects/legacy/members/'+viewer_id,
+                                                {'role':'viewer'}, token=admin).status, 200)
+                page = run_node_module(self, node, 'await import(process.argv[1])',
+                    (KIT/'tests'/'web_owner_requirements.mjs').as_uri(),
+                    (KIT/'web'/'js'/'api.js').as_uri(), (KIT/'web'/'js'/'views'/'owner_requirements.js').as_uri(),
+                    'http://127.0.0.1:'+str(harness.port), 'legacy', token, viewer)
+                self.assertEqual(page.returncode, 0, page.stderr)
+                self.assertTrue(all(json.loads(page.stdout).values()), page.stdout)
             # Real native backup plus the shipped restore-new order: restore
             # governance, inner receipts and outer journal before the merge slot.
             (root/'backups').mkdir(exist_ok=True)
-            initialized = self.bd('backup', 'init', str(root/'backups'/'pp'))
-            self.assertEqual(initialized.returncode, 0, initialized.stderr)
             before_restore = self.rows()
             governance_bytes = (self.project/governance.FILE).read_bytes()
             import requirement_http
@@ -233,8 +281,36 @@ class NativeOwnerTests(fixture.RealBdLabelAliasTests):
             original_receipt = original_journal.lookup(operation)
             self.assertEqual(original_receipt['state'], 'committed')
             self.assertEqual(copied_journal.lookup(operation), original_receipt)
+            registered = harness.request('POST','/v1/projects',{'project_id':'cloned','name':'Restored owner flow'}, token=admin)
+            self.assertEqual(registered.status, 201, registered.data)
+            self.assertEqual(harness.request('PUT','/v1/projects/cloned/members/'+account,
+                                           {'role':'owner'}, token=admin).status, 200)
+            new = harness.request('POST','/v1/projects/cloned/requirements', {'kind':'requirement','parent':job,
+                'title':'Destination owner content','description':'Uses the restored source mode.'}, token=token, key='clone-create')
+            self.assertEqual(new.status, 201, new.data)
+            accepted_new = harness.request('POST','/v1/projects/cloned/requirements/'+new.data['id']+'/accept',
+                expected(new.data), token=token, key='clone-accept')
+            self.assertEqual(accepted_new.status, 200, accepted_new.data)
+            for suffix in ('/requirements', '/brd', '/requirements/'+new.data['id']):
+                view = harness.request('GET','/v1/projects/cloned'+suffix, token=token)
+                self.assertEqual(view.status, 200, view.data)
             # Source native evidence remains byte-for-byte unchanged by restore.
             self.assertEqual(self.rows(), before_restore)
+            # A raw, historical row beyond the JSON guard is visible by native
+            # filtered membership; it cannot turn into a missing requirement.
+            bad = self.bd('create', 'Unreadable historical requirement', '--labels','requirement', '--json')
+            self.assertEqual(bad.returncode, 0, bad.stderr); bad_id = json.loads(bad.stdout)['id']
+            past = '{"deep":' + '{"a":'*749 + '1' + '}'*749 + '}'
+            nested = self.bd('update', bad_id, '--metadata', past)
+            self.assertEqual(nested.returncode, 0, nested.stderr)
+            for suffix in ('/requirements', '/brd'):
+                read = harness.request('GET', base+suffix, token=token)
+                self.assertEqual(read.status, 200, read.data)
+                self.assertTrue(next(i for i in read.data['items'] if i['id']==bad_id)['unreadable'])
+                self.assertTrue(next(i for i in read.data['items'] if i['id']==first['id'])['accepted'])
+            refused = harness.request('GET', base+'/requirements/'+bad_id, token=token)
+            self.assertEqual(refused.status, 422, refused.data)
+            self.assertIn(bad_id, str(refused.data))
         finally:
             harness._stop_server(); harness.doCleanups()
 

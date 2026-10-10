@@ -1888,6 +1888,8 @@ def reserved_match(body):
     if not isinstance(body, str):
         return None
     for view in (body, _reserved_prefix_view(body)):
+        if view.startswith('Kind: requirement-owner-'):
+            return ('Kind: requirement-owner-', 'owner requirement record', 'the owner requirements page')
         for prefix, kind, operation in RESERVED:
             if view.startswith(prefix):
                 return (prefix, kind, operation)

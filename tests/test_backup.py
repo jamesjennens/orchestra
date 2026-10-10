@@ -341,7 +341,7 @@ class BackupTests(unittest.TestCase):
                 patch.object(admin, 'run_bd', return_value='restored') as native, \
                 contextlib.redirect_stdout(io.StringIO()) as out:
             admin.main()
-        create.assert_called_once_with(self.root, 'destination')
+        create.assert_called_once_with(self.root, 'destination', requirements_default=False)
         # `bd backup restore` and then the kittrial-5bb.49 re-point of the clone's own
         # native backup target (a restored clone otherwise keeps the source's target).
         self.assertEqual([item.args[2] for item in native.call_args_list],
@@ -543,7 +543,7 @@ class BackupTests(unittest.TestCase):
         def read(root, source):
             locked('validate-sidecar')
             return real_read(root, source)
-        def create(*args): locked('create-destination')
+        def create(*args, **kwargs): locked('create-destination')
         def native(*args):
             # The native restore, then the kittrial-5bb.49 re-point of the clone's target.
             locked('repoint-native' if args[2][:2] == ['backup', 'init'] else 'restore-native')

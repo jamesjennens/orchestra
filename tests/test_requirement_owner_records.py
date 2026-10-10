@@ -3,6 +3,7 @@ import json
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -49,6 +50,120 @@ class OwnerEvidenceTests(unittest.TestCase):
         return http.apply(self.path, self.context, 'accept', {
             'expected_revision': item['revision'], 'expected_sha256': item['sha256']},
             operation, self.native, task=item['id'])
+
+    def test_poisoned_row_is_marked_while_healthy_accepted_content_survives(self):
+        first = self.create(); accepted = self.accept(first)
+        bad = self.native.seed('broken-1', labels=['requirement'], comments=[
+            {'id': 'bad', 'author': 'alice', 'text': 'Kind: requirement-owner-xyz-v1'}])
+        # Give it real content before poisoning its separate authority ledger.
+        bad['comments'].insert(0, dict(self.native.row(first['id'])['comments'][0]))
+        bad['comments'][0]['text'] = records.REVISION_PREFIX + '{broken'
+        for mode in ('simple', 'governed'):
+            state = governance.current(self.path, 'alpha')
+            governance.set_mode(self.path, 'alpha', mode, ACCOUNT, 'mode-'+mode,
+                                state['revision'], state['sha256'])
+            for command in ('list', 'brd'):
+                result = http.read(self.path, 'alpha', [command], self.native)
+                self.assertEqual(next(i for i in result['items'] if i['id']==first['id'])['accepted']['sha256'], accepted['sha256'])
+                self.assertTrue(next(i for i in result['items'] if i['id']=='broken-1')['unreadable'])
+            with self.assertRaisesRegex(ValueError, 'broken-1.*cannot be read'):
+                http.read(self.path, 'alpha', ['get', 'broken-1'], self.native)
+
+    def test_whole_owner_family_is_reserved_including_unknown_and_incomplete_spelling(self):
+        for suffix in ('acceptance-v1 ', 'acceptance-v1\r{}', 'acceptance-v2\n{}', 'xyz-v1', ''):
+            body = 'Kind: requirement-owner-'+suffix
+            with self.subTest(body=body):
+                self.assertIsNotNone(reserved_comments.reserved_match(body))
+                self.assertIsNotNone(reserved_comments.reserved_match('\ufeff'+body))
+                with self.assertRaises(ValueError):
+                    reserved_comments.check_comment_body(body, 'positional', actor='alice', task='req-1')
+
+    def test_accepted_text_and_decisions_are_immutable_while_pending_edit_is_separate(self):
+        first = self.create(); accepted = self.accept(first)
+        evidence = owner.existing_acceptances(self.native.row(first['id']))[2]
+        self.native.row(evidence['decision']['decision_id'])['title'] = 'Contributor retitled this'
+        self.native.seed('unrelated-decision', title='Forged owner direction', issue_type='decision')
+        http.apply(self.path, self.context, 'revise', {
+            'expected_revision': accepted['revision'], 'expected_sha256': accepted['sha256'],
+            'title': 'Pending title', 'description': 'Pending body'}, 'pending-edit', self.native, first['id'])
+        result = http.read(self.path, 'alpha', ['brd'], self.native)
+        self.assertEqual(result['items'][0]['accepted']['description'], 'The owner edits this.')
+        self.assertEqual(result['items'][0]['pending_draft']['description'], 'Pending body')
+        self.assertEqual(result['decisions'], [{'id': evidence['decision']['decision_id'],
+            'requirement_id': first['id'], 'title': 'Accepted One thing', 'revision': 2}])
+        self.assertNotIn('questions', result)
+
+    def test_accepting_latest_accepted_content_is_noop(self):
+        first = self.create(); accepted = self.accept(first); before = len(self.native.writes())
+        repeated = self.accept(accepted, 'already-accepted')
+        self.assertEqual(repeated['sha256'], accepted['sha256'])
+        self.assertEqual(len(self.native.writes()), before)
+
+    def test_cli_requirements_reads_route_to_requirements_action(self):
+        import client
+        import io
+        configuration = self.path/'synthetic-client.json'; configuration.write_text('{}')
+        for command in (['list'], ['get','req-1'], ['brd'], ['governance'], ['snapshot']):
+            with patch.object(sys, 'argv', ['client.py','--config',str(configuration),
+                    '--project','alpha','--actor','reader','--','requirements',*command]), \
+                    patch.object(client, 'request', return_value={'returncode':0,'stdout':'{}','stderr':''}) as request, \
+                    patch('sys.stdout', new=io.StringIO()):
+                self.assertEqual(client.main(), 0)
+                self.assertEqual(request.call_args.args[3], command)
+                self.assertEqual(request.call_args.args[4], 'requirements')
+
+    def test_nel_create_and_revision_are_preserved_and_do_not_allocate_orphan(self):
+        created = http.apply(self.path, self.context, 'create', {
+            'kind': 'requirement', 'parent': 'job-1', 'title': 'NEL\u0085title',
+            'description': 'Before\u0085after'}, 'nel-create', self.native)
+        self.accept(created, 'nel-accept')
+        result = http.read(self.path, 'alpha', ['get', created['id']], self.native)
+        self.assertEqual(result['accepted']['description'], 'Before\u0085after')
+        self.assertEqual(sum('requirement' in r['labels'] for r in self.native.rows), 1)
+
+    def test_unreadable_anchor_stays_visible_by_filtered_membership_without_fields(self):
+        first = self.create(); self.accept(first)
+        healthy = copy.deepcopy(self.native.rows)
+        marker = {'id': 'deep-row', 'malformed': True}
+        def membership(args):
+            if args[0] == 'list':
+                return json.dumps([{'id': 'deep-row'}] if '--label' in args and args[args.index('--label')+1]=='requirement' else [])
+            return self.native(args)
+        with patch.object(records, 'read_rows', return_value=healthy+[marker]):
+            listing = http.read(self.path, 'alpha', ['list'], membership)
+            self.assertEqual(len(listing['items']), 2)
+            self.assertTrue(next(i for i in listing['items'] if i['id']=='deep-row')['unreadable'])
+            with self.assertRaisesRegex(ValueError, 'deep-row.*cannot be read'):
+                http.read(self.path, 'alpha', ['get', 'deep-row'], membership)
+
+    def test_allocated_create_retry_finishes_same_row_after_unconfirmed_comment(self):
+        self.native.fail_comment_prefix = records.REVISION_PREFIX
+        with self.assertRaises(ValueError): self.create()
+        allocated = next(r['id'] for r in self.native.rows if 'requirement' in r['labels'])
+        listing = http.read(self.path, 'alpha', ['list'], self.native)
+        self.assertTrue(listing['items'][0]['unreadable'])
+        self.native.fail_comment_prefix = None
+        recovered = self.create()
+        self.assertEqual(recovered['id'], allocated)
+        self.assertEqual(sum('requirement' in r['labels'] for r in self.native.rows), 1)
+
+    def test_restored_current_source_mode_allows_destination_acceptance_and_further_restore(self):
+        first = self.create(); self.accept(first)
+        files = governance.restored_files(governance.snapshot(self.path, 'alpha'), 'alpha', 'beta')
+        beta = self.path/'beta'; beta.mkdir()
+        for name, value in files.items(): (beta/name).write_text(json.dumps(value))
+        context = http.OwnerContext('beta', ACCOUNT, governance.current(beta, 'beta'))
+        created = http.apply(beta, context, 'create', {'kind':'requirement', 'parent':'job-1',
+            'title':'Restored project content', 'description':'Accepted without changing its source mode.'},
+            'beta-create', self.native)
+        accepted = http.apply(beta, context, 'accept', {'expected_revision':created['revision'],
+            'expected_sha256':created['sha256']}, 'beta-accept', self.native, created['id'])
+        self.assertEqual(http.read(beta, 'beta', ['get', created['id']], self.native)['accepted']['sha256'], accepted['sha256'])
+        files = governance.restored_files(governance.snapshot(beta, 'beta'), 'beta', 'gamma')
+        evidence = owner.existing_acceptances(self.native.row(created['id']))[2]
+        governance.validate_evidence_files(files, 'gamma', evidence)
+        files = governance.restored_files(files, 'gamma', 'delta')
+        governance.validate_evidence_files(files, 'delta', evidence)
 
     def test_owner_no_operator_enrollment_writes_decision_then_evidence_then_revision(self):
         item = self.create()

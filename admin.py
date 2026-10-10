@@ -2582,6 +2582,8 @@ def initialize_requirements_governance(root,name):
     record=project_creation.read_record(root,name)
     if record is None or record['state'] not in ('started','incomplete'):
         raise ValueError('Requirements governance initialization needs an unfinished project creation')
+    if record.get('requirements_governance') != 'simple':
+        return requirement_governance.current(project_dir(root,name),name)
     # Host creations predate operation_id; their durable start identity is stable
     # across finish-project, unlike the mutable stage and last-error fields.
     operation=record.get('operation_id') or content_hash({
@@ -2645,7 +2647,7 @@ def finish_project_steps(root,name):
     provision_merge_slot(root,name)
     backup_project(root,name)
 
-def add_project(root,name):
+def add_project(root,name,requirements_default=True):
     """Initialize one project, provision its merge slot and back it up once.
 
     The operator's route keeps the same creation record the web route keeps
@@ -2666,7 +2668,11 @@ def add_project(root,name):
     """
     import project_creation
     try:
-        project_creation.host_create(root,name,initialize_project,require_creatable_project)
+        if requirements_default:
+            project_creation.host_create(root,name,initialize_project,require_creatable_project)
+        else:
+            project_creation.host_create(root,name,initialize_project,require_creatable_project,
+                                         requirements_default=False)
     except ValueError as error:
         # A name held by a creation that stopped is not a dead end: the record names the
         # commands that act on it (kittrial-5bb.176).
@@ -7297,7 +7303,7 @@ def main():
                 # the native restore: a stop during add-project (or the re-point) used to
                 # end the process with no notice at all (review 01a1026a).
                 with signal_termination_guard():
-                    add_project(root,args.destination)
+                    add_project(root,args.destination,requirements_default=False)
                     # The native restore runs through the Dolt SQL client (no bd ~10 s read
                     # timeout), in its own process group, and adopts the restored project
                     # identity; a destination without server metadata keeps `bd backup restore`.
