@@ -395,7 +395,7 @@ class RealStackOrderTests(held_stack.RealStackTests):
             self.assertEqual(200, brief.status, brief.data)
             self.assertGreaterEqual(brief.data['newer']['other_count'], 1)
             self.assertLessEqual(len(brief.data['newer']['entries']), 5)
-            self.assertEqual(brief.data['checkpoint']['id'], cp.data['id'])
+            self.assertEqual(brief.data['checkpoint']['id'], cp.data['comment_id'])
         history = self.request('GET', base + '/history?limit=100', token=agent)
         self.assertEqual(200, history.status, history.data)
         self.assertIn('Review this <script> literally', json.dumps(history.data, ensure_ascii=False))
