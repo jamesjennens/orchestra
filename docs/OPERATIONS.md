@@ -325,6 +325,111 @@ refuses every such key. The same applies to a coordination-sidecar backup taken 
 adoption. [OFFICE_SERVICE.md](OFFICE_SERVICE.md) repeats this beside "Binary pins on
 rollback".
 
+### Accept bound keys only
+
+An installation can be set to accept bound keys only, so a line that leaves a key bound to
+nothing - no project to reach, or no principal whose actors it may be - is refused by the forced
+command before the endpoint runs (kittrial-5bb.196; slice 4 of
+[COORDINATORS_PER_PROJECT_DESIGN.md](COORDINATORS_PER_PROJECT_DESIGN.md), and Migration steps 6
+and 7):
+
+```sh
+python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime \
+  bound-keys-only on --actor OPERATOR
+```
+
+The command has three actions: `status` prints the setting, the last recorded change, whether the
+two agree (`audit_agrees`, with a warning when an older kit or a hand edit changed one without the
+other) and the lines that turning it on would refuse; `on` and `off` flip it. `audit_agrees` is
+`null` with `audit_note` `no entry` when no flip was ever recorded: a value hand-set to on with no
+audit entry does not read as agreeing, and `status` says so. Both `status` and
+`on` read the authorized_keys file named by `--file` (default this account's
+`~/.ssh/authorized_keys`) and report `would_be_refused`: the lines of this kit and this root that
+the setting refuses, or would refuse while it is off. So the operator sees what `on` is about to
+cut off before it happens, and `on` prints that list - after reading and building it and before it
+writes the flip, so a slow or failing read of the keys file never leaves the setting on with
+nothing printed. The keys file is read at most its first 1 MiB, and `would_be_refused` names at most
+20 line numbers with `would_be_refused_more` (and an "and N more" in the note) saying how many more
+there are, so a hand-written file cannot flood the terminal. It is operator-gated (`--actor` must be
+on the deployment operator allowlist) and every flip is recorded in the deployment document's
+`bound_keys_only_audit`, with the value it replaced, keeping the last 20 flips; a flip that changes
+nothing writes nothing. `off` on a value that is not true or false is a real flip: it writes false,
+so the bad value and its warning do not stay in the file.
+
+The setting itself is one key, `bound_keys_only`, in `deployment.private.json`; absent or false is
+off, so an installation that configures nothing behaves as it did in the ordinary case, and a fresh
+install and one that turned the setting back off read identically. The reader reads at most the
+first 1 MiB of that file and refuses a larger one, in the forced command and in `admin.py` alike:
+the file is read on every connection, so a huge one must not be read whole.
+
+With it on, a line that names no `--project` or no `--principal` is answered on stderr with exit
+status 2, the missing part is named, and nothing is run - `ssh -T HOST` on such a key answers
+this too. That message, like the non-bool warning, speaks of "the installation setting" and names
+neither the settings file's server path nor the value found: stderr reaches the connecting
+contributor. The operator's own `admin.py` commands name both. A line that names both is served
+exactly as before, and `admin.py authorized-keys`
+refuses to print a contributor line that the setting would refuse (`--role operator` still prints
+the unrestricted line: a shell is outside this setting). What the setting does not touch: an
+unrestricted key, another program's `command=`, a project's rules, and rules 1 and 2.
+
+**What it does not do, said plainly.** A line printed before an upgrade names the wrapper and the
+endpoint of the release it was printed from, by absolute path, and on an office installation that
+path carries the release. Such a line runs THAT release's wrapper and endpoint - which know
+nothing of this setting, or of rules 1 to 3 - against the live runtime, for as long as that
+release's directory is there, and nothing in the new kit can refuse it. **Clean
+`authorized_keys` by hand**: remove or reprint every line that points at another release. The
+setting closes a forgotten line of the CURRENT kit; it does nothing about an older release's.
+`admin.py authorized-keys-list` flags each line that points at a kit other than the installed one
+(`other_kit`, `names_release`) and, while the setting is on, it also puts under `attention` every
+line of THIS kit and THIS root that names no project or no principal, and its `bound_keys_only`
+field says which setting it read. Its `would_be_refused` field names those lines whether the
+setting is on or off, so it is the preview before `on`. The setting is decided by what the
+wrapper's own command line decides: the wrapper FILE the line runs and its LAST `--root` (its
+argparse takes the last when a line names it twice); an `--endpoint` argument that names another
+kit's file does not move the line out of this kit's reach. A line that runs another kit's wrapper,
+or whose last `--root` is another runtime, is never counted as refused: this setting does not reach
+it (that line is served by the release or the root it names), and the note says so. A named line
+the wrapper refuses for another reason (a bad or unknown argument, a binding named twice) is listed
+as refused with a sentence saying the setting is not why.
+
+`setup-status` reports the setting: the endpoint's read-only action carries a `bound_keys_only`
+block (`enabled` true or false, and `null` with its reason when the setting cannot be read - a
+damaged file, a path that is not a regular file, or one that nests too deeply - each with a
+sentence). An endpoint older than this kit does not carry the block at all.
+
+**Before an upgrade or a rollback.** The printed lines name the release, so after every upgrade
+of an office installation print and install them again (`authorized-keys`), as Migration step 6
+says. A kit older than this one does not know the setting at all: rolling back to it silently
+stops refusing unbound lines although `bound_keys_only` is still true in
+`deployment.private.json`. It reads that file otherwise as before, and when this kit is back the
+setting applies again.
+
+**A damaged or unreadable `deployment.private.json` refuses a confined key.** The wrapper cannot
+tell whether the setting is on, so it refuses every call of a forced-command key (exit status 2,
+saying the installation setting could not be read) until an operator repairs or removes the file;
+nothing is run. The operator's own unrestricted key does not run the wrapper and still reaches a
+shell, so this can never lock the operator out. A value that is neither true nor false is read as
+off with a warning on stderr, as `review-writes` reads such a value for its own switch.
+
+**Three exceptions to "an installation that configures nothing behaves exactly as it did".** All
+three are deliberate, and all three are covered by the recovery:
+
+* **A damaged `deployment.private.json` refuses every forced-command key even where the setting
+  was never on.** The forced command cannot see whether the setting is on, so it refuses rather
+  than serve unbound (a release before this one still answered `setup-status` here). **Recovery:**
+  an operator repairs the file, or removes it - a missing file reads as off - and the confined
+  keys work again; the operator's own unrestricted key reaches a shell throughout.
+* **A line whose `--root` names a regular file is refused** (the wrapper's reader cannot look up
+  `deployment.private.json` under a regular file). **Recovery:** correct that line's `--root` to
+  the runtime directory and print it again with `admin.py authorized-keys`.
+* **A VALID `deployment.private.json` larger than 1 MiB refuses every forced-command key even
+  where the setting was never on.** Both readers read at most the first 1 MiB and refuse a larger
+  file, because neither can tell whether the setting sits beyond the bound; so a valid but oversized
+  file refuses a confined key although `bound_keys_only` was never set. **Recovery:** bring the
+  file back under 1 MiB - the kit keeps a damaged audit list aside inside that file, which is the
+  only thing in this kit that grows it - and the confined keys work again; the operator's own
+  unrestricted key reaches a shell throughout.
+
 ### sshd settings the boundary needs
 
 The forced command closes what the key can run; two sshd settings decide what the client can
@@ -445,6 +550,7 @@ history](#malformed-structured-history) (`void-record`).
 | `authority-changes` | read-only: the recorded changes of the operator and verifier lists - which list, the actor added or removed, the change, when, and the recorded `--actor`/`--reason` (`null` when the caller gave neither) | none: read-only |
 | `review-writes status\|on\|off --actor OPERATOR` | read or set the per-installation switch that allows **writing** the new review-workflow record shapes (`withdraw`, `request-review`, `resolve-item`, `decline-review`, an item `severity`, a request-changes `summary`). Readers in this kit understand those shapes either way; with the switch off (the default) a write of one is refused before any native write. See [Review-workflow write switch](#review-workflow-write-switch) | the deployment operator allowlist, checked before any write; `deployment.private.json` is the only source (there is no environment fallback) |
 | `checkpoint-provenance-writes status\|on\|off --actor OPERATOR` | read or set the per-installation switch that allows **writing** checkpoint provenance and direction dispositions (acknowledge, resolve, supersede). Readers in this kit understand them either way; with the switch off (the default) a checkpoint that asks for them is refused before any native write. See [Checkpoint provenance write switch](#checkpoint-provenance-write-switch) | the deployment operator allowlist, checked before any write; `deployment.private.json` is the only source |
+| `bound-keys-only status\|on\|off --actor OPERATOR [--file AUTHORIZED_KEYS]` | read or set the per-installation setting that **accepts bound keys only**: with it on, the forced command of an `authorized_keys` line refuses a line that names no project or no principal, and `setup-status` reports it. `status` and `on` report `would_be_refused` (the lines of this kit and this root the setting refuses, or would refuse while it is off), read from `--file` or `~/.ssh/authorized_keys`. Off is the default and the absent key, so an installation that configures nothing behaves as before. See [Accept bound keys only](#accept-bound-keys-only) | the deployment operator allowlist, checked before any write; `deployment.private.json` is the only source |
 | `proposal-review PROJECT --actor OPERATOR --file review.json` | record a coordinator disposition on a requirement proposal. The payload is `{schema_version, operation_id, key, previous, proposal_sha256, to_state, ...}`: `previous` is the `disposition_comment_id` and `proposal_sha256` the `sha256` that `proposal get` returned, so a stale read is refused before any write. `to_state` is `under-review` (the claim), `rejected` (with `reason`), `duplicate-of` (with `duplicate_of`), `needs-info` (with `question`), `escalated-to-owner` (with `escalation: {question, owner_identity, due_by}`) or `incorporated` (with `incorporation`, checked against the requirement record) | the deployment operator allowlist, checked before any read; the actor must be mapped to a person and must not be the submitter |
 | `proposal-decide PROJECT --actor OPERATOR --file decision.json` | record the owner decision on an escalated proposal: `to_state` `approved` or `rejected` (with `reason`), and `decision: {decision_id}` naming an existing native decision issue. Never a requirement id | the allowlist; the decider must be a different person than the escalator and must not be the submitter |
 | `proposal-settings PROJECT --actor OPERATOR [--map-actor ACTOR --to IDENTITY] [--namespace NAME --to IDENTITY] [--unmap-actor ACTOR] [--unmap-namespace NAME] [--add-decider IDENTITY] [--remove-decider IDENTITY]` | with no change, print the contribution settings; otherwise write the next settings record, composed from the current one and bound to its hash | the allowlist |
@@ -551,8 +657,9 @@ operations the host carries, `retire` included, not the one this route does.
 **What stays with the installation operator.** `proposal-settings`, `capability-retire`,
 `capability-alias-propose`/`-reject`, `void-record`, `revert-record`, every `*-reconcile`,
 `anchor-release`, `remove-creation`, `retire-project`, the backups, the switch commands
-(`review-writes`, `checkpoint-provenance-writes`) and the operator and verifier list commands
-are **not** reachable through this surface, for anybody: they remain `admin.py` host commands.
+(`review-writes`, `checkpoint-provenance-writes`, `bound-keys-only`) and the operator and
+verifier list commands are **not** reachable through this surface, for anybody: they remain
+`admin.py` host commands.
 The action refuses any name it does not know and names the ones it does.
 
 **How the power is taken away.** The operator list is checked against the name the project's

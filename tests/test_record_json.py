@@ -230,6 +230,11 @@ class NoUnguardedParseTests(unittest.TestCase):
         'sessions.py': (1, 'the session registry the kit writes in read_registry (which turns a '
                            'damaged or nested file into one plain sentence; kittrial-5bb.194 revision 2 made '
                            'execute read through it)'),
+        'ssh_forced_command.py': (1, "one installation setting read from the runtime's own "
+                                     'deployment.private.json (kittrial-5bb.196): the wrapper cannot import the kit '
+                                     '(it must start on any interpreter the account has), so it reads that '
+                                     'host-written file itself and refuses a file it cannot read, a deeply nested '
+                                     'one included'),
         'version.py': (1, "the kit's own version file"),
         'work.py': (1, 'the request files the kit writes'),
         'worker.py': (2, "the endpoint's answer, on the caller's machine"),
