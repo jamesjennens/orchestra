@@ -2288,7 +2288,7 @@ RETIRE_JOURNAL='journal.jsonl'
 #: The receipt journals whose ``pending`` entries are reservations still in flight.
 RESERVATION_JOURNALS=('.coordination-requests','.requirement-requests','.handoff-requests',
                       '.reference-requests','.proposal-requests','.capability-requests',
-                      '.open-item-requests')
+                      '.open-item-requests','.requirement-owner-requests')
 
 def retired_entries(root):
     """``[(project name, entry directory name)]`` for every retired project, sorted.
@@ -2575,6 +2575,21 @@ def require_creatable_project(root,name):
     require_bd_init_tools(root)
     return path
 
+def initialize_requirements_governance(root,name):
+    """Only a durable, unfinished creation may install the new-project default."""
+    import project_creation
+    import requirement_governance
+    record=project_creation.read_record(root,name)
+    if record is None or record['state'] not in ('started','incomplete'):
+        raise ValueError('Requirements governance initialization needs an unfinished project creation')
+    if record.get('requirements_governance') != 'simple':
+        return requirement_governance.current(project_dir(root,name),name)
+    # Host creations predate operation_id; their durable start identity is stable
+    # across finish-project, unlike the mutable stage and last-error fields.
+    operation=record.get('operation_id') or content_hash({
+        'project':name,'by':record['by'],'started_at':record['started_at']})
+    return requirement_governance.initialize(project_dir(root,name),name,record['by'],operation)
+
 def initialize_project(root,name,stage=None):
     """The work of ``add-project``: database, settings, backup target, merge slot, first backup.
 
@@ -2606,6 +2621,8 @@ def initialize_project(root,name,stage=None):
     at('configure')
     for key,value in PROJECT_SETTINGS:
         run_bd(root,name,['config','set',key,value])
+    at('requirements-governance')
+    initialize_requirements_governance(root,name)
     at('backup-target')
     run_bd(root,name,['backup','init',str(root/'backups'/name)])
     at('merge-slot')
@@ -2623,13 +2640,14 @@ def finish_project_steps(root,name):
     if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
     for key,value in PROJECT_SETTINGS:
         run_bd(root,name,['config','set',key,value])
+    initialize_requirements_governance(root,name)
     target=root/'backups'/name
     if not (target.is_dir() and any(target.iterdir())):
         run_bd(root,name,['backup','init',str(target)])
     provision_merge_slot(root,name)
     backup_project(root,name)
 
-def add_project(root,name):
+def add_project(root,name,requirements_default=True):
     """Initialize one project, provision its merge slot and back it up once.
 
     The operator's route keeps the same creation record the web route keeps
@@ -2650,7 +2668,11 @@ def add_project(root,name):
     """
     import project_creation
     try:
-        project_creation.host_create(root,name,initialize_project,require_creatable_project)
+        if requirements_default:
+            project_creation.host_create(root,name,initialize_project,require_creatable_project)
+        else:
+            project_creation.host_create(root,name,initialize_project,require_creatable_project,
+                                         requirements_default=False)
     except ValueError as error:
         # A name held by a creation that stopped is not a dead end: the record names the
         # commands that act on it (kittrial-5bb.176).
@@ -2677,7 +2699,7 @@ def backup_lock(root,name):
 # kittrial-5bb.126 (open items design, slice 0) adds `.open-item-requests`, which no
 # kit writes yet either. The host-issued `.owner-answers` journal is not a receipt
 # journal: see OWNER_ANSWERS_JOURNAL.
-RECORD_JOURNALS=('.reference-requests','.proposal-requests','.capability-requests','.open-item-requests')
+RECORD_JOURNALS=('.reference-requests','.proposal-requests','.capability-requests','.open-item-requests','.requirement-owner-requests')
 #: The host-issued owner answer and owner decision journal of the open items design
 #: (kittrial-5bb.126, slice 0). Nothing writes it yet. It is backed up when present and
 #: validated by its reader's own validator, open_items.validate_owner_entry, exactly
@@ -2705,8 +2727,8 @@ def validate_coordination_files(files):
     if not isinstance(files,dict):raise ValueError('Invalid coordination files map')
     for name,record in files.items():
         quarantine = isinstance(name,str) and re.fullmatch(r'\.feedback\.jsonl\.(?:[a-f0-9]{16}|[a-f0-9]{64})\.incomplete',name)
-        journal = isinstance(name,str) and re.fullmatch(r'(?:\.coordination-requests|\.handoffs|\.handoff-requests|\.handoff-recoveries|\.requirement-requests|\.requirement-backfills|\.integration-reverts|\.reference-requests|\.proposal-requests|\.capability-requests|\.open-item-requests|\.owner-answers)/[a-f0-9]{64}\.json',name)
-        if name not in ('.merge-context.json','ONBOARDING.md','GUIDANCE.md','.guidance.json','.guidance-clear.json','.sessions.json','.feedback.jsonl') and not quarantine and not journal:raise ValueError('Invalid coordination backup path')
+        journal = isinstance(name,str) and re.fullmatch(r'(?:\.coordination-requests|\.handoffs|\.handoff-requests|\.handoff-recoveries|\.requirement-requests|\.requirement-owner-requests|\.requirement-backfills|\.integration-reverts|\.reference-requests|\.proposal-requests|\.capability-requests|\.open-item-requests|\.owner-answers)/[a-f0-9]{64}\.json',name)
+        if name not in ('.merge-context.json','ONBOARDING.md','GUIDANCE.md','.guidance.json','.guidance-clear.json','.sessions.json','.feedback.jsonl','.requirements-governance.json','.requirements-governance-source.json') and not quarantine and not journal:raise ValueError('Invalid coordination backup path')
         if not isinstance(record,dict):raise ValueError('Invalid coordination record')
         if name=='.sessions.json':
             from sessions import validate
@@ -2765,6 +2787,8 @@ def validate_coordination_files(files):
         if quarantine:
             from feedback import validate_quarantine_record
             validate_quarantine_record(name,record)
+    from requirement_governance import validate_files as validate_governance_files
+    validate_governance_files(files)
     # The guidance text and its audit record are one generation: a backup that
     # carries the text but not the matching record (or a record whose version is not
     # the hash of the text) is refused rather than restored as a mismatched pair
@@ -3175,6 +3199,8 @@ def backup_project(root,name):
         fcntl.flock(lock,fcntl.LOCK_EX)
         atomic(bundle,{'schema_version':1,'status':'pending'})
         files={}
+        from requirement_governance import snapshot as governance_snapshot
+        files.update(governance_snapshot(path,name))
         if (path/'.coordination-requests').is_symlink() or (path/'.merge-context.json').is_symlink():raise ValueError('Coordination paths must not be symlinks')
         for record in sorted((path/'.coordination-requests').glob('*.json')):
             if record.is_symlink():raise ValueError('Coordination receipt must not be a symlink')
@@ -4386,6 +4412,8 @@ def restore_coordination(root,source,destination,restore_operators=False,restore
     if files is None:
         print('Legacy backup has no coordination journal. Reconcile outstanding child requests and merge ownership before accepting writes.')
         return False
+    from requirement_governance import restored_files as restored_governance_files
+    files=restored_governance_files(files,source,destination)
     if using_last_complete_sidecar(root,source):
         print('The canonical coordination sidecar backups/%s.coordination.json is not complete, so this restore '
               'uses the durable last-complete copy %s (the previous complete generation, restored with the '
@@ -7275,7 +7303,7 @@ def main():
                 # the native restore: a stop during add-project (or the re-point) used to
                 # end the process with no notice at all (review 01a1026a).
                 with signal_termination_guard():
-                    add_project(root,args.destination)
+                    add_project(root,args.destination,requirements_default=False)
                     # The native restore runs through the Dolt SQL client (no bd ~10 s read
                     # timeout), in its own process group, and adopts the restored project
                     # identity; a destination without server metadata keeps `bd backup restore`.

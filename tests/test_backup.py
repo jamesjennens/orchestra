@@ -114,6 +114,49 @@ class BackupTests(unittest.TestCase):
         admin.restore_coordination(self.root,'source','destination')
         self.assertEqual(json.loads((self.destination/'.sessions.json').read_text()),registry)
 
+    def test_owner_requirement_history_governance_receipts_and_request_journal_restore(self):
+        import requirement_governance as gov
+        import requirement_http as owner_http
+        import requirement_owner_records as owner_records
+        import requirement_records as records
+        from http_authority import OperationJournal, journal_path
+        from test_requirement_owner_records import OwnerNative, ACCOUNT
+        native = OwnerNative(); native.actor = ACCOUNT
+        native.row('job-1')['issue_type'] = 'epic'
+        gov.initialize(self.source, 'source', 'host', 'new-project-source')
+        context = owner_http.OwnerContext('source', ACCOUNT, gov.current(self.source, 'source'))
+        draft = owner_http.apply(self.source, context, 'create', {
+            'kind': 'requirement', 'parent': 'job-1', 'title': 'Durable content',
+            'description': 'Retain this exact history.'}, 'restore-create', native)
+        accepted = owner_http.apply(self.source, context, 'accept', {
+            'expected_revision': draft['revision'], 'expected_sha256': draft['sha256']},
+            'restore-accept', native, draft['id'])
+        row = native.row(draft['id'])
+        original = json.dumps(row, sort_keys=True)
+        governance_bytes = (self.source/gov.FILE).read_bytes()
+        receipt_bytes = {p.name: p.read_bytes() for p in (self.source/owner_http.JOURNAL).glob('*.json')}
+        journal = OperationJournal(journal_path(self.source))
+        journal.reserve('restore-accept', 'a'*64, ACCOUNT)
+        journal.complete('restore-accept', {'returncode': 0, 'stdout': json.dumps(accepted),
+                                         'stderr': '', 'server_time': '2030-01-01T00:00:00+00:00'},
+                         'a'*64, ACCOUNT)
+        with patch.object(admin, 'run_bd', return_value='synced'):
+            admin.backup_project(self.root, 'source')
+        admin.restore_coordination(self.root, 'source', 'destination')
+        self.assertEqual((self.destination/gov.FILE).read_bytes(), governance_bytes)
+        admin.restore_journal(admin.journal_snapshot_path(self.root, 'source'),
+                              journal_path(self.destination))
+        self.assertEqual({p.name: p.read_bytes() for p in (self.destination/owner_http.JOURNAL).glob('*.json')},
+                         receipt_bytes)
+        view = owner_http.read(self.destination, 'destination', ['get', draft['id']], native)
+        self.assertEqual(view['current']['sha256'], accepted['sha256'])
+        self.assertEqual(json.dumps(row, sort_keys=True), original)
+        self.assertEqual(owner_records.existing_acceptances(row)[2]['project'], 'source')
+        self.assertTrue(records.resolved_acceptance(row, records.existing_revisions(row)[2]))
+        restored = OperationJournal(journal_path(self.destination)).lookup('restore-accept')
+        self.assertEqual(restored['state'], 'committed')
+        self.assertEqual(restored['envelope']['stdout'], json.dumps(accepted))
+
     def test_feedback_feed_is_backed_up_and_restored_as_private_text(self):
         feed_path = self.source/'.feedback.jsonl'
         payload = {
@@ -298,7 +341,7 @@ class BackupTests(unittest.TestCase):
                 patch.object(admin, 'run_bd', return_value='restored') as native, \
                 contextlib.redirect_stdout(io.StringIO()) as out:
             admin.main()
-        create.assert_called_once_with(self.root, 'destination')
+        create.assert_called_once_with(self.root, 'destination', requirements_default=False)
         # `bd backup restore` and then the kittrial-5bb.49 re-point of the clone's own
         # native backup target (a restored clone otherwise keeps the source's target).
         self.assertEqual([item.args[2] for item in native.call_args_list],
@@ -500,7 +543,7 @@ class BackupTests(unittest.TestCase):
         def read(root, source):
             locked('validate-sidecar')
             return real_read(root, source)
-        def create(*args): locked('create-destination')
+        def create(*args, **kwargs): locked('create-destination')
         def native(*args):
             # The native restore, then the kittrial-5bb.49 re-point of the clone's target.
             locked('repoint-native' if args[2][:2] == ['backup', 'init'] else 'restore-native')

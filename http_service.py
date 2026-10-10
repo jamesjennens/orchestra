@@ -1967,6 +1967,27 @@ class EndpointBackend:
         """One entry through `ref get`; an unknown or unfinished key is a 404."""
         return self._ref_read(project_id, ['get', caller_arg(key, 'key')], missing=True)
 
+    def requirements_read(self, project_id, args):
+        reply=self._endpoint('requirements',project_id,self.actor_namespace+'/read',args)
+        if isinstance(reply,dict) and reply.get('returncode')==2 and 'Requirement was not found' in (reply.get('stderr') or ''):
+            raise not_found('Requirement not found')
+        return self._checked(reply, reading=True)
+
+    def owner_requirements(self, principal, project_id, action, fields, key, task=None):
+        operation_id=self._result_key(principal,project_id,'requirements.'+action,key,task)
+        authority=authority_request(principal,project_id,CAP_PROJECT_ADMIN,now=self.service._expiry_now())
+        args=[action]+([task] if task is not None else [])
+        attachment={'payload':{'flag':'--file','text':json.dumps(fields,ensure_ascii=False)}}
+        reply=self._endpoint('owner-requirements',project_id,principal.user_id,args,attachment,
+                             operation_id=operation_id,authority=authority,require_authority=True,
+                             route='requirements.'+action)
+        if isinstance(reply,dict) and reply.get('returncode')==2:
+            detail=reply.get('stderr') or ''
+            if ('Requirements changed. Reload and try again.' in detail
+                    or 'Operation identity reused with a different request' in detail):
+                raise conflict('Requirements changed. Reload and try again.')
+        return self._checked(reply)
+
     def proposal_read(self, project_id, args, missing=False):
         """One read-only `proposal get|list|mine` through the endpoint (.58 slice 1b).
 
@@ -5649,6 +5670,82 @@ class ApiHandler(BaseHTTPRequestHandler):
     def references_get(self, ctx):
         self._project(ctx, CAP_READ)
         return 200, self.backend.reference(ctx.params['pid'], ctx.params['key'])
+
+    # -- direct owner requirements, slice A -------------------------------------
+    def _requirements_backend(self):
+        if not hasattr(self.backend,'requirements_read') or not hasattr(self.backend,'owner_requirements'):
+            raise not_implemented('Requirements editing needs the canonical tracker backend')
+
+    def _requirements_owner(self, ctx):
+        pid=ctx.params['pid']
+        self._project(ctx,CAP_PROJECT_ADMIN)
+        if (ctx.principal.via!='session' or ctx.principal.credential_id or ctx.principal.agent_id
+                or self.service.state.get('memberships',{}).get(pid,{}).get(ctx.principal.user_id)!='owner'):
+            raise forbidden('Requirements editing needs the signed-in project owner')
+
+    def _requirements_write(self, ctx, action, status=200):
+        self._requirements_backend()
+        self._requirements_owner(ctx)
+        fields,operation_id=self._proposal_body(ctx,{
+            'create':('kind','parent','title','description','key'),
+            'revise':('expected_revision','expected_sha256','title','description'),
+            'accept':('expected_revision','expected_sha256'),
+            'governance':('mode','expected_revision','expected_sha256')}[action],'Requirements')
+        import requirement_http
+        try: requirement_http.checked_body(fields,action)
+        except ValueError as error: raise invalid(str(error))
+        if operation_id is not None:
+            raise invalid('Use the Idempotency-Key header for requirements writes')
+        pid=ctx.params['pid']
+        def write():
+            result=self.backend.owner_requirements(ctx.principal,pid,action,fields,
+                                                    ctx.idempotency_key or ctx.request_id,ctx.params.get('rid'))
+            return result,result
+        return self._mutate(ctx,'requirements.'+action,pid,write,status=status,
+                            capability=CAP_PROJECT_ADMIN,serialize=False,canonical=True)
+
+    @route('GET', r'/v1/projects/(?P<pid>'+ID+r')/requirements/governance')
+    def requirements_governance_read(self,ctx):
+        self._requirements_backend(); self._project(ctx,CAP_READ)
+        return 200,self.backend.requirements_read(ctx.params['pid'],['governance'])
+
+    @route('PUT', r'/v1/projects/(?P<pid>'+ID+r')/requirements/governance')
+    def requirements_governance_write(self,ctx):
+        return self._requirements_write(ctx,'governance')
+
+    @route('GET', r'/v1/projects/(?P<pid>'+ID+r')/requirements')
+    def requirements_list(self,ctx):
+        self._requirements_backend(); self._project(ctx,CAP_READ)
+        result=dict(self.backend.requirements_read(ctx.params['pid'],['list']))
+        result['can_edit']=(ctx.principal.via=='session' and not ctx.principal.agent_id
+                            and self.service.state.get('memberships',{}).get(ctx.params['pid'],{}).get(ctx.principal.user_id)=='owner')
+        return 200,result
+
+    @route('POST', r'/v1/projects/(?P<pid>'+ID+r')/requirements')
+    def requirements_create(self,ctx):
+        return self._requirements_write(ctx,'create',status=201)
+
+    @route('GET', r'/v1/projects/(?P<pid>'+ID+r')/requirements/(?P<rid>'+ID+r')')
+    def requirements_get(self,ctx):
+        self._requirements_backend(); self._project(ctx,CAP_READ)
+        result=dict(self.backend.requirements_read(ctx.params['pid'],['get',ctx.params['rid']]))
+        result['governance']=self.backend.requirements_read(ctx.params['pid'],['governance'])
+        result['can_edit']=(ctx.principal.via=='session' and not ctx.principal.agent_id
+                            and self.service.state.get('memberships',{}).get(ctx.params['pid'],{}).get(ctx.principal.user_id)=='owner')
+        return 200,result
+
+    @route('PATCH', r'/v1/projects/(?P<pid>'+ID+r')/requirements/(?P<rid>'+ID+r')')
+    def requirements_revise(self,ctx):
+        return self._requirements_write(ctx,'revise')
+
+    @route('POST', r'/v1/projects/(?P<pid>'+ID+r')/requirements/(?P<rid>'+ID+r')/accept')
+    def requirements_accept(self,ctx):
+        return self._requirements_write(ctx,'accept')
+
+    @route('GET', r'/v1/projects/(?P<pid>'+ID+r')/brd')
+    def requirements_brd(self,ctx):
+        self._requirements_backend(); self._project(ctx,CAP_READ)
+        return 200,self.backend.requirements_read(ctx.params['pid'],['brd'])
 
     # -- contributed requirement proposals (.58 slice 1b, kittrial-5bb.70) -----------
     #
