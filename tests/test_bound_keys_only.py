@@ -8,8 +8,8 @@ setting, and the printing and listing commands name the lines that must be repri
 allowlist and audited.
 
 The test that matters is ``test_an_installation_that_configures_nothing_is_unchanged``: with
-the setting absent or false, the line the wrapper launches is byte for byte the line of before,
-bound or unbound, and every other reader of the setting reads off.
+the setting absent or false, the line the wrapper launches is the same line as before, bound or
+unbound, and every other reader of the setting reads off.
 """
 import base64
 import io
