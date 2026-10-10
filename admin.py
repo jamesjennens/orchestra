@@ -1208,7 +1208,7 @@ def audit_agreement(damage,last,current):
     return False,'stale'
 
 
-def bound_keys_only_switch(root,action,actor,file=None):
+def bound_keys_only_switch(root,action,actor,file=None,without_preview=False):
     """Read or flip ``bound_keys_only`` with its operator audit (kittrial-5bb.196, slice 4).
 
     The actor must be on the deployment operator allowlist, as for the two rollout switches: a
@@ -1254,6 +1254,18 @@ def bound_keys_only_switch(root,action,actor,file=None):
             return dict(bound_keys_only=None,audit=None,audit_history=[],audit_records=0,audit_readable=False,
                         audit_agrees=None,audit_note='unknown',audit_max=BOUND_KEYS_ONLY_AUDIT_MAX,
                         would_be_refused=None,changed=False,unknown=reason)
+        # F10 (kittrial-5bb.250): a dangling symlink reads as absent to the value reader but as
+        # unreadable to the allowlist reader, which answered 'requires an actor on the
+        # deployment operator allowlist' to a real operator. Say what is wrong with the file.
+        reason=('%s is a dangling symlink: its target does not exist'%marker
+                if marker.is_symlink()
+                else '%s is not a regular file'%marker)
+        if action!='status':
+            raise ConfigurationUnreadable(reason) from None
+        print('WARNING: '+reason,file=sys.stderr)
+        return dict(bound_keys_only=None,audit=None,audit_history=[],audit_records=0,audit_readable=False,
+                    audit_agrees=None,audit_note='unknown',audit_max=BOUND_KEYS_ONLY_AUDIT_MAX,
+                    would_be_refused=None,changed=False,unknown=reason)
     if actor not in operators(root,strict=True):
         raise ValueError('bound-keys-only requires an actor on the deployment operator allowlist')
     if action=='status':
@@ -1286,16 +1298,59 @@ def bound_keys_only_switch(root,action,actor,file=None):
                   'The next on/off keeps it aside in deployment.private.json under %s_damaged_<UTC stamp> and '
                   'starts a fresh list.'%(damage,BOUND_KEYS_ONLY_AUDIT_KEY),file=sys.stderr)
         for line in warnings:print(line,file=sys.stderr)
-        return dict(bound_keys_only=current,audit=last,audit_history=audit,audit_records=len(audit),
+        # F1 (kittrial-5bb.250): the preview before `on` says what `on` itself says - the named
+        # lines, the count beyond them (would_be_refused_more), and that only the first part of
+        # a too-large file was inspected (truncated, with the same stderr warning) - so the
+        # operator is not shown an incomplete preview without being told.
+        preview_info=authorized_keys_preview(root,file)
+        preview=None if preview_info is None else preview_info[0]
+        preview_more=0 if preview_info is None else preview_info[1]
+        preview_truncated=False if preview_info is None else preview_info[2]
+        if preview:
+            print('WARNING: turning this setting on would refuse %d authorized_keys line(s) of this kit and this '
+                  'root: %s%s. Print each such line again with `admin.py authorized-keys --project ... '
+                  '--principal ...` and replace it before turning the setting on.'
+                  %(len(preview)+preview_more,', '.join(str(number) for number in preview),
+                    ' and %d more'%preview_more if preview_more else ''),file=sys.stderr)
+        elif preview is None:
+            print('WARNING: the authorized_keys file could not be read, so the lines turning this setting on '
+                  'would cut off could not be listed.',file=sys.stderr)
+        if preview_truncated:
+            print('WARNING: the authorized_keys file is larger than the %d bytes this command reads, so only its '
+                  'first part was inspected; a line beyond that was not listed and would still be refused '
+                  'after on.'%AUTHORIZED_KEYS_MAX_BYTES,file=sys.stderr)
+        # F7 (kittrial-5bb.250): the audit entries are hand-editable, so what stdout prints of
+        # them is bounded and escaped exactly as the stderr warnings are (audit_field): a
+        # hand-edited 800 kB field no longer prints whole.
+        def _shown(entry):
+            return None if entry is None else {key:(audit_field(value) if key in ('actor','at') else value)
+                                               for key,value in entry.items()}
+        return dict(bound_keys_only=current,audit=_shown(last),audit_history=[_shown(e) for e in audit],
+                    audit_records=len(audit),
                     audit_readable=damage is None,audit_agrees=agrees,audit_note=audit_note,
                     audit_max=BOUND_KEYS_ONLY_AUDIT_MAX,
-                    would_be_refused=bound_keys_only_would_refuse(root,file),changed=False)
+                    would_be_refused=preview,would_be_refused_more=preview_more,
+                    truncated=preview_truncated,changed=False)
     enabled=action=='on'
     warnings=[]
     # Read and build the preview list BEFORE anything is flipped (item 1): a slow or failing read
     # of the keys file can then not leave the setting on with nothing printed. It is read after
     # the operator check, so a non-operator's call reads no key file at all (item 6).
+    # The coordinator's decision of kittrial-5bb.250 F2: an operator who cannot see what will
+    # be cut off must say so deliberately - `on` REFUSES when the keys file cannot be read or
+    # was only partly inspected, unless the new explicit --without-preview was given.
     preview_info=authorized_keys_preview(root,file) if enabled else None
+    if enabled and preview_info is None and not without_preview:
+        raise ValueError('Refusing to turn bound-keys-only on: the authorized_keys file could not be read, so '
+                         'what the setting would cut off cannot be shown. Fix the file (it must be a readable '
+                         'regular file), or say so deliberately with --without-preview to turn the setting on '
+                         'without this preview. Nothing was changed.')
+    if enabled and preview_info is not None and preview_info[2] and not without_preview:
+        raise ValueError('Refusing to turn bound-keys-only on: the authorized_keys file is larger than the %d '
+                         'bytes this command reads, so only its first part was inspected and a line beyond that '
+                         'was not listed although it would be refused. Read the whole file, or say so '
+                         'deliberately with --without-preview to turn the setting on without this preview. '
+                         'Nothing was changed.'%AUTHORIZED_KEYS_MAX_BYTES)
     preview=None if preview_info is None else preview_info[0]
     preview_more=0 if preview_info is None else preview_info[1]
     preview_truncated=False if preview_info is None else preview_info[2]
@@ -1340,7 +1395,7 @@ def bound_keys_only_switch(root,action,actor,file=None):
             print('WARNING: turning this setting on now refuses %d authorized_keys line(s) of this kit and this '
                   'root: %s%s. Print each such line again with `admin.py authorized-keys --project ... '
                   '--principal ...` and replace it.'
-                  %(len(preview),', '.join(str(number) for number in preview),
+                  %(len(preview)+preview_more,', '.join(str(number) for number in preview),
                     ' and %d more'%preview_more if preview_more else ''),file=sys.stderr)
         elif preview is None:
             print('WARNING: the authorized_keys file could not be read, so the lines turning this setting on '
@@ -5400,6 +5455,12 @@ def authorized_keys_listing(root,file=None):
     """
     path=Path(file) if file else Path.home()/'.ssh'/'authorized_keys'
     kit=Path(__file__).resolve().parent
+    # A file that is there but is not a regular file - a directory, a fifo, a dangling
+    # symlink - is refused BEFORE it is opened: opening a fifo blocks for ever, on
+    # `status` and on `on` alike (kittrial-5bb.250 F2).
+    if os.path.lexists(str(path)) and not path.is_file():
+        raise ValueError('Cannot read %s: it is not a regular file (a directory, a fifo or a '
+                         'dangling link), and this command will not wait on it'%path)
     # The file is read at most AUTHORIZED_KEYS_MAX_BYTES, whole lines only: it is read on every
     # `status`/`on`, and a hand-written file with thousands of unbound lines must not be read
     # whole or flood the operator's terminal (kittrial-5bb.196 review, item 5).
@@ -5413,7 +5474,11 @@ def authorized_keys_listing(root,file=None):
         raw=raw.rsplit(b'\n',1)[0] if b'\n' in raw else b''
     text=raw.decode('utf-8',errors='replace')
     lines=[];summary={}
-    for number,raw in enumerate(text.splitlines(),1):
+    # sshd splits authorized_keys at the line feed alone, so the numbers must come from the
+    # line feed alone too: str.splitlines() also cuts at U+2028, U+0085, a form feed and a
+    # bare carriage return inside a line, shifting every later number against sshd's
+    # (kittrial-5bb.250 F6).
+    for number,raw in enumerate(text.split('\n'),1):
         entry=key_line(raw,root,kit)
         if entry is None:continue
         lines.append({'line':number,**entry})
@@ -5447,17 +5512,35 @@ def authorized_keys_listing(root,file=None):
         return (entry.get('kind') in ('bound','confined')
                 and (not entry.get('projects') or not entry.get('principal')))
     here=Path(os.path.realpath(str(kit)))
+    def _wrapper_knows_the_setting(wrapper):
+        """Whether a wrapper file OUTSIDE this kit names the setting (kittrial-5bb.250 F3).
+
+        Read at most 64 KiB, once: the question is only whether the wrapper reads
+        `bound_keys_only` at all. True for every release of this design line from .196 on,
+        so a line that names an older releases/ folder after an upgrade still decides by the
+        setting although its file is not this kit's; a wrapper that cannot be read decides
+        nothing and its line is reported as one the setting MAY refuse, never as not reached.
+        """
+        try:
+            with open(wrapper,'rb') as handle:body=handle.read(64*1024)
+        except OSError:
+            return False
+        return b'bound_keys_only' in body
     def _setting_reached(entry):
         """Whether this line's forced command reads THIS root's setting (item 2).
 
         The wrapper decides by the wrapper FILE it runs and its LAST --root (its argparse takes
         the last); an --endpoint argument that names another kit's file does not move the line
         out of this kit's reach. `other_kit` is true for either a foreign wrapper or a foreign
-        endpoint, so it cannot answer this on its own.
+        endpoint, so it cannot answer this on its own. A wrapper file that is not this kit's
+        but names the setting (a later release pointed at the same root, or an older
+        releases/ folder after an upgrade) reaches the setting too (kittrial-5bb.250 F3).
         """
         wrapper=entry.get('wrapper')
-        return bool(wrapper) and Path(os.path.realpath(wrapper))==here/'ssh_forced_command.py' \
-            and not entry.get('other_root')
+        if not wrapper or entry.get('other_root'):
+            return False
+        real=Path(os.path.realpath(wrapper))
+        return real==here/'ssh_forced_command.py' or _wrapper_knows_the_setting(real)
     def _refused_before_the_setting(entry):
         """Whether the wrapper refuses this line before it ever reads the setting."""
         return bool(entry.get('unknown_arguments') or entry.get('principal_repeated')
@@ -5489,8 +5572,10 @@ def authorized_keys_listing(root,file=None):
            'project_repeated: the line names the same project twice (`--project pa --project pa`); the '
            'wrapper refuses the line. It is under attention and must be reprinted.',
            'other_kit: the line runs a wrapper or an endpoint that is not this kit\'s file. Such a line is '
-           'served by that other kit, whatever its text says: a kit older than this one binds nothing. '
-           'Print the line again with this kit (authorized-keys) and replace it.',
+           'served by that other kit, whatever its text says: a kit older than this one binds nothing, and a '
+           'kit from this design line (from bound keys only, .196, on) refuses an unbound line itself, so '
+           'such a line MAY be refused - this listing does not decide it. Print the line again with this '
+           'kit (authorized-keys) and replace it.',
            'names_release: the line is this kit today but names its release folder, so after the next '
            'upgrade it is other_kit. Print it again; it then goes through install/current.',
            'other_root: the line serves another runtime than --root (or names none); its projects were not looked up here.']
@@ -5501,19 +5586,22 @@ def authorized_keys_listing(root,file=None):
         notes.append('bound_keys_only: this installation accepts bound keys only, so the forced command refuses '
                      'a line of this kit and this root that names no project or no principal%s. Print each such '
                      'line again with authorized-keys --project ... --principal ... and replace it. A line that '
-                     'runs a wrapper of another kit or of another root is not refused by this setting at all: it '
-                     'does not reach it%s.'
+                     'runs a wrapper of another kit or of another root is not decided here: the kit that serves '
+                     'it may refuse it%s.'
                      %(' (%s%s)'%(_named(refused),more_text) if refused else ' (no line here is such a line)',
-                       ' (%s are not reached)'%_named(not_reached) if not_reached else ''))
+                       ' (%s may be refused)'%_named(not_reached) if not_reached else ''))
     else:
         # The preview before `on` (kittrial-5bb.196 review, item 4c): with the setting off nothing
         # is refused, but the operator must see what turning it on would cut off, all at once.
         notes.append('would_be_refused: the setting is off, so nothing is refused today; `admin.py '
                      'bound-keys-only on --actor OPERATOR` would refuse the line(s) of this kit and this root '
                      'that name no project or no principal%s. Print each such line again with authorized-keys '
-                     '--project ... --principal ... and replace it before turning the setting on.'
+                     '--project ... --principal ... and replace it before turning the setting on. A line that '
+                     'runs a wrapper of another kit or of another root is not decided here: the kit that serves '
+                     'it may refuse it%s.'
                      %(' (%s%s)'%(_named(would_be_refused),more_text) if would_be_refused
-                       else ' (no line here is such a line)'))
+                       else ' (no line here is such a line)',
+                       ' (%s may be refused)'%_named(not_reached) if not_reached else ''))
     if refused_for_another_reason:
         # Named because `on` would still not serve them, but the SETTING is not the reason: the
         # reviewer asked for that to be said rather than implied (kittrial-5bb.196 review, item 2).
@@ -5549,7 +5637,8 @@ def bound_keys_only_would_refuse(root,file=None):
 
     Read-only, for the ``status`` report and for ``on`` itself (kittrial-5bb.196 review, item 4c):
     the operator sees what turning the setting on cuts off before it happens. Only lines of this
-    kit and this root are returned; a line of another kit or root is not reached by the setting.
+    kit and this root are returned; a line of another kit or root is not decided here (the kit
+    that serves it may refuse it - kittrial-5bb.250 F3).
     At most ``WOULD_BE_REFUSED_NAMED_MAX`` numbers are named (item 5); use
     :func:`authorized_keys_preview` for the count of the rest and for the read bound.
     """
@@ -7010,6 +7099,10 @@ def main():
                      'principal (OFF by default; operator allowlist, audited)')
     a.add_argument('action',choices=['status','on','off'])
     a.add_argument('--actor',required=True,help='an actor on the deployment operator allowlist')
+    a.add_argument('--without-preview',action='store_true',
+                   help='turn the setting on even when the keys file cannot be read or was only partly '
+                        'inspected: the deliberate operator answer to the refusal that otherwise stops `on` '
+                        '(kittrial-5bb.250 F2)')
     a.add_argument('--file',default=None,help='the authorized_keys file to preview (default: '
                    '~/.ssh/authorized_keys of this account): status and on name the lines of this kit and this '
                    'root that the setting refuses or would refuse')
@@ -7690,7 +7783,8 @@ def main():
     elif args.command=='checkpoint-provenance-writes':
         print(json.dumps(checkpoint_provenance_switch(root,args.action,args.actor)))
     elif args.command=='bound-keys-only':
-        print(json.dumps(bound_keys_only_switch(root,args.action,args.actor,args.file)))
+        print(json.dumps(bound_keys_only_switch(root,args.action,args.actor,args.file,
+                                                without_preview=getattr(args,'without_preview',False))))
     elif args.command=='review-writes':
         result,warnings=review_writes_command(root,args.actor,args.action)
         for line in warnings:print(line,file=sys.stderr)

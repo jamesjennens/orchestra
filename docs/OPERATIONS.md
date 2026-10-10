@@ -350,7 +350,17 @@ cut off before it happens, and `on` prints that list - after reading and buildin
 writes the flip, so a slow or failing read of the keys file never leaves the setting on with
 nothing printed. The keys file is read at most its first 1 MiB, and `would_be_refused` names at most
 20 line numbers with `would_be_refused_more` (and an "and N more" in the note) saying how many more
-there are, so a hand-written file cannot flood the terminal. It is operator-gated (`--actor` must be
+there are, so a hand-written file cannot flood the terminal; `status` reports the same
+`would_be_refused`, `would_be_refused_more` and `truncated` fields with the same warnings, so the
+preview it prints is never incomplete without saying so (kittrial-5bb.250 F1). **`on` refuses to
+turn the setting on when the keys file cannot be read or was only partly inspected** - a file that
+is missing, a directory, a fifo (which this command refuses to wait on), or larger than the 1 MiB
+bound: an operator who cannot see what will be cut off must say so deliberately, with
+`--without-preview`, and the refusal names that option; nothing is changed by the refusal
+(kittrial-5bb.250 F2, the coordinator's decision). A line whose forced command runs another kit's
+wrapper is not decided by this preview: a kit from this design line refuses an unbound line
+itself, so such a line **may be refused** by the kit that serves it - the notes never say it is
+not reached (kittrial-5bb.250 F3). It is operator-gated (`--actor` must be
 on the deployment operator allowlist) and every flip is recorded in the deployment document's
 `bound_keys_only_audit`, with the value it replaced, keeping the last 20 flips; a flip that changes
 nothing writes nothing. `off` on a value that is not true or false is a real flip: it writes false,

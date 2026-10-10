@@ -739,6 +739,161 @@ class SettingsCommandTests(unittest.TestCase):
         status = admin.bound_keys_only_switch(self.root, 'status', OPERATOR, str(file))
         self.assertEqual(status['would_be_refused'], [1])
 
+    def test_status_names_the_lines_beyond_the_twenty_it_lists(self):
+        """kittrial-5bb.250 F1: with 25 unbound lines status says what `on` says - twenty
+        named, would_be_refused_more 5, the warning naming both - not a silent list of 20."""
+        file = Path(self.tmp.name)/'authorized_keys'
+        file.write_text(''.join(key_line_text(self.root) + '\n' for _ in range(25)), encoding='utf-8')
+        said = io.StringIO()
+        with mock.patch.object(sys, 'stderr', said):
+            status = admin.bound_keys_only_switch(self.root, 'status', OPERATOR, str(file))
+        self.assertEqual(list(range(1, 21)), status['would_be_refused'])
+        self.assertEqual(5, status['would_be_refused_more'])
+        self.assertFalse(status['truncated'])
+        self.assertIn('would refuse 25 authorized_keys line(s)', said.getvalue())
+        self.assertIn('and 5 more', said.getvalue())
+
+    def test_status_says_when_only_part_of_the_file_was_inspected(self):
+        """kittrial-5bb.250 F1: one unbound line beyond the 1 MiB read bound makes status
+        report an empty named list WITH truncated true and the warning, not an empty preview."""
+        file = Path(self.tmp.name)/'authorized_keys'
+        filler = ('#' * 99 + '\n') * 10485
+        file.write_text(filler + key_line_text(self.root) + '\n', encoding='utf-8')
+        self.assertGreater(file.stat().st_size, admin.AUTHORIZED_KEYS_MAX_BYTES)
+        said = io.StringIO()
+        with mock.patch.object(sys, 'stderr', said):
+            status = admin.bound_keys_only_switch(self.root, 'status', OPERATOR, str(file))
+        self.assertEqual([], status['would_be_refused'])
+        self.assertEqual(0, status['would_be_refused_more'])
+        self.assertTrue(status['truncated'])
+        self.assertIn('only its first part was inspected', said.getvalue())
+
+    def test_on_refuses_when_only_part_of_the_file_was_inspected(self):
+        """kittrial-5bb.250 F2: the truncated preview refuses `on` (a line beyond the bound
+        would be refused after on, unnamed); --without-preview flips with the warning."""
+        file = Path(self.tmp.name)/'authorized_keys'
+        filler = ('#' * 99 + '\n') * 10485
+        file.write_text(filler + key_line_text(self.root) + '\n', encoding='utf-8')
+        with self.assertRaises(ValueError) as refused:
+            admin.bound_keys_only_switch(self.root, 'on', OPERATOR, str(file))
+        self.assertIn('only its first part was inspected', str(refused.exception))
+        self.assertIn('--without-preview', str(refused.exception))
+        self.assertFalse(admin.bound_keys_only(self.root))
+        said = io.StringIO()
+        with mock.patch.object(sys, 'stderr', said):
+            result = admin.bound_keys_only_switch(self.root, 'on', OPERATOR, str(file),
+                                                  without_preview=True)
+        self.assertTrue(result['changed'])
+        self.assertTrue(result['truncated'])
+        self.assertIn('only its first part was inspected', said.getvalue())
+
+    def test_status_and_on_refuse_a_file_that_is_not_regular(self):
+        """kittrial-5bb.250 F2: a fifo as --file made status and on wait for ever; a
+        directory and a dangling symlink are refused too, before anything is opened - the
+        listing raises instead of blocking, status answers the could-not-be-read warning,
+        and `on` refuses (nothing flipped)."""
+        fifo = self.fifo()
+        directory = Path(self.tmp.name)
+        dangling = Path(self.tmp.name)/'dangling'
+        dangling.symlink_to(Path(self.tmp.name)/'no-such-target')
+        for label, path in (('a fifo', fifo), ('a directory', directory), ('a dangling symlink', dangling)):
+            with self.subTest(shape=label):
+                # The reader itself refuses the shape before opening it: no open, no wait.
+                with self.assertRaises(ValueError) as refused:
+                    admin.authorized_keys_listing(self.root, str(path))
+                self.assertIn('not a regular file', str(refused.exception))
+                said = io.StringIO()
+                with mock.patch.object(sys, 'stderr', said):
+                    status = admin.bound_keys_only_switch(self.root, 'status', OPERATOR, str(path))
+                self.assertIsNone(status['would_be_refused'])
+                self.assertIn('could not be read', said.getvalue())
+                with self.assertRaises(ValueError) as on_refused:
+                    admin.bound_keys_only_switch(self.root, 'on', OPERATOR, str(path))
+                self.assertIn('Refusing to turn bound-keys-only on', str(on_refused.exception))
+                self.assertIn('--without-preview', str(on_refused.exception))
+        self.assertFalse(admin.bound_keys_only(self.root))
+        self.assertNotIn(admin.BOUND_KEYS_ONLY_KEY, self.document())
+
+    def test_a_wrapper_of_a_later_kit_that_knows_the_setting_decides_the_line(self):
+        """kittrial-5bb.250 F3: a line whose wrapper is not this kit's file but names the
+        setting (every release from .196 on) is decided by the setting - it counts in
+        would_be_refused - instead of being waved through as another kit's business."""
+        other = Path(self.tmp.name)/'other-release'
+        other.mkdir()
+        shutil.copy(KIT/'ssh_forced_command.py', other/'ssh_forced_command.py')
+        self.assertIn(b'bound_keys_only', (other/'ssh_forced_command.py').read_bytes()[:65536])
+        file = Path(self.tmp.name)/'authorized_keys'
+        file.write_text(key_line_text(self.root, kit=other) + '\n', encoding='utf-8')
+        listing = admin.authorized_keys_listing(self.root, str(file))
+        self.assertEqual([1], listing['would_be_refused'])
+        self.assertEqual([], listing.get('not_reached') or [])
+        status = admin.bound_keys_only_switch(self.root, 'status', OPERATOR, str(file))
+        self.assertEqual([1], status['would_be_refused'])
+
+    def test_a_wrapper_outside_every_kit_of_this_line_may_be_refused_never_not_reached(self):
+        """kittrial-5bb.250 F3: a line whose wrapper cannot be read or names nothing is not
+        decided here: the note says the kit that serves it MAY refuse it, and never says the
+        setting does not reach the line at all."""
+        other = Path(self.tmp.name)/'foreign'
+        other.mkdir()
+        (other/'ssh_forced_command.py').write_text('#!/bin/sh\necho hello\n', encoding='utf-8')
+        file = Path(self.tmp.name)/'authorized_keys'
+        file.write_text(key_line_text(self.root, kit=other) + '\n', encoding='utf-8')
+        listing = admin.authorized_keys_listing(self.root, str(file))
+        self.assertEqual([], listing['would_be_refused'])
+        self.assertIn(1, listing.get('not_reached') or [1])
+        notes = ' '.join(listing['notes'])
+        self.assertIn('may refuse it', notes)
+        self.assertNotIn('not refused by this setting at all', notes)
+        self.assertNotIn('are not reached', notes)
+
+    def test_line_numbers_follow_the_line_feed_alone(self):
+        """kittrial-5bb.250 F6 (main too): U+2028, U+0085, a form feed or a bare CR inside a
+        line must not shift every later number against sshd's, which splits on \n only."""
+        first = key_line_text(self.root, bound=' --project alpha --principal ' + MINE,
+                              comment='first\u2028line\rwith\u0085odd\u000cchars')
+        second = key_line_text(self.root)
+        file = Path(self.tmp.name)/'authorized_keys'
+        file.write_text(first + '\n' + second + '\n', encoding='utf-8')
+        listing = admin.authorized_keys_listing(self.root, str(file))
+        # sshd numbers by \n alone: both lines keep their numbers (str.splitlines() would
+        # split the first at each odd character and shift the second to 5 or later).
+        self.assertEqual([1, 2], [entry['line'] for entry in listing['lines']])
+        self.assertEqual([2], listing['would_be_refused'])
+
+    def test_status_bounds_the_audit_entries_it_prints(self):
+        """kittrial-5bb.250 F7: the audit list is hand-editable; the entries status prints
+        on stdout are escaped and bounded as the stderr warnings are, not whole."""
+        self.switch('on') if False else None
+        admin.bound_keys_only_switch(self.root, 'on', OPERATOR, without_preview=True)
+        document = self.document()
+        document[admin.BOUND_KEYS_ONLY_AUDIT_KEY][0]['actor'] = '\x1b[1M' + 'x' * 200000
+        self.marker.write_text(json.dumps(document), encoding='utf-8')
+        status = admin.bound_keys_only_switch(self.root, 'status', OPERATOR)
+        shown = json.dumps(status)
+        self.assertLess(len(shown), 10000)
+        self.assertLess(len(status['audit']['actor']), admin.AUDIT_FIELD_MAX + 10)
+        self.assertTrue(status['audit']['actor'].endswith('...'))
+        self.assertTrue(status['audit']['actor'].startswith('\\x1b'))  # the ESCAPE TEXT, not the raw control
+        self.assertEqual(1, status['audit_records'])
+
+    def test_a_dangling_symlink_at_the_settings_says_what_is_wrong(self):
+        """kittrial-5bb.250 F10: a dangling symlink answered 'requires an actor on the
+        deployment operator allowlist' to a real operator; it says the file is a dangling
+        symlink now, and a flip refuses."""
+        self.marker.unlink()
+        self.marker.symlink_to(Path(self.tmp.name)/'no-such-deployment')
+        said = io.StringIO()
+        with mock.patch.object(sys, 'stderr', said):
+            status = admin.bound_keys_only_switch(self.root, 'status', OPERATOR)
+        self.assertIsNone(status['bound_keys_only'])
+        self.assertEqual('unknown', status['audit_note'])
+        self.assertIn('dangling symlink', status['unknown'])
+        self.assertIn('dangling symlink', said.getvalue())
+        self.assertNotIn('operator allowlist', said.getvalue())
+        with self.assertRaises(admin.ConfigurationUnreadable):
+            admin.bound_keys_only_switch(self.root, 'on', OPERATOR)
+
     def test_the_preview_is_read_before_the_flip_is_written(self):
         """Item 1: read and build the list first, then flip, then print."""
         events = []
@@ -761,16 +916,38 @@ class SettingsCommandTests(unittest.TestCase):
             admin.bound_keys_only_switch(self.root, 'on', OPERATOR, str(file))
         self.assertEqual(events[:2], ['preview', 'write'])
 
-    def test_a_failing_preview_read_does_not_flip_the_setting(self):
-        """Item 1: a slow or failing read must not leave the setting on with nothing printed."""
-        def failing(*args, **kwargs):
-            raise OSError('the keys file is on a slow mount')
+    def test_a_keys_file_that_cannot_be_read_refuses_on_without_flipping(self):
+        """Item 1, and kittrial-5bb.250 F2 with the coordinator's decision: the REAL cases of an
+        unreadable keys file - missing, a directory, a fifo, no permission - make `on` refuse
+        (nothing changed) unless the operator says so deliberately with --without-preview. The
+        old shape of this test mocked an OSError the real reader never raises: the listing
+        converts OSError to ValueError and the preview swallows both to None."""
+        missing = Path(self.tmp.name)/'no-such-authorized_keys'
+        for label, path in (('missing', missing),
+                            ('a directory', Path(self.tmp.name)),
+                            ('a fifo', self.fifo())):
+            with self.subTest(shape=label):
+                with self.assertRaises(ValueError) as refused:
+                    admin.bound_keys_only_switch(self.root, 'on', OPERATOR, str(path))
+                self.assertIn('Refusing to turn bound-keys-only on', str(refused.exception))
+                self.assertIn('--without-preview', str(refused.exception))
+                self.assertFalse(admin.bound_keys_only(self.root))
+                self.assertNotIn(admin.BOUND_KEYS_ONLY_KEY, self.document())
+        # Saying so deliberately flips, with the unreadable preview said, not silent.
+        said = io.StringIO()
+        with mock.patch.object(sys, 'stderr', said):
+            result = admin.bound_keys_only_switch(self.root, 'on', OPERATOR, str(missing),
+                                                  without_preview=True)
+        self.assertTrue(result['changed'])
+        self.assertIsNone(result['would_be_refused'])
+        self.assertIn('could not be read', said.getvalue())
+        self.assertTrue(admin.bound_keys_only(self.root))
 
-        with mock.patch.object(admin, 'authorized_keys_preview', failing):
-            with self.assertRaises(OSError):
-                admin.bound_keys_only_switch(self.root, 'on', OPERATOR)
-        self.assertFalse(admin.bound_keys_only(self.root))
-        self.assertNotIn(admin.BOUND_KEYS_ONLY_KEY, self.document())
+    @staticmethod
+    def fifo():
+        path = Path(tempfile.mkdtemp(prefix='bound-keys-fifo-'))/'authorized_keys'
+        os.mkfifo(path)
+        return path
 
     def test_the_status_command_prints_what_the_reader_says(self):
         said = io.StringIO()
@@ -859,7 +1036,8 @@ class ListingTests(unittest.TestCase):
         self.assertEqual(listing['would_be_refused'], [2, 3, 4])
         note = next(note for note in listing['notes'] if note.startswith('bound_keys_only:'))
         self.assertIn('lines 2, 3, 4', note)
-        self.assertIn('another kit or of another root is not refused by this setting at all', note)
+        self.assertIn('another kit or of another root is not decided here', note)
+        self.assertIn('may refuse it', note)
 
     def test_lines_of_another_kit_or_root_are_not_counted_as_refused(self):
         """Item 2a: those lines are SERVED by the release or the root they name."""
@@ -875,7 +1053,7 @@ class ListingTests(unittest.TestCase):
         # itself under attention here, and no other-kit or other-root line is named as refused.
         self.assertEqual(listing['attention'], [1, 2])
         note = next(note for note in listing['notes'] if note.startswith('bound_keys_only:'))
-        self.assertIn('lines 2, 3 are not reached', note)
+        self.assertIn('lines 2, 3 may be refused', note)
 
     def test_a_settings_file_that_cannot_be_read_does_not_fail_the_listing(self):
         (self.root/'deployment.private.json').write_text('{not json', encoding='utf-8')
@@ -930,7 +1108,7 @@ class ListingTests(unittest.TestCase):
         self.assertTrue(listing['lines'][1]['other_root'])
         note = next(note for note in listing['notes'] if note.startswith('bound_keys_only:'))
         self.assertIn('line 2', note)
-        self.assertIn('not reached', note)
+        self.assertIn('may be refused', note)
 
     def test_lines_refused_for_another_reason_are_named_but_not_as_the_settings_doing(self):
         """Item 2, the harness's lines 18, 20, 40, 41, 44: say refused, not "the setting refuses"."""
