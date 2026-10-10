@@ -39,9 +39,11 @@ membership are checked under the authority lock before any replay or effect.
 
 If a creation fails before any native row is allocated, the owner who attempted
 it can use **Clear failed creation**, give a reason, and start a new creation.
-The original attempt and its release audit are retained. An allocated row, even
-an empty one, cannot be cleared here: retry the original creation and, if that
-still fails, ask the host operator to reconcile it.
+The original attempt and its release audit are retained. Failed creations show
+their recorded title and time when available. An interruption before the receipt
+write has its own **No creation receipt was written** message. An allocated row,
+even an empty one, cannot be cleared here: reload the requirements and, if the
+creation is still incomplete, ask the host operator to reconcile it.
 
 An interrupted acceptance uses its recorded generated decision ID. Editable
 native titles, descriptions, labels and creator metadata cannot substitute a
@@ -55,8 +57,11 @@ history. Reads and writes continue; revision numbers and hashes order authority,
 and the service does not rewrite the stored history.
 
 The generated document shows the last accepted text first. A newer draft is a
-separate pending edit. Its Decisions section uses immutable acceptance evidence,
-not editable native decision titles. An unreadable requirement is marked by ID;
+separate pending edit, with its validated native author beside **Accept** when
+that attribution is available. Changing modes preserves that attribution; an
+actor name does not establish a human account identity. Its Decisions section
+uses immutable acceptance evidence for the accepted revision, including when a
+later draft exists. An unreadable requirement is marked by ID;
 healthy requirements remain readable and an affected acceptance is never trusted.
 On an empty project, **Start requirements** creates a parent task through the
 ordinary authorized task route, then the owner can add content on this page.
