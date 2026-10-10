@@ -109,8 +109,8 @@ automatically. This does not give service credentials or agent tokens owner righ
 The host's operator requirement-apply/backfill routes remain available in both
 modes and keep their operator allowlist and exact evidence requirements.
 
-This slice supplies direct editing and acceptance. Withdrawal, supersession,
-baseline controls, downloadable baseline comparisons and proposal/room acceptance
+This slice supplies direct editing, acceptance, withdrawal and exact supersession.
+Baseline controls, downloadable baseline comparisons and proposal/room acceptance
 controls await their separate releases.
 
 For the existing host export command, selections containing owner acceptance
