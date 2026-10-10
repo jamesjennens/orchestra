@@ -6616,6 +6616,26 @@ class ApiHandler(BaseHTTPRequestHandler):
     def healthz(self, ctx):
         return 200, {'status': 'ok'}
 
+    @route('GET', r'/v1/service/certificate', anonymous=True, csrf=False)
+    def service_certificate(self, ctx):
+        """The service's own public leaf certificate, for the person setting up an agent (kittrial-5bb.203).
+
+        Only what the TLS handshake already gives every client: the certificate the loaded context
+        presents first, taken by an in-memory handshake against that context and re-encoded as the
+        kit's own PEM by ``service_certificate_pem`` -- never the private key and never the ``--cert``
+        file itself, which is read only once, by the TLS loader. No log-in, because the point is that
+        the certificate can be fetched before the browser or the agent has been made to trust it (the
+        My agents set-up dialog shows its SHA-256 fingerprint and saves the file). A service without
+        a certificate of its own -- plain http, or the first-install tunnel -- and a context against
+        which the in-memory handshake cannot be made serve nothing here: the ordinary not-found
+        answer, as if the route did not exist.
+        """
+        certificate = getattr(self.server, 'tls_certificate_pem', None)
+        if not certificate:
+            raise not_found('No such operation')
+        return 200, {'certificate': certificate,
+                     'sha256': certificate_fingerprint(certificate)}
+
     def _page(self, ctx, query):
         limit_raw = query.get('limit', str(DEFAULT_PAGE))
         try:
@@ -6981,6 +7001,83 @@ def quiet_memory_errors():
     return hook
 
 
+def certificate_fingerprint(certificate):
+    """The SHA-256 fingerprint of a PEM certificate, in the form the dialog and the extension show it.
+
+    The same string ``openssl x509 -noout -fingerprint -sha256`` prints and the VS Code extension
+    shows for the certificate the TLS handshake presented: the SHA-256 of the certificate's DER,
+    as uppercase hex pairs joined by colons. The dialog shows it so a person can compare it with
+    what the extension shows; that comparison only says both reached the same endpoint, which is
+    why the docs also name the independent check on the server itself (see
+    ``docs/HTTP_DEPLOYMENT.md``, "The service's own certificate ...").
+
+    Only the FIRST certificate of the text is used. The route's own PEM (``service_certificate_pem``)
+    holds exactly one certificate -- the one the handshake presents -- so this is that one.
+    Anything that is not a certificate block is refused.
+    """
+    match = re.search(r'-----BEGIN CERTIFICATE-----(.*?)-----END CERTIFICATE-----',
+                      str(certificate or ''), re.S)
+    if not match:
+        raise ValueError('not a PEM certificate')
+    try:
+        der = base64.b64decode(''.join(match.group(1).split()), validate=True)
+    except (binascii.Error, ValueError):
+        raise ValueError('not a PEM certificate: its body is not base64') from None
+    return ':'.join('%02X' % byte for byte in hashlib.sha256(der).digest())
+
+
+def service_certificate_pem(context):
+    """The certificate the given TLS context presents first, as PEM, or ``None``.
+
+    One in-memory handshake against the very ``ssl.SSLContext`` ``load_cert_chain`` filled: the
+    client's ``getpeercert(binary_form=True)`` is the DER of exactly the certificate a real client
+    receives first, so the route can serve nothing the handshake would not present (kittrial-5bb.203
+    review 01a12488, items 1 and 2). ``ssl.MemoryBIO`` keeps it off the network: no socket is opened,
+    and the ``--cert`` file is NOT read again -- the TLS loader read it once, exactly as main does.
+    Whatever the loader itself ignores is therefore irrelevant here: armour that does not start a
+    line (indented, or after a line that merely ends with it), a ``TRUSTED CERTIFICATE`` or
+    ``X509 CERTIFICATE`` label, an older certificate kept above the real one and a comment that
+    merely names the armour lines cannot make the route answer anything else. There is no size cap
+    and no per-block cap: this decodes nothing, so the answer is one leaf, about 1.2 kB, whatever the
+    file's size.
+
+    ``None`` when the handshake cannot be made at all (a context with no certificate of its own, a
+    pair that cannot complete): the service still starts and the route answers the ordinary 404,
+    never a 500 and never the raw file.
+    """
+    try:
+        client = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        client.check_hostname = False
+        client.verify_mode = ssl.CERT_NONE
+        c_in, c_out = ssl.MemoryBIO(), ssl.MemoryBIO()
+        s_in, s_out = ssl.MemoryBIO(), ssl.MemoryBIO()
+        client_side = client.wrap_bio(c_in, c_out, server_side=False)
+        server_side = context.wrap_bio(s_in, s_out, server_side=True)
+        for _ in range(20):
+            done = 0
+            for side in (client_side, server_side):
+                try:
+                    side.do_handshake()
+                    done += 1
+                except (ssl.SSLWantReadError, ssl.SSLWantWriteError):
+                    pass
+            s_in.write(c_out.read())
+            c_in.write(s_out.read())
+            if done == 2:
+                der = client_side.getpeercert(binary_form=True)
+                break
+        else:
+            return None
+    except (ssl.SSLError, OSError, ValueError):
+        return None
+    if not der:
+        return None
+    encoded = base64.b64encode(der).decode('ascii')
+    lines = [encoded[at:at + 64] for at in range(0, len(encoded), 64)]
+    return ('-----BEGIN CERTIFICATE-----\n' + '\n'.join(lines)
+            + '\n-----END CERTIFICATE-----\n')
+
+
 def create_server(service, backend, *, host='127.0.0.1', port=0, trusted_proxies=(),
                   max_body=MAX_BODY_BYTES, certfile=None, keyfile=None,
                   allow_plaintext_non_loopback=False, web_root=DEFAULT_WEB_ROOT,
@@ -6991,11 +7088,18 @@ def create_server(service, backend, *, host='127.0.0.1', port=0, trusted_proxies
         raise ValueError('Refusing plaintext on a non-loopback interface; supply TLS or '
                          'explicitly allow disposable plaintext')
     context = None
+    certificate = None
     if certfile:
         # Before anything is bound: a certificate or key that cannot be used stops the start.
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.minimum_version = ssl.TLSVersion.TLSv1_2
         context.load_cert_chain(certfile, keyfile)
+        # What the handshake actually presents, for GET /v1/service/certificate
+        # (kittrial-5bb.203 review 01a12488, items 1 and 2): one in-memory handshake against this
+        # very context, so the route can never answer with anything but the certificate a client
+        # receives first. The file is not read again and no armour is pattern-matched; a context the
+        # handshake cannot be made against leaves the route answering 404, not the start failing.
+        certificate = service_certificate_pem(context)
     if ':' in host:
         server_class = type('GuardedServer6', (GuardedServer,), {'address_family': __import__('socket').AF_INET6})
     else:
@@ -7006,6 +7110,9 @@ def create_server(service, backend, *, host='127.0.0.1', port=0, trusted_proxies
                                                      web_root=web_root))
     # The TLS context is the connection's (ApiHandler.setup): the listening socket stays plain.
     httpd.tls_context = context
+    # The public certificate this listener serves, for GET /v1/service/certificate: None when the
+    # service has no certificate of its own (plain http, or the first-install tunnel).
+    httpd.tls_certificate_pem = certificate
     if client_seconds is not None:
         httpd.client_seconds = client_seconds
     if connection_limit is not None:

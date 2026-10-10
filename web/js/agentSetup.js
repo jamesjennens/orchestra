@@ -10,6 +10,10 @@
 export const CONFIG_PATH = '.orchestra/agent.json';
 export const GUIDE_PATH = '.orchestra/AGENT.md';
 export const GITIGNORE_LINE = '.orchestra/';
+//: The extension's two roles: one window is one role. The prompt names the role so the person
+//: chooses the same in the extension's own "Orchestra Bridge: Set up"; the kit itself writes no
+//: workspace settings (kittrial-5bb.203 review 01a12408, item 2).
+export const BRIDGE_ROLES = Object.freeze(['worker', 'reviewer']);
 
 const plain = (name) => String(name || '').replace(/\s*\(agent[^)]*\)$/, '');
 
@@ -40,6 +44,60 @@ export function headerLine(secretValue = SECRET_PLACEHOLDER) {
   return `header = "Authorization: Bearer ${secretValue}"`;
 }
 
+// Where the service's own certificate is saved for the person who clicks the dialog's Save button:
+// beside the credential file in the user profile, never in the agent's folder or the repository.
+// The kit does not name it in any setting any more (kittrial-5bb.203 review 01a12408, item 2): the
+// extension shows the server's fingerprint on first contact and asks the person to trust it.
+export function certificateFile(name) {
+  const file = `.orchestra-agent-${slug(name)}.crt`;
+  return Object.freeze({
+    name: file,
+    windows: `%USERPROFILE%\\${file}`,
+    powershell: `$env:USERPROFILE\\${file}`,
+    posix: `~/${file}`,
+  });
+}
+
+// The comment lines the extension and a careful person read out of the credential file. curl
+// ignores comment lines, so they cost nothing there. The extension's own rule for the address is
+// `^#\s*server\s*=\s*(https?://\S+)\s*$`, so the address stands alone on its line and the
+// fingerprint gets a line of its own.
+export function credentialCommentLines(server, fingerprint) {
+  const lines = [`# server = ${server}`];
+  if (fingerprint) lines.push(`# server certificate sha256 = ${fingerprint}`);
+  return lines;
+}
+
+// The command that makes the credential file's content exactly those comment lines followed by
+// whatever it already held (its one `header = "Authorization: Bearer ..."` line). It is a rewrite,
+// not an append: any earlier comment line is removed first, so a second set-up replaces it instead
+// of adding a second copy, and each comment ends with a newline, so the dialog's Notepad path --
+// which saves no final newline -- cannot glue a comment onto the header line (the extension's rule
+// then matches nothing; kittrial-5bb.203 review 01a12408, item 3a). The POSIX form runs in a
+// subshell under `umask 077`, so the same-directory temporary file is created mode 600 from the
+// first byte -- it never holds the secret while it is group- or world-readable (review 01a12488,
+// item 3) -- and moves it over the original, so the secret is never printed and never reaches a
+// command line or a process argument list. The PowerShell form runs in its own scope (`& { ... }`)
+// so the `$c` that held the file's content does not stay in the session (review 01a12488, item 3).
+// Both forms leave the file ending with a newline, whatever the file held before (Notepad saves no
+// final newline; review 01a12488, item 4). If the credential file is a symlink, the move replaces
+// the symlink with a regular file and the old target keeps its own content (review 01a12488, item 3).
+const CREDENTIAL_COMMENT_PATTERN = "'^#[[:space:]]*server([[:space:]]+certificate[[:space:]]+sha256)?[[:space:]]*='";
+const POWERSHELL_COMMENT_PATTERN = "'(?m)^#[ \\t]*server([ \\t]+certificate[ \\t]+sha256)?[ \\t]*=[^\\r\\n]*\\r?\\n?'";
+export function credentialFileCommand(file, comments) {
+  const quoted = comments.map((line) => `'${line}'`).join(' ');
+  const powershellText = comments.map((line) => line.replace(/`/g, '``').replace(/\$/g, '`$').replace(/"/g, '`"'))
+    .join('`r`n') + '`r`n';
+  const powershell = '& { $p="' + file.powershell + '"; $c=[IO.File]::ReadAllText($p); '
+    + '$c=[Text.RegularExpressions.Regex]::Replace($c,' + POWERSHELL_COMMENT_PATTERN + ",''); "
+    + 'if ($c -and -not $c.EndsWith("`n")) { $c = $c + "`r`n" } '
+    + '[IO.File]::WriteAllText($p,"' + powershellText + '" + $c) }';
+  const posix = `( umask 077; rm -f ${file.posix}.new; printf '%s\\n' ${quoted} > ${file.posix}.new && `
+    + `grep -vE ${CREDENTIAL_COMMENT_PATTERN} ${file.posix} >> ${file.posix}.new && `
+    + `chmod 600 ${file.posix}.new && mv ${file.posix}.new ${file.posix} || rm -f ${file.posix}.new )`;
+  return Object.freeze({ powershell, posix });
+}
+
 // Commands that prove the stored secret works (they never contain it).
 export function testCommands(payload) {
   const file = payload.secretFile;
@@ -62,6 +120,7 @@ export function secretlessPayload(created, fallbackServer) {
     agentId: config.agent_id || agent.id,
     name,
     secretFile: secretFile(name),
+    certificateFile: certificateFile(name),
     owner: agent.owner_display_name || created.owner_name || agent.owner_name || 'your owner',
     server: config.server_url || created.server || fallbackServer || '<ORCHESTRA_SERVER_URL>',
     projects: Object.freeze(projects.slice()),
@@ -84,7 +143,7 @@ export function agentGuide(payload) {
     '',
     '## Your secret',
     '',
-    `Your owner keeps your secret in a curl config file in their user profile: ${file.windows} on Windows, ${file.posix} on macOS/Linux. It holds one line, ${headerLine()}. Hand that file to curl with -K on every call. Never open, print or copy that file, and never put the secret on a command line, in this folder, in a commit or in any other file.`,
+    `Your owner keeps your secret in a curl config file in their user profile: ${file.windows} on Windows, ${file.posix} on macOS/Linux. It holds one line, ${headerLine()}. Hand that file to curl with -K on every call. Apart from the set-up step that rewrote that one file in place to put the comment lines above the header line (nothing was shown), never open, print or copy it, and never put the secret on a command line, in this folder, in a commit or in any other file.`,
     '',
     '## Every call',
     '',
@@ -124,8 +183,24 @@ export function resumePrompt(name) {
 }
 
 // What the owner pastes into the agent's chat once, in the agent's folder, to set it up.
-export function setupPrompt(payload) {
-  return [
+//
+// Beyond the two small files in .orchestra/, the prompt makes the credential file's content what
+// the VS Code bridge extension reads (kittrial-5bb.203): the `# server = ADDRESS` line (and the
+// fingerprint line when the service has its own certificate) become the file's first lines, each
+// on its own line, replacing any earlier copy. It writes NO workspace settings: since extension
+// 0.9.0 the extension's own "Orchestra Bridge: Set up" command writes them from that address line
+// and shows the server certificate's fingerprint for the person to compare, so no certificate
+// file and no bridge setting naming one is part of the set-up at all (coordinator decision on
+// review 01a12408, item 2). `role` names what this window does (the extension's worker or
+// reviewer) so the person picks the same there; `certificate` is the route's answer
+// (GET /v1/service/certificate) or null when the service has none (plain http, the tunnel).
+export function setupPrompt(payload, { role = 'worker', certificate = null, bridgeServer = null } = {}) {
+  const fingerprint = (certificate && certificate.sha256) || null;
+  const address = bridgeServer || payload.server;
+  const comments = credentialCommentLines(address, fingerprint);
+  const command = credentialFileCommand(payload.secretFile, comments);
+  const roleWord = BRIDGE_ROLES.includes(role) ? role : 'worker';
+  const steps = [
     `Set up this folder for the Orchestra agent "${payload.name}".`,
     '',
     '1. Create the folder .orchestra here if it does not exist.',
@@ -137,12 +212,24 @@ export function setupPrompt(payload) {
     '~~~markdown',
     agentGuide(payload).trimEnd(),
     '~~~',
-    `4. If this folder is a git repository and its .gitignore does not already list ${GITIGNORE_LINE}, add the line ${GITIGNORE_LINE} to .gitignore. Do not change any other file.`,
-    `5. Your secret is not in this message. I keep it in ${payload.secretFile.windows} (on macOS/Linux ${payload.secretFile.posix}); you hand that file to curl with -K, as AGENT.md says. Never open, print or copy that file, and never write the secret to a file, a commit or a command line.`,
-    '',
+    `4. If this folder is a git repository and its .gitignore does not already list ${GITIGNORE_LINE}, add the line ${GITIGNORE_LINE} to .gitignore. Do not change any other file in this folder.`,
+    `5. Your secret is not in this message. I keep it in ${payload.secretFile.windows} (on macOS/Linux ${payload.secretFile.posix}); you hand that file to curl with -K, as AGENT.md says. Never open, print or copy that file, and never write the secret to a file, a commit or a command line -- with the single exception of step 6: that one command reads the credential file only to rewrite that same file in place, and it shows nothing.`,
+    `6. Make the credential file ${payload.secretFile.windows} (macOS/Linux ${payload.secretFile.posix}) hold these comment lines as its FIRST lines, each on its own line ending with a newline, followed by whatever it already held (its header line):`,
+    '~~~',
+    ...comments,
+    '~~~',
+    '   Run exactly one of these commands. That command is the one exception to step 5: it reads the credential file only to rewrite that same file in place -- nothing is printed and the secret is copied nowhere else -- and it removes any earlier copy of these comment lines first, so running it a second time leaves exactly the same content:',
+    `   - PowerShell: ${command.powershell}`,
+    `   - macOS/Linux: ${command.posix}`,
+    '   The first line is the address the extension reads, so nobody types it. If that credential file is a symlink, the rewrite replaces the symlink with a regular file and the old target keeps its own content: keep it a regular file. If the credential file does not exist yet, stop here and ask me for step 1 of the dialog first.',
+    `7. This window's role is ${roleWord}: when you run "Orchestra Bridge: Set up" in VS Code, choose ${roleWord} (the extension's own set-up writes the workspace settings from the address line above; the kit writes no settings file).`,
     `Then continue: ${resumePrompt(payload.name)}`,
     '',
-  ].join('\n');
+  ];
+  if (fingerprint) {
+    steps.push(`The service's own certificate fingerprint is ${fingerprint}. The extension shows it when it first reaches this server; compare it with the value the operator reads on the server itself, as the dialog says.`, '');
+  }
+  return steps.join('\n');
 }
 
 // Full destination path of a setup file inside the recorded working directory:

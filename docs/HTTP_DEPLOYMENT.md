@@ -1762,6 +1762,67 @@ process list either. A lost secret is replaced, never re-shown: `POST
 /v1/agents/{id}/credentials` issues a new one (the old credential works until revoked
 with `POST /v1/agents/{id}/credentials/{credential}/revoke`).
 
+#### The service's own certificate route, and the set-up dialog (kittrial-5bb.203)
+
+A service started with `--cert`/`--key` serves its own public leaf certificate at
+`GET /v1/service/certificate` **without a log-in**: the answer is
+`{"certificate": "<PEM>", "sha256": "<fingerprint>"}`, where the fingerprint is the SHA-256 of the
+certificate's DER as uppercase hex pairs joined by colons — the same string
+`openssl x509 -in <the certificate file> -noout -fingerprint -sha256` prints and the VS Code bridge
+extension shows before it trusts the server. What is served is the certificate the TLS handshake
+presents first, taken from the loaded TLS context: after `load_cert_chain` the service makes one
+in-memory handshake against that very context (`ssl.MemoryBIO` and `wrap_bio`, no socket, standard
+library) and keeps `getpeercert(binary_form=True)`, the DER of exactly the certificate a real client
+receives first, re-encoded here as the kit's own PEM. The `--cert` file is never read a second time
+and no armour is pattern-matched, so nothing OpenSSL does not itself load can reach the answer, and
+the private key is never served (a key's DER base64 inside `CERTIFICATE` armour, indented or after a
+line that merely ends with the armour, is invisible to the loader and to this route alike). A
+`TRUSTED CERTIFICATE` or `X509 CERTIFICATE` label, an older certificate kept above the real one and a
+comment that merely names the armour lines cannot make the route answer a certificate the handshake
+does not present. There is no size cap and no
+per-block cap any more — the route decodes nothing — so a 64 MB file does not make every anonymous
+GET answer 64 MB: the answer is one leaf, about 1.2 kB. A service without its own certificate —
+plain HTTP, or the first-install tunnel — and a context against which the in-memory handshake cannot
+be made answer the ordinary `404`: nothing is served there, never a `500` and never the raw file, and
+neither case keeps the service from starting.
+
+The My agents set-up dialog reads that route, shows the fingerprint and offers a Save button. It
+does **not** write the VS Code workspace settings and does not save a certificate for the
+extension: since extension 0.9.0 the extension shows the server certificate's fingerprint on first
+contact and asks the person to trust it, and its own "Orchestra Bridge: Set up" command writes the
+workspace settings itself from the credential file's `# server = ADDRESS` line. So the set-up
+prompt writes:
+
+- the two files in `.orchestra/`, and the `.gitignore` line when the folder is a Git repository;
+- into the credential file, as its first lines, `# server = <address>` (the address the page itself
+  was loaded from, not the configured public address, which may be a name that does not resolve on
+  that network) and, when the service has its own certificate,
+  `# server certificate sha256 = <fingerprint>`. The prompt's command *rewrites* the file: it
+  removes any earlier copy of those lines and puts each on its own line ending with a newline, so a
+  second set-up changes nothing and the dialog's Notepad path — whose file has no final newline —
+  cannot glue a comment onto the `header = ...` line. The secret is never printed and never put on a
+  command line: the POSIX command runs in a subshell under `umask 077`, so the same-directory
+  temporary file that receives the header line is created mode 600 from its first byte (before this
+  fix it was created with the umask's mode and held the secret until its `chmod 600`), and then moved
+  over the original; the PowerShell command runs in its own scope (`& { ... }`), so the variable that
+  held the file's content does not stay in the session. Both forms leave the file ending with a
+  newline. If the credential file is a symlink, the move replaces the symlink with a regular file and
+  the old target keeps its own content: keep the credential file a regular file. Nothing is printed,
+  and `curl -K` reads the result as before.
+
+The dialog's certificate block says what comparing the fingerprint proves and what it does not: the
+page and the fingerprint come over the same connection, so a third party who can serve the page
+serves his own certificate and his own fingerprint, and the comparison only shows the extension
+reached the same endpoint the browser did. The independent source is the operator reading the value
+on the server itself: `openssl x509 -in <the certificate file> -noout -fingerprint -sha256`.
+
+Nothing in any of it holds the secret: the prompt sends the agent to the secret only through
+`curl -K`. The same prompt is written for an agent that reviews other agents' deliveries, and it
+names the window's role (`worker` or `reviewer`) so the person chooses the same in the extension's
+own set-up. What the person still does once is said in the dialog: install the extension, run
+"Orchestra Bridge: Set up" (and compare the fingerprint it shows), reload the window, click the
+first wake.
+
 **What an agent may do is kept on the agent, and a new credential carries exactly that**
 (kittrial-5bb.208). The agent record holds its `scopes`: written when the agent is made
 (the list asked for, or the default four) and changed only by a renewal that sends a

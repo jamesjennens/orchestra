@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "operation_id": "capnew-78e8a894267c9d4a014882d6004a2c3c",
+  "key": "http.service-own-certificate",
+  "name": "The service serves its own leaf certificate at an anonymous route, and the set-up dialog shows its fingerprint",
+  "aliases": [
+    "service certificate route",
+    "GET /v1/service/certificate",
+    "server certificate fingerprint in the set-up dialog",
+    "anonymous certificate endpoint"
+  ],
+  "summary": "A service started with --cert/--key answers GET /v1/service/certificate without a log-in with {\"certificate\": \"<PEM>\", \"sha256\": \"<fingerprint>\"}: the certificate is the one the TLS handshake presents first, taken from the loaded TLS context by one in-memory ssl.MemoryBIO handshake after load_cert_chain (PEM-encoded by the kit); its fingerprint is the SHA-256 DER hash in openssl's colon form. The --cert file is never read again and no armour is pattern-matched, so a key's DER inside CERTIFICATE armour, a TRUSTED or X509 CERTIFICATE label, an old certificate above the real one and a comment naming the armour lines cannot make the route answer anything but the handshake's first certificate; the private key is never served. There is no size or per-block cap any more (nothing is decoded). Plain http, the tunnel, and a context the handshake cannot be made against answer the ordinary 404, never 500; the service still starts. The dialog shows the fingerprint with a Save button; the prompt writes no settings or certificate file and puts the '# server = ADDRESS' line into the credential file, under umask 077 in a subshell, in PowerShell in its own scope, each line ending with a newline.",
+  "requirements": [],
+  "anchors": [
+    "docs/HTTP_DEPLOYMENT.md#the-services-own-certificate-route-and-the-set-up-dialog-kittrial-5bb203",
+    "docs/HTTP_TRANSPORT_DESIGN.md#bounded-route-and-operation-contract"
+  ],
+  "code": [
+    "http_service.py::ApiHandler.service_certificate",
+    "http_service.py::service_certificate_pem",
+    "http_service.py::certificate_fingerprint",
+    "http_service.py::create_server"
+  ],
+  "tests": [
+    "tests/test_vscode_setup.py",
+    "tests/test_http_web.py"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "http",
+    "tls",
+    "web",
+    "agents"
+  ]
+}
