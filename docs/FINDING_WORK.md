@@ -114,6 +114,11 @@ brief carries the newer summary (see step 2 above). The agent reads the full his
 to learn what the comments say. A delivered task follows its review state; request
 changes on its contribution for review feedback.
 
+Without a checkpoint, an in-progress task's `newer_activity` and its brief's `newer`
+are `null`: there is no known boundary against which to flag a comment. The
+coordinator should ask the worker to read the task history and save its first
+checkpoint; do not treat the missing flag as proof that the comment was read.
+
 **In the web interface today: no.** The task page shows the task's history. Writing a
 comment over the web is not there yet (planned: kittrial-5bb.211). A review that
 requests changes on a delivered contribution IS there, and reaches the worker as

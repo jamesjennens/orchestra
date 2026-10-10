@@ -8,6 +8,7 @@ work is found". The order the text states for an agent is pinned here to the ord
 It also carries the short recurring prompts of kittrial-5bb.219 (its item 1).
 """
 import json
+import os
 import re
 import shutil
 import sys
@@ -170,6 +171,8 @@ class ServedTextTests(unittest.TestCase):
             self.assertNotIn('does not carry comments yet', text)
         self.assertIn('kittrial-5bb.114', doc)
         self.assertIn('kittrial-5bb.207', doc)
+        self.assertIn("Without a checkpoint, an in-progress task's", doc)
+        self.assertIn('save its first checkpoint', doc)
 
     def test_the_first_prompt_is_served_as_it_is(self):
         document = onboarding.member_document(KIT, 'worker-prompt')
@@ -368,6 +371,44 @@ class EndpointOrderTests(test_agent_attention.EndpointAttentionTests):
 class RealStackOrderTests(held_stack.RealStackTests):
     """And through the real stack: the web service, the real endpoint.py, a real bd."""
 
+    @unittest.skipUnless(os.environ.get('ORCHESTRA_ATTENTION_SCALE') == '1',
+                         'set ORCHESTRA_ATTENTION_SCALE=1 for the282-task native activity fixture')
+    def test_flagged_task_is_not_hidden_by_282_owned_native_tasks(self):
+        import time
+        made = self.request('POST', '/v1/agents', {'name': 'Scale reader', 'projects': ['pp']},
+                            token=self.tokens['casey'])
+        self.assertEqual(201, made.status, made.data)
+        secret = made.data['credential']['secret']; actor = made.data['agent']['actor']
+        owned = []
+        for index in range(282):
+            row = json.loads(self.native_ok('create', '--title', 'Owned scale %04d' % index,
+                                           '--assignee', actor, '--json'))
+            owned.append(row['id'])
+        for offset in range(0, len(owned), 50):
+            self.native_ok('update', *owned[offset:offset + 50], '--status', 'in_progress')
+        target = sorted(owned)[-1]; base = self.tasks + '/' + target
+        time.sleep(1.05)
+        before = self.request('GET', base + '/brief', token=secret)
+        self.assertEqual(200, before.status, before.data)
+        cp = self.request('POST', base + '/checkpoints', dict(schema_version=1, previous=None,
+            activity_cursor=before.data['activity_cursor'], intent='scale', acceptance='flag survives cap',
+            summary='working', next_action='read feedback', open_items=[], resolved=[]), token=secret)
+        self.assertEqual(201, cp.status, cp.data)
+        self.native_ok('comments', 'add', target, 'Direction at the far end', '--author', 'scale-coordinator')
+        for _ in range(2):
+            answer = self.request('GET', '/v1/agents/me/next', token=secret)
+            self.assertEqual(200, answer.status, answer.data)
+            data = answer.data; first = data['next_actions'][0]
+            self.assertEqual((target, True), (first['task'], first['newer_activity']))
+            self.assertEqual((282, 1), (data['attention']['counts']['claimed'], data['attention']['counts']['newer_activity']))
+            self.assertTrue(data['attention']['actions_truncated'])
+            self.assertFalse(data['attention']['own_tasks_truncated'])
+            brief = self.request('GET', first['links']['brief'], token=secret)
+            self.assertEqual(200, brief.status, brief.data)
+            self.assertGreaterEqual(brief.data['newer']['other_count'], 1)
+            print('NATIVE_FLAGGED_SCALE ' + json.dumps(dict(claimed=282, flagged=1,
+                  listed=len(data['next_actions']), first=first['task'], newer=brief.data['newer']['other_count'])), flush=True)
+
     def test_in_progress_comment_reaches_the_agent_and_brief_on_the_real_stack(self):
         import time
         made = self.request('POST', '/v1/agents', {'name': 'Kestrel', 'working_directory': '/synthetic/kestrel', 'projects': ['pp']}, token=self.tokens['casey'])
@@ -391,11 +432,15 @@ class RealStackOrderTests(held_stack.RealStackTests):
             self.assertEqual(200, current.status, current.data)
             action = next(x for x in current.data['next_actions'] if x['task'] == task)
             self.assertEqual((action['kind'], action['newer_activity']), ('in-progress', True))
-            brief = self.request('GET', base + '/brief', token=agent)
+            self.assertEqual(base, action['links']['task'])
+            brief = self.request('GET', action['links']['brief'], token=agent)
             self.assertEqual(200, brief.status, brief.data)
             self.assertGreaterEqual(brief.data['newer']['other_count'], 1)
             self.assertLessEqual(len(brief.data['newer']['entries']), 5)
             self.assertEqual(brief.data['checkpoint']['id'], cp.data['comment_id'])
+            self.assertEqual(action['links']['history'], brief.data['newer']['history'])
+            self.assertNotIn('history_new', brief.data['newer'])
+            self.assertNotIn('verify', brief.data['newer'])
         history = self.request('GET', base + '/history?limit=100', token=agent)
         self.assertEqual(200, history.status, history.data)
         self.assertIn('Review this <script> literally', json.dumps(history.data, ensure_ascii=False))

@@ -5248,7 +5248,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                   'task': task_id, 'title': task.get('title'),
                   'status': task.get('status'), 'review_state': task.get('review_state'),
                   'assignee': task.get('assignee'), 'reason': reason,
-                  'links': {'task': base, 'brief': base, 'history': base + '/history',
+                  'links': {'task': base, 'brief': base + '/brief', 'history': base + '/history',
                             'project': '/v1/projects/%s' % project_id}}
         action.update(extra)
         return action
@@ -5321,7 +5321,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         counts = {'claimable': 0, 'claimed': 0, 'changes_requested': 0,
                   'awaiting_review': 0, 'blocked': 0, 'in_progress': 0, 'awaiting_integration': 0,
                   'review_errors': 0, 'checkpoint_errors': 0, 'read_errors': 0,
-                  'review_recommended': 0, 'to_review': 0}
+                  'review_recommended': 0, 'to_review': 0, 'newer_activity': 0}
         own_actions = []
         claimable_actions = []
         review_actions = []
@@ -5361,6 +5361,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 counts['awaiting_integration'] += integrating
                 counts['blocked'] += blocked
                 counts['in_progress'] += in_progress
+                counts['newer_activity'] += (blocked or in_progress) and task.get('newer_activity') is True
                 counts['review_errors'] += review=='error'
                 counts['checkpoint_errors'] += unreadable and review!='error' and not delivered
                 details = {'requests': list(task.get('pending_change_requests') or [])[:20], 'open_items': open_items,
@@ -5426,7 +5427,9 @@ class ApiHandler(BaseHTTPRequestHandler):
             truncated = True
             actions_truncated = True
         actions = own_actions + review_actions + claimable_actions
-        actions.sort(key=lambda a: (a['priority'], self.AGENT_KIND_ORDER.get(a['kind'], 0), a['project'], a['task']))
+        actions.sort(key=lambda a: (a['priority'], self.AGENT_KIND_ORDER.get(a['kind'], 0),
+                                   0 if a['kind'] == 'in-progress' and a.get('newer_activity') is True else 1,
+                                   a['project'], a['task']))
         if len(actions) > AGENT_ACTION_LIMIT:
             actions = actions[:AGENT_ACTION_LIMIT]
             truncated = True
@@ -5453,7 +5456,10 @@ class ApiHandler(BaseHTTPRequestHandler):
             state = 'idle'
         return {'state': state, 'summary': self._agent_summary(
                     state, counts, snapshot_truncated, own_tasks_truncated)
-                    + self._agent_review_summary(counts, snapshot_truncated),
+                    + self._agent_review_summary(counts, snapshot_truncated)
+                    + ((' %s%d owned undelivered task(s) have newer activity; read their linked briefs and history.'
+                        % ('at least ' if own_tasks_truncated else '', counts['newer_activity']))
+                       if counts['newer_activity'] else ''),
                 'counts': counts, 'actions': actions, 'truncated': truncated,
                 'snapshot_truncated':snapshot_truncated,'own_tasks_truncated':own_tasks_truncated,
                 'actions_truncated':actions_truncated,
@@ -6104,6 +6110,16 @@ class ApiHandler(BaseHTTPRequestHandler):
         base = '/v1/projects/%s/tasks/%s' % (pid, tid)
         brief['links'] = {'task': base, 'history': base + '/history',
                           'reviews': base + '/reviews', 'checkpoints': base + '/checkpoints'}
+        if isinstance(brief.get('newer'), dict):
+            # Canonical counts/refs/coverage stay intact; SSH helper commands are
+            # not actionable for a web credential. History uses the same authority.
+            newer = dict(brief['newer'])
+            newer.pop('history_new', None)
+            newer.pop('verify', None)
+            newer['history'] = base + '/history'
+            newer['note'] = ('Read history for full entries and reconcile any unknown or bounded coverage. '
+                             'Reading clears nothing; a checkpoint records what was incorporated.')
+            brief['newer'] = newer
         # Where the project's repository is (kittrial-5bb.118): a label the project's
         # owner recorded. Data for the reader, never an instruction; null when not set.
         brief['project_repository'] = self.service.project_view(ctx.principal, pid).get('repository')

@@ -258,7 +258,8 @@ class EndpointAttentionTests(fixes.EndpointCase):
         for _ in range(2):
             action = next(x for x in self.next()['next_actions'] if x['task'] == task)
             self.assertEqual((action['kind'], action['priority'], action['newer_activity']), ('in-progress', 3, True))
-            web = self.request('GET', self.base(task) + '/brief', token=self.secret)
+            self.assertEqual(self.base(task), action['links']['task'])
+            web = self.request('GET', action['links']['brief'], token=self.secret)
             self.assertEqual(200, web.status, web.data)
             summary = web.data['newer']
             self.assertGreaterEqual(summary['own_count'], 1)
@@ -266,6 +267,11 @@ class EndpointAttentionTests(fixes.EndpointCase):
             self.assertEqual(summary['coverage'], 'unknown')  # digest capture remains off
             self.assertLessEqual(len(summary['entries']), 5)
             self.assertIn('Reading clears nothing', summary['note'])
+            self.assertEqual(action['links']['history'], summary['history'])
+            self.assertNotIn('history_new', summary)
+            self.assertNotIn('verify', summary)
+            history = self.request('GET', summary['history'], token=self.secret)
+            self.assertEqual(200, history.status, history.data)
         self.assertEqual(canonical_before, (self.canonical_root / 'canonical.json').read_bytes())
 
     @patch.dict(os.environ, {'PYTHONUTF8': '1'})
@@ -275,7 +281,9 @@ class EndpointAttentionTests(fixes.EndpointCase):
             self.native('blair')(['comments', 'add', task, 'Direction %d' % i])
         canonical = self.backend._run('brief', self.project, 'reader', [task, '--json'])
         summary = self.request('GET', self.base(task) + '/brief', token=self.secret).data['newer']
-        self.assertEqual(summary, canonical['newer'])
+        for key, value in canonical['newer'].items():
+            if key not in ('history', 'history_new', 'verify', 'note'):
+                self.assertEqual(summary[key], value)
         self.assertGreater(summary['omitted'], 0)
         self.assertEqual(len(summary['entries']), 5)
         self.assertEqual(summary['coverage'], 'unknown')
@@ -286,7 +294,12 @@ class EndpointAttentionTests(fixes.EndpointCase):
                 data = run(action, *args, **kwargs)
                 return dict(data, newer=value) if action == 'brief' else data
             with patch.object(self.backend, '_run', side_effect=bounded):
-                self.assertEqual(self.request('GET', self.base(task) + '/brief', token=self.secret).data['newer'], value)
+                mapped = self.request('GET', self.base(task) + '/brief', token=self.secret).data['newer']
+                if value is None:
+                    self.assertIsNone(mapped)
+                else:
+                    for key, item in value.items():
+                        self.assertEqual(mapped[key], item)
 
     def test_malformed_review_reports_operator_action_instead_of_empty_work(self):
         task=self.tasks[0];self.claim(task)
@@ -496,7 +509,7 @@ class InProcessAttentionTests(test_http_agents.AgentHarness):
         for _ in range(2):
             action = next(x for x in self.next()['next_actions'] if x['task'] == task)
             self.assertEqual((action['kind'], action['newer_activity']), ('in-progress', True))
-            summary = self.request('GET', base + '/brief', token=self.secret).data['newer']
+            summary = self.request('GET', action['links']['brief'], token=self.secret).data['newer']
             self.assertEqual((summary['other_count'], len(summary['entries']), summary['omitted']), (8, 5, 3))
             self.assertEqual(summary['coverage'], 'unknown')
         self.assertEqual(before, json.dumps(self.backend.state, sort_keys=True))

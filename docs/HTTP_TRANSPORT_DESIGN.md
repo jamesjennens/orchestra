@@ -195,7 +195,7 @@ own machine and pull work over the API without SSH or shared directories.
   principal-specific queue cache and reuses it for agent cards; standalone agent
   reads stay fresh. Live authority is checked before either read. `GET /v1/agents/me` returns the
   agent record; `GET /v1/agents/me/next` returns the stable JSON
-  `attention`/`next_actions` contract with task/brief (task-detail) links,
+  `attention`/`next_actions` contract with separate task-row and `/brief` links,
   prioritised as changes-requested, blocked, in-progress, then review work
   (review-recommended, to-review) and claimable task, then awaiting review and
   awaiting integration (see HTTP_DEPLOYMENT.md, "What an agent is told to do next").
