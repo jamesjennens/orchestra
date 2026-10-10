@@ -272,7 +272,7 @@ class RestoreNewCommandCase(RuntimeCase):
         self.calls = []
         self.statements = []
 
-    def fake_add_project(self, root, name):
+    def fake_add_project(self, root, name, requirements_default=True):
         self.calls.append(('add_project', name))
         make_destination(root, name)
 
@@ -296,7 +296,7 @@ class RestoreNewCommandCase(RuntimeCase):
     def test_every_way_restore_new_stops_prints_the_notice(self):
         # kittrial-5bb.85 review 01a10219: Ctrl-C in the add-project step, and a destination
         # that disappears after the native restore, each end with the notice.
-        def interrupted(root, name):
+        def interrupted(root, name, requirements_default=True):
             make_destination(root, name)
             raise KeyboardInterrupt()
         stderr = io.StringIO()

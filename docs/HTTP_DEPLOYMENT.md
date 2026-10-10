@@ -13,6 +13,18 @@ the operator path.
 
 ## 1. What the service is and is not
 
+### Requirements governance storage
+
+New creation intents opt into simple owner editing. Existing projects, old
+interrupted creations and backups without governance history stay governed.
+The project sidecars `.requirements-governance.json` and
+`.requirements-governance-source.json`, the `.requirement-owner-requests/`
+receipts and the outer operation journal are included in the same complete
+backup/restore set. Restore-new preserves historical hashes and source bindings
+before the destination merge slot is provisioned. Do not copy only the native
+database and omit those files. See [Requirements](REQUIREMENTS.md) for snapshot
+capture, owner authority, bearer/CSRF behavior and uncertain-write recovery.
+
 It is an authenticated adapter to canonical coordination data: browser sessions
 and project-scoped worker credentials gate every route, and organization is by
 project membership (`owner`, `contributor`, `viewer`) with a global superuser.
@@ -2567,7 +2579,7 @@ line separately and unconfined.
     `requests`, the request-changes record ids), `blocked` (2: the latest checkpoint
     lists an open `blocker` or `dependency` on undelivered work; with `open_items`,
     `blocking_items`, `blocked_since` and `newer_activity`),
-    `in-progress` (3: claimed, not closed, nothing delivered yet), then
+    `in-progress` (3: claimed, not closed, nothing delivered yet, with `newer_activity`), then
     review work and `claimable-task` (4, see below), then `awaiting-review` and `awaiting-integration` (5).
     `review-error` (priority 2) names the malformed state and asks an operator to reconcile it;
     other own states get `review-state`, naming the state and who acts next. Neither
@@ -2651,7 +2663,17 @@ line separately and unconfined.
       nothing for it to do until the review is decided.
   - **Order within a priority is part of the contract; the numbers are not.**
     `review-recommended`, `to-review` and `claimable-task` all carry priority 4 and
-    are listed in that order, and within a kind by project and then by task. No kind was renumbered when these two were added. A
+    are listed in that order. Within `in-progress`, actions with `newer_activity: true`
+    come first, before the 50-action cap; other ties are by project and then task.
+    `counts.newer_activity` counts observed owned undelivered tasks with confirmed
+    newer activity, including blocked tasks, even when not all actions are listed.
+    The summary names that count; with incomplete own reads it says "at least N".
+    A task without a checkpoint has an unknown (`null`) flag, not confirmed silence.
+    The linked `/brief` preserves bounded newer counts, references, omissions and
+    coverage; its `newer.history` is the authorized task `/history` route. SSH-only
+    `history_new` and `verify` commands are omitted. Read history to reconcile unknown
+    coverage; reading acknowledges nothing.
+    No kind was renumbered when these two were added. A
     client relies on the order of `next_actions` and on the kind names.
   - **Why the two waiting kinds are last.** An agent, and anything that wakes it,
     takes the first action. The agent can do nothing about a contribution that waits

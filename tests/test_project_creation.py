@@ -203,6 +203,7 @@ class StopTests(Host):
         (self.root / 'projects' / 'alpha').mkdir()            # an empty directory, as add-project resumes
         self.assertEqual([item['state'] for item in pc.attention(self.root)], ['stalled'])
         self.assertEqual(self.create(limit=1)['status'], 'created')
+        self.assertNotIn('requirements_governance', pc.read_record(self.root, 'alpha'))
         self.assertEqual(pc.attention(self.root), [])
 
 
@@ -581,7 +582,7 @@ class AddProjectStillTests(unittest.TestCase):
         self.assertEqual((written['state'], written['by']), ('created', pc.HOST))
         self.assertEqual(out.getvalue(), 'Created project alpha\nSCHEDULE TEXT\nCLIENT TEXT\n')
 
-    def test_initialize_runs_the_five_stages_in_order(self):
+    def test_initialize_runs_the_creation_stages_in_order(self):
         seen = []
         saved = (admin.run_bd, admin.provision_merge_slot, admin.backup_project, admin.config,
                  admin.refuse_retired_name)
@@ -593,13 +594,20 @@ class AddProjectStillTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / 'projects').mkdir()
+            pc.write_record(root, 'alpha', {'project': 'alpha', 'by': pc.HOST,
+                                          'state': 'started', 'stage': None,
+                                          'started_at': '2030-01-01T00:00:00Z',
+                                          'requirements_governance': 'simple'})
             try:
                 admin.initialize_project(root, 'alpha', seen.append)
+                import requirement_governance
+                self.assertEqual(requirement_governance.current(root / 'projects' / 'alpha',
+                                                                 'alpha')['mode'], 'simple')
             finally:
                 (admin.run_bd, admin.provision_merge_slot, admin.backup_project, admin.config,
                  admin.refuse_retired_name) = saved
         self.assertEqual(seen, ['init', 'init', 'configure', 'config no-git-ops', 'config dolt.auto-push',
-                                'config dolt.auto-commit', 'config backup.git-push', 'backup-target', 'backup',
+                                'config dolt.auto-commit', 'config backup.git-push', 'requirements-governance', 'backup-target', 'backup',
                                 'merge-slot', 'slot', 'first-backup', 'first backup'])
 
 

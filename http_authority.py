@@ -638,7 +638,7 @@ class AuthorityConfig:
         self.service_namespace = service_namespace
 
 
-def principal_key(request, authority_configured=False):
+def principal_key(request, authority_configured=False, account_identity=False):
     """The authenticated identity an operation identity is bound to.
 
     A trusted authority descriptor binds the stable principal (user, credential and
@@ -653,6 +653,8 @@ def principal_key(request, authority_configured=False):
     if isinstance(authority, dict):
         user_id = authority.get('user_id')
         if isinstance(user_id, str) and user_id:
+            if account_identity:
+                return 'owner-account:' + user_id
             return 'user:%s|cred:%s|session:%s' % (
                 user_id, authority.get('credential_id') or '-',
                 authority.get('session_hash') or '-')
@@ -660,7 +662,7 @@ def principal_key(request, authority_configured=False):
     return 'actor:%s' % (actor if isinstance(actor, str) else '')
 
 
-def operation_hash(request, authority_configured=False):
+def operation_hash(request, authority_configured=False, account_identity=False):
     """Canonical identity of a mutation.
 
     Binds the project, route, actor *and* authenticated principal in addition to the
@@ -672,7 +674,7 @@ def operation_hash(request, authority_configured=False):
     """
     payload = {'project': request.get('project'), 'action': request.get('action'),
                'route': request.get('route'), 'actor': request.get('actor') or '',
-               'principal': principal_key(request, authority_configured),
+               'principal': principal_key(request, authority_configured, account_identity),
                'args': request.get('args'),
                'attachments': request.get('attachments') or {}}
     text = json.dumps(payload, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
@@ -2073,7 +2075,8 @@ def descriptor_actor_denial(request, authority_config, reserved):
 
 
 def run_guarded(request, journal_path, effect, authority_config=None,
-                require_authority=False, runner=None, journal_options=None):
+                require_authority=False, runner=None, journal_options=None, account_identity=False,
+                identity_check=None):
     """Run one canonical mutation through the live-authority and identity boundary.
 
     Returns the canonical response envelope (the same shape ``endpoint.py`` emits).
@@ -2096,6 +2099,10 @@ def run_guarded(request, journal_path, effect, authority_config=None,
       canonical endpoint passes none, so production uses the module defaults.
     * The authority lock is held across re-validation and the effect, so an HTTP-side
       revocation that committed first is observed here and the effect never runs.
+    * ``account_identity`` is a server adapter option, never a request field. The
+      owner requirements adapter uses it after checking a human owner session so
+      a new login can recover the same account's request. Live session authority
+      is still checked here, under the lock, before even a committed replay.
     """
     authority = request.get('authority')
     if not isinstance(authority, dict):
@@ -2120,12 +2127,17 @@ def run_guarded(request, journal_path, effect, authority_config=None,
             except AuthorityDenied as denied:
                 return _envelope(126, stderr='%s\n' % denied.message,
                                  authority_status=denied.status)
+        if identity_check is not None:
+            try:
+                identity_check()
+            except ValueError as denied:
+                return _envelope(2, stderr=str(denied) + '\n')
         operation_id = request.get('operation_id')
         journal = (OperationJournal(journal_path, **(journal_options or {}))
                    if operation_id else None)
         # The principal half of the identity comes from the request descriptor only
         # when this launch actually has a trusted authority store.
-        principal = principal_key(request, trusted)
+        principal = principal_key(request, trusted, account_identity)
         if journal is not None:
             # The directed actor label and canonical route are recorded with the row, so
             # the journal reports what an identity was aimed at, not only its principal.
@@ -2133,7 +2145,7 @@ def run_guarded(request, journal_path, effect, authority_config=None,
             route = request.get('route')
             journal._actor = actor if isinstance(actor, str) and actor else None
             journal._route = route if isinstance(route, str) and route else None
-            request_hash = operation_hash(request, trusted)
+            request_hash = operation_hash(request, trusted, account_identity)
             entry = journal.lookup(operation_id)
             if entry is not None:
                 if entry.get('principal') != principal:

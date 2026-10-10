@@ -27,6 +27,15 @@ If initial installation fails, it stops the service and preserves files for insp
 
 ## Connect a contributor
 
+Requirements governance is part of the complete backup sidecar and operation
+journal set: `.requirements-governance.json`, its optional restore binding
+`.requirements-governance-source.json`, and `.requirement-owner-requests/`.
+New creation intents start simple; old creations and backups with no history
+remain governed. Restore does not choose a mode. Preserve this set when moving
+a project; use the [requirements snapshot command](REQUIREMENTS.md) for offline
+owner-evidence export. Operator requirement-apply/backfill authority remains
+unchanged in both modes.
+
 Configure the [server-owned project entry point](ONBOARDING.md) so new workers can start from an empty directory using a single SSH onboarding command. Its private instructions are included in coordination sidecar backups.
 
 Install Python 3.10+ and OpenSSH on their machine. Configure an SSH alias `beads-team` for the server/service account with their own key; verify the server host key on first connection. Confirm an ordinary `ssh beads-team` works before using the noninteractive client.

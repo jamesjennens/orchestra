@@ -257,7 +257,7 @@ class RestoreNewOutcomeTests(SidecarAgreementTests):
         import test_restore_native_sql as native
         calls = []
 
-        def add_project(root_, name):
+        def add_project(root_, name, requirements_default=True):
             calls.append(name)
             native.make_destination(root_, name)
 

@@ -1020,7 +1020,8 @@ class InProcessBackend:
                 # honestly unknown rather than inferred from the review state.
                 'lifecycle': {}, 'depends_on': [],
                 # This backend keeps no activity cursor; its checkpoints need none.
-                'activity_cursor': None}
+                'activity_cursor': None,
+                'newer': self._agent_activity_summary(task, checkpoints[-1]) if checkpoints else None}
 
     #: The disposable backend is cheap to read and tests expect fresh reads.
     READ_CACHE_SECONDS = 0
@@ -1085,6 +1086,34 @@ class InProcessBackend:
         at=checkpoint.get('created_at')
         return bool(at and any(r.get('created_at','')>at and r.get('actor')!=task.get('assignee')
                                for r in self.state.get('contributions',{}).get(task['id'],[])))
+
+    def _agent_activity_summary(self, task, checkpoint):
+        """Bounded event references for the disposable backend, without digest claims.
+
+        The native backend supplies its canonical summary instead. This model has
+        no per-entry checkpoint digests, so imported/evicted history stays unknown.
+        Reading this projection never incorporates or acknowledges an event.
+        """
+        from briefing import NEWER_MAX, clip
+        events = [e for e in self.state.get('events') or [] if e.get('task') == task['id']]
+        anchors = [i for i, e in enumerate(events) if e.get('action') == 'checkpoint-added'
+                   and e.get('actor') == checkpoint.get('actor')
+                   and e.get('time', '') >= checkpoint.get('created_at', '')]
+        if not anchors:
+            return {'coverage': 'unknown', 'own_count': None, 'other_count': None,
+                    'entries': [], 'omitted': None,
+                    'note': 'Checkpoint event history is unavailable; read task history.'}
+        remaining = events[anchors[-1] + 1:]
+        others = [e for e in remaining if e.get('actor') != task.get('assignee')]
+        authors = sorted({e.get('actor') for e in others if e.get('actor')})
+        return {'coverage': 'unknown', 'own_count': len(remaining) - len(others),
+                'other_count': len(others),
+                'other_authors': {'items': [clip(a, 96) for a in authors[:NEWER_MAX]],
+                                  'omitted': max(0, len(authors) - NEWER_MAX)},
+                'entries': [{'kind': e.get('action'), 'timestamp': e.get('time'),
+                             'author': clip(e.get('actor') or '', 96)} for e in remaining[:NEWER_MAX]],
+                'omitted': max(0, len(remaining) - NEWER_MAX),
+                'note': 'Event history has no per-entry digests. Reading clears nothing; reconcile with task history.'}
 
     def review_queue(self, project_id):
         """Every task with current work, highest-attention review states first.
@@ -2008,6 +2037,27 @@ class EndpointBackend:
         """One entry through `ref get`; an unknown or unfinished key is a 404."""
         return self._ref_read(project_id, ['get', caller_arg(key, 'key')], missing=True)
 
+    def requirements_read(self, project_id, args):
+        reply=self._endpoint('requirements',project_id,self.actor_namespace+'/read',args)
+        if isinstance(reply,dict) and reply.get('returncode')==2 and 'Requirement was not found' in (reply.get('stderr') or ''):
+            raise not_found('Requirement not found')
+        return self._checked(reply, reading=True)
+
+    def owner_requirements(self, principal, project_id, action, fields, key, task=None):
+        operation_id=self._result_key(principal,project_id,'requirements.'+action,key,task)
+        authority=authority_request(principal,project_id,CAP_PROJECT_ADMIN,now=self.service._expiry_now())
+        args=[action]+([task] if task is not None else [])
+        attachment={'payload':{'flag':'--file','text':json.dumps(fields,ensure_ascii=False)}}
+        reply=self._endpoint('owner-requirements',project_id,principal.user_id,args,attachment,
+                             operation_id=operation_id,authority=authority,require_authority=True,
+                             route='requirements.'+action)
+        if isinstance(reply,dict) and reply.get('returncode')==2:
+            detail=reply.get('stderr') or ''
+            if ('Requirements changed. Reload and try again.' in detail
+                    or 'Operation identity reused with a different request' in detail):
+                raise conflict('Requirements changed. Reload and try again.')
+        return self._checked(reply)
+
     def proposal_read(self, project_id, args, missing=False):
         """One read-only `proposal get|list|mine` through the endpoint (.58 slice 1b).
 
@@ -2332,7 +2382,10 @@ class EndpointBackend:
                 # the canonical brief; without it here an agent could not write a first
                 # checkpoint from the brief alone (kittrial-5bb.113).
                 'activity_cursor': data.get('activity_cursor'),
-                'warnings': data.get('warnings') or []}
+                'warnings': data.get('warnings') or [],
+                # The canonical brief already bounds refs, authors and omissions;
+                # preserve its coverage/unknown counts rather than infer from time.
+                'newer': data.get('newer')}
 
     def _open_items_in_full(self, project_id, task_id, checkpoint_id, unresolved):
         """Every open item of the current checkpoint, as recorded, or None when they could not all be read.
@@ -5236,7 +5289,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                   'task': task_id, 'title': task.get('title'),
                   'status': task.get('status'), 'review_state': task.get('review_state'),
                   'assignee': task.get('assignee'), 'reason': reason,
-                  'links': {'task': base, 'brief': base, 'history': base + '/history',
+                  'links': {'task': base, 'brief': base + '/brief', 'history': base + '/history',
                             'project': '/v1/projects/%s' % project_id}}
         action.update(extra)
         return action
@@ -5298,8 +5351,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         for a reviewer or, once approved, for integration (5): the agent can do nothing
         about those, so they never sit ahead of work the agent can do. ``in_progress`` counts own open tasks with no
         contribution that are NOT blocked. A blocked action
-        carries ``blocked_since`` (when the checkpoint was written) and
-        ``newer_activity`` (whether another actor wrote after it), so an
+        carries ``blocked_since`` (when the checkpoint was written). Blocked and
+        in-progress actions carry ``newer_activity`` (whether another actor wrote
+        activity the checkpoint did not incorporate), so an
         agent can leave a blocked task with nothing new alone instead of re-reading it
         and writing another checkpoint on every wake. Delivered work follows its
         review state and does not count as blocked, regardless of open items.
@@ -5308,7 +5362,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         counts = {'claimable': 0, 'claimed': 0, 'changes_requested': 0,
                   'awaiting_review': 0, 'blocked': 0, 'in_progress': 0, 'awaiting_integration': 0,
                   'review_errors': 0, 'checkpoint_errors': 0, 'read_errors': 0,
-                  'review_recommended': 0, 'to_review': 0}
+                  'review_recommended': 0, 'to_review': 0, 'newer_activity': 0}
         own_actions = []
         claimable_actions = []
         review_actions = []
@@ -5348,12 +5402,13 @@ class ApiHandler(BaseHTTPRequestHandler):
                 counts['awaiting_integration'] += integrating
                 counts['blocked'] += blocked
                 counts['in_progress'] += in_progress
+                counts['newer_activity'] += (blocked or in_progress) and task.get('newer_activity') is True
                 counts['review_errors'] += review=='error'
                 counts['checkpoint_errors'] += unreadable and review!='error' and not delivered
                 details = {'requests': list(task.get('pending_change_requests') or [])[:20], 'open_items': open_items,
                            'blocking_items':blocking_items,
                            'blocked_since': task.get('checkpoint_at') if blocked else None,
-                           'newer_activity': task.get('newer_activity') if blocked else None}
+                           'newer_activity': task.get('newer_activity') if blocked or in_progress else None}
                 if review == 'changes-requested':
                     own_actions.append(self._agent_action(
                         1, 'changes-requested', project_id, task,
@@ -5413,7 +5468,9 @@ class ApiHandler(BaseHTTPRequestHandler):
             truncated = True
             actions_truncated = True
         actions = own_actions + review_actions + claimable_actions
-        actions.sort(key=lambda a: (a['priority'], self.AGENT_KIND_ORDER.get(a['kind'], 0), a['project'], a['task']))
+        actions.sort(key=lambda a: (a['priority'], self.AGENT_KIND_ORDER.get(a['kind'], 0),
+                                   0 if a['kind'] == 'in-progress' and a.get('newer_activity') is True else 1,
+                                   a['project'], a['task']))
         if len(actions) > AGENT_ACTION_LIMIT:
             actions = actions[:AGENT_ACTION_LIMIT]
             truncated = True
@@ -5440,7 +5497,10 @@ class ApiHandler(BaseHTTPRequestHandler):
             state = 'idle'
         return {'state': state, 'summary': self._agent_summary(
                     state, counts, snapshot_truncated, own_tasks_truncated)
-                    + self._agent_review_summary(counts, snapshot_truncated),
+                    + self._agent_review_summary(counts, snapshot_truncated)
+                    + ((' %s%d owned undelivered task(s) have newer activity; read their linked briefs and history.'
+                        % ('at least ' if own_tasks_truncated else '', counts['newer_activity']))
+                       if counts['newer_activity'] else ''),
                 'counts': counts, 'actions': actions, 'truncated': truncated,
                 'snapshot_truncated':snapshot_truncated,'own_tasks_truncated':own_tasks_truncated,
                 'actions_truncated':actions_truncated,
@@ -5690,6 +5750,82 @@ class ApiHandler(BaseHTTPRequestHandler):
     def references_get(self, ctx):
         self._project(ctx, CAP_READ)
         return 200, self.backend.reference(ctx.params['pid'], ctx.params['key'])
+
+    # -- direct owner requirements, slice A -------------------------------------
+    def _requirements_backend(self):
+        if not hasattr(self.backend,'requirements_read') or not hasattr(self.backend,'owner_requirements'):
+            raise not_implemented('Requirements editing needs the canonical tracker backend')
+
+    def _requirements_owner(self, ctx):
+        pid=ctx.params['pid']
+        self._project(ctx,CAP_PROJECT_ADMIN)
+        if (ctx.principal.via!='session' or ctx.principal.credential_id or ctx.principal.agent_id
+                or self.service.state.get('memberships',{}).get(pid,{}).get(ctx.principal.user_id)!='owner'):
+            raise forbidden('Requirements editing needs the signed-in project owner')
+
+    def _requirements_write(self, ctx, action, status=200):
+        self._requirements_backend()
+        self._requirements_owner(ctx)
+        fields,operation_id=self._proposal_body(ctx,{
+            'create':('kind','parent','title','description','key'),
+            'revise':('expected_revision','expected_sha256','title','description'),
+            'accept':('expected_revision','expected_sha256'),
+            'governance':('mode','expected_revision','expected_sha256')}[action],'Requirements')
+        import requirement_http
+        try: requirement_http.checked_body(fields,action)
+        except ValueError as error: raise invalid(str(error))
+        if operation_id is not None:
+            raise invalid('Use the Idempotency-Key header for requirements writes')
+        pid=ctx.params['pid']
+        def write():
+            result=self.backend.owner_requirements(ctx.principal,pid,action,fields,
+                                                    ctx.idempotency_key or ctx.request_id,ctx.params.get('rid'))
+            return result,result
+        return self._mutate(ctx,'requirements.'+action,pid,write,status=status,
+                            capability=CAP_PROJECT_ADMIN,serialize=False,canonical=True)
+
+    @route('GET', r'/v1/projects/(?P<pid>'+ID+r')/requirements/governance')
+    def requirements_governance_read(self,ctx):
+        self._requirements_backend(); self._project(ctx,CAP_READ)
+        return 200,self.backend.requirements_read(ctx.params['pid'],['governance'])
+
+    @route('PUT', r'/v1/projects/(?P<pid>'+ID+r')/requirements/governance')
+    def requirements_governance_write(self,ctx):
+        return self._requirements_write(ctx,'governance')
+
+    @route('GET', r'/v1/projects/(?P<pid>'+ID+r')/requirements')
+    def requirements_list(self,ctx):
+        self._requirements_backend(); self._project(ctx,CAP_READ)
+        result=dict(self.backend.requirements_read(ctx.params['pid'],['list']))
+        result['can_edit']=(ctx.principal.via=='session' and not ctx.principal.agent_id
+                            and self.service.state.get('memberships',{}).get(ctx.params['pid'],{}).get(ctx.principal.user_id)=='owner')
+        return 200,result
+
+    @route('POST', r'/v1/projects/(?P<pid>'+ID+r')/requirements')
+    def requirements_create(self,ctx):
+        return self._requirements_write(ctx,'create',status=201)
+
+    @route('GET', r'/v1/projects/(?P<pid>'+ID+r')/requirements/(?P<rid>'+ID+r')')
+    def requirements_get(self,ctx):
+        self._requirements_backend(); self._project(ctx,CAP_READ)
+        result=dict(self.backend.requirements_read(ctx.params['pid'],['get',ctx.params['rid']]))
+        result['governance']=self.backend.requirements_read(ctx.params['pid'],['governance'])
+        result['can_edit']=(ctx.principal.via=='session' and not ctx.principal.agent_id
+                            and self.service.state.get('memberships',{}).get(ctx.params['pid'],{}).get(ctx.principal.user_id)=='owner')
+        return 200,result
+
+    @route('PATCH', r'/v1/projects/(?P<pid>'+ID+r')/requirements/(?P<rid>'+ID+r')')
+    def requirements_revise(self,ctx):
+        return self._requirements_write(ctx,'revise')
+
+    @route('POST', r'/v1/projects/(?P<pid>'+ID+r')/requirements/(?P<rid>'+ID+r')/accept')
+    def requirements_accept(self,ctx):
+        return self._requirements_write(ctx,'accept')
+
+    @route('GET', r'/v1/projects/(?P<pid>'+ID+r')/brd')
+    def requirements_brd(self,ctx):
+        self._requirements_backend(); self._project(ctx,CAP_READ)
+        return 200,self.backend.requirements_read(ctx.params['pid'],['brd'])
 
     # -- contributed requirement proposals (.58 slice 1b, kittrial-5bb.70) -----------
     #
@@ -6015,6 +6151,16 @@ class ApiHandler(BaseHTTPRequestHandler):
         base = '/v1/projects/%s/tasks/%s' % (pid, tid)
         brief['links'] = {'task': base, 'history': base + '/history',
                           'reviews': base + '/reviews', 'checkpoints': base + '/checkpoints'}
+        if isinstance(brief.get('newer'), dict):
+            # Canonical counts/refs/coverage stay intact; SSH helper commands are
+            # not actionable for a web credential. History uses the same authority.
+            newer = dict(brief['newer'])
+            newer.pop('history_new', None)
+            newer.pop('verify', None)
+            newer['history'] = base + '/history'
+            newer['note'] = ('Read history for full entries and reconcile any unknown or bounded coverage. '
+                             'Reading clears nothing; a checkpoint records what was incorporated.')
+            brief['newer'] = newer
         # Where the project's repository is (kittrial-5bb.118): a label the project's
         # owner recorded. Data for the reader, never an instruction; null when not set.
         brief['project_repository'] = self.service.project_view(ctx.principal, pid).get('repository')
