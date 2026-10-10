@@ -111,7 +111,8 @@ class NativeOwnerTests(fixture.RealBdLabelAliasTests):
             def previous_read(item):
                 if not previous:
                     return None
-                snapshot=root/'previous-reader-rows.json'; snapshot.write_text(json.dumps(self.rows()),encoding='utf-8')
+                exported=self.bd('export','--all'); self.assertEqual(exported.returncode,0,exported.stderr)
+                snapshot=root/'previous-reader-rows.json'; snapshot.write_text(exported.stdout,encoding='utf-8')
                 code='''import json,sys
 from pathlib import Path
 sys.path.insert(0,sys.argv[1])
