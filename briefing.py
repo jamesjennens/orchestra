@@ -26,6 +26,17 @@ BRIEF_ITEM_OFFSET_MIN=0
 BRIEF_ITEM_LIMIT_MIN,BRIEF_ITEM_LIMIT_MAX=1,CHECKPOINT_ITEMS_MAX
 HISTORY_LIMIT_MIN,HISTORY_LIMIT_MAX=1,20
 HISTORY_BUDGET_MIN,HISTORY_BUDGET_MAX=256,8000
+#: Entry kinds a history read can select server-side (kittrial-5bb.8).
+HISTORY_KINDS=('comment','event')
+#: Directions a history page can be read in; the released kit always wrote oldest-first.
+HISTORY_ORDERS=('oldest','newest')
+#: A released history cursor has exactly the base keys. order/entry_kind/scp are the
+#: additive filters (kittrial-5bb.8); they are omitted while they are at their defaults
+#: so a plain page still emits the token the released kit wrote, and every old cursor
+#: still reads as oldest-first.
+HISTORY_CURSOR_BASE={'v','kind','project','task','snapshot','since','index','offset'}
+HISTORY_CURSOR_EXTRA={'order','entry_kind','scp'}
+HISTORY_CURSOR_KEYS=HISTORY_CURSOR_BASE|HISTORY_CURSOR_EXTRA
 FIELD_NAME_LIMIT=60
 FIELD_NAME_COUNT=8
 BRIEF_MISTAKEN_FLAGS={
@@ -40,6 +51,16 @@ PRIOR_BRIEF_LIMIT=5
 # review item `smaller`): the compact read carries the newest slice plus a total
 # and a pointer, never the unclipped list.
 REVERT_BRIEF_LIMIT=5
+# `brief TASK --full` is bounded too (kittrial-5bb.8 review, F4): the fuller-context
+# block carries at most this many encoded bytes in total, and at most this many for any
+# single field. What the cap removes is reported per field and `show TASK` keeps the
+# complete text, so a hostile description cannot make one answer unbounded.
+FULL_CONTEXT_BUDGET=20000
+FULL_FIELD_BUDGET=8000
+# C0/C1 controls other than tab and newline are rendered as the same \uXXXX escape the
+# JSON form already uses, so the fuller-context read cannot emit a raw ESC/BEL or a bare
+# carriage return that rewrites the reader's line.
+CONTROL_TEXT_RE=re.compile('[\x00-\x08\x0b-\x1f\x7f]')
 
 def token(data):return base64.urlsafe_b64encode(canonical_bytes(data)).decode().rstrip('=')
 
@@ -359,6 +380,27 @@ def clip(value,limit):
     value=str(value or '')
     return {'text':value[:limit],'omitted_chars':max(0,len(value)-limit)}
 
+def plain_text(value):
+    """Terminal-safe text: C0/C1 controls other than tab and newline become the same
+    \\uXXXX escape the JSON form already emits, so no answer carries a raw ESC/BEL or a
+    bare CR that rewrites the line a reader is looking at."""
+    return CONTROL_TEXT_RE.sub(lambda match:'\\u%04x'%ord(match.group()),str(value or ''))
+
+def encoded_size(text):
+    """Encoded JSON string bytes: the unit history budgets an answer in (control
+    characters and Unicode must not make a bounded answer silently much larger)."""
+    return len(json.dumps(text,ensure_ascii=False).encode())
+
+def fitting_prefix(text,budget):
+    """Longest prefix of `text` whose encoded JSON string fits `budget` bytes."""
+    if budget<=0:return ''
+    lo,hi=0,len(text)
+    while lo<hi:
+        middle=(lo+hi+1)//2
+        if encoded_size(text[:middle])<=budget:lo=middle
+        else:hi=middle-1
+    return text[:lo]
+
 NEWER_MAX=5
 # Bounded provenance window: a checkpoint records exact digests for the most
 # recent incorporated entries and a rolling chain hash covering all older ones,
@@ -567,10 +609,19 @@ def direction_entries(data,context):
                  or (parse_moment(e['timestamp'])==previous[e['author']][0]
                      and e['entry_id'] not in previous[e['author']][1]))]
 
-def retained_provenance(state):
-    exact,trunc,recorded=chain_evidence(state['history'],state['provenance'])
+def retained_provenance(state,upto=None):
+    """Retained evidence merged across the chain, optionally up to one linked record.
+
+    ``upto`` is the index of the linked record whose answer is wanted (the
+    newest-my-own-checkpoint read); the default is the whole chain. A chain whose
+    newest record is legacy returns None: nothing newer can claim incorporation using
+    evidence belonging to an earlier checkpoint.
+    """
+    history=state['history'] if upto is None else state['history'][:upto+1]
+    if not history:return None
+    exact,trunc,recorded=chain_evidence(history,state['provenance'])
     if not recorded:return None
-    latest=state['provenance'][state['history'][-1][0]]
+    latest=state['provenance'][history[-1][0]]
     return dict(latest,digests=exact,older=trunc,verifiable=len(exact)+len(trunc),
                 complete=not trunc and len(exact)>=latest['covered'])
 
@@ -622,7 +673,7 @@ def newer_activity_summary(data,prov,checkpoint_timestamp,owner,direction_idx=No
             'omitted':max(0,len(outstanding)-NEWER_MAX)}
     return result
 
-def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifiers=None,actor=None):
+def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifiers=None,actor=None,full=False):
     if type(offset) is not int or offset<BRIEF_ITEM_OFFSET_MIN or type(limit) is not int or not BRIEF_ITEM_LIMIT_MIN<=limit<=BRIEF_ITEM_LIMIT_MAX:
         raise ValueError('Invalid unresolved-item page: --items-offset must be >= %d and --items-limit must be %d..%d' % (BRIEF_ITEM_OFFSET_MIN,BRIEF_ITEM_LIMIT_MIN,BRIEF_ITEM_LIMIT_MAX))
     issue=task_row(rows,task);state=checkpoint_state(issue);current=state['current'];invalid=state['invalid']
@@ -766,6 +817,43 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
         # carries the current version; a direct library call with no project path
         # cannot read the guidance and omits the block.
         result['guidance']=brief_block(journal,actor)
+    if full:
+        # The explicit fuller-context read (kittrial-5bb.8): the compact brief stays
+        # compact, and a caller that needs the whole text asks for it and is told how
+        # many characters the compact read clips from each field. The block is BOUNDED
+        # like a history page: at most FULL_CONTEXT_BUDGET encoded bytes in total and
+        # FULL_FIELD_BUDGET for any one field, with what the cap removed reported per
+        # field, so a hostile description cannot make one answer unbounded (review, F4).
+        # Control characters are escaped exactly as the JSON form already escapes them,
+        # and `show TASK` keeps the complete text.
+        full_fields={'title':str(issue.get('title') or ''),
+                     'owner':str(issue.get('assignee') or 'unassigned'),
+                     'intent':str(p['intent'] if p else (issue.get('description') or '')),
+                     'acceptance':str(p['acceptance'] if p else (issue.get('acceptance_criteria') or '')),
+                     'current_position':str(result['current_position']),'next_action':str(next_action)}
+        counts={'title':result['title']['omitted_chars'],'owner':result['owner']['omitted_chars'],
+                'intent':result['intent']['omitted_chars'],'acceptance':result['acceptance']['omitted_chars'],
+                # These two are never clipped by the compact read; they are carried whole.
+                'current_position':0,'next_action':0}
+        bounded={};bounded_omitted={};truncated=[];remaining=FULL_CONTEXT_BUDGET
+        for name,value in full_fields.items():
+            text=plain_text(value)
+            kept=fitting_prefix(text,max(0,min(remaining,FULL_FIELD_BUDGET)))
+            bounded[name]=kept
+            bounded_omitted[name]=len(text)-len(kept)
+            if bounded_omitted[name]:truncated.append(name)
+            remaining-=encoded_size(kept)
+        result['full_context']={'note':'Task context, bounded to %d encoded bytes in total; omission_counts are the '
+                                       'characters the compact brief clips from each field, and full_omitted_chars are the characters '
+                                       'this cap removed. `show TASK` carries the complete text.'
+                                       % FULL_CONTEXT_BUDGET,
+                                'omission_counts':counts,
+                                'full_omitted_chars':bounded_omitted,
+                                'truncated':truncated,
+                                'complete':not truncated,
+                                'context_budget':FULL_CONTEXT_BUDGET,
+                                'field_budget':FULL_FIELD_BUDGET,
+                                **bounded}
     return result
 
 def fit_provenance(payload,digests,previous=None):
@@ -981,23 +1069,206 @@ def checkpoint_queue_fields(rows,row,state=None):
                 'unresolved_directions':len(unresolved_directions(direction_data,dispositions,context[0]))}
     except (ValueError,TypeError,KeyError):return empty
 
-def history_page(data,project,task,limit=5,since=None,cursor=None,body_budget=4000):
+def snapshot_checkpoints(data):
+    """Valid checkpoints of one snapshot in linked order, exactly as ``checkpoint`` reads them.
+
+    Checkpoint comments are ordinary snapshot entries, so a checkpoint-relative history
+    read or a cursor continuation can resolve the newest checkpoint without another
+    export read and without mixing in live activity (kittrial-5bb.8).
+    """
+    prefix=data['task']+'-c'
+    comments=[]
+    for entry in data['entries']:
+        if entry['kind']!='comment' or not entry['entry_id'].startswith(prefix):continue
+        comments.append({'id':entry['entry_id'][len(prefix):],'text':entry['body'],
+                         'created_at':entry['timestamp'],'author':entry['author']})
+    return checkpoint_state({'id':data['task'],'comments':comments})
+
+def snapshot_comment_index(data):
+    """Checkpoint comment records keyed by comment id, read from the snapshot's own entries."""
+    prefix=data['task']+'-c'
+    return {entry['entry_id'][len(prefix):]:{'id':entry['entry_id'][len(prefix):],'created_at':entry['timestamp'],
+                                             'author':entry['author']}
+            for entry in data['entries'] if entry['kind']=='comment' and entry['entry_id'].startswith(prefix)}
+
+def checkpoint_view(data,state,index,comments=None):
+    """One linked checkpoint of a snapshot, with the CHAIN's retained evidence.
+
+    ``provenance`` is ``retained_provenance`` of the chain up to and including this
+    record, not the record's own map: once an earlier checkpoint exists the newest
+    record stores only a delta, so a record-local map cannot say what an EARLIER record
+    incorporated (kittrial-5bb.8 review, F1). ``record_provenance`` keeps that record's
+    own normalized map for callers that need it.
+    """
+    comments=snapshot_comment_index(data) if comments is None else comments
+    cid,payload=state['history'][index]
+    comment=comments.get(cid) or {'id':cid,'created_at':None,'author':None}
+    return {'comment_id':cid,'entry_id':data['task']+'-c'+cid,'payload':payload,'comment':comment,
+            'record_provenance':normalize_provenance(payload),
+            'provenance':retained_provenance(state,index),
+            'chain_length':index+1}
+
+def latest_checkpoint(data,actor=None):
+    """The newest valid checkpoint of a snapshot, or None; a corrupt chain still refuses.
+
+    The default baseline is the newest valid checkpoint BY ANYONE: the kit lets any
+    project actor write a real checkpoint on a task it does not hold, so the newest
+    record need not be the reader's own (kittrial-5bb.8 review, F3). ``actor`` restricts
+    the baseline to that actor's newest valid checkpoint — the optional "my own newest"
+    read — and returns None when that actor never wrote one.
+    """
+    state=snapshot_checkpoints(data)
+    if not state['history']:return None
+    index=len(state['history'])-1
+    if actor is not None:
+        comments=snapshot_comment_index(data)
+        mine=[position for position,(cid,_payload) in enumerate(state['history'])
+              if (comments.get(cid) or {}).get('author')==actor]
+        if not mine:return None
+        index=mine[-1]
+    return checkpoint_view(data,state,index)
+
+def checkpoint_by_id(data,cid):
+    """The linked checkpoint with this comment id, or None (a cursor's stored boundary)."""
+    state=snapshot_checkpoints(data)
+    for index,(chain_id,_payload) in enumerate(state['history']):
+        if chain_id==str(cid):return checkpoint_view(data,state,index)
+    return None
+
+def since_checkpoint_entries(data,checkpoint):
+    """Entries the baseline checkpoint did not incorporate, in immutable snapshot order.
+
+    The selection uses the checkpoint CHAIN's retained evidence, never the newest
+    record's own map alone. Recorded provenance then makes it exact in both directions:
+    an entry the chain proves was incorporated is dropped even when it sorts after the
+    baseline, and a late backdated arrival or an entry edited since the checkpoint —
+    including one an EARLIER checkpoint recorded — is selected even when it sorts before
+    the baseline. An entry the retained evidence cannot re-verify at all is kept when it
+    orders after the baseline (an extra entry is safer than a hidden one) and is counted
+    by ``checkpoint_gaps``, because nothing can show whether its content changed. A
+    legacy checkpoint records no provenance, so the released brief's timestamp rule
+    applies: every entry at or after the checkpoint's timestamp is selected, and the
+    answer says plainly what that cannot see (kittrial-5bb.8 review, F1).
+    """
+    entries=data['entries']
+    if checkpoint is None:return list(entries)
+    if checkpoint['provenance'] is None:
+        stamp=parse_moment(checkpoint['comment'].get('created_at'),'checkpoint timestamp')
+        return [entry for entry in entries
+                if entry['entry_id']!=checkpoint['entry_id']
+                and parse_moment(entry['timestamp'])>=stamp]
+    positions={entry['entry_id']:index for index,entry in enumerate(entries)}
+    boundary=positions.get(checkpoint['entry_id'])
+    prov=checkpoint['provenance'];unincorporated_ids=set()
+    selected,_fresh,_changed,_unverified=unincorporated(data,prov)
+    unincorporated_ids={entry['entry_id'] for entry in selected}
+    result=[]
+    for index,entry in enumerate(entries):
+        # The baseline checkpoint's own entry is never "after the checkpoint", and a
+        # checkpoint never records its own comment in its provenance.
+        if entry['entry_id']==checkpoint['entry_id']:continue
+        after=boundary is None or index>boundary
+        if entry['entry_id'] in unincorporated_ids:result.append(entry)
+        elif after and classify_entry(entry,prov)!='incorporated':result.append(entry)
+    return result
+
+def checkpoint_gaps(data,checkpoint):
+    """(coverage, unverified_count, note) for a checkpoint-relative read.
+
+    ``coverage`` is `snapshot` (retained evidence re-verifies every entry the checkpoint
+    incorporated), `windowed` (entries beyond the retained bounds have no per-entry
+    evidence) or `unknown` (a legacy record). `unverified_count` is how many current
+    entries the read could be hiding: entries the chain recorded but cannot re-verify
+    that sort before the baseline. ``note`` says in plain words what this read cannot
+    show, so a reader never has to infer a hidden instruction from a count
+    (kittrial-5bb.8 review, F1/F3).
+    """
+    if checkpoint is None:
+        return None,0,None
+    who=('newest valid checkpoint, by anyone: '+str(checkpoint['comment_id'])+' by '
+         +str(checkpoint['comment'].get('author'))+' at '+str(checkpoint['comment'].get('created_at')))
+    prov=checkpoint['provenance']
+    if prov is None:
+        return ('unknown',0,who+'. It records no per-entry provenance (a legacy record), so the released timestamp rule is '
+                'used: every entry at or after the checkpoint is shown. An entry edited since the checkpoint, or an arrival '
+                'backdated to before it, CANNOT be seen in this read; read the whole history (history '+data['task']+') to be sure.')
+    if prov['covered']-prov['verifiable']<=0:
+        return ('snapshot',0,who+'. Retained evidence from the checkpoint chain re-verifies every entry it incorporated, '
+                'so this read hides nothing it can prove.')
+    count=sum(1 for entry in data['entries']
+              if entry['entry_id']!=checkpoint['entry_id'] and classify_entry(entry,prov)=='unverified')
+    return ('windowed',count,who+'. Retained evidence re-verifies '+str(prov['verifiable'])+' of the '+str(prov['covered'])
+            +' entries this checkpoint recorded; '+str(count)+' current entries have no per-entry evidence and are only shown '
+            'when they order after the checkpoint, so an edit to one of those older entries CANNOT be seen here. Run '
+            'checkpoint '+data['task']+' --verify or read the whole history before trusting this read alone.')
+
+def history_page(data,project,task,limit=5,since=None,cursor=None,body_budget=4000,
+                 recent=None,kind=None,since_checkpoint=False,actor=None,since_my_checkpoint=False):
+    """One page of an immutable snapshot, oldest-first or newest-first.
+
+    ``recent`` (the CLI's ``--recent``/``--last``) pages the same snapshot newest-first
+    and is the page size for that direction; each body is still delivered in body
+    order, so a fragmented body reconstructs without gaps or duplicates and the
+    continuation cursor walks toward older entries. ``kind`` filters entries by
+    comment/event. ``since_checkpoint`` selects the activity the newest valid checkpoint
+    did not incorporate; ``since_my_checkpoint`` uses this actor's own newest valid
+    checkpoint instead of the newest one by anyone. Cursors bind the direction and both
+    filters; a cursor written by the released kit has no direction key and keeps its
+    oldest-first meaning, and unknown cursor keys are still refused.
+    """
+    # `--recent` is validated before `--limit`: parse_args mirrors the recent value into
+    # the page size, so a caller that asked for too many newest entries must hear about
+    # --recent (the option it gave), not about the internal limit (kittrial-5bb.8 review, F7).
+    if recent is not None and (type(recent) is not int or not HISTORY_LIMIT_MIN<=recent<=HISTORY_LIMIT_MAX):
+        raise ValueError('History --recent/--last must be %d..%d' % (HISTORY_LIMIT_MIN,HISTORY_LIMIT_MAX))
     if type(limit) is not int or not HISTORY_LIMIT_MIN<=limit<=HISTORY_LIMIT_MAX:raise ValueError('History limit must be %d..%d' % (HISTORY_LIMIT_MIN,HISTORY_LIMIT_MAX))
+    if recent is not None:limit=recent
+    if kind is not None and kind not in HISTORY_KINDS:raise ValueError('History --kind must be one of '+', '.join(HISTORY_KINDS))
     if type(body_budget) is not int or not HISTORY_BUDGET_MIN<=body_budget<=HISTORY_BUDGET_MAX:raise ValueError('History body budget must be %d..%d' % (HISTORY_BUDGET_MIN,HISTORY_BUDGET_MAX))
     if data.get('project')!=project or data.get('task')!=task:raise ValueError('History scope mismatch')
-    digest=content_hash(data);index=0;start=0
+    if since_my_checkpoint and not actor:raise ValueError('History --since-my-checkpoint requires a caller actor')
+    digest=content_hash(data);index=0;start=0;order='oldest'
     since=utc_text(parse_moment(since,'--since')) if since is not None else None
+    c=None
     if cursor:
         c=untoken(cursor)
-        if not isinstance(c,dict) or set(c)!={'v','kind','project','task','snapshot','since','index','offset'} or type(c['v']) is not int or c['v']!=1 or c['kind']!='history':raise ValueError('Invalid history cursor')
+        if not isinstance(c,dict) or not HISTORY_CURSOR_BASE<=set(c)<=HISTORY_CURSOR_KEYS or type(c['v']) is not int or c['v']!=1 or c['kind']!='history':raise ValueError('Invalid history cursor')
         if (c['project'],c['task'],c['snapshot'])!=(project,task,digest):raise ValueError('Cursor snapshot/scope mismatch')
         if since is not None and since!=c['since']:raise ValueError('Cursor --since mismatch')
+        if c.get('order','oldest') not in HISTORY_ORDERS:raise ValueError('Invalid history cursor')
+        if c.get('entry_kind') is not None and c['entry_kind'] not in HISTORY_KINDS:raise ValueError('Invalid history cursor')
+        if recent is not None and c.get('order','oldest')!='newest':raise ValueError('Cursor direction mismatch: this cursor continues an oldest-first page')
+        if kind is not None and kind!=c.get('entry_kind'):raise ValueError('Cursor --kind mismatch')
         since=c['since'];index=c['index'];start=c['offset']
         if type(index) is not int or type(start) is not int or index<0 or start<0:raise ValueError('Invalid cursor position')
-    entries=[e for e in data['entries'] if not since or parse_moment(e['timestamp'])>=parse_moment(since)]
-    if index>len(entries) or (index==len(entries) and start) or (index<len(entries) and start>len(entries[index]['body'])):raise ValueError('Invalid cursor position')
+        order='newest' if (recent is not None or c.get('order')=='newest') else 'oldest'
+    elif recent is not None:order='newest'
+    entry_kind=kind if kind is not None else (c.get('entry_kind') if c is not None else None)
+    # Resolve the checkpoint only when one is asked for, so an ordinary history read
+    # never starts refusing because a checkpoint chain is corrupt.
+    use_checkpoint=bool(since_checkpoint or since_my_checkpoint or (c is not None and c.get('scp') is not None))
+    checkpoint=None
+    if use_checkpoint:
+        if c is not None and c.get('scp') is not None:
+            # A cursor stores the boundary it was written with, so continuing a
+            # --since-my-checkpoint page needs no repeated selector.
+            checkpoint=checkpoint_by_id(data,c['scp'])
+        else:
+            checkpoint=latest_checkpoint(data,actor=actor if since_my_checkpoint else None)
+    checkpoint_id=checkpoint['comment_id'] if checkpoint else None
+    if c is not None and c.get('scp')!=checkpoint_id:raise ValueError('Cursor --since-checkpoint mismatch')
+    entries=since_checkpoint_entries(data,checkpoint) if use_checkpoint else list(data['entries'])
+    if since:entries=[e for e in entries if parse_moment(e['timestamp'])>=parse_moment(since)]
+    if entry_kind is not None:entries=[e for e in entries if e['kind']==entry_kind]
+    if order=='newest' and c is None:index=len(entries)-1
+    # An empty selection is an answer, not a cursor fault: the newest-first first page
+    # of nothing (the ordinary poller case) reports the same total_entries 0 the same
+    # read without --recent reports. Only a real cursor position is refused.
+    if order=='oldest':
+        if index>len(entries) or (index==len(entries) and start) or (index<len(entries) and start>len(entries[index]['body'])):raise ValueError('Invalid cursor position')
+    elif index>=0 and (index>=len(entries) or start>len(entries[index]['body'])):raise ValueError('Invalid cursor position')
     page=[];remaining=body_budget
-    while index<len(entries) and len(page)<limit and remaining>0:
+    while 0<=index<len(entries) and len(page)<limit and remaining>0:
         entry=entries[index];body=entry['body'];end=min(len(body),start+remaining)
         # Budget JSON-encoded body bytes, not just characters: Unicode/control
         # characters must not unexpectedly inflate the transport response.
@@ -1013,9 +1284,29 @@ def history_page(data,project,task,limit=5,since=None,cursor=None,body_budget=40
                      'body':fragment,'body_offset':start,'body_total_chars':len(body),'continued':end<len(body)})
         remaining-=max(1,len(json.dumps(fragment,ensure_ascii=False).encode())-2)
         if end<len(body):start=end;break
-        index+=1;start=0
-    next_value=None if index==len(entries) else token({'v':1,'kind':'history','project':project,'task':task,'snapshot':digest,'since':since,'index':index,'offset':start})
-    return {'task':task,'snapshot':digest,'since':since,'since_inclusive':True,'total_entries':len(entries),'entries':page,'next_cursor':next_value,'activity_cursor':activity_cursor(data),
+        index+=-1 if order=='newest' else 1;start=0
+    # The released token shape is unchanged for a plain oldest-first page; the extra
+    # keys appear only when a direction or filter is actually in force.
+    extra={}
+    if order=='newest':extra['order']='newest'
+    if entry_kind is not None:extra['entry_kind']=entry_kind
+    if checkpoint_id is not None:extra['scp']=checkpoint_id
+    exhausted=index<0 if order=='newest' else index>=len(entries)
+    next_value=None if exhausted else token({'v':1,'kind':'history','project':project,'task':task,'snapshot':digest,
+                                             'since':since,'index':index,'offset':start,**extra})
+    coverage,unverified,note=checkpoint_gaps(data,checkpoint) if use_checkpoint else (None,0,None)
+    return {'task':task,'snapshot':digest,'since':since,'since_inclusive':True,
+            'order':'newest-first' if order=='newest' else 'oldest-first',
+            'kind':entry_kind,'since_checkpoint':checkpoint_id,
+            # Whose checkpoint is the baseline, when, and what it cannot show: a reader
+            # must be able to tell from this answer alone what it was not shown
+            # (kittrial-5bb.8 review, F1/F3).
+            'checkpoint_author':clip(checkpoint['comment'].get('author'),96) if checkpoint else None,
+            'checkpoint_timestamp':checkpoint['comment'].get('created_at') if checkpoint else None,
+            'checkpoint_coverage':coverage,'unverified_entries':unverified,'checkpoint_note':note,
+            'snapshot_entries':len(data['entries']),'total_entries':len(entries),
+            'omitted_entries':len(data['entries'])-len(entries),
+            'entries':page,'next_cursor':next_value,'activity_cursor':activity_cursor(data),
             'coverage':'Snapshot of exported comments and native task events, not every database mutation. Continue this snapshot or restart for new activity.'}
 
 class Parser(argparse.ArgumentParser):
@@ -1027,11 +1318,26 @@ class Parser(argparse.ArgumentParser):
 def parse_args(action,args):
     parser=Parser(add_help=False);parser.hints=BRIEF_MISTAKEN_FLAGS if action=='brief' else {}
     parser.add_argument('task');parser.add_argument('--json',action='store_true')
-    if action=='brief':parser.add_argument('--items-offset',type=int,default=0);parser.add_argument('--items-limit',type=int,default=5)
+    if action=='brief':
+        parser.add_argument('--items-offset',type=int,default=0);parser.add_argument('--items-limit',type=int,default=5)
+        parser.add_argument('--full',action='store_true')
     elif action=='history':
-        parser.add_argument('--limit',type=int,default=5);parser.add_argument('--since');parser.add_argument('--cursor');parser.add_argument('--body-budget',type=int,default=4000)
+        parser.add_argument('--limit',type=int);parser.add_argument('--since');parser.add_argument('--cursor');parser.add_argument('--body-budget',type=int,default=4000)
+        parser.add_argument('--recent',type=int);parser.add_argument('--last',type=int)
+        parser.add_argument('--kind',choices=list(HISTORY_KINDS));parser.add_argument('--since-checkpoint',action='store_true')
+        parser.add_argument('--since-my-checkpoint',action='store_true')
     else:raise ValueError('Unknown briefing action')
-    parsed=parser.parse_args(args);identity(parsed.task);return parsed
+    parsed=parser.parse_args(args);identity(parsed.task)
+    if action=='history':
+        # --recent and --last are two spellings of the same newest-first read
+        # (kittrial-5bb.8); either one is the page size for that direction.
+        if parsed.recent is not None and parsed.last is not None and parsed.recent!=parsed.last:raise ValueError('History: --recent and --last are the same option; give one value')
+        parsed.recent=parsed.recent if parsed.recent is not None else parsed.last
+        if parsed.recent is not None and parsed.limit is not None:raise ValueError('History: use --limit or --recent/--last, not both')
+        if parsed.limit is None:parsed.limit=parsed.recent if parsed.recent is not None else 5
+        if parsed.since_my_checkpoint:
+            parsed.since_checkpoint=True
+    return parsed
 
 def format_brief(result):
     def excerpt(value):return value['text']+(f' [excerpt; {value["omitted_chars"]} characters omitted — use show/history]' if value['omitted_chars'] else '')
@@ -1095,15 +1401,28 @@ def format_brief(result):
         from reference_records import DRAFTS_SHOWN_MAX
         count=result['reference_drafts_matching']
         lines.append('Draft reference entries that match this task: %s (not accepted, not authoritative)'%('%d or more'%count if count>=DRAFTS_SHOWN_MAX else count))
+    full=result.get('full_context')
+    if full:
+        lines += ['Full context (bounded; omission_counts are characters the compact read clipped, full_omitted_chars what this cap removed):',
+                  'Title: '+full['title'],'Owner: '+full['owner'],'Intent: '+full['intent'],
+                  'Acceptance: '+full['acceptance'],'Current position: '+full['current_position'],
+                  'Next: '+full['next_action'],
+                  'Omission counts: '+json.dumps(full['omission_counts'],ensure_ascii=False),
+                  'Bounded full context: omitted '+json.dumps(full['full_omitted_chars'],ensure_ascii=False)
+                  +('; complete' if full['complete'] else '; truncated fields: '+', '.join(full['truncated']))
+                  +' — '+full['note']]
     return '\n'.join(lines)+'\n'
 
 def help_limits(action):
     """Documented limits for the machine-readable help of one briefing command."""
     if action=='brief':
         return {'items-offset':'>= %d'%BRIEF_ITEM_OFFSET_MIN,
-                'items-limit':'%d..%d'%(BRIEF_ITEM_LIMIT_MIN,BRIEF_ITEM_LIMIT_MAX)}
+                'items-limit':'%d..%d'%(BRIEF_ITEM_LIMIT_MIN,BRIEF_ITEM_LIMIT_MAX),
+                'full_context':'<= %d encoded bytes in total, <= %d per field (--full)'%(FULL_CONTEXT_BUDGET,FULL_FIELD_BUDGET)}
     if action=='history':
         return {'limit':'%d..%d'%(HISTORY_LIMIT_MIN,HISTORY_LIMIT_MAX),
+                'recent/last':'%d..%d (same range; newest-first page size; the same option under two spellings)'%(HISTORY_LIMIT_MIN,HISTORY_LIMIT_MAX),
+                'kind':'one of '+', '.join(HISTORY_KINDS),
                 'body-budget':'%d..%d encoded bytes'%(HISTORY_BUDGET_MIN,HISTORY_BUDGET_MAX)}
     limits={key:'<= %d characters'%limit for key,limit in CHECKPOINT_FIELD_LIMITS}
     limits.update({'open_items':'<= %d'%CHECKPOINT_ITEMS_MAX,'resolved':'<= %d'%CHECKPOINT_ITEMS_MAX,
@@ -1119,6 +1438,12 @@ def help_limits(action):
 def help_notes(action):
     if action=='brief':
         return ['Unresolved items come from the latest valid checkpoint; a missing checkpoint means unknown, not zero.',
+                'The compact brief stays compact. `brief TASK --full` adds a BOUNDED full_context block '
+                '(title, owner, intent, acceptance, current_position, next_action) plus omission_counts, the '
+                'characters the compact read clips from each field, and full_omitted_chars, the characters '
+                'this block\'s own cap removed: at most %d encoded bytes in total and %d for any one field, '
+                'with control characters escaped as the JSON form escapes them. `show TASK` keeps the '
+                'complete text.'%(FULL_CONTEXT_BUDGET,FULL_FIELD_BUDGET),
                 'Every endpoint brief carries a guidance block (kittrial-5bb.99): the current coordinator '
                 'guidance version, who set it and whether this actor has acknowledged it; read it with '
                 '`guidance get` and record the read with `guidance ack --version VERSION`, naming the version '
@@ -1137,8 +1462,41 @@ def help_notes(action):
                 'one of the task\'s labels, drifted first), each with trust; attention_total and '
                 'attention_more count every kind. Reading changes nothing.']
     if action=='history':
-        return ['Pages are snapshot-bound; pass next_cursor back to continue the same snapshot.']
+        return ['Pages are snapshot-bound; pass next_cursor back to continue the same snapshot.',
+                'Example (ordinary recent review retrieval): history TASK --recent 10 — the ten newest '
+                'entries, newest first (--recent/--last accept 1..%d, so the newest 20 is the largest page '
+                'of that direction); continue older pages with the returned next_cursor.'%HISTORY_LIMIT_MAX,
+                '--recent N and --last N are the same option. Use it instead of --limit: it pages the '
+                'same immutable snapshot newest-first, and a fragmented body is still delivered in body '
+                'order so it reconstructs exactly with no gaps or duplicates. A selection with nothing in '
+                'it answers total_entries 0, exactly like the same read without --recent.',
+                'Example (only what arrived since the latest checkpoint): history TASK --since-checkpoint. '
+                'The baseline is the NEWEST VALID CHECKPOINT, BY ANYONE (the kit lets another project actor '
+                'write a real checkpoint on a task it does not hold), and the answer names that checkpoint\'s '
+                'comment id, author and timestamp as well as checkpoint_coverage and unverified_entries. '
+                'history TASK --since-my-checkpoint uses this actor\'s own newest valid checkpoint instead.',
+                'Coverage is part of the answer: snapshot means retained evidence from the checkpoint chain '
+                're-verifies every entry the checkpoint incorporated; windowed means N entries recorded by '
+                'the checkpoint have no per-entry evidence and are only returned when they order after it, '
+                'so an edit to one of them cannot be seen (unverified_entries counts them); unknown means the '
+                'baseline is a legacy record with no provenance, where the released timestamp rule applies — '
+                'every entry at or after the checkpoint is shown — and an entry edited since it, or an arrival '
+                'backdated to before it, CANNOT be seen. checkpoint_note states this in words. Read history '
+                'TASK or run checkpoint TASK --verify before trusting a windowed or unknown read alone.',
+                'Example (comments only): history TASK --kind comment --recent 20. --kind accepts comment '
+                'or event; --since stays inclusive and timezone-aware and composes with both filters.',
+                'The JSON result names the effective order, kind and checkpoint boundary and reports '
+                'snapshot_entries, total_entries and omitted_entries, so a bounded read states its omissions.',
+                'A cursor binds the direction, kind and checkpoint boundary as well as the snapshot and --since: '
+                'continue with the returned token alone, or repeat the same values. A released oldest-first '
+                'cursor keeps its meaning and unknown cursor keys are still refused.']
     return ['A JSON file attachment is required; payload.task must equal TASK.',
+            'checkpoint TASK --latest returns only the newest valid checkpoint record: its comment_id, '
+            'author and timestamp, source commit and branch, activity cursor, intent, acceptance, summary, '
+            'next action, open items and resolutions, and coverage (provenance or legacy). Its recorded '
+            'provenance is a COUNT (covered, digests, older, verifiable, complete, chain) so a long task '
+            'stays bounded; add --provenance to return the retained digest map itself. It reads nothing '
+            'else of the history; an invalid or absent checkpoint is reported rather than guessed.',
             'The record has exactly these fields: schema_version (1), task, previous (the current checkpoint\'s '
             'comment_id, or null for the first), activity_cursor (from brief or history), source_commit and branch '
             '(text; empty when there is none), intent, acceptance, summary, next_action, open_items (each: id, kind, '
@@ -1189,6 +1547,37 @@ def direction_page(rows,project,task,offset=0,limit=50):
             'coverage':'Current full digests for outstanding directions, including entries outside stored provenance windows. '
                        'Pages are fresh reads; compare activity_cursor across pages and restart if it changes.'}
 
+def latest_checkpoint_read(rows,project,task,include_provenance=False):
+    """The newest valid checkpoint record alone (kittrial-5bb.8): `checkpoint TASK --latest`.
+
+    A bounded alternative to reading a long task's whole comment history when a caller
+    needs only the current position, its unresolved items and what evidence it carries.
+    The recorded provenance is returned as COUNTS by default: on a long task the digest
+    map is tens of kilobytes, and a caller that wants it asks with `--provenance`
+    (review, F5).
+    """
+    issue=task_row(rows,task)
+    if issue.get('issue_type')=='event':raise ValueError('Use history/show for an event; checkpoint requires a task or job')
+    state=checkpoint_state(issue)
+    if state['current'] is None:
+        return {'task':task,'checkpoint':None,'invalid_checkpoint_comments':state['invalid'][:5],
+                'note':'No valid structured checkpoint on this task; unresolved items are unknown, not zero.'}
+    p,c=state['current'];prov=normalize_provenance(p)
+    counts=None if prov is None else {'covered':prov['covered'],'digests':len(prov['digests']),'older':len(prov['older']),
+                                      'verifiable':prov['verifiable'],'complete':prov['complete'],'chain':prov['chain']}
+    return {'task':task,
+            'checkpoint':{'comment_id':str(c['id']),'author':c.get('author'),'timestamp':c.get('created_at'),
+                          'source_commit':p['source_commit'],'branch':p['branch'],'activity_cursor':p['activity_cursor'],
+                          'intent':p['intent'],'acceptance':p['acceptance'],'summary':p['summary'],
+                          'next_action':p['next_action'],'open_items':p['open_items'],'resolved':p['resolved'],
+                          'open_items_total':len(p['open_items']),'resolved_total':len(p['resolved'])},
+            'coverage':'provenance' if prov is not None else 'legacy',
+            'provenance':counts,
+            'provenance_digests':(prov if include_provenance else None),
+            'provenance_note':'Counts only; add --provenance to return the retained digest map itself.' if counts is not None else None,
+            'invalid_checkpoint_comments':state['invalid'][:5],
+            'evidence':{'history':'history '+task,'checkpoint_entry':task+'-c'+str(c['id'])}}
+
 def execute(root,path,project,actor,action,args,attachments,run,operators=None,verifiers=None):
     """Endpoint holds project coordination lock. History caches are disposable."""
     from work import help_payload,help_requested
@@ -1216,6 +1605,13 @@ def execute(root,path,project,actor,action,args,attachments,run,operators=None,v
         if len(args)==2 and args[1]=='--verify':
             rows=exported_rows(run)
             return json.dumps(verify_checkpoint(rows,project,args[0]),ensure_ascii=False,indent=2)+'\n'
+        if '--latest' in args[1:]:
+            # A bounded latest-checkpoint read (kittrial-5bb.8): one record and a
+            # provenance COUNT, with the digest map only on --provenance.
+            rest=[token for token in args[1:] if token!='--latest']
+            if rest not in ([],['--provenance']):raise ValueError('Use checkpoint TASK --file checkpoint.json [--json]')
+            return json.dumps(latest_checkpoint_read(exported_rows(run),project,args[0],include_provenance=bool(rest)),
+                              ensure_ascii=False,indent=2)+'\n'
         if len(args)!=2 or not args[1].startswith('@attachment:'):raise ValueError('Use checkpoint TASK --file checkpoint.json [--json]')
         item=attachments.get(args[1].partition(':')[2],{})
         if item.get('flag') not in ('--file','-f') or not isinstance(item.get('text'),str):raise ValueError('Checkpoint needs a JSON file attachment')
@@ -1237,7 +1633,7 @@ def execute(root,path,project,actor,action,args,attachments,run,operators=None,v
         rows=exported_rows(run)
         if action=='brief':
             result=brief(rows,project,a.task,a.items_offset,a.items_limit,operators=operators,journal=path,
-                         verifiers=verifiers,actor=actor)
+                         verifiers=verifiers,actor=actor,full=a.full)
             return json.dumps(result,ensure_ascii=False,indent=2)+'\n' if a.json else format_brief(result)
         data=snapshot(rows,project,a.task);digest=content_hash(data);cache.mkdir(exist_ok=True)
         file=cache/(digest+'.json')
@@ -1246,7 +1642,8 @@ def execute(root,path,project,actor,action,args,attachments,run,operators=None,v
             from coordination import atomic
             atomic(file,{'captured_at':datetime.now(timezone.utc).isoformat(),'data':data})
         saved=json.loads(file.read_text(encoding='utf-8'))
-    result=history_page(data,project,a.task,a.limit,a.since,a.cursor,a.body_budget)
+    result=history_page(data,project,a.task,a.limit,a.since,a.cursor,a.body_budget,a.recent,a.kind,a.since_checkpoint,
+                        actor=actor,since_my_checkpoint=a.since_my_checkpoint)
     result['captured_at']=saved['captured_at']
     # JSON for both modes keeps fragments and opaque continuation cursors exact.
     return json.dumps(result,ensure_ascii=False,indent=2)+'\n'
