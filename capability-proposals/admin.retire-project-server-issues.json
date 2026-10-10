@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "operation_id": "77fa5a6a-c886-48eb-8cef-3d79d076dba8",
+  "key": "admin.retire-project-server-issues",
+  "name": "Protect same-named server issues during project retirement",
+  "aliases": [
+    "retire-project with missing metadata",
+    "retirement of projects with server issues"
+  ],
+  "summary": "When project metadata is absent, retire-project checks the exact same-named Dolt database and requires --force if it contains issues or the issue count cannot be read. An absent or issue-free database adds no blocker.",
+  "requirements": [],
+  "anchors": [],
+  "code": [
+    "admin.py::server_database_exists",
+    "admin.py::server_database_issue_count",
+    "admin.py::retire_findings",
+    "admin.py::retire_blockers"
+  ],
+  "tests": [
+    "tests/test_retire_project.py"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "admin",
+    "retirement",
+    "data-safety"
+  ]
+}
