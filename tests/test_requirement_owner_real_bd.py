@@ -256,6 +256,13 @@ class NativeOwnerTests(fixture.RealBdLabelAliasTests):
                 self.assertTrue(all(json.loads(page.stdout).values()), page.stdout)
             # Real native backup plus the shipped restore-new order: restore
             # governance, inner receipts and outer journal before the merge slot.
+            # The browser probe ends by testing governed-mode refusal. Capture
+            # a simple-mode backup explicitly for destination owner acceptance.
+            current_mode = harness.request('GET', base+'/requirements/governance', token=token)
+            self.assertEqual(current_mode.status, 200, current_mode.data)
+            restored_simple = harness.request('PUT', base+'/requirements/governance',
+                dict(expected(current_mode.data), mode='simple'), token=token, key='restore-simple')
+            self.assertEqual(restored_simple.status, 200, restored_simple.data)
             (root/'backups').mkdir(exist_ok=True)
             before_restore = self.rows()
             governance_bytes = (self.project/governance.FILE).read_bytes()
