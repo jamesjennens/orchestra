@@ -114,5 +114,46 @@ class RealStackTests(held.RealStackTests):
         self.assertEqual((before, 'awaiting-review'), (self.comments(task), self.review(task)['state']))
 
 
+    def test_the_endpoint_refuses_an_approval_whose_block_claims_what_the_agent_has_not(self):
+        """Sent to the endpoint as the web service sends it, but WITHOUT the web service's own check: the
+        endpoint reads the live state again and refuses an agent that holds no grant. With the grant the
+        same call is carried out. Then the host rule `coordinator_writes`, on with nobody listed: it is
+        about names on the host route, and the web route's own authority decides, so the granted agent's
+        approval is carried out and the ungranted one's is refused as before."""
+        import http_authority
+        from http_auth import HttpError
+        task, contribution = self.deliver('casey')
+        principal = self.service.authenticate(self.agent)
+        self.count += 1
+        body = dict(operation='approve', schema_version=1, operation_id='op-forged-%d' % self.count, previous=contribution,
+                    contribution=contribution, summary='Accepted', task_id=task)
+
+        def sent(operation_id):
+            return self.backend.invoke('reviews.add', principal, 'pp', dict(body, operation_id=operation_id), None,
+                                       target='/v1/projects/pp/tasks/%s/reviews' % task, authorize=None,
+                                       capability=http_authority.CAP_APPROVE)
+        before = self.comments(task)
+        with self.assertRaises(HttpError) as refused:
+            sent('op-forged-a')
+        self.assertEqual(refused.exception.status, 403)
+        self.assertEqual((before, 'awaiting-review'), (self.comments(task), self.review(task)['state']))
+        # The host rule on, nobody listed.
+        deployment = self.root / 'deployment.private.json'
+        kept = deployment.read_text(encoding='utf-8')
+        self.addCleanup(deployment.write_text, kept, encoding='utf-8')
+        deployment.write_text(json.dumps(dict(json.loads(kept), coordinator_writes=True)), encoding='utf-8')
+        with self.assertRaises(HttpError) as refused:
+            sent('op-forged-b')
+        self.assertEqual(refused.exception.status, 403)
+        self.assertEqual(before, self.comments(task))
+        self.assertEqual(200, self.grant().status)
+        self.assertEqual(201, self.approve(self.agent, task, contribution).status)             # the granted agent, by the web route
+        self.assertEqual('awaiting-integration', self.review(task)['state'])
+        self.assertEqual([self.agent_actor], [author for author, _ in self.comments(task)[len(before):]])
+        # A signed-in owner too, as before this slice.
+        other, second = self.deliver('drew')
+        self.assertEqual(201, self.approve(self.tokens['alex'], other, second).status)
+
+
 if __name__ == '__main__':
     unittest.main()

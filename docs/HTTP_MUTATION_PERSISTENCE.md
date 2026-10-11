@@ -6,6 +6,10 @@ The following inventory counts call sites, including wrapper forwarding paths; o
 
 The registration callback saves its `registered_by` mark after `create_project` has saved the project. The confirmation callback saves `confirmed_by`, `confirmed_at` and any backfilled `registered_by` before its success receipt. A process killed after a committed receipt therefore replays only a durable complete effect. A kill before the effect save cannot replay success; a kill after the effect save but before the receipt leaves an in-progress identity and refuses the retry. Ordinary route retry behavior is otherwise unchanged. The final route audit save follows the receipt, so a crash can still omit that audit entry; these fixes do not claim cross-store atomic audit persistence.
 
+## The coordinator grant
+
+`grant_coordinator` and `revoke_coordinator` save the state inside the service method, before the route writes its audit entry and its receipt. If the process dies between that save and the receipt, the grant (or its removal) is on disk with **no audit entry**, and the same idempotency key answers `409` "in progress" until its reservation expires. Every route of this inventory whose contract reads "Service method has an inner save" has that window; it is not changed here. A grant that ends because its agent left the project (`agents_update`, `project_agent_revoke`) is deleted and audited in the same save as the change that ended it.
+
 ## Call-site inventory
 
 | Handler | Operation | Persistence contract |
@@ -35,6 +39,8 @@ The registration callback saves its `registered_by` mark after `create_project` 
 | `_mutate_agent_credential` | `operation` | Credential transaction: JSON save before receipt; absent-agent path refuses. |
 | `_mutate_agent_credential` | `operation` | Credential transaction: JSON save before receipt; absent-agent path refuses. |
 | `project_agent_revoke` | `agents.project.revoke` | Service method has an inner save; conditional paths need route-specific proof. |
+| `project_agent_coordinator_grant` | `agents.coordinator.grant` | Service method has an inner save (`grant_coordinator`); a grant that is already there writes nothing. See "The coordinator grant" below. |
+| `project_agent_coordinator_revoke` | `agents.coordinator.revoke` | Service method has an inner save (`revoke_coordinator`). See "The coordinator grant" below. |
 | `tasks_create` | `tasks.create` | Canonical backend operation/journal; local receipt alone does not prove external atomicity. |
 | `tasks_update` | `tasks.update` | Canonical backend operation/journal; local receipt alone does not prove external atomicity. |
 | `_requirements_write` | `requirements.' + action` | Canonical backend operation/journal; local receipt alone does not prove external atomicity. |

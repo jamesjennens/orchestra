@@ -8,6 +8,7 @@ whatever the slice-1a setting says.
 Through the real routes of the web service (the in-process backend); the endpoint backend
 with a real bd is in tests/test_coordinator_grant_real.py.
 """
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -184,6 +185,123 @@ class GrantTests(Grants):
                 self.assertIn(self.approve(agent, task, contribution).status, (401, 403))
                 self.assertEqual(self.state_of(task), 'awaiting-review')
                 self.assertFalse(self.listed()[agent_id]['coordinator']['effective'])
+
+    def audited(self, project=None):
+        with self.service.store.lock:
+            return [(event['action'], event['outcome'], event['reason']) for event in self.service.state['audit']
+                    if event['action'].startswith('agents.coordinator.') and event['project_id'] == (project or self.project)]
+
+    def test_the_grant_ends_when_the_agent_leaves_the_project_by_any_route(self):
+        """The review's blocking finding: PATCH /v1/agents/{id} took the agent out of the project and left the
+        grant in the state, unseen by the owner; putting the project back made it effective again with no
+        owner's decision. By the account and by a superuser."""
+        beta = self.create_project(self.admin, 'Beta')
+        self.assertEqual(200, self.request('PUT', '/v1/projects/%s/members/%s' % (beta, self.ids['cora']), {'role': 'owner'},
+                                           token=self.admin).status)
+        for label, token in (('its own account', self.tokens['cora']), ('a superuser', self.admin)):
+            with self.subTest(taken_out_by=label):
+                agent, agent_id = self.agent_with_id('cora', 'Heron ' + label[:5], projects=[self.project, beta])
+                self.assertEqual(200, self.grant(agent_id).status)
+                self.assertEqual(200, self.grant(agent_id, token=self.tokens['cora'], project=beta).status)
+                task, contribution = self.deliver(self.tokens['carl'])
+                # Out of Alpha, still in Beta: the grant in Alpha ends, the one in Beta stays.
+                patched = self.request('PATCH', '/v1/agents/%s' % agent_id, {'projects': [beta]}, token=token)
+                self.assertEqual(200, patched.status, patched.data)
+                with self.service.store.lock:
+                    grants = self.service.state.get('coordinator_grants') or {}
+                    self.assertNotIn(agent_id, grants.get(self.project) or {})
+                    self.assertIn(agent_id, grants[beta])
+                self.assertIn(('agents.coordinator.revoke', 'committed',
+                               "agent %s: the agent's projects were changed (PATCH /v1/agents)" % agent_id), self.audited())
+                # Put back by its own account: no grant, and it approves nothing until an owner decides again.
+                back = self.request('PATCH', '/v1/agents/%s' % agent_id, {'projects': [self.project, beta]}, token=self.tokens['cora'])
+                self.assertEqual(200, back.status, back.data)
+                self.assertIsNone(self.listed()[agent_id]['coordinator'])
+                self.assertEqual(403, self.approve(agent, task, contribution).status)
+                self.assertEqual(self.state_of(task), 'awaiting-review')
+                self.assertEqual(200, self.grant(agent_id).status)
+                self.assertEqual(201, self.approve(agent, task, contribution).status)
+                # Every project at once, and a change that takes it out of none.
+                self.assertEqual(200, self.request('PATCH', '/v1/agents/%s' % agent_id, {'notes': 'x'}, token=token).status)
+                self.assertIsNotNone(self.listed()[agent_id]['coordinator'])
+                self.assertEqual(200, self.request('PATCH', '/v1/agents/%s' % agent_id, {'projects': []}, token=token).status)
+                with self.service.store.lock:
+                    self.assertNotIn(agent_id, json.dumps(self.service.state.get('coordinator_grants') or {}))
+        # The owner's own route says why in the audit too.
+        self.assertEqual(200, self.grant().status)
+        self.assertEqual(200, self.request('DELETE', '/v1/projects/%s/agents/%s' % (self.project, self.agent_id),
+                                           token=self.tokens['olive']).status)
+        self.assertIn(('agents.coordinator.revoke', 'committed',
+                       'agent %s: a project owner took the agent out of the project' % self.agent_id), self.audited())
+
+    def test_a_task_held_by_the_agents_own_account_is_its_own_partys(self):
+        """The assignee half of the rule, for an agent: carl delivered, the task was then given to cora."""
+        self.assertEqual(200, self.grant().status)
+        task, contribution = self.deliver(self.tokens['carl'])
+        self.backend._task(self.project, task)['assignee'] = self.ids['cora']
+        refused = self.approve(self.agent, task, contribution)
+        api = http_service.ApiHandler
+        self.assertEqual((403, api.OWN_PARTY_AGENT[2] + api.OWN_PARTY_AGENT[3]),
+                         (refused.status, refused.data['error']['message']), refused.data)
+        self.assertEqual(self.state_of(task), 'awaiting-review')
+        self.backend._task(self.project, task)['assignee'] = self.ids['carl']
+        self.assertEqual(201, self.approve(self.agent, task, contribution).status)
+
+    def test_a_disabled_agent_is_not_granted_and_a_damaged_record_is_said(self):
+        self.assertEqual(200, self.request('POST', '/v1/agents/%s/disable' % self.agent_id, {}, token=self.tokens['cora']).status)
+        refused = self.grant()
+        self.assertEqual((409, 'A disabled agent cannot be granted'), (refused.status, refused.data['error']['message']))
+        self.assertNotIn('coordinator_grants', self.service.state)
+        self.assertEqual(200, self.request('POST', '/v1/agents/%s/enable' % self.agent_id, {}, token=self.tokens['cora']).status)
+        # A record of grants that is not an object: a sentence and no write, where it was a 500.
+        for damaged in ([], 'x', {self.project: []}, {self.project: 'x'}):
+            with self.subTest(stored=damaged):
+                with self.service.store.lock:
+                    self.service.state['coordinator_grants'] = damaged
+                refused = self.grant()
+                self.assertEqual(503, refused.status, refused.data)
+                self.assertIn('is damaged (it is not an object), so no grant was written', refused.data['error']['message'])
+                with self.service.store.lock:
+                    self.assertEqual(self.service.state['coordinator_grants'], damaged)
+        with self.service.store.lock:
+            del self.service.state['coordinator_grants']
+        self.assertEqual(200, self.grant().status)
+
+    def test_why_a_grant_on_record_has_no_effect(self):
+        self.assertEqual(200, self.grant().status)
+        view = lambda: self.listed()[self.agent_id]['coordinator']
+        self.assertEqual((view()['effective'], view()['no_effect_because']), (True, None))
+        self.assertEqual(200, self.member('cora', 'contributor').status)
+        self.assertEqual((view()['effective'], view()['no_effect_because']), (False, 'account-role'))
+        self.assertEqual(200, self.member('cora', 'coordinator').status)
+        self.assertEqual(200, self.request('POST', '/v1/agents/%s/disable' % self.agent_id, {}, token=self.tokens['cora']).status)
+        self.assertEqual((view()['effective'], view()['no_effect_because']), (False, 'agent-disabled'))
+        self.assertEqual(200, self.request('POST', '/v1/agents/%s/enable' % self.agent_id, {}, token=self.tokens['cora']).status)
+        self.assertEqual(200, self.request('POST', '/v1/accounts/%s/disable' % self.ids['cora'], {}, token=self.admin).status)
+        self.assertEqual((view()['effective'], view()['no_effect_because']), (False, 'account-disabled'))
+        page = (KIT / 'web' / 'js' / 'views' / 'project.js').read_text(encoding='utf-8')
+        for word in ('agent-disabled', 'account-disabled', 'account-role'):
+            self.assertIn("'%s': " % word, page)
+        self.assertIn("NO_EFFECT[grant.no_effect_because] || NO_EFFECT['account-role']", page)
+
+    def test_the_endpoints_own_check_refuses_a_block_that_claims_the_approval(self):
+        """The second authorization: what the endpoint is handed is read again from the live state. An agent
+        WITHOUT the grant whose block claims `reviews.approve` is refused there; with the grant it passes."""
+        principal = self.service.authenticate(self.agent)
+        block = http_authority.authority_request(principal, self.project, 'reviews.approve')
+        for claimed in ('reviews.approve', 'coordinate'):
+            with self.subTest(capability=claimed), self.assertRaises(http_authority.AuthorityDenied) as denied:
+                http_authority.decide(self.service.state, dict(block, capability=claimed))
+            self.assertEqual(denied.exception.status, 403)
+        self.assertEqual(200, self.grant().status)
+        for claimed in ('reviews.approve', 'coordinate'):
+            http_authority.decide(self.service.state, dict(block, capability=claimed))          # no refusal now
+        with self.assertRaises(http_authority.AuthorityDenied):
+            http_authority.decide(self.service.state, dict(block, capability='project.admin'))
+        # In another project of the same agent the grant is nothing.
+        beta = self.create_project(self.admin, 'Beta')
+        with self.assertRaises(http_authority.AuthorityDenied):
+            http_authority.decide(self.service.state, dict(block, project=beta))
 
     def test_who_may_grant_and_what_may_be_granted(self):
         for label, token, status in (('a coordinator', self.tokens['cora'], 403), ('a contributor', self.tokens['carl'], 403),
@@ -370,6 +488,28 @@ class ProposalTests(test_http_proposals.ProposalHarness):
         self.assertEqual(seen(), (200, False, 200, False, 403, 'A credential cannot record a proposal disposition'))
         # Its owner, signed in, triages as before.
         self.assertTrue(self.request('GET', self.base(), token=self.token('blair')).data['can_triage'])
+
+    def test_a_coordinator_triages_and_the_decision_stays_an_owners(self):
+        """`reviews.approve` alone carried both: a coordinator could record the owner's decision."""
+        admin = self.admin
+        cora = self.create_account(admin, 'cora', 'cora-password-1')
+        self.assertEqual(200, self.request('PUT', '/v1/projects/%s/members/%s' % (self.project, cora), {'role': 'coordinator'},
+                                           token=admin).status)
+        token = self.login('cora', 'cora-password-1')[0]
+        key = self.submit().data['key']
+        path = self.base() + '/' + key + '/dispositions'
+        self.assertTrue(self.request('GET', self.base(), token=token).data['can_triage'])
+        decided = self.request('POST', path, {'operation': 'decide', 'to_state': 'accepted'}, token=token, key='coord-decide-0001')
+        self.assertEqual(403, decided.status, decided.data)
+        self.assertEqual(decided.data['error']['message'],
+                         'The decision on a proposal is an owner\'s. A coordinator triages a proposal and may escalate it to an '
+                         'owner; it does not record the owner\'s decision')
+        # Triage is not refused for want of authority (the body here is incomplete on purpose: 422, not 403).
+        triaged = self.request('POST', path, {'operation': 'review', 'to_state': 'under-review'}, token=token, key='coord-review-0001')
+        self.assertNotEqual(403, triaged.status, triaged.data)
+        # An owner's decide is not refused by this rule (whatever the endpoint then says of the transition).
+        owned = self.request('POST', path, {'operation': 'decide', 'to_state': 'accepted'}, token=self.token('blair'), key='owner-decide-0001')
+        self.assertNotEqual(403, owned.status, owned.data)
 
 
 class PageTests(Grants):

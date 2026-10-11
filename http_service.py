@@ -6329,6 +6329,11 @@ class ApiHandler(BaseHTTPRequestHandler):
         command = payload.pop('operation', 'review')
         if command not in ('review', 'decide'):
             raise invalid('operation must be review or decide')
+        if command == 'decide' and CAP_PROJECT_ADMIN not in self.service.capabilities_for(principal, ctx.params['pid']):
+            # A coordinator triages; the decision an escalated proposal waits for is the
+            # owner's (kittrial-5bb.209 review): `reviews.approve` alone used to carry both.
+            raise forbidden('The decision on a proposal is an owner\'s. A coordinator triages a proposal and may '
+                            'escalate it to an owner; it does not record the owner\'s decision')
         ctx.payload = payload
         fields, operation_id = self._proposal_body(ctx, self.PROPOSAL_DISPOSE_FIELDS, 'A proposal disposition')
         body = dict(fields, schema_version=1, operation=command, key=ctx.params['key'], operation_id=operation_id)

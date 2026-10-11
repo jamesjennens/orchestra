@@ -8,6 +8,12 @@ export const canWrite = (p) => ['owner', 'coordinator', 'contributor', 'superuse
 export const isOwner = (p) => ['owner', 'superuser'].includes(p.role);
 // Who decides on a contribution: an owner, or a coordinator (kittrial-5bb.209). Not who administers the project.
 export const canApprove = (p) => ['owner', 'coordinator', 'superuser'].includes(p.role);
+// Why a grant on record has no effect now, as the server says it (`coordinator.no_effect_because`).
+export const NO_EFFECT = {
+  'agent-disabled': ' — the agent is disabled',
+  'account-disabled': ' — its account is disabled',
+  'account-role': ' — its account is no longer a coordinator or owner here',
+};
 export const ROLE_NAMES = [['viewer', 'Viewer'], ['contributor', 'Contributor'], ['coordinator', 'Coordinator'], ['owner', 'Owner']];
 
 async function load(ctx, pid) {
@@ -294,7 +300,7 @@ export async function settings(ctx, { pid }) {
             h('td', null, !grant ? h('span', { class: 'muted' }, 'No') :
               [h('span', { class: 'chip ' + (grant.effective ? 'ok' : 'plain') }, grant.effective ? 'Coordinates' : 'Granted, no effect'),
                 h('div', { class: 'sub' }, 'by ', grant.granted_by_display_name || grant.granted_by, ' ', time(grant.granted_at),
-                  grant.effective ? null : ' — its account is no longer a coordinator or owner here')]),
+                  grant.effective ? null : (NO_EFFECT[grant.no_effect_because] || NO_EFFECT['account-role']))]),
             h('td', null, project.archived ? null : grant ?
               h('button', { type: 'button', class: 'danger', 'aria-label': 'Remove the coordinator grant from ' + a.name,
                 onclick: (e) => change(e, () => ctx.api.revokeCoordinator(pid, a.id), `${a.name} no longer coordinates`) }, 'Remove grant') :

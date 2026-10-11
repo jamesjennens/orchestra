@@ -2710,8 +2710,13 @@ class Service:
         grant = coordinator_grant(self.state, project_id, agent['id'])
         if grant is None:
             return None
+        effective = self._may_coordinate(project_id, agent)
+        owner = self.state['users'].get(agent.get('owner')) or {}
+        # Why a grant on record has no effect now; null when it has. One word, for the page.
+        why = None if effective else ('agent-disabled' if not agent.get('enabled') else
+                                      'account-disabled' if owner.get('disabled') else 'account-role')
         return {'granted_by': grant['granted_by'], 'granted_by_display_name': self._owner_name(grant['granted_by']),
-                'granted_at': grant.get('granted_at'), 'effective': self._may_coordinate(project_id, agent)}
+                'granted_at': grant.get('granted_at'), 'effective': effective, 'no_effect_because': why}
 
     def _may_coordinate(self, project_id, agent):
         """Whether the agent's account holds the coordinator's capabilities in the project now."""
@@ -2744,11 +2749,39 @@ class Service:
                 raise conflict('A disabled agent cannot be granted')
             if not self._may_coordinate(project_id, agent):
                 raise conflict(self.NOT_A_COORDINATOR)
+            stored = self.state.get('coordinator_grants')
+            if stored is not None and (not isinstance(stored, dict) or not isinstance(stored.get(project_id, {}), dict)):
+                raise HttpError(503, 'unavailable',
+                                'The record of coordinator grants in the service state is damaged (it is not an object), '
+                                'so no grant was written. An operator must repair the state file')
             grants = self.state.setdefault('coordinator_grants', {}).setdefault(project_id, {})
             if coordinator_grant(self.state, project_id, agent_id) is None:
                 grants[agent_id] = {'granted_by': principal.user_id, 'granted_at': now_iso(self._now())}
                 self.store.save()
             return self.project_agent_view(agent, project_id)
+
+    def _end_coordinator_grants(self, agent, project_ids, principal, request_id, reason):
+        """Delete the agent's coordinator grant in each of ``project_ids``, and say so in the audit.
+
+        The ONE place for every way an agent stops being in a project: out of the project, out
+        of its coordinators. A grant must not wait in the state for the project to be put back.
+        Caller holds ``store.lock`` and saves. Each grant that was there is audited as a revoke
+        in its project, with who did what ended it and why.
+        """
+        grants = self.state.get('coordinator_grants')
+        if not isinstance(grants, dict):
+            return []
+        ended = []
+        for project_id in project_ids:
+            held = grants.get(project_id)
+            if isinstance(held, dict) and agent['id'] in held:
+                del held[agent['id']]
+                if not held:
+                    del grants[project_id]
+                ended.append(project_id)
+                self.audit(request_id, principal, 'agents.coordinator.revoke', 'committed', project_id=project_id,
+                           reason='agent %s: %s' % (agent['id'], reason))
+        return ended
 
     def revoke_coordinator(self, principal, project_id, agent_id, request_id=None):
         """Take the coordinator grant away. From the next request the agent approves nothing here."""
@@ -2832,13 +2865,8 @@ class Service:
                 # learns nothing and a project owner cannot probe for the id.
                 raise not_found('Agent not found')
             agent['projects'] = [pid for pid in projects if pid != project_id]
-            # Out of the project, out of its coordinators: a grant must not wait there for the
-            # agent's own account to add the project back (kittrial-5bb.209).
-            grants = self.state.get('coordinator_grants')
-            if isinstance(grants, dict) and isinstance(grants.get(project_id), dict):
-                grants[project_id].pop(agent_id, None)
-                if not grants[project_id]:
-                    del grants[project_id]
+            self._end_coordinator_grants(agent, [project_id], principal, request_id,
+                                         'a project owner took the agent out of the project')
             self.store.save()
             view = self.project_agent_view(agent, project_id)
         return {'operation': 'agents.project.revoke', 'project': project_id, 'agent': view}
@@ -3169,7 +3197,13 @@ class Service:
                     principal, payload.get('projects'), owner_id=agent['owner'])
             if 'enabled' in payload and payload.get('enabled') is not None:
                 changes['enabled'] = bool(payload.get('enabled'))
+            left = [pid for pid in (agent.get('projects') or []) if pid not in changes.get('projects', agent.get('projects') or [])]
             agent.update(changes)
+            # An agent that leaves a project by THIS route leaves its coordinators too (review of
+            # kittrial-5bb.209): the grant stayed in the state, unseen by the project's owner, and
+            # took effect again when the project was put back, with no owner's decision.
+            self._end_coordinator_grants(agent, left, principal, None,
+                                         'the agent\'s projects were changed (PATCH /v1/agents)')
             if changes.get('enabled') is False:
                 self._revoke_agent_credentials(agent)
             self.store.save()

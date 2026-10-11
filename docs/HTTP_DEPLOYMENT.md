@@ -1751,6 +1751,7 @@ things, and an installation that uses neither behaves as before.
 | Read | yes | yes | yes | yes |
 | Claim, deliver, checkpoint, review, recommend, propose | no | yes | yes | yes |
 | Approve a contribution, triage a proposal (`reviews.approve`) | no | no | yes | yes |
+| Record the owner's decision on a proposal (`decide`) | no | no | no | yes |
 | `coordinate` (no route asks for it yet; the merge slot and the lifecycle facts will) | no | no | yes | yes |
 | Members, worker credentials, archive, the audit, this grant (`project.admin`) | no | no | no | yes |
 
@@ -1796,13 +1797,19 @@ credential approved anything; this is the one place where that is lifted.
 - It is read from the present state on every request, by the web service and again when
   the endpoint authorizes the write. Each of these ends it at the agent's next request:
   the grant is removed; the account is made a contributor or a viewer, or leaves the
-  project; the agent is taken out of the project (which also deletes the grant, so it
-  does not wait there for the account to add the project back); the agent or its account
+  project; the agent is taken out of the project, **by any route** (the project owner's
+  `DELETE /v1/projects/{id}/agents/{agent}`, or `PATCH /v1/agents/{id}` by its account or a
+  superuser): the grant is deleted with it and audited as a revoke with the reason, so it
+  does not wait in the state for the project to be put back; the agent or its account
   is disabled. A grant whose account was lowered stays on record and shows as "Granted,
   no effect" until the account is raised again or the grant is removed.
 
 `GET /v1/projects/{id}/agents` and `.../agents/{agent}` carry `coordinator` for each
-agent: `null`, or `{granted_by, granted_by_display_name, granted_at, effective}`. The
+agent: `null`, or `{granted_by, granted_by_display_name, granted_at, effective,
+no_effect_because}`; the last is `null` while the grant has effect, else `agent-disabled`,
+`account-disabled` or `account-role`, and the page says which. A record of grants in the
+state file that is not an object answers `503` to a new grant, with a sentence and no
+write. The
 project's settings page lists "Agents in this project" for an owner with a "Make
 coordinator" or "Remove grant" button on each row, and shows the server's sentence when a
 grant is refused. `GET /v1/agents/me/next` tells a granted agent of a contribution by
@@ -1812,14 +1819,36 @@ it or request changes", and never lists its own party's work for approval.
 Like the setting above, this is the web route's: an approval on the host route
 (`endpoint.py` over SSH, or run on the server) knows no accounts and no grants.
 
-**The host's own rules come on top, when an installation turns them on.** The three
-coordinator rules of the host (`lifecycle_authors`, `independent_approval`,
-`coordinator_writes` in `deployment.private.json`; OPERATIONS.md, "The coordinator rules")
-are all off by default and are about the names the endpoint is given, not about web roles.
-An approval that the web service lets through still reaches the endpoint under the
-approver's name (the account's id, or the agent's), and with `coordinator_writes` on the
-endpoint refuses it unless that name is listed there. A web coordinator, person or agent,
-is not a listed operator of the host by being a coordinator here.
+**The host's coordinator rules and the web route.** The host has three rules of its own
+(`lifecycle_authors`, `independent_approval`, `coordinator_writes` in
+`deployment.private.json`; OPERATIONS.md, "The coordinator rules"), all off by default.
+`coordinator_writes` is about **names on the host route**: with it on, the endpoint refuses
+an approval from a name that is not listed there. **On the web route the service's own
+authority decides instead**: an owner, a coordinator by role, or an agent with the
+project's coordinator grant approves with `coordinator_writes` on and nobody listed, because
+the endpoint reads that authority again from the live state for every such request and
+does not go by a name the caller sends. An agent WITHOUT the grant is refused there even
+when the request claims the approval (tested through the real endpoint). A web
+coordinator is not thereby a listed operator of the host: the merge slot and the lifecycle
+facts are not on the web route. `independent_approval` applies to the web route as well.
+
+**What the owner of a project should know about a grant** (each as the review ran it, and
+accepted as the design):
+
+- A grant on record takes effect again **without a new decision by an owner** when the
+  agent's account is made a coordinator or owner again, or the agent or its account is
+  enabled again. To end it for good, remove the grant.
+- A grant stays when the owner who gave it is lowered or leaves.
+- Two granted agents of two accounts may approve each other's work: they are two parties.
+- A grant works in an archived project as every other write there does.
+
+**Going back to a kit older than this one.** First, in every project, set every member
+whose role is `coordinator` to `contributor` or `owner`, and remove every coordinator grant.
+The older kit opens the state file unchanged, but it does not know the role: such a member
+and their agents are **locked out of the project, reads included**, and the grants stay in
+the file, where they take effect again at the next upgrade. A page cached from the older
+kit shows a coordinator as a viewer and offers no Approve; this kit's page against the
+older service offers "Make coordinator" and gets `404`.
 
 ### The merge slot is not a task
 
