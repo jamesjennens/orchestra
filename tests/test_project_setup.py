@@ -1423,6 +1423,10 @@ class SetupScreenTests(test_http_agents.AgentHarness):
         self.assertEqual(seen['fill']['buttons'], ['Copy command (fill in first)'])
         self.assertIn('Replace first: OPERATOR, FILE', seen['fill']['text'])
         self.assertEqual(seen['nullEntry'], {'kinds': ['shell'], 'texts': ['run-me'], 'buttons': ['Copy command']})
+        # kittrial-5bb.251 item 9 (mutant n23): the hint is shown when there are words to replace
+        # and NOT when the list is empty (which used to leave a bare "Replace first: ").
+        self.assertTrue(seen['replaceHint']['withWords'])
+        self.assertFalse(seen['replaceHint']['without'])
         self.assertIn('does not check that the repository exists', steps['repository']['text'])
 
         # The repository form.
