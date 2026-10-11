@@ -47,6 +47,9 @@ ITEM_FIELDS = {
     # Additive checkpoint attention (.1), independent of review completion.
     'newer_activity_by_others', 'newer_activity_own',
     'newer_activity_coverage', 'unresolved_directions',
+    # Additive: one sentence for a contribution that waits for somebody else's approval
+    # (kittrial-5bb.197 review request 01a12894, item 3b).
+    'waiting_for_approval',
 }
 BRIEF_FIELDS = {
     'task', 'title', 'owner', 'status', 'activity_cursor', 'checkpoint', 'intent',

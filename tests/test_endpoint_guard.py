@@ -549,12 +549,14 @@ class EndpointSingleDispatchTests(_EndpointRootMixin, unittest.TestCase):
         self.assertFalse(self.out(result)['reconciled'])
         # The endpoint resolves the operator allowlist and the project journal for
         # the release revert rule (kittrial-5bb.107 item 2) and passes both down; since
-        # kittrial-5bb.197 it also passes the lifecycle_authors rule and the list the
-        # transport reports its warnings in.
-        self.assertEqual(set(passed), {'operators', 'journal', 'lifecycle_authors', 'warnings'})
+        # kittrial-5bb.197 it also passes the two coordinator-rules settings and the
+        # lazily-read principal map (no `warnings` list: all-off is main, item 4b).
+        self.assertEqual(set(passed), {'operators', 'journal', 'lifecycle_authors',
+                                       'independent_approval', 'owners'})
         self.assertEqual(passed['journal'], self.root / 'projects' / 'pp')
         self.assertIs(passed['lifecycle_authors'], False)   # this installation configures nothing
-        self.assertEqual(passed['warnings'], [])
+        self.assertIs(passed['independent_approval'], False)
+        self.assertTrue(callable(passed['owners']))
 
     def test_coordinate_dispatches_exactly_once(self):
         import coordination

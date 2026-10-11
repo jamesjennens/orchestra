@@ -54,15 +54,22 @@ class RulesHelpers:
             result = self.r.bd('config', 'set', key, value)
             self.assertEqual(result.returncode, 0, result.stderr)
         self._ensure_merge_slot()
+        # A baseline the previous test cannot leak into: valid operators, rules off, and
+        # no damaged registry or stale merge context left behind by another test.
+        for leftover in ('.sessions.json', '.merge-context.json'):
+            try:
+                (self.project / leftover).unlink()
+            except FileNotFoundError:
+                pass
+        self.deployment()
 
     # -- helpers ---------------------------------------------------------------
-    def deployment(self, **rules):
+    def deployment(self, operators=None, **rules):
         document = json.loads((self.root / 'deployment.private.json').read_text(encoding='utf-8'))
         for key in ('lifecycle_authors', 'independent_approval', 'coordinator_writes'):
             document.pop(key, None)
         document.update(rules)
-        if 'operators' not in document:
-            document['operators'] = ['ops']
+        document['operators'] = ['ops'] if operators is None else operators
         (self.root / 'deployment.private.json').write_text(json.dumps(document), encoding='utf-8')
 
     def _ensure_merge_slot(self):
@@ -92,13 +99,13 @@ class RulesHelpers:
         return self.endpoint('review', actor, [task, '@attachment:0'],
                              {'0': {'flag': '--file', 'text': json.dumps(body)}})
 
-    def contribute(self, task, actor, commit=COMMIT, base=BASE, previous=None):
+    def contribute(self, task, actor, commit=COMMIT, base=BASE, previous=None, supersedes=None):
         return self.post_review(task, actor, {
             'schema_version': 1, 'operation': 'contribute', 'operation_id': 'c-' + secrets.token_hex(8),
             'task': task, 'previous': previous, 'repository': 'ssh://git/example', 'commit': commit,
             'base_commit': base, 'delivery': {'kind': 'bundle', 'path': 'server:/rev.bundle',
                                               'sha256': 'f' * 64},
-            'summary': 'Delivered and verified', 'supersedes': None})
+            'summary': 'Delivered and verified', 'supersedes': supersedes})
 
     def approve(self, task, actor, contribution):
         return self.post_review(task, actor, {
@@ -204,7 +211,7 @@ class CoordinatorRulesEndpointTests(RulesHelpers, unittest.TestCase):
         approved = self.approve(task, 'w2', contribution)
         approve_id = json.loads(approved['stdout'])['comment_id']
         superseding = self.contribute(task, 'w1', commit='1' * 40,
-                                      previous=approve_id)
+                                      previous=approve_id, supersedes=contribution)
         self.assertEqual(json.loads(superseding['stdout'])['review_state'], 'awaiting-review')
         with self.assertRaises(ValueError) as caught:
             self.lifecycle('w1', 'integrated', task)
@@ -240,7 +247,6 @@ class CoordinatorRulesEndpointTests(RulesHelpers, unittest.TestCase):
         task = self.task('all off ' + uuid.uuid4().hex[:8], assignee='w1')
         checked = self.coordinate('w1', 'merge-check')
         self.assertIsInstance(json.loads(checked['stdout']), dict)
-
     def test_a_damaged_registry_does_not_stop_reads_or_a_listed_operator(self):
         # item 4c: only the two writes that need the registry are refused, and a plain
         # listed operator does not need it at all.
@@ -300,6 +306,7 @@ class CoordinatorRulesWebRouteTests(RulesHelpers, unittest.TestCase):
     def web_contribution(self, harness, token, task):
         body = {'operation': 'contribute', 'schema_version': 1, 'operation_id': 'w-' + secrets.token_hex(8),
                 'previous': None, 'repository': 'ssh://git/example', 'commit': COMMIT, 'base_commit': BASE,
+                'supersedes': None,
                 'delivery': {'kind': 'bundle', 'path': 'server:/rev.bundle', 'sha256': 'f' * 64},
                 'summary': 'Delivered over the web'}
         return harness.request('POST', '/v1/projects/pp/tasks/%s/reviews' % task, body, token=token)
