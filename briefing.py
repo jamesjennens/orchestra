@@ -1525,7 +1525,9 @@ def checkpoint_writes_enabled(root):
     """Reader-first rollout: only an installation operator enables new writes."""
     from admin import config
     marker=root/'deployment.private.json'
-    if marker.is_symlink():raise ValueError('Deployment configuration must not be a symlink')
+    # One rule everywhere (kittrial-5bb.173 item 2): a symlinked deployment.private.json is
+    # FOLLOWED, as every other route and host command already follows it (os.open on the
+    # path). A checkpoint no longer refuses a link that every other reader accepts.
     if not marker.exists():return False
     settings=config(root)
     if not isinstance(settings,dict):raise ValueError('Deployment configuration must be a JSON object')

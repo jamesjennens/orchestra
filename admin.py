@@ -3231,6 +3231,30 @@ def require_creatable_project(root,name):
     refuse_retired_name(root,name)
     if path.exists() and any(path.iterdir()): raise ValueError('Project already exists; use it rather than initializing again')
     require_bd_init_tools(root)
+    # The deployment configuration is read before anything is created (kittrial-5bb.173
+    # item 1): a missing file or a dangling link used to raise FileNotFoundError after
+    # ``projects/NAME`` had been made, and left that empty folder behind. One sentence,
+    # nothing left. A directory or a FIFO in its place is already one line (ConfigurationUnreadable).
+    try:
+        document = config(root)
+    except FileNotFoundError:
+        raise ValueError('Deployment is not installed; run install first. Nothing was created.') from None
+    except OSError as error:
+        raise ValueError('This host cannot read the deployment configuration %s (%s). '
+                         'Fix that file and run this command again; nothing was created.'
+                         % (root/'deployment.private.json', error.strerror or error)) from None
+    except ValueError:
+        raise
+    if not isinstance(document, dict):
+        raise ValueError('Deployment configuration %s is not a JSON object. Fix that file and run '
+                         'this command again; nothing was created.' % (root/'deployment.private.json'))
+    port = document.get('port')
+    # isinstance(True, int) is true: a bool is not a port (review 01a1288a).
+    usable = ((type(port) is int and 1 <= port <= 65535)
+              or (isinstance(port, str) and port.isdigit() and 1 <= int(port) <= 65535))
+    if not usable:
+        raise ValueError('Deployment configuration %s has no usable port. Fix that file and run '
+                         'this command again; nothing was created.' % (root/'deployment.private.json'))
     return path
 
 def initialize_requirements_governance(root,name):
