@@ -1578,6 +1578,9 @@ class EndpointBackend:
     #: The follow-on base refusal is handed on whole (kittrial-5bb.158): cut at 200 it lost the
     #: reason, the recorder's name and what an operator must do.
     BASE_REFUSAL_LIMIT = 1500
+    #: A refusal by one of the coordinator rules is handed on whole too (kittrial-5bb.197 review
+    #: request 01a12894, item 2): it must name the setting and the way to turn it off.
+    RULE_REFUSAL_LIMIT = 1500
 
     @classmethod
     def _detail_limit(cls, action, said):
@@ -1586,10 +1589,15 @@ class EndpointBackend:
         The larger limit is for the kit's own sentence only, never for a caller's text echoed
         back at length: the line must BE the follow-on base refusal, whole, as
         ``review_workflow.BASE_REFUSAL`` describes it (the kit's words, hexadecimal commit
-        ids, a recorder name of a constrained shape). Anything else keeps the limit it had.
+        ids, a recorder name of a constrained shape), or one of the coordinator-rule
+        refusals, which are fixed kit text naming the setting. Anything else keeps the limit
+        it had.
         """
         if action == 'review' and cls.base_refusal(said) is not None:
             return cls.BASE_REFUSAL_LIMIT            # the longest form of the sentence is well below it
+        if action in ('review', 'coordinate', 'lifecycle') and isinstance(said, str) \
+                and 'the installation setting' in said:
+            return cls.RULE_REFUSAL_LIMIT
         return cls.DETAIL_LIMITS.get(action, cls.DETAIL_LIMIT)
 
     @staticmethod
@@ -5902,6 +5910,7 @@ class ApiHandler(BaseHTTPRequestHandler):
     def requirements_list(self,ctx):
         self._requirements_backend(); self._project(ctx,CAP_READ)
         result=dict(self.backend.requirements_read(ctx.params['pid'],['list']))
+        result['items']=[self._requirement_author(ctx,item) for item in result.get('items',[])]
         result['can_edit']=(ctx.principal.via=='session' and not ctx.principal.agent_id
                             and self.service.state.get('memberships',{}).get(ctx.params['pid'],{}).get(ctx.principal.user_id)=='owner')
         return 200,result
@@ -5914,10 +5923,33 @@ class ApiHandler(BaseHTTPRequestHandler):
     def requirements_get(self,ctx):
         self._requirements_backend(); self._project(ctx,CAP_READ)
         result=dict(self.backend.requirements_read(ctx.params['pid'],['get',ctx.params['rid']]))
+        result=self._requirement_author(ctx,result)
         result['governance']=self.backend.requirements_read(ctx.params['pid'],['governance'])
         result['can_edit']=(ctx.principal.via=='session' and not ctx.principal.agent_id
                             and self.service.state.get('memberships',{}).get(ctx.params['pid'],{}).get(ctx.principal.user_id)=='owner')
         return 200,result
+
+    def _requirement_author(self,ctx,item):
+        result=dict(item)
+        if not result.get('pending_draft'):
+            result['pending_author']=None
+            return result
+        author=result.get('pending_author')
+        if not isinstance(author,dict) or author.get('kind')!='account':
+            return result
+        account=author.get('text')
+        user=self.service.state.get('users',{}).get(account)
+        role=self.service.state.get('memberships',{}).get(ctx.params['pid'],{}).get(account)
+        if not isinstance(user,dict) or role!='owner':
+            result['pending_author']={'kind':'unknown','text':'', 'omitted_chars':0,'at':author.get('at')}
+            return result
+        name=user.get('display_name') or user.get('username')
+        if not isinstance(name,str) or not name.strip():
+            result['pending_author']={'kind':'unknown','text':'','omitted_chars':0,'at':author.get('at')}
+            return result
+        result['pending_author']=dict(author,kind='owner-account',text=name[:200],
+            omitted_chars=max(0,len(name)-200),is_self=account==ctx.principal.user_id)
+        return result
 
     @route('PATCH', r'/v1/projects/(?P<pid>'+ID+r')/requirements/(?P<rid>'+ID+r')')
     def requirements_revise(self,ctx):
@@ -5930,7 +5962,9 @@ class ApiHandler(BaseHTTPRequestHandler):
     @route('GET', r'/v1/projects/(?P<pid>'+ID+r')/brd')
     def requirements_brd(self,ctx):
         self._requirements_backend(); self._project(ctx,CAP_READ)
-        return 200,self.backend.requirements_read(ctx.params['pid'],['brd'])
+        result=self.backend.requirements_read(ctx.params['pid'],['brd'])
+        result['items']=[self._requirement_author(ctx,item) for item in result.get('items',[])]
+        return 200,result
 
     # -- contributed requirement proposals (.58 slice 1b, kittrial-5bb.70) -----------
     #
@@ -6515,6 +6549,13 @@ class ApiHandler(BaseHTTPRequestHandler):
                 # nothing else of theirs), so it is the message, not only the detail.
                 if recommending and refusal.status == 422 and isinstance(refusal.detail, str) \
                         and refusal.detail.startswith('ValueError: '):
+                    raise invalid(refusal.detail[len('ValueError: '):], refusal.detail) from None
+                # A refusal by one of the coordinator rules names the setting it came from
+                # (kittrial-5bb.197 review request 01a12894, item 2): the web caller must see
+                # that sentence, not the generic "Canonical command rejected the request".
+                if refusal.status == 422 and isinstance(refusal.detail, str) \
+                        and refusal.detail.startswith('ValueError: ') \
+                        and 'the installation setting' in refusal.detail:
                     raise invalid(refusal.detail[len('ValueError: '):], refusal.detail) from None
                 # So does a refused follow-on base (kittrial-5bb.158): the sentence says which
                 # base is acceptable, why this one is not and what an operator does about it.

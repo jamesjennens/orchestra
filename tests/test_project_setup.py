@@ -434,7 +434,8 @@ class HostStatusTests(unittest.TestCase):
 
     def test_a_bare_project(self):
         status = self.status()
-        self.assertEqual(sorted(status), ['admin', 'backup', 'bound_keys_only', 'coordination', 'creation_record',
+        self.assertEqual(sorted(status), ['admin', 'backup', 'bound_keys_only', 'coordination',
+                                          'coordinator_rules', 'creation_record',
                                           'guidance', 'merge_slot', 'onboarding',
                                           'project', 'project_databases', 'schema_version'])
         # The metadata records no Dolt server coordinates, so bd was not run (it would create

@@ -184,6 +184,12 @@ class NativeOwnerTests(fixture.RealBdLabelAliasTests):
             detail = harness.request('GET', route, token=token)
             self.assertEqual(detail.status, 200, detail.data)
             self.assertEqual([r['acceptance_state'] for r in detail.data['history']], ['draft','accepted','draft'])
+            self.assertEqual(detail.data['acceptance']['revision'], accepted.data['revision'])
+            self.assertEqual(detail.data['acceptance']['record_sha256'], accepted.data['sha256'])
+            self.assertEqual(detail.data['pending_author']['kind'], 'owner-account')
+            self.assertTrue(detail.data['pending_author']['is_self'])
+            self.assertEqual(detail.data['pending_author']['text'], harness.service.state['users'][account]['display_name'])
+            self.assertIsNotNone(detail.data['pending_author']['at'])
             for revision in detail.data['history']:
                 from requirements import content_hash
                 self.assertEqual(content_hash(revision), revision['sha256'])
@@ -210,6 +216,17 @@ class NativeOwnerTests(fixture.RealBdLabelAliasTests):
             governed = harness.request('PUT', base+'/requirements/governance', dict(expected(simple.data), mode='governed'),
                                        token=token, key='native-governed-mode')
             self.assertEqual(governed.status, 200, governed.data)
+            # Governed contributor wording retains its native attribution when
+            # the owner switches back to simple editing.
+            contributor_payload.update(operation_id='native-governed-pending-author', revision=latest['revision']+1)
+            contribution = fixture.endpoint.execute(root, {'project':'pp','actor':'alice',
+                'action':'requirement','args':[json.dumps(contributor_payload)]})
+            self.assertEqual(contribution['returncode'], 0, contribution)
+            pending = harness.request('GET', route, token=token)
+            self.assertEqual(pending.status, 200, pending.data)
+            self.assertEqual(pending.data['pending_author']['kind'], 'contributor-name')
+            self.assertEqual(pending.data['pending_author']['text'], 'alice')
+            self.assertIsNotNone(pending.data['pending_author']['at'])
             before = self.rows()
             denied = harness.request('POST', route+'/accept', expected(changed.data), token=token, key='native-governed-accept')
             self.assertEqual(denied.status, 422, denied.data)
@@ -222,6 +239,53 @@ class NativeOwnerTests(fixture.RealBdLabelAliasTests):
             enabled = harness.request('PUT', base+'/requirements/governance',
                 dict(expected(governed.data), mode='simple'), token=token, key='native-page-simple')
             self.assertEqual(enabled.status, 200, enabled.data)
+            pending = harness.request('GET', route, token=token)
+            self.assertEqual(pending.data['pending_author']['kind'], 'contributor-name')
+            self.assertEqual(pending.data['pending_author']['text'], 'alice')
+            self.assertIsNotNone(pending.data['pending_author']['at'])
+            # Kill this real endpoint process before its first receipt write.
+            # The native adapter and both authority checks remain unchanged.
+            prewrite_endpoint = root/'prewrite-endpoint.py'
+            prewrite_marker = root/'fail-prewrite-once'
+            prewrite_endpoint.write_text(
+                'import os,sys\nfrom pathlib import Path\n'
+                'sys.path.insert(0, '+repr(str(KIT))+')\n'
+                'import endpoint,keyed_records\n'
+                'original=keyed_records.atomic\n'
+                'marker=Path('+repr(str(prewrite_marker))+')\n'
+                'def interrupted(path,value):\n'
+                ' if path.parent.name==".requirement-owner-requests" and marker.exists():\n'
+                '  marker.unlink(); os._exit(17)\n'
+                ' return original(path,value)\n'
+                'keyed_records.atomic=interrupted\nendpoint.main()\n', encoding='utf-8')
+            prewrite_marker.write_text('one prewrite process exit', encoding='utf-8')
+            original_endpoint = harness.backend.endpoint
+            before_prewrite = self.rows()
+            prewrite_fields = dict(kind='requirement',parent=job,title='Prewrite process crash',description='No allocation.')
+            try:
+                harness.backend.endpoint = str(prewrite_endpoint)
+                interrupted = harness.request('POST',base+'/requirements',prewrite_fields,
+                    token=token,key='native-prewrite-process-exit')
+                self.assertEqual(interrupted.status, 503, interrupted.data)
+            finally:
+                harness.backend.endpoint = original_endpoint
+            self.assertFalse(prewrite_marker.exists())
+            self.assertEqual(self.rows(), before_prewrite)
+            prewrite_listing = harness.request('GET',base+'/requirements/recoveries',token=token)
+            self.assertEqual(prewrite_listing.status, 200, prewrite_listing.data)
+            self.assertEqual(len(prewrite_listing.data['items']), 1)
+            prewrite_item = prewrite_listing.data['items'][0]
+            self.assertIn('No creation receipt was written',prewrite_item['message'])
+            self.assertTrue(prewrite_item['can_clear'],prewrite_item)
+            prewrite_clear = harness.request('POST',base+'/requirements/recoveries/clear',dict(
+                original_operation_id=prewrite_item['operation_id'],
+                expected_receipt_sha256=prewrite_item['expected_receipt_sha256'],reason='Endpoint exited before receipt write.'),
+                token=token,key='native-prewrite-clear')
+            self.assertEqual(prewrite_clear.status, 200, prewrite_clear.data)
+            self.assertEqual(self.rows(), before_prewrite)
+            self.assertEqual(harness.request('POST',base+'/requirements',prewrite_fields,
+                token=token,key='native-prewrite-process-exit').status, 422)
+            print('NATIVE_PREWRITE_PROCESS_EXIT '+json.dumps(dict(exit_status=17, released=True, native_writes=0)),flush=True)
             # Two distinct owner clicks on one immutable draft serialize at the
             # actual endpoint lock. Only one creates acceptance evidence.
             from concurrent.futures import ThreadPoolExecutor
@@ -257,6 +321,8 @@ class NativeOwnerTests(fixture.RealBdLabelAliasTests):
             self.assertEqual(listing.status, 200, listing.data)
             self.assertEqual(len(listing.data['items']), 1)
             empty = listing.data['items'][0]; self.assertTrue(empty['can_clear'], empty)
+            self.assertEqual(empty['title'], fields['title'])
+            self.assertRegex(empty['at'], r'^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$')
             # The production discovery journal holds 25 synthetic owner
             # intents; real bd supplies the complete export/membership proof.
             import time
@@ -308,6 +374,31 @@ class NativeOwnerTests(fixture.RealBdLabelAliasTests):
                 journal.complete(operation, {'returncode':2,'stdout':'','stderr':'synthetic fixture complete'},
                                  origin['request_hash'], origin['principal'])
                 path.unlink()
+            # The old-key retry uses the same actual HTTP/endpoint route. A
+            # damaged receipt cannot expose its private filename or directory.
+            try:
+                receipt_path.write_bytes(b'{damaged native receipt')
+                retried_damage = harness.request('POST', base+'/requirements', fields,
+                    token=token, key='native-empty-create')
+                self.assertEqual(retried_damage.status, 422, retried_damage.data)
+                self.assertNotIn(receipt_path.name, str(retried_damage.data))
+                self.assertNotIn(str(self.project), str(retried_damage.data))
+                # A FIFO has no writer. Reading it while holding the endpoint
+                # locks must still return promptly and isolate this item.
+                import os
+                receipt_path.unlink(); os.mkfifo(receipt_path)
+                started = time.perf_counter()
+                fifo_listing = harness.request('GET', base+'/requirements/recoveries', token=token)
+                elapsed = time.perf_counter() - started
+                self.assertEqual(fifo_listing.status, 200, fifo_listing.data)
+                fifo_item = next(i for i in fifo_listing.data['items'] if i['operation_id']==empty['operation_id'])
+                self.assertFalse(fifo_item['can_clear'])
+                self.assertIn('unreadable', fifo_item['message'])
+                self.assertLess(elapsed, 15)
+                print('NATIVE_FIFO_RECOVERY '+json.dumps(dict(seconds=elapsed, can_clear=False)), flush=True)
+            finally:
+                if receipt_path.exists(): receipt_path.unlink()
+                receipt_path.write_bytes(receipt_bytes)
             clear_body = dict(original_operation_id=empty['operation_id'],
                               expected_receipt_sha256=empty['expected_receipt_sha256'],
                               reason='Complete native reads prove no row was written.')
@@ -344,7 +435,7 @@ class NativeOwnerTests(fixture.RealBdLabelAliasTests):
             self.assertEqual(listing.status, 200, listing.data)
             self.assertEqual(len(listing.data['items']), 1)
             item = listing.data['items'][0]; self.assertFalse(item['can_clear'])
-            self.assertIn('Retry the original creation', item['message'])
+            self.assertIn('Reload the requirements', item['message'])
             self.assertIn('host operator', item['message'])
             before_allocated = self.rows()
             refused = harness.request('POST', base+'/requirements/recoveries/clear',

@@ -62,6 +62,13 @@ VALUE_OPTIONS = {'--owner', '--state', '--limit', '--offset', '--handoff-limit',
 #: At most this many request ids are named per work item (a review record holds at most 20 items).
 PENDING_REQUEST_IDS_MAX = 20
 
+#: One sentence for a contribution that waits for somebody else's approval (kittrial-5bb.197
+#: review request 01a12894, item 3b). It is carried by `work` and `brief` whether the
+#: installation's approval rules are on or off, so a reader of either learns what the
+#: contribution is waiting for without reading the setting. It is deliberately short: the
+#: brief is bounded, and this field must not push a long prior chain past the bound.
+APPROVAL_WAIT = 'Waiting for somebody else\'s approval of the current contribution.'
+
 # Compact owned-work context, not a recipient or authorization inference.
 CHECKPOINT_WAIT_ITEMS_MAX = 3
 
@@ -419,6 +426,11 @@ def workflow(issue,scopes=None,operators=None,reverts=None,journal=None,invalid_
     # reader (review, brief, work) gets them from this one place.
     from review_recommendations import block as recommendations
     result.update(recommendations(issue,result))
+    # One sentence for a contribution that waits for somebody else's approval
+    # (kittrial-5bb.197 review request 01a12894, item 3b): `work` and `brief` both read
+    # this projection, and it is present whether the rules are on or off.
+    result['waiting_for_approval']=(APPROVAL_WAIT if result.get('review_state')=='awaiting-review'
+                                    and result.get('contribution') else None)
     return result
 
 def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes=None, journal=None,
@@ -524,6 +536,7 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
                           'integration_disagreements':[],'integration_warnings':[],
                           'newer_activity_by_others':None,'newer_activity_own':None,
                           'newer_activity_coverage':None,'unresolved_directions':None,
+                          'waiting_for_approval':None,
                           # A malformed row shows no validated review state, so whose move it
                           # is stays unknown rather than guessed (kittrial-5bb.249).
                           'whose_move':'unknown','next':UNKNOWN_MOVE_TEXT,
@@ -690,7 +703,10 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
                       'contribution_author':(review.get('contribution') or {}).get('author'),
                       # Additive (kittrial-5bb.52): the integration disagreement entries
                       # naming both facts and both scopes, and their rendered warnings.
-                      'integration_disagreements':disagreements,'integration_warnings':integration_warnings})
+                      'integration_disagreements':disagreements,'integration_warnings':integration_warnings,
+                      # Additive (kittrial-5bb.197 item 3b): one sentence when the current
+                      # contribution waits for another party's approval, rules on or off.
+                      'waiting_for_approval':(APPROVAL_WAIT if state=='awaiting-review' and contribution else None)})
     from briefing import checkpoint_queue_fields
     task_rows={row['id']:row for row in rows if isinstance(row,dict) and row.get('id')}
     # The bounded claimable-work view (kittrial-5bb.6 deliverable b): filter to the rows
@@ -779,7 +795,14 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
             limit=a.capability_limit,offset=a.capability_offset)
     return result
 
-def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None,review_writes=None):
+def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None,review_writes=None,
+            independent_approval=False,coordinator_writes=False,owners=None,web_owner=False):
+    """``independent_approval``, ``coordinator_writes`` and ``owners`` are the slices
+    6 and 7 settings and the project's actor -> principal map (kittrial-5bb.197),
+    supplied by the endpoint; all default OFF/absent, so nothing changes for an
+    installation that configures nothing. ``owners`` may be a callable, so the
+    registry is read only when a rule needs it. ``web_owner`` says a verified web
+    owner approved through the web route (kittrial-5bb.199)."""
     # Help is recognised anywhere as a standalone token and never touches the
     # native export, the coordination lock or an attachment.
     if help_requested(args):
@@ -825,7 +848,8 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
         return recommend(rows,task,actor,payload,run,operators=operators,journal=path)
     from review_workflow import execute as review
     result=review(rows,task,actor,payload,run, operators=operators, journal=path,
-                  review_writes=review_writes)
+                  review_writes=review_writes, independent_approval=independent_approval,
+                  coordinator_writes=coordinator_writes, owners=owners, web_owner=web_owner)
     if payload.get('operation')=='request-changes':
         # Retry repairs a label update interrupted after the durable review comment.
         run(['update',task,'--remove-label','review-ready','--json'])
