@@ -1137,7 +1137,8 @@ class InProcessBackend:
                 waiting_since=review['latest_at'],
                 attention=self._agent_fields(task, review),
                 recommended_by=[r['author'] for r in review['recommendations']],
-                contribution_author=(review['contribution'] or {}).get('author')))
+                contribution_author=(review['contribution'] or {}).get('author'),
+                claimable=claimable_task(task, review)))
         items.sort(key=queue_order)
         return {'items': items, 'complete': True, 'warnings': []}
 
@@ -1226,7 +1227,8 @@ def queue_order(item):
 
 def queue_item(project_id, task, review_state, contribution, open_requests,
                pending_request_ids=None, waiting_since=None, integration=None,
-               integration_warnings=None, attention=None, recommended_by=None, contribution_author=None):
+               integration_warnings=None, attention=None, recommended_by=None, contribution_author=None,
+               claimable=None):
     """One review-queue row, in the shape both backends return.
 
     ``pending_request_ids`` and ``waiting_since`` (time of the latest review record)
@@ -1238,7 +1240,16 @@ def queue_item(project_id, task, review_state, contribution, open_requests,
     the canonical backend passes the ``work`` row's integration block and its
     any-pass-wins disagreement warnings through; the disposable backend records no
     lifecycle evidence and leaves them ``None``/empty.
+
+    ``claimable`` is additive (kittrial-5bb.6): the one bounded interpretation of
+    claimable work (``work.claimable``), so agent attention, My work and the claim
+    fall-through offer exactly the rows the canonical ``work --claimable`` view
+    offers. Advisory, never a reservation. ``None`` means the row's endpoint did not
+    state it (a staged upgrade or rollback): the older "open and unassigned" reading
+    is kept, so such an endpoint loses no suggestion it used to offer.
     """
+    if claimable is None:
+        claimable = task.get('status') == 'open' and task.get('assignee') is None
     return {'id': task.get('id'), 'project_id': project_id, 'title': task.get('title'),
             'status': task.get('status'), 'assignee': task.get('assignee'),
             'priority': task.get('priority'), 'created_at': task.get('created_at'),
@@ -1249,6 +1260,7 @@ def queue_item(project_id, task, review_state, contribution, open_requests,
             'waiting_since': waiting_since,
             'integration': integration,
             'integration_warnings': list(integration_warnings or []),
+            'claimable': bool(claimable),
             # What agent attention needs from the canonical ``work`` row (kittrial-5bb.114):
             # the request-changes record ids, and the latest checkpoint's open items,
             # time and whether anything is newer. None where the backend does not say.
@@ -1260,6 +1272,20 @@ def queue_item(project_id, task, review_state, contribution, open_requests,
             # Additive (kittrial-5bb.115 review): who delivered the current contribution, so
             # the person rule can be applied to a row as it is to a brief.
             'contribution_author': contribution_author}
+
+
+def claimable_task(task, review):
+    """One in-process task's bounded claimability, from the shared ``work.claimable``.
+
+    The disposable backend knows each row's issue type directly; the canonical backend
+    reads the ``claimable`` field the ``work`` projection already computed, so both
+    answer the same question (kittrial-5bb.6 deliverable b).
+    """
+    from work import claimable
+    contribution = review.get('contribution') if isinstance(review, dict) else None
+    return claimable(task.get('issue_type'), task.get('status'), task.get('assignee'),
+                     (contribution or {}).get('id'),
+                     review.get('state') if isinstance(review, dict) else None)
 
 
 def attention_blocking_items(fields):
@@ -2790,7 +2816,9 @@ class EndpointBackend:
                                         recommended_by=[name for name in row.get('recommended_by') or []
                                                         if isinstance(name, str)],
                                         contribution_author=row.get('contribution_author')
-                                        if isinstance(row.get('contribution_author'), str) else None))
+                                        if isinstance(row.get('contribution_author'), str) else None,
+                                        claimable=row.get('claimable')
+                                        if isinstance(row.get('claimable'), bool) else None))
             offset = page.get('next_offset')
             if offset is None:
                 complete = True
@@ -2798,8 +2826,7 @@ class EndpointBackend:
             # Over-bound single-agent reads recover own tasks separately. Stop
             # once claimable suggestions fill; a review-heavy first page must
             # not hide all unclaimed work. Keep the same bounded page walk.
-            claimable = sum(item.get('status') == 'open' and item.get('assignee') is None
-                            for item in items)
+            claimable = sum(item.get('claimable') is True for item in items)
             if (stop_if_over_bound and type(page.get('total')) is int
                     and page['total'] > self.QUEUE_MAX_PAGES * MAX_PAGE
                     and claimable >= min(AGENT_CLAIMABLE_LIMIT, AGENT_ACTION_LIMIT)):
@@ -3937,6 +3964,32 @@ class ApiHandler(BaseHTTPRequestHandler):
         """
         return self._cached_read('queue', project_id,
                                  lambda: self._independent_queue(self.backend.review_queue(project_id), project_id), shared)
+
+    def _claim_candidates(self, project_id, exclude, limit=None):
+        """Bounded claimable rows to fall through to when a claim is refused.
+
+        The same rows the canonical ``work --claimable`` view lists (kittrial-5bb.6
+        deliverable b), taken from this request's bounded queue read, in the queue's own
+        order and excluding the task just refused. Advisory only: a candidate is not a
+        reservation and the next claim is still atomic. A read failure supplies no
+        candidates and never changes the refusal.
+        """
+        try:
+            read = self._review_queue(project_id)
+        except (HttpError, ValueError):
+            return []
+        if not isinstance(read, dict):
+            return []
+        bound = AGENT_CLAIMABLE_LIMIT if limit is None else limit
+        found = []
+        for task in read.get('items') or []:
+            if not isinstance(task, dict) or task.get('id') == exclude:
+                continue
+            if task.get('claimable') is True:
+                found.append({'task': task.get('id'), 'title': task.get('title')})
+            if len(found) >= bound:
+                break
+        return found
 
     def _cached_read(self, kind, project_id, load, shared=False):
         """One canonical read per request, optionally reused across requests.
@@ -5487,7 +5540,11 @@ class ApiHandler(BaseHTTPRequestHandler):
                         'Review state %s: %s.' % (review or 'unknown', action['text']),
                         who=action['who'], **details))
             for task in read['tasks']:
-                if task.get('status') == 'open' and task.get('assignee') is None:
+                # The one bounded interpretation (kittrial-5bb.6 deliverable b): a row the
+                # shared predicate calls claimable, not "any open unassigned task". Epics,
+                # decisions, gates, jobs, record anchors, delivered work and owned work are
+                # therefore never offered as claimable suggestions.
+                if task.get('claimable') is True:
                     counts['claimable'] += 1
                     if len(claimable_actions) < AGENT_CLAIMABLE_LIMIT:
                         claimable_actions.append(self._agent_action(
@@ -6288,12 +6345,27 @@ class ApiHandler(BaseHTTPRequestHandler):
                                              capability=CAP_TASKS)
             except HttpError as refusal:
                 held_by = getattr(refusal, 'held_by', None)
-                if held_by is None:
+                if held_by is None and refusal.code != 'conflict':
                     raise
+                # Candidate fall-through (kittrial-5bb.6 deliverable b): a refused claim
+                # answers with the next bounded claimable rows so an agent need not re-read
+                # the queue. Advisory: claimability is not a reservation and the next claim
+                # is still atomic. When there is nothing to fall through to, the refusal is
+                # re-raised byte for byte, so every existing sentence and detail is kept.
+                candidates = self._claim_candidates(ctx.params['pid'], ctx.params['tid'])
+                if not candidates and held_by is None:
+                    raise
+                detail = dict(refusal.detail) if isinstance(refusal.detail, dict) else {}
+                if held_by is not None:
+                    detail['held_by'] = held_by
+                if candidates:
+                    detail['candidates'] = candidates
+                if held_by is None:
+                    raise conflict(refusal.message, detail) from None
                 # Somebody else has it. Nobody takes a task over through a claim, an owner
                 # included (kittrial-5bb.187); said with the holder's name as people know it.
                 shown = self.service.actor_names([held_by]).get(held_by) or held_by
-                raise conflict('Task is already claimed by %s' % shown, {'held_by': held_by}) from None
+                raise conflict('Task is already claimed by %s' % shown, detail) from None
             return result, result
         return self._mutate(ctx, 'tasks.claim', ctx.params['pid'], claim,
                             capability=CAP_TASKS, serialize=False, canonical=True)

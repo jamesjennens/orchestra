@@ -797,6 +797,13 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
             'intent':clip(p['intent'] if p else issue.get('description'),600),'acceptance':clip(p['acceptance'] if p else issue.get('acceptance_criteria'),1000),
             'current_position':p['summary'] if p else 'No checkpoint yet; current position and unresolved items have not been summarized.',
             'next_action':next_action,
+            # Additive selection fact (kittrial-5bb.6), from the same shared projection the
+            # `review` block and every `work` row use: the next-action actor as a ROLE,
+            # separate from `owner` (the assignee). `next_action` above stays the prose
+            # sentence; `next_actor` never replaces it. The brief stays compact, so the
+            # filterable `work_state` and the reconciliation signal stay in `review`
+            # (with the bounded prior-contribution slice) rather than being duplicated here.
+            'next_actor':review.get('next_actor'),
             'unresolved':{'coverage':'explicit checkpoint items only; unsummarized prose is not classified','total':len(items) if p else None,'items':items[offset:offset+limit],'next_offset':offset+limit if offset+limit<len(items) else None},
             'review':dict(review,pending_requests=pending[:5],pending_total=len(pending),more='review '+task if len(pending)>5 else None,
                           prior_contributions=bounded_priors,prior_contributions_total=len(priors),

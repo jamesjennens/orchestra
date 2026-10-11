@@ -49,6 +49,9 @@ ITEM_FIELDS = {
     'newer_activity_coverage', 'unresolved_directions',
     # Additive move sentence (kittrial-5bb.249): whose move it is, in words.
     'whose_move', 'next',
+    # Additive selection facts (kittrial-5bb.6): the next-action actor role, the
+    # filterable work state, the reconciliation signal and bounded claimability.
+    'next_actor', 'work_state', 'reconciliation_needed', 'reconciliation_reasons', 'claimable',
 }
 BRIEF_FIELDS = {
     'task', 'title', 'owner', 'status', 'activity_cursor', 'checkpoint', 'intent',
@@ -59,6 +62,10 @@ BRIEF_FIELDS = {
     'deployed_delivery', 'deployed_delivery_is_current_contribution',
     # Additive liveness (kittrial-5bb.107 rev2).
     'deployed_live',
+    # Additive selection fact (kittrial-5bb.6): the next-action actor role. The
+    # filterable work state and the reconciliation signal travel in the brief's
+    # bounded `review` block.
+    'next_actor',
 }
 
 

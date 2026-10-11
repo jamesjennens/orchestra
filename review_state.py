@@ -51,18 +51,147 @@ and neither switches the rule to newest-wins:
 
 
 #: Warning prefixes this module adds to a read's ``warnings`` list for the
-#: integration overlay. ``brief`` and ``work`` use the predicate below to carry
-#: them into their own warning surfaces without matching strings by hand.
+#: integration overlay and the reconciliation signal below. ``brief`` and ``work``
+#: use the predicate below to carry them into their own warning surfaces without
+#: matching strings by hand.
 INTEGRATION_WARNING_PREFIXES = ('Integration fact disagreement', 'Integration revert',
-                                'Integration after withdrawal')
+                                'Integration after withdrawal', 'Reconciliation needed')
 #: Bound on the ``integration.reverted_commits`` list a read embeds; the
 #: untruncated count stays available as ``integration.reverted_total``.
 REVERTED_COMMITS_LIMIT = 5
+
+#: The closed set of next-action actors a read may report (kittrial-5bb.6). It is a
+#: ROLE, never a person, and is deliberately SEPARATE from the ``assignee`` field:
+#: an assignee does not always act next (a reviewer, the coordinator or an operator
+#: does), and a task with no assignee is not always free (it may already be
+#: delivered). ``assignee`` means the task's own assignee acts next; ``reviewer`` a
+#: reviewer; ``coordinator`` the integrator/release party; ``operator`` an operator
+#: who must reconcile; ``anyone`` an open undelivered task nobody holds; ``none``
+#: settled or closed work; ``unknown`` when no state supports a claim. It is derived
+#: only from the effective review state, the assignee's presence and the task status,
+#: never from a title, a comment or an actor name.
+NEXT_ACTORS = ('assignee', 'reviewer', 'coordinator', 'operator', 'anyone', 'none', 'unknown')
+
+#: The additive, filterable work-state value for a contribution whose recorded
+#: evidence must be reconciled before it is read as current (kittrial-5bb.6). It is
+#: a SELECTION signal: it never replaces ``review_state``, never clears an open
+#: item or a blocker, and infers neither abandonment nor deployment.
+RECONCILIATION_STATE = 'reconciliation-needed'
 
 
 def is_integration_warning(value):
     """True for one of this module's integration-overlay warning lines."""
     return isinstance(value, str) and value.startswith(INTEGRATION_WARNING_PREFIXES)
+
+
+def next_actor(state, assignee=None, closed=False):
+    """The party that acts next, as a role token from :data:`NEXT_ACTORS`.
+
+    Caller-neutral and derived only from the effective review state, whether an
+    assignee is present and whether the task is closed. ``closed`` keeps its meaning
+    from the ``work`` queue: a closed task whose review is not still active is
+    ``none``, never an invitation to act. It never reports a person and never reads
+    a title, a comment or an actor name as a claim about intent.
+    """
+    if closed and state not in ('changes-requested', 'error', 'awaiting-integration',
+                                'withdrawn', 'superseded'):
+        return 'none'
+    if state in ('changes-requested', 'withdrawn', 'superseded'):
+        return 'assignee' if assignee else 'unknown'
+    if state in ('awaiting-review', 'legacy-review-ready'):
+        return 'reviewer'
+    if state in ('awaiting-integration', 'approved', 'integrated'):
+        return 'coordinator'
+    if state in ('error', RECONCILIATION_STATE):
+        return 'operator'
+    if state in (None, 'none'):
+        return 'assignee' if assignee else 'anyone'
+    return 'unknown'
+
+
+def reconciliation(result, scopes=None):
+    """``{'needed', 'reasons'}``: recorded evidence that must be reconciled first.
+
+    Two independent signals, each shown with the facts that disagree, never cleared
+    automatically:
+
+    * ``integration-facts-disagree`` -- the shared projection already found
+      ``integration_disagreements`` (a host-issued revert, a newest matching scope
+      whose value differs from the any-pass-wins fact, or a withdrawn contribution
+      whose commit still records a pass). Both scopes and both values are named by
+      that block; this signal makes the same mismatch filterable;
+    * ``lifecycle-scope-lags`` -- the current contribution exists, the NEWEST
+      recorded lifecycle scope (from the raw ``scopes``, whether or not it matches
+      the current commit) names a ``source_commit`` that is one of the
+      contribution's PRIOR revisions (a revision the current one supersedes), and no
+      scope passes for the current contribution. The recorded scope lags the
+      delivered revision, so its old tested facts must not be read as current.
+
+    A contribution whose own commit already records a pass is NOT flagged for the
+    lag: the lifecycle facts then do include the current work, and the newest scope
+    naming other work is already carried by ``lifecycle_matches_contribution``. This
+    is deliberately a signal, not a state change.
+    """
+    reasons = []
+    disagreements = result.get('integration_disagreements') or []
+    if disagreements:
+        reasons.append({'reason': 'integration-facts-disagree',
+                        'disagreements': [entry.get('kind') for entry in disagreements
+                                          if isinstance(entry, dict)][:5],
+                        'entries': [{key: entry.get(key) for key in
+                                     ('kind', 'fact', 'newest_fact', 'scope', 'newest_scope',
+                                      'reverted_commits')}
+                                    for entry in disagreements[:3] if isinstance(entry, dict)]})
+    contribution = result.get('contribution') if isinstance(result.get('contribution'), dict) else {}
+    commit = str(contribution.get('commit') or '')
+    evidence = result.get('integration') if isinstance(result.get('integration'), dict) else {}
+    newest = _newest_recorded_scope(scopes)
+    newest_scope = (newest or {}).get('scope') if isinstance(newest, dict) else {}
+    newest_scope = newest_scope if isinstance(newest_scope, dict) else {}
+    newest_commit = str(newest_scope.get('source_commit') or '')
+    prior_commits = {str(entry.get('commit') or '').lower()
+                     for entry in (result.get('prior_contributions') or []) if isinstance(entry, dict)}
+    if (commit and newest_commit and newest_commit.lower() != commit.lower()
+            and newest_commit.lower() in prior_commits and evidence.get('fact') != 'passed'):
+        reasons.append({'reason': 'lifecycle-scope-lags',
+                        'contribution_commit': commit,
+                        'scope_source_commit': newest_commit,
+                        'scope_token': (newest or {}).get('scope_token'),
+                        'scope': {key: newest_scope.get(key) for key in
+                                  ('source_commit', 'integration_commit', 'release_id', 'environment')}})
+    return {'needed': bool(reasons), 'reasons': reasons}
+
+
+def _newest_recorded_scope(scopes):
+    """The newest recorded lifecycle scope, matching the current contribution or not.
+
+    ``integration`` only looks at scopes whose ``source_commit`` equals the current
+    contribution's commit, so it cannot answer "does the NEWEST recorded scope lag the
+    delivered revision?". This applies the same recency rule (newest ``order``, ties on
+    the scope token) to every valid evidence entry.
+    """
+    def recency(entry):
+        order = entry.get('order')
+        return (order if isinstance(order, int) else -1, str(entry.get('scope_token') or ''))
+    found = [entry for entry in (scopes or []) if isinstance(entry, dict) and entry.get('scope')]
+    return max(found, key=recency) if found else None
+
+
+def reconciliation_warnings(reasons):
+    """One plain line per reconciliation reason, for every read's ``warnings`` list.
+
+    A ``integration-facts-disagree`` reason gets no extra line: the disagreement's own
+    warning (``disagreement_warnings``) already names both facts and both scopes, and a
+    second line for the same mismatch would double-count it in the bounded brief.
+    """
+    lines = []
+    for item in reasons or []:
+        if item.get('reason') == 'lifecycle-scope-lags':
+            lines.append('Reconciliation needed: the newest recorded lifecycle scope names commit ' +
+                         str(item.get('scope_source_commit')) + ', a revision the current contribution (' +
+                         str(item.get('contribution_commit')) + ') supersedes; the recorded scope lags the '
+                         'current contribution, so its old tested facts must not be read as current')
+    return lines
 
 
 def integration(contribution, scopes, reverts=None):
@@ -279,7 +408,7 @@ def _scope_text(scope):
         scope.get('release_id') or '-', scope.get('environment') or '-')
 
 
-def effective(result, scopes=None, workflow_state=None):
+def effective(result, scopes=None, workflow_state=None, assignee=None, closed=False):
     """Apply the integration overlay to one raw workflow projection result.
 
     ``workflow_state`` overrides the raw state recorded alongside the effective
@@ -301,6 +430,15 @@ def effective(result, scopes=None, workflow_state=None):
     revert in play is reported as kind ``newest-scope-disagrees``; each gets one
     warning on the existing ``warnings`` list, so the owner decision to keep
     any-pass-wins stays visible and a revert is never silent on any read.
+
+    Additive selection facts (kittrial-5bb.6) are computed here, in the one shared
+    projection, so `review`, `brief`'s review block and every `work` row cannot
+    disagree: ``next_actor`` (the role token, separate from the assignee),
+    ``reconciliation_needed``/``reconciliation_reasons`` (the filterable
+    reconciliation signal with the mismatching facts) and ``work_state`` (the
+    reconciliation state when needed, else the effective review state).
+    ``review_state`` itself keeps its exact meaning, the reconciliation signal
+    clears no blocker and neither abandonment nor deployment is inferred.
     """
     reverts=result.get('reverts') or []
     evidence=integration(result.get('contribution'),scopes,reverts)
@@ -315,9 +453,19 @@ def effective(result, scopes=None, workflow_state=None):
         answer['prior_contributions']=[dict(c,integration=integration(c,scopes,reverts)) for c in priors]
     disagreements=integration_disagreements(answer)
     answer['integration_disagreements']=disagreements
+    reconciliation_facts=reconciliation(answer,scopes)
+    answer['reconciliation_needed']=reconciliation_facts['needed']
+    # The reasons (which name the mismatching commits/scopes) are present exactly when
+    # there is something to reconcile: the bounded brief must not carry an empty list on
+    # every read, and a `work` row normalises the absent key to [] so its shape is stable.
+    if reconciliation_facts['reasons']:
+        answer['reconciliation_reasons']=reconciliation_facts['reasons']
+    answer['work_state']=RECONCILIATION_STATE if reconciliation_facts['needed'] else state
+    answer['next_actor']=next_actor(state,assignee,closed)
     warnings=answer.get('warnings')
     if warnings is not None:
         warnings.extend(disagreement_warnings(disagreements))
+        warnings.extend(reconciliation_warnings(reconciliation_facts['reasons']))
     return answer
 
 
@@ -391,4 +539,5 @@ def project(issue, scopes=None, operators=None, reverts=None, journal=None, inva
     raw=result['review_state']
     if raw=='none' and 'review-ready' in (issue.get('labels') or []):
         result=dict(result,review_state='legacy-review-ready')
-    return effective(result,scopes,raw)
+    return effective(result,scopes,raw,assignee=issue.get('assignee'),
+                     closed=issue.get('status')=='closed')
