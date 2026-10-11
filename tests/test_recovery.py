@@ -379,7 +379,7 @@ class ReviewRecoveryTests(unittest.TestCase):
         before = w.project(data[0])
         # A native `bd backup`/`restore-new` pair carries issues and comments verbatim.
         backup = ''.join(json.dumps(row, ensure_ascii=False) + '\n' for row in data)
-        restored = [json.loads(line) for line in backup.splitlines() if line.strip()]
+        restored = [json.loads(line) for line in backup.split('\n') if line.strip()]
         stored = {c['id']: c['text'] for c in restored[0]['comments']}
         self.assertEqual(stored['c2'], bad['text'])
         self.assertTrue(stored['w1'].startswith(recovery.PREFIX))

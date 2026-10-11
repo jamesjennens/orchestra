@@ -5,18 +5,56 @@ Start with `brief TASK`, then use `history` for the evidence you need. Both use 
 ```sh
 b brief example-task
 b brief example-task --json
+b brief example-task --full
 b history example-task --limit 5 --since 2026-09-15T12:00:00-04:00
+b history example-task --recent 10
+b history example-task --since-checkpoint
+b history example-task --since-my-checkpoint
+b history example-task --kind comment --recent 20
 b history example-task --cursor RETURNED_CURSOR
+b checkpoint example-task --latest
+b checkpoint example-task --latest --provenance
 b show example-task --json
 ```
 
 The default briefing answers who owns the task, its current position, unresolved items and next action. It also includes intent, acceptance, checkpoint author/time/branch/source commit and incorporated activity cursor, freshness, native dependencies, and six independent lifecycle facts with evidence pointers. A checkpoint does not set lifecycle facts; completed code never implies deployment. The native assignee remains authoritative.
+
+`brief TASK --full` is the explicit fuller-context read: the compact brief stays compact, and `--full` adds an additive `full_context` block with the title, owner, intent, acceptance, current position and next action, plus `omission_counts` naming exactly how many characters the compact read clipped from each field. The block is **bounded** like a history page: at most 20,000 encoded bytes in total and 8,000 for any one field, with `full_omitted_chars` naming what that cap removed, `truncated` listing the clipped fields, `complete` saying whether anything was capped, and control characters escaped exactly as the JSON form escapes them. `show TASK` keeps the complete text. It changes no existing field.
 
 The `review` object comes from the same projection used by `review TASK`, `work` and the review write receipt, so those surfaces cannot disagree about whether a contribution is integrated. It carries the raw `workflow_state` plus an additive `integration` block (`fact`, `scope`, `scope_token`, `source_commit`, `integration_commit`, `matches_contribution`, `newest_fact`, `newest_scope_token`); see [REVIEWS.md](REVIEWS.md). The top-level `lifecycle`/`lifecycle_scope` fields remain the newest recorded scope, and top-level `lifecycle_matches_contribution` keeps its original meaning — True only when that newest scope belongs to the current contribution's FULL commit. The ANY-scope answer is `review.integration.matches_contribution`, and integration is any-pass-wins with `newest_fact` exposing the newest matching value.
 
 An old task without a structured checkpoint reports its current position and unresolved coverage as **unknown**, not empty or complete. It shows bounded excerpts and directs the reader to reconcile history. Do not manufacture a checkpoint from only the last few comments. `show` retains the full native output; it can still exceed a calling tool's output limit.
 
 ## Publish a checkpoint
+
+`work --mine` also returns `items[].checkpoint_wait`, so the owned queue printed
+after host worker `resume` carries the worker's authored wait and next action.
+This is read-only context from that exact actor's latest validated checkpoint,
+not inferred recipient information or proof of authority. `status` is `recorded`,
+`none` (no own checkpoint), `unknown` (unreadable or invalid history), or
+`not-owned` (a row shown to another reader). `checkpoint` and `author` identify
+the source. `is_current` is false when a newer checkpoint by another actor exists;
+`active` is false when no wait remains, or for historical, closed or delivered review work. Review state
+still takes precedence over the authored next action.
+
+The projection includes only blocker/dependency items, at most three, with exact
+`total` and `omitted` counts. Text/source/next action are objects with `text` and
+`omitted_chars`: controls (C0 and C1, DEL included), the Unicode line/paragraph
+separators and the bidi controls are escaped before clipping to 400/240/600 characters.
+Questions, decisions and corrections do not become waits. Missing person wording
+stays missing; do not guess it from task titles or actor names. Use `brief TASK`
+for the current full unresolved-item page and reconcile before acting. Reads
+acknowledge nothing and add no native query to the owned work read.
+
+Each `work --mine` item also carries `whose_move` (`you`, `reviewer`, `coordinator` or
+`unknown`, relative to the calling actor) and `next`, one plain sentence saying whose
+move it is in words, both derived only from the validated review state the item already
+shows. A task with changes requested is the caller's work until a revision is delivered;
+one waiting for review or integration is the reviewer's or the coordinator's move. Where
+the caller's own current checkpoint records a blocker or dependency, `next` quotes that
+checkpoint's own next action, escaped; no person is inferred, and the move and the count
+stay the caller's. Items where the move is the caller's sort first, and top-level
+`your_move` carries their count in the answer.
 
 Read `brief --json`, reconcile relevant history and repository state, and save a UTF-8 JSON file using [the template](../templates/CHECKPOINT.json). Set `previous` to the current checkpoint's `comment_id` (or null for the first checkpoint) and copy the briefing's top-level `activity_cursor`. Fill in the real source commit and branch, or leave them empty when unknown.
 
@@ -64,6 +102,20 @@ Only use `checkpoint` to write the structured format. Malformed structured comme
 History returns JSON, with up to 5 entries and 4,000 encoded body bytes by default. `--limit` accepts 1–20; `--body-budget` accepts 256–8,000. Oversized comments are split into fragments retaining `entry_id`, character offset, total characters and `continued`. Concatenate fragments by entry ID and offset to recover the entire body. Metadata is additional to the body budget.
 
 `--since` is inclusive and requires `Z` or an explicit UTC offset. Each continuation cursor binds project, task, cutoff, snapshot and position. Continue with the exact returned token; omit `--since` or repeat the same instant. Ordering is timestamp followed by stable entry ID, including timestamp ties. An immutable server snapshot prevents gaps or duplicates when new activity arrives or old comments are edited during pagination. Start a new history request without a cursor to see that activity. The separate project activity feed supports novelty tracking across exports.
+
+`--recent N` (the same option as `--last N`) pages the same immutable snapshot newest-first: the newest N entries, then older pages through the returned `next_cursor`. It is a direction and page size in one, so it replaces `--limit` rather than combining with it; a fragmented body is still delivered in body order (offset and `continued` unchanged), so the newest-first read reconstructs exactly with no gaps or duplicates. The ordinary recent-review retrieval is `b history example-task --recent 10`. `--recent`/`--last` accept N in 1–20 (the same cap as `--limit`), which is the newest 20 entries per page; a larger N is refused and the refusal names `--recent`. A selection with nothing in it — no entries at all, no entries of the requested `--kind`, a `--since` instant in the future, or `--since-checkpoint` with nothing new — answers `total_entries: 0` with a null `next_cursor`, exactly like the same read without `--recent`.
+
+`--kind comment|event` filters entries server-side. `--since-checkpoint` selects the activity the baseline checkpoint did not incorporate. The baseline is the **newest valid checkpoint, by anyone** — the kit lets any project actor write a real checkpoint on a task it does not hold, so the newest record need not be the reader's own. `--since-my-checkpoint` uses this actor's own newest valid checkpoint instead. The answer names the baseline (`since_checkpoint`, `checkpoint_author`, `checkpoint_timestamp`) and states its evidence and its blind spots (`checkpoint_coverage`, `unverified_entries`, `checkpoint_note`), so a reader can tell from the answer alone what it was not shown:
+
+- `snapshot`: retained evidence from the **linked checkpoint chain** re-verifies every entry the checkpoint incorporated, so the read hides nothing it can prove.
+- `windowed`: some entries the checkpoint recorded have no per-entry evidence. They are returned only when they order after the checkpoint, and `unverified_entries` counts the current entries that may therefore be hiding an edit. `checkpoint_note` says so; run `checkpoint TASK --verify` or read the whole history first.
+- `unknown`: the baseline is a legacy record with no provenance. The released timestamp rule applies — every entry at or after the checkpoint is shown — and an entry edited since it, or an arrival backdated to before it, **cannot** be seen in this read.
+
+Recorded provenance makes the selection exact in both directions and is taken from the whole chain, not the newest record's own delta: a late backdated arrival or an entry edited since the checkpoint is included even though it sorts before the checkpoint entry, an entry edited after an **earlier** checkpoint is still surfaced after a later one, and an entry the chain provably already had is dropped so a timestamp tie is not reported twice. A tie that cannot be proven is retained rather than hidden. With no valid checkpoint it returns the whole snapshot and reports `since_checkpoint: null`. The result also reports `order`, `kind`, `snapshot_entries`, `total_entries` and `omitted_entries`, so a bounded read states its omissions.
+
+A cursor binds the direction, the kind filter and the checkpoint boundary as well as the snapshot and `--since`. Continue with the exact returned token alone, or repeat the same values; a mismatched direction, kind or boundary is refused. A cursor written by an earlier kit (no direction key) still reads as oldest-first, and unknown cursor keys are still refused.
+
+`checkpoint TASK --latest` is the bounded latest-checkpoint read: one record with its `comment_id`, author and timestamp, source commit and branch, activity cursor, intent, acceptance, summary, next action, open items and resolutions, plus `coverage` (`provenance` or `legacy`). Its retained provenance is returned as **counts** (`covered`, `digests`, `older`, `verifiable`, `complete`, `chain`), so a long task's answer stays small; `checkpoint TASK --latest --provenance` returns the digest map itself. It reads nothing else of the history and reports a missing checkpoint rather than inventing one.
 
 More unresolved items are available through `brief TASK --items-offset N`; the default is five per page, maximum ten. This is a fresh current-state query, so re-read after a checkpoint change. Dependency counts and omitted counts are explicit; use `show` for all native edges.
 

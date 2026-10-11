@@ -298,15 +298,23 @@ export function createMock(options = {}) {
     const tasks = db.tasks.filter((t) => t.project_id === p.pid).length;
     const agents = Object.values(db.users).filter((u) => u.agent_of && (db.memberships[p.pid] || {})[u.id]);
     const operator = 'The web interface cannot do this step. It is done on the server, by an operator, with the command shown. If you are also the operator, run it there; otherwise send the command to whoever is.';
-    const step = (id, title, state, detail, who, who_text, extra = {}) => ({ id, title, state, detail, who, who_text, link: null, command: null, note: null, ...extra });
+    const entry = (kind, label, text, note, replace = []) => ({ kind, label, text, note, replace });
+    const step = (id, title, state, detail, who, who_text, extra = {}) => {
+      const commands = Array.isArray(extra.commands) ? extra.commands : [];
+      return { id, title, state, detail, who, who_text, link: null,
+        command: commands.length ? commands[0].text : null, commands, note: null, ...extra };
+    };
     const steps = [
       step('members', 'Add the people who will work in this project', members > 1 ? 'done' : 'optional', members > 1 ? `${members} members.` : 'You are the only member. That is fine if you work alone; otherwise add the others.', 'owner', 'A project owner', { note: 'An owner adds contributors and viewers. Only a superuser can make someone an owner.' }),
       step('repository', "Record where the project's repository is", project.repository ? 'done' : 'todo', project.repository ? 'Recorded: ' + project.repository : 'Not recorded. An agent needs a clone of the repository with a remote it can push to; this tells it which repository that is.', 'owner', 'A project owner', { note: "Orchestra stores this as a label and shows it to members and their agents. It does not check that the repository exists, that anyone can reach it, or that an agent's clone points at it." }),
       step('first-task', 'Define a first task', tasks ? 'done' : 'todo', tasks ? `${tasks} task(s) defined.` : 'No task yet. Define the first piece of work so that someone, or an agent, can claim it.', 'member', 'Any member who may write tasks'),
       step('agent', 'Grant a personal agent this project', agents.length ? 'done' : 'todo', agents.length ? `${agents.length} agent(s) may work here.` : 'No agent may work here yet. Each member creates their own agent and grants it this project; the agent page gives the setup text to copy to the machine the agent runs on.', 'each-member', 'Each member, for their own agent', { note: "An agent belongs to the member who created it. You can see that other members' agents exist here, not their setup." }),
-      step('guidance', 'Set the standing guidance every worker reads', 'todo', 'Not set. Guidance is the short standing instruction every worker and agent reads at the start of a run.', 'operator', 'An operator, on the server that runs Orchestra', { command: `admin.py set-guidance ${p.pid} --actor OPERATOR --file FILE`, note: operator }),
+      step('guidance', 'Set the standing guidance every worker reads', 'todo', 'Not set. Guidance is the short standing instruction every worker and agent reads at the start of a run.', 'operator', 'An operator, on the server that runs Orchestra', { commands: [entry('shell-fill', 'Set the guidance (a shell command)', `admin.py set-guidance ${p.pid} --actor OPERATOR --file FILE`, operator, ['OPERATOR', 'FILE'])] }),
       step('onboarding', "Set the project's onboarding entry point", 'done', 'Set (last changed 2026-10-01).', 'operator', 'An operator, on the server that runs Orchestra'),
-      step('backup', 'Make sure a scheduled backup covers this project', 'todo', 'No scheduled backup on the server covers this project. An operator adds the line shown to the backup schedule, or names this project in the existing one. No backup run has recorded this project yet.', 'operator', 'An operator, on the server that runs Orchestra', { command: 'ExecStart=/usr/bin/python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime backup --all', note: operator }),
+      step('backup', 'Make sure a scheduled backup covers this project', 'todo', 'No systemd user schedule was found for this project, and no backup run has recorded it yet. An operator adds the line shown to the schedule, or names this project in the existing one.', 'operator', 'An operator, on the server that runs Orchestra', { commands: [
+        entry('shell', 'Run a backup now (a shell command)', '/usr/bin/python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime backup --all', 'It backs up every project of this server once. It does not schedule anything.'),
+        entry('unit-line', 'The line for a schedule (not a shell command)', 'ExecStart=/usr/bin/python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime backup --all', operator),
+        entry('shell', 'Check', '/usr/bin/python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime backup-status --require-complete', null)] }),
     ];
     return ok({ project: { id: p.pid, name: project.name, repository: project.repository || null }, steps, remaining: steps.filter((s) => s.state === 'todo').length, host: 'available', generated_at: new Date().toISOString() });
   });

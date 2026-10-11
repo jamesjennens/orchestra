@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "operation_id": "caprev-890119283b6748948a2f386c1a28427d",
+  "key": "requirements.owner-drafts",
+  "name": "Human project owners create and edit requirements drafts",
+  "aliases": [
+    "owner requirement create",
+    "owner requirement edit",
+    "pending owner edit",
+    "contributor replace owner draft",
+    "propose a requirements change",
+    "owner requirement recovery"
+  ],
+  "summary": "In simple mode the signed-in project owner creates and edits requirements drafts under current membership, governance and content checks. Contributors propose changes to protected human drafts. Failed-creation recovery lists at most 20 intents with counts and one complete export/membership proof. Missing prewrite receipts have a distinct nothing-written message and an account/request-bound retained clear audit; damaged or special files cannot block the reader. Valid title/time metadata is displayed when available. Recovery listing preserves fixed enable-editing and operator-repair advice; CREATE keeps its own canonical refusal sentences, while bounded receipt reads hide file paths at their source; transient native reads advise reload. Clearing still needs current locks, exact receipt hash and native absence; allocated or uncertain content is not invented. Governed/host policies and machine credential authority are unchanged.",
+  "requirements": [],
+  "anchors": [
+    "docs/REQUIREMENTS.md#editing-a-projects-requirements-in-the-web-interface"
+  ],
+  "code": [
+    "requirement_http.py::apply",
+    "requirement_http.py::web_action",
+    "requirement_records.py::apply_native",
+    "requirement_http.py::recovery_projection"
+  ],
+  "tests": [
+    "tests/test_http_requirements_owner.py",
+    "tests/test_requirement_owner_records.py",
+    "tests/test_requirement_owner_real_bd.py",
+    "tests/test_owner_recovery_second.py"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "requirements",
+    "owner",
+    "drafts"
+  ],
+  "revision": 5,
+  "expected_sha256": "831852a1adb03f9402720f275d0284979503d8861c7e8604dd547c5d6b008b64"
+}

@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "operation_id": "capnew-5bb196-bound-keys-only-0001",
+  "key": "ssh.bound-keys-only",
+  "name": "An installation can accept bound keys only",
+  "aliases": [
+    "bound keys only",
+    "the bound-keys-only installation setting",
+    "an authorized_keys line without a project or a principal is refused",
+    "coordinators per project slice 4"
+  ],
+  "summary": "One installation setting: deployment.private.json's bound_keys_only, absent or false meaning off, so a bare installation is unchanged. admin.py bound-keys-only status|on|off --actor OPERATOR [--file FILE] is operator-gated, holds the deployment config lock, writes nothing when nothing changes, and appends to bound_keys_only_audit, keeping the last 20 flips. status reports audit_agrees and would_be_refused - the lines of this kit and root the setting refuses, or would refuse while off - and on prints that list. With it on, ssh_forced_command.py reads the runtime's own settings file (at most 1 MiB) and refuses, before selecting or running anything, a line naming no --project or no --principal: exit 2, the missing part named, nothing run; a line naming both runs as before. A settings file that cannot be read refuses every forced-command key, saying the installation setting could not be read (no path or value to the contributor); a non-bool value reads as off with a flushed warning. setup-status reports a bound_keys_only block; authorized-keys refuses to print a line the setting would refuse; authorized-keys-list flags such lines and names other-kit or other-root lines as not reached.",
+  "requirements": [],
+  "anchors": [
+    "docs/OPERATIONS.md#accept-bound-keys-only"
+  ],
+  "code": [
+    "admin.py::bound_keys_only",
+    "admin.py::bound_keys_only_switch",
+    "admin.py::bound_keys_only_audit",
+    "admin.py::bound_keys_only_would_refuse",
+    "admin.py::project_setup_status",
+    "admin.py::authorized_keys",
+    "admin.py::authorized_keys_listing",
+    "ssh_forced_command.py::bound_keys_only",
+    "ssh_forced_command.py::main"
+  ],
+  "tests": [
+    "tests/test_bound_keys_only.py"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "ssh",
+    "operations",
+    "security"
+  ]
+}

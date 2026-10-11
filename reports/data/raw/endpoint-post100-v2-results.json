@@ -1,0 +1,1465 @@
+[
+  {
+    "operation": "release-fixture-create",
+    "databases": 100,
+    "rep": 0,
+    "seconds": 5.741825967095792,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      13.8505859375,
+      10.98046875,
+      8.24169921875
+    ],
+    "available_GiB": 115.07658767700195,
+    "trace": "endpoint-post100-v2-100-0-release-fixture-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 5023,
+    "query_ms_sum": 5148
+  },
+  {
+    "operation": "release-fixture-scope",
+    "databases": 100,
+    "rep": 0,
+    "seconds": 5.991016143001616,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      13.3818359375,
+      10.9306640625,
+      8.240234375
+    ],
+    "available_GiB": 114.68937683105469,
+    "trace": "endpoint-post100-v2-100-0-release-fixture-scope.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 4610,
+    "query_ms_sum": 5036
+  },
+  {
+    "operation": "release-fixture-integrated",
+    "databases": 100,
+    "rep": 0,
+    "seconds": 6.435365810059011,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      12.79052734375,
+      10.8486328125,
+      8.22802734375
+    ],
+    "available_GiB": 114.26887893676758,
+    "trace": "endpoint-post100-v2-100-0-release-fixture-integrated.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 5093,
+    "query_ms_sum": 5498
+  },
+  {
+    "operation": "release-fixture-create",
+    "databases": 100,
+    "rep": 1,
+    "seconds": 5.404306733049452,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      12.56689453125,
+      10.83447265625,
+      8.23779296875
+    ],
+    "available_GiB": 114.14268493652344,
+    "trace": "endpoint-post100-v2-100-1-release-fixture-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 4594,
+    "query_ms_sum": 4736
+  },
+  {
+    "operation": "release-fixture-scope",
+    "databases": 100,
+    "rep": 1,
+    "seconds": 5.748557444894686,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      12.201171875,
+      10.787109375,
+      8.236328125
+    ],
+    "available_GiB": 114.13914489746094,
+    "trace": "endpoint-post100-v2-100-1-release-fixture-scope.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 4406,
+    "query_ms_sum": 4900
+  },
+  {
+    "operation": "release-fixture-integrated",
+    "databases": 100,
+    "rep": 1,
+    "seconds": 5.881963318912312,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.94482421875,
+      10.75732421875,
+      8.24072265625
+    ],
+    "available_GiB": 114.2088508605957,
+    "trace": "endpoint-post100-v2-100-1-release-fixture-integrated.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 4438,
+    "query_ms_sum": 4836
+  },
+  {
+    "operation": "release-fixture-create",
+    "databases": 100,
+    "rep": 2,
+    "seconds": 5.4102427929174155,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.49169921875,
+      10.69921875,
+      8.24951171875
+    ],
+    "available_GiB": 114.12227630615234,
+    "trace": "endpoint-post100-v2-100-2-release-fixture-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 4708,
+    "query_ms_sum": 4834
+  },
+  {
+    "operation": "release-fixture-scope",
+    "databases": 100,
+    "rep": 2,
+    "seconds": 6.311188628897071,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.3720703125,
+      10.6875,
+      8.25927734375
+    ],
+    "available_GiB": 114.16287612915039,
+    "trace": "endpoint-post100-v2-100-2-release-fixture-scope.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 5034,
+    "query_ms_sum": 5457
+  },
+  {
+    "operation": "release-fixture-integrated",
+    "databases": 100,
+    "rep": 2,
+    "seconds": 5.692902171984315,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.50244140625,
+      10.72607421875,
+      8.28515625
+    ],
+    "available_GiB": 113.95976257324219,
+    "trace": "endpoint-post100-v2-100-2-release-fixture-integrated.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 4433,
+    "query_ms_sum": 4823
+  },
+  {
+    "operation": "release-fixture-create",
+    "databases": 100,
+    "rep": 3,
+    "seconds": 5.189398291986436,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.54248046875,
+      10.74755859375,
+      8.30517578125
+    ],
+    "available_GiB": 114.05282211303711,
+    "trace": "endpoint-post100-v2-100-3-release-fixture-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 4520,
+    "query_ms_sum": 4645
+  },
+  {
+    "operation": "release-fixture-scope",
+    "databases": 100,
+    "rep": 3,
+    "seconds": 5.7157766839955,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.4189453125,
+      10.73486328125,
+      8.314453125
+    ],
+    "available_GiB": 114.05632781982422,
+    "trace": "endpoint-post100-v2-100-3-release-fixture-scope.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 4407,
+    "query_ms_sum": 4853
+  },
+  {
+    "operation": "release-fixture-integrated",
+    "databases": 100,
+    "rep": 3,
+    "seconds": 6.179517069132999,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.14501953125,
+      10.689453125,
+      8.3125
+    ],
+    "available_GiB": 113.99979782104492,
+    "trace": "endpoint-post100-v2-100-3-release-fixture-integrated.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 4843,
+    "query_ms_sum": 5235
+  },
+  {
+    "operation": "release-fixture-create",
+    "databases": 100,
+    "rep": 4,
+    "seconds": 5.317546290112659,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      12.375,
+      10.9775390625,
+      8.4326171875
+    ],
+    "available_GiB": 114.0201644897461,
+    "trace": "endpoint-post100-v2-100-4-release-fixture-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 4600,
+    "query_ms_sum": 4726
+  },
+  {
+    "operation": "release-fixture-scope",
+    "databases": 100,
+    "rep": 4,
+    "seconds": 5.934336491860449,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      12.2646484375,
+      10.97802734375,
+      8.44677734375
+    ],
+    "available_GiB": 114.05408096313477,
+    "trace": "endpoint-post100-v2-100-4-release-fixture-scope.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 4643,
+    "query_ms_sum": 5040
+  },
+  {
+    "operation": "release-fixture-integrated",
+    "databases": 100,
+    "rep": 4,
+    "seconds": 6.2391684169415385,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      12.0029296875,
+      10.94482421875,
+      8.4501953125
+    ],
+    "available_GiB": 114.04121017456055,
+    "trace": "endpoint-post100-v2-100-4-release-fixture-integrated.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 4680,
+    "query_ms_sum": 5262
+  },
+  {
+    "operation": "release-fixture-create",
+    "databases": 100,
+    "rep": 5,
+    "seconds": 5.275533050997183,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.68212890625,
+      10.8955078125,
+      8.44775390625
+    ],
+    "available_GiB": 113.97015762329102,
+    "trace": "endpoint-post100-v2-100-5-release-fixture-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 4485,
+    "query_ms_sum": 4654
+  },
+  {
+    "operation": "release-fixture-scope",
+    "databases": 100,
+    "rep": 5,
+    "seconds": 6.506330149946734,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.7080078125,
+      10.9140625,
+      8.46728515625
+    ],
+    "available_GiB": 113.92499542236328,
+    "trace": "endpoint-post100-v2-100-5-release-fixture-scope.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 5155,
+    "query_ms_sum": 5634
+  },
+  {
+    "operation": "release-fixture-integrated",
+    "databases": 100,
+    "rep": 5,
+    "seconds": 5.977465197909623,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      12.77099609375,
+      11.177734375,
+      8.580078125
+    ],
+    "available_GiB": 113.90362930297852,
+    "trace": "endpoint-post100-v2-100-5-release-fixture-integrated.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 4646,
+    "query_ms_sum": 5052
+  },
+  {
+    "operation": "release-fixture-create",
+    "databases": 100,
+    "rep": 6,
+    "seconds": 5.446936215041205,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      12.388671875,
+      11.12451171875,
+      8.57666015625
+    ],
+    "available_GiB": 113.96639633178711,
+    "trace": "endpoint-post100-v2-100-6-release-fixture-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 4676,
+    "query_ms_sum": 4816
+  },
+  {
+    "operation": "release-fixture-scope",
+    "databases": 100,
+    "rep": 6,
+    "seconds": 6.031043417053297,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      12.037109375,
+      11.072265625,
+      8.5732421875
+    ],
+    "available_GiB": 113.88554763793945,
+    "trace": "endpoint-post100-v2-100-6-release-fixture-scope.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 4582,
+    "query_ms_sum": 5029
+  },
+  {
+    "operation": "release-fixture-integrated",
+    "databases": 100,
+    "rep": 6,
+    "seconds": 6.007764453068376,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.79345703125,
+      11.03759765625,
+      8.57568359375
+    ],
+    "available_GiB": 113.9062614440918,
+    "trace": "endpoint-post100-v2-100-6-release-fixture-integrated.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 4685,
+    "query_ms_sum": 5116
+  },
+  {
+    "operation": "release-fixture-create",
+    "databases": 100,
+    "rep": 7,
+    "seconds": 5.024827003013343,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.4892578125,
+      10.98681640625,
+      8.572265625
+    ],
+    "available_GiB": 113.86050796508789,
+    "trace": "endpoint-post100-v2-100-7-release-fixture-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 4375,
+    "query_ms_sum": 4496
+  },
+  {
+    "operation": "release-fixture-scope",
+    "databases": 100,
+    "rep": 7,
+    "seconds": 6.2427567390259355,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.04931640625,
+      10.90380859375,
+      8.55810546875
+    ],
+    "available_GiB": 113.88515090942383,
+    "trace": "endpoint-post100-v2-100-7-release-fixture-scope.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 4766,
+    "query_ms_sum": 5227
+  },
+  {
+    "operation": "release-fixture-integrated",
+    "databases": 100,
+    "rep": 7,
+    "seconds": 6.501940949819982,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      15.080078125,
+      11.8046875,
+      8.87841796875
+    ],
+    "available_GiB": 113.75871658325195,
+    "trace": "endpoint-post100-v2-100-7-release-fixture-integrated.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 4578,
+    "query_ms_sum": 4989
+  },
+  {
+    "operation": "release-fixture-create",
+    "databases": 100,
+    "rep": 8,
+    "seconds": 5.727111394982785,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      14.6728515625,
+      11.7744140625,
+      8.884765625
+    ],
+    "available_GiB": 113.84754943847656,
+    "trace": "endpoint-post100-v2-100-8-release-fixture-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 5053,
+    "query_ms_sum": 5197
+  },
+  {
+    "operation": "release-fixture-scope",
+    "databases": 100,
+    "rep": 8,
+    "seconds": 5.947316267993301,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      14.21826171875,
+      11.72802734375,
+      8.8857421875
+    ],
+    "available_GiB": 113.83398056030273,
+    "trace": "endpoint-post100-v2-100-8-release-fixture-scope.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 4516,
+    "query_ms_sum": 4954
+  },
+  {
+    "operation": "release-fixture-integrated",
+    "databases": 100,
+    "rep": 8,
+    "seconds": 6.086876143934205,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      13.80029296875,
+      11.6826171875,
+      8.88671875
+    ],
+    "available_GiB": 113.85700988769531,
+    "trace": "endpoint-post100-v2-100-8-release-fixture-integrated.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 4786,
+    "query_ms_sum": 5185
+  },
+  {
+    "operation": "release-fixture-create",
+    "databases": 100,
+    "rep": 9,
+    "seconds": 6.019529239041731,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      13.65576171875,
+      11.68798828125,
+      8.90380859375
+    ],
+    "available_GiB": 113.71221160888672,
+    "trace": "endpoint-post100-v2-100-9-release-fixture-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 5211,
+    "query_ms_sum": 5373
+  },
+  {
+    "operation": "release-fixture-scope",
+    "databases": 100,
+    "rep": 9,
+    "seconds": 6.3815866550430655,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      17.6416015625,
+      12.6435546875,
+      9.2470703125
+    ],
+    "available_GiB": 113.76365280151367,
+    "trace": "endpoint-post100-v2-100-9-release-fixture-scope.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 5020,
+    "query_ms_sum": 5406
+  },
+  {
+    "operation": "release-fixture-integrated",
+    "databases": 100,
+    "rep": 9,
+    "seconds": 5.716940796934068,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      16.94921875,
+      12.5830078125,
+      9.24560546875
+    ],
+    "available_GiB": 113.66342163085938,
+    "trace": "endpoint-post100-v2-100-9-release-fixture-integrated.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 4301,
+    "query_ms_sum": 4730
+  },
+  {
+    "operation": "release-fixture-create",
+    "databases": 100,
+    "rep": 10,
+    "seconds": 5.24846734595485,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      16.552734375,
+      12.5732421875,
+      9.2607421875
+    ],
+    "available_GiB": 113.7579116821289,
+    "trace": "endpoint-post100-v2-100-10-release-fixture-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 4559,
+    "query_ms_sum": 4692
+  },
+  {
+    "operation": "release-fixture-scope",
+    "databases": 100,
+    "rep": 10,
+    "seconds": 5.820014110067859,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      15.86767578125,
+      12.4970703125,
+      9.25390625
+    ],
+    "available_GiB": 114.10982894897461,
+    "trace": "endpoint-post100-v2-100-10-release-fixture-scope.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 4250,
+    "query_ms_sum": 4751
+  },
+  {
+    "operation": "release-fixture-integrated",
+    "databases": 100,
+    "rep": 10,
+    "seconds": 5.705873592989519,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      15.1572265625,
+      12.40576171875,
+      9.24169921875
+    ],
+    "available_GiB": 114.04659271240234,
+    "trace": "endpoint-post100-v2-100-10-release-fixture-integrated.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 4443,
+    "query_ms_sum": 4831
+  },
+  {
+    "operation": "release-fixture-create",
+    "databases": 100,
+    "rep": 11,
+    "seconds": 5.518245179904625,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      14.744140625,
+      12.36572265625,
+      9.24609375
+    ],
+    "available_GiB": 114.00696563720703,
+    "trace": "endpoint-post100-v2-100-11-release-fixture-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 4848,
+    "query_ms_sum": 5004
+  },
+  {
+    "operation": "release-fixture-scope",
+    "databases": 100,
+    "rep": 11,
+    "seconds": 5.7850146340206265,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      14.0078125,
+      12.287109375,
+      9.25439453125
+    ],
+    "available_GiB": 113.98556518554688,
+    "trace": "endpoint-post100-v2-100-11-release-fixture-scope.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 4395,
+    "query_ms_sum": 4871
+  },
+  {
+    "operation": "release-fixture-integrated",
+    "databases": 100,
+    "rep": 11,
+    "seconds": 5.7078747290652245,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      13.6064453125,
+      12.232421875,
+      9.2529296875
+    ],
+    "available_GiB": 114.03142929077148,
+    "trace": "endpoint-post100-v2-100-11-release-fixture-integrated.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 4481,
+    "query_ms_sum": 4855
+  },
+  {
+    "operation": "release-fixture-create",
+    "databases": 100,
+    "rep": 12,
+    "seconds": 5.0161143420264125,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      13.3974609375,
+      12.2119140625,
+      9.2626953125
+    ],
+    "available_GiB": 114.05438995361328,
+    "trace": "endpoint-post100-v2-100-12-release-fixture-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 4286,
+    "query_ms_sum": 4435
+  },
+  {
+    "operation": "release-fixture-scope",
+    "databases": 100,
+    "rep": 12,
+    "seconds": 5.806620081188157,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      12.724609375,
+      12.091796875,
+      9.23974609375
+    ],
+    "available_GiB": 114.037353515625,
+    "trace": "endpoint-post100-v2-100-12-release-fixture-scope.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 4328,
+    "query_ms_sum": 4817
+  },
+  {
+    "operation": "release-fixture-integrated",
+    "databases": 100,
+    "rep": 12,
+    "seconds": 5.628520294092596,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      12.26611328125,
+      12.0068359375,
+      9.2275390625
+    ],
+    "available_GiB": 113.9867935180664,
+    "trace": "endpoint-post100-v2-100-12-release-fixture-integrated.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 4282,
+    "query_ms_sum": 4745
+  },
+  {
+    "operation": "release-fixture-create",
+    "databases": 100,
+    "rep": 13,
+    "seconds": 5.1186584029346704,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      12.00439453125,
+      11.95654296875,
+      9.22607421875
+    ],
+    "available_GiB": 113.97444915771484,
+    "trace": "endpoint-post100-v2-100-13-release-fixture-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 4407,
+    "query_ms_sum": 4540
+  },
+  {
+    "operation": "release-fixture-scope",
+    "databases": 100,
+    "rep": 13,
+    "seconds": 6.047613583970815,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.603515625,
+      11.8740234375,
+      9.2138671875
+    ],
+    "available_GiB": 113.94281005859375,
+    "trace": "endpoint-post100-v2-100-13-release-fixture-scope.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 4534,
+    "query_ms_sum": 5040
+  },
+  {
+    "operation": "release-fixture-integrated",
+    "databases": 100,
+    "rep": 13,
+    "seconds": 5.951502098934725,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.39501953125,
+      11.826171875,
+      9.21240234375
+    ],
+    "available_GiB": 113.94994354248047,
+    "trace": "endpoint-post100-v2-100-13-release-fixture-integrated.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 4652,
+    "query_ms_sum": 5074
+  },
+  {
+    "operation": "release-fixture-create",
+    "databases": 100,
+    "rep": 14,
+    "seconds": 5.240660545183346,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      10.8662109375,
+      11.69921875,
+      9.19873046875
+    ],
+    "available_GiB": 113.92862701416016,
+    "trace": "endpoint-post100-v2-100-14-release-fixture-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 4553,
+    "query_ms_sum": 4684
+  },
+  {
+    "operation": "release-fixture-scope",
+    "databases": 100,
+    "rep": 14,
+    "seconds": 6.073369195917621,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      10.55615234375,
+      11.62109375,
+      9.1865234375
+    ],
+    "available_GiB": 113.97238159179688,
+    "trace": "endpoint-post100-v2-100-14-release-fixture-scope.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 4533,
+    "query_ms_sum": 5091
+  },
+  {
+    "operation": "release-fixture-integrated",
+    "databases": 100,
+    "rep": 14,
+    "seconds": 6.341574436984956,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      10.19091796875,
+      11.52734375,
+      9.1689453125
+    ],
+    "available_GiB": 113.92687606811523,
+    "trace": "endpoint-post100-v2-100-14-release-fixture-integrated.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 4803,
+    "query_ms_sum": 5330
+  },
+  {
+    "operation": "release-fixture-create",
+    "databases": 100,
+    "rep": 15,
+    "seconds": 5.3905902109108865,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      10.3359375,
+      11.53564453125,
+      9.1845703125
+    ],
+    "available_GiB": 113.90246200561523,
+    "trace": "endpoint-post100-v2-100-15-release-fixture-create.jsonl",
+    "query_count": 65,
+    "catalog_query_count": 2,
+    "catalog_ms": 4677,
+    "query_ms_sum": 4809
+  },
+  {
+    "operation": "release-fixture-scope",
+    "databases": 100,
+    "rep": 15,
+    "seconds": 6.050882515031844,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      10.30859375,
+      11.509765625,
+      9.18896484375
+    ],
+    "available_GiB": 113.93494415283203,
+    "trace": "endpoint-post100-v2-100-15-release-fixture-scope.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 4673,
+    "query_ms_sum": 5140
+  },
+  {
+    "operation": "release-fixture-integrated",
+    "databases": 100,
+    "rep": 15,
+    "seconds": 6.34563021780923,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      10.1748046875,
+      11.4423828125,
+      9.19189453125
+    ],
+    "available_GiB": 113.83803939819336,
+    "trace": "endpoint-post100-v2-100-15-release-fixture-integrated.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 4865,
+    "query_ms_sum": 5385
+  },
+  {
+    "operation": "release-fixture-create",
+    "databases": 100,
+    "rep": 16,
+    "seconds": 5.736466079950333,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      10.16064453125,
+      11.41796875,
+      9.1962890625
+    ],
+    "available_GiB": 113.89558792114258,
+    "trace": "endpoint-post100-v2-100-16-release-fixture-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 5034,
+    "query_ms_sum": 5165
+  },
+  {
+    "operation": "release-fixture-scope",
+    "databases": 100,
+    "rep": 16,
+    "seconds": 6.270886536920443,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      10.38818359375,
+      11.4443359375,
+      9.216796875
+    ],
+    "available_GiB": 113.76240921020508,
+    "trace": "endpoint-post100-v2-100-16-release-fixture-scope.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 4838,
+    "query_ms_sum": 5306
+  },
+  {
+    "operation": "release-fixture-integrated",
+    "databases": 100,
+    "rep": 16,
+    "seconds": 6.232220592908561,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      15.482421875,
+      12.48291015625,
+      9.56494140625
+    ],
+    "available_GiB": 113.71305465698242,
+    "trace": "endpoint-post100-v2-100-16-release-fixture-integrated.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 4781,
+    "query_ms_sum": 5276
+  },
+  {
+    "operation": "release-fixture-create",
+    "databases": 100,
+    "rep": 17,
+    "seconds": 5.4002661081030965,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      14.962890625,
+      12.4248046875,
+      9.5615234375
+    ],
+    "available_GiB": 113.70670700073242,
+    "trace": "endpoint-post100-v2-100-17-release-fixture-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 4767,
+    "query_ms_sum": 4900
+  },
+  {
+    "operation": "release-fixture-scope",
+    "databases": 100,
+    "rep": 17,
+    "seconds": 6.380309616914019,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      14.13232421875,
+      12.32861328125,
+      9.560546875
+    ],
+    "available_GiB": 113.70633697509766,
+    "trace": "endpoint-post100-v2-100-17-release-fixture-scope.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 4969,
+    "query_ms_sum": 5439
+  },
+  {
+    "operation": "release-fixture-integrated",
+    "databases": 100,
+    "rep": 17,
+    "seconds": 6.473664112156257,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      13.96142578125,
+      12.32275390625,
+      9.57373046875
+    ],
+    "available_GiB": 113.69885635375977,
+    "trace": "endpoint-post100-v2-100-17-release-fixture-integrated.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 4999,
+    "query_ms_sum": 5485
+  },
+  {
+    "operation": "release-fixture-create",
+    "databases": 100,
+    "rep": 18,
+    "seconds": 5.623470686143264,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      13.40380859375,
+      12.234375,
+      9.5595703125
+    ],
+    "available_GiB": 113.76327133178711,
+    "trace": "endpoint-post100-v2-100-18-release-fixture-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 4953,
+    "query_ms_sum": 5102
+  },
+  {
+    "operation": "release-fixture-scope",
+    "databases": 100,
+    "rep": 18,
+    "seconds": 6.359430768061429,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      13.291015625,
+      12.23046875,
+      9.57275390625
+    ],
+    "available_GiB": 113.65777969360352,
+    "trace": "endpoint-post100-v2-100-18-release-fixture-scope.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 4841,
+    "query_ms_sum": 5372
+  },
+  {
+    "operation": "release-fixture-integrated",
+    "databases": 100,
+    "rep": 18,
+    "seconds": 6.059043935965747,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      12.9384765625,
+      12.189453125,
+      9.58837890625
+    ],
+    "available_GiB": 113.60982513427734,
+    "trace": "endpoint-post100-v2-100-18-release-fixture-integrated.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 4657,
+    "query_ms_sum": 5121
+  },
+  {
+    "operation": "release-fixture-create",
+    "databases": 100,
+    "rep": 19,
+    "seconds": 5.441346711944789,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      12.783203125,
+      12.16943359375,
+      9.59619140625
+    ],
+    "available_GiB": 113.62638092041016,
+    "trace": "endpoint-post100-v2-100-19-release-fixture-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 4729,
+    "query_ms_sum": 4848
+  },
+  {
+    "operation": "release-fixture-scope",
+    "databases": 100,
+    "rep": 19,
+    "seconds": 6.191371714929119,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      12.56005859375,
+      12.13330078125,
+      9.5986328125
+    ],
+    "available_GiB": 113.63727951049805,
+    "trace": "endpoint-post100-v2-100-19-release-fixture-scope.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 4840,
+    "query_ms_sum": 5291
+  },
+  {
+    "operation": "release-fixture-integrated",
+    "databases": 100,
+    "rep": 19,
+    "seconds": 6.386786327930167,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      12.51513671875,
+      12.130859375,
+      9.61181640625
+    ],
+    "available_GiB": 113.63640213012695,
+    "trace": "endpoint-post100-v2-100-19-release-fixture-integrated.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 5074,
+    "query_ms_sum": 5533
+  },
+  {
+    "operation": "release-fixture-create",
+    "databases": 100,
+    "rep": 20,
+    "seconds": 5.2905167730059475,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      12.3134765625,
+      12.09521484375,
+      9.6142578125
+    ],
+    "available_GiB": 113.57548522949219,
+    "trace": "endpoint-post100-v2-100-20-release-fixture-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 4676,
+    "query_ms_sum": 4792
+  },
+  {
+    "operation": "release-fixture-scope",
+    "databases": 100,
+    "rep": 20,
+    "seconds": 5.827380786882713,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      12.1845703125,
+      12.07470703125,
+      9.63525390625
+    ],
+    "available_GiB": 113.55440521240234,
+    "trace": "endpoint-post100-v2-100-20-release-fixture-scope.jsonl",
+    "query_count": 129,
+    "catalog_query_count": 2,
+    "catalog_ms": 4439,
+    "query_ms_sum": 4947
+  },
+  {
+    "operation": "release-fixture-integrated",
+    "databases": 100,
+    "rep": 20,
+    "seconds": 6.188467578031123,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      12.08935546875,
+      12.056640625,
+      9.64306640625
+    ],
+    "available_GiB": 113.58798599243164,
+    "trace": "endpoint-post100-v2-100-20-release-fixture-integrated.jsonl",
+    "query_count": 136,
+    "catalog_query_count": 2,
+    "catalog_ms": 4734,
+    "query_ms_sum": 5225
+  },
+  {
+    "operation": "release-fixture-create",
+    "databases": 100,
+    "rep": 21,
+    "seconds": 5.342967310920358,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.921875,
+      12.0224609375,
+      9.64501953125
+    ],
+    "available_GiB": 113.59196853637695,
+    "trace": "endpoint-post100-v2-100-21-release-fixture-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 4747,
+    "query_ms_sum": 4870
+  },
+  {
+    "operation": "release-fixture-scope",
+    "databases": 100,
+    "rep": 21,
+    "seconds": 6.465893694898114,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.84765625,
+      12.00537109375,
+      9.65234375
+    ],
+    "available_GiB": 113.68989181518555,
+    "trace": "endpoint-post100-v2-100-21-release-fixture-scope.jsonl",
+    "query_count": 136,
+    "catalog_query_count": 2,
+    "catalog_ms": 5051,
+    "query_ms_sum": 5533
+  },
+  {
+    "operation": "release-fixture-integrated",
+    "databases": 100,
+    "rep": 21,
+    "seconds": 5.972496981965378,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.619140625,
+      11.955078125,
+      9.6484375
+    ],
+    "available_GiB": 113.61941146850586,
+    "trace": "endpoint-post100-v2-100-21-release-fixture-integrated.jsonl",
+    "query_count": 136,
+    "catalog_query_count": 2,
+    "catalog_ms": 4618,
+    "query_ms_sum": 5032
+  },
+  {
+    "operation": "release-fixture-create",
+    "databases": 100,
+    "rep": 22,
+    "seconds": 5.642197638051584,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      12.0458984375,
+      12.0380859375,
+      9.70068359375
+    ],
+    "available_GiB": 113.35056686401367,
+    "trace": "endpoint-post100-v2-100-22-release-fixture-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 4895,
+    "query_ms_sum": 5042
+  },
+  {
+    "operation": "release-fixture-scope",
+    "databases": 100,
+    "rep": 22,
+    "seconds": 6.1264987390022725,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      12.0419921875,
+      12.037109375,
+      9.71337890625
+    ],
+    "available_GiB": 113.47334671020508,
+    "trace": "endpoint-post100-v2-100-22-release-fixture-scope.jsonl",
+    "query_count": 136,
+    "catalog_query_count": 2,
+    "catalog_ms": 4744,
+    "query_ms_sum": 5220
+  },
+  {
+    "operation": "release-fixture-integrated",
+    "databases": 100,
+    "rep": 22,
+    "seconds": 6.231857142876834,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.87841796875,
+      12.0029296875,
+      9.71533203125
+    ],
+    "available_GiB": 113.43206787109375,
+    "trace": "endpoint-post100-v2-100-22-release-fixture-integrated.jsonl",
+    "query_count": 136,
+    "catalog_query_count": 2,
+    "catalog_ms": 4807,
+    "query_ms_sum": 5275
+  },
+  {
+    "operation": "release-fixture-create",
+    "databases": 100,
+    "rep": 23,
+    "seconds": 5.258609864860773,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.7275390625,
+      11.96923828125,
+      9.71728515625
+    ],
+    "available_GiB": 113.3117904663086,
+    "trace": "endpoint-post100-v2-100-23-release-fixture-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 4507,
+    "query_ms_sum": 4648
+  },
+  {
+    "operation": "release-fixture-scope",
+    "databases": 100,
+    "rep": 23,
+    "seconds": 6.6259897500276566,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.5888671875,
+      11.9365234375,
+      9.71923828125
+    ],
+    "available_GiB": 113.34992980957031,
+    "trace": "endpoint-post100-v2-100-23-release-fixture-scope.jsonl",
+    "query_count": 136,
+    "catalog_query_count": 2,
+    "catalog_ms": 5076,
+    "query_ms_sum": 5573
+  },
+  {
+    "operation": "release-fixture-integrated",
+    "databases": 100,
+    "rep": 23,
+    "seconds": 6.216164486948401,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.78662109375,
+      11.970703125,
+      9.7548828125
+    ],
+    "available_GiB": 113.2870101928711,
+    "trace": "endpoint-post100-v2-100-23-release-fixture-integrated.jsonl",
+    "query_count": 136,
+    "catalog_query_count": 2,
+    "catalog_ms": 4743,
+    "query_ms_sum": 5187
+  },
+  {
+    "operation": "release-fixture-create",
+    "databases": 100,
+    "rep": 24,
+    "seconds": 5.223869727924466,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.56298828125,
+      11.9208984375,
+      9.75048828125
+    ],
+    "available_GiB": 113.15837860107422,
+    "trace": "endpoint-post100-v2-100-24-release-fixture-create.jsonl",
+    "query_count": 64,
+    "catalog_query_count": 2,
+    "catalog_ms": 4514,
+    "query_ms_sum": 4640
+  },
+  {
+    "operation": "release-fixture-scope",
+    "databases": 100,
+    "rep": 24,
+    "seconds": 6.146027124952525,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.357421875,
+      11.8720703125,
+      9.74609375
+    ],
+    "available_GiB": 113.2631607055664,
+    "trace": "endpoint-post100-v2-100-24-release-fixture-scope.jsonl",
+    "query_count": 136,
+    "catalog_query_count": 2,
+    "catalog_ms": 4718,
+    "query_ms_sum": 5165
+  },
+  {
+    "operation": "release-fixture-integrated",
+    "databases": 100,
+    "rep": 24,
+    "seconds": 6.1994281460065395,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      11.08837890625,
+      11.8076171875,
+      9.736328125
+    ],
+    "available_GiB": 113.27891540527344,
+    "trace": "endpoint-post100-v2-100-24-release-fixture-integrated.jsonl",
+    "query_count": 136,
+    "catalog_query_count": 2,
+    "catalog_ms": 4921,
+    "query_ms_sum": 5335
+  },
+  {
+    "operation": "endpoint-release25-initial",
+    "databases": 100,
+    "rep": 1,
+    "seconds": 430.69623954594135,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      10.9208984375,
+      11.7607421875,
+      9.73193359375
+    ],
+    "available_GiB": 113.15773010253906,
+    "trace": "endpoint-post100-v2-100-1-endpoint-release25-initial.jsonl",
+    "query_count": 7343,
+    "catalog_query_count": 150,
+    "catalog_ms": 353138,
+    "query_ms_sum": 374431
+  },
+  {
+    "operation": "backup-all",
+    "databases": 100,
+    "rep": 1,
+    "seconds": 12.14653293415904,
+    "logging": "debug",
+    "outcome": "passed",
+    "load": [
+      13.38427734375,
+      12.4111328125,
+      10.80419921875
+    ],
+    "available_GiB": 113.42053604125977,
+    "trace": "endpoint-post100-v2-100-1-backup-all.jsonl",
+    "query_count": 300,
+    "catalog_query_count": 0,
+    "catalog_ms": 0,
+    "query_ms_sum": 5329
+  }
+]

@@ -278,6 +278,23 @@ def merge_slot_missing(state):
 SLOT_DAMAGED=('The merge slot record is damaged: it is not available and names no holder. '
               'Run the merge-create operation, which repairs it, then try again.')
 
+def merge_slot_damaged(state):
+    """True when a native merge-slot check reports the damaged shape (kittrial-5bb.202).
+
+    A real state carries ``holder`` and ``waiters`` (either may be null): a free slot is
+    ``available: true`` with no holder, and a held slot is ``available: false`` WITH a
+    holder. The damaged row is ``available: false`` and names no holder (``SLOT_DAMAGED``),
+    whether the ``holder`` key is present and null or absent entirely: an answer that is
+    unavailable with ``waiters`` but NO ``holder`` key was refused as damaged before this
+    task and stayed refused (main's answer; the rev-1 tip let it through, review
+    `damaged-test-looser-than-main`). A state that is absent, empty or unparseable is NOT
+    damaged, it is missing (``merge_slot_missing``); the missing test comes first and a
+    missing shape (no ``holder`` AND no ``waiters``) is never damaged, so the two do not
+    overlap for a caller that tests missing first -- as every caller here does.
+    """
+    if merge_slot_missing(state):return False
+    return state.get('available') is False and not state.get('holder')
+
 def repair_merge_slot(run,slot):
     """Put a damaged merge slot row back in order; returns what was changed (kittrial-5bb.113 review).
 
@@ -303,8 +320,17 @@ def repair_merge_slot(run,slot):
     if changes:run(['update',slot,*changes,'--json'])
     return fixed,wanted
 
-def apply_native(p, actor, run, project):
-    """Caller holds canonical project lock. Journals belong to runtime, never Git."""
+def apply_native(p, actor, run, project, operators=None, coordinator_writes=False, independent_approval=False,
+                 owners=None):
+    """Caller holds canonical project lock. Journals belong to runtime, never Git.
+
+    ``coordinator_writes`` and ``independent_approval`` are the per-installation
+    settings of slices 6 and 7 (``admin.coordinator_rules``, supplied by the
+    endpoint; OFF by default), ``operators`` the installation's operator allowlist
+    ``coordinator_writes`` is judged against, and ``owners`` the project's
+    actor -> principal map, or a callable returning it so the registry is read only
+    when the rule needs it (kittrial-5bb.197 review request 01a12894, item 4c).
+    """
     if not isinstance(p,dict):raise ValueError('Expected object')
     op=p.get('operation')
     if op=='create-child':
@@ -382,6 +408,33 @@ def apply_native(p, actor, run, project):
         raise ValueError('Invalid merge request fields for %s: %s. merge-acquire takes operation, task and target; '
                          'merge-create, merge-check and merge-release take only operation. The holder is always '
                          'the request actor.'%(op,'; '.join(details)))
+    if op=='merge-acquire' and (coordinator_writes or independent_approval):
+        # Slice 7 (kittrial-5bb.197): taking the merge slot is a listed actor of the
+        # project's, when the installation turned the rule on. Judged before the slot
+        # is read or reserved, so a refusal writes nothing. The import is local
+        # because review_workflow imports this module. `owners` is a lazily-read map,
+        # so a plain listed name does not read the registry and a damaged registry
+        # never stops a listed operator (item 4c).
+        from review_workflow import listed_operator_actor,named_rule_actor
+        if coordinator_writes and not listed_operator_actor(actor,operators,owners):
+            raise ValueError('merge-acquire refused: the installation setting coordinator_writes is on, so only a '
+                             'listed operator of this project may take the merge slot (or an actor of a listed '
+                             "operator's principal), and %s is neither. An operator turns the rule off with "
+                             '`admin.py coordinator-rules off --rule coordinator_writes --actor OPERATOR`.'
+                             %named_rule_actor(actor))
+        if independent_approval:
+            # Part (b): the slot may only be taken for a contribution another party
+            # approved. The task's review chain is read from the same export every
+            # reader uses; an unknown task falls through to the native refusal below.
+            from lifecycle import read_event_rows
+            from briefing import task_row
+            from review_workflow import require_independent_approval
+            rows=read_event_rows(run)
+            try: issue=task_row(rows,p['task'])
+            except ValueError: issue=None
+            if issue is not None:
+                require_independent_approval(issue,'merge-acquire',p['task'],
+                                             operators=operators,owners=owners,journal=project)
     context_path=project/'.merge-context.json'
     if op=='merge-create':
         # Creates the slot, or says it exists; either way a damaged row is put right.
@@ -395,7 +448,7 @@ def apply_native(p, actor, run, project):
         detail=''
         if isinstance(state,dict) and state.get('error'):detail=' (%s)' % state['error']
         raise ValueError('Merge slot does not exist for this project%s; run the merge-create operation to create it before checking, acquiring or releasing' % detail)
-    if state.get('available') is False and not state.get('holder'):raise ValueError(SLOT_DAMAGED)
+    if merge_slot_damaged(state):raise ValueError(SLOT_DAMAGED)
     context=load_json(context_path) if context_path.exists() else None
     if op=='merge-check':
         state['context']=context if context and context['holder']==state.get('holder') else None

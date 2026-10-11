@@ -102,7 +102,7 @@ def read_labelled(run, label):
         rows = AnchoredKind.shown(run, ids)
     else:
         wanted = set(ids)
-        exported = (record_json.loads_row(line) for line in run(['export', '--all']).splitlines() if line.strip())
+        exported = (record_json.loads_row(line) for line in run(['export', '--all']).split('\n') if line.strip())
         rows = [row for row in exported if isinstance(row, dict) and row.get('id') in wanted]
     for r in rows:
         if isinstance(r, dict) and r.get('id') in id_labels and not r.get('labels'):

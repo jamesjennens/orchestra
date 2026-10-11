@@ -65,9 +65,13 @@ Worker setup:
   available; do not stop just because the previous task was delivered. Stop at the
   deadline or, after checking both sources, when you have no actionable open or
   pending-review task and `ready` has no unheld task. Do not wait on tasks held by
-  other actors or poll an empty queue indefinitely. In office mode, do not poll or
-  loop; end each turn with a one-line status for the person. Use the full client
-  prefix and printed config, project and actor for each command.
+  other actors or poll an empty queue indefinitely. In office mode, do not start a poll
+  or a loop of your own; end each turn with a one-line status for the person. Only the
+  worker's own user authorizes checking again, by asking, within what the project's
+  standing guidance allows. A task awaiting review or integration is not a reason to
+  stop checking before the deadline; that is exactly when checking matters. A harness
+  that cannot wait or schedule tells its user so in one line instead of refusing. Use
+  the full client prefix and printed config, project and actor for each command.
 """
 
 def main():

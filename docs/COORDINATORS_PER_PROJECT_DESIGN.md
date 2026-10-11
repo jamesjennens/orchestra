@@ -3,10 +3,20 @@
 **Status: design note (kittrial-5bb.178), second version after review; James
 decided the seven questions on 2026-10-07 ("recommended for all"). Built so far:
 slice 1, a key names its projects (kittrial-5bb.193; see "Bind a key to its
-projects" in [OPERATIONS.md](OPERATIONS.md)), and slice 2, a key names its
+projects" in [OPERATIONS.md](OPERATIONS.md)); slice 2, a key names its
 principal and actors belong to principals (kittrial-5bb.194; see "Bind a key to
-its principal" in [OPERATIONS.md](OPERATIONS.md)). The rest of this note describes
-the design and the state of main when it was written, not what is built.**
+its principal" in [OPERATIONS.md](OPERATIONS.md)); and slice 3, the acceptance
+commands a confined coordinator runs through the endpoint (kittrial-5bb.195; see
+"A confined coordinator runs the acceptance commands through the endpoint" in
+[OPERATIONS.md](OPERATIONS.md)); and slice 4, the installation setting that
+accepts bound keys only (kittrial-5bb.196; see "Accept bound keys only" in
+[OPERATIONS.md](OPERATIONS.md)); and slices 6 and 7 (kittrial-5bb.197; see "The
+coordinator rules" in [OPERATIONS.md](OPERATIONS.md)), including both halves of
+rule 3: the self-approval refusal (the contribution's author and the task's
+assignee, by party) and the second refusal (`reviewed` and `integrated`, and
+taking the merge slot, need a validated approval of the CURRENT contribution from
+another party). The rest of this note describes the design and
+the state of main when it was written, not what is built.**
 
 **For an installation where nobody but its owner is to have SSH (the office),
 see [WEB_COORDINATOR_DESIGN.md](WEB_COORDINATOR_DESIGN.md) (kittrial-5bb.201):
@@ -473,9 +483,16 @@ safe than before. The order is the one the review recommended.
    `docs/REVIEWS.md` and what `work` and `brief` show for a contribution that
    waits for somebody else. It takes its list of facts from the decision on
    kittrial-5bb.106 and is built with it, not before it.
+   *Built by kittrial-5bb.197 as the installation rule `independent_approval`, BOTH
+   halves: an approval from the contribution's author or the task's assignee (by
+   party) is refused, and `reviewed`/`integrated` - and taking the merge slot - are
+   refused unless the CURRENT contribution carries a validated approval from another
+   party; an approval of an older contribution does not carry over. Over an unbound
+   key this is attribution, not authentication (see OPERATIONS.md).*
 7. **Coordinator-only writes**, if James wants them (question 3): approval and
    taking the merge slot only for a listed actor of the project. Also with
    kittrial-5bb.106.
+   *Built by kittrial-5bb.197 as the installation rule `coordinator_writes`.*
 8. **The web interface** shows who coordinates a project.
 
 Slices 1, 2 and 6 are the design asked for. Not sized: a per-project operator

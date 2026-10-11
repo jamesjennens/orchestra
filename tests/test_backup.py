@@ -114,6 +114,49 @@ class BackupTests(unittest.TestCase):
         admin.restore_coordination(self.root,'source','destination')
         self.assertEqual(json.loads((self.destination/'.sessions.json').read_text()),registry)
 
+    def test_owner_requirement_history_governance_receipts_and_request_journal_restore(self):
+        import requirement_governance as gov
+        import requirement_http as owner_http
+        import requirement_owner_records as owner_records
+        import requirement_records as records
+        from http_authority import OperationJournal, journal_path
+        from test_requirement_owner_records import OwnerNative, ACCOUNT
+        native = OwnerNative(); native.actor = ACCOUNT
+        native.row('job-1')['issue_type'] = 'epic'
+        gov.initialize(self.source, 'source', 'host', 'new-project-source')
+        context = owner_http.OwnerContext('source', ACCOUNT, gov.current(self.source, 'source'))
+        draft = owner_http.apply(self.source, context, 'create', {
+            'kind': 'requirement', 'parent': 'job-1', 'title': 'Durable content',
+            'description': 'Retain this exact history.'}, 'restore-create', native)
+        accepted = owner_http.apply(self.source, context, 'accept', {
+            'expected_revision': draft['revision'], 'expected_sha256': draft['sha256']},
+            'restore-accept', native, draft['id'])
+        row = native.row(draft['id'])
+        original = json.dumps(row, sort_keys=True)
+        governance_bytes = (self.source/gov.FILE).read_bytes()
+        receipt_bytes = {p.name: p.read_bytes() for p in (self.source/owner_http.JOURNAL).glob('*.json')}
+        journal = OperationJournal(journal_path(self.source))
+        journal.reserve('restore-accept', 'a'*64, ACCOUNT)
+        journal.complete('restore-accept', {'returncode': 0, 'stdout': json.dumps(accepted),
+                                         'stderr': '', 'server_time': '2030-01-01T00:00:00+00:00'},
+                         'a'*64, ACCOUNT)
+        with patch.object(admin, 'run_bd', return_value='synced'):
+            admin.backup_project(self.root, 'source')
+        admin.restore_coordination(self.root, 'source', 'destination')
+        self.assertEqual((self.destination/gov.FILE).read_bytes(), governance_bytes)
+        admin.restore_journal(admin.journal_snapshot_path(self.root, 'source'),
+                              journal_path(self.destination))
+        self.assertEqual({p.name: p.read_bytes() for p in (self.destination/owner_http.JOURNAL).glob('*.json')},
+                         receipt_bytes)
+        view = owner_http.read(self.destination, 'destination', ['get', draft['id']], native)
+        self.assertEqual(view['current']['sha256'], accepted['sha256'])
+        self.assertEqual(json.dumps(row, sort_keys=True), original)
+        self.assertEqual(owner_records.existing_acceptances(row)[2]['project'], 'source')
+        self.assertTrue(records.resolved_acceptance(row, records.existing_revisions(row)[2]))
+        restored = OperationJournal(journal_path(self.destination)).lookup('restore-accept')
+        self.assertEqual(restored['state'], 'committed')
+        self.assertEqual(restored['envelope']['stdout'], json.dumps(accepted))
+
     def test_feedback_feed_is_backed_up_and_restored_as_private_text(self):
         feed_path = self.source/'.feedback.jsonl'
         payload = {
@@ -298,14 +341,126 @@ class BackupTests(unittest.TestCase):
                 patch.object(admin, 'run_bd', return_value='restored') as native, \
                 contextlib.redirect_stdout(io.StringIO()) as out:
             admin.main()
-        create.assert_called_once_with(self.root, 'destination')
+        create.assert_called_once_with(self.root, 'destination', requirements_default=False)
         # `bd backup restore` and then the kittrial-5bb.49 re-point of the clone's own
         # native backup target (a restored clone otherwise keeps the source's target).
         self.assertEqual([item.args[2] for item in native.call_args_list],
                          [['backup', 'restore', str(self.root / 'backups' / 'source'), '--force'],
-                          ['backup', 'init', str(self.root / 'backups' / 'destination')]])
+                          ['backup', 'init', str(self.root / 'backups' / 'destination')],
+                          # kittrial-5bb.202 item 3: a source made before the slot was provisioned
+                          # would leave the clone without one, so restore-new provisions it too.
+                          ['merge-slot', 'check', '--json'],
+                          ['merge-slot', 'create', '--json']])
         self.assertIn('Restored only into the newly created project', out.getvalue())
         self.assertEqual(json.loads((self.destination / self.request_name).read_text()), self.receipt)
+
+    def restore_with_a_failing_provisioning(self, slot_answer, empty_destination=False):
+        """``restore-new`` whose merge-slot provisioning step fails; returns (order, notice).
+
+        The step itself is what fails (``provision_merge_slot`` is patched to raise), so the
+        order the other steps ran in can be read from ``order`` and the notice's claims can be
+        checked against what the clone's own ``merge-slot check`` answers (``slot_answer``,
+        fed to the read ``restore_failure_notice`` makes through ``project_merge_slot_state``).
+        ``empty_destination`` makes ``restore_destination_state``'s read answer the destination's
+        own merge slot alone: its "empty, working project" shape, which a clone from an empty
+        slotless source has.
+        """
+        (self.root / 'deployment.private.json').write_text(
+            json.dumps({'password': 'x', 'operators': ['operator']}), encoding='utf-8')
+        self.save_bundle()
+        (self.destination / '.beads').mkdir()
+        (self.destination / '.beads' / 'metadata.json').write_text(
+            json.dumps({'dolt_server_host': '127.0.0.1', 'dolt_server_port': 13317,
+                        'dolt_server_user': 'root', 'dolt_database': 'destination'}), encoding='utf-8')
+        order = []
+
+        def native(root, name, args):
+            order.append(list(args))
+            if list(args)[:2] == ['merge-slot', 'check']:
+                return slot_answer
+            if list(args)[:1] == ['list']:
+                return json.dumps({'id': 'destination-merge-slot'}) if empty_destination else 'not rows'
+            return 'restored'
+
+        def sidecar(*args, **kwargs):
+            order.append('sidecar')
+            return True
+
+        def journal(*args, **kwargs):
+            order.append('journal')
+            return None
+
+        def provision(*args, **kwargs):
+            order.append('provision')
+            raise admin.subprocess.CalledProcessError(1, 'bd', stderr='create refused')
+
+        argv = ['admin.py', '--root', str(self.root), 'restore-new', 'source', 'destination']
+        stderr = io.StringIO()
+        with patch.object(sys, 'argv', argv), patch.object(admin, 'root_path', return_value=self.root), \
+                patch.object(admin, 'add_project'), \
+                patch.object(admin, 'native_restore', return_value='restored (stubbed native restore)'), \
+                patch.object(admin, 'run_bd', side_effect=native), \
+                patch.object(admin, 'restore_coordination', side_effect=sidecar), \
+                patch.object(admin, 'restore_journal', side_effect=journal), \
+                patch.object(admin, 'provision_merge_slot', side_effect=provision), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(stderr), \
+                self.assertRaises(admin.subprocess.CalledProcessError):
+            admin.main()
+        return order, stderr.getvalue()
+
+    def test_a_failed_provisioning_leaves_the_sidecar_and_journals_restored(self):
+        """kittrial-5bb.202 rev-3 item 1 (F1): the provisioning step runs AFTER the re-point,
+        the coordination sidecar and the journals (it ran before them in revision 2, and the
+        reviewer's `g3` measured a failed clone with no `.http-operations.sqlite3`)."""
+        order, notice = self.restore_with_a_failing_provisioning(json.dumps(
+            {'available': False, 'error': 'not found', 'id': 'destination-merge-slot'}))
+        self.assertLess(order.index('sidecar'), order.index('provision'), order)
+        self.assertLess(order.index('journal'), order.index('provision'), order)
+        self.assertIn('the merge-slot provisioning step failed', notice)
+        self.assertIn('its data, its re-pointed backup target and its journals are in place', notice)
+        # A genuinely slotless clone: the slot is the one thing left, and merge-create is named.
+        self.assertIn('Its merge slot is still missing', notice)
+        self.assertIn('merge-create', notice)
+        self.assertIn('retire-project destination', notice)
+        self.assertNotIn('its backup fails', notice)
+        self.assertNotIn('the re-point and coordination step failed', notice)
+
+    def test_a_failed_provisioning_does_not_call_a_slot_missing_that_is_there(self):
+        """The reviewer's `failcheck` shape: the step fails on its own check while the slot came
+        with the source (merge-check rc 0, report healthy). Saying "was not provisioned" or
+        "the report names it missing" would be untrue (F1)."""
+        _, notice = self.restore_with_a_failing_provisioning(json.dumps(
+            {'available': True, 'holder': None, 'id': 'destination-merge-slot', 'waiters': None}))
+        self.assertIn('Its merge slot reads healthy', notice)
+        self.assertIn('nothing is left to mend', notice)
+        self.assertIn('its data, its re-pointed backup target and its journals are in place', notice)
+        self.assertNotIn('was not provisioned', notice)
+        self.assertNotIn('names it missing', notice)
+        self.assertNotIn('Its merge slot is still missing', notice)
+        self.assertNotIn('its backup fails', notice)
+
+    def test_a_failed_provisioning_of_an_empty_clone_is_not_said_as_nothing_restored(self):
+        """A clone from an empty slotless source reads as the "empty, working project" shape (bd
+        lists no rows at all), but after the reorder its coordination sidecar and journals WERE
+        restored: the notice must be the provisioning one, not the "nothing was restored" one."""
+        _, notice = self.restore_with_a_failing_provisioning(json.dumps(
+            {'available': False, 'error': 'not found', 'id': 'destination-merge-slot'}),
+            empty_destination=True)
+        self.assertIn('the merge-slot provisioning step failed', notice)
+        self.assertIn('Its merge slot is still missing', notice)
+        self.assertIn('its data, its re-pointed backup target and its journals are in place', notice)
+        self.assertNotIn('nothing was restored', notice)
+        self.assertNotIn('NOT restored', notice)
+
+    def test_a_failed_provisioning_that_cannot_read_the_slot_does_not_guess(self):
+        """The same fault that stopped the step can stop the re-read: the notice says so plainly
+        rather than claiming the slot is missing (F1)."""
+        _, notice = self.restore_with_a_failing_provisioning('not json at all')
+        self.assertIn('Whether it has a usable merge slot could not be read', notice)
+        self.assertIn('its data, its re-pointed backup target and its journals are in place', notice)
+        self.assertNotIn('Its merge slot is still missing', notice)
+        self.assertNotIn('was not provisioned', notice)
+        self.assertNotIn('its backup fails', notice)
 
     def restore_new_output(self):
         argv = ['admin.py', '--root', str(self.root), 'restore-new', 'source', 'destination']
@@ -363,11 +518,14 @@ class BackupTests(unittest.TestCase):
                 patch.object(admin, 'add_project'), patch.object(admin, 'run_bd', side_effect=native), \
                 contextlib.redirect_stdout(io.StringIO()):
             admin.main()
-        self.assertEqual([name for name, _ in calls], ['destination', 'destination'])
+        self.assertEqual([name for name, _ in calls], ['destination', 'destination', 'destination', 'destination'])
         self.assertEqual(calls[0][1],
                          ['backup', 'restore', str(self.root / 'backups' / 'source'), '--force'])
         self.assertEqual(calls[1][1],
                          ['backup', 'init', str(self.root / 'backups' / 'destination')])
+        # kittrial-5bb.202 item 3: the restore provisions the clone's merge slot (idempotent).
+        self.assertEqual(calls[2][1], ['merge-slot', 'check', '--json'])
+        self.assertEqual(calls[3][1], ['merge-slot', 'create', '--json'])
 
     def test_restore_holds_source_backup_lock_across_entire_pair(self):
         self.save_bundle()
@@ -385,7 +543,7 @@ class BackupTests(unittest.TestCase):
         def read(root, source):
             locked('validate-sidecar')
             return real_read(root, source)
-        def create(*args): locked('create-destination')
+        def create(*args, **kwargs): locked('create-destination')
         def native(*args):
             # The native restore, then the kittrial-5bb.49 re-point of the clone's target.
             locked('repoint-native' if args[2][:2] == ['backup', 'init'] else 'restore-native')
@@ -395,7 +553,7 @@ class BackupTests(unittest.TestCase):
         with patch.object(sys, 'argv', argv), patch.object(admin, 'root_path', return_value=self.root), patch.object(admin, 'coordination_backup', side_effect=read), patch.object(admin, 'add_project', side_effect=create), patch.object(admin, 'run_bd', side_effect=native), patch.object(admin, 'restore_coordination', side_effect=restore), contextlib.redirect_stdout(io.StringIO()):
             admin.main()
         self.assertEqual(phases, ['validate-sidecar', 'create-destination', 'restore-native',
-                                  'repoint-native', 'restore-sidecar'])
+                                  'repoint-native', 'restore-sidecar', 'restore-native', 'restore-native'])
         self.assertTrue(self.flock.call_args.args[0].closed)
 
     def test_backup_rejects_symlink_journal_directory(self):

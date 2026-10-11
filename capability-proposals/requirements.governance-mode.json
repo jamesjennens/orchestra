@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "operation_id": "capnew-18e84b0ec8af4f93a075c6e15ba7a902",
+  "key": "requirements.governance-mode",
+  "name": "Requirements governance modes preserve immutable history",
+  "aliases": [
+    "simple requirements",
+    "governed requirements",
+    "requirements mode",
+    "requirements governance history"
+  ],
+  "summary": "Newly provisioned projects start in simple mode. Existing projects without governance history remain governed. A signed-in project owner may switch modes with revision and hash compare-and-swap; switching never accepts content or rewrites earlier history. The endpoint checks current owner membership. Backup and restore carry governance history, owner operation receipts and validated source bindings. A present JSON-null or damaged history refuses with a repair message; absence alone keeps the legacy governed behavior. Host operator requirement authority remains unchanged. Governance reads attach a bounded entry-specific clock warning past the existing skew bound. Future timestamps do not refuse reads or writes, rewrite history or order authority; revision numbers and hashes retain that role.",
+  "requirements": [],
+  "anchors": [
+    "docs/REQUIREMENTS.md#editing-a-projects-requirements-in-the-web-interface"
+  ],
+  "code": [
+    "requirement_governance.py::current",
+    "requirement_governance.py::set_mode",
+    "requirement_governance.py::restored_files",
+    "requirement_http.py::owner_context"
+  ],
+  "tests": [
+    "tests/test_requirement_governance.py",
+    "tests/test_http_requirements_owner.py",
+    "tests/test_backup.py"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "requirements",
+    "governance",
+    "history"
+  ]
+}

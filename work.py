@@ -26,10 +26,137 @@ HELP_TOKENS = ('-h', '--help')
 VALUE_OPTIONS = {'--owner', '--state', '--limit', '--offset', '--handoff-limit',
                  '--handoff-offset', '--file', '-f', '--items-offset', '--items-limit',
                  '--since', '--cursor', '--body-budget', '--ref-limit', '--ref-offset',
-                 '--proposal-limit', '--proposal-offset', '--capability-limit', '--capability-offset'}
+                 '--proposal-limit', '--proposal-offset', '--capability-limit', '--capability-offset',
+                 '--recent', '--last', '--kind'}
 
 #: At most this many request ids are named per work item (a review record holds at most 20 items).
 PENDING_REQUEST_IDS_MAX = 20
+
+#: One sentence for a contribution that waits for somebody else's approval (kittrial-5bb.197
+#: review request 01a12894, item 3b). It is carried by `work` and `brief` whether the
+#: installation's approval rules are on or off, so a reader of either learns what the
+#: contribution is waiting for without reading the setting. It is deliberately short: the
+#: brief is bounded, and this field must not push a long prior chain past the bound.
+APPROVAL_WAIT = 'Waiting for somebody else\'s approval of the current contribution.'
+
+# Compact owned-work context, not a recipient or authorization inference.
+CHECKPOINT_WAIT_ITEMS_MAX = 3
+
+#: The four values `whose_move` takes on a queue item (kittrial-5bb.249). `'you'` is the
+#: calling actor; the two middle values name the party that moves next. It answers the
+#: one question the queue's review-state field left a worker to guess.
+WHOSE_MOVE = ('you', 'reviewer', 'coordinator', 'unknown')
+UNKNOWN_MOVE_TEXT = 'Whose move this is cannot be told from the review state shown here.'
+
+
+def review_move(state, task, owned, named_reviewer=False, pending_items=0, redelivered=False):
+    """`(whose_move, next)`: one plain sentence from the validated review state alone.
+
+    Caller-relative: `'you'` only when the next move is the calling actor's, so an
+    operator reading another lane's queue is never told the move is theirs, while a
+    named reviewer's own open review request is. Derived only from the review state the
+    item already shows plus the facts the row already carries: whether the caller
+    holds it as a named reviewer, how many blocking items are open, and whether every one
+    of those items was filed on a contribution the current one supersedes (`redelivered`).
+    No title, no comment and no actor is read as a claim about intent, and nothing is
+    inferred from a state this function does not name (that stays `'unknown'`).
+    """
+    name = str(task or 'the task')
+    items = max(0, int(pending_items or 0))
+    plural = 'item' if items == 1 else 'items'
+    if named_reviewer and state in ('awaiting-review', 'legacy-review-ready'):
+        return 'you', 'This is your review: read `review %s` and record your decision.' % name
+    if not owned:
+        return 'unknown', UNKNOWN_MOVE_TEXT
+    if state == 'changes-requested':
+        if redelivered:
+            # A revision that supersedes the one the items were filed on is already
+            # delivered: only the responses are owed, so the worker does not redeliver
+            # again (kittrial-5bb.249 review, item 3b).
+            return 'you', ('This is your work now: %d outstanding review %s. Read `review %s` and '
+                           'respond to each item: the revision that supersedes this contribution '
+                           'has already been delivered.' % (items, plural, name))
+        return 'you', ('This is your work now: %d outstanding review %s. Read `review %s`, deliver '
+                       'a revision that supersedes this contribution and respond to each item.'
+                       % (items, plural, name))
+    if state in ('awaiting-review', 'legacy-review-ready'):
+        return 'reviewer', "Nothing is for you to do: the next move is the reviewer's."
+    if state in ('awaiting-integration', 'approved'):
+        # `approved` is the web service's in-process name for the same state.
+        return 'coordinator', "Nothing is for you to do: the next move is the coordinator's."
+    if state in ('withdrawn', 'superseded') and items:
+        return 'you', ('This is your work now: %d outstanding review %s on a final contribution. '
+                       'Read `review %s` and deliver a new contribution that answers each item.'
+                       % (items, plural, name))
+    if state in (None, 'none'):
+        return 'you', ('This is your work: no contribution has been delivered yet. Read `review %s` '
+                       'for its current state and deliver one.' % name)
+    return 'unknown', UNKNOWN_MOVE_TEXT
+
+
+def quoted_checkpoint_text(value):
+    """One checkpoint line, safe inside the sentence's double quotes.
+
+    A raw backslash is doubled first; ``briefing.plain_text`` then escapes the C0/C1
+    controls (DEL included), the Unicode line/paragraph separators and the bidi controls,
+    exactly as the rest of the answer does. The double quote and a newline are escaped
+    last, so the quoted text cannot close the quote or start a second line that reads as
+    a move of its own (kittrial-5bb.249 review, item 1).
+    """
+    from briefing import plain_text
+    text = plain_text(str(value or '').replace('\\', '\\\\'))
+    return text.replace('"', '\\"').replace('\n', '\\n')
+
+
+def waiting_move(next_action):
+    """`next` for a caller whose own current checkpoint records a blocker or dependency.
+
+    What is known is the caller's own record, never an inferred person (kittrial-5bb.219):
+    the sentence says the caller recorded a blocker or dependency and quotes that
+    checkpoint's own wording, escaped so it cannot read as a move. The move is still the
+    caller's own: the row keeps ``whose_move`` 'you' and stays in ``your_move``
+    (kittrial-5bb.249 review, item 1).
+    """
+    text = next_action.get('text') if isinstance(next_action, dict) else next_action
+    if not text:
+        return None
+    return ('You recorded a blocker or dependency in your own checkpoint: "%s".'
+            % quoted_checkpoint_text(text))
+
+
+def checkpoint_wait(row, actor, state, delivered=False):
+    """Project the caller's latest validated checkpoint from the existing parse.
+
+    A later checkpoint by someone else makes this explicitly historical. Review
+    delivery likewise keeps the authored context without turning it into work.
+    No transport reads or checkpoint writes are performed here.
+    """
+    result = dict(status='unknown', checkpoint=None, author=None, is_current=None,
+                  active=None, items=[], total=None, omitted=None, next_action=None)
+    if row.get('assignee') != actor or not actor:
+        result.update(status='not-owned', active=False)
+        return result
+    if state is None or state['invalid']:
+        return result
+    comments = {str(c.get('id')): c for c in row.get('comments') or [] if isinstance(c, dict)}
+    own = [(cid, p) for cid, p in state['history']
+           if comments.get(str(cid), {}).get('author') == actor]
+    if not own:
+        result.update(status='none', is_current=False, active=False, total=0, omitted=0)
+        return result
+    from briefing import clip, plain_text
+    cid, p = own[-1]
+    current = state['current'] is not None and str(state['current'][1]['id']) == str(cid)
+    items = [item for item in p['open_items'] if item['kind'] in ('blocker', 'dependency')]
+    bounded = lambda value, limit: clip(plain_text(value), limit)
+    result.update(status='recorded', checkpoint=cid, author=actor, is_current=current,
+                  active=current and bool(items) and not delivered and row.get('status') != 'closed',
+                  items=[dict(id=item['id'], kind=item['kind'],
+                              text=bounded(item['text'], 400), source=bounded(item['source'], 240))
+                         for item in items[:CHECKPOINT_WAIT_ITEMS_MAX]],
+                  total=len(items), omitted=max(0, len(items)-CHECKPOINT_WAIT_ITEMS_MAX),
+                  next_action=bounded(p['next_action'], 600))
+    return result
 
 
 def help_requested(args):
@@ -46,10 +173,11 @@ def help_payload(action='work'):
                 '[--handoff-limit N] [--handoff-offset N] [--ref-limit N] [--ref-offset N] [--json]',
         'review': 'review TASK [--file payload.json]',
         'handoff': 'handoff TASK --file payload.json',
-        'brief': 'brief TASK [--items-offset N] [--items-limit N] [--json]',
-        'history': 'history TASK [--limit N] [--since TIME] [--cursor TOKEN] '
+        'brief': 'brief TASK [--items-offset N] [--items-limit N] [--full] [--json]',
+        'history': 'history TASK [--limit N | --recent N | --last N] [--since TIME] '
+                   '[--since-checkpoint | --since-my-checkpoint] [--kind comment|event] [--cursor TOKEN] '
                    '[--body-budget BYTES]',
-        'checkpoint': 'checkpoint TASK --file checkpoint.json [--json] | checkpoint TASK --provenance | checkpoint TASK --verify | checkpoint TASK --directions [--offset N] [--limit N]',
+        'checkpoint': 'checkpoint TASK --file checkpoint.json [--json] | checkpoint TASK --provenance | checkpoint TASK --verify | checkpoint TASK --latest [--provenance] | checkpoint TASK --directions [--offset N] [--limit N]',
     }
     payload = {'schema_version': 1, 'contract': CONTRACT_VERSION, 'command': action,
                'usage': usage.get(action, action),
@@ -70,7 +198,7 @@ def help_payload(action='work'):
             'capability-offset': '>= %d' % WORK_OFFSET_MIN,
         }
         payload['output'] = {
-            'top_level': ['owner', 'total', 'items', 'next_offset', 'coverage', 'attention', 'guidance'],
+            'top_level': ['owner', 'total', 'your_move', 'items', 'next_offset', 'coverage', 'attention', 'guidance'],
             'guidance': 'guidance: the project\'s current standing guidance version (kittrial-5bb.99), '
                         'with present, version (null for unbound text), set_at, set_by (null when the audit record does not bind to '
                         'the text), repaired_by and repaired_at (only when a same-text repair kept that setter), '
@@ -98,9 +226,18 @@ def help_payload(action='work'):
                          'allowlist, paged by --capability-limit/--capability-offset',
             'item_identity': 'items[].task is the native task ID; items[].contribution_id is the '
                              'contribution comment ID, not a Git commit or latest_comment_id',
-            'item_fields': ['task', 'title', 'owner', 'status', 'review_state', 'contribution_id',
+            'item_move': 'items[].whose_move is you, reviewer, coordinator or unknown, relative to the '
+                         'calling actor, derived only from the validated review state the row already '
+                         'shows; items[].next is one plain sentence saying the same in words, and '
+                         'quotes the next action of the caller\'s own checkpoint when that checkpoint records '
+                         'a blocker or dependency (no person is inferred; the move stays the caller\'s). '
+                         'Items where the move is the caller\'s sort first; top-level your_move '
+                         'carries their count for the filtered queue. Nothing is inferred from a title, a '
+                         'comment or an actor name.',
+            'item_fields': ['task', 'title', 'owner', 'status', 'review_state', 'whose_move', 'next',
+                            'contribution_id',
                             'commit', 'pending_review_items', 'pending_change_requests', 'open_items',
-                            'checkpoint_at', 'newer_activity',
+                            'blocking_items', 'checkpoint_at', 'newer_activity', 'checkpoint_wait',
                             'pending_handoff_requests',
                             'pending_handoff_total', 'pending_handoff_next_offset', 'lifecycle',
                             'lifecycle_scope', 'lifecycle_matches_contribution', 'error',
@@ -194,14 +331,19 @@ def help_options(action):
             {'flag': 'TASK', 'description': 'task to brief'},
             {'flag': '--items-offset N', 'description': 'unresolved-item page offset >= 0 (default 0)'},
             {'flag': '--items-limit N', 'description': 'unresolved items per page 1..10 (default 5)'},
+            {'flag': '--full', 'description': 'add a bounded full_context block (title, owner, intent, acceptance, position, next action) with the characters the compact read clipped per field and the characters the block cap removed'},
             *common,
         ]
     if action == 'history':
         return [
             {'flag': 'TASK', 'description': 'task whose snapshot-bound history is paged'},
-            {'flag': '--limit N', 'description': 'entries per page 1..20 (default 5)'},
-            {'flag': '--since TIME', 'description': 'only entries at or after this timestamp'},
-            {'flag': '--cursor TOKEN', 'description': 'continue the exact snapshot page'},
+            {'flag': '--limit N', 'description': 'oldest-first entries per page 1..20 (default 5)'},
+            {'flag': '--recent N / --last N', 'description': 'page the same snapshot newest-first; N 1..20 is the page size for that direction (the same option under two spellings); an empty selection answers total_entries 0'},
+            {'flag': '--since TIME', 'description': 'only entries at or after this timezone-aware instant (inclusive)'},
+            {'flag': '--since-checkpoint', 'description': 'only entries after the NEWEST VALID CHECKPOINT, BY ANYONE (the activity it did not incorporate); the answer names its author, time, coverage and unverified count'},
+            {'flag': '--since-my-checkpoint', 'description': 'the same read based on this actor\'s own newest valid checkpoint'},
+            {'flag': '--kind comment|event', 'description': 'only entries of this kind'},
+            {'flag': '--cursor TOKEN', 'description': 'continue the exact snapshot page, direction, kind and checkpoint boundary'},
             {'flag': '--body-budget N', 'description': 'encoded body bytes per page 256..8000 (default 4000)'},
             *common,
         ]
@@ -209,7 +351,8 @@ def help_options(action):
         return [
             {'flag': 'TASK', 'description': 'task the checkpoints belong to'},
             {'flag': '--file checkpoint.json', 'description': 'transport the checkpoint payload as text'},
-            {'flag': '--provenance', 'description': 'read the current bounded provenance and activity cursor without writing'},
+            {'flag': '--provenance', 'description': 'read the current bounded provenance and activity cursor without writing; with --latest, return the record\'s retained digest map instead of counts'},
+            {'flag': '--latest', 'description': 'read only the newest valid checkpoint record (identity, commit, branch, text, items, coverage and provenance COUNTS)'},
             {'flag': '--directions', 'description': 'read full digests for outstanding directions, including outside the stored windows'},
             {'flag': '--offset N / --limit N', 'description': '--directions page: offset >= 0, limit 1..100 (default 50)'},
             {'flag': '--verify', 'description': 'classify current entries using newest retained evidence in linked checkpoint order without writing'},
@@ -231,6 +374,11 @@ def workflow(issue,scopes=None,operators=None,reverts=None,journal=None,invalid_
     # reader (review, brief, work) gets them from this one place.
     from review_recommendations import block as recommendations
     result.update(recommendations(issue,result))
+    # One sentence for a contribution that waits for somebody else's approval
+    # (kittrial-5bb.197 review request 01a12894, item 3b): `work` and `brief` both read
+    # this projection, and it is present whether the rules are on or off.
+    result['waiting_for_approval']=(APPROVAL_WAIT if result.get('review_state')=='awaiting-review'
+                                    and result.get('contribution') else None)
     return result
 
 def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes=None, journal=None,
@@ -334,7 +482,11 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
                           'recommended':False,'recommended_by':[],
                           'integration_disagreements':[],'integration_warnings':[],
                           'newer_activity_by_others':None,'newer_activity_own':None,
-                          'newer_activity_coverage':None,'unresolved_directions':None})
+                          'newer_activity_coverage':None,'unresolved_directions':None,
+                          'waiting_for_approval':None,
+                          # A malformed row shows no validated review state, so whose move it
+                          # is stays unknown rather than guessed (kittrial-5bb.249).
+                          'whose_move':'unknown','next':UNKNOWN_MOVE_TEXT})
             continue
         # The merge slot is an internal record (kittrial-5bb.113): on real bd it is a
         # row of type task, so the type alone never excluded it.
@@ -422,6 +574,8 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
             checkpoint_states[row['id']]=checkpoint_state(row,normalize=False)
             latest_checkpoint=checkpoint_states[row['id']]['current']
             open_items=len(latest_checkpoint[0]['open_items']) if latest_checkpoint else 0
+            blocking_items=sum(item['kind'] in ('blocker','dependency')
+                               for item in latest_checkpoint[0]['open_items']) if latest_checkpoint else 0
             if latest_checkpoint:
                 comments=row.get('comments') or []
                 position=next(index for index,comment in enumerate(comments)
@@ -430,14 +584,29 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
                 newer_activity=any(comment.get('author')!=row.get('assignee')
                                    for comment in comments[position+1:])
         except (ValueError,TypeError,KeyError,StopIteration):
-            open_items=None;checkpoint_at=None;newer_activity=None
+            open_items=None;blocking_items=None;checkpoint_at=None;newer_activity=None
         pending_change_requests=[]
         for pending in review.get('pending_requests',[]):
             if pending.get('request') not in pending_change_requests:pending_change_requests.append(pending.get('request'))
-        items.append({'open_items':open_items,'checkpoint_at':checkpoint_at,'newer_activity':newer_activity,
+        pending_requests=review.get('pending_requests',[])
+        pending_items=len(pending_requests)
+        # A superseding redelivery that has not been answered: every open item was filed on a
+        # contribution the current one replaces, so only the responses are owed
+        # (kittrial-5bb.249 review, item 3b).
+        contribution_id=contribution.get('comment_id')
+        redelivered=bool(contribution_id) and bool(pending_requests) and all(
+            str(pending.get('contribution') or '')!=str(contribution_id) for pending in pending_requests)
+        # Whose move it is, and one plain sentence saying so (kittrial-5bb.249). Derived from
+        # the validated review state this row already shows; no further read.
+        move,move_text=review_move(state,row['id'],bool(actor) and row.get('assignee')==actor,
+                                   named_reviewer=review_request,pending_items=pending_items,
+                                   redelivered=redelivered)
+        items.append({'open_items':open_items,'blocking_items':blocking_items,
+                      'checkpoint_at':checkpoint_at,'newer_activity':newer_activity,
                       'pending_change_requests':pending_change_requests[:PENDING_REQUEST_IDS_MAX],
                       'task':row['id'],'title':str(row.get('title',''))[:200],'owner':row.get('assignee'),'status':row.get('status'),'review_state':state,
-                      'contribution_id':contribution.get('comment_id'),'commit':contribution.get('commit'),'pending_review_items':len(review.get('pending_requests',[])),
+                      'whose_move':move,'next':move_text,
+                      'contribution_id':contribution.get('comment_id'),'commit':contribution.get('commit'),'pending_review_items':pending_items,
                       'pending_handoff_requests':handoff_requests,
                       'pending_handoff_total':handoff_total,
                       'pending_handoff_next_offset':a.handoff_offset+a.handoff_limit if a.handoff_offset+a.handoff_limit<handoff_total else None,
@@ -463,9 +632,33 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
                       'contribution_author':(review.get('contribution') or {}).get('author'),
                       # Additive (kittrial-5bb.52): the integration disagreement entries
                       # naming both facts and both scopes, and their rendered warnings.
-                      'integration_disagreements':disagreements,'integration_warnings':integration_warnings})
+                      'integration_disagreements':disagreements,'integration_warnings':integration_warnings,
+                      # Additive (kittrial-5bb.197 item 3b): one sentence when the current
+                      # contribution waits for another party's approval, rules on or off.
+                      'waiting_for_approval':(APPROVAL_WAIT if state=='awaiting-review' and contribution else None)})
+    from briefing import checkpoint_queue_fields
+    task_rows={row['id']:row for row in rows if isinstance(row,dict) and row.get('id')}
+    # Reconcile EVERY row's checkpoint wait BEFORE the sort and the count, not only the rows
+    # on this page (kittrial-5bb.249 review, item 2a): `checkpoint_states` is already parsed
+    # for all rows, so the move and `your_move` are the queue's, never the page's. The
+    # heavier per-row checkpoint fields stay on the displayed page below.
+    for item in items:
+        item['checkpoint_wait']=checkpoint_wait(task_rows.get(item['task'],{}),actor,
+            checkpoint_states.get(item['task']),
+            delivered=bool(item['contribution_id']) or item['review_state'] not in (None,'none'))
+        # (kittrial-5bb.219 addition c, revised for kittrial-5bb.249 item 1) Where the caller's
+        # own current checkpoint records a blocker or dependency, `next` quotes that
+        # checkpoint's own words and says no person was inferred. The move stays the caller's:
+        # `whose_move` is not rewritten and the row stays in `your_move`.
+        if item['checkpoint_wait'].get('active'):
+            wait_text=waiting_move(item['checkpoint_wait'].get('next_action'))
+            if wait_text:
+                item['next']=wait_text
     priority={'changes-requested':0,'error':1,'awaiting-review':2,'legacy-review-ready':2,'awaiting-integration':3}
-    items.sort(key=lambda r:(priority.get(r['review_state'],4),r['task']))
+    # Items where the next move is the CALLER's sort first (kittrial-5bb.249); inside each
+    # group the review-state order above is unchanged, so a revision request still leads
+    # the caller's own undelivered work.
+    items.sort(key=lambda r:(0 if r['whose_move']=='you' else 1,priority.get(r['review_state'],4),r['task']))
     coverage='Fresh current view; structured review takes precedence over legacy review-ready labels. Lifecycle facts remain independent; malformed handoff journals are surfaced as errors.'
     if malformed_named:
         coverage+=' Malformed issue rows: %s.'%(', '.join(malformed_named))
@@ -473,13 +666,18 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
         coverage+=' %d unparseable issue row(s).'%unparseable_count
     result={'owner':owner,'total':len(items),'items':items[a.offset:a.offset+a.limit],'next_offset':a.offset+a.limit if a.offset+a.limit<len(items) else None,
             'coverage':coverage}
-    # .1 adds checkpoint attention after constructing the page. This is separate
-    # from the review/handoff/HTTP queue fields and parses only displayed tasks.
-    from briefing import checkpoint_queue_fields
-    task_rows={row['id']:row for row in rows if isinstance(row,dict) and row.get('id')}
+    # .1 adds the remaining checkpoint attention fields for the displayed page only; this is
+    # separate from the review/handoff/HTTP queue fields and parses only displayed tasks.
     for item in result['items']:
         if item['task'] in task_rows:
             item.update(checkpoint_queue_fields(rows,task_rows[item['task']],checkpoint_states.get(item['task'])))
+    # The count of the QUEUE's items where the next move is the caller's, from the same
+    # reconciled rows the sort used, so every page reports the same number
+    # (kittrial-5bb.249 review, item 2a).
+    own_move=sum(1 for item in items if item['whose_move']=='you')
+    result={'owner':result['owner'],'total':result['total'],
+            'your_move':{'count':own_move,'text':'%d of your tasks need your action'%own_move},
+            **{key:value for key,value in result.items() if key not in ('owner','total')}}
     if journal is not None:
         # The standing guidance channel (kittrial-5bb.99): every work queue page
         # carries the current guidance version, so a worker that only runs `work`
@@ -522,7 +720,14 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
             limit=a.capability_limit,offset=a.capability_offset)
     return result
 
-def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None,review_writes=None):
+def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None,review_writes=None,
+            independent_approval=False,coordinator_writes=False,owners=None,web_owner=False):
+    """``independent_approval``, ``coordinator_writes`` and ``owners`` are the slices
+    6 and 7 settings and the project's actor -> principal map (kittrial-5bb.197),
+    supplied by the endpoint; all default OFF/absent, so nothing changes for an
+    installation that configures nothing. ``owners`` may be a callable, so the
+    registry is read only when a rule needs it. ``web_owner`` says a verified web
+    owner approved through the web route (kittrial-5bb.199)."""
     # Help is recognised anywhere as a standalone token and never touches the
     # native export, the coordination lock or an attachment.
     if help_requested(args):
@@ -568,7 +773,8 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
         return recommend(rows,task,actor,payload,run,operators=operators,journal=path)
     from review_workflow import execute as review
     result=review(rows,task,actor,payload,run, operators=operators, journal=path,
-                  review_writes=review_writes)
+                  review_writes=review_writes, independent_approval=independent_approval,
+                  coordinator_writes=coordinator_writes, owners=owners, web_owner=web_owner)
     if payload.get('operation')=='request-changes':
         # Retry repairs a label update interrupted after the durable review comment.
         run(['update',task,'--remove-label','review-ready','--json'])

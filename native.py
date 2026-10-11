@@ -155,7 +155,7 @@ def withheld(lines, raw):
 
 def detail(raw):
     """Bounded, redacted echo of native output; never a whole private payload."""
-    lines = [line.strip() for line in str(raw or '').splitlines() if line.strip()]
+    lines = [line.strip() for line in str(raw or '').split('\n') if line.strip()]
     if not lines:
         return ''
     if len(lines[0]) > DETAIL_LINE_LIMIT:
@@ -182,7 +182,7 @@ def stdout_ambiguous(stdout):
     the ambiguity itself is the finding, and the fragments on either side of it
     may be private.
     """
-    lines = [line for line in str(stdout or '').splitlines() if line.strip()]
+    lines = [line for line in str(stdout or '').split('\n') if line.strip()]
     return ('Native stdout carries more than one JSON document (exit 0): %s'
             % withheld(lines, stdout or ''))
 
@@ -349,17 +349,17 @@ def json_stdout(stdout):
         if len(documents) > 1:
             raise ValueError(stdout_ambiguous(text))
         start, end = documents[0]
-        outside = [line for line in (text[:start] + text[end:]).splitlines()
+        outside = [line for line in (text[:start] + text[end:]).split('\n')
                    if line.strip()]
         return text[start:end], outside
     data, noise = [], []
-    for line in text.splitlines():
+    for line in text.split('\n'):
         if not line.strip():
             continue
         (data if _data_line(line) else noise).append(line)
     if data:
         return '\n'.join(data) + '\n', noise
-    return '', [line for line in text.splitlines() if line.strip()]
+    return '', [line for line in text.split('\n') if line.strip()]
 
 
 def _noise_notes(noise, raw):

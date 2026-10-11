@@ -31,7 +31,7 @@ const steps = (root) => root.all((e) => e.tagName === 'LI').map((li) => ({
   commands: li.all((e) => e.tagName === 'PRE').map((pre) => pre.textContent),
 }));
 
-// 1. The owner's page: seven steps, their states, where each is done.
+// 1. The owner's page: eight steps, their states, where each is done.
 {
   const ctx = who.owner;
   const page = await setup.page(ctx, { pid: project });
@@ -119,6 +119,12 @@ out.unchecked = [setup.summary({ remaining: 0, unchecked: 1 }), setup.summary({ 
   out.older = { kinds: older.kinds, texts: older.texts, buttons: older.buttons };
   const none = await shown({ command: null, commands: [] });
   out.none = { kinds: none.kinds, texts: none.texts, buttons: none.buttons };
+  // kittrial-5bb.220 F5: a fill-in command is marked and names its words; a null entry does not throw.
+  const fill = await shown({ command: 'admin.py set-guidance p1 --actor OPERATOR --file FILE', commands: [
+    { kind: 'shell-fill', label: 'Set the guidance (a shell command)', text: 'admin.py set-guidance p1 --actor OPERATOR --file FILE', note: null, replace: ['OPERATOR', 'FILE'] }] });
+  out.fill = { kinds: fill.kinds, buttons: fill.buttons, text: fill.text };
+  const nullEntry = await shown({ command: null, commands: [null, { kind: 'shell', label: 'Run', text: 'run-me', note: null, replace: [] }] });
+  out.nullEntry = { kinds: nullEntry.kinds, texts: nullEntry.texts, buttons: nullEntry.buttons };
   // kittrial-5bb.199: the installation's review rule under the steps. A service older than the rule
   // sends none: then nothing is added (a null handed to replaceChildren would be the word "null").
   out.rule = [];

@@ -188,10 +188,12 @@ class NoUnguardedParseTests(unittest.TestCase):
 
     ALLOWED = {
         'activity.py': (2, "the tracker export, and a cursor file on the caller's own machine"),
-        'admin.py': (25, 'bd output and files on the coordination host, in operator commands; credential-actors '
-                         '(kittrial-5bb.184) reads the web state and an export and catches RecursionError itself; '
-                         'adopt-actor (kittrial-5bb.194 revision 2) reads one export to check that the actor '
-                         'appears in the project and catches RecursionError itself'),
+        'admin.py': (25, 'bd output and files on the coordination host, in operator commands; the export row reads '
+                         'of credential-actors (kittrial-5bb.184) and adopt-actor\'s tracker check (kittrial-5bb.194 '
+                         'revision 2) go through record_json.loads_rows (kittrial-5bb.221 revision 2): rows nested '
+                         'to 750 read normally and any unreadable row fails the read as a whole; two more '
+                         '(kittrial-5bb.202) read a project\'s .beads/metadata.json and one bd merge-slot check '
+                         'answer in project_merge_slot_state, whose caller catches OSError/ValueError itself'),
         'artifacts.py': (1, 'the artifact index the kit writes'),
         'bootstrap.py': (2, 'bd output on the host'),
         'bd_refusals.py': (1, "bd's own answer to one command; it catches RecursionError itself"),
@@ -200,7 +202,13 @@ class NoUnguardedParseTests(unittest.TestCase):
         'capability_misses.py': (1, 'the telemetry file the kit writes; any failure starts a new log'),
         'client.py': (10, "the endpoint's own answer, on the caller's machine"),
         'coordination.py': (7, 'bd output'),
-        'endpoint.py': (4, 'bd output'),
+        'endpoint.py': (5, 'bd output, and the project\'s .beads/metadata.json whose Dolt server coordinates '
+                           'guard bd (kittrial-5bb.202 rev-3 item 2; the file is the host\'s own)'),
+        'export_requirements.py': (3, 'offline native export rows are first parsed through the row guard '
+                                  '(750 levels), then reparsed with duplicate-field refusal; syntax checking '
+                                  'of a malformed row runs only within the same bound and catches parser '
+                                  'recursion; the iterative identity scanner parses single string literals '
+                                  'only. Reserved revision comments still use the 64-level record guard'),
         'handoff.py': (15, 'bd output and the request, receipt and recovery files the kit writes'),
         'http_auth.py': (3, "the service's own store"),
         'http_authority.py': (3, "the service's own store and journal"),
@@ -222,13 +230,18 @@ class NoUnguardedParseTests(unittest.TestCase):
         'sessions.py': (1, 'the session registry the kit writes in read_registry (which turns a '
                            'damaged or nested file into one plain sentence; kittrial-5bb.194 revision 2 made '
                            'execute read through it)'),
+        'ssh_forced_command.py': (1, "one installation setting read from the runtime's own "
+                                     'deployment.private.json (kittrial-5bb.196): the wrapper cannot import the kit '
+                                     '(it must start on any interpreter the account has), so it reads that '
+                                     'host-written file itself and refuses a file it cannot read, a deeply nested '
+                                     'one included'),
         'version.py': (1, "the kit's own version file"),
         'work.py': (1, 'the request files the kit writes'),
         'worker.py': (2, "the endpoint's answer, on the caller's machine"),
         'worker_gate.py': (1, "the endpoint's answer, on the caller's machine"),
     }
     # Files that parse text somebody else wrote, and have no bare json.loads at all.
-    GUARDED_ONLY = ('capability_records.py', 'capability_verification.py', 'export_requirements.py', 'feedback.py', 'guidance.py', 'keyed_entries.py', 'recovery.py', 'reserved_comments.py')
+    GUARDED_ONLY = ('capability_records.py', 'capability_verification.py', 'feedback.py', 'guidance.py', 'keyed_entries.py', 'recovery.py', 'reserved_comments.py')
 
     def bare(self, path):
         return len(re.findall(r'(?<![A-Za-z_.])json\.loads\(', path.read_text(encoding='utf-8')))
@@ -264,9 +277,24 @@ class NoUnguardedParseTests(unittest.TestCase):
             # The fourth (kittrial-5bb.194) reads the actor-adoptions audit, which an
             # operator command appends to and an operator reads: a nested or unreadable file
             # must be a refusal naming it, not a traceback.
-            'admin.py': 4,
+            # The fifth (kittrial-5bb.192) reads the authority-changes audit, which the
+            # operator/verifier list commands append to and an operator reads: a nested or
+            # unreadable file must be a refusal naming it, not a traceback.
+            # The sixth (kittrial-5bb.220 F1) reads the backup-schedule note an operator
+            # records; a damaged or nested note reads as no note, never a traceback.
+            # The seventh (kittrial-5bb.220 review 2 item 4a) reads one line of the
+            # backup-schedule log the kit writes; a damaged line is skipped.
+            'admin.py': 7,
+            # endpoint.py's fifth (kittrial-5bb.195): the JSON payload of a coordinator
+            # acceptance command, which the caller transports as a file attachment. It is
+            # the caller's text, so it is parsed through the guard.
+            # kittrial-5bb.221 revision 2 moved tracker_actors' export rows to
+            # record_json.loads_rows (the row bound), so four remain.
             'briefing.py': 3, 'coordination.py': 3, 'endpoint.py': 4, 'export_requirements.py': 1, 'feedback.py': 3, 'guidance.py': 3,
             'handoff.py': 1, 'http_service.py': 2, 'lifecycle.py': 1, 'recovery.py': 1, 'requirements.py': 1, 'requirement_records.py': 1, 'reserved_comments.py': 1,
+            # The simple owner adapter guards bd's decision-create receipt and
+            # its bounded, regular-file owner receipt reader.
+            'requirement_http.py': 2,
             'review_recommendations.py': 2, 'review_workflow.py': 4, 'work.py': 1, 'worker_gate.py': 1})
 
     def test_the_parsers_that_do_not_call_it_directly_reach_it(self):

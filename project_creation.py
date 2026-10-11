@@ -68,7 +68,7 @@ SERVER_LIMIT_MAX = 500
 #: names, such as information_schema, hold an underscore and are not project names anyway.)
 RESERVED_NAMES = frozenset({'mysql', 'sys', 'dolt', 'doltcfg'})
 #: The stages of the work, in order; a record names the one that was running.
-STAGES = ('init', 'configure', 'backup-target', 'merge-slot', 'first-backup')
+STAGES = ('init', 'configure', 'requirements-governance', 'backup-target', 'merge-slot', 'first-backup')
 ERROR_LIMIT = 300
 #: One sentence for a name that cannot be used, whatever the reason (taken by a project,
 #: held by another creation, or retired), so the answer does not say which.
@@ -387,8 +387,15 @@ def reserve(root, name, account, operation_id, limit=None, registered=(), known=
         # holds its own place already, so only the others are counted for it too; it is refused
         # only when they alone fill the server (an operator lowered the limit or added projects).
         raise NothingMade(AT_SERVER_LIMIT)
-    write_record(root, name, {'project': name, 'by': account, 'operation_id': operation_id, 'state': 'started',
-                              'stage': None, 'started_at': _stamp()})
+    # A retry preserves whether the original creation opted into the default.
+    # Old, already-started creations must not acquire a new mode at release time.
+    updated = {'project': name, 'by': account, 'operation_id': operation_id, 'state': 'started',
+               'stage': None, 'started_at': record['started_at'] if record else _stamp()}
+    if record is None or record.get('state') == 'removed':
+        updated['requirements_governance'] = 'simple'
+    elif 'requirements_governance' in record:
+        updated['requirements_governance'] = record['requirements_governance']
+    write_record(root, name, updated)
     return None
 
 
@@ -503,7 +510,7 @@ def host_busy_message(root, name):
     return BUSY
 
 
-def host_create(root, name, initialize, guards):
+def host_create(root, name, initialize, guards, requirements_default=True):
     """``admin.py add-project``'s path: the operator's route keeps the web route's record.
 
     ``guards`` refuses a name that cannot be used before anything is written, so a refusal
@@ -531,16 +538,18 @@ def host_create(root, name, initialize, guards):
     root = Path(root)
     try:
         with creation_lock(root, wait=0, name=name):
-            return _host_create_locked(root, name, initialize, guards)
+            return _host_create_locked(root, name, initialize, guards, requirements_default)
     except Busy:
         raise ValueError(host_busy_message(root, name)) from None
 
 
-def _host_create_locked(root, name, initialize, guards):
+def _host_create_locked(root, name, initialize, guards, requirements_default=True):
     guards(root, name)
     record = read_record(root, name)
     if record is None or record['state'] != 'started':
         record = {'project': name, 'by': HOST, 'state': 'started', 'stage': None, 'started_at': _stamp()}
+        if requirements_default:
+            record['requirements_governance'] = 'simple'
 
     def stage(label):
         record['stage'] = label
@@ -850,7 +859,8 @@ def registrable(root, name):
 #: started with the service's authority arguments AND the request carries a
 #: live-authority descriptor that passes for exactly the capability named here.
 SERVICE_ACTIONS = {'create-project': 'project.host-create', 'project-creations': 'accounts.admin',
-                   'set-onboarding': 'project.admin', 'creation-standing': 'project.host-create'}
+                   'set-onboarding': 'project.admin', 'owner-requirements': 'project.admin',
+                   'creation-standing': 'project.host-create'}
 CREATION_JOURNAL = 'operations.sqlite3'
 
 

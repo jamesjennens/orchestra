@@ -27,10 +27,12 @@ records already carrying the `requirement`/`brd-section` type label (or records
 this command created). The operator may accept revision 1 on an untyped task
 with no prior revisions and F3 evidence. `revise` is bound to the record's
 existing kind and key: cross-kind changes and key swaps are refused before any
-native write. Revise follows the trusted-team
-model: any contributor actor may revise any draft (see
-docs/REQUIREMENTS_INTEGRATION.md); the actor string is an attribution, not an
-authenticated owner identity.
+native write. In governed mode, any contributor actor may revise a draft (see
+docs/REQUIREMENTS_INTEGRATION.md). In simple mode, a draft whose latest validated
+revision was written by a human owner is protected from contributor replacement;
+contributors propose a change instead. This check also applies when resuming a
+pending operation. The actor string is attribution, not an authenticated owner
+identity.
 
 Idempotency is native-first. A created record carries `request:<hash>` and
 `request-content:<hash>` labels (the create-child convention), and the revision
@@ -278,7 +280,7 @@ def existing_revisions(row):
                                 'requirement', 'revision', 'revision')
 
 
-def existing_acceptances(row, operators=None):
+def _host_acceptances(row, operators=None):
     """Validated durable acceptance ledger for one record; malformed fails closed.
 
     Keyed by the bound revision (None for a backfill record with no revision
@@ -300,6 +302,63 @@ def existing_acceptances(row, operators=None):
             return evidence_is_live(record, comment.get('author'), allowed)
     return core.existing_ledger(row, ACCEPTANCE_PREFIX, parse_acceptance_record,
                                 'requirement', 'acceptance', 'revision', keep=keep)
+
+
+def existing_acceptances(row, operators=None):
+    """One evidence resolver for host and authenticated owner decisions.
+
+    Catalog acceptance authority is unchanged. Only requirement evidence learns
+    the owner kind; each owner decision binds its native human author at write
+    time, regardless of later membership or governance changes.
+    """
+    from requirement_owner_records import existing_acceptances as owner_acceptances
+    result = dict(_host_acceptances(row, operators))
+    for revision, evidence in owner_acceptances(row).items():
+        if revision in result and (result[revision]['record_sha256'] != evidence['record_sha256']
+                                   or result[revision].get('decision') != evidence['decision']):
+            raise ValueError('Conflicting host and owner requirement acceptance evidence')
+        result[revision] = evidence
+    return result
+
+
+def resolved_acceptance(row, record, operators=None):
+    """Exact revision's acceptance, retaining legacy captured-snapshot reads.
+
+    An owner-family claim always needs valid, author-bound evidence. Neither an
+    accepted label nor an accepted revision can substitute for that evidence.
+    Older host-only snapshots retain their declared v1 acceptance semantics.
+    """
+    from requirement_owner_records import ACCEPTANCE_PREFIX as owner_prefix, STATE_PREFIX, HUMAN, parse
+    from reserved_comments import _reserved_prefix_view
+    owner_claim = False
+    for comment in row.get('comments') or []:
+        body = comment.get('text', '') if isinstance(comment, dict) else ''
+        if (isinstance(body, str) and body.startswith(REVISION_PREFIX)
+                and HUMAN.fullmatch(str(comment.get('author', '')))):
+            from reserved_comments import parse_requirement_record
+            claimed = parse_requirement_record(body)
+            if claimed is not None and claimed['revision'] == record['revision']:
+                owner_claim = True
+        view = _reserved_prefix_view(body) if isinstance(body, str) else ''
+        if view.startswith('Kind: requirement-owner-'):
+            owner_claim = True
+            if view != body:
+                raise ValueError('Malformed owner requirement evidence')
+            if not body.startswith((owner_prefix, STATE_PREFIX)):
+                raise ValueError('Unsupported owner requirement evidence')
+            if body.startswith(STATE_PREFIX):
+                # Reserved future state evidence cannot make a record accepted.
+                # An unimplemented state operation is never silently ignored.
+                if parse(body, state=True) is None:
+                    raise ValueError('Malformed owner requirement state evidence')
+                raise ValueError('Owner requirement state is not supported by this kit')
+    evidence = existing_acceptances(row, operators).get(record['revision'])
+    if record.get('id') != row.get('id') or record.get('acceptance_state') != 'accepted':
+        return False
+    if evidence is not None:
+        return (evidence['record_sha256'] == record.get('sha256')
+                and evidence.get('acceptance_state', 'accepted') == 'accepted')
+    return not owner_claim
 
 
 def acceptance_evidence(bound, task, revision, acceptance_state, actor, at=None):
@@ -460,6 +519,13 @@ def _check_revision(payload, revision, existing, record, task):
 
 def _current_acceptance(row, existing):
     """Whether the record is currently accepted, from state label and revisions."""
+    from requirement_owner_records import HUMAN
+    if any(isinstance(c, dict) and isinstance(c.get('text'), str)
+           and (c['text'].startswith('Kind: requirement-owner-')
+                or (c['text'].startswith(REVISION_PREFIX) and HUMAN.fullmatch(str(c.get('author', '')))))
+           for c in row.get('comments') or []):
+        newest = latest_revision(existing)
+        return 'accepted' if newest is not None and resolved_acceptance(row, newest) else 'draft'
     if 'requirement:accepted' in (row.get('labels') or []):
         return 'accepted'
     record = latest_revision(existing)
@@ -604,7 +670,36 @@ def apply_native(payload, actor, run, project, operator=False, operators=None):
     The steps are the shared keyed-record core's (keyed_records.apply_native)
     with this module's REQUIREMENT spec.
     """
-    return core.apply_native(payload, actor, run, project, SPEC, operator=operator,
+    spec = SPEC
+    if not operator:
+        # The caller holds the project lock. Recheck mode and the exact latest
+        # revision at the effect boundary, including retries of pending writes.
+        # Native author attribution is reserved for the service's human writer;
+        # mutable issue titles, labels and creator fields cannot establish it.
+        def selectable(row, payload, operator, existing):
+            _require_selectable(row, payload, operator, existing)
+            latest = latest_revision(existing)
+            if latest is None or latest['acceptance_state'] != 'draft':
+                return
+            from requirement_owner_records import HUMAN, existing_acceptances as owner_acceptances
+            body = revision_comment(latest)
+            if not any(isinstance(comment, dict) and comment.get('text') == body
+                       and HUMAN.fullmatch(str(comment.get('author', '')))
+                       for comment in row.get('comments') or []):
+                return
+            import requirement_governance as governance
+            name = Path(project).name
+            if governance.current(project, name)['mode'] != 'simple':
+                return
+            for evidence in owner_acceptances(row).values():
+                governance.validate_evidence(project, name, evidence)
+            raise ValueError('This pending requirement edit belongs to the project owner. '
+                             'Propose a change instead of replacing it.')
+
+        values = {name: getattr(SPEC, name) for name in core.RecordSpec.VALUES + core.RecordSpec.HOOKS}
+        values['require_selectable'] = selectable
+        spec = core.RecordSpec(**values)
+    return core.apply_native(payload, actor, run, project, spec, operator=operator,
                              operators=operators)
 
 

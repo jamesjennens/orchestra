@@ -49,6 +49,32 @@ def fill(status, label, words, note, replace):
                  ('PYTHON', 'KIT', 'RUNTIME_ROOT') + tuple(replace))
 
 
+def fill_coordination(status, label, words, note, replace):
+    """A coordination command with words to replace, from the host's own beginning.
+
+    ``coordination.py`` is a sibling of ``admin.py`` and takes ``--config`` (the operator's
+    own client configuration), not ``--root``, so it has its own beginning and the host
+    reports it as ``coordination`` beside ``admin`` (kittrial-5bb.202 review item 4: the
+    merge-slot step said host steps show a command and carried none). A host that does not say
+    how its coordination commands begin, or no host at all, names the words to replace."""
+    prefix = status.get('coordination') if isinstance(status, dict) else None
+    if isinstance(prefix, str) and prefix.strip():
+        return entry('shell-fill', label, prefix + ' ' + words, note, replace)
+    return entry('shell-fill', label, 'PYTHON KIT/coordination.py ' + words,
+                 note + ' This server did not say how its commands begin: PYTHON is the interpreter the kit runs '
+                        'under and KIT the installed kit.',
+                 ('PYTHON', 'KIT') + tuple(replace))
+
+
+def ended(text):
+    """``text`` with one full stop, unless it already ends in a sentence mark.
+
+    An operator's note may itself end in a full stop, and appending another would print '..'
+    (kittrial-5bb.220 review 2 item 3).
+    """
+    return text if text.endswith(('.', '!', '?')) else text + '.'
+
+
 def is_merge_slot(row, project_id=None):
     """The project's merge slot row: an internal record, not a task.
 
@@ -156,6 +182,37 @@ def steps(handler, principal, project_id):
 
     status, reason = host_status(backend, project_id)
     name = project_id
+
+    def merge_slot(block):
+        # The host's own read of the project's merge slot (kittrial-5bb.202 item 2). A project
+        # with NO slot row cannot issue a worker credential and needs an operator to run the
+        # merge-create coordination operation; a DAMAGED slot still issues one (201, as on
+        # main), it is listed here because merge-create repairs it (kittrial-5bb.202 review
+        # item 4: the old comment said a damaged slot cannot issue a credential, and it can).
+        state = block.get('state')
+        if state == 'healthy':
+            return 'done', 'The project has a usable merge slot.'
+        if state in ('missing', 'damaged'):
+            return 'todo', (block.get('detail') or
+                            'Run the merge-create operation, which creates or repairs it, then try again.')
+        return 'unknown', 'The server could not say whether the project has a usable merge slot.'
+
+    result.append(host_step(
+        'merge-slot', 'Make sure the project has a usable merge slot',
+        # The host's key is ``merge_slot``; host_step looks a step up by its id, so hand it a
+        # one-key status. A service that predates the field says unknown, not "no host".
+        None if status is None else {'merge-slot': status.get('merge_slot')},
+        reason, merge_slot, None,
+        # The page says host steps show a command (kittrial-5bb.200); merge-create is a
+        # coordination operation, so this is the coordination.py invocation with the payload
+        # in the note (kittrial-5bb.202 review item 4).
+        [fill_coordination(status, 'Run the merge-create operation (a shell command, on the server)',
+                           '--config CLIENT_CONFIG --project %s --actor OPERATOR --file MERGE_JSON' % name,
+                           'Replace CLIENT_CONFIG with your coordination client configuration, OPERATOR with your '
+                           'name on the operator list and MERGE_JSON with the path of a file holding '
+                           '{"operation":"merge-create"}. The operation creates the slot, or repairs a damaged one.',
+                           ('CLIENT_CONFIG', 'OPERATOR', 'MERGE_JSON'))],
+        None))
     result.append(host_step(
         'guidance', 'Set the standing guidance every worker reads', status, reason,
         lambda block: ({'set': ('done', 'Set%s.' % (' on %s' % block['set_at'][:10] if block.get('set_at') else '')),
@@ -192,46 +249,91 @@ def steps(handler, principal, project_id):
     def backup(block):
         # Two different things, and the step says which is missing (kittrial-5bb.200: "todo" beside
         # "the last backup run recorded this project complete" read as a contradiction): a backup that
-        # has been RUN, and a SCHEDULE that will run the next one.
+        # has been RUN (as the last run recorded it), and a SCHEDULE that will run the next one. The
+        # step sees only systemd user units, so it never asserts as fact that no schedule anywhere
+        # covers the project: it says "no systemd user schedule was found", and an operator's recorded
+        # statement that backups are scheduled elsewhere reads the step done (kittrial-5bb.220 F1).
         last = block.get('last_run') if isinstance(block.get('last_run'), dict) else None
         if last:
             when = ' on %s' % last['completed_at'][:10] if last.get('completed_at') else ''
             run = 'A backup of this project was run%s and recorded it %s%s' % (
                 when, last.get('status'), ', degraded' if last.get('degraded') else '')
         scheduled = block.get('scheduled')
+        # An operator's recorded statement, shown with who recorded it and when. The server did
+        # not check it; it is about the whole runtime and never expires (kittrial-5bb.220 F1).
+        note = block.get('elsewhere')
+        recorded = None
+        if note:
+            who = ' by %s' % block.get('elsewhere_by') if block.get('elsewhere_by') else ''
+            when = ' on %s' % block.get('elsewhere_at')[:10] if block.get('elsewhere_at') else ''
+            recorded = ('An operator%s%s recorded that this runtime\'s backups are scheduled elsewhere: %s'
+                        % (who, when, note))
+        # When no unit line can be printed for this installation, say why where the line would be
+        # shown (kittrial-5bb.220 review 2 item 2a).
+        line_reason = block.get('line_reason') if isinstance(block.get('line_reason'), str) else None
+        no_line = (' No line for a schedule can be printed for this installation: %s.' % line_reason) if line_reason else ''
         if scheduled == 'covered':
             return 'done', ('A scheduled backup on the server covers this project. ' + (run + '.' if last else
                             'It has not run yet: no backup run has recorded this project.'))
-        if scheduled == 'not-covered':
-            looked = ('The step looks for a systemd unit of the service account (beads-*backup*.service) that backs '
-                      'up this runtime; a schedule kept anywhere else is not seen here.')
+        if scheduled == 'elsewhere':
+            detail = (ended(recorded) + ' The server did not check this; the statement covers the whole runtime '
+                      'and never expires.' + no_line)
             if last:
-                return 'todo', (run + ', but no schedule on the server covers it, so it will not be backed up again '
-                                'by itself. What is missing is the schedule. ' + looked)
-            return 'todo', ('No backup of this project has been run, and no schedule on the server covers it: both '
-                            'are missing. Run one now, then add the schedule. ' + looked)
+                detail += ' ' + run + '.'
+            return 'done', detail
+        if scheduled == 'not-covered':
+            looked = ('The step looks for an enabled systemd user timer (beads-*backup*.timer) that runs a '
+                      'beads-*backup*.service unit backing up this runtime; a schedule kept anywhere else is not '
+                      'seen here, and an operator can record one so this step reads done.')
+            if last:
+                return 'todo', (run + ', but no systemd user schedule was found for it. What is missing is the '
+                                'schedule. ' + looked + no_line)
+            return 'todo', ('No backup run has recorded this project yet, and no systemd user schedule was found '
+                            'for it: both are missing. Run one now, then add the schedule. ' + looked + no_line)
         ran = (' ' + run + '.') if last else ' No backup run has recorded this project yet.'
         if block.get('reason') == 'no-account-home':
-            return 'unknown', ('The server could not check its backup schedule: the web service was started without '
-                               'the account\'s home directory, so it cannot see the installed schedule. Ask an '
-                               'operator to check on the server.' + ran)
-        return 'unknown', 'The server could not read its backup schedule, so ask an operator.' + ran
+            detail = ('The server could not check its backup schedule: the web service was started without '
+                      'the account\'s home directory, so it cannot see the installed schedule. Ask an '
+                      'operator to check on the server.' + ran)
+        else:
+            detail = 'The server could not read its backup schedule, so ask an operator.' + ran
+        if recorded:
+            detail += ' ' + ended(recorded) + ' (the server did not check it).'
+        return 'unknown', detail + no_line
     block = (status or {}).get('backup') if isinstance((status or {}).get('backup'), dict) else {}
     line, run_now, check = (block.get(key) if isinstance(block.get(key), str) else None for key in ('line', 'run_now', 'check'))
+    line_reason = block.get('line_reason') if isinstance(block.get('line_reason'), str) else None
     where = block.get('unit_directory') if isinstance(block.get('unit_directory'), str) else None
     commands = []
     if run_now:
         commands.append(entry('shell', 'Run a backup now (a shell command, on the server, as the service account)', run_now,
                               'It backs up every project of this server once. It does not schedule anything.'))
-    commands.append(entry(
-        'unit-line', 'The line for a schedule (a line of a systemd unit file, not a shell command)',
-        line or 'ExecStart=PYTHON admin.py --root RUNTIME_ROOT backup --all',
-        'It goes in the [Service] section of a beads-*backup*.service unit%s, which a timer runs. To check, reload this '
-        'page: the step reads the installed units.%s' % (
-            ' in %s' % where if where else ' in the service account\'s systemd user directory',
-            ' On the server: systemctl --user list-timers, and the check below.' if check else '')))
+    if line:
+        commands.append(entry(
+            'unit-line', 'The line for a schedule (a line of a systemd unit file, not a shell command)',
+            line,
+            'It goes in the [Service] section of a beads-*backup*.service unit%s, which a timer runs. To check, reload this '
+            'page: the step reads the installed units.%s' % (
+                ' in %s' % where if where else ' in the service account\'s systemd user directory',
+                ' On the server: systemctl --user list-timers, and the check below.' if check else '')))
+    elif not line_reason:
+        # A page older than the host's answer, or one with no line to show: the placeholder line,
+        # never when the host refused to print one (then the detail says why).
+        commands.append(entry(
+            'unit-line', 'The line for a schedule (a line of a systemd unit file, not a shell command)',
+            'ExecStart=PYTHON admin.py --root RUNTIME_ROOT backup --all',
+            'It goes in the [Service] section of a beads-*backup*.service unit%s, which a timer runs.' % (
+                ' in %s' % where if where else ' in the service account\'s systemd user directory')))
     if check:
         commands.append(entry('shell', 'Check that every project has a complete backup (a shell command, on the server)', check))
+    # An operator can record that backups are scheduled elsewhere: show the command, as the other
+    # steps show theirs (kittrial-5bb.220 review 2 item 4c).
+    commands.append(fill(status, 'Record that backups are scheduled elsewhere (a shell command, on the server)',
+                         'backup-schedule --note NOTE --actor OPERATOR',
+                         'Replace NOTE with one line of at most 300 characters and OPERATOR with your name on the '
+                         'server\'s operator list. The statement is about the whole runtime and never expires; the '
+                         'server does not check it. Every set and clear is kept in a log on the server.',
+                         ('NOTE', 'OPERATOR')))
     result.append(host_step('backup', 'Make sure a scheduled backup covers this project', status, reason, backup,
                             None, commands, None))
 

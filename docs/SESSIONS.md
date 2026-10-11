@@ -46,8 +46,12 @@ stop just because the previous task was delivered. Stop at the configured deadli
 or, after checking both sources, when there is no actionable open or pending-review
 task owned by this actor and no unheld task in `ready`. Use the full
 client-prefixed examples above, and do not wait on other actors' held tasks or poll
-an empty queue indefinitely. Office/person-started turns do not poll or loop; end
-each turn with a one-line status for the person.
+an empty queue indefinitely. Office/person-started turns do not start a poll or a loop
+of their own: end each turn with a one-line status for the person. Only the worker's own
+user authorizes checking again, by asking, within what the project's standing guidance
+allows. A task awaiting review or integration is not a reason to stop checking before the
+deadline; that is exactly when checking matters. A harness that cannot wait or schedule
+tells its user so in one line instead of refusing.
 
 ## Register with an installed client
 
@@ -58,6 +62,8 @@ python client.py --config client.local.json --project example --actor RETURNED_A
 ```
 
 Registration is the only client action that does not require an actor. Other commands retain the existing explicit-actor rule. The output is JSON containing `session.actor`, `session.name`, `session.created_at` and `session.request_id`.
+
+**Bound keys (`--principal lane:NAME`)**: For a key bound to a principal, `session register` is the **only** permitted first action. Because the principal owns no actors in the project before its first registration, any pre-registration command (including `docs`, `onboard`, or `ready`) is refused: client commands require `--actor`, and the endpoint's principal gate refuses any unowned actor. Workers in a newly bound lane must read instructions from their local checkout of the repository rather than querying served docs before registering. Operators can verify key installation without registering using `admin.py --root RUNTIME authorized-keys-list` on the server or plain SSH on the client (see [checking a bound key](OPERATIONS.md#checking-a-bound-key-without-registering)).
 
 Before sending a registration, the client prints its generated request ID to stderr. After an uncertain response, retry with the **same name and request ID**:
 

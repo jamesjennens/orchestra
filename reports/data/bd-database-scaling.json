@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "measurement_source": "f615440bea48fdba534ba6efb1dfb56ed18eca2d",
+  "platform": "Linux amd64",
+  "bd_version": "1.2.2",
+  "bd_source": "6c124203e771433a3550c348771a5b5e27fd3c21",
+  "dolt_version": "2.2.0",
+  "binary_sha256": {
+    "bd": "54fc0e0581ce4c5487a5b242f0a4f34af1ef09cf056e164a1af63a6ec7aa1e0e",
+    "dolt": "72352f1d882472a7a8d6124e9c4dc12f80e2c2359ea95f1424c032e9250e35e6"
+  },
+  "completed_samples": 1234,
+  "failed_samples": 0,
+  "release_backup100_complete": true,
+  "sources": [
+    {
+      "name": "native-curve-v2-results.json",
+      "samples": 481,
+      "sha256": "d19c91e9880cf5c887dfcfea63cec1723f630f1b72548a1607a21419cb5ca5d5",
+      "path": "raw/native-curve-v2-results.json"
+    },
+    {
+      "name": "native-post-v1-results.json",
+      "samples": 84,
+      "sha256": "ce692231d2642cae3a4786a93f7ae8a39ec4143e32b75fccdb211f33931134d6",
+      "path": "raw/native-post-v1-results.json"
+    },
+    {
+      "name": "endpoint-curve-v1-results.json",
+      "samples": 520,
+      "sha256": "8ee5bdede135d0ccec0c69548300927f6a86f714fabcb0ce10509cc32d659265",
+      "path": "raw/endpoint-curve-v1-results.json"
+    },
+    {
+      "name": "native100-v1-results.json",
+      "samples": 72,
+      "sha256": "fff255c6e3ca46141bee77a6059da9786e3ad9c55a267af34f96a117b481e011",
+      "path": "raw/native100-v1-results.json"
+    },
+    {
+      "name": "endpoint-post100-v2-results.json",
+      "samples": 77,
+      "sha256": "09639d29334a81944c50b2b30f486f59309d8ca180032e23b31883d959f30738",
+      "path": "raw/endpoint-post100-v2-results.json"
+    }
+  ],
+  "method": "Three debug and three warning samples per ordinary operation/count; release/backup are single debug samples. Native100 uses the larger endpoint fixture, not the original native fixture.",
+  "version_comparison": {
+    "measurement_source": "f615440bea48fdba534ba6efb1dfb56ed18eca2d",
+    "bd131_commit": "c1c4b642ac1c08d8c828007a1c2f96e47e43ef7c",
+    "bd131_archive_sha256": "3219443a9734b89b93fb16ee8d65844759fa1b3cd3cf139c606b7353cfb0715c",
+    "bd131_binary_sha256": "a8f48d771b9e11eccfced4aed72923b59eda746f7a9b425e7ca1af7a51251653",
+    "dolt_version": "2.2.0",
+    "completed_samples": 126,
+    "failed_samples": 0,
+    "raw": {
+      "path": "raw/bd-version-comparison.json",
+      "sha256": "2fc018e8162876765d9ecfd429d702b8d5b0fd2908d62b2d2964a475a84fbf37"
+    },
+    "fixture": "Fresh stopped pinned seed copies,26tables/222columns; migrate target only for new version; actual existing DB count1/20/50 for each repetition. Other databases retain seed schema."
+  },
+  "aggregation": "Derived groups are not stored. Run summarize_bd_scaling.py; groups retain actual raw filename and avoid ambiguous post50 aliases. For the displayed filtered-columns50 debug control, pool six samples in native-curve-v2 and native-post-v1: median818.5ms.",
+  "trace_location": "Raw trace names are evidence identifiers, not repository paths. Preserved in private review evidence, archive sha256 d93c7ae10c27fa1793bebc62b31096d8a7aaa2f241d95eea0aaaf820655ce9a0."
+}

@@ -40,6 +40,10 @@ import test_http_review_fixes as fixes
 SESSION_A = 'session-11111111-2222-3333-4444-555555555555'
 SESSION_FREE = 'session-99999999-8888-7777-6666-555555555555'
 HOST = {'sessions': [SESSION_A], 'operators': ['ops-lead', 'team/alice'], 'verifiers': ['verity']}
+#: The four keys `admin.project_merge_slot_state` (and now `endpoint.tracker_actors`) require
+#: before bd is run at all: without them bd falls back to an embedded database (rev-3 item 2).
+SERVER_COORDINATES = {'dolt_server_host': '127.0.0.1', 'dolt_server_port': 13317,
+                      'dolt_server_user': 'root', 'dolt_database': 'probe'}
 #: (what it is, the namespace asked for, the rule it breaks)
 TAKEN = (
     ('a registered session actor', SESSION_A, actor_names.SESSION),
@@ -284,6 +288,10 @@ class DenialTests(unittest.TestCase):
             # Issued before the rule: no mark, and it was issued at this instant.
             'cred_old': {'user_id': 'usr_a', 'project_id': 'probe', 'actor': 'opus-worker-lane', 'revoked': False,
                          'created_at': '2026-10-07T00:00:00Z'},
+            # The same shape under a neutral name, for the tests added after the review of
+            # revision 2 that do not need the legacy name (kittrial-5bb.202 rev-3 item 5).
+            'cred_plain': {'user_id': 'usr_a', 'project_id': 'probe', 'actor': 'held-name', 'revoked': False,
+                           'created_at': '2026-10-07T00:00:00Z'},
         }
         (self.tmp / 'authority.json').write_text(json.dumps(state), encoding='utf-8')
         self.config = http_authority.AuthorityConfig(str(self.tmp / 'authority.json'))
@@ -404,6 +412,22 @@ class DenialTests(unittest.TestCase):
         self.assertEqual((2, 'tracker'), (answer['returncode'], answer.get('fault')), answer)
         self.assertNotEqual(126, answer['returncode'])
 
+    def test_a_tracker_without_the_merge_slot_is_its_own_fault_naming_merge_create(self):
+        """kittrial-5bb.202 item 1: rows without the slot are not the transient no-rows fault."""
+        def slotless(rows=False, own=()):
+            if rows:
+                raise actor_names.TrackerMergeSlotMissing()
+            return dict(HOST)
+        answer = http_authority.descriptor_actor_denial(
+            {'project': 'probe', 'actor': 'held-name', 'action': 'bd', 'args': ['create', 'x'],
+             'authority': {'via': 'credential', 'user_id': 'usr_a', 'credential_id': 'cred_plain',
+                           'session_hash': 'sess_a', 'project': 'probe', 'capability': 'tasks.write'}},
+            self.config, slotless)
+        self.assertEqual((2, 'merge-slot'), (answer['returncode'], answer.get('fault')), answer)
+        self.assertIn('merge-create', answer['stderr'])
+        self.assertNotIn('try again shortly', answer['stderr'])
+        self.assertNotEqual(126, answer['returncode'])
+
     def test_a_settled_credential_is_not_read_against_the_tracker_again(self):
         """Items 4 and 5: checked, waived and refused marks each answer without an export."""
         state = json.loads((self.tmp / 'authority.json').read_text(encoding='utf-8'))
@@ -503,6 +527,28 @@ class IssueCase(HostNames, fixes.EndpointCase):
         self.assertEqual(422, refused.status)
         for name in ('alice', 'ops-lead', 'verity', SESSION_A):
             self.assertNotIn(name, json.dumps(refused.data))
+
+    def test_the_superuser_waiver_does_not_cross_an_unreadable_row(self):
+        """kittrial-5bb.243 r2 review item 3: `allow_actor` waives the ROW rule only -- the
+        tracker is still read to bound the rows, and a row that cannot be read still
+        refuses the issue. A mutant that lets the waiver skip the read must fail here."""
+        self.project()
+        self.host(tracker='unreadable', unreadable_rows=[{'id': 'probe-deep'}])
+        admin = self.admin_token()
+        refused = self.request('POST', self.credentials,
+                               {'actor': 'opus-worker-lane', 'allow_actor': True,
+                                'allow_actor_reason': 'the lane owns this name'}, token=admin, key='waiver-1')
+        self.assertEqual(503, refused.status, refused.data)
+        self.assertEqual('unreadable_rows', refused.data['error']['code'])
+        self.assertIn('probe-deep', message(refused))
+        self.assertIn('second try', message(refused))
+        self.assertEqual([], [c for c in self.listed_without_asking() if c.get('actor') == 'opus-worker-lane'])
+        # And the key is not spent: with the tracker readable again the same key issues.
+        self.host(authors=['opus-worker-lane'])
+        allowed = self.request('POST', self.credentials,
+                               {'actor': 'opus-worker-lane', 'allow_actor': True,
+                                'allow_actor_reason': 'the lane owns this name'}, token=admin, key='waiver-1')
+        self.assertEqual(201, allowed.status, allowed.data)
 
     def test_a_name_the_trackers_rows_already_hold_is_refused_and_a_superuser_may_allow_it(self):
         """kittrial-5bb.188 items 1 and 4 at issue: the reviewer's `opus-worker-lane` case."""
@@ -692,12 +738,15 @@ class IssueCase(HostNames, fixes.EndpointCase):
         self.assertEqual(actor_names.ROWS, refused.data['error']['detail']['rule'])
 
     def test_an_export_that_answers_no_rows_issues_nothing(self):
-        """kittrial-5bb.188 item 1 at issue: nothing was changed, and the key stays free."""
+        """kittrial-5bb.188 item 1 at issue: nothing was changed, and the key stays free.
+        Since kittrial-5bb.243 the unreadable-row shape is its own 503 (unreadable_rows);
+        nothing is issued and the key stays free exactly the same."""
         self.project()
         self.host(tracker='unreadable')
         refused = self.request('POST', self.credentials, {'actor': 'lane-empty'}, token=self.alex, key='empty-key-1')
         self.assertEqual(503, refused.status, refused.data)
-        self.assertIn('Nothing was changed', message(refused))
+        self.assertEqual('unreadable_rows', refused.data['error']['code'])
+        self.assertIn('second try', message(refused))
         self.assertEqual([], self.listed_without_asking())
         self.host()
         self.assertEqual(201, self.request('POST', self.credentials, {'actor': 'lane-empty'},
@@ -989,7 +1038,7 @@ class UseCase(HostNames, fixes.EndpointCase):
             self.assertEqual(201, self.request('POST', self.tasks, {'title': 'again'}, token=legacy['secret']).status)
             self.assertEqual([False, True], seen)
 
-    def test_an_unmarked_credential_is_not_let_through_when_the_export_answers_nothing(self):
+    def test_an_unmarked_credential_is_not_let_through_when_the_tracker_cannot_be_read(self):
         """kittrial-5bb.188 item 1 at use: a host fault, nothing written, no mark kept."""
         self.project()
         legacy = self.old_credential('lane-empty', checked=False)
@@ -1002,17 +1051,32 @@ class UseCase(HostNames, fixes.EndpointCase):
         self.assertNotIn('actor_rows_refused', record)
 
     def test_every_broken_tracker_answer_is_unavailable_and_changes_nothing(self):
-        """kittrial-5bb.188 revision-3 item 3(1): a cut line, a nonzero bd, words that are not
-        rows and a tracker without its merge slot are host faults answered 503, not 422, at
-        issue and at use."""
+        """kittrial-5bb.188 revision-3 item 3(1): a cut line, a nonzero bd and words that are not
+        rows are host faults answered 503, not 422, at issue and at use. A tracker without its
+        merge slot is 503 too, but its own, non-transient sentence naming merge-create
+        (kittrial-5bb.202 item 1); a readable tracker with NO rows at all (a plain `bd init`) is
+        the same non-transient answer since rev-2, not the transient one."""
         self.project()
-        for mode in ('unreadable', 'cut', 'exit1', 'words', 'no-slot'):
+        for mode in ('unreadable', 'cut', 'exit1', 'words', 'no-slot', 'empty'):
             with self.subTest(tracker=mode):
                 self.host(tracker=mode)
                 refused = self.request('POST', self.credentials, {'actor': 'lane-%s' % mode},
                                        token=self.alex, key='bad-tracker-%s' % mode)
                 self.assertEqual(503, refused.status, refused.data)
-                self.assertIn('Nothing was changed', message(refused))
+                said = message(refused)
+                if mode in ('no-slot', 'empty'):
+                    self.assertIn('merge-create', said)
+                    self.assertNotIn('try again shortly', said)
+                    self.assertEqual('merge_slot_missing', refused.data['error']['code'])
+                elif mode == 'unreadable':
+                    # kittrial-5bb.243: a row that cannot be read is its own non-transient
+                    # answer, naming the repair after a second try.
+                    self.assertIn('second try', said)
+                    self.assertNotIn('try again shortly', said)
+                    self.assertEqual('unreadable_rows', refused.data['error']['code'])
+                else:
+                    self.assertIn('Nothing was changed', said)
+                    self.assertEqual('unavailable', refused.data['error']['code'])
         self.assertEqual([], self.listed_without_asking())
         # At use, an unjudged credential's first write is the same host fault, with no mark.
         legacy = self.old_credential('lane-old', checked=False)
@@ -1110,7 +1174,11 @@ class RealEndpointCase(unittest.TestCase):
         self.project = self.root / 'projects' / 'probe'
         (self.root / 'bin').mkdir(parents=True)
         (self.project / '.beads').mkdir(parents=True)
-        (self.project / '.beads' / 'metadata.json').write_text('{}', encoding='utf-8')
+        # Real server coordinates: `endpoint.tracker_actors` refuses to run bd without them
+        # (kittrial-5bb.202 rev-3 item 2, F2: bd would fall back to an embedded database), and
+        # this fixture's `bd` is a stub, so any coordinates that satisfy the guard do.
+        (self.project / '.beads' / 'metadata.json').write_text(json.dumps(SERVER_COORDINATES),
+                                                               encoding='utf-8')
         (self.root / 'deployment.private.json').write_text(json.dumps(
             {'password': 'probe', 'operators': ['ops-lead'], 'verifiers': HOST['verifiers']}), encoding='utf-8')
         record = {'request_id': '11111111-2222-3333-4444-555555555555', 'actor': SESSION_A, 'name': 'Coordinator',
@@ -1255,43 +1323,292 @@ class RealEndpointCase(unittest.TestCase):
                          json.loads(asked['stdout'])['names'])
         self.assertTrue(self.marker.exists())
 
-    def test_an_export_that_answers_no_rows_is_a_tracker_fault_not_empty(self):
-        """kittrial-5bb.188 item 1 on the endpoint: zero rows is a host fault, at use and at issue."""
+    def test_an_empty_tracker_answers_the_missing_slot_not_the_transient_fault(self):
+        """kittrial-5bb.202 rev-2, the empty-project decision: a readable tracker with NO rows at
+        all (a plain `bd init`, whose `bd export --all` exits 0 and prints nothing) is not "the
+        tracker holds no names" and not the transient host fault either. The read succeeded and
+        what is absent is the merge-slot row, so the answer is the non-transient merge-slot
+        fault naming merge-create, at use and through the endpoint CLI. A tracker that cannot be
+        read keeps the transient answer (the cut/exit1/words shapes in the test below)."""
         self.set_bd([], slot=False)
-        with self.assertRaises(actor_names.TrackerUnreadable):
+        with self.assertRaises(actor_names.TrackerMergeSlotMissing):
             self.endpoint.tracker_actors(self.root, self.project)
-        # At use, the descriptor path answers the host fault, not "nothing is taken".
+        # At use, the descriptor path answers the non-transient fault, not "nothing is taken".
         answer = self.write('opus-worker-lane', self.credential('opus-worker-lane', rows_checked=False,
                                                                 created_at='2026-10-07T00:00:00Z'), 'empty')
-        self.assertEqual((2, 'tracker'), (answer['returncode'], answer.get('fault')), answer)
+        self.assertEqual((2, 'merge-slot'), (answer['returncode'], answer.get('fault')), answer)
+        self.assertIn('merge-create', answer['stderr'])
+        self.assertNotIn('try again shortly', answer['stderr'])
         self.assertFalse((self.project / '.http-operations.sqlite3').exists(), 'an operation identity was reserved')
-        # The service's own read of the rows answers the same marked host fault.
+        # The service's own read of the rows answers the same marked fault, through the endpoint CLI.
         told = self.run_main({'project': 'probe', 'actor': 'http/read', 'action': 'actor-standing',
                               'args': ['opus-worker-lane'], 'tracker': True},
                              ['--authority-store', str(self.config_path)])
+        self.assertEqual((2, 'merge-slot'), (told['returncode'], told.get('fault')), told)
+
+    def test_a_project_with_no_server_coordinates_is_the_transient_fault(self):
+        """kittrial-5bb.202 rev-3 item 2 (F2): `tracker_actors` now applies the same guard
+        `admin.project_merge_slot_state` does.
+
+        Without the Dolt server coordinates bd falls back to an embedded database, exits 0 and
+        prints nothing, which revision 2 read as the empty-project answer, `merge_slot_missing`,
+        and advised a merge-create that then fails (the reviewer's g4/g5). It is the host fault:
+        `TrackerUnreadable`, answered 503 `unavailable` with the transient sentence, as on main.
+        """
+        (self.project / '.beads' / 'metadata.json').write_text(json.dumps(
+            {'dolt_server_host': '127.0.0.1', 'dolt_server_port': 13317, 'dolt_server_user': 'root'}),
+            encoding='utf-8')                      # the database name is not recorded
+        with self.assertRaises(actor_names.TrackerUnreadable):
+            self.endpoint.tracker_actors(self.root, self.project)
+        answer = self.write('worker-a', self.credential('worker-a', rows_checked=False,
+                                                        created_at='2026-10-07T00:00:00Z'), 'coords')
+        self.assertEqual((2, 'tracker'), (answer['returncode'], answer.get('fault')), answer)
+        self.assertNotEqual('merge-slot', answer.get('fault'))
+        self.assertFalse(self.marker.exists(), 'bd ran without the server coordinates')
+        # And through the endpoint's own CLI, the same mark (the service answers fault 'tracker'
+        # with its 503 `unavailable` sentence, exactly as on main; the merge-slot mark, which
+        # revision 2 gave this shape, is the one that must not appear).
+        told = self.run_main({'project': 'probe', 'actor': 'http/read', 'action': 'actor-standing',
+                              'args': ['worker-a'], 'tracker': True},
+                             ['--authority-store', str(self.config_path)])
         self.assertEqual((2, 'tracker'), (told['returncode'], told.get('fault')), told)
+        self.assertNotEqual('merge-slot', told.get('fault'))
+
+    def test_the_real_endpoint_marks_the_missing_slot_on_its_own_cli(self):
+        """kittrial-5bb.202 review `one-test-through-the-real-route`: mutant M2, endpoint.py's
+        `main` marking the missing slot as `tracker` instead of `merge-slot`, must fail here.
+
+        The stub-backed HTTP tests cannot catch it: ``tools/strict_canonical_endpoint.py``
+        carries its own copy of the mark. This drives the endpoint the service really launches,
+        ``endpoint.py main()``, for the shape the reviewer's M2 attacks (rows that came back
+        without the merge-slot row) and for the empty tracker.
+        """
+        self.set_bd([{'id': 'probe-1', 'created_by': 'held-name',
+                      'created_at': '2026-01-01T00:00:00Z'}], slot=False)
+        answered = self.run_main({'project': 'probe', 'actor': 'http/read', 'action': 'actor-standing',
+                                  'args': ['held-name'], 'tracker': True},
+                                 ['--authority-store', str(self.config_path)])
+        self.assertEqual((2, 'merge-slot'), (answered['returncode'], answered.get('fault')), answered)
+        self.assertIn('merge-create', answered['stderr'])
+        self.assertNotIn('try again shortly', answered['stderr'])
+        # And the use path through the CLI: the same mark, not UNREAD's.
+        descriptor = self.credential('worker-a', rows_checked=False, created_at='2026-10-07T00:00:00Z')
+        self.set_bd([], slot=False)
+        written = self.run_main({'project': 'probe', 'actor': 'worker-a', 'action': 'bd',
+                                 'args': ['create', 'x'], 'operation_id': 'op-cli-merge-slot',
+                                 'authority': descriptor},
+                                ['--authority-store', str(self.config_path), '--require-authority'])
+        self.assertEqual((2, 'merge-slot'), (written['returncode'], written.get('fault')), written)
 
     def test_an_answer_without_the_merge_slot_or_not_rows_at_all_is_a_host_fault(self):
         """kittrial-5bb.188 revision-3 item 3(1): a whole read requires the merge slot, and an
-        answer that is a cut line, a nonzero bd or words that are not rows is a host fault."""
-        row = json.dumps(json.dumps({'id': 'probe-1', 'created_by': 'opus-worker-lane',
+        answer that is a cut line, a nonzero bd or words that are not rows is a host fault.
+        kittrial-5bb.202 item 1: rows that came back without the slot row are their own,
+        non-transient fault naming the merge-create repair.
+        kittrial-5bb.221 revision 2: the cut-line and not-rows fixtures carry the merge slot
+        too, so they pin the unreadable row (and the slot requirement), not only its absence."""
+        row = json.dumps(json.dumps({'id': 'probe-1', 'created_by': 'held-name',
                                      'created_at': '2026-01-01T00:00:00Z'}))
+        slot = json.dumps(json.dumps({'id': 'probe-merge-slot', 'issue_type': 'merge-slot',
+                                      'title': 'the merge slot', 'created_at': '2026-01-01T00:00:00Z'}))
         shapes = (
-            ('rows but no merge slot', '#!/bin/sh\necho %s\nexit 0\n' % row),
-            ('the last line cut short', '#!/bin/sh\necho %s\necho \'{"id": "probe-2", "created_\'\nexit 0\n' % row),
-            ('exit 1 with an error line', '#!/bin/sh\necho "bd: the database is locked" >&2\nexit 1\n'),
-            ('words that are not rows', '#!/bin/sh\necho "not a row at all"\nexit 0\n'),
+            ('rows but no merge slot', '#!/bin/sh\necho %s\nexit 0\n' % row,
+             actor_names.TrackerMergeSlotMissing, 'merge-slot'),
+            ('the last line cut short', '#!/bin/sh\necho %s\necho %s\necho \'{"id": "probe-2", "created_\'\nexit 0\n'
+                                        % (row, slot),
+             actor_names.TrackerRowsUnreadable, 'unreadable-rows'),
+            ('exit 1 with an error line', '#!/bin/sh\necho "bd: the database is locked" >&2\nexit 1\n',
+             actor_names.TrackerUnreadable, 'tracker'),
+            ('words that are not rows', '#!/bin/sh\necho %s\necho "not a row at all"\nexit 0\n' % row,
+             actor_names.TrackerRowsUnreadable, 'unreadable-rows'),
+            # kittrial-5bb.202 rev-3 item 4 (F5): JSON that PARSES but is not rows at all. The
+            # export succeeded and said nothing about this project's tracker, so it is the
+            # transient host fault, never the missing-slot answer. Mutant N8 (`if False:` in
+            # place of the guard) answers merge_slot_missing for these and must fail here.
+            ('JSON null, not rows', '#!/bin/sh\necho null\nexit 0\n',
+             actor_names.TrackerUnreadable, 'tracker'),
+            ('JSON number, not rows', '#!/bin/sh\necho 1\nexit 0\n',
+             actor_names.TrackerUnreadable, 'tracker'),
+            ('JSON array of non-rows', '#!/bin/sh\necho \'[1, 2]\'\nexit 0\n',
+             actor_names.TrackerUnreadable, 'tracker'),
         )
-        for number, (label, script) in enumerate(shapes):
+        for number, (label, script, fault_class, fault) in enumerate(shapes):
             with self.subTest(answer=label):
                 self.set_bd_raw(script)
-                with self.assertRaises(actor_names.TrackerUnreadable):
+                with self.assertRaises(fault_class):
                     self.endpoint.tracker_actors(self.root, self.project)
                 answer = self.write('worker-a', self.credential('worker-a', rows_checked=False,
                                                                 created_at='2026-10-07T00:00:00Z'), 'bad-%d' % number)
-                self.assertEqual((2, 'tracker'), (answer['returncode'], answer.get('fault')), answer)
+                self.assertEqual((2, fault), (answer['returncode'], answer.get('fault')), answer)
+                if fault == 'merge-slot':
+                    self.assertIn('merge-create', answer['stderr'])
+                    self.assertNotIn('try again shortly', answer['stderr'])
                 self.assertFalse((self.project / '.http-operations.sqlite3').exists(),
                                  'an operation identity was reserved')
+
+    def _whole_tracker_script(self, *extra_lines, slot=True):
+        """A tracker answer as lines: one healthy row, any extra lines, the merge slot."""
+        healthy = json.dumps({'id': 'probe-1', 'created_by': 'opus-worker-lane',
+                              'created_at': '2026-01-01T00:00:00Z', 'updated_at': '2026-01-01T00:00:00Z'})
+        lines = [healthy] + list(extra_lines)
+        if slot:
+            lines.append(json.dumps({'id': 'probe-merge-slot', 'title': 'the merge slot',
+                                     'issue_type': 'merge-slot', 'created_at': '2026-01-01T00:00:00Z',
+                                     'updated_at': '2026-01-01T00:00:00Z'}))
+        script = '\n'.join('echo %s' % json.dumps(line) for line in lines)
+        self.set_bd_raw('#!/bin/sh\necho ran >> %s\n%s\nexit 0\n' % (self.marker, script))
+
+    def test_a_line_that_is_not_an_object_beside_real_rows_refuses(self):
+        """kittrial-5bb.243 item N4: a JSON line that is a number, a string or a list holding
+        a real row, each beside healthy rows and the merge slot, refuses the whole read. The
+        list is the mutant that mattered: on the release before kittrial-5bb.221 r2, the
+        names inside such a list were silently free (a non-dict row is not a mark to the
+        name reader), so nothing pinned that they refuse."""
+        shapes = (
+            ('a number', '2026'),
+            ('a string', '"just a string"'),
+            ('a list holding a real row',
+             '[{"id": "probe-in-a-list", "created_by": "hidden-name", "created_at": "2026-01-01T00:00:00Z"}]'),
+        )
+        for label, line in shapes:
+            with self.subTest(line=label):
+                self._whole_tracker_script(line)
+                with self.assertRaises(actor_names.TrackerRowsUnreadable):
+                    self.endpoint.tracker_actors(self.root, self.project)
+                answer = self.write('worker-a', self.credential('worker-a', rows_checked=False,
+                                                                created_at='2026-10-07T00:00:00Z'),
+                                    'non-object-%s' % label.split()[0])
+                self.assertEqual((2, 'unreadable-rows'), (answer['returncode'], answer.get('fault')), answer)
+                # The sentence names the repair, never "try again shortly".
+                self.assertNotIn('try again shortly', answer['stderr'])
+                self.assertIn('--unset-metadata', answer['stderr'])
+
+    def test_the_unreadable_row_ids_are_bounded_and_checked(self):
+        """kittrial-5bb.243 r2 review item 1: a thousand unreadable rows name five ids and
+        count the rest, an id not of the tracker's shape is never printed, and the web
+        answer is built from the fault's fields, not from a stderr tail a row shaped."""
+        thousand = ['{"id": "probe-%d", "created_by": "x", "metadata": %s}' % (i, '[' * 900 + ']' * 900)
+                    for i in range(1000)]
+        hostile = ('{"id": "' + 'x' * 500 + '\\n\\r\\u202e", "created_by": "y", "metadata": '
+                   + '[' * 900 + ']' * 900 + '}')
+        with self.subTest(answer='a thousand rows'):
+            self._whole_tracker_script(*thousand)
+            raised = None
+            try:
+                self.endpoint.tracker_actors(self.root, self.project)
+            except actor_names.TrackerRowsUnreadable as error:
+                raised = error
+            self.assertIsNotNone(raised)
+            self.assertEqual(5, len(raised.ids))
+            self.assertLess(len(str(raised)), 600)
+            self.assertIn('and 995 more', str(raised))
+            answer = self.write('worker-a', self.credential('worker-a', rows_checked=False,
+                                                            created_at='2026-10-07T00:00:00Z'), 'thousand')
+            self.assertEqual((2, 'unreadable-rows'), (answer['returncode'], answer.get('fault')), answer)
+            self.assertEqual(5, len(answer['unreadable_rows']))
+            self.assertLess(len(answer['stderr']), 600)
+        with self.subTest(answer='a hostile id'):
+            self._whole_tracker_script(hostile)
+            raised = None
+            try:
+                self.endpoint.tracker_actors(self.root, self.project)
+            except actor_names.TrackerRowsUnreadable as error:
+                raised = error
+            self.assertIsNotNone(raised)
+            self.assertIsNone(raised.ids)               # not of the tracker's id shape: counted, not printed
+            self.assertNotIn('x' * 50, str(raised))
+            import http_service
+            failure = http_service.EndpointBackend._rows_unreadable(['x' * 500 + '\\n' + '\\u202e'])
+            self.assertNotIn('x' * 50, failure.message)  # built from fields, never a stderr tail
+            self.assertEqual('unreadable_rows', failure.code)
+
+    def test_one_row_nested_65_levels_is_read_and_its_names_count(self):
+        """kittrial-5bb.221: the 64-level comment guard refused the whole project's read on
+        one row nested 65 levels. The row bound of kittrial-5bb.141 (750) applies: this row
+        parses normally, its own author counts beside the healthy ones, and the rule that
+        depends on the read works again."""
+        import record_json
+        deep = ('{"id": "probe-deep", "created_by": "deep-author", "created_at": "2026-01-01T00:00:00Z",'
+                ' "updated_at": "2026-01-01T00:00:00Z", "metadata": ' + '{"a":' * 64 + '1' + '}' * 64 + '}')
+        self.assertEqual(65, record_json.nesting(deep))       # what the comment guard refused
+        self._whole_tracker_script(deep)
+        self.assertEqual({'opus-worker-lane', 'deep-author'},
+                         set(self.endpoint.tracker_actors(self.root, self.project)))
+        # The healthy row's name is still held against a credential at use ...
+        refused = self.write('opus-worker-lane', self.credential('opus-worker-lane', rows_checked=False,
+                                                                 created_at='2026-10-07T00:00:00Z'), 'deep-65')
+        self.assertEqual((126, 403), (refused['returncode'], refused.get('authority_status')), refused)
+        # ... and a free name writes, where this row used to fault the whole project.
+        self.marker.unlink()
+        done = self.write('worker-a/sub', self.credential('worker-a'), 'deep-65-free')
+        self.assertEqual(0, done['returncode'], done)
+        self.assertTrue(self.marker.exists())
+
+    def test_any_unreadable_row_refuses_the_whole_read_as_main(self):
+        """kittrial-5bb.221 revision 2, review item 1: a row past the bound is marked, and
+        ANY marked row refuses the whole read -- the unreadable row may be the row that
+        holds the name, and a name the tracker might hold must not become issuable through
+        a worker credential. A credential under the marked row's own name gets the host
+        fault, never a pass."""
+        import record_json
+        deeper = ('{"id": "probe-deeper", "created_by": "deep-author", "created_at": "2026-01-01T00:00:00Z",'
+                  ' "updated_at": "2026-01-01T00:00:00Z", "metadata": ' + '{"a":' * 750 + '1' + '}' * 750 + '}')
+        self.assertEqual(record_json.ROW_NESTING_MAX + 1,
+                         record_json.nesting(deeper, record_json.ROW_NESTING_MAX))
+        self._whole_tracker_script(deeper)
+        with self.assertRaises(actor_names.TrackerUnreadable):
+            self.endpoint.tracker_actors(self.root, self.project)
+        # The write path answers the unreadable-rows fault for every name: the taken name
+        # is not refused (it cannot be read), and a free name does not pass either. Since
+        # kittrial-5bb.243 N7 the answer carries the row id and the operator repair, never
+        # the bare fault's "try again shortly".
+        for number, name in enumerate(('opus-worker-lane', 'worker-a/sub', 'deep-author')):
+            answer = self.write(name, self.credential(name.split('/')[0], rows_checked=False,
+                                                       created_at='2026-10-07T00:00:00Z'), 'deep-751-%d' % number)
+            self.assertEqual((2, 'unreadable-rows'), (answer['returncode'], answer.get('fault')), answer)
+            self.assertIn('probe-deeper', answer['stderr'])
+            self.assertIn('--unset-metadata', answer['stderr'])
+        self.assertFalse((self.project / '.http-operations.sqlite3').exists(),
+                         'an operation identity was reserved')
+        # The issue path (actor-standing with rows) answers the same fault, with the row id.
+        told = self.run_main({'project': 'probe', 'actor': 'http/read', 'action': 'actor-standing',
+                              'args': ['opus-worker-lane'], 'tracker': True},
+                             ['--authority-store', str(self.config_path)])
+        self.assertEqual((2, 'unreadable-rows'), (told['returncode'], told.get('fault')), told)
+        self.assertIn('probe-deeper', told['stderr'])
+
+    def test_non_row_answers_with_exit_zero_refuse_even_with_the_slot(self):
+        """kittrial-5bb.221 revision 2, review item 2: with bd exiting 0, answers that are
+        not whole trackers still refuse -- a line cut mid-row, a row replaced by an error
+        sentence, every line cut, a 5,000-digit number (over the interpreter's integer
+        digit limit), and a junk line whose recoverable id says merge-slot: a marked row
+        never proves the slot. Each fixture carries healthy rows; all but the last carry
+        the slot too."""
+        shapes = (
+            ('the last line cut mid-row', lambda: self._whole_tracker_script('{"id": "probe-2", "created_')),
+            ('a row replaced by an error sentence',
+             lambda: self._whole_tracker_script('bd: the database is locked, try again')),
+            ('every row cut',
+             lambda: self.set_bd_raw('#!/bin/sh\necho ran >> %s\necho \'{"id": "probe-1", "created_by": "op\'\n'
+                                     'echo \'{"id": "probe-merge-slot", "issue_t\'\nexit 0\n' % self.marker)),
+            ('a row with a 5,000-digit number',
+             lambda: self._whole_tracker_script('{"id": "probe-huge", "created_by": "huge-author", "n": ' + '9' * 5000 + '}')),
+            ('a junk line whose id says merge-slot, and no real slot',
+             lambda: self._whole_tracker_script(
+                 '{"id": "probe-merge-slot", "created_by": "forged", "metadata": ' + '[' * 900 + ']' * 900 + '}',
+                 slot=False)),
+        )
+        for label, make, fault in [(l, m, 'unreadable-rows') for l, m in shapes
+                                   if l != 'every row cut'] + [('every row cut',
+                                   dict(shapes)['every row cut'], 'tracker')]:
+            with self.subTest(answer=label):
+                make()
+                with self.assertRaises(actor_names.TrackerUnreadable):   # the bare fault or its subclass
+                    self.endpoint.tracker_actors(self.root, self.project)
+                answer = self.write('worker-a', self.credential('worker-a', rows_checked=False,
+                                                                created_at='2026-10-07T00:00:00Z'),
+                                    'shape-%s' % label[:8].replace(' ', '-'))
+                self.assertEqual((2, fault), (answer['returncode'], answer.get('fault')), answer)
 
     def test_the_endpoint_cli_carries_the_service_namespace_it_was_launched_with(self):
         """kittrial-5bb.188 item 6: mutant U6 (main drops --service-namespace) must fail here."""
@@ -1412,6 +1729,81 @@ class RealEndpointCase(unittest.TestCase):
         with self.assertRaises(ValueError):
             admin.credential_actors(self.root, path)
 
+    def test_an_empty_export_is_tracker_rows_null_and_not_false(self):
+        """kittrial-5bb.202 rev-3 item 3(a) (review F3): main's answer, restored.
+
+        ``credential-actors`` is a read-only listing, and an operator reading
+        ``tracker_rows: false`` would take the tracker as read and the name as free. Revision 2
+        made an empty export mean "no names"; the docstring always said null ("the tracker was
+        not read"), and this read does not run the merge-slot decision
+        ``endpoint.tracker_actors`` runs. This test holds the answer so mutant N3's shape (an
+        empty export read as a whole tracker) can never come back unnoticed.
+        """
+        import admin
+        path = self.tmp / 'empty-export-state.json'
+        path.write_text(json.dumps({'users': {}, 'credentials': {
+            'cred_e': {'user_id': 'usr_a', 'project_id': 'probe', 'label': 'empty', 'actor': 'worker-el',
+                       'revoked': False, 'created_at': '2026-10-01T00:00:00Z'}}}), encoding='utf-8')
+        for answer in ('', '\n', 'null', '1'):
+            with self.subTest(export=repr(answer)):
+                with mock.patch.object(admin, 'run_bd', return_value=answer):
+                    report = admin.credential_actors(self.root, path)
+                item = [c for c in report['credentials'] if c['credential'] == 'cred_e'][0]
+                self.assertIsNone(item['tracker_rows'], (answer, item))
+                self.assertIsNone(item['collides'], (answer, item))
+        # A whole tracker that holds no row under the name is the other answer: false, a read.
+        with mock.patch.object(admin, 'run_bd', return_value=json.dumps(
+                {'id': 'probe-merge-slot', 'issue_type': 'merge-slot'})):
+            report = admin.credential_actors(self.root, path)
+        item = [c for c in report['credentials'] if c['credential'] == 'cred_e'][0]
+        self.assertIs(item['tracker_rows'], False, item)
+
+    def test_the_listing_reads_rows_through_the_row_bound(self):
+        """kittrial-5bb.221 revision 2: credential-actors read the export with a bare
+        json.loads per line. Now rows nested to 750 read normally (their names count), and
+        an export with ANY unreadable row is one the tracker could not be read from:
+        tracker_rows null for every credential of the project, with the unreadable row ids
+        named, never "no such rows"."""
+        import admin
+        path = self.tmp / 'state.json'
+        path.write_text(json.dumps({'users': {}, 'credentials': {
+            'cred_free': {'user_id': 'usr_a', 'project_id': 'probe', 'label': 'free', 'actor': 'worker-a',
+                          'revoked': False, 'created_at': '2026-10-01T00:00:00Z'},
+            'cred_rows': {'user_id': 'usr_a', 'project_id': 'probe', 'label': 'rows', 'actor': 'opus-worker-lane',
+                          'revoked': False, 'created_at': '2026-10-07T00:00:00Z'},
+            'cred_deep': {'user_id': 'usr_a', 'project_id': 'probe', 'label': 'deep', 'actor': 'mid-author',
+                          'revoked': False, 'created_at': '2026-10-07T00:00:00Z'}}}), encoding='utf-8')
+        healthy = json.dumps({'id': 'probe-1', 'created_by': 'opus-worker-lane',
+                              'created_at': '2026-01-01T00:00:00Z', 'updated_at': '2026-01-01T00:00:00Z'})
+        deep65 = ('{"id": "probe-deep", "assignee": "mid-author", "created_at": "2026-01-01T00:00:00Z",'
+                  ' "updated_at": "2026-01-01T00:00:00Z", "metadata": ' + '{"a":' * 64 + '1' + '}' * 64 + '}')
+        deeper = ('{"id": "probe-deeper", "created_by": "deep-author", "created_at": "2026-01-01T00:00:00Z",'
+                  ' "updated_at": "2026-01-01T00:00:00Z", "metadata": ' + '{"a":' * 750 + '1' + '}' * 750 + '}')
+        # A row nested 65 levels reads normally: the healthy name and the deep row's name both count.
+        with mock.patch.object(admin, 'run_bd', return_value='\n'.join((healthy, deep65)) + '\n'):
+            found = {item['credential']: item for item in admin.credential_actors(self.root, path)['credentials']}
+        self.assertEqual((True, actor_names.ROWS, True),
+                         tuple(found['cred_rows'][key] for key in ('tracker_rows', 'collides',
+                                                                  'refused_when_it_writes')))
+        self.assertEqual((False, None, False),
+                         tuple(found['cred_free'][key] for key in ('tracker_rows', 'collides',
+                                                                 'refused_when_it_writes')))
+        self.assertEqual((True, actor_names.ROWS, True),
+                         tuple(found['cred_deep'][key] for key in ('tracker_rows', 'collides',
+                                                                 'refused_when_it_writes')))
+        self.assertNotIn('unreadable_rows', found['cred_rows'])
+        # One unreadable row: the tracker could not be read -- null, not false, for every
+        # credential of the project, with the row id named so an operator sees it.
+        with mock.patch.object(admin, 'run_bd', return_value='\n'.join((healthy, deeper)) + '\n'):
+            found = {item['credential']: item for item in admin.credential_actors(self.root, path)['credentials']}
+        for identifier in ('cred_free', 'cred_rows', 'cred_deep'):
+            with self.subTest(credential=identifier):
+                self.assertIsNone(found[identifier]['tracker_rows'])
+                self.assertEqual(['probe-deeper'], found[identifier]['unreadable_rows'])
+                # kittrial-5bb.243 item N5: beside a null, "not read", never a False that
+                # reads as "it may write" -- the name may be anybody's.
+                self.assertIsNone(found[identifier]['refused_when_it_writes'])
+
     def test_the_host_command_shows_a_waived_name_as_allowed(self):
         """kittrial-5bb.188 item 4: a waived credential is allowed, not colliding/refused."""
         import admin
@@ -1432,6 +1824,197 @@ class RealEndpointCase(unittest.TestCase):
         self.assertEqual('allowed by root-admin on 2026-10-07T00:00:00Z', item['actor_allowed'])
         self.assertEqual('the lane owns it', item['waived_reason'])
         self.assertEqual(0, report['colliding_and_not_revoked'])
+
+    def test_a_cheap_rule_refusal_stays_true_beside_an_unread_tracker(self):
+        """kittrial-5bb.243 r3 review item 3(a), pinning r2 item 2(a): a name the service's
+        own namespace (or any cheap rule) refuses is refused at every write without reading
+        any tracker, so beside an unread tracker collides still says the rule,
+        refused_when_it_writes stays true, and the credential is counted in the refused
+        sentence only -- never also as could-not-be-judged."""
+        import admin
+        path = self.tmp / 'state.json'
+        path.write_text(json.dumps({'users': {}, 'credentials': {
+            'cred_web': {'user_id': 'usr_a', 'project_id': 'probe', 'label': 'web', 'actor': 'http',
+                         'revoked': False, 'created_at': '2026-10-01T00:00:00Z'},
+            'cred_free': {'user_id': 'usr_a', 'project_id': 'probe', 'label': 'free', 'actor': 'worker-a',
+                          'revoked': False, 'created_at': '2026-10-01T00:00:00Z'}}}), encoding='utf-8')
+        deeper = ('{"id": "probe-deeper", "created_by": "deep-author", "created_at": "2026-01-01T00:00:00Z",'
+                  ' "updated_at": "2026-01-01T00:00:00Z", "metadata": ' + '{"a":' * 750 + '1' + '}' * 750 + '}')
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(admin, 'run_bd', return_value=deeper + '\n'), \
+                mock.patch.object(sys, 'argv', ['admin.py', '--root', str(self.root), 'credential-actors',
+                                                '--state', str(path), '--service-namespace', 'web']), \
+                redirect_stdout(out), redirect_stderr(err):
+            admin.main()
+        report = json.loads(out.getvalue())
+        found = {item['credential']: item for item in report['credentials']}
+        self.assertEqual((actor_names.SERVICE, True),
+                         (found['cred_web']['collides'], found['cred_web']['refused_when_it_writes']))
+        self.assertIsNone(found['cred_web']['tracker_rows'])
+        self.assertIsNone(found['cred_free']['collides'])
+        self.assertIsNone(found['cred_free']['refused_when_it_writes'])
+        # Only the truly-unjudged name is counted; the refused one is not also among them.
+        self.assertEqual(1, report['could_not_be_judged'])
+        self.assertIn('1 worker credential(s) could not be judged', err.getvalue())
+        self.assertIn('probe: it holds 1 unreadable row(s) (probe-deeper)', err.getvalue())
+        self.assertEqual(1, err.getvalue().count('unreadable row(s)'))   # once per project, not per credential
+        # And the count reached stdout, as a field of the printed report.
+        self.assertIn('"could_not_be_judged": 1', out.getvalue())
+
+    def test_the_exception_prints_no_id_that_is_not_of_the_trackers_shape(self):
+        """kittrial-5bb.243 r3 review item 3(b): the row reader drops a hostile id early, so
+        the exception's own shape check is pinned directly -- a mutant removing it must
+        fail here."""
+        hostile = 'x' * 500 + '\n\r\u202e'
+        built = actor_names.TrackerRowsUnreadable([hostile, 'probe-2'])
+        self.assertEqual(('probe-2',), built.ids)          # the shaped one is named
+        self.assertEqual(2, built.total)                   # the hostile one is still counted
+        self.assertNotIn('x' * 10, str(built))             # and never printed
+        only_hostile = actor_names.TrackerRowsUnreadable([hostile])
+        self.assertIsNone(only_hostile.ids)
+        self.assertEqual(1, only_hostile.total)
+        self.assertNotIn('x' * 10, str(only_hostile))
+        self.assertIn('a row that cannot be read', str(only_hostile))
+
+    def test_the_web_answer_says_and_k_more_with_the_right_k(self):
+        """kittrial-5bb.247 (M19): a thousand unreadable rows answer with five named ids and
+        'and 995 more' in the message -- a mutant that drops the K or the total must fail."""
+        import http_service
+        ids = ['probe-%d' % number for number in range(1000)]
+        with self.assertRaises(http_service.HttpError) as failed:
+            http_service.EndpointBackend._checked(
+                {'returncode': 2, 'stdout': '', 'stderr': '', 'fault': 'unreadable-rows',
+                 'unreadable_rows': ids[:5], 'unreadable_total': 1000},
+                'actor-standing', reading=True)
+        self.assertIn('and 995 more', failed.exception.message)
+        self.assertEqual(1000, failed.exception.unreadable_total)
+        # Fewer unnamed than the cap names nothing further; K is right at the edge too.
+        with self.assertRaises(http_service.HttpError) as edge:
+            http_service.EndpointBackend._checked(
+                {'returncode': 2, 'stdout': '', 'stderr': '', 'fault': 'unreadable-rows',
+                 'unreadable_rows': ids[:5], 'unreadable_total': 6},
+                'actor-standing', reading=True)
+        self.assertIn('and 1 more', edge.exception.message)
+        self.assertEqual(6, edge.exception.unreadable_total)
+
+    def test_the_endpoint_envelope_carries_the_total(self):
+        """kittrial-5bb.247 (M21): the endpoint's fault envelope carries unreadable_total
+        beside the ids, so the service can say 'and K more' from fields."""
+        deeper = ('{"id": "probe-a", "created_by": "x", "created_at": "2026-01-01T00:00:00Z",'
+                  ' "metadata": ' + '{"a":' * 750 + '1' + '}' * 750 + '}')
+        deeper_too = ('{"id": "probe-b", "created_by": "y", "created_at": "2026-01-01T00:00:00Z",'
+                      ' "metadata": ' + '{"a":' * 750 + '1' + '}' * 750 + '}')
+        self._whole_tracker_script(deeper, deeper_too)
+        answer = self.write('worker-a', self.credential('worker-a', rows_checked=False,
+                                                        created_at='2026-10-07T00:00:00Z'), 'total-field')
+        self.assertEqual((2, 'unreadable-rows'), (answer['returncode'], answer.get('fault')), answer)
+        self.assertEqual(2, answer['unreadable_total'])
+        self.assertEqual(['probe-a', 'probe-b'], answer['unreadable_rows'])
+
+    def test_a_bd_that_failed_is_not_said_to_have_answered_nothing(self):
+        """kittrial-5bb.247 (M22): the three non-answers are told apart -- bd exiting nonzero
+        is 'bd failed (exit not 0)', never 'bd answered nothing' (a mutant that lumps them
+        must fail here)."""
+        import admin
+        path = self.tmp / 'state.json'
+        path.write_text(json.dumps({'users': {}, 'credentials': {
+            'cred_w': {'user_id': 'usr_a', 'project_id': 'probe', 'label': 'w', 'actor': 'worker-a',
+                       'revoked': False, 'created_at': '2026-10-01T00:00:00Z'}}}), encoding='utf-8')
+        import subprocess as real_subprocess
+        failure = real_subprocess.CalledProcessError(1, 'bd')
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(admin, 'run_bd', side_effect=failure), \
+                mock.patch.object(sys, 'argv', ['admin.py', '--root', str(self.root), 'credential-actors',
+                                                '--state', str(path)]), \
+                redirect_stdout(out), redirect_stderr(err):
+            admin.main()
+        report = json.loads(out.getvalue())
+        self.assertEqual('bd failed (exit not 0)', report['credentials'][0]['tracker_not_read'])
+        self.assertIn('bd failed (exit not 0)', err.getvalue())
+        self.assertNotIn('answered nothing', err.getvalue())
+        self.assertEqual(1, report['could_not_be_judged'])
+
+    def test_rows_without_an_id_are_counted_as_unreadable_rows(self):
+        """kittrial-5bb.247 r2, review item 1, pinning NEW-1: an error line, a bare number
+        and a list among the rows are unreadable rows with no id, counted beside the one
+        that has an id. Must fail if admin.py counts only id-bearing rows again."""
+        import admin
+        path = self.tmp / 'state.json'
+        path.write_text(json.dumps({'users': {}, 'credentials': {
+            'cred_w': {'user_id': 'usr_a', 'project_id': 'probe', 'label': 'w', 'actor': 'worker-a',
+                       'revoked': False, 'created_at': '2026-10-01T00:00:00Z'}}}), encoding='utf-8')
+        healthy = json.dumps({'id': 'probe-1', 'created_by': 'opus-worker-lane',
+                              'created_at': '2026-01-01T00:00:00Z', 'updated_at': '2026-01-01T00:00:00Z'})
+        with_id = ('{"id": "probe-deep", "created_by": "deep-author", "created_at": "2026-01-01T00:00:00Z",'
+                   ' "metadata": ' + '{"a":' * 750 + '1' + '}' * 750 + '}')
+        shapes = (
+            ('an error line', 'bd: the database is locked, try again'),
+            ('a bare number', '2026'),
+            ('a list among the rows', '[{"id": "probe-vic", "created_by": "vic", "created_at": "2026-01-01T00:00:00Z"}]'),
+        )
+        for label, line in shapes:
+            with self.subTest(shape=label):
+                with mock.patch.object(admin, 'run_bd',
+                                       return_value='\n'.join((healthy, with_id, line)) + '\n'):
+                    report = admin.credential_actors(self.root, path)
+                item = report['credentials'][0]
+                # Every unreadable row is counted - the two with no id and the one with.
+                self.assertEqual(2, item['unreadable_total'])
+                self.assertEqual('it holds 2 unreadable row(s)', item['tracker_not_read'])
+                # Only the printable id is named.
+                self.assertEqual(['probe-deep'], item['unreadable_rows'])
+                self.assertIsNone(item['tracker_rows'])
+
+    def test_no_sentence_about_zero_credentials_that_could_not_be_judged(self):
+        """kittrial-5bb.247 r2, review item 2, pinning NEW-2: when the only credential beside
+        an unread tracker is refused by a cheap rule, could_not_be_judged is 0 and the
+        closing sentence is not printed. Must fail if the condition is 'if not_read:'
+        again."""
+        import admin
+        path = self.tmp / 'state.json'
+        path.write_text(json.dumps({'users': {}, 'credentials': {
+            'cred_web': {'user_id': 'usr_a', 'project_id': 'probe', 'label': 'web', 'actor': 'http',
+                         'revoked': False, 'created_at': '2026-10-01T00:00:00Z'}}}), encoding='utf-8')
+        deeper = ('{"id": "probe-deeper", "created_by": "deep-author", "created_at": "2026-01-01T00:00:00Z",'
+                  ' "updated_at": "2026-01-01T00:00:00Z", "metadata": ' + '{"a":' * 750 + '1' + '}' * 750 + '}')
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(admin, 'run_bd', return_value=deeper + '\n'), \
+                mock.patch.object(sys, 'argv', ['admin.py', '--root', str(self.root), 'credential-actors',
+                                                '--state', str(path), '--service-namespace', 'web']), \
+                redirect_stdout(out), redirect_stderr(err):
+            admin.main()
+        report = json.loads(out.getvalue())
+        self.assertEqual(0, report['could_not_be_judged'])
+        self.assertEqual(actor_names.SERVICE, report['credentials'][0]['collides'])
+        self.assertTrue(report['credentials'][0]['refused_when_it_writes'])
+        self.assertEqual('it holds 1 unreadable row(s)', report['credentials'][0]['tracker_not_read'])
+        # The refused sentence is said; the could-not-be-judged sentence is not.
+        self.assertIn('1 worker credential(s) write under a name', err.getvalue())
+        self.assertNotIn('could not be judged', err.getvalue())
+
+    def test_the_command_line_also_counts_what_could_not_be_judged(self):
+        """kittrial-5bb.243 item N5: the closing sentence names the credentials that could
+        not be judged at all, with the unreadable row ids, beside the colliding count."""
+        import admin
+        path = self.tmp / 'state.json'
+        path.write_text(json.dumps({'users': {}, 'credentials': {
+            'cred_w': {'user_id': 'usr_a', 'project_id': 'probe', 'label': 'one', 'actor': 'worker-a',
+                       'revoked': False, 'created_at': '2026-10-01T00:00:00Z'}}}), encoding='utf-8')
+        healthy = json.dumps({'id': 'probe-1', 'created_by': 'opus-worker-lane',
+                              'created_at': '2026-01-01T00:00:00Z', 'updated_at': '2026-01-01T00:00:00Z'})
+        deeper = ('{"id": "probe-deeper", "created_by": "deep-author", "created_at": "2026-01-01T00:00:00Z",'
+                  ' "updated_at": "2026-01-01T00:00:00Z", "metadata": ' + '{"a":' * 750 + '1' + '}' * 750 + '}')
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(admin, 'run_bd', return_value='\n'.join((healthy, deeper)) + '\n'), \
+                mock.patch.object(sys, 'argv', ['admin.py', '--root', str(self.root), 'credential-actors',
+                                                '--state', str(path)]), \
+                redirect_stdout(out), redirect_stderr(err):
+            admin.main()
+        self.assertIn('1 worker credential(s) could not be judged', err.getvalue())
+        self.assertIn('probe: it holds 1 unreadable row(s) (probe-deeper)', err.getvalue())
+        self.assertEqual(1, err.getvalue().count('unreadable row(s)'))   # once per project, not per credential
+        self.assertIn('--unset-metadata', err.getvalue())
+        self.assertNotIn('could not be judged', out.getvalue())
 
     def test_the_command_line_prints_the_list_and_says_how_many(self):
         import admin
@@ -1462,6 +2045,63 @@ class TrackerFaultTests(unittest.TestCase):
                 self.assertEqual((503, 'unavailable', http_service.EndpointBackend.UNREAD, True),
                                  (error.status, error.code, error.message,
                                   getattr(error, 'nothing_done', False)))
+
+    def test_the_missing_slot_is_its_own_error_and_says_merge_create(self):
+        """kittrial-5bb.202 item 1: not UNREAD's transient sentence, and its own code."""
+        for reading in (True, False):
+            with self.subTest(reading=reading):
+                with self.assertRaises(http_service.HttpError) as failed:
+                    http_service.EndpointBackend._checked(
+                        {'returncode': 2, 'stdout': '', 'stderr': 'ValueError: no slot\n', 'fault': 'merge-slot'},
+                        'actor-standing', reading=reading)
+                error = failed.exception
+                self.assertEqual((503, 'merge_slot_missing', http_service.EndpointBackend.MERGE_SLOT_MISSING, True),
+                                 (error.status, error.code, error.message,
+                                  getattr(error, 'nothing_done', False)))
+                self.assertIn('merge-create', error.message)
+                self.assertNotEqual(http_service.EndpointBackend.UNREAD, error.message)
+                self.assertNotEqual('unavailable', error.code)
+
+    def test_unreadable_rows_are_their_own_error_and_name_the_row(self):
+        """kittrial-5bb.243 item N7: an export read with one unreadable row answers 503 with
+        its own code and the endpoint's sentence naming the row id and the repair, never
+        UNREAD's "try again shortly" -- at issue and at use alike (reading or not)."""
+        sentence = ("TrackerRowsUnreadable: The project's tracker holds unreadable row(s) pp-9, so it was "
+                    "not read as a whole tracker: the unreadable row may be the row that holds a name. "
+                    "An operator must repair the row (for deeply nested metadata: bd update ID "
+                    "--unset-metadata KEY) if a second try gives the same answer, then try again.\n")
+        for reading in (True, False):
+            with self.subTest(reading=reading):
+                with self.assertRaises(http_service.HttpError) as failed:
+                    http_service.EndpointBackend._checked(
+                        {'returncode': 2, 'stdout': '', 'stderr': sentence, 'fault': 'unreadable-rows',
+                         'unreadable_rows': ['pp-9']}, 'actor-standing', reading=reading)
+                error = failed.exception
+                self.assertEqual((503, True), (error.status, getattr(error, 'nothing_done', False)))
+                self.assertEqual('unreadable_rows', error.code)
+                self.assertIn('pp-9', error.message)
+                self.assertIn('--unset-metadata', error.message)
+                self.assertIn('second try', error.message)
+                self.assertNotIn('try again shortly', error.message)
+                self.assertNotIn('re-enter the text', error.message)
+                self.assertNotEqual(http_service.EndpointBackend.UNREAD, error.message)
+                self.assertNotEqual('unavailable', error.code)
+        # The message is built from the fault's fields: the ids ride as a field, and a
+        # stderr tail shaped like a row's body never becomes the message (r2 review item 1).
+        with self.assertRaises(http_service.HttpError) as failed:
+            http_service.EndpointBackend._checked(
+                {'returncode': 2, 'stdout': '', 'stderr': '', 'fault': 'unreadable-rows',
+                 'unreadable_rows': ['pp-9']}, 'actor-standing', reading=True)
+        self.assertEqual((503, 'unreadable_rows'), (failed.exception.status, failed.exception.code))
+        self.assertIn('pp-9', failed.exception.message)
+        self.assertEqual(['pp-9'], failed.exception.unreadable_rows)
+        # With no ids at all, the fixed one answers, still its own code.
+        with self.assertRaises(http_service.HttpError) as failed:
+            http_service.EndpointBackend._checked(
+                {'returncode': 2, 'stdout': '', 'stderr': '', 'fault': 'unreadable-rows'},
+                'actor-standing', reading=True)
+        self.assertEqual((503, 'unreadable_rows', http_service.EndpointBackend.ROWS_UNREADABLE),
+                         (failed.exception.status, failed.exception.code, failed.exception.message))
 
     def test_an_ordinary_code_two_reading_refusal_is_still_422(self):
         """The endpoint's own guard refusals stay 422 on the reading path (main's rule)."""
@@ -1494,6 +2134,141 @@ class LaunchWiringTests(unittest.TestCase):
                          False, None, False, None)
         self.assertIn('--service-namespace', captured['argv'])
         self.assertEqual('web2', captured['argv'][captured['argv'].index('--service-namespace') + 1])
+
+
+try:
+    import test_bd_label_aliases as rb
+except Exception:                                            # the real-bd fixture imports endpoint too
+    rb = None
+
+
+@unittest.skipIf(rb is None or rb.endpoint is None, 'real bd tracker read needs POSIX endpoint imports')
+@unittest.skipIf(rb is not None and (rb.BD is None or not rb.BD.with_name('dolt').is_file()),
+                 'no real bd/dolt pair (set ORCHESTRA_BD_BIN to a bd with a sibling dolt)')
+class RealBdTrackerActorTests(unittest.TestCase):
+    """kittrial-5bb.221 on a real pinned bd, in the fixture of test_bd_label_aliases.
+
+    One tracker row planted exactly 65 levels deep (bd update --metadata embeds the value
+    structurally in the exported row; on bd 1.2.2 the row line nests the value's depth plus
+    the row and the metadata wrapper) sits beside healthy rows and the merge slot: the read
+    answers its names, the issue path (`actor-standing` with rows, what the web service asks
+    to issue a credential) holds the names, and a write under a held name is refused while a
+    free name writes. A row planted exactly 751 levels deep is marked, and the whole read
+    refuses as on main -- at issue and at first use.
+
+    The fixture's machinery (its server, its scratch runtime, its signal handling) is
+    borrowed method by method: the class is not a subclass, so its own test methods do not
+    run a second time here.
+    """
+    BORROWED = ('PASSWORD', 'READY_TRIES', 'READY_PAUSE', 'bd', '_free_port',
+                '_stop_server', '_signalled', '_watch_signals', '_await_server', '_set_root_password')
+
+    @classmethod
+    def setUpClass(cls):
+        for name in cls.BORROWED:
+            attr = rb.RealBdLabelAliasTests.__dict__[name]
+            if isinstance(attr, classmethod):          # re-wrapped, so cls.<name>() binds the class again
+                attr = classmethod(attr.__func__)
+            setattr(cls, name, attr)
+        rb.RealBdLabelAliasTests.setUpClass.__func__(cls)
+
+    @classmethod
+    def tearDownClass(cls):
+        rb.RealBdLabelAliasTests.tearDownClass.__func__(cls)
+
+    def created(self, title, *args):
+        result = self.bd('create', title, '--json', *args)
+        self.assertEqual(0, result.returncode, result.stderr)
+        return json.loads(result.stdout)['id']
+
+    def setUp(self):
+        import http_authority
+        self.endpoint = rb.endpoint
+        self.config_path = self.root / 'authority.json'
+        self.state = fixes.authority_state(project='pp')
+        self.config = http_authority.AuthorityConfig(str(self.config_path))
+
+    def credential(self, name, rows_checked=None):
+        self.state['credentials'] = {'cred_x': {
+            'id': 'cred_x', 'user_id': 'usr_a', 'project_id': 'pp', 'actor': name, 'revoked': False,
+            'scopes': ['tasks', 'checkpoints', 'reviews', 'feedback'], 'expires_at': time.time() + 3600}}
+        if rows_checked is not None:
+            self.state['credentials']['cred_x']['actor_rows_checked'] = rows_checked
+        self.config_path.write_text(json.dumps(self.state), encoding='utf-8')
+        return {'via': 'credential', 'user_id': 'usr_a', 'credential_id': 'cred_x', 'project': 'pp',
+                'capability': 'tasks.write', 'now': time.time() + 5}
+
+    def write(self, actor, descriptor, number):
+        return self.endpoint.execute(self.root, {'project': 'pp', 'actor': actor, 'action': 'bd',
+                                                 'args': ['create', 'x'], 'operation_id': 'op-221-%s' % number,
+                                                 'authority': descriptor},
+                                     authority_config=self.config, require_authority=True)
+
+    def standing(self, names):
+        """One actor-standing request through the endpoint's own CLI, exactly as the web
+        service's issue path makes it (the shape of RealEndpointCase.run_main)."""
+        out = io.StringIO()
+        argv = ['endpoint.py', '--root', str(self.root), '--authority-store', str(self.config_path)]
+        request = {'project': 'pp', 'actor': 'http/read', 'action': 'actor-standing',
+                   'args': names, 'tracker': True}
+        with mock.patch.object(sys, 'argv', argv), \
+                mock.patch.object(sys, 'stdin', io.StringIO(json.dumps(request))), \
+                redirect_stdout(out), redirect_stderr(io.StringIO()):
+            self.endpoint.main()
+        return json.loads(out.getvalue())
+
+    def row_line(self, wanted):
+        export = self.bd('export', '--all')
+        self.assertEqual(0, export.returncode, export.stderr)
+        for line in export.stdout.splitlines():
+            if line.strip() and '"%s"' % wanted in line:
+                return line
+        self.fail('no row %s in the export' % wanted)
+
+    def depth_exactly(self, line, expected):
+        """Whether a row line nests exactly ``expected`` levels.
+
+        nesting(text, bound) answers "past this bound or not": 0 when the text cannot
+        exceed it. Exactly N is "not past N" and "past N-1" together."""
+        import record_json
+        return (record_json.nesting(line, expected) == 0
+                and record_json.nesting(line, expected - 1) == expected)
+
+    def test_rows_65_and_751_levels_read_and_refuse(self):
+        import record_json
+        self.created('the merge slot', '--id', 'pp-merge-slot')
+        self.created('healthy', '--assignee', 'vic')
+        deep = self.created('deep', '--assignee', 'deep-author')
+        # The value's depth plus the row and the metadata wrapper is the row line's depth.
+        shallow = '{"deep":' + '{"a":' * 63 + '1' + '}' * 63 + '}'
+        self.assertEqual(0, self.bd('update', deep, '--metadata', shallow).returncode)
+        line = self.row_line(deep)
+        self.assertTrue(self.depth_exactly(line, 65), 'row line not exactly 65 levels: %r' % line[:120])
+        # A whole tracker with one row nested 65 levels: the read answers its names (the
+        # fixture's own actor wrote the rows, so it is held too) ...
+        names = set(rb.endpoint.tracker_actors(self.root, self.project))
+        self.assertIn('vic', names)
+        self.assertIn('deep-author', names)
+        # ... the issue path holds the asked-for names ...
+        told = json.loads(self.standing(['vic', 'worker-a'])['stdout'])['names']
+        self.assertEqual({'vic': actor_names.ROWS}, {name: rule for name, rule in told.items() if rule})
+        # ... a write under the held name is refused, and a free name writes through the service.
+        refused = self.write('vic', self.credential('vic', rows_checked=False), 'held')
+        self.assertEqual((126, 403), (refused['returncode'], refused.get('authority_status')), refused)
+        done = self.write('worker-a/sub', self.credential('worker-a'), 'free')
+        self.assertEqual(0, done['returncode'], done)
+        # A row nested exactly 751 levels is marked, and the whole read refuses, at issue and use.
+        past = '{"deep":' + '{"a":' * 749 + '1' + '}' * 749 + '}'
+        self.assertEqual(0, self.bd('update', deep, '--metadata', past).returncode)
+        self.assertTrue(self.depth_exactly(self.row_line(deep), 751), 'row line not exactly 751 levels')
+        with self.assertRaises(actor_names.TrackerUnreadable):
+            rb.endpoint.tracker_actors(self.root, self.project)
+        told = self.standing(['vic'])
+        self.assertEqual((2, 'unreadable-rows'), (told['returncode'], told.get('fault')), told)
+        self.assertIn(deep, told['stderr'])              # the sentence names the unreadable row
+        fault = self.write('vic', self.credential('vic', rows_checked=False), 'unreadable')
+        self.assertEqual((2, 'unreadable-rows'), (fault['returncode'], fault.get('fault')), fault)
+        self.assertNotIn('try again shortly', fault['stderr'])
 
 
 if __name__ == '__main__':

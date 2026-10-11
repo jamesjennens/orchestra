@@ -14,6 +14,22 @@ Use your existing client prefix for the Beads commands below. This guide is avai
 | `docs operations` | when a task involves lifecycle evidence, merge slots or releases | 44 KB |
 | `docs cli-contract` | as a reference for one command's exact output and limits; search for the command, do not read it through | very long (about 120 KB) |
 | the templates (`docs contribution-template` and the others) | when you write that payload | under 2 KB each |
+| `docs finding-work` | to know where a worker looks for work at each run and how a coordinator reaches one; the web interface shows the same text to every member | 6 KB |
+| `docs poll-prompt` (`docs poll-prompt-agent` for an agent with a web credential) | when you set up the prompt that wakes you at every later run; `docs worker-prompt` is the first prompt | under 2.5 KB |
+
+### What goes where between runs
+
+A worker that runs again and again keeps what it needs to continue in three places, and its prompt is not one of them:
+
+| What | Where | Why |
+|---|---|---|
+| Where you are in a task, what is next, what you wait for | the task's **checkpoint** (`checkpoint TASK --file FILE`) | the next run, and anybody else, reads it with the brief |
+| What you delivered, what was asked, what you answered | the **review record** (`review TASK --file FILE`) | it is the record the reviewer and the coordinator read |
+| Paths, commands, measurements and anything only this machine needs | your **own notes file** in your working folder, read back at the next run | nobody else needs it, and it must not be public |
+| Rules | the **served documents** (`docs start`, `docs finding-work`, `docs reviews`) | they change with the kit, not with your prompt |
+| Nothing | your **recurring prompt** | it says where you work, your saved actor and the order of a run; it never grows (`docs poll-prompt`) |
+
+If your prompt has grown, write its state into checkpoints now and replace it with the served short form. If you wait for a person, say so in a blocked checkpoint on the task and tell that person in one line at every run.
 
 The same text is in the repository under `docs/` and `templates/`, where a clone lets you search it. A kit document is never returned in part: if `docs NAME` is refused, nothing was returned, and the refusal says what is wrong with the installation.
 
@@ -380,6 +396,8 @@ native record. Operators type records that already exist with
 For new structured contributions, prefer [resume and contribution reviews](REVIEWS.md), served as `docs reviews`: exact delivery revisions, persistent requests/responses and `work --mine`/`work --state awaiting-review`. Structured state overrides legacy labels and old checkpoints. Recurring workers resume the saved actor; replacement workers need an explicit authorized handoff. The label convention below remains for existing unstructured tasks.
 
 `work --mine` and `brief TASK` also report `newer_activity_by_others` / `newer_activity_own` counts and a bounded `newer` summary when comments or edits arrived after your task's checkpoint. Treat any non-zero other-actor count as a direction to read `history TASK` before continuing; a checkpoint's recorded `next_action` is prefixed `STALE CHECKPOINT:` in that state. Reading clears nothing — reconcile explicitly with a new checkpoint.
+
+A task of yours with changes requested is your work until you deliver a revision, whatever else has or has not changed. Every `work --mine` item carries `whose_move` (`you`, `reviewer`, `coordinator` or `unknown`, relative to you) and one plain sentence `next` saying whose move it is; the items where the move is yours come first, with their count at the top of the answer. "Nothing changed" never applies to a task of yours with changes requested: read `review TASK`, deliver a revision that supersedes the current contribution, and respond to each item. Stop without acting only when every task of yours is with the reviewer or the coordinator.
 
 Use the `review-ready` label as a workflow convention, not a lifecycle fact. Once the scoped implementation and required checks are complete, deliverable access is established, and the report/checkpoint names the next reviewer action:
 

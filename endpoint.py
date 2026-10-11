@@ -28,7 +28,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from admin import ConfigurationUnreadable,deployment_document,deployment_password,environment,project_dir,root_path,operators as configured_operators,verifiers as configured_verifiers,review_workflow_writes as configured_review_writes
+from admin import ConfigurationUnreadable,deployment_document,deployment_password,environment,project_dir,root_path,operators as configured_operators,verifiers as configured_verifiers,review_workflow_writes as configured_review_writes,coordinator_rules as configured_coordinator_rules
 import bd_refusals
 import native
 from coordination import is_merge_slot, merge_slot_sentence
@@ -41,7 +41,34 @@ from reserved_comments import (carries_record_label, check_raw_request, comment_
                                is_merge_slot_id, shown_token, write_targets, MERGE_SLOT_LABEL, MERGE_SLOT_SUFFIX,
                                reserved_label_in_args, refuse_http_actor, status_change_targets, title_change_targets,
                                unresolved_bd_flags)
-from http_authority import AuthorityConfig, NativeRunner, CAP_PROJECT_ADMIN, descriptor_actor_denial, http_actor_denial, journal_path, run_guarded, stamp_write
+from http_authority import AuthorityConfig, NativeRunner, CAP_APPROVE, CAP_PROJECT_ADMIN, descriptor_actor_denial, http_actor_denial, journal_path, run_guarded, stamp_write
+
+#: One warning per line on stderr (kittrial-5bb.197 review request 01a12894, item 6):
+#: the configuration warnings and the native warnings are collected in one list, and
+#: three joined warnings with no separator read as one run-on line.
+def warning_text(warnings):
+    """The stderr text of a warning list, one line per warning."""
+    return ''.join(line if line.endswith('\n') else line+'\n' for line in warnings)
+
+
+def owner_loader(path,rule):
+    """A zero-argument reader of the project's actor -> principal map.
+
+    The map (``sessions.owners``) is read ONLY when a rule needs it, and only for the
+    writes that need it, so a damaged registry never stops ``work``, ``review``,
+    ``contribute`` or a listed operator's operation (kittrial-5bb.197 review request
+    01a12894, item 4c). A registry that cannot be read raises with the way to turn
+    ``rule`` off; the caller adds nothing.
+    """
+    def load():
+        import sessions
+        try:
+            return sessions.owners(path)
+        except (ValueError,OSError) as exc:
+            raise ValueError('%s An operator turns the rule off with `admin.py coordinator-rules off --rule %s '
+                             '--actor OPERATOR`, or repairs the session registry; nothing was changed.'
+                             %(exc,rule)) from None
+    return load
 
 ALLOWED={'list','show','ready','search','count','create','update','close','reopen','comments','dep','state','lint'}
 # Legacy name kept for operators reading this file; enforcement is the
@@ -425,26 +452,85 @@ def tracker_actors(root,path,before=None,own=()):
     One ``bd export --all`` for the project, through the same read ``admin.py
     credential-actors`` makes: a bd process that opens the project's database. That is the
     cost of judging a plain name by the rows it has, and it is paid where the rule is
-    applied, never by every write (docs/HTTP_DEPLOYMENT.md says so). A tracker that cannot
-    be read raises, and so does an answer that is not a whole tracker -- an export that
-    parses to no rows, that fails partway (a cut line, a non-JSON word, a bd that exits
-    nonzero), or that carries rows but not the project's merge slot
-    (``actor_names.TrackerUnreadable``): every project this kit makes holds that slot, so an
-    answer without it did not come from a whole read and is a host fault, not "the tracker
-    holds no names" (kittrial-5bb.188 review of item 1, revision-3 item 3). ``own`` are the
-    lifetimes of earlier credentials of the same name whose rows are not held against this
-    one (item 3)."""
+    applied, never by every write (docs/HTTP_DEPLOYMENT.md says so). What depends on it:
+    ``reserved_actors`` feeds the tracker names to the worker-credential name rule on every
+    HTTP-path write (``descriptor_actor_denial``, kittrial-5bb.184/188) and to the
+    ``actor-standing`` rows read the web service makes when it issues a credential, so a
+    read that fails blocks every write under a plain name and every issue, for the whole
+    project.
+
+    Rows are parsed with the row bound of kittrial-5bb.141 (``record_json.loads_rows``,
+    ``ROW_NESTING_MAX`` 750), not the 64-level record-comment guard that used to refuse
+    this read on one row nested 65 levels (kittrial-5bb.221): a row nested up to 750
+    levels parses normally and its own author, assignee and comment names count. ANY row
+    that cannot be parsed -- unparseable text, deeper than 750, a line cut short -- still
+    refuses the whole read exactly as before: an unreadable row may be the row that holds
+    the name, and a name the tracker might hold must not become issuable or writable
+    through a worker credential (revision-2 review item 1: a comment holding U+0085, or
+    751-level metadata, hid a row's author and a credential under that name was issued and
+    wrote). A marked row never counts as the project's merge slot: its id can be recovered
+    from text nobody has read, and the whole-read proof must rest on a row that was read.
+
+    A tracker that cannot be read raises ``actor_names.TrackerUnreadable`` -- a bd that
+    exits nonzero, or text that is not rows at all --, a read that came back holding a row
+    that cannot be parsed raises ``actor_names.TrackerRowsUnreadable`` (its own sentence
+    naming the row ids and the operator repair, never "try again shortly"; kittrial-5bb.243
+    item N7), and a read that came back without the
+    project's merge slot raises ``actor_names.TrackerMergeSlotMissing``: every project this
+    kit makes holds that slot, and a missing slot is what the merge-create operation
+    repairs, so it must not be answered as the transient fault "try again shortly"
+    (kittrial-5bb.188 review of item 1, revision-3 item 3; kittrial-5bb.202 item 1). A read
+    that answered no rows at all, the plain ``bd init`` shape, is one of the missing-slot
+    cases, not a failed read: bd exited 0 and said nothing, so the tracker was read and the
+    absent thing is the slot row (kittrial-5bb.202 review `documents-say-the-old-answer`;
+    the empty-project decision is recorded in the lane plan and docs/HTTP_DEPLOYMENT.md).
+    A project whose metadata records no Dolt server coordinates is not read at all: bd would
+    fall back to an embedded database there, so that answer is the same host fault, never the
+    empty-project decision (kittrial-5bb.202 rev-3 item 2, review F2).
+    ``own`` are the lifetimes of earlier credentials of the same name whose rows are not
+    held against this one (item 3)."""
     import actor_names
     from admin import run_bd
+    # The SAME guard ``admin.project_merge_slot_state`` uses, for the same reason: without the
+    # Dolt server coordinates recorded in ``.beads/metadata.json`` bd falls back to an EMBEDDED
+    # database, creates ``.beads/embeddeddolt`` and exits 0 having printed nothing. That answer
+    # is not this project's tracker at all, so it is the host fault and never the empty-project
+    # missing-slot answer: reading it as "no rows at all" answered 503 merge_slot_missing and
+    # advised a merge-create that then fails (kittrial-5bb.202 review of revision 2, F2).
+    try:
+        metadata=json.loads((path/'.beads'/'metadata.json').read_text(encoding='utf-8'))
+    except (OSError,ValueError,UnicodeError):
+        metadata=None
+    coordinates=('dolt_server_host','dolt_server_port','dolt_server_user','dolt_database')
+    if not isinstance(metadata,dict) or not all(metadata.get(key) for key in coordinates):
+        raise actor_names.TrackerUnreadable()
     try:
         text=run_bd(root,path.name,['export','--all'])
-        rows=[record_json.loads(line) for line in text.splitlines() if line.strip()]
+        rows=record_json.loads_rows(text)
     except (subprocess.SubprocessError,OSError,ValueError,RecursionError):
         # bd could not answer, or answered something that is not rows: a host fault, never an
         # empty tracker and never a rejection of the caller's request.
         raise actor_names.TrackerUnreadable()
-    if not any(isinstance(row,dict) for row in rows) or not any(is_merge_slot(row) for row in rows):
+    offending=[row for row in rows if not isinstance(row,dict) or row.get('malformed')]
+    read_any_row=any(isinstance(row,dict) and not row.get('malformed') for row in rows)
+    if offending and read_any_row:
+        # One unreadable row refuses the whole read (not only its own names): the row may be
+        # the one that holds the name, and an unreadable row's id never proves the slot
+        # (kittrial-5bb.221). TrackerRowsUnreadable, not the bare fault: the row will not
+        # read again until an operator repairs it, so the answer names the row ids and the
+        # repair instead of "try again shortly" (kittrial-5bb.243 item N7).
+        raise actor_names.TrackerRowsUnreadable(
+            row.get('id') if isinstance(row, dict) else None for row in offending)
+    if offending or (not rows and text.strip()):
+        # Nothing rows-like came back at all: text that is not rows, the same failed read,
+        # not an empty tracker and not a row an operator can repair (kittrial-5bb.202 rev-3
+        # item 4: the transient fault, never the missing-slot answer).
         raise actor_names.TrackerUnreadable()
+    if not any(is_merge_slot(row) for row in rows):
+        # Zero rows (a plain `bd init`: the read succeeded and the tracker holds nothing,
+        # so what is absent is the merge-slot row) or rows without the slot row: only an
+        # operator's merge-create puts it back (kittrial-5bb.202 item 1).
+        raise actor_names.TrackerMergeSlotMissing()
     return actor_names.tracker_names(actor_names.tracker_marks(rows),before,own)
 
 def reserved_actors(root,path,rows=False,own=()):
@@ -506,6 +592,133 @@ def key_principal_refusal(request,path,key_principal):
         raise ValueError('This key is bound to principal %s and may act only as actors that principal '
                          'registered in this project; %s is not one of them'
                          % (key_principal,actor if isinstance(actor,str) and actor else repr(actor)))
+
+#: The acceptance commands a confined coordinator may run through the endpoint (slice 3 of
+#: docs/COORDINATORS_PER_PROJECT_DESIGN.md, kittrial-5bb.195). They are the host commands of
+#: admin.py that rest on the operator allowlist, reachable here only because a bound key makes
+#: the actor the server's fact instead of the caller's own word (rules 1 and 2, kittrial-5bb.193
+#: and .194). Voiding, reverting, reconciling, backups, retiring and the rollout switches are
+#: deliberately absent (James's answer to question 5, 2026-10-07).
+COORDINATOR_COMMANDS=('guidance-set','guidance-clear','guidance-status','reference-apply',
+                      'capability-apply','capability-verify','proposal-review','proposal-decide',
+                      'handoff','set-onboarding')
+#: The coordinator commands that only read (no journal, no server time; the read takes the
+#: project's coordination lock, exactly as the host command does).
+COORDINATOR_READS=('guidance-status',)
+#: The coordinator commands whose attachment is plain text rather than a JSON payload.
+COORDINATOR_TEXTS=('guidance-set','set-onboarding')
+#: The payload ``operation`` values ``reference-apply`` and ``capability-apply`` may carry
+#: through this route (review of 958e883, item 1; the owner decision of 2026-10-09 on
+#: kittrial-5bb.238). ``accept`` is the ONLY one: a record reaches this route only after
+#: somebody proposed it as a draft, so every acceptance has a recorded proposal before it (two
+#: attributed steps; that proposer and accepter differ is NOT checked here). ``draft`` - the
+#: library's direct accepted revision 1, which
+#: creates a key that did not exist already accepted, on one party's own word - is refused
+#: here and stays with the installation operator on the host (``admin.py reference-apply`` /
+#: ``admin.py capability-apply``). The host command's operator route also allows ``retire`` on
+#: a capability, the only route that withdraws an accepted entry, and ``propose``/``revise``
+#: are the contributor route; both stay off this surface. ``incorporated`` is not an
+#: entry-apply operation at all: it is a proposal disposition state reached through
+#: ``proposal-review``/``proposal-decide``, so it is neither allowed nor needed here.
+COORDINATOR_APPLY_OPERATIONS=('accept',)
+
+def coordinator_refusal(request,root,key_principal):
+    """Refuse the coordinator acceptance commands unless the caller is a key bound to a principal
+    whose actor is on this installation's operator list (or, for ``capability-verify``, verifiers).
+
+    Slice 3 of docs/COORDINATORS_PER_PROJECT_DESIGN.md. ``key_principal`` is passed only by the
+    forced command of a bound authorized_keys line (kittrial-5bb.194); the actor has already
+    been checked to be one the project's registry gives to that principal, so the operator
+    allowlist is asked of a name the server chose, not of a name the caller typed. An
+    installation that configures nothing sends no ``--key-principal``: this surface is then
+    unreachable and every other action behaves exactly as it did.
+    """
+    if key_principal is None:
+        raise ValueError('These are the acceptance commands of a confined coordinator: they need an SSH key '
+                         'bound to a principal (--principal on its authorized_keys line), so that the actor is '
+                         'the server\'s fact and not the caller\'s word. This request names no principal, so '
+                         'nothing was changed; run the matching admin.py command on the host instead.')
+    args=request.get('args') if isinstance(request,dict) else None
+    command=args[0] if isinstance(args,list) and args and isinstance(args[0],str) else None
+    actor=request.get('actor') if isinstance(request,dict) else None
+    # The verifiers list may also record a capability check, as the host command allows.
+    if command=='capability-verify' and actor in configured_verifiers(root):return
+    from keyed_records import require_configured_operator
+    require_configured_operator(actor,configured_operators(root),
+                                'run %s through the endpoint'
+                                %(command if command else 'a coordinator command'))
+
+def coordinator_operation_refusal(command,where,operation,in_batch=False):
+    """One sentence for a payload operation this route does not carry (kittrial-5bb.238).
+
+    ``where`` says where the operation was found: ``carries`` for the single payload, or
+    ``items[2] carries`` for one item of a batch. ``draft`` gets its own sentence, because it
+    is the one operation a caller may expect from the host command: through this route a
+    record is accepted only after somebody proposed it, so the direct accepted revision 1
+    (a key created already accepted, on one party's own word) stays on the host. A batch item
+    carries no operation of its own whatever the value - the batch itself is the acceptance -
+    and that has its own sentence too.
+    """
+    if operation=='draft':
+        return ('coordinator %s %s operation %r: a new record is proposed first (capability propose / '
+                'ref propose) and then accepted, or created directly by the installation operator on the '
+                'host (admin.py %s with operation draft). Nothing was written.'
+                %(command,where,operation,command))
+    if in_batch:
+        return ('coordinator %s %s operation %r; a batch item carries no operation of its own - the batch '
+                'itself is the acceptance, and %s is the only operation this route carries. Nothing was '
+                'written.'%(command,where,operation,', '.join(COORDINATOR_APPLY_OPERATIONS)))
+    return ('coordinator %s %s operation %r; this route carries only %s. Nothing was written.'
+            %(command,where,operation,', '.join(COORDINATOR_APPLY_OPERATIONS)))
+
+def coordinator_apply_refusal(payload,command):
+    """Refuse a payload operation ``reference-apply``/``capability-apply`` is not meant to carry.
+
+    The check is on the PAYLOAD, before the library is called, for the single form and the
+    ``items`` batch alike, so a payload can never carry an operation the route does not name
+    (review of 958e883, item 1: ``operation: retire`` reached ``apply_native(operator=True)``
+    and superseded an accepted capability). ``accept`` is the only operation carried here (the
+    owner decision of 2026-10-09 on kittrial-5bb.238): ``draft``, the direct accepted
+    revision 1, is refused with its own sentence. The host commands are unchanged.
+    """
+    operation=payload.get('operation','accept')
+    if operation not in COORDINATOR_APPLY_OPERATIONS:
+        raise ValueError(coordinator_operation_refusal(command,'carries',operation))
+    items=payload.get('items')
+    if isinstance(items,list):
+        for index,item in enumerate(items):
+            if isinstance(item,dict) and 'operation' in item:
+                raise ValueError(coordinator_operation_refusal(command,'items[%d] carries'%index,
+                                                               item.get('operation'),in_batch=True))
+
+def coordinator_payload(args,request):
+    """The text of the one attachment a coordinator command carries, or None.
+
+    The client transports a local file as ONE token ``@attachment:N`` with the flag kept on
+    the attachment (``client.py`` ``_attachments``), exactly as it does for every other write,
+    so the server never reads a path out of the request (review of 958e883, item 2: this used
+    to demand the two tokens ``--file @attachment:N`` the client never sends). The two-token
+    form is still accepted for a hand-built request, and a token that is neither is refused
+    without ever being read as a path. ``args`` is everything after the subcommand.
+    """
+    if not args:return None
+    if len(args)==1:
+        flag=None;token=args[0]
+    elif len(args)==2 and args[0] in ('--file','-f'):
+        flag=args[0];token=args[1]
+    else:
+        raise ValueError('Use --file with a local JSON or text file; the server reads no file path')
+    attachments=request.get('attachments') if isinstance(request,dict) else None
+    item=None
+    if isinstance(attachments,dict) and isinstance(token,str) and token.startswith('@attachment:'):
+        item=attachments.get(token.partition(':')[2])
+    if (not isinstance(item,dict) or not isinstance(item.get('text'),str)
+            or item.get('flag') not in ('--file','-f')):
+        raise ValueError('Invalid attachment: a coordinator command needs --file with one local JSON or '
+                         'text file, carried as a single @attachment token; the server reads no file path')
+    if flag is not None and item.get('flag')!=flag:
+        raise ValueError('Invalid attachment: the flag on the attachment does not match the request')
+    return item['text']
 
 def execute(root,request,authority_config=None,require_authority=False,key_projects=None,key_principal=None):
     key_project_refusal(request,key_projects)
@@ -590,22 +803,64 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
         # failing every work/review action (kittrial-5bb.110 item 2).
         switch_warnings=[]
         review_writes=configured_review_writes(root,warnings=switch_warnings)
+        rules=configured_coordinator_rules(root,warnings=switch_warnings)
         run_warnings.extend(switch_warnings)
+        # The principal rule of slice 7 and the party comparison of rule 3 both need the
+        # project's actor -> principal map, and only when a rule that consults it is on:
+        # an installation that configures nothing reads no registry here, and a damaged
+        # registry does not stop work, review, contribute or a listed operator's own
+        # operation (kittrial-5bb.197 review request 01a12894, items 1 and 4c).
+        registry_rule='coordinator_writes' if rules['coordinator_writes'] else 'independent_approval'
+        owners=(owner_loader(path,registry_rule)
+                if (rules['coordinator_writes'] or rules['independent_approval']) else None)
+        # A verified web-owner approval capability: the web service already established
+        # who the caller is, so `coordinator_writes` does not refuse an owner approving
+        # through the web route (kittrial-5bb.199). The merge slot is not on that route.
+        web_owner=(authority_config is not None and action=='review'
+                   and isinstance(request.get('authority'),dict)
+                   and request['authority'].get('capability')==CAP_APPROVE)
         def work_effect():
             result=work_execute(path,actor,action,args,request.get('attachments',{}),runner,
                                 operators=configured_operators(root),
                                 verifiers=configured_verifiers(root),
-                                review_writes=review_writes)
+                                review_writes=review_writes,
+                                independent_approval=rules['independent_approval'],
+                                coordinator_writes=rules['coordinator_writes'],
+                                owners=owners,web_owner=web_owner)
             # A handoff request and a decline are recorded in the kit's handoff journal and move
             # nothing in bd, so the runner saw no write; they are writes all the same (review
             # of kittrial-5bb.97). One that was already recorded (`reconciled`) wrote nothing.
             if action=='handoff' and len(args)==2 and isinstance(result,dict) and result.get('reconciled') is False:runner.wrote=True
-            return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False,indent=2)+'\n','stderr':''.join(run_warnings)}
+            return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False,indent=2)+'\n','stderr':warning_text(run_warnings)}
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
             return guarded_write(root,request,journal_path(path),work_effect,
                                authority_config=authority_config,
                                require_authority=require_authority,runner=runner)
+    if action=='requirements':
+        from requirement_http import read as read_requirements
+        run_warnings=[]
+        def run(argv):
+            stdout,warnings=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
+            if warnings:run_warnings.append(warnings)
+            return stdout
+        with (path/'.coordination.lock').open('a') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            result=read_requirements(path,name,request.get('args',[]),run,configured_operators(root))
+        return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
+    if action=='owner-requirements':
+        from requirement_http import web_action
+        run_warnings=[]
+        def run(argv):
+            stdout,warnings=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
+            if warnings:run_warnings.append(warnings)
+            return stdout
+        runner=NativeRunner(run)
+        with (path/'.coordination.lock').open('a') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            answer=web_action(root,path,name,request,authority_config,runner,guarded_write)
+        answer['stderr']=answer.get('stderr','')+''.join(run_warnings)
+        return answer
     if action=='set-onboarding':
         # An owner sets the project's onboarding text from the web interface
         # (kittrial-5bb.118 part 2). Service-only; see onboarding.web_action.
@@ -862,6 +1117,162 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             return guarded_write(root,request,journal_path(path),proposal_effect,
                                authority_config=authority_config,
                                require_authority=require_authority,runner=runner)
+    if action=='coordinator':
+        # Slice 3 of docs/COORDINATORS_PER_PROJECT_DESIGN.md (kittrial-5bb.195): the acceptance
+        # commands a confined coordinator runs in its own project. These are the host commands
+        # of admin.py; they are reachable here only because the caller is a bound key
+        # (--key-principal, kittrial-5bb.194), so the actor is the one the project's registry
+        # gives to the key's principal and not the caller's own word. An installation that
+        # configures nothing sends no principal and reaches none of them (coordinator_refusal).
+        args=request.get('args',[])
+        if not isinstance(args,list) or not args or any(not isinstance(a,str) or '\0' in a for a in args):
+            raise ValueError('Use coordinator with one of: %s'%', '.join(COORDINATOR_COMMANDS))
+        command=args[0]
+        if command not in COORDINATOR_COMMANDS:
+            raise ValueError('Unknown coordinator command %r: a confined coordinator may run only %s. Voiding, '
+                             'reverting, reconciling, backups, retiring and the rollout switches stay with the '
+                             'installation operator.'%(command,', '.join(COORDINATOR_COMMANDS)))
+        coordinator_refusal(request,root,key_principal)
+        text=coordinator_payload(args[1:],request)
+        payload=None
+        if command in COORDINATOR_READS or command=='guidance-clear':
+            if args[1:]:raise ValueError('Use coordinator %s without a payload'%command)
+        elif command in COORDINATOR_TEXTS:
+            if text is None:raise ValueError('coordinator %s needs --file with the text to set'%command)
+        else:
+            if text is None:raise ValueError('coordinator %s needs --file with its JSON payload'%command)
+            try:
+                payload=record_json.loads(text)
+            except ValueError as error:
+                # A bare JSONDecodeError is not a sentence a confined coordinator can act on
+                # (review of 958e883, item 3c).
+                raise ValueError('coordinator %s payload is not valid JSON (%s); supply one JSON object '
+                                 'in the --file attachment. Nothing was changed.'%(command,error)) from None
+            if not isinstance(payload,dict):
+                raise ValueError('coordinator %s payload must be a JSON object'%command)
+            if command in ('reference-apply','capability-apply'):
+                coordinator_apply_refusal(payload,command)
+        operators=configured_operators(root)
+        verifiers=configured_verifiers(root)
+        run_warnings=[]
+        def coordinator_run(argv):
+            stdout,warnings=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
+            if warnings:run_warnings.append(warnings)
+            return stdout
+        runner=NativeRunner(coordinator_run)
+        import contextlib
+        @contextlib.contextmanager
+        def held():
+            # One hold of the project's coordination lock; closing the file releases it. A
+            # batch command takes it once per item through this callable and releases it
+            # between items, so the caller holds nothing around the batch (kittrial-5bb.67
+            # review 01a0fc55), exactly as admin.py does for the same commands.
+            with (path/'.coordination.lock').open('a') as lock:
+                fcntl.flock(lock,fcntl.LOCK_EX)
+                yield
+        per_item_lock=(command=='capability-verify'
+                       or (command in ('reference-apply','capability-apply')
+                           and isinstance(payload,dict) and 'items' in payload))
+        if command=='guidance-status':
+            # The host read (`admin.py guidance-status`): a bound, listed actor may see the
+            # text, which the endpoint's self-declared `guidance status` withholds. The host
+            # command takes the project's coordination lock around the read, so this does too
+            # (review of 958e883, item 4d): the answer is one snapshot, not a read racing a set.
+            import guidance
+            with held():
+                result=guidance.status(path,actor,operators,host=True)
+            return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''}
+        def coordinator_effect():
+            if command=='guidance-set':
+                import guidance
+                result=guidance.write_guidance(path,text,actor)
+            elif command=='guidance-clear':
+                import guidance
+                result=guidance.clear(path,actor)
+            elif command=='set-onboarding':
+                from onboarding import write_project
+                from http_authority import server_time as now_stamp
+                target=path/'ONBOARDING.md'
+                previous=None
+                if target.is_file() and not target.is_symlink():
+                    try:
+                        previous=target.read_text(encoding='utf-8-sig')
+                    except (UnicodeDecodeError,OSError):
+                        # A damaged previous document must not stop the route from replacing it
+                        # (review of 6f3007a, finding 1; kittrial-5bb.238 item 1): the host command
+                        # replaces it, and a caller with no shell has no other way. The unreadable
+                        # previous text is treated as changed, and the answer says so in a sentence
+                        # rather than the bare UnicodeDecodeError that used to answer rc 2 with
+                        # nothing written.
+                        run_warnings.append('the previous ONBOARDING.md could not be read as UTF-8 text; '
+                                            'it was treated as changed and replaced')
+                write_project(target,text)
+                # This route does NOT probe the text for endpoint paths (review of 958e883, item 3b):
+                # probe_endpoints resolves and reads every absolute *.py path the text names and
+                # reveals one bit about each plus the resolved symlink target, and the server must
+                # never read a path out of the request. The host `admin.py set-onboarding` keeps its
+                # warning for the operator with a shell. `set_by` ECHOES the actor the server chose
+                # for this request (kittrial-5bb.238 item 4): the route records no attribution of its
+                # own, a request field called set_by is ignored, and the installation's own log is
+                # the only trace of who set the text.
+                result={'state':'set','source':'operator','bytes':len(text.encode('utf-8')),
+                        'changed':previous!=text,'set_by':actor,'set_at':now_stamp()}
+            elif command=='handoff':
+                from handoff import execute as handoff_execute
+                result=handoff_execute(path,actor,payload,runner,operator=True)
+            elif command=='reference-apply':
+                import reference_records
+                if isinstance(payload,dict) and 'items' in payload:
+                    result=reference_records.apply_batch(payload,actor,runner,path,operators=operators,lock=held)
+                else:
+                    payload.setdefault('operation','accept')
+                    result=reference_records.apply_native(payload,actor,runner,path,operator=True,
+                                                          operators=operators)
+            elif command=='capability-apply':
+                import capability_records
+                if isinstance(payload,dict) and 'items' in payload:
+                    result=capability_records.apply_batch(payload,actor,runner,path,operators=operators,lock=held)
+                else:
+                    result=capability_records.apply_native(payload,actor,runner,path,operator=True,
+                                                           operators=operators)
+            elif command=='capability-verify':
+                import capability_verification
+                result=capability_verification.verify_batch(payload,actor,runner,operators=operators,
+                                                            verifiers=verifiers,journal=path,lock=held)
+            else:
+                import proposal_records
+                result=proposal_records.dispose(payload,actor,runner,path,operators=operators,
+                                                route='decide' if command=='proposal-decide' else 'review')
+            # The answer carries the server's time when this call wrote: a file set (guidance,
+            # onboarding), a record accepted, a verification, a disposition. A no-op - an
+            # idempotent retry the record module answered `reconciled: true` or `changed: false`,
+            # an items batch whose every item was already-accepted, or a verify whose every item
+            # was already-recorded - wrote nothing and carries no server_time (review of 958e883,
+            # finding 11: the comment used to claim this while guidance-set, set-onboarding and a
+            # batch still carried server_time; review of 6f3007a, finding 4: an all-
+            # already-recorded verify still did).
+            no_op=(isinstance(result,dict)
+                   and (result.get('reconciled') is True or result.get('changed') is False
+                        or (command in ('reference-apply','capability-apply') and isinstance(payload,dict)
+                            and isinstance(payload.get('items'),list) and bool(result.get('items'))
+                            and all(isinstance(item,dict) and item.get('result')=='already-accepted'
+                                    for item in result['items']))
+                        or (command=='capability-verify' and isinstance(result.get('items'),list)
+                            and bool(result['items'])
+                            and all(isinstance(item,dict) and item.get('result')=='already-recorded'
+                                    for item in result['items']))))
+            if not (isinstance(result,dict) and result.get('reconciled') is True):runner.wrote=True
+            if no_op:runner.wrote=False
+            return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n',
+                    'stderr':''.join(run_warnings)}
+        if per_item_lock:
+            return guarded_write(root,request,journal_path(path),coordinator_effect,
+                                 authority_config=authority_config,
+                                 require_authority=require_authority,runner=runner)
+        with held():
+            return guarded_write(root,request,journal_path(path),coordinator_effect,
+                                 authority_config=authority_config,
+                                 require_authority=require_authority,runner=runner)
     if action in ('brief','history','checkpoint'):
         from briefing import execute as briefing_execute
         args=request.get('args',[])
@@ -891,16 +1302,36 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             if warnings:run_warnings.append(warnings)
             return stdout
         runner=NativeRunner(run)
+        # Slices 6 and 7 (kittrial-5bb.197): the three rules are read once, from the
+        # installation's own file, and an installation that configures nothing reads
+        # them all as OFF. A malformed value reads as OFF with a warning, as
+        # review_workflow_writes does, rather than failing every lifecycle write.
+        switch_warnings=[]
+        rules=configured_coordinator_rules(root,warnings=switch_warnings)
+        run_warnings.extend(switch_warnings)
+        # The registry is read only when a rule that needs it is on, and for the
+        # lifecycle write only when `lifecycle_authors` is on: with the rules OFF a
+        # malformed `operators` value must not stop `coordinate`, and a damaged
+        # registry must not stop the reads or a listed operator's operation
+        # (kittrial-5bb.197 review request 01a12894, item 4).
+        coordinate_operators=(configured_operators(root)
+                              if (rules['coordinator_writes'] or rules['independent_approval']) else None)
         def lifecycle_effect():
             if action=='lifecycle':result=apply_native(payload,actor,runner,
-                                                       operators=configured_operators(root),journal=path)
+                                                       operators=configured_operators(root),journal=path,
+                                                       lifecycle_authors=rules['lifecycle_authors'],
+                                                       independent_approval=rules['independent_approval'],
+                                                       owners=owner_loader(path,'lifecycle_authors'))
             elif action=='coordinate':
                 from coordination import apply_native as coordinate
-                result=coordinate(payload,actor,runner,path)
+                result=coordinate(payload,actor,runner,path,operators=coordinate_operators,
+                                  coordinator_writes=rules['coordinator_writes'],
+                                  independent_approval=rules['independent_approval'],
+                                  owners=owner_loader(path,'coordinator_writes'))
             else:
                 from requirement_records import apply_native as requirement_apply
                 result=requirement_apply(payload,actor,runner,path)
-            return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
+            return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':warning_text(run_warnings)}
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
             return guarded_write(root,request,journal_path(path),lifecycle_effect,
@@ -1018,7 +1449,9 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                                require_authority=require_authority,runner=runner)
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--root',required=True)
+    # No prefix matching: the wrapper passes these flags exactly, and an abbreviation must
+    # not silently select a different option (kittrial-5bb.223, finding 7).
+    p=argparse.ArgumentParser(allow_abbrev=False);p.add_argument('--root',required=True)
     p.add_argument('--authority-store',help='server-side live-authority document (HTTP service only)')
     p.add_argument('--authority-lock',help='server-side authority lock (defaults to STORE.lock)')
     p.add_argument('--require-authority',action='store_true',
@@ -1030,11 +1463,12 @@ def main():
                    help='a project the calling SSH key is bound to (repeatable; passed only by '
                         'ssh_forced_command.py from the authorized_keys line): every request for '
                         'another project is refused (kittrial-5bb.193)')
-    p.add_argument('--key-principal',metavar='NAME',
+    p.add_argument('--key-principal',action='append',default=None,metavar='NAME',
                    help='the principal the calling SSH key belongs to (passed only by '
                         'ssh_forced_command.py from the authorized_keys line): every request whose '
                         'actor that principal does not own in the project is refused, except a '
-                        'session registration, which makes the new actor its own (kittrial-5bb.194)')
+                        'session registration, which makes the new actor its own (kittrial-5bb.194; '
+                        'given twice, refused)')
     a=p.parse_args()
     authority_config=None
     if a.authority_store:
@@ -1047,8 +1481,13 @@ def main():
             raise ValueError('--key-principal is for an SSH key line and cannot be combined with --authority-store')
         from admin import validate_name
         key_projects=None if a.key_project is None else frozenset(validate_name(name) for name in a.key_project)
+        if a.key_principal is not None and len(a.key_principal)>1:
+            # The flag may be named at most once: argparse would otherwise keep the last and a
+            # line that names two principals would be served as one of them (finding 7).
+            raise ValueError('--key-principal names %s twice; a key may name at most one principal'
+                             %', '.join(str(value) for value in a.key_principal))
         from sessions import valid_principal
-        key_principal=None if a.key_principal is None else valid_principal(a.key_principal,'--key-principal')
+        key_principal=None if a.key_principal is None else valid_principal(a.key_principal[0],'--key-principal')
         text=sys.stdin.read(2_000_001)
         if len(text)>2_000_000:raise ValueError('Request exceeds 2 MB')
         answer=execute(root_path(a.root),record_json.loads(text),authority_config=authority_config,
@@ -1063,10 +1502,26 @@ def main():
         answer={'returncode':2,'stdout':'','stderr':f'{type(e).__name__}: {e}\n'}
         import actor_names
         if isinstance(e,actor_names.TrackerUnreadable):
-            # The export answered no rows: a host fault, not a refusal of the request. The
-            # service reads this mark and answers 503 "nothing was changed" (kittrial-5bb.188
-            # item 1); `fault` is how it tells a read the service may retry from a rejection.
+            # The export could not be read (bd failed, or answered something that is not
+            # rows): a host fault, not a refusal of the request. The service reads this mark
+            # and answers 503 "nothing was changed" (kittrial-5bb.188 item 1); `fault` is how
+            # it tells a read the service may retry from a rejection.
             answer['fault']='tracker'
+        if isinstance(e,actor_names.TrackerRowsUnreadable):
+            # The export was read but holds a row that cannot be parsed: not transient, so
+            # its own mark and its own sentence naming the row ids and the operator repair
+            # (kittrial-5bb.243 item N7), beside the bare fault above for older readers.
+            # The ids ride as a field, bounded and checked by the exception itself, so the
+            # web service builds its answer from them and never from a stderr tail a row
+            # could shape (r2 review item 1).
+            answer['fault']='unreadable-rows'
+            answer['unreadable_rows']=list(e.ids or ())
+            answer['unreadable_total']=e.total
+        if isinstance(e,actor_names.TrackerMergeSlotMissing):
+            # The read came back without the merge slot (rows, or no rows at all): not
+            # transient, so its own mark and its own sentence naming the merge-create repair
+            # (kittrial-5bb.202 item 1). The service answers its own 503 code and sentence.
+            answer['fault']='merge-slot'
         if configuration_fault(a.root,e):
             # Not a fault of the request: the server's own configuration file cannot be read.
             # The line names the file, as it does for the operator; `fault` lets the web service

@@ -131,7 +131,11 @@ class EndpointTests(unittest.TestCase):
         source = (KIT / 'endpoint.py').read_text(encoding='utf-8')
         self.assertEqual([line.strip() for line in source.splitlines() if 'run_guarded(' in line],
                          ['return run_guarded(request,journal,effect,**options)'])
-        self.assertEqual(source.count('return guarded_write(root,request,journal_path(path),'), 7)
+        # Nine call sites: the seven of kittrial-5bb.156 plus the two of the coordinator
+        # action (kittrial-5bb.195) - the one under the project lock and the one for a
+        # batch, whose items take the lock themselves. Every one goes through guarded_write,
+        # so every one reads the configuration before it reserves.
+        self.assertEqual(source.count('return guarded_write(root,request,journal_path(path),'), 9)
 
     def test_an_action_that_needs_nothing_from_the_file_is_not_stopped_by_its_damage(self):
         """Review of kittrial-5bb.156: the file was read before EVERY action, so the onboarding text could

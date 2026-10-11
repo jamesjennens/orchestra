@@ -27,6 +27,40 @@ If initial installation fails, it stops the service and preserves files for insp
 
 ## Connect a contributor
 
+Requirements governance is part of the complete backup sidecar and operation
+journal set: `.requirements-governance.json`, its optional restore binding
+`.requirements-governance-source.json`, and `.requirement-owner-requests/`.
+New creation intents start simple; old creations and backups with no history
+remain governed. Restore does not choose a mode. Preserve this set when moving
+a project; use the [requirements snapshot command](REQUIREMENTS.md) for offline
+owner-evidence export. Operator requirement-apply/backfill authority remains
+unchanged in both modes.
+
+**Rollback and restore of simple requirements.** A release predating owner requirements editing can restore
+a backup of a project that has never had these sidecars. It refuses a backup
+containing `.requirements-governance.json`, `.requirement-owner-requests/` or
+`.requirements-governance-source.json` with `Invalid coordination backup path`.
+Restore those backups with this kit or a newer compatible kit. A backup taken
+by that predecessor omits these files: its restored project is governed, and
+owner-accepted requirements cannot be read because their governance history is
+missing. Keep the current kit's complete backup when rolling back; an older
+kit's successful backup does not preserve owner requirement authority.
+The optional `owner_decision` binding in an existing owner request receipt does
+not change this restore limit for a release predating owner requirements editing. Current backups preserve
+and validate the binding. An interrupted acceptance without a binding keeps the
+old operation unknown; the owner reloads the requirement and accepts again with a
+new request key. For a legacy interrupted acceptance with a readable draft, the owner edits that
+draft and accepts the new revision. Unreadable history still needs host operator
+reconciliation.
+Neither action completes the unbound old operation or invents its decision.
+
+The failed-creation recovery panel lists at most 20 of the current owner's pending
+creations and reports the exact total and whether more remain. A request needing an absence proof reads
+one native export and one complete native membership list, then reuses the validated
+request-label index for those items. An unreadable receipt affects its own item;
+an unreadable native absence proof refuses clearing. The clear action checks a
+fresh absence proof and the exact receipt hash under the existing locks.
+
 Configure the [server-owned project entry point](ONBOARDING.md) so new workers can start from an empty directory using a single SSH onboarding command. Its private instructions are included in coordination sidecar backups.
 
 Install Python 3.10+ and OpenSSH on their machine. Configure an SSH alias `beads-team` for the server/service account with their own key; verify the server host key on first connection. Confirm an ordinary `ssh beads-team` works before using the noninteractive client.
@@ -177,6 +211,46 @@ only when the first argument is exactly `register`; a `session resume`, `session
 principal the actor belongs to (`principal`); on an installation that has never written an
 owners map the key is omitted, so the answer is the one this kit gave before rule 2.
 
+#### First call and pre-registration checks
+
+Because a new lane owns no registered actors in the project initially, a bound key's
+**first kit call must be `session register`**. No other call can precede registration or
+be used as a pre-registration check:
+1. `client.py` requires `--actor` for commands other than `session register`, refusing locally
+   before any connection is attempted (`Supply a short contributor/session actor`).
+2. If an actor is supplied, the endpoint's principal gate refuses the request before execution
+   (`This key is bound to principal lane:NAME and may act only as actors that principal registered in this project`).
+Consequently, a newly set-up lane cannot read served documentation (such as `docs sessions`
+or `docs start`) through the kit client until *after* registration. The worker must read startup
+instructions and registration guidelines directly from its local repository clone.
+
+#### Checking a bound key without registering
+
+To verify that an authorized_keys entry is installed and working without registering (or without making an actor):
+- **On the server**: Run:
+  ```sh
+  python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime authorized-keys-list
+  ```
+  (pass `--file` only to inspect an authorized_keys file other than the account's own `~/.ssh/authorized_keys`). The command shows what each line is bound to (`projects` and `principal`) and puts under `attention` any lines that do not point at the installed kit (`other_kit`, `names_release`), or have a repeated or ill-formed binding (`principal_repeated`, `principal_ill_formed`, `project_repeated`), missing files, or unreadable lines.
+- **On the client**: Test network and SSH authentication using plain SSH without the client wrapper:
+  - With no command:
+    ```sh
+    ssh -T USER@HOST
+    ```
+    The forced-command wrapper answers on stderr with exit status 2:
+    ```text
+    ssh_forced_command: no endpoint selected: this key runs only the configured endpoint; a client with "forced_command": true sends its path
+    ```
+  - With a command:
+    ```sh
+    ssh USER@HOST exit
+    ```
+    The forced-command wrapper answers on stderr with exit status 2:
+    ```text
+    ssh_forced_command: this key may not run 'exit'
+    ```
+  Both exit status 2 refusals confirm that SSH authentication succeeded and the key is properly confined to the forced-command wrapper.
+
 An actor that existed before the key was bound (an older coordinator, a legacy name with no
 registration) keeps its name and its history if it is given to the principal once by the
 writing host command:
@@ -188,7 +262,12 @@ python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime \
 ```
 
 The command refuses a name that appears nowhere in the project (no session registration, no
-owner entry and no tracker row names it), so the audit is not a place to invent an actor. It
+owner entry and no tracker row names it), so the audit is not a place to invent an actor. An
+ASSIGNEE on a tracker row counts as naming the actor, so a row assigned to a name makes that
+name adoptable exactly as a row's author does; the check is a guard against a mistyped name,
+not proof that the actor ever acted. A name on the deployment operator allowlist is not
+exempt: until a session registration, an owner entry or a tracker row in the project names
+it, a coordinator's listed name cannot be adopted there. It
 refuses a name on the deployment operator allowlist that another principal owns in another
 project: the one operator list must mean the same lane everywhere. It records in
 `<runtime>/actor-adoptions.audit.json` who gave which actor to which principal, when and why
@@ -204,7 +283,11 @@ refusal changes nothing, so one mistyped actor cannot take a lane's identity and
 **Nothing removes an owner**: there is no command that takes an actor back to "no principal",
 and a wrong owner is corrected with `adopt-actor ... --from`. The audit is a short history:
 it keeps the newest 200 entries and drops the oldest silently; it is a record of recent
-adoptions, not a complete ledger (the registry's owners map is the authority).
+adoptions, not a complete ledger (the registry's owners map is the authority). A kill between
+the command's two writes leaves an audit entry for a move that did not happen: the audit is
+written first, so the registry can still give the actor to the principal it had, and running
+the same command again appends a second identical entry. Read a `moved` entry against the
+registry.
 
 **What this section does not do.** Rule 2 binds only BOUND keys. A line with no
 `--principal`, a key bound only to projects, and a line printed by an older release all act
@@ -241,6 +324,208 @@ from the keys), or the older kit cannot read the registry, cannot back the proje
 refuses every such key. The same applies to a coordination-sidecar backup taken after an
 adoption. [OFFICE_SERVICE.md](OFFICE_SERVICE.md) repeats this beside "Binary pins on
 rollback".
+
+### Accept bound keys only
+
+An installation can be set to accept bound keys only, so a line that leaves a key bound to
+nothing - no project to reach, or no principal whose actors it may be - is refused by the forced
+command before the endpoint runs (kittrial-5bb.196; slice 4 of
+[COORDINATORS_PER_PROJECT_DESIGN.md](COORDINATORS_PER_PROJECT_DESIGN.md), and Migration steps 6
+and 7):
+
+```sh
+python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime \
+  bound-keys-only on --actor OPERATOR
+```
+
+The command has three actions: `status` prints the setting, the last recorded change, whether the
+two agree (`audit_agrees`, with a warning when an older kit or a hand edit changed one without the
+other) and the lines that turning it on would refuse; `on` and `off` flip it. `audit_agrees` is
+`null` with `audit_note` `no entry` when no flip was ever recorded: a value hand-set to on with no
+audit entry does not read as agreeing, and `status` says so. Both `status` and
+`on` read the authorized_keys file named by `--file` (default this account's
+`~/.ssh/authorized_keys`) and report `would_be_refused`: the lines of this kit and this root that
+the setting refuses, or would refuse while it is off. So the operator sees what `on` is about to
+cut off before it happens, and `on` prints that list - after reading and building it and before it
+writes the flip, so a slow or failing read of the keys file never leaves the setting on with
+nothing printed. The keys file is read at most its first 1 MiB, and `would_be_refused` names at most
+20 line numbers with `would_be_refused_more` (and an "and N more" in the note) saying how many more
+there are, so a hand-written file cannot flood the terminal. It is operator-gated (`--actor` must be
+on the deployment operator allowlist) and every flip is recorded in the deployment document's
+`bound_keys_only_audit`, with the value it replaced, keeping the last 20 flips; a flip that changes
+nothing writes nothing. `off` on a value that is not true or false is a real flip: it writes false,
+so the bad value and its warning do not stay in the file.
+
+The setting itself is one key, `bound_keys_only`, in `deployment.private.json`; absent or false is
+off, so an installation that configures nothing behaves as it did in the ordinary case, and a fresh
+install and one that turned the setting back off read identically. The reader reads at most the
+first 1 MiB of that file and refuses a larger one, in the forced command and in `admin.py` alike:
+the file is read on every connection, so a huge one must not be read whole.
+
+With it on, a line that names no `--project` or no `--principal` is answered on stderr with exit
+status 2, the missing part is named, and nothing is run - `ssh -T HOST` on such a key answers
+this too. That message, like the non-bool warning, speaks of "the installation setting" and names
+neither the settings file's server path nor the value found: stderr reaches the connecting
+contributor. The operator's own `admin.py` commands name both. A line that names both is served
+exactly as before, and `admin.py authorized-keys`
+refuses to print a contributor line that the setting would refuse (`--role operator` still prints
+the unrestricted line: a shell is outside this setting). What the setting does not touch: an
+unrestricted key, another program's `command=`, a project's rules, and rules 1 and 2.
+
+**What it does not do, said plainly.** A line printed before an upgrade names the wrapper and the
+endpoint of the release it was printed from, by absolute path, and on an office installation that
+path carries the release. Such a line runs THAT release's wrapper and endpoint - which know
+nothing of this setting, or of rules 1 to 3 - against the live runtime, for as long as that
+release's directory is there, and nothing in the new kit can refuse it. **Clean
+`authorized_keys` by hand**: remove or reprint every line that points at another release. The
+setting closes a forgotten line of the CURRENT kit; it does nothing about an older release's.
+`admin.py authorized-keys-list` flags each line that points at a kit other than the installed one
+(`other_kit`, `names_release`) and, while the setting is on, it also puts under `attention` every
+line of THIS kit and THIS root that names no project or no principal, and its `bound_keys_only`
+field says which setting it read. Its `would_be_refused` field names those lines whether the
+setting is on or off, so it is the preview before `on`. The setting is decided by what the
+wrapper's own command line decides: the wrapper FILE the line runs and its LAST `--root` (its
+argparse takes the last when a line names it twice); an `--endpoint` argument that names another
+kit's file does not move the line out of this kit's reach. A line that runs another kit's wrapper,
+or whose last `--root` is another runtime, is never counted as refused: this setting does not reach
+it (that line is served by the release or the root it names), and the note says so. A named line
+the wrapper refuses for another reason (a bad or unknown argument, a binding named twice) is listed
+as refused with a sentence saying the setting is not why.
+
+`setup-status` reports the setting: the endpoint's read-only action carries a `bound_keys_only`
+block (`enabled` true or false, and `null` with its reason when the setting cannot be read - a
+damaged file, a path that is not a regular file, or one that nests too deeply - each with a
+sentence). An endpoint older than this kit does not carry the block at all.
+
+**Before an upgrade or a rollback.** The printed lines name the release, so after every upgrade
+of an office installation print and install them again (`authorized-keys`), as Migration step 6
+says. A kit older than this one does not know the setting at all: rolling back to it silently
+stops refusing unbound lines although `bound_keys_only` is still true in
+`deployment.private.json`. It reads that file otherwise as before, and when this kit is back the
+setting applies again.
+
+**A damaged or unreadable `deployment.private.json` refuses a confined key.** The wrapper cannot
+tell whether the setting is on, so it refuses every call of a forced-command key (exit status 2,
+saying the installation setting could not be read) until an operator repairs or removes the file;
+nothing is run. The operator's own unrestricted key does not run the wrapper and still reaches a
+shell, so this can never lock the operator out. A value that is neither true nor false is read as
+off with a warning on stderr, as `review-writes` reads such a value for its own switch.
+
+**Three exceptions to "an installation that configures nothing behaves exactly as it did".** All
+three are deliberate, and all three are covered by the recovery:
+
+* **A damaged `deployment.private.json` refuses every forced-command key even where the setting
+  was never on.** The forced command cannot see whether the setting is on, so it refuses rather
+  than serve unbound (a release before this one still answered `setup-status` here). **Recovery:**
+  an operator repairs the file, or removes it - a missing file reads as off - and the confined
+  keys work again; the operator's own unrestricted key reaches a shell throughout.
+* **A line whose `--root` names a regular file is refused** (the wrapper's reader cannot look up
+  `deployment.private.json` under a regular file). **Recovery:** correct that line's `--root` to
+  the runtime directory and print it again with `admin.py authorized-keys`.
+* **A VALID `deployment.private.json` larger than 1 MiB refuses every forced-command key even
+  where the setting was never on.** Both readers read at most the first 1 MiB and refuse a larger
+  file, because neither can tell whether the setting sits beyond the bound; so a valid but oversized
+  file refuses a confined key although `bound_keys_only` was never set. **Recovery:** bring the
+  file back under 1 MiB - the kit keeps a damaged audit list aside inside that file, which is the
+  only thing in this kit that grows it - and the confined keys work again; the operator's own
+  unrestricted key reaches a shell throughout.
+
+### The coordinator rules: who may write which fact, and who may approve
+
+Slices 6 and 7 of [COORDINATORS_PER_PROJECT_DESIGN.md](COORDINATORS_PER_PROJECT_DESIGN.md)
+(kittrial-5bb.197), from the decisions recorded on kittrial-5bb.106. Three
+**per-installation** rules live in `deployment.private.json`, each absent or false = OFF, so
+**an installation that configures nothing behaves exactly as it did before**:
+
+| Key | With it ON |
+|---|---|
+| `lifecycle_authors` | the lifecycle action accepts `implemented`, `tested` and the task's `lifecycle-scope` only from the task's **assignee** (compared exactly) or a listed operator, and `reviewed`, `integrated`, `deployed`, `live-verified`, `enabled`, `live` and a release deploy only from a **listed operator** |
+| `independent_approval` | the task's **rule 3**, both halves. (i) `review approve` is refused when the approver is the same **party** as the **contribution's author** or the **task's assignee**. (ii) `reviewed` and `integrated`, and taking the merge slot (`coordination merge-acquire`), are refused unless the **current** contribution carries a validated `approve` record from a party other than its author and the task's assignee; an approval of an **older** (superseded) contribution does not count for a newer one |
+| `coordinator_writes` | `review approve` and `coordination merge-acquire` (taking the merge slot) are refused unless the actor is a listed actor of the project. Workers still contribute, respond, recommend and request changes |
+
+**One rule for "listed" (item 3a).** A listed actor is an actor on the **installation's**
+operator allowlist, or an actor whose **principal** (the project's session-registry `owners`
+map, slice 2) is the principal of an actor on that list. There is no per-project operator
+list: the design gives none, because rules 1 and 2 confine a listed name to the projects of
+its principal's key, so one installation list serves every project. The same one rule is
+applied by `review_workflow.listed_operator_actor` and by `lifecycle.py`, so an unlisted
+actor of a listed operator's principal may approve, take the slot and record an
+operator-only lifecycle fact alike. Names match by whole name and case.
+
+**What this cannot tell apart.** The comparison above is attribution, not authentication. Two
+actors of the same principal are one party; two actors with **no** principal are compared by
+their normalised names (case-folded, a `/`-namespace suffix dropped); and a name-only actor
+and a principal-bound actor can never be shown to be the same party, so they are treated as
+distinct. The lifecycle **assignee** is compared exactly, never folded. The reviewer
+recommendation route keeps its own person rule.
+
+**How to turn the rules on, in order.** They bind only where the caller's identity is the
+server's fact, not the caller's word. **Over an UNBOUND key the rules attribute but do not
+authenticate anybody**: any caller may send a listed name, so turn on `bound_keys_only`
+(kittrial-5bb.196) and give each coordinator a key bound to its principal first; then read
+`admin.py lifecycle-authors PROJECT` and turn `lifecycle_authors` on from that evidence; then
+`independent_approval`; and `coordinator_writes` where only coordinators should approve or
+merge. A rule turned on for a project whose keys are unbound is a report, not a boundary.
+
+```sh
+python3 admin.py coordinator-rules status --actor OPERATOR
+python3 admin.py coordinator-rules on  --rule lifecycle_authors --actor OPERATOR
+python3 admin.py coordinator-rules off --rule coordinator_writes --actor OPERATOR
+python3 admin.py lifecycle-authors PROJECT          # read-only preview of part (a)
+```
+
+**Turn `lifecycle_authors` on from evidence, not from hope.** Read
+`admin.py lifecycle-authors PROJECT` first: it writes nothing, reads the project's own
+export with the reader every other lifecycle read uses, and prints, for every recorded
+trusted fact, the actor who recorded it and whether the rule would allow it
+(`counts.would_be_refused` and `counts.tasks_with_would_be_refused`; at most
+`task_limit` tasks are listed and `truncated` says when there are more). **While a rule is
+OFF nothing is refused and nothing is written to stderr**: all-off is byte-identical to an
+installation that never had the rules, and the read-only report is the only preview. A fact
+that an unlisted actor recorded while the rule was off is not rewritten and still reads as
+recorded: nothing is migrated, and the rule applies to the next write.
+
+**The approval rules refuse before any native write** and name the rule and the setting in
+the sentence, so nothing is recorded and the retry is the same operation. An already-written
+record keeps reading as it did: nothing is migrated. The project's session registry is read
+**only when a `coordinator_writes` write actually needs it** (an actor that is not a plain
+listed name) and only for `review approve` and `coordination merge-acquire`: with the rules
+off no registry is read at all, and a damaged registry does not stop `work`, `review`,
+`contribute`, or a listed operator's own approve or merge. When the registry is needed and
+cannot be read, only those two writes are refused, with a sentence saying how to turn the
+rule off.
+
+**`work` and `brief` say what a contribution is waiting for.** While a contribution is
+`awaiting-review`, both carry one sentence (`waiting_for_approval`) saying it waits for an
+approval from a party other than its author and the task's assignee. The sentence is present
+whether the rules are on or off.
+
+**Where the rules are enforced.** `independent_approval` and `coordinator_writes` are host
+(endpoint/SSH) settings for the review write path, and between them they cover `reviewed`,
+`integrated` and the merge slot. The **web route** has its own authority model
+([WEB_COORDINATOR_DESIGN.md](WEB_COORDINATOR_DESIGN.md)); a signed-in **owner** of the
+project may still approve through it under `coordinator_writes`, because the service has
+already established who the caller is and passes that verified principal to the endpoint
+(never a name the caller sends). `independent_approval` applies to the web route as well: an
+owner approving their **own** web contribution is refused, and the refusal names the setting.
+The merge slot is not on the web route and stays with listed actors.
+
+**Recovery.** A rule is turned off by the same command (`... off --rule NAME`), effective
+from the next request: the endpoint reads the file on every request. Removing the key
+altogether is the same as off; `off` on a value that is not a boolean **writes false** rather
+than leaving the bad value in place. A value that is neither true nor false is read as OFF
+with a warning on stderr that shows the value escaped and bounded, as `review-writes` reads
+such a value for its own switch. The flips are audited under this installation's
+`coordinator_rules_audit` list in `deployment.private.json` (who, when, which rule, which
+action, the value replaced; the last 20 are kept), written under the same
+`.review-writes.lock` as the other deployment switches; `status` bounds every hand-edited
+audit field it prints.
+
+**What of rule 3 is built.** All of it: the self-approval half (the author and the assignee,
+by party) and the second refusal (`reviewed` and `integrated`, and the merge slot, need
+another party's approval of the **current** contribution). What remains outside the code is
+the limit above: over an unbound key this is attribution, not authentication.
+
 
 ### sshd settings the boundary needs
 
@@ -357,9 +642,14 @@ history](#malformed-structured-history) (`void-record`).
 | `capability-alias-reject PROJECT --actor OPERATOR --file reject.json` | reject a pending alias (`{schema_version, key, alias, reason}`); lookup then ignores it | the deployment operator allowlist |
 | `capability-alias-propose PROJECT --actor OPERATOR --file alias.json` | propose an alias as a verified operator (`{schema_version, key, alias, evidence?}`). This is the only route that writes `identity: verified`; `capability propose-alias` through the endpoint always writes `unverified`, even for an operator's actor name | the deployment operator allowlist |
 | `capability-verify PROJECT --actor ACTOR --file payloads.json` | record capability checks as **verified**. The file is what `capability check --repo . --payloads payloads.json` wrote at the commit being verified (one payload, or `{schema_version, items}` of up to 500). Each item is one capability and takes the coordination lock on its own; the result is `recorded`, `already-recorded` or `refused` per item, and re-running the file is safe. This is the only route that writes a verified check: `capability check --record` through the endpoint always writes an unverified report | the deployment operator allowlist or the `verifiers` list, both checked before any read |
-| `verifiers list\|add\|remove [ACTOR] [--confirm-revoke]` | manage the deployment `verifiers` list: actors, other than operators, whose `capability-verify` records readers count as verified. The list is empty by default and grants nothing else. `remove` needs `--confirm-revoke`; the refusal names the capabilities whose verification would change | shell access to the coordination host; `deployment.private.json` is the only authority source |
+| `operators list\|add\|remove [ACTOR] [--actor OPERATOR] [--reason TEXT] [--confirm-revoke] [--all-revoked]` | manage the deployment operator allowlist: who may run the operator-gated host commands. `add` refuses an HTTP account or agent id. `remove` needs `--confirm-revoke` and first names the voids, proposal dispositions and settings that change (capped at 5; `--all-revoked` names all). Every real change is recorded in `<runtime>/authority-changes.audit.json`, with `--actor`/`--reason` when they are given (see [the audited list changes](#the-operator-and-verifier-list-changes-are-audited)) | shell access to the coordination host; `deployment.private.json` is the only authority source |
+| `verifiers list\|add\|remove [ACTOR] [--actor OPERATOR] [--reason TEXT] [--confirm-revoke]` | manage the deployment `verifiers` list: actors, other than operators, whose `capability-verify` records readers count as verified. The list is empty by default and grants nothing else. `remove` needs `--confirm-revoke`; the refusal names the capabilities whose verification would change. Every real change is recorded like `operators` (see [the audited list changes](#the-operator-and-verifier-list-changes-are-audited)) | shell access to the coordination host; `deployment.private.json` is the only authority source |
+| `authority-changes` | read-only: the recorded changes of the operator and verifier lists - which list, the actor added or removed, the change, when, and the recorded `--actor`/`--reason` (`null` when the caller gave neither) | none: read-only |
 | `review-writes status\|on\|off --actor OPERATOR` | read or set the per-installation switch that allows **writing** the new review-workflow record shapes (`withdraw`, `request-review`, `resolve-item`, `decline-review`, an item `severity`, a request-changes `summary`). Readers in this kit understand those shapes either way; with the switch off (the default) a write of one is refused before any native write. See [Review-workflow write switch](#review-workflow-write-switch) | the deployment operator allowlist, checked before any write; `deployment.private.json` is the only source (there is no environment fallback) |
 | `checkpoint-provenance-writes status\|on\|off --actor OPERATOR` | read or set the per-installation switch that allows **writing** checkpoint provenance and direction dispositions (acknowledge, resolve, supersede). Readers in this kit understand them either way; with the switch off (the default) a checkpoint that asks for them is refused before any native write. See [Checkpoint provenance write switch](#checkpoint-provenance-write-switch) | the deployment operator allowlist, checked before any write; `deployment.private.json` is the only source |
+| `bound-keys-only status\|on\|off --actor OPERATOR [--file AUTHORIZED_KEYS]` | read or set the per-installation setting that **accepts bound keys only**: with it on, the forced command of an `authorized_keys` line refuses a line that names no project or no principal, and `setup-status` reports it. `status` and `on` report `would_be_refused` (the lines of this kit and this root the setting refuses, or would refuse while it is off), read from `--file` or `~/.ssh/authorized_keys`. Off is the default and the absent key, so an installation that configures nothing behaves as before. See [Accept bound keys only](#accept-bound-keys-only) | the deployment operator allowlist, checked before any write; `deployment.private.json` is the only source |
+| `coordinator-rules status\|on\|off [--rule lifecycle_authors\|independent_approval\|coordinator_writes] --actor OPERATOR` | read or set the three per-installation rules of the coordinators design, slices 6 and 7 (kittrial-5bb.197): who may record which lifecycle fact, that nobody passes their own work, and that approval and the merge slot belong to a listed actor of the project. `status` reports **all three**; `--rule` names the one `on`/`off` flips and is required for `on`/`off` (given at most once). Off is the default and the absent key, so an installation that configures nothing behaves as before. See [The coordinator rules](#the-coordinator-rules-who-may-write-which-fact-and-who-may-approve) | the deployment operator allowlist, checked before any write; `deployment.private.json` is the only source (there is no environment fallback) |
+| `lifecycle-authors PROJECT [--limit N]` | read-only: for every recorded trusted lifecycle fact of the project, the actor who recorded it, whether the `lifecycle_authors` rule would allow it (`allowed`, `would_be_refused`, `reason`) and the totals (`counts.would_be_refused`), plus whether the setting is currently on. Run it **before** turning `lifecycle_authors` on. It writes nothing and takes no `--actor`: shell access to the service account is already authority over the installation. At most `--limit` tasks (default 200) are listed and `truncated` says when there are more | none: read-only |
 | `proposal-review PROJECT --actor OPERATOR --file review.json` | record a coordinator disposition on a requirement proposal. The payload is `{schema_version, operation_id, key, previous, proposal_sha256, to_state, ...}`: `previous` is the `disposition_comment_id` and `proposal_sha256` the `sha256` that `proposal get` returned, so a stale read is refused before any write. `to_state` is `under-review` (the claim), `rejected` (with `reason`), `duplicate-of` (with `duplicate_of`), `needs-info` (with `question`), `escalated-to-owner` (with `escalation: {question, owner_identity, due_by}`) or `incorporated` (with `incorporation`, checked against the requirement record) | the deployment operator allowlist, checked before any read; the actor must be mapped to a person and must not be the submitter |
 | `proposal-decide PROJECT --actor OPERATOR --file decision.json` | record the owner decision on an escalated proposal: `to_state` `approved` or `rejected` (with `reason`), and `decision: {decision_id}` naming an existing native decision issue. Never a requirement id | the allowlist; the decider must be a different person than the escalator and must not be the submitter |
 | `proposal-settings PROJECT --actor OPERATOR [--map-actor ACTOR --to IDENTITY] [--namespace NAME --to IDENTITY] [--unmap-actor ACTOR] [--unmap-namespace NAME] [--add-decider IDENTITY] [--remove-decider IDENTITY]` | with no change, print the contribution settings; otherwise write the next settings record, composed from the current one and bound to its hash | the allowlist |
@@ -373,6 +663,7 @@ history](#malformed-structured-history) (`void-record`).
 | `project-creations --set-server-limit N --actor OPERATOR` | set the most project databases this server may hold (default 20); see [The cost of many projects on one server](#the-cost-of-many-projects-on-one-server) | a listed operator |
 | `remove-creation PROJECT --actor OPERATOR --reason TEXT` | remove a project creation that `add-project` or the web interface did not finish. Refuses a finished project, a name with no creation record and a running creation. An incomplete one is retired (nothing deleted, the name stays retired); a stalled one, for which nothing was made, loses only its record and its name is free. A record that cannot be read (`damaged`) is only set aside, as `project-creations/PROJECT.json.damaged-<UTC stamp>`; nothing else is touched | a listed operator |
 | `retire-project PROJECT --actor OPERATOR --reason TEXT [--force]` | retire a partial or drill project: move `projects/PROJECT` to `retired/PROJECT-<UTC stamp>`. Nothing is deleted; see [Retiring a project](#retiring-a-project) | the deployment operator allowlist, checked first |
+| `backup-schedule --note TEXT --actor OPERATOR` / `backup-schedule --clear --actor OPERATOR` | record, as an operator, that this runtime's backups are scheduled elsewhere, so the project set-up backup step reads done when no enabled systemd timer covers it (see [Set-up steps](HTTP_DEPLOYMENT.md#set-up-steps)). `--note` is one line of at most 300 characters with no control or format character; `--clear` removes the note and takes no `--note`. The statement is about the whole runtime, never expires, and the server does not check it, so the page shows the operator's words, who recorded them and when. Every set and clear is appended (who, when, which) to `backups/backup-schedule-log.jsonl`, bounded to the newest 100 entries; the note itself is only the current statement. Some installation paths (an interpreter or kit path holding a `$`, a quote, a backslash or a control character) get no systemd unit line at all: the operator is told so, with the reason, instead of a line | a listed operator, checked before any write |
 | `reference-misses-clear PROJECT` | delete the project's [reference lookup-miss log](#the-reference-lookup-miss-log). Same behaviour and output as `capability-misses-clear`, on `.reference-misses.json`, `.reference-misses.json.tmp` and `.reference-misses.lock` | none beyond the service account: it deletes telemetry only |
 | `capability-misses-clear PROJECT` | delete the project's [capability lookup-miss log](#the-capability-lookup-miss-log). It prints what was removed (`finds`, `misses`, `phrases`), and in `repaired` any symlink, directory or unopenable lock file it removed from the three miss-log names (never following a link). It writes nothing to the tracker, takes no coordination lock and calls no `bd` | none beyond the service account: it deletes telemetry only, so there is no allowlist check and no `--actor` |
 | `void-record PROJECT --actor OPERATOR --file void.json` | void a malformed or stale contribution-review record, or a malformed, foreign or conflicting reference or capability record ([below](#reference-and-capability-records)) | the deployment operator allowlist (`operators` in `deployment.private.json`) |
@@ -400,6 +691,257 @@ and confirm with `operators list`; an empty or short list is a deploy blocker,
 not a warning. Use the identity of the person actually running the command as
 `--actor`; the owner decision is named in the payload, never by reusing the
 owner's actor.
+
+### A confined coordinator runs the acceptance commands through the endpoint
+
+Slice 3 of [COORDINATORS_PER_PROJECT_DESIGN.md](COORDINATORS_PER_PROJECT_DESIGN.md)
+(kittrial-5bb.195). A coordinator that gave up the shell (a key bound to a principal) can run
+the acceptance commands it needs without one, when **all** of these hold: the request arrives
+over a key bound to a principal, the project's session registry gives the request's actor to
+that principal, that actor is on the deployment operator allowlist (for `capability-verify`
+the `verifiers` list is enough), and the project is one the key may name.
+
+| Command | The host command it runs |
+| --- | --- |
+| `coordinator guidance-set --file FILE` | `admin.py set-guidance` |
+| `coordinator guidance-clear` | `admin.py clear-guidance` |
+| `coordinator guidance-status` | `admin.py guidance-status` (the authoritative read, with the text) |
+| `coordinator reference-apply --file FILE` | `admin.py reference-apply` (one entry, or an `items` batch) |
+| `coordinator capability-apply --file FILE` | `admin.py capability-apply` |
+| `coordinator capability-verify --file FILE` | `admin.py capability-verify` |
+| `coordinator proposal-review --file FILE` | `admin.py proposal-review` |
+| `coordinator proposal-decide --file FILE` | `admin.py proposal-decide` |
+| `coordinator handoff --file FILE` | `admin.py handoff` (the operator's transfer) |
+| `coordinator set-onboarding --file FILE` | `admin.py set-onboarding` |
+
+Each runs the same library call with the same payload as its host command, so the payload
+schemas in the table above apply unchanged - except where the row below says the route carries
+less. `--file` is a local file the client transports with the same attachment transport every
+other write uses; the server never reads a path out of the request. `coordinator set-onboarding`
+writes the document and answers with `changed` and with `set_by`, which **echoes** the actor the
+server chose for the request: the route stores no attribution of its own (a request field called
+`set_by` is ignored), so the installation's own log is the only trace of who set the text. A
+previous `ONBOARDING.md` that cannot be read as UTF-8 text does not stop the write: it is treated
+as changed, replaced, and the answer says so on stderr - the route used to answer a bare
+`UnicodeDecodeError` with nothing written, so a damaged document could not be replaced from a
+host without a shell (kittrial-5bb.238 item 1). Unlike the host command the route does **not**
+probe the text for endpoint paths, because that probe resolves and reads every absolute `*.py`
+path the text names - server files read out of the request - and the host
+`admin.py set-onboarding` still warns the operator with a shell. A clear with nothing set
+(`guidance-clear`) answers `changed: false` and writes nothing, so a retry whose answer was lost
+is reconcilable without a shell.
+
+**Which payload operations this surface carries.** `coordinator reference-apply` and
+`coordinator capability-apply` carry exactly one payload `operation` value: `accept`, of a
+draft that exists. Through this route a record is accepted only after somebody proposed it as a
+draft (`ref propose` / `capability propose`), so every accepted record has a recorded proposal
+before its acceptance: two steps, both attributed. The route does not check that the proposer and
+the accepter differ; the same actor may do both. They do **not** carry
+`draft`, the library's direct accepted revision 1, which creates a key that did not exist
+already accepted on one party's own word - a per-project coordinator, possibly an agent,
+accepting its own brand-new record in one step; a direct revision 1 is created by the
+installation operator on the host (`admin.py reference-apply` / `admin.py capability-apply`).
+They do **not** carry `retire` either, the only operation that withdraws an accepted entry: that
+stays with the installation operator (`admin.py capability-retire`, above) - nor the contributor
+operations `propose`/`revise`. `incorporated` is not an entry-apply operation at all: it is a
+proposal disposition state, reached with `coordinator proposal-review` and
+`coordinator proposal-decide`. Any other operation, in the single payload or anywhere in an
+`items` batch, is refused before the library is called and nothing is written; a `draft`
+anywhere in a batch refuses the whole batch, so a valid item beside it is not applied either. A
+batch item carries no `operation` of its own, whatever the value, `accept` included: the batch
+itself is the acceptance. A payload with no `operation` is the one place the two commands
+differ, exactly as on the host: `reference-apply` defaults to `accept`, and `capability-apply`
+is answered by the library ("operation must be one of ...") - a message that names the
+operations the host carries, `retire` included, not the one this route does.
+
+**What stays with the installation operator.** `proposal-settings`, `capability-retire`,
+`capability-alias-propose`/`-reject`, `void-record`, `revert-record`, every `*-reconcile`,
+`anchor-release`, `remove-creation`, `retire-project`, the backups, the switch commands
+(`review-writes`, `checkpoint-provenance-writes`, `bound-keys-only`, `coordinator-rules`) and the operator and
+verifier list commands are **not** reachable through this surface, for anybody: they remain
+`admin.py` host commands.
+The action refuses any name it does not know and names the ones it does.
+
+**How the power is taken away.** The operator list is checked against the name the project's
+session registry gives the key's principal, so removing the **actor** from the list
+(`admin.py operators remove ACTOR --confirm-revoke`) refuses it at once, with no key change.
+Removing the **key** means removing **every** `authorized_keys` line of that principal: a
+principal that still has a second line still works, so one line removed is not a revocation.
+An unbound key that names a listed actor is still refused by this action (it sends no
+`--key-principal`), but, as before, it is not confined and can still write ordinary rows.
+
+**The list is per installation, not per project.** A listed actor is a coordinator in **every**
+project where its principal owns that actor name, and a key bound only to a principal (no
+`--project`) reaches all of those projects. A confined coordinator therefore needs a key bound
+to the projects it may serve (rule 1), not just a listed actor name.
+
+**An installation that configures nothing is unchanged.** The action exists only for a key
+bound to a principal: without `--key-principal` - every ordinary host loop and every key that
+binds nothing - the endpoint refuses it before it reads a project file, takes a lock or calls
+`bd`, and every other action behaves exactly as it did.
+
+### The operator and verifier list changes are audited
+
+`operators add|remove` and `verifiers add|remove` take `--actor OPERATOR` (the operator
+making the change) and `--reason TEXT` (at most 400 characters). Every change that really
+changes a list appends one entry - time, operator, list, actor, change, reason - to
+`<runtime>/authority-changes.audit.json` beside `deployment.private.json` (schema version 1,
+mode `0600`, the last `200` entries kept). The entry is written under the same deployment
+lock as the list and **before** it, so a crash between the two leaves an entry with no
+change rather than a change with no entry. When the cap makes room by dropping the oldest
+entry, the change says so on stderr and what it recorded is carried in the baseline (below),
+so a name is never lost from the trail. The read-only `authority-changes` command prints the
+history; it counts and marks the entries that name no operator, prints the current operator
+and verifier lists beside the entries, prints the baseline the trail begins with and any
+damaged audit file kept beside the runtime, and replays the trail against the lists, saying
+plainly (in the report's `replay.note` and on stderr) when the trail does not lead to the
+lists. The recorded `--actor` is a record, not a grant: these commands still check no
+allowlist, exactly as before (kittrial-5bb.192).
+
+A call without the flags still works, because the office wrapper `coord.sh` runs the bare
+`admin.py --root RT operators add ACTOR`. Such a call still records the change, with
+`operator` and/or `reason` `null`, and prints one sentence on stderr naming exactly what to
+add: the change is never silent, and the audit never pretends somebody was named. With one of
+the two flags given, the sentence names the operator (or the reason) it does have and asks
+only for the flag that is missing - a change by a named operator is not called unattributed.
+A call that changes nothing (the name is already listed, or a remove of a name that is not
+listed) records nothing, prints nothing and exits 0, exactly as the release before this audit.
+
+**The baseline: every new history starts from a known state.** The first change that finds no
+baseline in the file writes one beside the entries: a compact record - `at`, `operator`,
+`reason` and `lists` - holding the operator and verifier lists exactly as they stood then, read
+under the lock and before that change. So a history begins with a baseline when it is started
+on an installation from before this kit, and again when a removal starts a fresh history after
+a damaged audit. It is carried forward, never cut: when a change needs room in the 200-entry
+cap, the entries dropped for room are folded into a fresh baseline first, so a name they
+mentioned is still in the trail. (One compact record, not one entry per name: a baseline that
+cost an entry for every name it holds could not fit inside a 200-*entry* cap on an installation
+that lists many names, and the trail would stop being replayable exactly when it is needed.) The
+baseline is what makes the reader's answer usable: a name the list holds that the trail never
+mentions is then really a hand edit or a change made by a kit older than the baseline. A
+history with no baseline at all - a file written by hand, or by a kit older than this one - is
+still read, and the note says the trail is incomplete for these lists and may simply be older
+than the lists. When a later change takes a baseline on such a history it says so: it holds the
+lists as they stand at that change, not "as they stood when this history began"
+(kittrial-5bb.229 finding 6). A list that cannot be read is recorded in the baseline as `null`,
+labelled `UNKNOWN` (kittrial-5bb.229 rev-2 item 1): never as an empty list. An empty list there
+would read every name the list really holds as one the trail never mentions, for good, and the
+baseline's own `reason` says which list it is and that the trail is incomplete for it.
+
+**Reading the answer: a script reads `replay.agrees`.** `authority-changes` exits 0 whether the
+trail leads to the lists or not, and also when `deployment.private.json` cannot be read (then
+`current_lists` and `replay` are `null` and the warning is on stderr). The JSON says it in
+`replay.agrees`: `true` when the trail leads to the lists, `false` when it does not, and `null`
+when there is no trail yet (no audit file at all: the reader then says there is no trail yet,
+prints the lists and warns about nothing) or when the trail is INCOMPLETE for a list. `replay.state`
+carries the same answer as `agrees`, `mismatch`, `no-trail`, or `incomplete`, and `replay.note` is
+the sentence printed on stderr. Never a non-zero exit on a mismatch: every existing installation
+would fail otherwise.
+When one list ALONE cannot be read, `current_lists` holds `null` for it,
+`replay.state` is `incomplete` and `replay.agrees` is `null`: the note says the trail is
+incomplete for that list - and names it FIRST, before anything about the lists it could compare -
+and the comparison this read cannot make is not made (kittrial-5bb.229 findings 2 and rev-2 item
+2). The same state is reported when the BASELINE holds a list as `null` (UNKNOWN), which is what a
+baseline records for a list that could not be read when that history began (rev-2 item 1): the
+trail has no known state to replay that list from, even after the value is repaired. One rule
+covers the audit and the lists both, and it is the same rule as for a damaged audit: a **removal**
+is never refused for it, and only an **add** is. A removal that would start a new history while a
+list cannot be read proceeds, and the baseline it writes records that list as `null` (UNKNOWN); an
+add that would start one is refused, because a baseline must never hold an empty list for a list
+that could not be read (rev-2 item 1). The placeholder flags are covered by the same rule: a
+removal carrying the literal `--actor OPERATOR`/`--reason TEXT` the printed re-grant commands carry
+is not refused - the placeholder is dropped, the entry is recorded without it, and one stderr
+sentence says so - while an add carrying them is refused (rev-2 item 3).
+
+**What the audit cannot see.** An entry holds no before/after of the list itself, so
+`authority-changes` can only replay the trail from its baseline: a name the list holds whose
+last recorded change is a remove, a name the trail adds that the list does not hold, and - with
+a baseline - a listed name the trail never mentions (a hand edit of `deployment.private.json`,
+or a list change made by a kit older than the baseline) are all reported as a trail that does
+not lead to the lists, never silently. Nothing else in the kit detects a hand edit.
+
+**A damaged audit, and the two kinds of change.** An `authority-changes.audit.json` this kit
+cannot read - not JSON, empty, a list, `null`, another `schema_version` (including JSON `true`
+or `1.0`), an unknown top-level key, an entry or a baseline with an unknown or missing field or
+an `at` that is not a UTC stamp, nested past the guard, a BOM, non-UTF-8 bytes, `NaN`, or mode
+`000` - is treated differently by the two. A **removal** (`operators remove NAME
+--confirm-revoke`, `verifiers remove NAME --confirm-revoke`) is NEVER refused for it: the
+damaged bytes are put beside the runtime FIRST, as a hard link or a copy, under the name
+`authority-changes.audit.json.damaged-<UTC date-time>` (`.N` if that name is taken), and the
+atomic write of the fresh history then replaces the audit path. The ONE rule for both the audit
+and the lists: a removal is never refused for either, and only an add is - here, an **add**
+(`operators add`, `verifiers add`, and a `restore-new --restore-operators`/`--restore-verifiers`
+re-grant, which is an add) IS refused, with a sentence that names the file and the recovery:
+move the damaged file aside by hand, then run the command again. That refusal is checked before
+the lock is taken, so it costs nothing at all (no lock file, nothing written), and an add that
+would change nothing is not refused at all. The sentence saying a fresh history starts is printed
+only once that history has actually been written, so the kit never says it and then refuses
+(kittrial-5bb.229 rev-2 item 1). Only a regular, non-symlink file
+is a candidate or is listed: a symlink at a `.damaged-*` name, even a dangling one, is never
+followed, never overwritten and never read as bytes the kit kept inside the runtime
+(kittrial-5bb.229 finding 1). Where the filesystem has no hard links the copy is written to a
+temporary name first and renamed into place, opened `O_CREAT|O_EXCL|O_NOFOLLOW`, so a kill
+inside the copy never leaves a partial file under a `.damaged-*` name (finding 4); `O_EXCL` is the
+flag that does the work - it already refuses a taken name, a symlink included - and `O_NOFOLLOW` is
+kept beside it only because it says the intent and costs nothing (rev-2 item 4). The path is therefore never absent,
+not even for an instant: a kill, or a write that fails, between the two leaves the
+damaged file exactly where it was plus one extra name, and running the command again sets the
+same bytes aside again - the name already holding them is reused, found by `samefile` or by
+comparing the BYTES (not the size: a same-size file holding something else is not the kept copy,
+rev-2 item 4) - so even without hard links the attempts do not pile up copies. One sentence on stderr says
+so, and the fresh history's first record - its baseline, or the removal when the lists are empty
+- names the file kept. The `mv` command every refusal prints carries a real,
+current stamp, not a placeholder, so following it twice cannot overwrite the first kept file. A
+path that is not a regular file at all - a directory, a fifo or a symlink - is refused for every
+command, because the kit only keeps a damaged regular FILE beside the runtime by itself.
+
+**The `.damaged-*` files are never removed.** Nothing in the kit deletes one, ever: they
+accumulate beside the runtime as the record of what the trail could no longer read, and the
+reader lists them (in its JSON, under `damaged_files`, and in the note when there are any). Move
+one away, or archive it, yourself once you have read it. Two things beside them ARE cleaned up,
+because they are interrupted writes rather than kept records: `.authority-changes.audit.json.XXXXXXXX`,
+the copy `atomic_private_write` leaves if it is killed before its rename, and
+`.authority-changes.audit.json.damaged-<stamp>.tmp-<16 hex>`, the copy of a damaged audit's bytes
+left if the process is killed inside that copy. The next write under the deployment lock removes
+both and says so on stderr (kittrial-5bb.229 rev-2 item 4).
+
+`--actor` and `--reason` may be given at most once; a repeat is refused instead of recording the
+last value silently. Abbreviations are OFF for these two commands, so `--act` and `--reas` are
+refused; the abbreviations that existed before these commands took `--actor` are kept as
+explicit aliases: `--a` and `--all` mean `--all-revoked`, and `--confirm` means
+`--confirm-revoke`. Neither command takes the recording flags on `list`: they would change
+nothing and be ignored.
+
+The audit is runtime-level and, like `actor-adoptions.audit.json`, is never part of a project's
+coordination backup.
+
+**Re-grants are recorded too.** `restore-new SRC DST --restore-operators`/`--restore-verifiers`
+re-adds the names the backup records that this host no longer lists, and every name it re-grants
+gets one entry in the same audit, written under the same deployment lock and before the
+configuration. `operator` is `restore-new`'s `--actor` (null when it was not given) and the
+recorded reason names `restore-new` and the source project, then the `--reason` sentence.
+`restore-new` itself takes `--actor OPERATOR` and `--reason TEXT` for these two flags, checked
+before the restore starts (the reason must leave room for the `restore-new SRC: ` prefix inside
+the 400-character ceiling); they are refused when neither flag is given, and a repeat of either
+is refused. Like `operators` and `verifiers`, `restore-new` does not abbreviate ANY of its flags:
+`--act`, `--reas`, `--restore-op` and `--without-c` are refused by the parser with exit status 2.
+The spelled-out names are unaffected, and every use in this document and in the kit's own calls
+is spelled out (`--restore-operators`, `--restore-verifiers`, `--without-coordination`). A
+re-grant nobody was named for
+records a null operator and prints the same one stderr sentence the four list commands print, so
+it is never silently unattributed. A damaged audit refuses the re-grant the same way it refuses
+an add: the restore is still complete, and it exits 3 with the warning and the commands to
+re-grant by hand - those commands now carry `--actor`/`--reason` (with what the restore was
+given where it had it), so following them does not leave the unattributed entry the warning says
+to avoid. Where the restore was given no `--actor`/`--reason`, the commands carry the literal
+placeholders `OPERATOR` and `TEXT` and the warning says to replace them: the re-grant is an ADD,
+and running one unchanged is refused, so the audit never records an operator named OPERATOR
+(kittrial-5bb.229 finding 3). A REMOVAL carrying the same literal placeholders is not refused -
+a removal is never harder with the flags than without (rev-2 item 3): the placeholder is dropped,
+the entry is recorded without it, and one stderr sentence says exactly what was recorded. What is
+NOT covered: a hand edit of `deployment.private.json`, and a list change made
+by an older kit running on the same runtime - both change the lists with no entry, and only the
+reader's replay reports the gap.
 
 ### Standing guidance
 
@@ -918,6 +1460,8 @@ A row is hidden as a record anchor only when it carries one of the labels `refer
 
 `add-project` initializes the project, provisions its merge slot (idempotently) and performs an initial backup, so a freshly provisioned project can run `merge-create`/`merge-check`/`merge-acquire` without a manual slot setup. A project whose slot is missing refuses `merge-check`/`merge-acquire`/`merge-release` with an error naming the `merge-create` operation, which is the manual repair. `backup` captures both the native backup directory and `backups/PROJECT.coordination.json`. The sidecar preserves pending child-request reservations and merge context outside Dolt. Keep this pair together. A pending marker is written before synchronization and becomes complete only after native sync succeeds; restore refuses an incomplete sidecar.
 
+**A project without a healthy merge slot (kittrial-5bb.202).** Three ways of making a project can leave it without one: a plain `bd init` (a tracker the kit did not provision), a `restore-new` whose source database predates the slot (the native restore replaces the clone's rows), and a project made before the slot was provisioned when `merge-create` was never run. The kit closes the ones it controls: `add-project`, `finish-project` and the web creation path provision the slot, and `restore-new` provisions it idempotently after the native restore and after the coordination sidecar and the operation journal are restored, so a failure of that step leaves only the slot to mend (kittrial-5bb.202 rev-3). For the rest, the read-only `admin.py --root RUNTIME merge-slot-report` lists every initialized project whose slot is missing, damaged or cannot be read, and the web set-up page lists a missing or damaged slot as a step. Both name the `merge-create` coordination operation, which is the repair. What issuing a worker credential answers depends on the case, exactly: a **missing** slot -- rows that came back without the slot row, or a readable tracker with **no rows at all** (a plain `bd init`, whose `bd export --all` exits 0 and prints nothing) -- answers 503 `merge_slot_missing` and names `merge-create`, never the transient sentence; a **damaged** slot is not a refusal at all (the row is there, so issuing a credential still answers 201, as on main, and the report and the set-up step list it so `merge-create` can repair it); and a tracker that **cannot be read** (its database dropped, its Dolt server stopped, `bd` failing, or no server coordinates recorded) keeps the transient 503 `unavailable`, "try again shortly", which a retry can mend.
+
 **A sidecar that exists but cannot be used (kittrial-5bb.152).** `restore-new` decides from the coordination sidecar before it creates anything:
 
 - **A copy is usable** (the canonical sidecar, else the last-complete copy described next): it restores from it.
@@ -960,39 +1504,46 @@ If restore is interrupted, the new destination may exist with only part of the r
 
 ### The cost of many projects on one server
 
-Every project is a database on the one Dolt server, and **every bd write on that server
-gets slower with each database it holds**, whichever project the write is for. Reads do
-not. Measured on one machine with the pinned bd 1.2.2 (kittrial-5bb.118 part 2 review):
+With pinned bd 1.2.2 and Dolt 2.2.0, catalog checks on writes get slower as the
+server holds more project databases. The [measured investigation](../reports/BD_DATABASE_SCALING.md)
+includes actual bd SQL, repeated synthetic timings, fixture limits and raw samples.
+At 1, 20 and 50 databases the native create medians were 0.338, 0.909 and 2.126 s;
+native list/show stayed near 0.2 s for the measured issue history. These values are
+not guarantees for other schemas, concurrent loads or arbitrary read histories.
 
-| Project databases on the server | `add-project` | one bd write (create, update, claim, comment, close, merge-slot, config) | one bd read (show, list, export) |
-|---|---|---|---|
-| 1 | 6 s | 0.2 to 0.4 s | 0.2 s |
-| 10 | 12 s | | |
-| 20 | 21 s | | |
-| 30 | 32 s | | |
-| 40 | 42 s | | |
-| 50 | 60 s | | |
-| 52 | 64 s | 1.9 to 2.4 s | 0.2 s |
-
-- The cause, as far as it was traced: bd checks its schema when it opens a database for
-  writing, with queries on `information_schema.columns`; Dolt answers such a query from
-  every database on the server (0.9 s at 52 databases, 0.07 s for an ordinary query),
-  and a write makes about two of them. bd's own SQL was not captured; the number of
-  queries is inferred from the timings.
-- **Archived and retired projects and unfinished creations cost the same as live ones**:
-  their databases stay on the server. The kit never drops a database.
-- **The limit.** `admin.py project-creations --usage` prints how many project databases
-  the server holds and its limit. The limit is 20 unless set:
-  `admin.py project-creations --set-server-limit N --actor OPERATOR` (a listed operator;
-  the change is recorded in `deployment.private.json` with who and when). At the limit
-  the web interface creates no project. `add-project` is the operator's own command and
-  is not stopped by the limit, but what it makes counts.
-- **Raising the limit** buys room at the price in the table: at 50 databases every task
-  write, claim, comment and merge-slot call takes about two seconds, and a creation
-  about a minute. A creation from the web interface may take up to `--create-timeout`
-  (900 seconds) of the web service.
-- The count is over everything under `projects/`, everything under `retired/`, and the
-  creations that hold a name. So twelve visible projects can reach a limit of 20.
+- **Captured cause.** Each measured native write and merge-slot command issued two
+  filtered `INFORMATION_SCHEMA.COLUMNS` checks. Pinned add-project samples issued
+  73 such checks, in addition to other SQL. The count is captured, not inferred.
+  The predicates name the selected schema, but pinned Dolt still builds the catalog
+  across databases. See the report for elapsed query times and exact sources.
+- **Keep the current pin.** Beads 1.3.1 replaces two cursor-column probes but
+  adds TABLES probes and expands migrated schemas. The available evidence does
+  not show a cost reduction; add-project was about 1.6 times slower. The kit also
+  fails compatibility checks with 1.3.1. Migration prevents 1.2.2 from using that
+  database, reads included, and has no data downgrade. See the report for the
+  measurements, independent review findings and upgrade requirements.
+- **Names and the limit.** `admin.py project-creations --usage` and the operator
+  setup-status view report `project_databases` used/limit. The default limit is 20;
+  a listed operator can record another value with
+  `admin.py project-creations --set-server-limit N --actor OPERATOR`.
+  The count comes from names under `projects/`, retired directories and creations
+  holding names, including damaged records. It is not a server-catalog query;
+  an unrepresented database can be missed, while a reservation may precede one.
+- **Enforcement.** The cap stops web creation only. Operator `add-project` remains
+  permitted above it.
+  Archived/retired records do not remove the database or its catalog cost. The kit
+  never drops a database. Twelve visible projects can therefore exhaust 20 names.
+- **Creation time.** Pinned add-project took about 7 s with one existing database,
+  23 to 26 s at 20 and 62 s at 50 in the synthetic measurements. One creation
+  runs at a time on a server, so at 20 to 50 databases it can keep every other
+  creation refused as busy for about 25 to 60 seconds, longer as the server fills.
+  Web creation can take up to the service's `--create-timeout` (900 seconds).
+- **Planning.** Retain 20 for these pins: measured create at 20 is about 2.7 times
+  the one-database cost. Compare the filesystem count with an operator-authorized
+  catalog count and passive operation timings; count errors are not zero usage.
+- **Release and backup.** The report's 25-target synthetic releases and backups at
+  50/100 databases are single observations, not a repeated curve or deployment
+  guarantee. Backup sends no catalog checks; its growth follows project count.
 
 ### Retiring a project
 
@@ -1006,13 +1557,13 @@ What it does:
 - **What holds a retired name is the directory, not the journal.** A name is refused for a new project (`add-project`, `restore-new`, a creation from the web interface) because `retired/NAME-<UTC stamp>` exists; that list of directories is the only thing read. `retired/journal.jsonl` is an audit trail for people: the kit appends to it and never reads it, so a broken or missing journal unprotects no name and stops nothing. Do not rename or remove a `retired/NAME-<UTC stamp>` directory: its database is still on the server, and without the directory the name could be used again and would adopt it.
 
 `--force` is needed when the project looks like a working tracker, holds the merge slot, or has pending reservations. The checks fail closed: what cannot be read is treated as the dangerous answer. The refusal names what it found:
-- **It looks like a working tracker:** bd reads the project and it holds issues. The state of its backups does not matter; a healthy project whose last backup failed is still a healthy project.
-- **Nothing could be checked:** the Dolt server (or bd itself) could not be reached, or the server did not answer the probe within 15 seconds (a frozen server does not make the command hang with its locks held). The project may be a healthy tracker, so this needs `--force` too. Start the server and retry instead when you can.
+- **It looks like a working tracker:** bd reads the project and it holds issues, or metadata is absent while the same-named server database holds issues. The state of its backups does not matter; a healthy project whose last backup failed is still a healthy project.
+- **Nothing could be checked:** the Dolt server (or bd itself) could not be reached, or the server did not answer the probe within 15 seconds (a frozen server does not make the command hang with its locks held). If a same-named database exists but its issue count cannot be read, that is also treated as unknown. The project may be a healthy tracker, so this needs `--force` too. Start the server and retry instead when you can.
 - **Its `.beads/metadata.json` is there but unusable:** it cannot be opened, is not JSON, or does not record the Dolt server. The kit cannot tell what the project is, so this needs `--force`. bd is never run on such a project: without the server coordinates bd would fall back to an embedded database, create `.beads/embeddeddolt` inside the project and report it as empty.
 - **The merge slot** is held, or bd reads the project but could not read its slot.
 - **Reservations:** pending receipts in its request journals, or receipts that could not be read.
 
-A project a stopped restore left behind needs no flag: the server answers and bd rejects the project. An empty project that bd reads (what a restore that failed before writing leaves) needs no flag either, and neither does a directory that was never initialized (no `.beads/metadata.json`: what a stop during the `add-project` step leaves).
+A project a stopped restore left behind needs no flag: the server answers and bd rejects the project. An empty project that bd reads (what a restore that failed before writing leaves) needs no flag either. A directory that was never initialized (no `.beads/metadata.json`: what a stop during the `add-project` step leaves) needs no flag when no same-named server database exists or that database contains no issues.
 
 "bd rejects the project" is any refusal by bd while the server answers. By design that also covers a project whose recorded `project_id` or `dolt_database` was changed by hand so that it no longer matches its database: bd refuses it exactly as it refuses a partial restore, the kit cannot tell the two apart, and it retires with no flag. Nothing is deleted, and moving the directory back undoes it.
 
@@ -1030,7 +1581,7 @@ Afterwards:
 **Upgrade note: reconcile commands and an empty allowlist.** `requirement-reconcile`, `reference-reconcile`, `capability-reconcile`, `record-reconcile` and `reconcile-request` now refuse an actor that is not on the deployment operator allowlist. A deployment that has never configured operators must add the acting operator first, or every one of these commands refuses with "No operator allowlist is configured":
 
 ```bash
-python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime operators add OPERATOR
+python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime operators add OPERATOR --actor OPERATOR --reason "why this operator is listed"
 ```
 
 ### The capability lookup-miss log
@@ -1273,7 +1824,7 @@ A comment that claims a reserved machine format (`Kind: contribution-review-v1`,
 Read the incident first: `brief PROJECT-TASK` fails naming the offending comment id, and `history PROJECT-TASK` returns its exact bytes. Configure the operator allowlist once per deployment, then build a void payload and submit it with the host command:
 
 ```sh
-python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime operators add OPERATOR
+python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime operators add OPERATOR --actor OPERATOR --reason "why this operator is listed"
 python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime operators list
 ```
 
@@ -1571,20 +2122,20 @@ The allowlist is deployment configuration rather than a native Beads object, so 
 To re-establish the recorded authority, re-grant it explicitly, one actor at a time:
 
 ```
-python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime operators add OPERATOR
+python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime operators add OPERATOR --actor OPERATOR --reason "why this operator is re-granted"
 python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime operators list
 ```
 
 Or re-run the whole restore with `--restore-operators` when the entire allowlist recorded in the backup is intended to be in force again, for example on a replacement host:
 
 ```
-python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime restore-new example examplerestore --restore-operators
+python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime restore-new example examplerestore --restore-operators --actor OPERATOR --reason "replacement host, re-granting the recorded allowlist"
 ```
 
-`--restore-operators` is additive only (it never removes an entry) and prints exactly which entries it re-granted. `--restore-operators` and `--restore-verifiers` are the last step of `restore-new`, after the coordination files and the operation-journal snapshot are restored (kittrial-5bb.142). They are the only step that takes the deployment lock, and both lists are re-granted under one wait for it (kittrial-5bb.144). When another change holds the lock past its 10-second wait, the restore still completes, but nothing is re-granted:
+The `--actor`/`--reason` on `restore-new` are recorded on every re-grant the restore makes in the authority-changes audit, exactly as on `operators add`/`verifiers add`; a re-grant without them records a null operator and prints the sentence saying so (kittrial-5bb.192). `--restore-operators` is additive only (it never removes an entry) and prints exactly which entries it re-granted. `--restore-operators` and `--restore-verifiers` are the last step of `restore-new`, after the coordination files and the operation-journal snapshot are restored (kittrial-5bb.142). They are the only step that takes the deployment lock, and both lists are re-granted under one wait for it (kittrial-5bb.144). The restore still completes, but nothing is re-granted, in two cases: another change holds the lock past its 10-second wait, or `authority-changes.audit.json` is damaged (a re-grant is an add, and an add is refused while the audit is damaged; move the file aside first, then run the printed commands):
 
 - **Exit status 3** means the restore is complete, but the authority asked for was not re-granted (kittrial-5bb.144; kittrial-5bb.142 exited 0). Status 0 means restored, including every re-grant asked for; 1 means failed. A script running `restore-new ... --restore-operators && next-step` therefore stops at status 3. `restore-new --help` states the codes.
-- **The warning is the last thing the restore prints**, on stderr, after `Restored only into the newly created project` and anything else on stdout. It names both lists (`WARNING: the restore is complete, but deployment authority the backup records was NOT re-granted: operators (--restore-operators): ...; verifiers (--restore-verifiers): ...`). It then gives one exact, shell-quoted `admin.py --root ROOT operators add ACTOR` (or `verifiers add`) command per entry and the `backup-authority` command below, and ends with `restore-new exits 3: ...`.
+- **The warning is the last thing the restore prints**, on stderr, after `Restored only into the newly created project` and anything else on stdout. It names both lists (`WARNING: the restore is complete, but deployment authority the backup records was NOT re-granted: operators (--restore-operators): ...; verifiers (--restore-verifiers): ...`) and the cause (the lock, or the damaged audit and how to move it aside). It then gives one exact, shell-quoted `admin.py --root ROOT operators add ACTOR --actor OPERATOR --reason TEXT` (or `verifiers add`) command per entry - with the operator and reason the restore was given where it had them, so following them does not leave the unattributed entry the audit warns about - and the `backup-authority` command below, and ends with `restore-new exits 3: ...`.
 
 Run the printed commands; do not repeat the restore, which is refused because the destination now exists. Before kittrial-5bb.142 such a refusal ended `restore-new` with exit status 1 and a half-restored destination: the operation journal and the other list were not restored either.
 

@@ -37,9 +37,15 @@ author. A name with the shape of a web account or agent id is not this module's 
 Rows inside an earlier credential's own lifetime are not held against a renewal under the
 same name by the same owner (kittrial-5bb.188 item 3, :func:`own_intervals`), and a
 credential is judged by the rows once, with the outcome kept on it, not on every write
-(item 5, ``http_service.EndpointBackend``). An export that yields no rows at all -- or a
-result that does not carry the project's merge slot -- is a failure, never "the tracker
-holds nothing" (item 1, :class:`TrackerUnreadable`).
+(item 5, ``http_service.EndpointBackend``). An export that cannot be read at all -- bd
+failed, a line cut short, text that is not rows -- is a failure, never "the tracker holds
+nothing": it is :class:`TrackerUnreadable`. A read that came back without the project's
+merge slot is :class:`TrackerMergeSlotMissing`, which names the merge-create repair; that
+covers rows that carry no slot row and a readable tracker with no rows at all, the plain
+``bd init`` shape (kittrial-5bb.188 item 1; kittrial-5bb.202 item 1 and rev-2). A read
+that holds one unreadable row -- marked by the row bound's parser, or not a JSON object at
+all -- is :class:`TrackerRowsUnreadable`, which names the row ids and the operator repair
+(kittrial-5bb.221 r2, kittrial-5bb.243).
 
 Pure and without imports of the kit, so the web service uses it on every platform.
 """
@@ -48,17 +54,101 @@ import re
 
 
 class TrackerUnreadable(ValueError):
-    """An export that yielded no rows at all: not a tracker that was read.
+    """An export that could not be read as a tracker (kittrial-5bb.188 item 1).
 
-    Every project this kit makes holds at least the merge slot, so an export that parses
-    to zero rows did not answer with the tracker (kittrial-5bb.188 item 1: the reviewer
-    made ``bd export`` exit 0 and print nothing, and the empty answer read as "the tracker
-    holds no names", which opened the rule). It is a host fault, not a refusal of the
+    bd exited nonzero, the answer is a line cut short or text that is not rows, or the
+    project's metadata records no Dolt server coordinates. Every project this kit makes
+    holds at least the merge slot, so a read that IS readable but carries no slot row --
+    including a tracker with no rows at all, the plain ``bd init`` shape -- is
+    :class:`TrackerMergeSlotMissing`, not this. It is a host fault, not a refusal of the
     request: the caller answers 503 and nothing was changed.
     """
 
-    MESSAGE = ("The project's tracker answered no rows, and every project this kit makes holds "
+    MESSAGE = ("The project's tracker could not be read, and every project this kit makes holds "
                "at least the merge slot. Nothing was changed; try again shortly.")
+
+
+class TrackerMergeSlotMissing(ValueError):
+    """The tracker was read, but it holds no merge slot (kittrial-5bb.202 item 1).
+
+    Every project this kit makes holds the merge-slot row, so a read that came back without
+    it is not a whole tracker. That covers rows that carry no slot row and a tracker with no
+    rows at all: a plain ``bd init`` answers ``bd export --all`` with exit 0 and nothing on
+    stdout, so the read succeeded and what is absent is the slot row (the empty-project
+    decision of the kittrial-5bb.202 rev-2 plan, docs/HTTP_DEPLOYMENT.md). It is NOT the
+    transient host fault :class:`TrackerUnreadable` describes: the row will not appear by
+    trying again, and only an operator can put it back with the coordination ``merge-create``
+    operation. Saying so is the point: a project from before the slot was provisioned (or
+    one whose slot row was deleted) otherwise answered "try again shortly", which never
+    helps.
+    """
+
+    MESSAGE = ("The project's tracker holds no merge slot row, so it was not read as a whole "
+               "tracker. An operator must run the merge-create operation, which creates the "
+               "slot, then try again.")
+
+    def __init__(self, message=None):
+        # The sentence travels with the exception: the endpoint's envelope and the SSH path
+        # show the exception's text, and a bare `raise TrackerMergeSlotMissing()` must still
+        # name the repair.
+        super().__init__(message or self.MESSAGE)
+
+
+#: The shape of an id the unreadable-rows sentence will print: a tracker id, never text a
+#: row's own body chose (a newline, an escape sequence, a bidi override or a 10,000-character
+#: id must not become the 503 message). The same shape record_json recovers ids with.
+ROW_ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,160}\Z')
+#: How many unreadable row ids the sentence names; the rest are counted, not printed.
+NAMED_ROWS_MAX = 5
+
+
+class TrackerRowsUnreadable(TrackerUnreadable):
+    """The export was read, but it holds a row that cannot be (kittrial-5bb.221 r2, .243).
+
+    One row of the export is marked malformed -- nested deeper than the row bound,
+    unparseable, a line cut short, a 5,000-digit number -- or is not a JSON object at all
+    (a number, a string, a list holding a row). For the worker-credential name rule that
+    refuses the WHOLE read, exactly as a tracker that could not be read: the unreadable
+    row may be the row that holds the name, and a name the tracker might hold must not
+    become issuable or writable through a credential (the .221 r2 review's security item:
+    a comment holding U+0085, or 751-level metadata, hid a row's author and a credential
+    under that name was issued and wrote).
+
+    Like :class:`TrackerMergeSlotMissing`, this is NOT the transient fault
+    :class:`TrackerUnreadable` answers with "try again shortly": an unreadable row stays
+    unreadable until an operator repairs it, so it carries its own sentence naming the row
+    ids and the repair. Rows nested up to 750 levels parse normally and their names count;
+    only what cannot be read lands here (kittrial-5bb.239 framed the export at the line
+    feed alone, so a U+0085 inside a string no longer cuts a row; whatever its framing
+    still cannot read lands here). A cut export or an error line among the rows can also
+    be a passing bd fault, so the sentence asks for a second try before the repair.
+
+    The ids it names are bounded and checked (:data:`NAMED_ROWS_MAX`, :data:`ROW_ID`): an
+    error body must stay short and plain whatever the rows hold, so at most five ids of
+    the tracker's id shape are printed, then "and K more"; an id that is not of that shape
+    is counted, never printed. ``ids`` carries exactly what the sentence names.
+    """
+
+    MESSAGE = ("The project's tracker holds a row that cannot be read, so it was not read as a "
+               "whole tracker: the unreadable row may be the row that holds a name. An operator "
+               "must repair the row (for deeply nested metadata: bd update ID --unset-metadata "
+               "KEY) if a second try gives the same answer, then try again.")
+
+    def __init__(self, ids=(), message=None):
+        # The sentence travels with the exception, naming at most NAMED_ROWS_MAX unreadable
+        # rows whose ids match the tracker's id shape, then counting the rest; a bare
+        # `raise TrackerRowsUnreadable()` still names the repair. `ids` is what was named,
+        # so the web service can build its answer from fields instead of a stderr tail.
+        given = [i for i in ids if isinstance(i, str) and i]
+        named = [i for i in given if ROW_ID.fullmatch(i)][:NAMED_ROWS_MAX]
+        more = len(given) - len(named)
+        self.ids = tuple(named) if named else None
+        self.total = len(given)
+        if message is None and self.ids:
+            named_text = ', '.join(named) + (', and %d more' % more if more else '')
+            message = self.MESSAGE.replace('a row that cannot be read',
+                                           'unreadable row(s) %s' % named_text, 1)
+        super(TrackerUnreadable, self).__init__(message or self.MESSAGE)
 
 
 #: The shape of the actors ``sessions.py`` makes.

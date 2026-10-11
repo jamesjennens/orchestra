@@ -166,7 +166,7 @@ class ProposalCase(unittest.TestCase):
         return fields
 
     def rows(self):
-        return [json.loads(line) for line in self.native(['export', '--all']).splitlines()]
+        return [json.loads(line) for line in self.native(['export', '--all']).split('\n') if line.strip()]
 
     def plant(self, task, body, author):
         self.native.add_comment(task, body, author=author)
@@ -1079,6 +1079,8 @@ class AttentionTests(ProposalCase):
         self.escalate(keys[1])
         block = self.block()
         shape = set(http_service.ApiHandler._agent_attention_view({}))     # state, summary, counts, truncated, ...
+        # Task-snapshot completeness is specific to agent task attention.
+        shape -= {'snapshot_truncated', 'own_tasks_truncated', 'actions_truncated'}
         self.assertTrue(shape | {'actions'} <= set(block))
         self.assertEqual(set(block) - shape - {'actions'}, {'items', 'next_offset', 'untrusted'})
         self.assertEqual(block['counts'], {'submitted': 2, 'under_review': 1, 'needs_info': 0, 'escalated': 1,

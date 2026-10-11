@@ -1666,7 +1666,7 @@ class AgentSetupDialogCase(unittest.TestCase):
         # that renders one; everything else is built from the secretless payload.
         uses = [line.strip() for line in dialog.splitlines()
                 if re.search(r'\bsecret\b', self.unquoted(line))]
-        self.assertIn('function setupDialog(ctx, source, { secret = null } = {}) {', code)
+        self.assertIn('function setupDialog(ctx, source, { secret = null, certificate = null } = {}) {', code)
         self.assertEqual(["secret ? secretSection(secret, 'Secret (shown once)', payload) : "
                           "reissueSection(ctx, source.agent || {}, payload)),"], uses)
         section = self.function_body(code, 'secretSection')
@@ -1687,13 +1687,21 @@ class AgentSetupDialogCase(unittest.TestCase):
         reopen = self.function_body(code, 'reopenSetup')
         # Built from the agent's current secretless record, with no secret at all.
         self.assertIn('ctx.api.agent(agentId)', reopen)
-        self.assertIn('setupDialog(ctx, { agent }, { secret: null })', reopen)
+        self.assertIn('setupDialog(ctx, { agent }, { secret: null, certificate: await agentCertificate(ctx) })', reopen)
         self.assertIsNone(re.search(r'credential|\.secret\b', reopen))
         # Losing the secret means issuing a NEW credential; only its fresh secret is shown.
         reissue = self.function_body(code, 'reissueSection')
         self.assertIn('ctx.api.issueAgentCredential(agent.id)', reissue)
+        # The confirmation has nested template literals for inferred versus stored
+        # scopes. The simple quoted-text stripper cannot parse those; check the
+        # confirmation separately without treating its prose as a secret variable.
+        confirmation = next(line.strip() for line in reissue.splitlines()
+                            if line.strip().startswith('body:'))
+        self.assertNotIn('.secret', confirmation)
+        self.assertIn('Issuing this secret confirms them as this agent’s stored scopes', confirmation)
         uses = [line.strip() for line in reissue.splitlines()
-                if re.search(r'\bsecret\b', self.unquoted(line))]
+                if not line.strip().startswith('body:')
+                and re.search(r'\bsecret\b', self.unquoted(line))]
         self.assertEqual(['if (!credential.secret) {',
                           "section.replaceChildren(secretSection(credential.secret, 'New secret (shown once)', payload),"],
                          uses)
@@ -1706,7 +1714,7 @@ class AgentSetupDialogCase(unittest.TestCase):
         # that sends a list (the page is run in tests/test_http_agents.py AgentsPageTests).
         self.assertIn('    compact ? null : scopesLine(raw),\n', self.function_body(code, 'agentCard'))
         self.assertNotIn('before this was fixed', code)
-        self.assertIn("if (agent.scopes === null) {", reissue)
+        self.assertIn('agent.scopes === null', reissue)
         self.assertIn("issueAgentCredential: (aid, scopes) => mutate('POST', `/v1/agents/${aid}/credentials`, "
                       "scopes ? { label: 'web: new secret', scopes } : { label: 'web: new secret' })",
                       (WEB / 'js' / 'api.js').read_text(encoding='utf-8'))
@@ -1823,8 +1831,13 @@ const reopened = m.secretlessPayload({ agent: { id: 'agent_1', name: 'Kestrel', 
     owner_display_name: 'Olive', working_directory: 'C:\\k', projects: ['p1'],
     credentials: [{ id: 'c1', label: 'x', revoked: false }] } }, 'http://127.0.0.1:9');
 const q = m.secretlessPayload(mock, 'http://fallback');
+// kittrial-5bb.203 review 01a12408 item 2: the prompt writes no VS Code settings and carries no
+// certificate; item 3a: the address (and fingerprint) become the credential file's own content.
+const plain = m.setupPrompt(p, { bridgeServer: 'https://office.example.invalid:7443' });
+const certificate = { certificate: '-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n', sha256: 'AB:CD' };
+const withCert = m.setupPrompt(p, { role: 'reviewer', bridgeServer: 'https://office.example.invalid:7443', certificate });
 const texts = [m.agentJson(p), m.agentGuide(p), m.setupPrompt(p), JSON.stringify(p),
-               m.agentJson(q), m.agentGuide(q), m.setupPrompt(q), JSON.stringify(q)];
+               m.agentJson(q), m.agentGuide(q), m.setupPrompt(q), JSON.stringify(q), plain, withCert];
 console.log(JSON.stringify({
   leaks: texts.filter((t) => t.includes('SECRET-XYZ-123') || t.includes('MOCK-SECRET-777')).length,
   json: JSON.parse(m.agentJson(p)), mockJson: JSON.parse(m.agentJson(q)),
@@ -1838,6 +1851,16 @@ console.log(JSON.stringify({
   promptNamesFile: m.setupPrompt(p).includes('%USERPROFILE%\\.orchestra-agent-kestrel.curlrc'),
   placeholder: m.headerLine(), real: m.headerLine('S3'),
   tests: m.testCommands(p),
+  promptWritesSettings: /settings\.json|orchestraBridge|caFile/.test(withCert),
+  promptCarriesPem: withCert.includes('MIIB'),
+  promptAddressLine: withCert.includes('# server = https://office.example.invalid:7443'),
+  promptFingerprintLine: withCert.includes('# server certificate sha256 = AB:CD'),
+  workerRoleSaid: plain.includes('role is worker'),
+  reviewerRoleSaid: withCert.includes('role is reviewer'),
+  commentLines: m.credentialCommentLines('https://office.example.invalid:7443', 'AB:CD'),
+  certFile: m.certificateFile('Kestrel (agent of Olive)'),
+  rewrite: m.credentialFileCommand(m.secretFile('Kestrel'),
+    m.credentialCommentLines('https://office.example.invalid:7443', 'AB:CD')).posix,
   paths: [m.destinationPath(p.workingDirectory, m.CONFIG_PATH), m.destinationPath('/home/j/x/', m.GUIDE_PATH),
           m.destinationPath('D:', m.CONFIG_PATH), m.destinationPath('', m.CONFIG_PATH)],
   ignore: [m.gitignoreAppend('node_modules'), m.gitignoreAppend('a\r\n'), m.gitignoreAppend('/.orchestra\n'),
@@ -1872,6 +1895,24 @@ console.log(JSON.stringify({
             {'path': '.orchestra\\agent.json', 'relative': True}], result['paths'])
         self.assertEqual(['\n.orchestra/\n', '.orchestra/\r\n', '', '', '.orchestra/\n'],
                          result['ignore'])
+        # kittrial-5bb.203 review 01a12408: the prompt writes NO VS Code settings and carries no
+        # certificate (item 2); the address and fingerprint lines become the credential file's own
+        # content by a rewrite, not an append (item 3a); the credential never reaches any of it.
+        self.assertEqual(False, result['promptWritesSettings'])
+        self.assertEqual(False, result['promptCarriesPem'])
+        self.assertEqual(True, result['promptAddressLine'])
+        self.assertEqual(True, result['promptFingerprintLine'])
+        self.assertEqual(True, result['workerRoleSaid'])
+        self.assertEqual(True, result['reviewerRoleSaid'])
+        self.assertEqual(['# server = https://office.example.invalid:7443',
+                          '# server certificate sha256 = AB:CD'], result['commentLines'])
+        self.assertIn('grep -vE', result['rewrite'])
+        self.assertIn('chmod 600', result['rewrite'])
+        self.assertIn('mv ', result['rewrite'])
+        self.assertEqual({'name': '.orchestra-agent-kestrel-agent-of-olive.crt',
+                          'windows': '%USERPROFILE%\\.orchestra-agent-kestrel-agent-of-olive.crt',
+                          'powershell': '$env:USERPROFILE\\.orchestra-agent-kestrel-agent-of-olive.crt',
+                          'posix': '~/.orchestra-agent-kestrel-agent-of-olive.crt'}, result['certFile'])
 
 
 

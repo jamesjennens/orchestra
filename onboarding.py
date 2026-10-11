@@ -20,7 +20,22 @@ DOCUMENTS = {
     'task-template': 'templates/TASK.md',
     'report-template': 'templates/REPORT.md',
     'decision-template': 'templates/DECISION.md',
+    # How a worker finds its work and how a coordinator reaches it, and the prompts a worker
+    # is started and woken with (kittrial-5bb.226, kittrial-5bb.219). The web service shows
+    # these same files to every member (WEB_DOCUMENTS below), so each text has one source.
+    'finding-work': 'docs/FINDING_WORK.md',
+    'worker-prompt': 'templates/WORKER_PROMPT.md',
+    'poll-prompt': 'templates/WORKER_POLL_PROMPT.md',
+    'poll-prompt-agent': 'templates/AGENT_POLL_PROMPT.md',
 }
+#: The catalogued documents the WEB service hands to any signed-in member or agent
+#: (``GET /v1/docs/NAME``): what a member reads to learn how work is found, and the
+#: prompts. Nothing of a project and nothing private is in them; the rest of the
+#: catalogue stays with the client's ``docs``.
+WEB_DOCUMENTS = ('finding-work', 'worker-prompt', 'poll-prompt', 'poll-prompt-agent')
+#: A recurring prompt stays short: it carries no state and no rules (kittrial-5bb.219).
+#: The bound is on the prompt itself, the fenced block of its file, in characters.
+POLL_PROMPT_LIMIT = 2000
 PROJECT_LIMIT = 8000
 #: The start document is put in front of every worker by ``onboard``: it is kept short.
 START_LIMIT = 8000
@@ -215,6 +230,46 @@ def read_document(base, relative, limit, kit_document=None):
 def read_kit_document(kit, name):
     """A catalogued document the kit ships, whole (``docs NAME``)."""
     return read_document(kit, DOCUMENTS[name], KIT_DOCUMENT_LIMIT, kit_document=name)
+
+
+def prompt_of(text):
+    """The prompt a document carries, or None: everything between its first line that is
+    exactly ```text and its LAST line that is exactly ```.
+
+    A prompt document says above the block what to replace; the block is what is pasted.
+    The last fence, not the next one: the worker prompt shows commands in a fenced block
+    of its own inside the prompt.
+    """
+    lines = (text if isinstance(text, str) else '').splitlines()
+    fences = [index for index, line in enumerate(lines) if line.rstrip() == '```']
+    starts = [index for index, line in enumerate(lines) if line.rstrip() == '```text']
+    if not starts or not fences or fences[-1] <= starts[0]:
+        return None
+    return '\n'.join(lines[starts[0] + 1:fences[-1]]).rstrip('\n') + '\n'
+
+
+PLACEHOLDER = re.compile(r'\bREPLACE_[A-Z][A-Z_]*[A-Z]\b')
+
+
+def placeholders(text):
+    """The named values a prompt leaves to be replaced, in the order they first appear."""
+    seen = []
+    for name in PLACEHOLDER.findall(text or ''):
+        if name not in seen:
+            seen.append(name)
+    return seen
+
+
+def member_document(kit, name):
+    """One of ``WEB_DOCUMENTS`` for the web service: the text ``docs NAME`` serves, its
+    title, and, when it is a prompt document, the prompt and the values to replace."""
+    if name not in WEB_DOCUMENTS:
+        raise KeyError(name)
+    text = read_kit_document(kit, name)
+    title = next((line[2:].strip() for line in text.splitlines() if line.startswith('# ')), name)
+    prompt = prompt_of(text)
+    return {'name': name, 'title': title, 'served_as': 'docs ' + name, 'file': DOCUMENTS[name], 'text': text,
+            'prompt': prompt, 'placeholders': placeholders(prompt) if prompt else []}
 
 
 def probe_endpoints(text, project, kit):

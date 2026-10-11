@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from export_requirements import adapt, read_export, reference, revision_comment, selection_from_manifest
+from export_requirements import REVISION_PREFIX, adapt, read_export, reference, revision_comment, selection_from_manifest
 from requirement_impact import analyze
 from requirements import content_hash
 from publish_brd import publish
@@ -57,6 +57,13 @@ class ExportTests(unittest.TestCase):
         m=baseline();rows=exported(m);rows[0]['comments']=[]
         with self.assertRaisesRegex(ValueError,'missing'):adapt(rows,selection_from_manifest(m))
 
+    def test_unselected_damaged_content_does_not_break_a_healthy_export(self):
+        manifest = baseline(); rows = exported(manifest)
+        rows.append({'id':'unselected-broken', 'comments':[{'id':'bad','text':REVISION_PREFIX+'{broken'}]})
+        self.assertEqual(adapt(rows, selection_from_manifest(manifest))['manifest'], manifest)
+        rows[0]['comments'][1]['text'] = REVISION_PREFIX+'{broken'
+        with self.assertRaises(ValueError): adapt(rows, selection_from_manifest(manifest))
+
     def test_conflicting_revision_rejected_even_when_original_selected(self):
         m=baseline();rows=exported(m);r=copy.deepcopy(m['narrative'][0]);r['description']='changed';r['sha256']=content_hash(r)
         rows[0]['comments'].append({'id':'conflict','text':revision_comment(r)})
@@ -83,6 +90,46 @@ class ExportTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             f=Path(tmp)/'export.jsonl';f.write_text('{"id":"a","id":"b"}\n',encoding='utf-8')
             with self.assertRaisesRegex(ValueError,'duplicate'):read_export(f)
+
+    def test_jsonl_ordinary_row_nesting_is_isolated_from_selected_records(self):
+        m = baseline()
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / 'export.jsonl'
+            for depth in (60, 80, 500, 751):
+                # Literal array framing avoids depending on the writer's own
+                # recursion limit when generating an over-limit native row.
+                ordinary = '{"id":"unrelated","metadata":'+'['*depth+'0'+']'*depth+'}'
+                source.write_text('\n'.join(json.dumps(r) for r in exported(m))+'\n'+ordinary+'\n')
+                rows = read_export(source)
+                self.assertEqual(adapt(rows, selection_from_manifest(m))['manifest'], m)
+                self.assertEqual(bool(rows[-1].get('malformed')), depth >= 751)
+            selected = exported(m)[0]['id']
+            source.write_text('{"id":'+json.dumps(selected)+',"metadata":'+'['*751+'0'+']'*751+'}')
+            with self.assertRaisesRegex(ValueError, 'selected requirement row cannot be read'):
+                adapt(read_export(source), selection_from_manifest(m))
+
+    def test_overlimit_jsonl_identity_cannot_be_nested_missing_or_duplicated(self):
+        nested = '['*751+'0'+']'*751
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / 'export.jsonl'
+            for row in ('{"metadata":{"id":"nested","value":'+nested+'}}',
+                        '{"id":"one","id":"two","metadata":'+nested+'}',
+                        '{"metadata":'+nested+'}',
+                        '{"id":'+nested+'}',
+                        '{"id":"one","metadata":'+nested+'}{}'):
+                with self.subTest(row=row[:40]):
+                    source.write_text(row)
+                    with self.assertRaisesRegex(ValueError, 'ID|trailing'):
+                        read_export(source)
+
+    def test_overlimit_jsonl_duplicate_issue_still_refuses_whole_selection(self):
+        m = baseline(); selected = exported(m)[0]['id']
+        bad = '{"id":'+json.dumps(selected)+',"metadata":'+'['*751+'0'+']'*751+'}'
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / 'export.jsonl'
+            source.write_text('\n'.join(json.dumps(r) for r in exported(m))+'\n'+bad)
+            with self.assertRaisesRegex(ValueError, 'duplicate issue id'):
+                adapt(read_export(source), selection_from_manifest(m))
 
     def test_cli_export_and_publish(self):
         m=baseline();root=Path(__file__).resolve().parents[1]

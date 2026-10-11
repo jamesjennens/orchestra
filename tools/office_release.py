@@ -343,7 +343,7 @@ def starts(label, path, arguments, scratch):
         code, said = None, error.strerror or str(error)
     if code == 0:
         return said.strip()
-    lines = [line.strip() for line in said.splitlines() if line.strip()]
+    lines = [line.strip() for line in said.split('\n') if line.strip()]
     # The loader's own sentence, when there is one: "version `GLIBC_2.34' not found (required by ...)".
     reason = next((line for line in lines if 'not found' in line or 'No such file' in line), lines[-1] if lines else 'it said nothing')
     try:
@@ -711,7 +711,7 @@ def verify(args):
     print('release=%s source=%s python=%s' % (manifest['build_id'],
                                              manifest.get('source_commit'), python))
     for name, _ in BINARIES:
-        print('%s starts on this host: %s' % (name, (said[name].splitlines() or [''])[0][:120]))
+        print('%s starts on this host: %s' % (name, (said[name].split('\n') or [''])[0][:120]))
 
 
 def main(argv=None):

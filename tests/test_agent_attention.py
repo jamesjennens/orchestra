@@ -7,6 +7,7 @@ stub (the real ``work.queue``, ``review_workflow`` and ``briefing``) and, in a s
 form, over the in-process backend.
 """
 import json
+import os
 import secrets
 import sys
 import unittest
@@ -125,6 +126,12 @@ class EndpointAttentionTests(fixes.EndpointCase):
         action = data['next_actions'][0]
         self.assertEqual((action['priority'], action['requests'], action['review_state']),
                          (1, [request], 'changes-requested'))
+        # kittrial-5bb.249: the next-actions answer carries the same move sentence as the
+        # canonical `work --mine` row, so an agent is never left to read a state alone.
+        self.assertEqual(action['whose_move'], 'you')
+        self.assertEqual(action['next'],
+                         'This is your work now: 2 outstanding review items. Read `review %s`, deliver '
+                         'a revision that supersedes this contribution and respond to each item.' % first)
         self.assertEqual((data['attention']['state'], data['attention']['counts']['changes_requested'],
                           data['attention']['counts']['awaiting_review']), ('changes-requested', 1, 0))
         self.assertIn('1 contribution(s) have changes requested', data['attention']['summary'])
@@ -168,6 +175,51 @@ class EndpointAttentionTests(fixes.EndpointCase):
         self.assertEqual(sorted(kinds(data)[-2:]), [('awaiting-integration', third), ('awaiting-review', first)])
         self.assertEqual([action['priority'] for action in data['next_actions']], [2, 4, 5, 5])
 
+    def test_only_changes_requested_carries_the_move_and_from_the_one_queue_helper(self):
+        """Item 2b: the two answers cannot disagree, so the fields are restricted.
+
+        The task asked for `whose_move`/`next` only where the kind is changes-requested. Every
+        other kind has a mover who is not the agent (an operator reconciles a review error or an
+        unreadable checkpoint; a reviewer or the coordinator holds awaiting work), so it carries
+        neither field: kind `checkpoint-error` can no longer pair `who: operator` with
+        `whose_move: you`, and kind `blocked` no longer contradicts the queue's own sentence.
+        Where the kind IS changes-requested, the words are the canonical row's, built by the same
+        helper the queue uses.
+        """
+        from work import review_move
+        first, second, third, spare = self.tasks
+        for task in (first, second, third):
+            self.claim(task)
+        self.checkpoint(second, [{'id': 'key', 'kind': 'blocker', 'text': 'No key.',
+                                  'source': 'the build log'}])
+        contribution = self.contribute(first)
+        # A malformed chain: kind review-error, whose action owner is an operator.
+        self.native('blair')(['comments', 'add', third, 'Kind: contribution-review-v1\n{}'])
+        data = self.next()
+        kinds_seen = {action['kind'] for action in data['next_actions']}
+        self.assertIn('blocked', kinds_seen)
+        self.assertIn('review-error', kinds_seen)
+        self.assertNotIn('changes-requested', kinds_seen)
+        for action in data['next_actions']:
+            if action['kind'] == 'changes-requested':
+                self.assertIn('whose_move', action)
+            else:
+                with self.subTest(kind=action['kind']):
+                    self.assertNotIn('whose_move', action)
+                    self.assertNotIn('next', action)
+        request = self.review(self.people['blair'], first, 'request-changes', previous=contribution,
+                              contribution=contribution, items=[{'id': 'tests', 'text': 'Add a test.'}])
+        self.assertTrue(request)
+        data = self.next()
+        action = next(item for item in data['next_actions'] if item['kind'] == 'changes-requested')
+        expected = review_move('changes-requested', first, True, pending_items=1)
+        self.assertEqual((action['whose_move'], action['next']), expected)
+        for other in data['next_actions']:
+            if other['kind'] != 'changes-requested':
+                with self.subTest(kind=other['kind']):
+                    self.assertNotIn('whose_move', other)
+                    self.assertNotIn('next', other)
+
     def test_one_unfiltered_work_read_supplies_own_and_claimable_tasks(self):
         self.claim(self.tasks[0])
         actor = self.next()['agent']['actor']
@@ -191,15 +243,14 @@ class EndpointAttentionTests(fixes.EndpointCase):
 
         def paged(action, project, reader, args, *rest, **kwargs):
             self.assertEqual(action, 'work')
-            self.assertNotIn('--owner', args)
             offset = int(args[args.index('--offset') + 1])
-            calls.append(offset)
+            calls.append((offset,'--owner' in args))
             return {'items': rows[offset:offset + 100],
                     'next_offset': offset + 100 if offset + 100 < len(rows) else None}
 
         with patch.object(self.backend, '_run', side_effect=paged):
             data = self.next()
-            self.assertEqual(calls, [0, 100])
+            self.assertEqual(calls, [(0,False), (100,False)])
             self.assertEqual(data['attention']['counts']['claimed'], 130)
             self.assertEqual(data['attention']['counts']['changes_requested'], 1)
             self.assertEqual(kinds(data)[0], ('changes-requested', 'owned-129'))
@@ -207,9 +258,13 @@ class EndpointAttentionTests(fixes.EndpointCase):
             calls.clear()
             with patch.object(self.backend, 'QUEUE_MAX_PAGES', 1):
                 bounded = self.next()
-            self.assertEqual(calls, [0])
+            self.assertEqual(calls, [(0,False),(0,True)])
             self.assertEqual(bounded['attention']['counts']['claimed'], 100)
             self.assertTrue(bounded['attention']['truncated'])
+            self.assertTrue(bounded['attention']['snapshot_truncated'])
+            self.assertTrue(bounded['attention']['own_tasks_truncated'])
+            self.assertTrue(bounded['attention']['actions_truncated'])
+            self.assertIn('at least 100 claimed', bounded['attention']['summary'])
 
     def test_conflicting_checkpoint_history_keeps_unknown_and_operator_action(self):
         task=self.tasks[0];self.claim(task)
@@ -228,6 +283,33 @@ class EndpointAttentionTests(fixes.EndpointCase):
         self.assertNotIn(task,[x['task'] for x in data['next_actions']])
         self.assertEqual(data['attention']['counts']['claimed'],0)
 
+    @patch.dict(os.environ, {'PYTHONUTF8': '1'})
+    def test_only_undelivered_blocked_or_working_tasks_count_as_newer(self):
+        blocked, working, delivered, approved = self.tasks
+        for task in self.tasks:
+            self.claim(task)
+            self.checkpoint(task, [dict(id='wait', kind='blocker', text='Await plan review.', source='plan')]
+                            if task == blocked else [])
+        self.contribute(delivered)
+        contribution = self.contribute(approved)
+        self.review(self.people['blair'], approved, 'approve', previous=contribution,
+                    contribution=contribution, summary='Accepted')
+        for task in self.tasks:
+            self.native('blair')(['comments', 'add', task, 'New direction after the checkpoint.'])
+        data = self.next()
+        self.assertEqual(data['attention']['counts']['newer_activity'], 2)
+        actions = {x['task']: x for x in data['next_actions']}
+        self.assertTrue(actions[blocked]['newer_activity'])
+        self.assertTrue(actions[working]['newer_activity'])
+        for task in (delivered, approved):
+            self.assertIsNone(actions[task]['newer_activity'])
+        # Authorized brief reads confirm the delivered tasks have newer activity;
+        # exclusion must happen in attention's current undelivered state rule.
+        for task in (delivered, approved):
+            brief = self.request('GET', self.base(task)+'/brief', token=self.secret)
+            self.assertEqual(brief.status, 200, brief.data)
+            self.assertTrue(brief.data['checkpoint']['newer_activity'])
+
     def test_own_records_stay_quiet_but_other_actor_comment_wakes(self):
         task=self.tasks[0];self.claim(task)
         self.checkpoint(task,[dict(id='q',kind='blocker',text='Need a key.',source='build')])
@@ -238,6 +320,64 @@ class EndpointAttentionTests(fixes.EndpointCase):
         self.native('blair')(['comments','add',task,'Here is the key.'])
         action=next(x for x in self.next()['next_actions'] if x['task']==task)
         self.assertTrue(action['newer_activity'])
+
+    @patch.dict(os.environ, {'PYTHONUTF8': '1'})
+    def test_in_progress_activity_and_web_summary_are_read_only(self):
+        task = self.tasks[0]; self.claim(task)
+        self.assertIsNone(next(x for x in self.next()['next_actions'] if x['task'] == task)['newer_activity'])
+        self.assertIsNone(self.request('GET', self.base(task) + '/brief', token=self.secret).data['newer'])
+        self.checkpoint(task, [])
+        actor = self.next()['agent']['actor']
+        self.native(actor)(['comments', 'add', task, 'Own progress.'])
+        action = next(x for x in self.next()['next_actions'] if x['task'] == task)
+        self.assertEqual((action['kind'], action['newer_activity']), ('in-progress', False))
+        self.native('blair')(['comments', 'add', task, '<script>read this</script>\u0085second line'])
+        canonical_before = (self.canonical_root / 'canonical.json').read_bytes()
+        for _ in range(2):
+            action = next(x for x in self.next()['next_actions'] if x['task'] == task)
+            self.assertEqual((action['kind'], action['priority'], action['newer_activity']), ('in-progress', 3, True))
+            self.assertEqual(self.base(task), action['links']['task'])
+            web = self.request('GET', action['links']['brief'], token=self.secret)
+            self.assertEqual(200, web.status, web.data)
+            summary = web.data['newer']
+            self.assertGreaterEqual(summary['own_count'], 1)
+            self.assertGreaterEqual(summary['other_count'], 1)
+            self.assertEqual(summary['coverage'], 'unknown')  # digest capture remains off
+            self.assertLessEqual(len(summary['entries']), 5)
+            self.assertIn('Reading clears nothing', summary['note'])
+            self.assertEqual(action['links']['history'], summary['history'])
+            self.assertNotIn('history_new', summary)
+            self.assertNotIn('verify', summary)
+            history = self.request('GET', summary['history'], token=self.secret)
+            self.assertEqual(200, history.status, history.data)
+        self.assertEqual(canonical_before, (self.canonical_root / 'canonical.json').read_bytes())
+
+    @patch.dict(os.environ, {'PYTHONUTF8': '1'})
+    def test_canonical_newer_omissions_and_unknown_are_preserved(self):
+        task = self.tasks[0]; self.claim(task); self.checkpoint(task, [])
+        for i in range(9):
+            self.native('blair')(['comments', 'add', task, 'Direction %d' % i])
+        canonical = self.backend._run('brief', self.project, 'reader', [task, '--json'])
+        summary = self.request('GET', self.base(task) + '/brief', token=self.secret).data['newer']
+        for key, value in canonical['newer'].items():
+            if key not in ('history', 'history_new', 'verify', 'note'):
+                self.assertEqual(summary[key], value)
+        self.assertGreater(summary['omitted'], 0)
+        self.assertEqual(len(summary['entries']), 5)
+        self.assertEqual(summary['coverage'], 'unknown')
+        run = self.backend._run
+        for value in (None, {'coverage': 'windowed', 'own_count': 0, 'other_count': None,
+                            'entries': [], 'omitted': 13, 'unverified_count': 19}):
+            def bounded(action, *args, **kwargs):
+                data = run(action, *args, **kwargs)
+                return dict(data, newer=value) if action == 'brief' else data
+            with patch.object(self.backend, '_run', side_effect=bounded):
+                mapped = self.request('GET', self.base(task) + '/brief', token=self.secret).data['newer']
+                if value is None:
+                    self.assertIsNone(mapped)
+                else:
+                    for key, item in value.items():
+                        self.assertEqual(mapped[key], item)
 
     def test_malformed_review_reports_operator_action_instead_of_empty_work(self):
         task=self.tasks[0];self.claim(task)
@@ -310,7 +450,10 @@ class EndpointAttentionTests(fixes.EndpointCase):
         self.assertEqual(([task['id'] for task in read['tasks']], read['complete']), (['mine'], True))
         self.assertEqual(read['tasks'][0], {
             'id': 'mine', 'title': 'm', 'status': 'in_progress', 'assignee': 'me', 'review_state': 'none',
-            'contribution_id': None, 'pending_change_requests': [], 'open_items': 2,
+            'contribution_id': None, 'pending_change_requests': [], 'open_items': 2, 'blocking_items':2,
+            # The canonical page says no item count here, so the move sentence falls back
+            # to the request ids it can see (kittrial-5bb.249).
+            'pending_review_items': None,
             'checkpoint_at': '2026-10-04T10:00:00Z', 'newer_activity': True})
         self.assertEqual(asked, [['--owner', 'me', '--limit', '100', '--offset', '0', '--json'],
                                  ['--owner', 'me', '--limit', '100', '--offset', '100', '--json']])
@@ -367,7 +510,7 @@ class InProcessAttentionTests(test_http_agents.AgentHarness):
         self.assertEqual(data['attention']['state'], 'working')
         # A blocker recorded in the latest checkpoint.
         self.backend.state.setdefault('checkpoints', {})[second] = [
-            {'created_at': '2026-10-04T10:00:00Z', 'open_items': [{'id': 'key', 'text': 'no key'}]}]
+            {'created_at': '2026-10-04T10:00:00Z', 'open_items': [{'id': 'key', 'kind':'blocker', 'text': 'no key'}]}]
         data = self.next()
         self.assertEqual(kinds(data), [('blocked', second), ('in-progress', first), ('claimable-task', spare)])
         blocked = data['next_actions'][0]
@@ -389,8 +532,11 @@ class InProcessAttentionTests(test_http_agents.AgentHarness):
         self.request('POST', '/v1/projects/%s/tasks/%s/claim' % (self.project, task), token=self.secret)
         actor = self.next()['agent']['actor']
         row = self.backend.agent_tasks(self.project, actor)['tasks'][0]
-        self.assertEqual(sorted(row), ['assignee', 'checkpoint_at', 'contribution_id', 'id', 'newer_activity',
-                                       'open_items', 'pending_change_requests', 'review_state', 'status', 'title'])
+        # `pending_review_items` is additive (kittrial-5bb.249): the canonical open-item
+        # count the move sentence needs, carried by both backends alike.
+        self.assertEqual(sorted(row), ['assignee', 'blocking_items', 'checkpoint_at', 'contribution_id', 'id', 'newer_activity',
+                                       'open_items', 'pending_change_requests', 'pending_review_items',
+                                       'review_state', 'status', 'title'])
         self.assertEqual(self.backend.agent_tasks(self.project)['tasks'], [row])   # unfiltered: every held task
 
     def test_actor_filter_excludes_somebody_elses_work(self):
@@ -419,19 +565,38 @@ class InProcessAttentionTests(test_http_agents.AgentHarness):
         task=self.task('blocker');base='/v1/projects/%s/tasks/%s'%(self.project,task)
         self.request('POST',base+'/claim',token=self.secret)
         cp=self.request('POST',base+'/checkpoints',
-                        {'previous':None,'summary':'blocked','open_items':[{'id':'key','text':'Need a key.'}]},
+                        {'previous':None,'summary':'blocked','open_items':[{'id':'key','kind':'blocker','text':'Need a key.'}]},
                         token=self.secret)
         self.assertEqual(cp.status,201,cp.data)
         self.request('POST',base+'/reviews',
                      {'operation':'contribute','commit':test_http_agents.COMMIT,'base_commit':test_http_agents.BASE,
                       'bundle_sha256':test_http_agents.BUNDLE,'summary':'partial'},token=self.secret)
         action=next(x for x in self.next()['next_actions'] if x['task']==task)
-        self.assertFalse(action['newer_activity'])
+        self.assertEqual(action['kind'],'awaiting-review')
+        self.assertFalse(self.backend.agent_tasks(self.project)['tasks'][0]['newer_activity'])
         changed=self.request('PATCH',base,{'description':'The key is available.',
                              'version':self.backend.state['tasks'][task]['version']},token=self.alex)
         self.assertEqual(changed.status,200,changed.data)
         action=next(x for x in self.next()['next_actions'] if x['task']==task)
-        self.assertTrue(action['newer_activity'])
+        self.assertTrue(self.backend.agent_tasks(self.project)['tasks'][0]['newer_activity'])
+
+    def test_in_progress_edits_have_a_bounded_summary_without_acknowledgement(self):
+        task = self.task('working'); base = '/v1/projects/%s/tasks/%s' % (self.project, task)
+        self.request('POST', base + '/claim', token=self.secret)
+        cp = self.request('POST', base + '/checkpoints', {'previous': None, 'summary': 'working', 'open_items': []}, token=self.secret)
+        self.assertEqual(201, cp.status, cp.data)
+        for i in range(8):
+            version = self.backend.state['tasks'][task]['version']
+            answer = self.request('PATCH', base, {'description': 'owner update %d <img>' % i, 'version': version}, token=self.alex)
+            self.assertEqual(200, answer.status, answer.data)
+        before = json.dumps(self.backend.state, sort_keys=True)
+        for _ in range(2):
+            action = next(x for x in self.next()['next_actions'] if x['task'] == task)
+            self.assertEqual((action['kind'], action['newer_activity']), ('in-progress', True))
+            summary = self.request('GET', action['links']['brief'], token=self.secret).data['newer']
+            self.assertEqual((summary['other_count'], len(summary['entries']), summary['omitted']), (8, 5, 3))
+            self.assertEqual(summary['coverage'], 'unknown')
+        self.assertEqual(before, json.dumps(self.backend.state, sort_keys=True))
 
     def test_every_other_open_review_state_names_who_acts_next(self):
         task=self.task('held');actor=self.next()['agent']['actor']
@@ -462,7 +627,7 @@ class InProcessAttentionTests(test_http_agents.AgentHarness):
         with patch.object(self.backend,'agent_tasks',return_value={'tasks':rows,'complete':True}):
             d=self.next();counts=d['attention']['counts']
             self.assertEqual((counts['blocked'],counts['changes_requested'],counts['awaiting_review'],
-                              counts['awaiting_integration'],counts['in_progress']),(1,2,1,1,1))
+                              counts['awaiting_integration'],counts['in_progress']),(0,2,1,1,1))
             self.assertEqual(d['attention']['state'],'changes-requested')
             # Once feedback and the blocker have gone, own implementation outranks waiting.
             rows[:]=rows[2:];d=self.next()

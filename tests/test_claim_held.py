@@ -207,7 +207,19 @@ class RealStackTests(Members, fixes.Harness, rb.RealBdLabelAliasTests):
             rb.signal.signal(signum, previous)
         cls._signals = {}
         rb.RealBdLabelAliasTests.__dict__['_stop_server'].__func__(cls)
-        cls._tmp.cleanup()
+        # The scratch server has ended, but a bd the endpoint started for the last request may
+        # still be writing under .dolt for a moment: the folder was then "not empty" while it
+        # was being removed (seen three times on a loaded machine, kittrial-5bb.208 and .226,
+        # every test of the class having passed). Tried again for a few seconds, then for real.
+        import time
+        for attempt in range(40):
+            try:
+                cls._tmp.cleanup()
+                break
+            except OSError:
+                if attempt == 39:
+                    raise
+                time.sleep(0.25)
 
     def bd_row(self, task):
         found = json.loads(self.bd('show', task, '--json').stdout)
