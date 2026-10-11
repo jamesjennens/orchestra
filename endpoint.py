@@ -1437,7 +1437,13 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             lifecycle_guard=args[0] in ('create','update','dep','close','reopen') and actor not in configured_operators(root)
             named=_guard_named_rows(root,path,name,args,request.get('attachments',{}),actor,strict=lifecycle_guard)
             if lifecycle_guard:
+                resolved_request=write_targets(args,request.get('attachments',{}))
+                resolved_tokens=resolved_request['targets'] if resolved_request is not None else None
                 def lifecycle_rows(tokens):
+                    # This exact vector was resolved natively above, under this
+                    # lock. Reuse it without guessing which row any subset or
+                    # differently spelled token means.
+                    if tokens==resolved_tokens and isinstance(named,list):return named
                     # Ask bd for the actual tokens this particular guard reads.
                     # A suffix of another named row is not proof of what bd's
                     # substring resolver selected for a positional operand.

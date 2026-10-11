@@ -73,14 +73,17 @@ class NativeLifecycleTests(fixture.RealBdLabelAliasTests):
                   ('labels', ['--add-label=reviewed:passed'])]
         # Every permutation is attempted one scalar write at a time. Each refusal
         # gets its own export equality and native-writer trace assertion.
-        for order in itertools.permutations(fields):
-            event = json.loads(self.bd('create', 'ordinary staged event', '-tevent', '--json').stdout)['id']
-            for name, flags in order:
-                with self.subTest(order=[x[0] for x in order], step=name):
-                    if name in ('title', 'description', 'labels'):
-                        self.no_write(['update', event, *flags, '--json'])
-                    else:
-                        self.assertEqual(self.raw(['update', event, *flags, '--json'])['returncode'], 0)
+        for initial_type in ('event', 'task'):
+            for order in itertools.permutations(fields):
+                event = json.loads(self.bd('create', 'ordinary staged row', '-t'+initial_type, '--json').stdout)['id']
+                for name, flags in order:
+                    with self.subTest(initial_type=initial_type, order=[x[0] for x in order], step=name):
+                        forbidden = name=='labels' or (initial_type=='event' and name in ('title', 'description')) or (initial_type=='task' and name=='type')
+                        if forbidden:
+                            self.no_write(['update', event, *flags, '--json'])
+                        else:
+                            answer = self.raw(['update', event, *flags, '--json'])
+                            self.assertEqual(answer['returncode'], 0, answer)
         ordinary = self.target()
         for flag in ('--title=State change: reviewed → passed', '--description=Set reviewed to passed'):
             self.assertEqual(self.raw(['update', ordinary, flag, '--json'])['returncode'], 0)
@@ -134,6 +137,8 @@ class NativeLifecycleTests(fixture.RealBdLabelAliasTests):
 
     def test_dependency_spellings_and_event_scalar_flags(self):
         target = self.target()
+        read = self.raw(['dep', 'list', target, '--json'])
+        self.assertEqual(read['returncode'], 0, read)
         result = self.bd('set-state', target, 'deployed=failed', '--json')
         self.assertEqual(result.returncode, 0, result.stderr)
         fact = next(r for r in self.export_rows() if r.get('issue_type')=='event' and
