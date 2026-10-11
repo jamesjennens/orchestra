@@ -257,7 +257,7 @@ class EndpointTests(unittest.TestCase):
                                                            encoding='utf-8')
         (self.root / 'projects' / 'pp' / '.beads').mkdir(parents=True)
         (self.root / 'projects' / 'pp' / '.beads' / 'metadata.json').write_text('{}', encoding='utf-8')
-        task = {'issue_type': 'task', 'status': 'open', 'labels': [], 'comments': []}
+        task = {'issue_type': 'task', 'title': 'ordinary task', 'status': 'open', 'labels': [], 'comments': []}
         self.bd = FakeBd([slot_row(), dict(task, id=OTHER), dict(task, id=THIRD)])
 
     def run_bd(self, args, actor='mallory', attachments=None):
