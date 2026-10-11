@@ -126,6 +126,12 @@ class EndpointAttentionTests(fixes.EndpointCase):
         action = data['next_actions'][0]
         self.assertEqual((action['priority'], action['requests'], action['review_state']),
                          (1, [request], 'changes-requested'))
+        # kittrial-5bb.249: the next-actions answer carries the same move sentence as the
+        # canonical `work --mine` row, so an agent is never left to read a state alone.
+        self.assertEqual(action['whose_move'], 'you')
+        self.assertEqual(action['next'],
+                         'This is your work now: 2 outstanding review items. Read `review %s`, deliver '
+                         'a revision that supersedes this contribution and respond to each item.' % first)
         self.assertEqual((data['attention']['state'], data['attention']['counts']['changes_requested'],
                           data['attention']['counts']['awaiting_review']), ('changes-requested', 1, 0))
         self.assertIn('1 contribution(s) have changes requested', data['attention']['summary'])
@@ -168,6 +174,51 @@ class EndpointAttentionTests(fixes.EndpointCase):
         self.assertEqual((data['attention']['state'], kinds(data)[0]), ('blocked', ('blocked', second)))
         self.assertEqual(sorted(kinds(data)[-2:]), [('awaiting-integration', third), ('awaiting-review', first)])
         self.assertEqual([action['priority'] for action in data['next_actions']], [2, 4, 5, 5])
+
+    def test_only_changes_requested_carries_the_move_and_from_the_one_queue_helper(self):
+        """Item 2b: the two answers cannot disagree, so the fields are restricted.
+
+        The task asked for `whose_move`/`next` only where the kind is changes-requested. Every
+        other kind has a mover who is not the agent (an operator reconciles a review error or an
+        unreadable checkpoint; a reviewer or the coordinator holds awaiting work), so it carries
+        neither field: kind `checkpoint-error` can no longer pair `who: operator` with
+        `whose_move: you`, and kind `blocked` no longer contradicts the queue's own sentence.
+        Where the kind IS changes-requested, the words are the canonical row's, built by the same
+        helper the queue uses.
+        """
+        from work import review_move
+        first, second, third, spare = self.tasks
+        for task in (first, second, third):
+            self.claim(task)
+        self.checkpoint(second, [{'id': 'key', 'kind': 'blocker', 'text': 'No key.',
+                                  'source': 'the build log'}])
+        contribution = self.contribute(first)
+        # A malformed chain: kind review-error, whose action owner is an operator.
+        self.native('blair')(['comments', 'add', third, 'Kind: contribution-review-v1\n{}'])
+        data = self.next()
+        kinds_seen = {action['kind'] for action in data['next_actions']}
+        self.assertIn('blocked', kinds_seen)
+        self.assertIn('review-error', kinds_seen)
+        self.assertNotIn('changes-requested', kinds_seen)
+        for action in data['next_actions']:
+            if action['kind'] == 'changes-requested':
+                self.assertIn('whose_move', action)
+            else:
+                with self.subTest(kind=action['kind']):
+                    self.assertNotIn('whose_move', action)
+                    self.assertNotIn('next', action)
+        request = self.review(self.people['blair'], first, 'request-changes', previous=contribution,
+                              contribution=contribution, items=[{'id': 'tests', 'text': 'Add a test.'}])
+        self.assertTrue(request)
+        data = self.next()
+        action = next(item for item in data['next_actions'] if item['kind'] == 'changes-requested')
+        expected = review_move('changes-requested', first, True, pending_items=1)
+        self.assertEqual((action['whose_move'], action['next']), expected)
+        for other in data['next_actions']:
+            if other['kind'] != 'changes-requested':
+                with self.subTest(kind=other['kind']):
+                    self.assertNotIn('whose_move', other)
+                    self.assertNotIn('next', other)
 
     def test_one_unfiltered_work_read_supplies_own_and_claimable_tasks(self):
         self.claim(self.tasks[0])
@@ -400,6 +451,9 @@ class EndpointAttentionTests(fixes.EndpointCase):
         self.assertEqual(read['tasks'][0], {
             'id': 'mine', 'title': 'm', 'status': 'in_progress', 'assignee': 'me', 'review_state': 'none',
             'contribution_id': None, 'pending_change_requests': [], 'open_items': 2, 'blocking_items':2,
+            # The canonical page says no item count here, so the move sentence falls back
+            # to the request ids it can see (kittrial-5bb.249).
+            'pending_review_items': None,
             'checkpoint_at': '2026-10-04T10:00:00Z', 'newer_activity': True})
         self.assertEqual(asked, [['--owner', 'me', '--limit', '100', '--offset', '0', '--json'],
                                  ['--owner', 'me', '--limit', '100', '--offset', '100', '--json']])
@@ -478,8 +532,11 @@ class InProcessAttentionTests(test_http_agents.AgentHarness):
         self.request('POST', '/v1/projects/%s/tasks/%s/claim' % (self.project, task), token=self.secret)
         actor = self.next()['agent']['actor']
         row = self.backend.agent_tasks(self.project, actor)['tasks'][0]
+        # `pending_review_items` is additive (kittrial-5bb.249): the canonical open-item
+        # count the move sentence needs, carried by both backends alike.
         self.assertEqual(sorted(row), ['assignee', 'blocking_items', 'checkpoint_at', 'contribution_id', 'id', 'newer_activity',
-                                       'open_items', 'pending_change_requests', 'review_state', 'status', 'title'])
+                                       'open_items', 'pending_change_requests', 'pending_review_items',
+                                       'review_state', 'status', 'title'])
         self.assertEqual(self.backend.agent_tasks(self.project)['tasks'], [row])   # unfiltered: every held task
 
     def test_actor_filter_excludes_somebody_elses_work(self):

@@ -397,6 +397,8 @@ For new structured contributions, prefer [resume and contribution reviews](REVIE
 
 `work --mine` and `brief TASK` also report `newer_activity_by_others` / `newer_activity_own` counts and a bounded `newer` summary when comments or edits arrived after your task's checkpoint. Treat any non-zero other-actor count as a direction to read `history TASK` before continuing; a checkpoint's recorded `next_action` is prefixed `STALE CHECKPOINT:` in that state. Reading clears nothing — reconcile explicitly with a new checkpoint.
 
+A task of yours with changes requested is your work until you deliver a revision, whatever else has or has not changed. Every `work --mine` item carries `whose_move` (`you`, `reviewer`, `coordinator` or `unknown`, relative to you) and one plain sentence `next` saying whose move it is; the items where the move is yours come first, with their count at the top of the answer. "Nothing changed" never applies to a task of yours with changes requested: read `review TASK`, deliver a revision that supersedes the current contribution, and respond to each item. Stop without acting only when every task of yours is with the reviewer or the coordinator.
+
 Use the `review-ready` label as a workflow convention, not a lifecycle fact. Once the scoped implementation and required checks are complete, deliverable access is established, and the report/checkpoint names the next reviewer action:
 
 ```sh

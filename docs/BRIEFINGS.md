@@ -39,11 +39,22 @@ still takes precedence over the authored next action.
 
 The projection includes only blocker/dependency items, at most three, with exact
 `total` and `omitted` counts. Text/source/next action are objects with `text` and
-`omitted_chars`: controls are escaped before clipping to 400/240/600 characters.
+`omitted_chars`: controls (C0 and C1, DEL included), the Unicode line/paragraph
+separators and the bidi controls are escaped before clipping to 400/240/600 characters.
 Questions, decisions and corrections do not become waits. Missing person wording
 stays missing; do not guess it from task titles or actor names. Use `brief TASK`
 for the current full unresolved-item page and reconcile before acting. Reads
 acknowledge nothing and add no native query to the owned work read.
+
+Each `work --mine` item also carries `whose_move` (`you`, `reviewer`, `coordinator` or
+`unknown`, relative to the calling actor) and `next`, one plain sentence saying whose
+move it is in words, both derived only from the validated review state the item already
+shows. A task with changes requested is the caller's work until a revision is delivered;
+one waiting for review or integration is the reviewer's or the coordinator's move. Where
+the caller waits for a person by its own current checkpoint, `next` quotes that
+checkpoint's own next action, and the move itself is not the caller's until the person
+answers. Items where the move is the caller's sort first, and top-level `your_move`
+carries their count in the answer.
 
 Read `brief --json`, reconcile relevant history and repository state, and save a UTF-8 JSON file using [the template](../templates/CHECKPOINT.json). Set `previous` to the current checkpoint's `comment_id` (or null for the first checkpoint) and copy the briefing's top-level `activity_cursor`. Fill in the real source commit and branch, or leave them empty when unknown.
 
