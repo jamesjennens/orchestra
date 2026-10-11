@@ -1896,7 +1896,7 @@ before Python started.
 `coordinate`/`create-child` is endpoint-side: the **server kit** must be a version that
 supports the `coordinate` action (this contract, `0.1.0`+). A client on a newer kit
 talking to an older endpoint fails with `ValueError: Unknown action` from that endpoint;
-`onboard` reports client/kit version and provenance parity so the mismatch is visible
+`docs --status` reports every catalogued document as served with its size or refused with its sentence; whoever may call `docs` may call it, and the web route does not offer it. `onboard` reports client/kit version and provenance parity so the mismatch is visible
 before mutating. The native `create` call uses `--no-inherit-labels` and, for
 `type=decision`, `--validate`, both of which require the pinned Beads 1.2.2. Request IDs
 and content hashes are durable, so an uncertain create is reconciled with the same

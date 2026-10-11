@@ -85,7 +85,7 @@ def main():
     resumed=False
     started=False
     if not args or args[0] not in ('onboard','docs','start','resume','run'):
-        parser.error('Use start --name NAME, resume with --actor SAVED_ACTOR, run start|heartbeat|end|status, onboard or docs [NAME]; configure client.py for normal work')
+        parser.error('Use start --name NAME, resume with --actor SAVED_ACTOR, run start|heartbeat|end|status, onboard or docs [NAME|--status]; configure client.py for normal work')
     cfg={'transport':'local','python':sys.executable,'endpoint':str(Path(__file__).resolve().with_name('endpoint.py')),'root':a.root}
     if args[0]=='start':
         if a.actor:parser.error('start allocates an actor; omit --actor')
