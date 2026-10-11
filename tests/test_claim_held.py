@@ -411,7 +411,7 @@ class EndpointWithAStandInBdTests(unittest.TestCase):
         # answered from the file and noted with the actor it ran under.
         bd.write_text('#!%s\nimport json, sys\nargv = sys.argv[1:]\n'
                       'if "--claim" not in argv:\n'
-                      '    print(json.dumps([{"id": "probe-1", "title": "x", "status": "open"}]) if "show" in argv else "[]")\n'
+                      '    print(json.dumps([{"id": "probe-1", "title": "x", "status": "open", "issue_type": "task", "description": "", "labels": []}]) if "show" in argv else "[]")\n'
                       '    sys.exit(0)\n'
                       'open(%r, "a").write(argv[argv.index("--actor") + 1] + "\\n")\n'
                       'answer = json.load(open(%r))\n'
