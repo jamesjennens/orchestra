@@ -39,6 +39,7 @@ import os
 import re
 import secrets
 import sqlite3
+from contextlib import closing
 import sys
 import threading
 import time
@@ -485,13 +486,23 @@ class RecordStore:
         self.settle = settle
         self._ensure()
 
+    @contextmanager
     def _connection(self):
+        """One SQLite connection, committed and CLOSED when the ``with`` block ends.
+
+        ``sqlite3``'s own context manager commits or rolls back but never closes (P3,
+        kittrial-5bb.174): the connection used to go out with the garbage collector, so
+        the -wal and -shm files could linger and the database file's time could move at
+        an arbitrary moment. ``contextlib.closing`` around it keeps that commit and adds
+        the close. Nothing keeps a connection between calls: each ``with`` is its own.
+        """
         connection = sqlite3.connect(str(self.path), timeout=30, isolation_level=None)
         connection.row_factory = sqlite3.Row
         connection.execute('PRAGMA busy_timeout = 30000')
         connection.execute('PRAGMA journal_mode = WAL')
         connection.execute('PRAGMA synchronous = FULL')
-        return connection
+        with closing(connection), connection:
+            yield connection
 
     #: Schema of the record store. Schema 2 (revision 11) adds ``expires_confirmed``,
     #: the record's expiry on the confirmed timeline, and its ``(kind,
