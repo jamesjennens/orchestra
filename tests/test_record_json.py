@@ -280,16 +280,21 @@ class NoUnguardedParseTests(unittest.TestCase):
             # The fifth (kittrial-5bb.192) reads the authority-changes audit, which the
             # operator/verifier list commands append to and an operator reads: a nested or
             # unreadable file must be a refusal naming it, not a traceback.
-            'admin.py': 5,
+            # The sixth (kittrial-5bb.220 F1) reads the backup-schedule note an operator
+            # records; a damaged or nested note reads as no note, never a traceback.
+            # The seventh (kittrial-5bb.220 review 2 item 4a) reads one line of the
+            # backup-schedule log the kit writes; a damaged line is skipped.
+            'admin.py': 7,
             # endpoint.py's fifth (kittrial-5bb.195): the JSON payload of a coordinator
             # acceptance command, which the caller transports as a file attachment. It is
             # the caller's text, so it is parsed through the guard.
             # kittrial-5bb.221 revision 2 moved tracker_actors' export rows to
             # record_json.loads_rows (the row bound), so four remain.
             'briefing.py': 3, 'coordination.py': 3, 'endpoint.py': 4, 'export_requirements.py': 1, 'feedback.py': 3, 'guidance.py': 3,
-            'handoff.py': 1, 'http_service.py': 2, 'lifecycle.py': 1, 'recovery.py': 1, 'requirements.py': 1, 'requirement_records.py': 1, 'reserved_comments.py': 1,
+            # Requirements request bodies use the guard and reject duplicate fields.
+            'handoff.py': 1, 'http_service.py': 3, 'lifecycle.py': 1, 'recovery.py': 1, 'requirements.py': 1, 'requirement_records.py': 1, 'reserved_comments.py': 1,
             # The simple owner adapter guards bd's decision-create receipt too.
-            'requirement_http.py': 1,
+            'requirement_http.py': 2,
             'review_recommendations.py': 2, 'review_workflow.py': 4, 'work.py': 1, 'worker_gate.py': 1})
 
     def test_the_parsers_that_do_not_call_it_directly_reach_it(self):

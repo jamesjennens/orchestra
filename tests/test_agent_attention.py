@@ -126,6 +126,12 @@ class EndpointAttentionTests(fixes.EndpointCase):
         action = data['next_actions'][0]
         self.assertEqual((action['priority'], action['requests'], action['review_state']),
                          (1, [request], 'changes-requested'))
+        # kittrial-5bb.249: the next-actions answer carries the same move sentence as the
+        # canonical `work --mine` row, so an agent is never left to read a state alone.
+        self.assertEqual(action['whose_move'], 'you')
+        self.assertEqual(action['next'],
+                         'This is your work now: 2 outstanding review items. Read `review %s`, deliver '
+                         'a revision that supersedes this contribution and respond to each item.' % first)
         self.assertEqual((data['attention']['state'], data['attention']['counts']['changes_requested'],
                           data['attention']['counts']['awaiting_review']), ('changes-requested', 1, 0))
         self.assertIn('1 contribution(s) have changes requested', data['attention']['summary'])
@@ -168,6 +174,51 @@ class EndpointAttentionTests(fixes.EndpointCase):
         self.assertEqual((data['attention']['state'], kinds(data)[0]), ('blocked', ('blocked', second)))
         self.assertEqual(sorted(kinds(data)[-2:]), [('awaiting-integration', third), ('awaiting-review', first)])
         self.assertEqual([action['priority'] for action in data['next_actions']], [2, 4, 5, 5])
+
+    def test_only_changes_requested_carries_the_move_and_from_the_one_queue_helper(self):
+        """Item 2b: the two answers cannot disagree, so the fields are restricted.
+
+        The task asked for `whose_move`/`next` only where the kind is changes-requested. Every
+        other kind has a mover who is not the agent (an operator reconciles a review error or an
+        unreadable checkpoint; a reviewer or the coordinator holds awaiting work), so it carries
+        neither field: kind `checkpoint-error` can no longer pair `who: operator` with
+        `whose_move: you`, and kind `blocked` no longer contradicts the queue's own sentence.
+        Where the kind IS changes-requested, the words are the canonical row's, built by the same
+        helper the queue uses.
+        """
+        from work import review_move
+        first, second, third, spare = self.tasks
+        for task in (first, second, third):
+            self.claim(task)
+        self.checkpoint(second, [{'id': 'key', 'kind': 'blocker', 'text': 'No key.',
+                                  'source': 'the build log'}])
+        contribution = self.contribute(first)
+        # A malformed chain: kind review-error, whose action owner is an operator.
+        self.native('blair')(['comments', 'add', third, 'Kind: contribution-review-v1\n{}'])
+        data = self.next()
+        kinds_seen = {action['kind'] for action in data['next_actions']}
+        self.assertIn('blocked', kinds_seen)
+        self.assertIn('review-error', kinds_seen)
+        self.assertNotIn('changes-requested', kinds_seen)
+        for action in data['next_actions']:
+            if action['kind'] == 'changes-requested':
+                self.assertIn('whose_move', action)
+            else:
+                with self.subTest(kind=action['kind']):
+                    self.assertNotIn('whose_move', action)
+                    self.assertNotIn('next', action)
+        request = self.review(self.people['blair'], first, 'request-changes', previous=contribution,
+                              contribution=contribution, items=[{'id': 'tests', 'text': 'Add a test.'}])
+        self.assertTrue(request)
+        data = self.next()
+        action = next(item for item in data['next_actions'] if item['kind'] == 'changes-requested')
+        expected = review_move('changes-requested', first, True, pending_items=1)
+        self.assertEqual((action['whose_move'], action['next']), expected)
+        for other in data['next_actions']:
+            if other['kind'] != 'changes-requested':
+                with self.subTest(kind=other['kind']):
+                    self.assertNotIn('whose_move', other)
+                    self.assertNotIn('next', other)
 
     def test_one_unfiltered_work_read_supplies_own_and_claimable_tasks(self):
         self.claim(self.tasks[0])
@@ -214,6 +265,59 @@ class EndpointAttentionTests(fixes.EndpointCase):
             self.assertTrue(bounded['attention']['own_tasks_truncated'])
             self.assertTrue(bounded['attention']['actions_truncated'])
             self.assertIn('at least 100 claimed', bounded['attention']['summary'])
+
+    def test_claimable_work_bounds_the_suggestion_list_at_the_page_cap(self):
+        """kittrial-5bb.6 item 4: the claimable SUGGESTION list stays capped.
+
+        The fixture puts the row the cap drops FIRST in the action sort order (it is a
+        ``none``-state row with the smallest task id, while the queue order puts every
+        ``awaiting-review`` row before it), so an implementation that collects past the
+        cap offers a task the bounded list must not (the
+        ``http-claimable-bound-removed`` mutant).
+        """
+        rows = [dict(task='claim-%03d' % (900 - i), title='claimable', status='open',
+                     review_state='awaiting-review', claimable=True, open_items=0)
+                for i in range(http_service.AGENT_CLAIMABLE_LIMIT)]
+        rows.append(dict(task='claim-000', title='claimable', status='open',
+                         review_state='none', claimable=True, open_items=0))
+
+        def paged(action, project, reader, args, *rest, **kwargs):
+            self.assertEqual(action, 'work')
+            offset = int(args[args.index('--offset') + 1])
+            return {'items': rows[offset:offset + 100],
+                    'next_offset': offset + 100 if offset + 100 < len(rows) else None}
+
+        with patch.object(self.backend, '_run', side_effect=paged):
+            data = self.next()
+        offered = [task for kind, task in kinds(data) if kind == 'claimable-task']
+        self.assertEqual(data['attention']['counts']['claimable'],
+                         http_service.AGENT_CLAIMABLE_LIMIT + 1)
+        self.assertNotIn('claim-000', offered)
+        self.assertTrue(offered)
+        self.assertLessEqual(set(offered), {'claim-%03d' % i for i in range(800, 901)})
+        self.assertTrue(data['attention']['actions_truncated'])
+
+    def test_endpoint_backend_carries_the_rows_own_claimable_answer(self):
+        """The canonical row's ``claimable`` is passed through, not recomputed here.
+
+        An open, unassigned task the shared rule excludes (an epic) must come back
+        ``claimable: false`` instead of falling back to "open and unassigned" (the
+        ``endpoint-backend-ignores-row-claimable`` mutant).
+        """
+        rows = [dict(task='t-epic', title='an epic', status='open', review_state='none',
+                     claimable=False, issue_type='epic', open_items=0),
+                dict(task='t-free', title='free work', status='open', review_state='none',
+                     claimable=True, issue_type='task', open_items=0)]
+
+        def paged(action, project, reader, args, *rest, **kwargs):
+            offset = int(args[args.index('--offset') + 1]) if '--offset' in args else 0
+            return {'items': rows[offset:offset + 100], 'next_offset': None}
+
+        with patch.object(self.backend, '_run', side_effect=paged):
+            read = self.backend.review_queue(self.project)
+        by_id = {item['id']: item['claimable'] for item in read['items']}
+        self.assertEqual(by_id.get('t-epic'), False)
+        self.assertEqual(by_id.get('t-free'), True)
 
     def test_conflicting_checkpoint_history_keeps_unknown_and_operator_action(self):
         task=self.tasks[0];self.claim(task)
@@ -400,6 +504,9 @@ class EndpointAttentionTests(fixes.EndpointCase):
         self.assertEqual(read['tasks'][0], {
             'id': 'mine', 'title': 'm', 'status': 'in_progress', 'assignee': 'me', 'review_state': 'none',
             'contribution_id': None, 'pending_change_requests': [], 'open_items': 2, 'blocking_items':2,
+            # The canonical page says no item count here, so the move sentence falls back
+            # to the request ids it can see (kittrial-5bb.249).
+            'pending_review_items': None,
             'checkpoint_at': '2026-10-04T10:00:00Z', 'newer_activity': True})
         self.assertEqual(asked, [['--owner', 'me', '--limit', '100', '--offset', '0', '--json'],
                                  ['--owner', 'me', '--limit', '100', '--offset', '100', '--json']])
@@ -478,8 +585,11 @@ class InProcessAttentionTests(test_http_agents.AgentHarness):
         self.request('POST', '/v1/projects/%s/tasks/%s/claim' % (self.project, task), token=self.secret)
         actor = self.next()['agent']['actor']
         row = self.backend.agent_tasks(self.project, actor)['tasks'][0]
+        # `pending_review_items` is additive (kittrial-5bb.249): the canonical open-item
+        # count the move sentence needs, carried by both backends alike.
         self.assertEqual(sorted(row), ['assignee', 'blocking_items', 'checkpoint_at', 'contribution_id', 'id', 'newer_activity',
-                                       'open_items', 'pending_change_requests', 'review_state', 'status', 'title'])
+                                       'open_items', 'pending_change_requests', 'pending_review_items',
+                                       'review_state', 'status', 'title'])
         self.assertEqual(self.backend.agent_tasks(self.project)['tasks'], [row])   # unfiltered: every held task
 
     def test_actor_filter_excludes_somebody_elses_work(self):
@@ -576,6 +686,149 @@ class InProcessAttentionTests(test_http_agents.AgentHarness):
             rows[:]=rows[2:];d=self.next()
             self.assertEqual(d['attention']['state'],'working')
             self.assertEqual(kinds(d)[0],('in-progress','working'))
+
+
+class RefusedClaimTests(test_http_agents.AgentHarness):
+    """The refused-claim fall-through over HTTP (kittrial-5bb.6 review item 4).
+
+    ``Task is already claimed`` on an OPEN task offers at most ten candidates and says
+    the list was cut; ``Task is not open`` (a closed task) offers none and costs no
+    fall-through read at all.
+    """
+
+    def setUp(self):
+        super().setUp()
+        admin = self.admin_token()
+        self.project = self.create_project(admin, 'Alpha')
+        self.alex = self.create_account(admin, 'alex', 'alex-password-1')
+        self.blair = self.create_account(admin, 'blair', 'blair-password-1')
+        for user in (self.alex, self.blair):
+            self.request('PUT', '/v1/projects/%s/members/%s' % (self.project, user),
+                         {'role': 'contributor'}, token=admin)
+        self.alex_token = self.login('alex', 'alex-password-1')[0]
+        self.blair_token = self.login('blair', 'blair-password-1')[0]
+        self.A = self.agent_secret(self.alex_token, name='Kestrel', projects=[self.project])[1]
+        self.B = self.agent_secret(self.blair_token, name='Merlin', projects=[self.project])[1]
+        self.tasks = '/v1/projects/%s/tasks' % self.project
+        self.reads = []
+        original = self.backend.review_queue
+
+        def counting(project_id, *args, **kwargs):
+            self.reads.append(project_id)
+            return original(project_id, *args, **kwargs)
+        self.backend.review_queue = counting
+
+    def task(self, title):
+        made = self.request('POST', self.tasks, {'title': title}, token=self.alex_token)
+        self.assertEqual(201, made.status, made.data)
+        return made.data['id']
+
+    def claim(self, secret, task):
+        return self.request('POST', '%s/%s/claim' % (self.tasks, task), {}, token=secret)
+
+    def detail(self, response):
+        return (response.data.get('error') or {}).get('detail') or {}
+
+    def test_an_open_refusal_is_bounded_and_a_closed_one_carries_none(self):
+        held = self.task('held')
+        self.assertEqual(200, self.claim(self.A, held).status)
+        for index in range(http_service.CLAIM_CANDIDATES_LIMIT + 15):
+            self.task('spare %03d' % index)
+        self.reads.clear()
+        refused = self.claim(self.B, held)
+        self.assertEqual(409, refused.status)
+        detail = self.detail(refused)
+        self.assertEqual(len(detail['candidates']), http_service.CLAIM_CANDIDATES_LIMIT)
+        self.assertTrue(detail['candidates_truncated'])
+        self.assertNotIn(held, [row['task'] for row in detail['candidates']])
+        self.assertEqual(len(self.reads), 1)
+        # A CLOSED task: no fall-through is possible, so no candidates and no read.
+        closed = self.task('closed one')
+        self.backend.state['tasks'][closed]['status'] = 'closed'
+        self.reads.clear()
+        not_open = self.claim(self.B, closed)
+        self.assertEqual(409, not_open.status)
+        self.assertIn('not open', (not_open.data['error'] or {}).get('message', ''))
+        self.assertNotIn('candidates', self.detail(not_open))
+        self.assertEqual(self.reads, [])
+
+
+class ClaimCandidateTests(unittest.TestCase):
+    """The refused-claim fall-through: bounded, filtered, never the refused task.
+
+    kittrial-5bb.6 review item 4. The read itself is stubbed: this pins the selection
+    rule, which the HTTP and CLI views all share.
+    """
+
+    def handler(self, items):
+        handler = http_service.ApiHandler.__new__(http_service.ApiHandler)
+        handler._review_queue = lambda project_id, shared=False: {'items': items}
+        return handler
+
+    def test_candidates_are_bounded_filtered_and_never_the_refused_task(self):
+        # The rows the rule excludes come FIRST, so an implementation that offers every row
+        # (the ``candidates-not-filtered`` mutant) puts one inside the returned ten.
+        items = [dict(id='epic', title='an epic', claimable=False),
+                 dict(id='taken', title='held by somebody', claimable=False),
+                 dict(id='refused', title='the refused task', claimable=True)]
+        items += [dict(id='c%02d' % i, title='claimable %d' % i, claimable=True) for i in range(25)]
+        found, truncated = self.handler(items)._claim_candidates('proj', 'refused')
+        self.assertEqual(len(found), http_service.CLAIM_CANDIDATES_LIMIT)
+        self.assertEqual([row['task'] for row in found],
+                         ['c%02d' % i for i in range(http_service.CLAIM_CANDIDATES_LIMIT)])
+        # The list says it was cut instead of dropping rows silently.
+        self.assertTrue(truncated)
+        # Never the refused task, and never a row the shared rule does not call claimable.
+        for excluded in ('refused', 'epic', 'taken'):
+            self.assertNotIn(excluded, [row['task'] for row in found])
+        # Not cut when the read holds no more than the cap.
+        found, truncated = self.handler(items[:5])._claim_candidates('proj', 'other')
+        self.assertEqual([row['task'] for row in found], ['refused', 'c00', 'c01'])
+        self.assertFalse(truncated)
+        # A read failure offers nothing and never changes the refusal.
+        broken = http_service.ApiHandler.__new__(http_service.ApiHandler)
+
+        def explode(project_id, shared=False):
+            raise ValueError('no read')
+        broken._review_queue = explode
+        self.assertEqual(broken._claim_candidates('proj', 'x'), ([], False))
+
+    def test_the_documented_candidate_cap_is_ten(self):
+        self.assertEqual(http_service.CLAIM_CANDIDATES_LIMIT, 10)
+        self.assertLess(http_service.CLAIM_CANDIDATES_LIMIT, http_service.AGENT_CLAIMABLE_LIMIT)
+
+
+class ClassifyClaimableRuleTests(unittest.TestCase):
+    """`agent_prompts.classify` uses the ONE claimable rule (kittrial-5bb.6 review item 4).
+
+    Round 3's surviving mutant put classify back on the old open-and-unassigned test, which
+    offers an epic, a gate, a job or a task LABELLED decision as claimable work. These rows
+    carry no ``claimable`` field, so the fallback rule itself is exercised; the last check
+    gives them the answer explicitly, which the old rule also ignored.
+    """
+
+    def rows(self):
+        base = {'title': 'A task', 'status': 'open', 'assignee': None,
+                'review_state': 'none', 'comments': [], 'labels': [], 'priority': 3}
+        return [dict(base, id='plain', title='plain'),
+                dict(base, id='epic', title='epic', issue_type='epic'),
+                dict(base, id='gate', title='gate', issue_type='gate'),
+                dict(base, id='job', title='job', issue_type='job'),
+                dict(base, id='labelled', title='labelled', labels=['decision'])]
+
+    def claimable(self, items):
+        import agent_prompts
+        from http_authority import CAP_READ, CAP_TASKS
+        project = {'id': 'p1', 'name': 'Customer portal', 'role': 'contributor'}
+        classes = agent_prompts.classify(project, {CAP_READ, CAP_TASKS}, items, 'usr_other',
+                                         set(), agent_prompts.parse_time('2026-09-29T12:00:00Z'))
+        return [item['id'] for item in classes['classes']['claimable']]
+
+    def test_only_the_rows_the_one_rule_marks_claimable_are_offered(self):
+        self.assertEqual(self.claimable(self.rows()), ['plain'])
+        # A row that states its own answer is taken at its word, whatever its status says.
+        declared = [dict(row, claimable=False) for row in self.rows()]
+        self.assertEqual(self.claimable(declared), [])
 
 
 if __name__ == '__main__':

@@ -160,6 +160,12 @@ else:
         with self.assertRaisesRegex(ValueError, 'Unknown'):
             service_config(self.config)
 
+    def test_private_root_accepts_a_root_with_a_space(self):
+        """kittrial-5bb.220 revision: run/health on an existing runtime with a space in its root
+        must not be refused."""
+        from office_service import private_root
+        self.assertEqual(private_root('/tmp/a b/runtime'), Path('/tmp/a b/runtime'))
+
     def test_prepare_keeps_bd_config_inside_the_runtime(self):
         """prepare must not write under the login user's HOME.
 

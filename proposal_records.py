@@ -1014,13 +1014,17 @@ def derived(entry, now, contributions=None, requirements=None):
                                         'sha256': linked['requirement_sha256'], 'acceptance_state': live,
                                         'manifest_sha256': linked['manifest_sha256']}
         result['incorporated_unaccepted'] = live is not None and live != 'accepted'
+        if live in ('unknown', 'withdrawn', 'superseded'):
+            result['linked_requirement']['state_message'] = ('Requirement status cannot be verified; ask its owner to reconcile it'
+                if live == 'unknown' else 'Requirement is ' + live + '; its historical revision remains readable')
+            result['incorporated_unaccepted'] = False
         if live == 'accepted':
             result['trust'] = 'incorporated'
     return result
 
 
 def live_acceptance(requirements, linked):
-    """The linked requirement revision's acceptance state TODAY: accepted, draft or missing.
+    """Current accepted/draft/terminal/unknown/missing state, with exact history.
 
     Read live from the requirement record (design 6.2), never from the snapshot the
     disposition recorded. `requirements` maps a requirement record id to its native row.
@@ -1036,6 +1040,12 @@ def live_acceptance(requirements, linked):
     record = revisions.get(linked['requirement_revision'])
     if record is None or record.get('sha256') != linked['requirement_sha256']:
         return 'missing'
+    if row.get('_terminal_status_unknown'):
+        return 'unknown'
+    from requirement_records import _current_acceptance
+    state = _current_acceptance(row, revisions)
+    if state in ('unknown', 'withdrawn', 'superseded'):
+        return state
     return 'accepted' if accepting_revision(row, revisions, record) is not None else 'draft'
 
 
@@ -1162,11 +1172,34 @@ def read_requirement_rows(run):
     return requirement_rows(read_labelled(run, 'requirement'))
 
 
-def read_linked_requirements(run, entries):
+def requirement_status(rows, project):
+    """Project-owned transition uncertainty affects only its linked requirement."""
+    if project is None:
+        return rows
+    from requirement_terminal import pending_ids
+    from requirement_owner_records import state_ledger
+    import requirement_governance as governance
+    path = Path(project)
+    pending, damaged = pending_ids(path, path.name)
+    result = dict(rows)
+    for task, row in rows.items():
+        unknown = task in pending or task in damaged
+        try:
+            state, _ = state_ledger(row)
+            if state is not None:
+                governance.validate_evidence(path, path.name, state)
+        except (ValueError, OSError, TypeError, KeyError):
+            unknown = True
+        if unknown:
+            result[task] = dict(row, _terminal_status_unknown=True)
+    return result
+
+
+def read_linked_requirements(run, entries, project=None):
     """Only the requirement records the given incorporated proposals point at, in one `bd show`."""
     ids = sorted({entry['disposition']['record']['incorporation']['requirement_id'] for entry in entries
                   if entry['state'] == 'incorporated' and entry['disposition']})
-    return requirement_rows(AnchoredKind.shown(run, ids[:SHOW_MAX]))
+    return requirement_status(requirement_rows(AnchoredKind.shown(run, ids[:SHOW_MAX])), project)
 
 
 def find_entry(rows, key, operators=None, resolve=None, verify_label=True):
@@ -1554,13 +1587,15 @@ def _check_decision(decision_id, run):
                          'decision' % decision_id)
 
 
-def _check_incorporation(linked, run, operators=None):
+def _check_incorporation(linked, run, operators=None, project=None):
     """The incorporation must describe the requirement record as it is, not as the caller says."""
     rows = AnchoredKind.shown(run, [linked['requirement_id']])
     row = rows[0] if rows else None
     if row is None or 'requirement' not in (row.get('labels') or []):
         raise ValueError('incorporation.requirement_id %s is not a requirement record' % linked['requirement_id'])
-    live = live_acceptance({row['id']: row}, linked)
+    live = live_acceptance(requirement_status({row['id']: row}, project), linked)
+    if live in ('unknown', 'withdrawn', 'superseded'):
+        raise ValueError('Cannot incorporate into a requirement whose current state is %s; select an active requirement' % live)
     if live == 'missing':
         raise ValueError('Requirement record %s has no revision %d with that sha256; re-read it and name the '
                          'exact revision the proposal landed in'
@@ -1710,7 +1745,7 @@ def dispose(payload, actor, run, project, operators=None, route='review', http=N
         if not (newest['rationale'] or '').strip():
             raise ValueError('Proposal %s has no rationale; ask for one (needs-info) before it is incorporated'
                              % key)
-        _check_incorporation(record['incorporation'], run, operators)
+        _check_incorporation(record['incorporation'], run, operators, project)
     atomic(receipt, {'sha256': digest, 'status': 'pending', 'actor': actor, 'id': task, 'operation': route,
                      'revision': newest['revision']})
     spec = _spec(operators, {})
@@ -2077,7 +2112,7 @@ def project_context(rows, operators, project):
     """(settings, resolver, requirement rows) from rows a caller already holds (a full export)."""
     settings = settings_view([row for row in rows if isinstance(row, dict)
                               and SETTINGS_LABEL in (row.get('labels') or [])], operators)
-    return settings, Resolver(settings, project), requirement_rows(rows)
+    return settings, Resolver(settings, project), requirement_status(requirement_rows(rows), project)
 
 
 ACTION_KINDS = (  # (count key, priority, kind, state filter token, reason)
@@ -2317,7 +2352,7 @@ def read(args, run, actor, operators, project=None, full=False):
         entry, _ = find_entry(rows, key, operators, resolve)
         superseders, total = read_superseders(run, key, {row.get('id') for row in rows})
         chain = read_supersedes_chain(run, entry, operators)
-        return get(rows + superseders, key, operators, resolve, settings, read_linked_requirements(run, [entry]),
+        return get(rows + superseders, key, operators, resolve, settings, read_linked_requirements(run, [entry], project),
                    actor, history=history, chain=chain, superseders_total=total, coordinator=coordinator, http=full)
     options = _options(rest, {'--state': 'state', '--target': 'target', '--submitter': 'submitter',
                               '--limit': 'limit', '--offset': 'offset', '--order': 'order'})
@@ -2337,7 +2372,7 @@ def read(args, run, actor, operators, project=None, full=False):
     rows = read_catalog(run)
     settings = settings_view(rows, operators)
     return list_entries(rows, options, operators, Resolver(settings, project), settings,
-                        lambda entries: read_linked_requirements(run, entries), actor, mine=command == 'mine',
+                        lambda entries: read_linked_requirements(run, entries, project), actor, mine=command == 'mine',
                         coordinator=coordinator, verified_only=full and command == 'mine')
 
 

@@ -229,8 +229,12 @@ checking both sources, when you have no actionable open or pending-review task a
 `ready` has no unheld task. Use the full client-prefixed example above with the
 installed client/config/project/actor; do not run bare `work --mine` or
 `ready --json` as shell commands. Do not wait on work held by other actors or keep
-polling an empty queue. In office/person-started mode, do not poll or loop: finish
-one bounded turn and end with a one-line status for the person.
+polling an empty queue. In office/person-started mode, do not start a poll or a loop of
+your own: finish one bounded turn and end with a one-line status for the person. Only
+the worker's own user authorizes checking again, by asking, within what the project's
+standing guidance allows. A task awaiting review or integration is not a reason to stop
+checking before the deadline; that is exactly when checking matters. A harness that
+cannot wait or schedule tells its user so in one line instead of refusing.
 
 ## Machine-specific settings are examples, not defaults
 
