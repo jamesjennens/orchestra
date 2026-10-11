@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "operation_id": "caprev-cc6d22511fde40efa387981ae17e2773",
+  "operation_id": "caprev-890119283b6748948a2f386c1a28427d",
   "key": "requirements.owner-drafts",
   "name": "Human project owners create and edit requirements drafts",
   "aliases": [
@@ -8,9 +8,10 @@
     "owner requirement edit",
     "pending owner edit",
     "contributor replace owner draft",
-    "propose a requirements change"
+    "propose a requirements change",
+    "owner requirement recovery"
   ],
-  "summary": "In simple mode a signed-in project owner creates requirement or narrative drafts under an existing task and edits accepted text while preserving history. Current session, owner membership and revision/hash checks gate writes; machine credentials and non-owner superusers gain no authority. Contributors cannot replace a validated human pending owner draft, including interrupted retries; they propose a change. Governed and host operator policies remain unchanged. Only the original owner can clear a validated pending revision-1 create with no allocated native row, under current locks and an exact receipt hash. The receipt and audit remain; released identities cannot allocate again. Recovery lists at most 20 items with exact listed, total and truncated fields, sharing one complete validated export and native membership read per request. Damaged receipts are isolated, recovery errors hide server paths and panel failure leaves the requirements document usable.",
+  "summary": "In simple mode the signed-in project owner creates and edits requirements drafts under current membership, governance and content checks. Contributors propose changes to protected human drafts. Failed-creation recovery lists at most 20 intents with counts and one complete export/membership proof. Missing prewrite receipts have a distinct nothing-written message and an account/request-bound retained clear audit; damaged or special files cannot block the reader. Valid title/time metadata is displayed when available. Recovery listing preserves fixed enable-editing and operator-repair advice; CREATE keeps its own canonical refusal sentences, while bounded receipt reads hide file paths at their source; transient native reads advise reload. Clearing still needs current locks, exact receipt hash and native absence; allocated or uncertain content is not invented. Governed/host policies and machine credential authority are unchanged.",
   "requirements": [],
   "anchors": [
     "docs/REQUIREMENTS.md#editing-a-projects-requirements-in-the-web-interface"
@@ -24,7 +25,8 @@
   "tests": [
     "tests/test_http_requirements_owner.py",
     "tests/test_requirement_owner_records.py",
-    "tests/test_requirement_owner_real_bd.py"
+    "tests/test_requirement_owner_real_bd.py",
+    "tests/test_owner_recovery_second.py"
   ],
   "owner": "person:orchestra-coordinator",
   "tags": [
@@ -32,6 +34,6 @@
     "owner",
     "drafts"
   ],
-  "revision": 3,
-  "expected_sha256": "130707549adbaeda9b4591aab035729689135a4b185e0cb6a229427e24333813"
+  "revision": 5,
+  "expected_sha256": "831852a1adb03f9402720f275d0284979503d8861c7e8604dd547c5d6b008b64"
 }
