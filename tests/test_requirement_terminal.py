@@ -126,6 +126,8 @@ class TerminalTests(unittest.TestCase):
     def test_reason_bounds_stored_bytes_and_pending_edit_advice(self):
         item=self.accepted()
         for reason in ('z'*1001,'z'+' '*5000,' '*1000):
+            with self.subTest(boundary='request',length=len(reason)),self.assertRaisesRegex(ValueError,'1000'):
+                http.checked_body(dict(self.expected(item),reason=reason),'withdraw')
             with self.subTest(length=len(reason)),self.assertRaisesRegex(ValueError,'1000'):
                 self.act(item,reason=reason)
         self.assertFalse(terminal.receipt_path(self.path,'terminal-first').exists())
@@ -280,6 +282,18 @@ class TerminalTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'Unusable.*receipt'):
             self.act(item)
         self.assertEqual(len(self.native.writes()),writes)
+
+    def test_reader_checks_lineage_even_when_native_pair_and_hashes_agree(self):
+        item=self.accepted();self.act(item);row=self.native.row(item['id'])
+        state_comment=next(c for c in row['comments'] if c['text'].startswith(owner.STATE_PREFIX))
+        reason_comment=next(c for c in row['comments'] if c['text'].startswith(owner.REASON_PREFIX))
+        state=owner.parse(state_comment['text'],state=True);reason=owner.parse_reason(reason_comment['text'])
+        state['governance']['sha256']='0'*64;state['sha256']=content_hash(state)
+        reason['state_sha256']=state['sha256'];reason['sha256']=content_hash(reason)
+        state_comment['text']=owner.body(state,state=True);reason_comment['text']=owner.reason_body(reason)
+        self.assertEqual(owner.state_ledger(row),(state,reason))
+        view=self.read(item);self.assertEqual(view['requirement_state'],'unknown')
+        self.assertEqual(view['accepted']['sha256'],item['sha256'])
 
     def test_shared_export_proposal_and_capability_consumers_preserve_exact_history(self):
         from export_requirements import adapt, selection_from_manifest
