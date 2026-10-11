@@ -329,9 +329,11 @@ def steps(handler, principal, project_id):
     # An operator can record that backups are scheduled elsewhere: show the command, as the other
     # steps show theirs (kittrial-5bb.220 review 2 item 4c).
     commands.append(fill(status, 'Record that backups are scheduled elsewhere (a shell command, on the server)',
-                         'backup-schedule --note NOTE --actor OPERATOR',
+                         'backup-schedule --note "NOTE" --actor OPERATOR',
                          'Replace NOTE with one line of at most 300 characters and OPERATOR with your name on the '
-                         'server\'s operator list. The statement is about the whole runtime and never expires; the '
+                         'server\'s operator list. NOTE is quoted because a note is free text: without the quotes a '
+                         'shell splits it at its spaces and the command records only the first word '
+                         '(kittrial-5bb.251 item 7). The statement is about the whole runtime and never expires; the '
                          'server does not check it. Every set and clear is kept in a log on the server.',
                          ('NOTE', 'OPERATOR')))
     result.append(host_step('backup', 'Make sure a scheduled backup covers this project', status, reason, backup,

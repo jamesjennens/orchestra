@@ -236,7 +236,7 @@ class InProcessSetupTests(test_http_agents.AgentHarness):
         self.assertEqual([one['replace'] for one in steps['onboarding']['commands']], [['PYTHON', 'KIT', 'RUNTIME_ROOT', 'FILE']])
         self.assertEqual([(one['kind'], one['text']) for one in steps['backup']['commands']],
                          [('unit-line', 'ExecStart=PYTHON admin.py --root RUNTIME_ROOT backup --all'),
-                          ('shell-fill', 'PYTHON KIT/admin.py --root RUNTIME_ROOT backup-schedule --note NOTE '
+                          ('shell-fill', 'PYTHON KIT/admin.py --root RUNTIME_ROOT backup-schedule --note "NOTE" '
                                          '--actor OPERATOR')])
         self.assertEqual(answer.data['project'], {'id': self.project, 'name': 'Alpha', 'repository': None})
         self.assertTrue(answer.data['generated_at'])
@@ -1075,7 +1075,7 @@ class EndpointSetupTests(fixes.EndpointCase):
         self.assertEqual((step['state'], step['command']), ('todo', line))
         self.assertEqual([(one['kind'], one['text']) for one in step['commands']],
                          [('unit-line', line),
-                          ('shell-fill', 'PYTHON KIT/admin.py --root RUNTIME_ROOT backup-schedule --note NOTE '
+                          ('shell-fill', 'PYTHON KIT/admin.py --root RUNTIME_ROOT backup-schedule --note "NOTE" '
                                          '--actor OPERATOR')])
         self.assertIn('not a shell command', step['commands'][0]['label'])
         self.assertIn('backup', [item['id'] for item in body['steps'] if item['state'] == 'todo'])
@@ -1085,7 +1085,7 @@ class EndpointSetupTests(fixes.EndpointCase):
         step, _ = host('not-covered', run_now=run, check=check, unit_directory='/home/svc/.config/systemd/user')
         self.assertEqual([(one['kind'], one['text']) for one in step['commands']],
                          [('shell', run), ('unit-line', line), ('shell', check),
-                          ('shell-fill', 'PYTHON KIT/admin.py --root RUNTIME_ROOT backup-schedule --note NOTE '
+                          ('shell-fill', 'PYTHON KIT/admin.py --root RUNTIME_ROOT backup-schedule --note "NOTE" '
                                          '--actor OPERATOR')])
         self.assertEqual(step['command'], run)                     # what an older page shows can be pasted
         labels = [one['label'] for one in step['commands']]
