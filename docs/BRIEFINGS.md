@@ -56,6 +56,72 @@ checkpoint's own next action, escaped; no person is inferred, and the move and t
 stay the caller's. Items where the move is the caller's sort first, and top-level
 `your_move` carries their count in the answer.
 
+### The selection facts: `next_actor`, `work_state`, reconciliation and `claimable`
+
+`work` items, the brief's `review` block and the `review TASK` read carry five additive
+selection facts, all computed once in the shared review-state projection, so no two
+surfaces can disagree (kittrial-5bb.6):
+
+- **`next_actor`** is the next-action actor as a caller-neutral ROLE: `assignee`,
+  `reviewer`, `coordinator`, `operator`, `anyone`, `none` or `unknown`. It is deliberately
+  NOT the assignee field and never a person. It comes from the SAME decision that gives
+  `whose_move`: `whose_move` is the caller-relative answer (`you` for the caller), and
+  `next_actor` is that decision's role, so the two can never name different movers. Where
+  the decision cannot be told, both say so — `next_actor` is `unknown` on integrated work,
+  on a withdrawn or superseded final contribution with no open item, and on an unassigned
+  row nobody could claim. It is never null: a malformed row (a broken review chain, a
+  malformed handoff journal or an unparseable native row) reads `operator`, the party who
+  must repair it. A closed task whose review is not still active reads `none`.
+- **`work_state`** is the review state the row SHOWS, or `reconciliation-needed` when the
+  shared projection found recorded evidence that must be reconciled first. It never
+  replaces `review_state`.
+- **`reconciliation_needed`** (boolean) is true exactly for those rows, and
+  **`reconciliation_reasons`** names the mismatching facts: `integration-facts-disagree`
+  (the shared projection's integration disagreement, with both scopes and both values) or
+  `lifecycle-scope-lags` (the newest recorded lifecycle scope names a PRIOR revision of
+  the current contribution while the current one records no pass).
+- **`claimable`** is the one bounded claimability rule: open, unassigned, no contribution,
+  and neither a record anchor nor an epic, decision, gate or job — by issue TYPE or by the
+  `decision` LABEL (`reference_records.py` treats that label as a decision whatever the
+  type). Advisory only: claimability is not a reservation and an atomic claim can still be
+  refused.
+
+`work --claimable` lists exactly the rows that rule marks claimable. `work --state` keeps
+its meaning on main for every value that existed there — it filters on the review state
+the row SHOWS, so a row is always found under the review state it displays, including a
+lagging-scope follow-on whose work state is `reconciliation-needed`. The ONE additive
+value, `--state reconciliation-needed`, selects the rows whose recorded evidence must be
+reconciled, whatever review state they show.
+
+The brief carries `next_actor`, `work_state` and `reconciliation_reasons` in its bounded
+`review` block and never twice. It does not repeat the `reconciliation_needed` boolean:
+`work_state == 'reconciliation-needed'` is the same fact, and the compact brief is under a
+hard 6000-byte bound.
+
+What is NOT delivered, stated plainly rather than claimed:
+
+- **Stale prose is not detected.** A checkpoint whose summary or `source_commit`
+  contradicts the evidence raises no reconciliation signal. Reconciliation is raised only
+  by the two evidence-backed signals above.
+- **A short or unrelated scope is not detected.** A scope naming a 7-character commit, or a
+  different full commit sharing seven characters with the contribution's, reads its normal
+  review state with no reconciliation prompt. Only a scope naming a PRIOR revision of the
+  current contribution raises `lifecycle-scope-lags`.
+- **No project owner is shown**, and the reconciliation reasons carry the scope token and
+  the two commits but **no evidence times and no record ids beyond that token**.
+- **Open dependencies and parent tasks are not considered by `claimable`**, and a
+  re-contribution of the SAME commit reads `integrated` after its own approval.
+
+Clearing nothing is a property, not a caveat: `work_state == 'reconciliation-needed'` is a
+selection signal. It never overwrites `review_state`, never clears an open item or a
+blocking checkpoint, and infers neither abandonment nor deployment. `workers.checkpoint-wait`
+therefore stays exactly as it is: reconciliation clears no blocker.
+
+The `Reconciliation needed: ...` line is added to the EXISTING warning surfaces — the
+`work` item's `integration_warnings` and a read's top-level `warnings` — not to a new
+field, so a reader that already reads warnings sees it.
+
+
 Read `brief --json`, reconcile relevant history and repository state, and save a UTF-8 JSON file using [the template](../templates/CHECKPOINT.json). Set `previous` to the current checkpoint's `comment_id` (or null for the first checkpoint) and copy the briefing's top-level `activity_cursor`. Fill in the real source commit and branch, or leave them empty when unknown.
 
 When new writes are enabled (see compatibility below), provenance is server-bound and round-trips: do not hand-craft incorporated digests. Omit them and the server computes and binds the exact snapshot provenance, or fetch the supported map with `checkpoint TASK --provenance` (returns the current `activity_cursor` and `provenance`) and embed the returned `provenance` verbatim — a missing, extra or altered map is rejected, so fabricated maps cannot be asserted. The first enabled record keeps an exact digest window, a bounded truncated-digest map for older entries and a chain hash. Subsequent enabled records store only new or changed evidence from those bounded maps (`provenance.delta: true`); unchanged evidence remains in the linked history. Each candidate map contains up to 200 exact and 300 truncated digests before the size fit, and the server shrinks the window as needed so the final serialized comment (including its Kind prefix) always fits the 80 KB cap; the same cap is enforced on read, so an accepted write always reads back.

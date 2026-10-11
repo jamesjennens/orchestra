@@ -84,28 +84,51 @@ def is_integration_warning(value):
     return isinstance(value, str) and value.startswith(INTEGRATION_WARNING_PREFIXES)
 
 
-def next_actor(state, assignee=None, closed=False):
+def next_actor(state, assignee=None, closed=False, pending_items=0, claimable=None):
     """The party that acts next, as a role token from :data:`NEXT_ACTORS`.
 
-    Caller-neutral and derived only from the effective review state, whether an
-    assignee is present and whether the task is closed. ``closed`` keeps its meaning
-    from the ``work`` queue: a closed task whose review is not still active is
-    ``none``, never an invitation to act. It never reports a person and never reads
-    a title, a comment or an actor name as a claim about intent.
+    This is the caller-neutral half of the ONE whose-move decision (kittrial-5bb.6
+    review item 2): ``work`` builds ``whose_move``, ``next`` and ``next_actor`` in a
+    single call so a row can never name one mover and deny another. It is derived
+    from the effective review state, whether an assignee is present, whether the task
+    is closed, whether any review item is still open and whether the row is
+    ``claimable`` -- never from a title, a comment or an actor name.
+
+    It is ``'unknown'`` wherever that decision cannot be told, which is exactly where
+    ``whose_move`` reads ``unknown`` for the holder:
+
+    * ``integrated`` work: main's move sentence says the move cannot be told from the
+      state shown, so no mover is named here either (item 2);
+    * ``withdrawn``/``superseded`` with NO open item (open or closed): the final
+      revision owes nothing, so main does not call the assignee to act;
+    * an unassigned, undelivered row that is not ``claimable`` (an epic, a decision, a
+      gate, a job, a labelled ``decision``, a blocked or in-progress row): nobody can
+      take it, so ``anyone`` would be a claim the row does not support.
+
+    ``'operator'`` is kept for the ``error`` state (a malformed row, whose repair is an
+    operator's) and for the documented ``reconciliation-needed`` STATE token. A row's
+    ``review_state`` is never that token -- the reconciliation signal is the additive
+    ``work_state`` -- so on a real row this function follows the review state the row
+    shows and never invents. ``closed`` keeps its meaning from the ``work`` queue: a
+    closed task whose review is not still active is ``none``, never an invitation.
     """
     if closed and state not in ('changes-requested', 'error', 'awaiting-integration',
                                 'withdrawn', 'superseded'):
         return 'none'
+    if state in ('withdrawn', 'superseded') and not pending_items:
+        return 'unknown'
     if state in ('changes-requested', 'withdrawn', 'superseded'):
         return 'assignee' if assignee else 'unknown'
     if state in ('awaiting-review', 'legacy-review-ready'):
         return 'reviewer'
-    if state in ('awaiting-integration', 'approved', 'integrated'):
+    if state in ('awaiting-integration', 'approved'):
         return 'coordinator'
     if state in ('error', RECONCILIATION_STATE):
         return 'operator'
     if state in (None, 'none'):
-        return 'assignee' if assignee else 'anyone'
+        if assignee:
+            return 'assignee'
+        return 'anyone' if claimable is not False else 'unknown'
     return 'unknown'
 
 
@@ -408,7 +431,8 @@ def _scope_text(scope):
         scope.get('release_id') or '-', scope.get('environment') or '-')
 
 
-def effective(result, scopes=None, workflow_state=None, assignee=None, closed=False):
+def effective(result, scopes=None, workflow_state=None, assignee=None, closed=False,
+              claimable=None):
     """Apply the integration overlay to one raw workflow projection result.
 
     ``workflow_state`` overrides the raw state recorded alongside the effective
@@ -433,12 +457,18 @@ def effective(result, scopes=None, workflow_state=None, assignee=None, closed=Fa
 
     Additive selection facts (kittrial-5bb.6) are computed here, in the one shared
     projection, so `review`, `brief`'s review block and every `work` row cannot
-    disagree: ``next_actor`` (the role token, separate from the assignee),
-    ``reconciliation_needed``/``reconciliation_reasons`` (the filterable
-    reconciliation signal with the mismatching facts) and ``work_state`` (the
-    reconciliation state when needed, else the effective review state).
-    ``review_state`` itself keeps its exact meaning, the reconciliation signal
-    clears no blocker and neither abandonment nor deployment is inferred.
+    disagree: ``next_actor`` (the role token, separate from the assignee, from the
+    same decision that gives ``whose_move``), ``reconciliation_needed``/
+    ``reconciliation_reasons`` (the filterable reconciliation signal with the
+    mismatching facts) and ``work_state`` (the reconciliation state when needed, else
+    the effective review state). ``review_state`` itself keeps its exact meaning, the
+    reconciliation signal clears no blocker and neither abandonment nor deployment is
+    inferred.
+
+    ``claimable`` is the caller's bounded claimability answer for this row
+    (``work.claimable``, or ``project``'s own computation of it). It only decides
+    whether an unassigned undelivered row may name ``anyone``; ``None`` means the
+    caller did not state it and the older reading is kept.
     """
     reverts=result.get('reverts') or []
     evidence=integration(result.get('contribution'),scopes,reverts)
@@ -461,7 +491,7 @@ def effective(result, scopes=None, workflow_state=None, assignee=None, closed=Fa
     if reconciliation_facts['reasons']:
         answer['reconciliation_reasons']=reconciliation_facts['reasons']
     answer['work_state']=RECONCILIATION_STATE if reconciliation_facts['needed'] else state
-    answer['next_actor']=next_actor(state,assignee,closed)
+    answer['next_actor']=next_actor(state,assignee,closed,pending_items=len(answer.get('pending_requests') or []),claimable=claimable)
     warnings=answer.get('warnings')
     if warnings is not None:
         warnings.extend(disagreement_warnings(disagreements))
@@ -519,6 +549,25 @@ def reverts_by_task(rows, operators=None, journal=None):
     return reverts,invalid
 
 
+def claimable_for_issue(issue, result):
+    """One issue row's bounded claimability, from the ONE rule in ``work`` (item 2/4).
+
+    The ``next_actor`` role needs it: an unassigned undelivered row may name
+    ``anyone`` only when somebody could actually take it, and a row that is an epic,
+    a decision, a gate, a job, a task LABELLED ``decision``, blocked, in progress or
+    already delivered may not. The rule itself lives once, in ``work.claimable``; this
+    is a thin bridge so the shared projection uses that same rule instead of a second
+    copy. The import is deliberately lazy: ``work`` imports this module at module
+    scope, and this module only reaches back when a read is actually projected.
+    """
+    from work import claimable
+    from reserved_comments import is_record_anchor
+    contribution=result.get('contribution') or {}
+    return claimable(issue.get('issue_type'),issue.get('status'),issue.get('assignee'),
+                     contribution.get('comment_id'),result.get('review_state'),
+                     record_anchor=is_record_anchor(issue),labels=issue.get('labels'))
+
+
 def project(issue, scopes=None, operators=None, reverts=None, journal=None, invalid_reverts=None):
     """Raw workflow state plus the effective, integration-aware review state.
 
@@ -540,4 +589,5 @@ def project(issue, scopes=None, operators=None, reverts=None, journal=None, inva
     if raw=='none' and 'review-ready' in (issue.get('labels') or []):
         result=dict(result,review_state='legacy-review-ready')
     return effective(result,scopes,raw,assignee=issue.get('assignee'),
-                     closed=issue.get('status')=='closed')
+                     closed=issue.get('status')=='closed',
+                     claimable=claimable_for_issue(issue,result))

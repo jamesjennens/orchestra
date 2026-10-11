@@ -789,6 +789,20 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
         next_action=('CHECKPOINT FROM PROJECT '+taken_in+': written before this project was restored or '
                      'copied under its current name; its task content is unchanged. Confirm the history '
                      'before relying on it. '+next_action)
+    # The compact brief carries the next-action ROLE once, inside the shared review
+    # projection block (kittrial-5bb.6 review item 2: it used to be carried twice, at the
+    # top level and in `review`). The brief is under a hard 6000-byte bound
+    # (tests/test_follow_on_contributions.py), so the reconciliation signal is carried in
+    # the one way that does not repeat itself: `work_state` is `reconciliation-needed`
+    # exactly when `reconciliation_needed` is true, and `reconciliation_reasons` names the
+    # mismatching facts whenever there are any. The boolean itself is carried by `work`
+    # rows and by the `review` read, which have no such bound.
+    brief_review=dict(review,pending_requests=pending[:5],pending_total=len(pending),more='review '+task if len(pending)>5 else None,
+                      prior_contributions=bounded_priors,prior_contributions_total=len(priors),
+                      prior_contributions_more='review '+task if len(priors)>PRIOR_BRIEF_LIMIT else None,
+                      reverts=reverts[-REVERT_BRIEF_LIMIT:],reverts_total=len(reverts),
+                      reverts_more='review '+task if len(reverts)>REVERT_BRIEF_LIMIT else None)
+    brief_review.pop('reconciliation_needed',None)
     result={**attention,'reference_drafts_matching':reference_drafts,'task':task,'title':clip(issue.get('title'),200),'owner':clip(issue.get('assignee') or 'unassigned',96),'status':issue.get('status'),
             'activity_cursor':activity_cursor(data),'checkpoint':None if p is None else {'comment_id':str(c['id']),'author':clip(c.get('author'),96),'timestamp':c.get('created_at'),'source_commit':p['source_commit'],'branch':p['branch'],'incorporated_activity_cursor':p['activity_cursor'],
                 'newer_activity':stale,**({'taken_in_project':taken_in} if taken_in else {})},
@@ -797,19 +811,8 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
             'intent':clip(p['intent'] if p else issue.get('description'),600),'acceptance':clip(p['acceptance'] if p else issue.get('acceptance_criteria'),1000),
             'current_position':p['summary'] if p else 'No checkpoint yet; current position and unresolved items have not been summarized.',
             'next_action':next_action,
-            # Additive selection fact (kittrial-5bb.6), from the same shared projection the
-            # `review` block and every `work` row use: the next-action actor as a ROLE,
-            # separate from `owner` (the assignee). `next_action` above stays the prose
-            # sentence; `next_actor` never replaces it. The brief stays compact, so the
-            # filterable `work_state` and the reconciliation signal stay in `review`
-            # (with the bounded prior-contribution slice) rather than being duplicated here.
-            'next_actor':review.get('next_actor'),
             'unresolved':{'coverage':'explicit checkpoint items only; unsummarized prose is not classified','total':len(items) if p else None,'items':items[offset:offset+limit],'next_offset':offset+limit if offset+limit<len(items) else None},
-            'review':dict(review,pending_requests=pending[:5],pending_total=len(pending),more='review '+task if len(pending)>5 else None,
-                          prior_contributions=bounded_priors,prior_contributions_total=len(priors),
-                          prior_contributions_more='review '+task if len(priors)>PRIOR_BRIEF_LIMIT else None,
-                          reverts=reverts[-REVERT_BRIEF_LIMIT:],reverts_total=len(reverts),
-                          reverts_more='review '+task if len(reverts)>REVERT_BRIEF_LIMIT else None),
+            'review':brief_review,
             'lifecycle_matches_contribution':matches_contribution,
             'deployed_delivery':deployed_delivery,
             'deployed_delivery_is_current_contribution':deployed_current,

@@ -82,6 +82,12 @@ AGENT_MAX_PAGES = 200
 #: an agent's own changes-requested, blocked or awaiting-review task is always collected
 #: however many claimable tasks sit beside it.
 AGENT_CLAIMABLE_LIMIT = MAX_PAGE
+#: Cap on the fall-through candidates a REFUSED claim offers (kittrial-5bb.6 review item
+#: 4). It is deliberately far smaller than the attention cap: a refusal is an error
+#: answer, not a listing, and a hundred candidate titles with a hostile one among them is
+#: both a size and a prompt-injection problem. When the cap cuts the list, the detail says
+#: so (``candidates_truncated``) instead of silently dropping rows.
+CLAIM_CANDIDATES_LIMIT = 10
 #: Bound on the projects one ``GET /v1/me/work`` read walks (the caller's own
 #: memberships, each read once). Reaching it reports ``truncated``.
 ME_WORK_MAX_PROJECTS = 50
@@ -1285,7 +1291,8 @@ def claimable_task(task, review):
     contribution = review.get('contribution') if isinstance(review, dict) else None
     return claimable(task.get('issue_type'), task.get('status'), task.get('assignee'),
                      (contribution or {}).get('id'),
-                     review.get('state') if isinstance(review, dict) else None)
+                     review.get('state') if isinstance(review, dict) else None,
+                     labels=task.get('labels'))
 
 
 def attention_blocking_items(fields):
@@ -3981,23 +3988,26 @@ class ApiHandler(BaseHTTPRequestHandler):
         order and excluding the task just refused. Advisory only: a candidate is not a
         reservation and the next claim is still atomic. A read failure supplies no
         candidates and never changes the refusal.
+
+        Returns ``(candidates, truncated)``: at most ``limit`` (default
+        :data:`CLAIM_CANDIDATES_LIMIT`, ten) rows, and whether the read held more
+        claimable rows than the cap allowed, so the caller can say the list was cut
+        (kittrial-5bb.6 review item 4).
         """
         try:
             read = self._review_queue(project_id)
         except (HttpError, ValueError):
-            return []
+            return [], False
         if not isinstance(read, dict):
-            return []
-        bound = AGENT_CLAIMABLE_LIMIT if limit is None else limit
+            return [], False
+        bound = CLAIM_CANDIDATES_LIMIT if limit is None else limit
         found = []
         for task in read.get('items') or []:
             if not isinstance(task, dict) or task.get('id') == exclude:
                 continue
             if task.get('claimable') is True:
                 found.append({'task': task.get('id'), 'title': task.get('title')})
-            if len(found) >= bound:
-                break
-        return found
+        return found[:bound], len(found) > bound
 
     def _cached_read(self, kind, project_id, load, shared=False):
         """One canonical read per request, optionally reused across requests.
@@ -6366,7 +6376,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         payload = dict(ctx.payload or {})
         # A field the route does not take is refused, not dropped (kittrial-5bb.183 item 2).
         refuse_unknown_fields(payload, self.TASK_CLAIM_FIELDS, 'A task claim')
-        self._refuse_record_anchor(self.backend.get_task(ctx.params['pid'], ctx.params['tid']), write=True)
+        task = self.backend.get_task(ctx.params['pid'], ctx.params['tid'])
+        self._refuse_record_anchor(task, write=True)
         payload['task_id'] = ctx.params['tid']
         actor = self.service.bind_actor(ctx.principal, payload.pop('actor', None))
         payload['actor'] = actor
@@ -6381,12 +6392,18 @@ class ApiHandler(BaseHTTPRequestHandler):
                 held_by = getattr(refusal, 'held_by', None)
                 if held_by is None and refusal.code != 'conflict':
                     raise
-                # Candidate fall-through (kittrial-5bb.6 deliverable b): a refused claim
-                # answers with the next bounded claimable rows so an agent need not re-read
-                # the queue. Advisory: claimability is not a reservation and the next claim
-                # is still atomic. When there is nothing to fall through to, the refusal is
-                # re-raised byte for byte, so every existing sentence and detail is kept.
-                candidates = self._claim_candidates(ctx.params['pid'], ctx.params['tid'])
+                # Candidate fall-through (kittrial-5bb.6 deliverable b, review item 4): a
+                # refused claim on a task that is still OPEN answers with the next BOUNDED
+                # claimable rows so an agent need not re-read the queue. It is not attached
+                # to a refusal about a task nobody could take anyway -- `Task is not open`
+                # (a closed task) makes no fall-through read at all -- and the refused task
+                # itself is never among the candidates. Advisory: claimability is not a
+                # reservation and the next claim is still atomic. When there is nothing to
+                # fall through to, the refusal is re-raised byte for byte, so every
+                # existing sentence and detail is kept.
+                candidates, truncated = [], False
+                if held_by is not None or str((task or {}).get('status')) == 'open':
+                    candidates, truncated = self._claim_candidates(ctx.params['pid'], ctx.params['tid'])
                 if not candidates and held_by is None:
                     raise
                 detail = dict(refusal.detail) if isinstance(refusal.detail, dict) else {}
@@ -6394,6 +6411,11 @@ class ApiHandler(BaseHTTPRequestHandler):
                     detail['held_by'] = held_by
                 if candidates:
                     detail['candidates'] = candidates
+                    if truncated:
+                        # Say when the list was cut instead of dropping rows silently.
+                        detail['candidates_truncated'] = True
+                        detail['candidates_notice'] = ('More claimable tasks remain; at most %d '
+                                                       'candidates are listed.' % CLAIM_CANDIDATES_LIMIT)
                 if held_by is None:
                     raise conflict(refusal.message, detail) from None
                 # Somebody else has it. Nobody takes a task over through a claim, an owner

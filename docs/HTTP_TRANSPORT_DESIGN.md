@@ -201,6 +201,15 @@ own machine and pull work over the API without SSH or shared directories.
   awaiting integration (see HTTP_DEPLOYMENT.md, "What an agent is told to do next").
   The order of the list is the contract, including the order of kinds that share a
   priority number.
+  A claimable task suggestion is the one bounded rule (kittrial-5bb.6): the row's own
+  `claimable` answer from the shared `work` predicate -- open, unassigned, no
+  contribution, and not an epic, decision, gate, job, record anchor or a task carrying
+  the `decision` label. Epics, decisions and jobs are therefore never offered as
+  claimable work, and a delivered or held task never looks unclaimed. It is a
+  suggestion, never a reservation: an atomic claim can still be refused. The queue row
+  carries `claimable`, and the review-queue rows also carry `review_state` and
+  `claimable` only -- no `next_actor`, `work_state` or reconciliation field travels on
+  the HTTP next-actions.
   Action kind names are the contract; numeric priority values are relative sorting
   hints and may change. Other own review states still receive an action naming
   their state and who acts next, including an operator action for malformed history.
@@ -408,7 +417,7 @@ call; it does not authorize direct database access. Protected mutation rows requ
 | `GET /v1/projects/{id}/agents`, `GET /v1/projects/{id}/agents/{agent}`, `DELETE /v1/projects/{id}/agents/{agent}` | Project owner/admin (the project's `CAP_PROJECT_ADMIN`), never `agents.manage`; a non-member gets `404` and an agent/worker credential `403` | A grant may only name a project the **agent's owner** can open; the delete requires the project to be in that agent's live grant | Reads are keyless; the delete is a project mutation keyed to principal + project + route + agent and records `agents.project.revoke` in the project audit; `200`, `403/404`; the response is the narrow safe view with no `working_directory` | Live agent registry (grant narrowing); no canonical mapping |
 | `POST /v1/projects/{id}/jobs`, `PATCH /v1/projects/{id}/jobs/{job}`, `POST /v1/projects/{id}/tasks`, `PATCH /v1/projects/{id}/tasks/{task}` | Owner/contributor for create/update according to project policy; viewer denied | Membership current; update carries resource version; task parent/job must be in same project | Key scoped to principal + project + route + client operation ID; `201/200`, `403/409` | Canonical job/task create/update |
 | `GET /v1/projects/{id}/tasks`, `GET .../tasks/{task}` | Project member; viewer may read | Membership checked before query and cursor validation | Opaque cursor bound to principal/project/query; `200`, `401/403/404` | Canonical task/list/show and history views |
-| `POST /v1/projects/{id}/tasks/{task}/claim` | Contributor/owner or bound worker credential | Task open/claimable and actor binding matches credential | Key scoped to principal + project + task + route; `200`, `403/409` | Existing atomic claim operation |
+| `POST /v1/projects/{id}/tasks/{task}/claim` | Contributor/owner or bound worker credential | Task open/claimable and actor binding matches credential. A refusal on an OPEN task answers with at most ten `detail.candidates` (`{task,title}`) from the one bounded claimable rule, never the refused task, plus `detail.candidates_truncated` and `detail.candidates_notice` when the list was cut; the fall-through queue read is made only for that case, so `Task is not open` carries no candidates and costs no read. Advisory: a candidate is not a reservation and the next claim is still atomic | Key scoped to principal + project + task + route; `200`, `403/409` | Existing atomic claim operation |
 | `POST /v1/projects/{id}/tasks/{task}/reviews` | Contributor submits; project owner requests or approves; a member or agent with the `reviews` capability who is not the author records `recommend` (advice, never an approval; see REVIEWS.md) | Current contribution and review chain are read under same authorization check | Key scoped to principal + project + task + route; `201`, `403/409` | Structured contribution/review protocol |
 | `POST /v1/projects/{id}/tasks/{task}/checkpoints` | Contributor/owner; viewer denied | Checkpoint previous/cursor is current; task membership remains valid | Key scoped to principal + project + task + route; `201`, `403/409` | Canonical checkpoint append |
 | `GET /v1/projects/{id}/tasks/{task}/history` | Project member; audit is separate | Cursor is bound to authorized task/project snapshot | Opaque cursor; `200`, `403/404/409` | Bounded history/activity read |

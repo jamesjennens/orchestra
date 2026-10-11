@@ -65,10 +65,11 @@ BRIEF_FIELDS = {
     'deployed_delivery', 'deployed_delivery_is_current_contribution',
     # Additive liveness (kittrial-5bb.107 rev2).
     'deployed_live',
-    # Additive selection fact (kittrial-5bb.6): the next-action actor role. The
-    # filterable work state and the reconciliation signal travel in the brief's
-    # bounded `review` block.
-    'next_actor',
+    # The next-action actor role (kittrial-5bb.6) is carried ONCE, in the brief's
+    # bounded `review` block -- the shared review-state projection -- together with
+    # the filterable `work_state` and the reconciliation signal (review item 2).
+    # There is deliberately no second top-level copy: it pushed the compact brief
+    # past its hard 6000-byte bound.
 }
 
 

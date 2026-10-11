@@ -72,13 +72,38 @@ class NextActorUnitTests(unittest.TestCase):
         self.assertEqual(review_state.next_actor('awaiting-review', 'alice/session'), 'reviewer')
         self.assertEqual(review_state.next_actor('legacy-review-ready', None), 'reviewer')
         self.assertEqual(review_state.next_actor('awaiting-integration', 'alice/session'), 'coordinator')
-        self.assertEqual(review_state.next_actor('integrated', 'alice/session'), 'coordinator')
+        # Integrated work: main's whose_move says the move cannot be told, so no mover is
+        # named here either (review item 2; the 15-row disagreement of revision 1).
+        self.assertEqual(review_state.next_actor('integrated', 'alice/session'), 'unknown')
         self.assertEqual(review_state.next_actor('error', 'alice/session'), 'operator')
         self.assertEqual(review_state.next_actor('reconciliation-needed', 'alice/session'), 'operator')
         self.assertEqual(review_state.next_actor('none', 'alice/session'), 'assignee')
         self.assertEqual(review_state.next_actor('none', None), 'anyone')
         self.assertEqual(review_state.next_actor(None, None), 'anyone')
         self.assertEqual(review_state.next_actor('not-a-state', 'alice/session'), 'unknown')
+
+    def test_the_role_is_unknown_where_the_move_cannot_be_told(self):
+        """Item 2: the two disagreements revision 1 shipped are gone, and no null.
+
+        A withdrawn or superseded final revision with nothing open owes nobody a move;
+        an unassigned row nobody could claim is not `anyone`; a row whose recorded
+        evidence must be reconciled keeps the REVIEW state's role, because the
+        reconciliation signal is `work_state` and never a review state.
+        """
+        for state in ('withdrawn', 'superseded'):
+            self.assertEqual(review_state.next_actor(state, 'alice/session'), 'unknown')
+            self.assertEqual(review_state.next_actor(state, 'alice/session', closed=True), 'unknown')
+            # ... but an open item on the final revision is still the assignee's work.
+            self.assertEqual(review_state.next_actor(state, 'alice/session', pending_items=1), 'assignee')
+        # Unassigned and undelivered, but not claimable: nothing can take it.
+        self.assertEqual(review_state.next_actor('none', None, claimable=False), 'unknown')
+        self.assertEqual(review_state.next_actor('none', None, claimable=True), 'anyone')
+        # A reconciliation row keeps the review state it shows (never `operator`, which
+        # is the role of the reconciliation STATE token, not of the signal).
+        self.assertEqual(review_state.next_actor('awaiting-review', 'alice/session',
+                                                 pending_items=0, claimable=False), 'reviewer')
+        self.assertEqual(review_state.next_actor('integrated', 'alice/session',
+                                                 pending_items=0, claimable=False), 'unknown')
 
     def test_a_closed_settled_task_has_no_next_actor_but_active_review_does(self):
         self.assertEqual(review_state.next_actor('integrated', 'alice/session', closed=True), 'none')
@@ -95,25 +120,54 @@ class SharedNextActorTests(unittest.TestCase):
         review, brief, item = surfaces(delivered_rows())
         self.assertEqual((review['review_state'], brief['review']['review_state'], item['review_state']),
                          ('awaiting-review',) * 3)
-        self.assertEqual([review['next_actor'], brief['next_actor'], brief['review']['next_actor'],
-                          item['next_actor']], ['reviewer'] * 4)
+        # The brief carries the role ONCE, in its shared review block (review item 2).
+        self.assertEqual([review['next_actor'], brief['review']['next_actor'],
+                          item['next_actor']], ['reviewer'] * 3)
+        self.assertNotIn('next_actor', brief)
 
     def test_requested_changes_name_the_assignee_not_the_reviewer(self):
         review, brief, item = surfaces(test_work_queue.reviewed_rows())
-        self.assertEqual([review['next_actor'], brief['next_actor'], item['next_actor']], ['assignee'] * 3)
+        self.assertEqual([review['next_actor'], brief['review']['next_actor'],
+                          item['next_actor']], ['assignee'] * 3)
         # The assignee field is still exactly the assignee and is untouched by the new field.
         self.assertEqual(item['owner'], 'alice/session')
 
-    def test_integrated_work_names_the_coordinator_and_free_work_anyone(self):
+    def test_integrated_work_names_no_mover_and_free_work_anyone(self):
         store = shared.reviewed()
         review, brief, item = surfaces(store.rows)
-        self.assertEqual([review['next_actor'], brief['next_actor'], item['next_actor']],
-                         ['coordinator'] * 3)
+        # Integrated work: whose_move is `unknown` to the holder, so next_actor is too
+        # (review item 2; this was the 15-row `coordinator` disagreement).
+        self.assertEqual([review['next_actor'], brief['review']['next_actor'],
+                          item['next_actor']], ['unknown'] * 3)
         free = rows()
-        free[0].update(assignee=None, comments=[])
+        free[0].update(assignee=None, status='open', comments=[])
         review, brief, item = surfaces(free)
-        self.assertEqual([review['next_actor'], brief['next_actor'], item['next_actor']], ['anyone'] * 3)
+        self.assertTrue(item['claimable'])
+        self.assertEqual([review['next_actor'], brief['review']['next_actor'],
+                          item['next_actor']], ['anyone'] * 3)
         self.assertIsNone(item['owner'])
+
+    def test_an_unassigned_row_nobody_could_claim_names_no_one(self):
+        """Item 2: `anyone` on a row whose claimable is false was a claim the row denies."""
+        for change in (dict(issue_type='epic'), dict(issue_type='decision'), dict(issue_type='job'),
+                       dict(issue_type='gate'), dict(issue_type='merge-slot'),
+                       dict(labels=['decision']), dict(status='blocked'),
+                       dict(status='in_progress')):
+            free = rows()
+            free[0].update(assignee=None, status='open', comments=[], labels=[])
+            free[0].update(change)
+            self.assertFalse(work.claimable(free[0].get('issue_type'), free[0]['status'], None, None,
+                                            'none', labels=free[0].get('labels')), change)
+            # The one rule drives the role: a row nobody can take names no mover.
+            self.assertEqual(review_state.next_actor('none', None, claimable=False), 'unknown', change)
+        # A row the queue still lists (a task LABELLED decision is not skipped by the queue)
+        # reads the same on every surface.
+        labelled = rows()
+        labelled[0].update(assignee=None, status='open', comments=[], labels=['decision'])
+        review, brief, item = surfaces(labelled)
+        self.assertFalse(item['claimable'])
+        self.assertEqual([review['next_actor'], brief['review']['next_actor'],
+                          item['next_actor']], ['unknown'] * 3)
 
 
 class ReconciliationTests(unittest.TestCase):
@@ -162,12 +216,25 @@ class ReconciliationTests(unittest.TestCase):
                          ('newest-scope-disagrees', 'passed', 'failed'))
         page = work.queue(store.rows, 'alice/session', ['--state', 'reconciliation-needed'])
         self.assertEqual([row['task'] for row in page['items']], [TASK])
-        self.assertEqual(work.queue(store.rows, 'alice/session', ['--state', 'integrated'])['total'], 0)
-        # The bounded brief keeps the signal in its review block and does not double the
-        # disagreement as a second warning line (the disagreement warning already names both).
-        self.assertTrue(brief['review']['reconciliation_needed'])
+        # Item 1: `--state` keeps main's meaning -- the review state the row SHOWS -- so the
+        # row is still found under `integrated` as well as under the new selection value.
+        self.assertEqual(work.queue(store.rows, 'alice/session', ['--state', 'integrated'])['total'], 1)
+        self.assertEqual([row['task'] for row in
+                          work.queue(store.rows, 'alice/session', ['--state', 'integrated'])['items']],
+                         [TASK])
+        # The bounded brief keeps the signal in its review block as `work_state`, which is
+        # `reconciliation-needed` exactly when `reconciliation_needed` is true, and does not
+        # double the disagreement as a second warning line (the disagreement warning names both).
+        self.assertEqual(brief['review']['work_state'], 'reconciliation-needed')
+        self.assertNotIn('reconciliation_needed', brief['review'])
+        self.assertNotIn('next_actor', brief)
         self.assertNotIn('reconciliation_reasons', brief)
         self.assertTrue(any(w.startswith('Integration fact disagreement') for w in item['integration_warnings']))
+        # Item 2 (next-actor-from-work-state): the role follows the REVIEW state the row
+        # shows, never the reconciliation `work_state`. This row is `integrated`, whose
+        # move cannot be told, so its role is `unknown` and not the `operator` that the
+        # reconciliation-needed STATE token maps to.
+        self.assertEqual([review['next_actor'], item['next_actor']], ['unknown'] * 2)
 
     def test_a_lagging_lifecycle_scope_names_both_commits(self):
         store = self.lagging()
@@ -180,10 +247,128 @@ class ReconciliationTests(unittest.TestCase):
             self.assertEqual(reason['contribution_commit'], OTHER)
             self.assertEqual(reason['scope_source_commit'], COMMIT)
         self.assertTrue(any(w.startswith('Reconciliation needed:') for w in item['integration_warnings']))
+        # Item 3c: the line stays in the EXISTING integration_warnings and in the top-level
+        # warnings of a read, it is not a new warning surface.
+        self.assertTrue(any(w.startswith('Reconciliation needed:')
+                            for w in brief['review']['warnings']))
+        self.assertTrue(any(w.startswith('Reconciliation needed:') for w in brief['warnings']))
         self.assertEqual(work.queue(store.rows, 'alice/session',
                                     ['--state', 'reconciliation-needed'])['total'], 1)
+        # Item 1: a lagging scope is the normal condition of a follow-on contribution, so
+        # the reviewer still finds it under the review state the row shows.
         self.assertEqual(work.queue(store.rows, 'alice/session',
-                                    ['--state', 'awaiting-review'])['total'], 0)
+                                    ['--state', 'awaiting-review'])['total'], 1)
+        self.assertEqual(work.queue(store.rows, 'alice/session',
+                                    ['--state', 'changes-requested'])['total'], 0)
+        # The role is the review state's (`awaiting-review` -> reviewer); the reconciliation
+        # signal is `work_state` and must not replace it (next-actor-from-work-state).
+        self.assertEqual([review['next_actor'], item['next_actor']], ['reviewer'] * 2)
+
+    def test_an_unrelated_newest_scope_is_not_a_lag(self):
+        """lag-raised-for-unrelated-scope: only a PRIOR revision of the current
+        contribution can make the newest recorded scope lag it."""
+        store = NativeStore()
+        store.rows[0]['comments'] = []
+        store.rows[0]['assignee'] = 'alice/session'
+        shared.add(store.rows, shared.contribute(COMMIT, cid='delivery-1'), 'delivery-1')
+        other = scope(source_commit='d' * 40, release_id='release-other')
+        store.record(payload('lifecycle-scope', operation='scope-other', scope=other))
+        store.record(payload('integrated', operation='fact-other', scope=other))
+        review, brief, item = surfaces(store.rows)
+        self.assertEqual(review['review_state'], 'awaiting-review')
+        self.assertFalse(review['reconciliation_needed'])
+        self.assertEqual(item['work_state'], 'awaiting-review')
+
+    def test_a_passing_current_contribution_is_not_a_lag(self):
+        """lag-raised-although-current-passes: the recorded facts DO include the current
+        contribution once a scope passes for its own commit."""
+        store = NativeStore()
+        prior = scope(source_commit=COMMIT, release_id='release-prior')
+        store.record(payload('lifecycle-scope', operation='scope-prior', scope=prior))
+        store.record(payload('integrated', operation='fact-prior', scope=prior))
+        store.rows[0]['comments'] = []
+        store.rows[0]['assignee'] = 'alice/session'
+        shared.add(store.rows, shared.contribute(COMMIT, cid='delivery-1'), 'delivery-1')
+        shared.add(store.rows, shared.approve('delivery-1', opid='approve-1'), 'approval-1', 'reviewer')
+        follow_on = dict(shared.contribute(OTHER, cid='delivery-2', opid='send-2'),
+                         previous='approval-1', supersedes='delivery-1')
+        shared.add(store.rows, follow_on, 'delivery-2')
+        shared.add(store.rows, shared.approve('delivery-2', opid='approve-2'), 'approval-2', 'reviewer')
+        own = scope(source_commit=OTHER, release_id='release-current')
+        store.record(payload('lifecycle-scope', operation='scope-current', scope=own))
+        store.record(payload('integrated', operation='fact-current', scope=own))
+        # A LATER recorded scope names the prior revision again, but the current
+        # contribution's own commit records a pass, so nothing lags it.
+        store.record(payload('lifecycle-scope', operation='scope-prior-2', scope=prior))
+        review, brief, item = surfaces(store.rows)
+        self.assertEqual(review['review_state'], 'integrated')
+        self.assertFalse(review['reconciliation_needed'])
+        self.assertEqual(review['integration']['fact'], 'passed')
+
+    def test_a_short_scope_hash_is_never_a_prefix_match(self):
+        """prefix-matching-accepted: only the FULL commit names a contribution."""
+        store = NativeStore()
+        short = scope(source_commit=COMMIT[:7], release_id='release-short')
+        store.record(payload('lifecycle-scope', operation='scope-short', scope=short))
+        store.record(payload('integrated', operation='fact-short', scope=short))
+        store.rows[0]['comments'] = []
+        store.rows[0]['assignee'] = 'alice/session'
+        shared.add(store.rows, shared.contribute(COMMIT, cid='delivery-1'), 'delivery-1')
+        review, brief, item = surfaces(store.rows)
+        self.assertEqual(review['review_state'], 'awaiting-review')
+        self.assertEqual(review['integration']['fact'], 'unknown')
+        self.assertFalse(review['integration']['matches_contribution'])
+        self.assertFalse(item['lifecycle_matches_contribution'])
+
+    def test_a_malformed_handoff_journal_reads_its_error_state_consistently(self):
+        """Item 3a: review_state, work_state and next_actor agree on a journal error.
+
+        The journal directory is a stub, so this pins the read's own facts rather than
+        the filesystem: one unparseable request record.
+        """
+        class BadRecord:
+            name = 'bad.json'
+
+            def read_text(self, encoding=None):
+                raise ValueError('bad json')
+
+        class BadJournal:
+            def is_dir(self):
+                return True
+
+            def glob(self, pattern):
+                return [BadRecord()]
+
+        item = work.queue(rows(), 'alice/session', [], request_dir=BadJournal())['items'][0]
+        self.assertEqual((item['review_state'], item['work_state'], item['next_actor'],
+                          item['claimable']),
+                         ('error', 'error', 'operator', False))
+        # The state it SHOWS is the state it is found under, and only that state.
+        self.assertEqual(work.queue(rows(), 'alice/session', ['--state', 'error'],
+                                    request_dir=BadJournal())['total'], 1)
+        self.assertEqual(work.queue(rows(), 'alice/session', ['--state', 'none'],
+                                    request_dir=BadJournal())['total'], 0)
+
+    def test_a_malformed_review_chain_reads_operator_and_is_never_claimable(self):
+        """Item 2/6: a review-error row is never null and is never offered as work."""
+        data = rows()
+        data[0]['comments'].append(dict(id='bad', text='Kind: contribution-review-v1\n{}'))
+        item = work.queue(data, 'alice/session', [])['items'][0]
+        self.assertEqual((item['review_state'], item['work_state'], item['next_actor'],
+                          item['claimable']),
+                         ('error', 'error', 'operator', False))
+        self.assertEqual(work.queue(data, 'alice/session', ['--claimable'])['total'], 0)
+
+    def test_a_malformed_row_reads_operator_and_is_never_claimable(self):
+        data = rows()
+        data.insert(0, dict(id='bad-row', malformed=True, title='Broken'))
+        page = work.queue(data, 'alice/session', [])
+        item = next(row for row in page['items'] if row['task'] == 'bad-row')
+        self.assertEqual((item['review_state'], item['work_state'], item['next_actor'],
+                          item['claimable']),
+                         ('error', 'error', 'operator', False))
+        self.assertEqual(work.queue(data, 'alice/session', ['--claimable'])['total'], 0)
+        self.assertEqual(work.queue(data, 'alice/session', ['--state', 'error'])['total'], 1)
 
     def test_a_newer_unrelated_scope_alone_is_not_reconciliation(self):
         """The normal post-release read (newest scope for other work) stays unflagged."""
@@ -191,7 +376,7 @@ class ReconciliationTests(unittest.TestCase):
                                                   environment='production'))
         review, brief, item = surfaces(store.rows)
         self.assertFalse(review['reconciliation_needed'])
-        self.assertFalse(brief['review']['reconciliation_needed'])
+        self.assertEqual(brief['review']['work_state'], 'integrated')
         self.assertFalse(item['reconciliation_needed'])
         self.assertEqual([review['work_state'], brief['review']['work_state'], item['work_state']],
                          ['integrated'] * 3)
