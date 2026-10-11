@@ -284,10 +284,16 @@ a `proj_...` record until a superuser decides. After every upgrade to this kit o
    - **archives** it (`POST /v1/projects/{id}/archive`).
 3. Archive each `no-canonical` entry (a `proj_...` id).
 
-Registration saves its complete registration mark, and confirmation saves its
-confirmation and backfilled mark, before committing a success receipt. A crash
-after that receipt can replay only a durable effect. A crash after the effect
-but before the receipt can leave an in-progress request that refuses retry.
+Registration writes the project record and its `registered_by` mark in one save, and
+confirmation saves its confirmation and backfilled mark — putting them back if that
+save raises — before committing a success receipt. A crash after that receipt can
+replay only a durable effect. A crash after the effect but before the receipt leaves
+an in-progress request that refuses the identical `Idempotency-Key` for
+`idempotency_ttl` (24 hours by default, `IDEMPOTENCY_TTL_SECONDS`). The owner gets out
+with a new key (or none), which is answered from the true state: a registration that is
+already recorded answers 409 "already registered", and a confirmation of an
+already-confirmed record answers 409 "This project needs no confirmation", while an
+exact retry of the committed request replays its own answer.
 See [HTTP mutation persistence](HTTP_MUTATION_PERSISTENCE.md) for the caller
 inventory, crash probes and remaining audit persistence limit.
 

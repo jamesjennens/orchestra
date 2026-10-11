@@ -1710,7 +1710,15 @@ class Service:
         return submitted_actor
 
     # -- projects and membership ----------------------------------------------
-    def create_project(self, principal, name, project_id=None):
+    def create_project(self, principal, name, project_id=None, registered_by=None):
+        """Write the web record of a project the caller creates in the ordinary way.
+
+        ``registered_by`` is the mark the endpoint backend's register route keeps on a
+        record a superuser stood behind (kittrial-5bb.80). It is written inside this one
+        save, so no window remains between the project record and its mark in which a
+        failure or a kill leaves a project on disk without it (kittrial-5bb.255). The
+        ordinary create route passes none, so its records carry no such mark.
+        """
         if principal is None or principal.via == 'credential':
             raise forbidden('A worker credential cannot create projects')
         self._validate_project_name(name)
@@ -1722,10 +1730,13 @@ class Service:
             pid = project_id or 'proj_' + secrets.token_hex(8)
             if pid in self.state['projects']:
                 raise conflict('Project identifier already exists')
-            self.state['projects'][pid] = {
+            record = {
                 'id': pid, 'name': name, 'created_by': principal.user_id,
                 'created_at': now_iso(self._now()), 'archived': False,
             }
+            if registered_by is not None:
+                record['registered_by'] = registered_by
+            self.state['projects'][pid] = record
             self.state['memberships'][pid] = {principal.user_id: 'owner'}
             self.store.save()
         return self.project_view(principal, pid)

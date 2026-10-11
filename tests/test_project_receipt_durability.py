@@ -115,6 +115,26 @@ class ProjectReceiptDurabilityTests(RegisterHarness):
     def test_registration_killed_before_receipt(self): self.check_crash('register', 'receipt')
     def test_registration_killed_after_receipt(self): self.check_crash('register', 'final')
 
+    def test_the_registration_mark_is_written_in_the_same_save_as_the_project(self):
+        """kittrial-5bb.255 U1: no save writes the project record without its mark, so
+        no kill or failed save can leave a project on disk without registered_by."""
+        admin = self.fixture('register')
+        write = self.store._write
+        marked = []
+
+        def watch():
+            record = self.service.state['projects'].get('alpha')
+            if record is not None:
+                marked.append(record.get('registered_by'))
+            return write()
+
+        with mock.patch.object(self.store, '_write', side_effect=watch):
+            reply = self.invoke('register', admin)
+        self.assertEqual(201, reply.status, reply.data)
+        self.assertTrue(marked)
+        self.assertEqual([self.admin_user['id']] * len(marked), marked)
+        self.assertEqual(self.admin_user['id'], self.service.state['projects']['alpha']['registered_by'])
+
     def test_confirmation_failed_effect_save_releases_key_and_restart_can_retry(self):
         admin = self.fixture('confirm')
         write = self.store._write
@@ -130,6 +150,36 @@ class ProjectReceiptDurabilityTests(RegisterHarness):
         self.reload()
         self.assertEqual(200, self.invoke('confirm', admin).status)
         self.assertEqual(200, self.invoke('confirm', admin).status)
+
+    def test_confirmation_failed_effect_save_undoes_the_fields_without_a_restart(self):
+        """kittrial-5bb.255 R1: a failed effect save must not leave an unaudited
+        confirmation in memory for the next save of anything to make durable."""
+        admin = self.fixture('confirm')
+        write = self.store._write
+
+        def fail():
+            if 'confirmed_by' in self.service.state['projects']['alpha']:
+                raise OSError('synthetic confirmation save failure')
+            return write()
+        with mock.patch.object(self.store, '_write', side_effect=fail):
+            reply = self.invoke('confirm', admin)
+        self.assertEqual(500, reply.status, reply.data)
+        record = self.service.state['projects']['alpha']
+        # No restart: the callback put the fields back, so nothing unsaved remains.
+        self.assertNotIn('confirmed_by', record)
+        self.assertNotIn('confirmed_at', record)
+        self.assertNotIn('registered_by', record)
+        # The next save of anything writes no confirmation and no registration mark.
+        self.store.save()
+        disk = json.loads(self.store.path.read_text(encoding='utf-8'))
+        self.assertNotIn('confirmed_by', disk['projects']['alpha'])
+        self.assertNotIn('registered_by', disk['projects']['alpha'])
+        self.assertEqual([], [event for event in self.service.state['audit']
+                              if event['action'] == 'projects.confirm' and event['outcome'] == 'committed'])
+        # The key was released, so the same key confirms without a restart.
+        done = self.invoke('confirm', admin)
+        self.assertEqual(200, done.status, done.data)
+        self.assertEqual(self.admin_user['id'], self.service.state['projects']['alpha']['confirmed_by'])
 
     def test_confirmation_conflicting_key_and_no_key_retry_stay_refused(self):
         admin = self.fixture('confirm')

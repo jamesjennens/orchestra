@@ -4553,12 +4553,10 @@ class ApiHandler(BaseHTTPRequestHandler):
                           'first (admin.py add-project %s), then you register it here.' % (project_id, project_id))
 
         def register():
-            self.service.create_project(principal, name, project_id)
-            # The mark that a superuser registered this mapping; `project_unusable` reads it.
-            self.service.state['projects'][project_id]['registered_by'] = principal.user_id
-            # create_project saved before this mark existed. Persist the complete
-            # registration before _mutate can commit its success receipt.
-            self.service.store.save()
+            # The registration mark is written inside create_project's own save
+            # (kittrial-5bb.255), so a kill or a failed save cannot leave the project
+            # record on disk without it.
+            self.service.create_project(principal, name, project_id, registered_by=principal.user_id)
             result = self._usable(self.service.project_view(principal, project_id))
             return result, result
         return self._mutate(ctx, 'projects.create', None, register, status=201, capability=CAP_ACCOUNTS_ADMIN,
@@ -4696,15 +4694,29 @@ class ApiHandler(BaseHTTPRequestHandler):
 
         def confirm():
             item = next(item for item in unusable_projects(self.service) if item['id'] == project_id)
+            # What a failed effect save must put back (kittrial-5bb.255): a save that
+            # raises would leave these in memory, and the next save of anything would
+            # make an unaudited confirmation durable. Credential issuance rolls its own
+            # record back the same way.
+            before = {name: (name in record, record.get(name))
+                      for name in ('confirmed_by', 'confirmed_at', 'registered_by')}
             record['confirmed_by'] = principal.user_id
             record['confirmed_at'] = now_iso(self.service._now())
             # Backfill the mark the register route writes: a record a superuser stands
             # behind stays usable even if that superuser is later demoted (kittrial-5bb.90).
             # A record that already names its registrant keeps it.
             record.setdefault('registered_by', principal.user_id)
-            # A replayed success must describe a durable confirmation, including
-            # the registration mark that survives the registrant's demotion.
-            self.service.store.save()
+            try:
+                # A replayed success must describe a durable confirmation, including
+                # the registration mark that survives the registrant's demotion.
+                self.service.store.save()
+            except BaseException:
+                for name, (present, value) in before.items():
+                    if present:
+                        record[name] = value
+                    else:
+                        record.pop(name, None)
+                raise
             result = {'id': project_id, 'name': record.get('name'), 'usable': True,
                       'confirmed_by': principal.user_id, 'confirmed_at': record['confirmed_at'],
                       'created_by': item['created_by'], 'members': item['members']}
