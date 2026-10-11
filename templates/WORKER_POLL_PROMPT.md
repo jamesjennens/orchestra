@@ -25,7 +25,7 @@ Each run, in this order:
 3. Only if none of your own tasks needs action: ready --json, and claim exactly one task nobody holds (update TASK --claim --json). A task assigned to somebody else is held. A parent or coordination task is background, not an inbox.
 4. Before you stop, write what you need to continue into the task's checkpoint (checkpoint TASK --file FILE). Nothing of it goes into this prompt.
 
-If nothing changed since your last run, say so in one line and stop.
+A task of yours with changes requested is your work until you deliver a revision: "nothing changed" never applies to it. Otherwise, if nothing changed since your last run, say so in one line and stop; stop without acting only when every task of yours is with the reviewer or the coordinator.
 If you are waiting for a person, say so in a blocked checkpoint on the task and tell that person in one line at every run.
 Never edit this prompt and never add status to it. The rules are served: docs start, docs finding-work, docs reviews.
 Run again every REPLACE_INTERVAL.

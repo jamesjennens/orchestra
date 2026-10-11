@@ -50,6 +50,8 @@ ITEM_FIELDS = {
     # Additive: one sentence for a contribution that waits for somebody else's approval
     # (kittrial-5bb.197 review request 01a12894, item 3b).
     'waiting_for_approval',
+    # Additive move sentence (kittrial-5bb.249): whose move it is, in words.
+    'whose_move', 'next',
 }
 BRIEF_FIELDS = {
     'task', 'title', 'owner', 'status', 'activity_cursor', 'checkpoint', 'intent',
@@ -148,8 +150,9 @@ class WorkHelpContractTests(unittest.TestCase):
 
     def test_work_output_shape_is_backward_compatible(self):
         result = work.queue(rows(), 'alice/session', ['--mine'])
-        self.assertEqual(set(result), {'owner', 'total', 'items', 'next_offset', 'coverage'})
+        self.assertEqual(set(result), {'owner', 'total', 'your_move', 'items', 'next_offset', 'coverage'})
         self.assertEqual(result['total'], 1)
+        self.assertEqual(result['your_move'], {'count': 1, 'text': '1 of your tasks need your action'})
         # Every existing field remains; owned authored wait context is additive.
         self.assertEqual(set(result['items'][0]), ITEM_FIELDS | {'checkpoint_wait'})
 

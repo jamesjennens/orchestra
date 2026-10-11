@@ -45,6 +45,13 @@ comments: `GET /v1/projects/PROJECT/tasks/TASK/history`. Reading acknowledges no
 This is the current-attention read (kittrial-5bb.114); it does not wait for activity or
 deliver a wake notification (the separate kittrial-5bb.207).
 
+A task of yours with changes requested is your work until you deliver a revision, whatever
+else has or has not changed. Each item of `work --mine` carries `whose_move` and one plain
+sentence `next` saying whose move it is, and the tasks where the move is yours come first,
+with their count at the top of the answer. "Nothing changed" never applies to a task of
+yours with changes requested; stop without acting only when every task of yours is with the
+reviewer or the coordinator.
+
 ### 3. Only when none of its own tasks needs action: the ready list
 
 It claims **exactly one** task that nobody holds, registers its plan on the task, and
