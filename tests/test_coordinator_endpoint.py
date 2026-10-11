@@ -260,6 +260,33 @@ class GuidanceAndOnboardingTests(unittest.TestCase):
         self.assertIs(json.loads(again['stdout'])['changed'], False)
         self.assertNotIn('could not be read', again['stderr'])
 
+    def test_the_damaged_previous_sentence_ends_its_own_line(self):
+        # kittrial-5bb.242 item 4: the route joins its warnings with '', and the shipped client
+        # appends "server_time: ..." to the answer's stderr (client.py), so a sentence with no
+        # trailing newline made it print "...and replacedserver_time: ..." on one line.
+        (self.project/'ONBOARDING.md').write_bytes(b'\xff\xfe\x00damaged')
+        answer = self.ask('set-onboarding', text='Fresh onboarding for alpha.\n')
+        self.assertEqual(answer['returncode'], 0, answer['stderr'])
+        self.assertIn('it was treated as changed and replaced\n', answer['stderr'])
+        self.assertTrue(answer['stderr'].endswith('\n'), repr(answer['stderr']))
+        self.assertNotIn('server_time', answer['stderr'])
+        # What the client would print: its stamp goes after this stderr, on its own line.
+        printed = answer['stderr'] + 'server_time: 2026-10-11T00:00:00Z\n'
+        self.assertNotIn('replacedserver_time', printed)
+
+    def test_set_onboarding_refuses_a_directory_at_the_documents_name(self):
+        # kittrial-5bb.242 item 5: a DIRECTORY at ONBOARDING.md reached os.replace inside the
+        # guarded write, and an OSError there is not a refusal, so the identity stayed reserved
+        # and the answer was rc 124 "outcome unknown" for something that wrote nothing. It is a
+        # refusal now, before anything is written.
+        (self.project/'ONBOARDING.md').mkdir()
+        before = file_tree(self.project)
+        with self.assertRaises(ValueError) as refusal:
+            self.ask('set-onboarding', text='Fresh onboarding for alpha.\n')
+        self.assertIn('is a directory', str(refusal.exception))
+        self.assertNotIn('outcome unknown', str(refusal.exception))
+        self.assertEqual(file_tree(self.project), before)
+
     def test_guidance_clear_with_nothing_set_answers_changed_false_and_writes_nothing(self):
         # Review of 958e883, item 3a: this used to answer rc 124 "outcome unknown" through an
         # AttributeError (version_of(None)), and a caller with no shell cannot reconcile that.
@@ -793,6 +820,42 @@ class RoundTwoMutantCoverageTests(unittest.TestCase):
         answer = self.ask(built)
         self.assertEqual(answer['returncode'], 0, answer['stderr'])
         self.assertEqual((self.project/'GUIDANCE.md').read_text(encoding='utf-8'), decoy)
+        # The token names an attachment that is NOT there, and the text on the one that IS there
+        # differs: naming each of two PRESENT attachments in turn left the mutant "the attachment
+        # the token did not name is used (the first one wins)" alive, because it never fell back to
+        # a different text (kittrial-5bb.242 item 2). The shipped code refuses, and the guidance is
+        # untouched; the mutant would set the fallback text and fail the last assertion.
+        fallback = 'The text a mutant would fall back to.\n'
+        built['args'] = ['guidance-set', '@attachment:1']
+        built['attachments'] = {'0': {'flag': '--file', 'text': fallback}}
+        with self.assertRaisesRegex(ValueError, 'Invalid attachment'):
+            self.ask(built)
+        self.assertEqual((self.project/'GUIDANCE.md').read_text(encoding='utf-8'), decoy)
+
+    def test_a_top_level_operation_beside_items_is_refused_before_the_library(self):
+        # kittrial-5bb.242 item 3: the gate refuses a payload operation the route does not name
+        # (``draft`` is the direct accepted revision 1, and this route carries only ``accept``).
+        # It was tested for the single form and for a batch ITEM, but never for a top-level
+        # ``operation`` BESIDE ``items``: a mutant that checked only the items survived, because
+        # the library refuses the operation too. With the library stubbed to ACCEPT, only the
+        # gate's own refusal can stop it, so this test pins the gate.
+        import capability_records
+        import reference_records
+        accepted = mock.Mock(return_value={'items': []})
+        for command in ('capability-apply', 'reference-apply'):
+            with self.subTest(command=command):
+                payload = {'schema_version': 1, 'operation_id': 'draft-beside-items',
+                           'operation': 'draft', 'items': [{'key': 'c-1'}]}
+                before = file_tree(self.root)
+                with mock.patch.object(capability_records, 'apply_batch', accepted), \
+                        mock.patch.object(capability_records, 'apply_native', accepted), \
+                        mock.patch.object(reference_records, 'apply_batch', accepted), \
+                        mock.patch.object(reference_records, 'apply_native', accepted):
+                    with self.assertRaises(ValueError) as refusal:
+                        self.ask(request(command, payload=payload))
+                self.assertIn('draft', str(refusal.exception))
+                accepted.assert_not_called()
+                self.assertEqual(file_tree(self.root), before)
 
 
 @POSIX
@@ -959,6 +1022,21 @@ class ClientThroughTheForcedCommandTests(unittest.TestCase):
         answer = self.envelope(self.through(request))
         self.assertEqual(answer['returncode'], 2, answer)
         self.assertIn('items[1]', answer['stderr'])
+        self.assertEqual(file_tree(self.root), before)
+
+    def test_an_onboarding_directory_is_a_refusal_not_an_unknown_outcome(self):
+        # kittrial-5bb.242 item 5, on the path a confined coordinator really uses: an OSError
+        # from os.replace is not a refusal, so this answered rc 124 "outcome unknown", kept the
+        # identity reserved and told a caller with no shell to reconcile. It is rc 2, with a
+        # sentence, and nothing is written.
+        (self.root/'projects'/'alpha'/'ONBOARDING.md').mkdir()
+        wire = self.wire('set-onboarding', 'Onboarding for alpha.\n')
+        before = file_tree(self.root)
+        answer = self.envelope(self.through(wire))
+        self.assertEqual(answer['returncode'], 2, answer)
+        self.assertIn('is a directory', answer['stderr'])
+        self.assertIn('Nothing was written', answer['stderr'])
+        self.assertNotIn('outcome unknown', answer['stderr'])
         self.assertEqual(file_tree(self.root), before)
 
 
