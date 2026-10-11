@@ -96,6 +96,44 @@ class RawLifecycleTests(unittest.TestCase):
         self.guard(['update', 'pp-task', '--description=Discuss State change: tested → passed'])
         self.guard(['update', 'pp-task', '--description=Set reviewed to passed'])
 
+    def test_event_membership_cannot_change_even_without_reserved_content(self):
+        self.rejected(['update', 'pp-task', '--type=event'])
+        self.rejected(['update', 'pp-task', '--type=task'], rows=[row(issue_type='event')])
+        self.guard(['update', 'pp-task', '--type=event'], rows=[row(issue_type='event')])
+        self.guard(['update', 'pp-task', '--type=event', '--type=task'])
+        self.rejected(['update', 'pp-task', '--type=task', '--type=event'])
+
+    def test_creation_and_parent_references_check_the_actual_event(self):
+        rows = {'pp-task': row(), 'pp-event': row(id='pp-event', issue_type='event',
+                                                title='State change: reviewed → failed')}
+        for args in (['create', 'ordinary', '--deps=parent-child:pp-event'],
+                     ['create', 'ordinary', '--waits-for=pp-event'],
+                     ['update', 'pp-task', '--parent=pp-event']):
+            with self.assertRaisesRegex(ValueError, 'linking.*lifecycle action.*no native write'):
+                raw.guard(args, {}, lambda tokens: [rows[t] for t in tokens])
+        raw.guard(['create', 'ordinary', '--deps=parent-child:pp-task'], {},
+                  lambda tokens: [rows[t] for t in tokens])
+
+    def test_ephemeral_update_last_boolean_value_and_persistence(self):
+        for flag in ('--ephemeral', '--ephemeral=true', '--ephemeral=1', '--ephemeral=bad'):
+            self.rejected(['update', 'pp-task', flag])
+        self.guard(['update', 'pp-task', '--ephemeral=false'])
+        self.guard(['update', 'pp-task', '--ephemeral', '--ephemeral=false'])
+        self.rejected(['update', 'pp-task', '--ephemeral=false', '--ephemeral'])
+        self.guard(['update', 'pp-task', '--persistent'])
+
+    def test_duplicate_description_uses_native_last_scalar_value(self):
+        self.guard(['update', 'pp-task', '--description=Set reviewed to passed',
+                    '--description=ordinary'], rows=[row(issue_type='event')])
+        self.rejected(['update', 'pp-task', '--description=ordinary',
+                       '--description=Set reviewed to passed'], rows=[row(issue_type='event')])
+
+    def test_label_case_is_not_folded_and_surrounding_space_is_checked(self):
+        self.guard(['create', 'ordinary', '-lReviewed:passed'])
+        for text in (' reviewed:passed ', '\nreviewed:passed', 'plain,reviewed:passed'):
+            self.rejected(['create', 'ordinary', '-l', text])
+        self.rejected(['create', 'ordinary', '-lplain', '-lreviewed:passed'])
+
     def test_terminal_commands_protect_every_named_event(self):
         for command in ('close', 'reopen'):
             for event in (row(issue_type='event', title='State change: reviewed → passed'),

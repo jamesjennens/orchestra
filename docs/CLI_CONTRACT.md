@@ -1922,9 +1922,12 @@ contributor path. Use the dedicated `lifecycle` action (`lifecycle.py record`)
 to assert or correct a fact. Raw creation, conversion or alteration of a
 lifecycle event and lifecycle label addition, removal, inheritance or
 replacement are refused before native writes, independently of optional policy
-rules. Ordinary events and task prose remain writable. A retyped ordinary row
-joins event membership, and a retyped ordinary event leaves it; type membership
-alone never makes readable event content a trusted fact. Configured operators
+rules. Ordinary event creation and task prose remain writable. Contributor raw
+updates cannot change a row to or from `event`, even without lifecycle content:
+that would change which tasks the readers include. Making an existing row
+ephemeral is also refused because native exports omit it. Create a child of a
+scoped task with `--no-inherit-labels`; inherited lifecycle labels are refused.
+Type membership alone never makes readable event content a trusted fact. Configured operators
 and structured host writers keep their existing routes and legacy readers.
 
 Consumers should key on documented fields, tolerate additional fields, and treat any

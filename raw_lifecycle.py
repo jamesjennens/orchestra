@@ -129,6 +129,11 @@ def guard(args, attachments, read):
         row.update(final)
         if event_shape(row):
             refuse('creating a lifecycle event through raw bd is not allowed')
+        references = write_targets(args, attachments)
+        if references['refusal']:
+            refuse('the affected rows cannot be resolved')
+        if references['targets'] and any(event_shape(r) for r in checked_rows(read, references['targets'])):
+            refuse('linking a new row to a lifecycle event through raw bd is not allowed')
         parents = [v for name, v in flags if name == '--parent']
         inherit = [v for name, v in flags if name == '--no-inherit-labels']
         if len(parents) > 1 or any(_parse_go_bool(v) is None for v in inherit):
@@ -141,11 +146,23 @@ def guard(args, attachments, read):
 
     if not operands:
         refuse('the task to update is not named')
+    ephemeral = [value for name, value in flags if name == '--ephemeral']
+    if ephemeral and _parse_go_bool(ephemeral[-1]) is not False:
+        refuse('making an existing row ephemeral would hide it from native exports')
+    references = write_targets(args, attachments)
+    if references['refusal']:
+        refuse('the affected rows cannot be resolved')
+    linked = [token for token in references['targets'] if token not in operands]
+    if linked and any(event_shape(r) for r in checked_rows(read, linked)):
+        refuse('linking a row to a lifecycle event through raw bd is not allowed')
     for row in checked_rows(read, operands):
         if event_shape(row):
             refuse('editing a lifecycle event through raw bd is not allowed')
         if '--set-labels' in names and any(reserved_label(v) for v in (row.get('labels') or [])):
             refuse('replacing labels would change existing lifecycle facts')
         candidate = dict(row, **final)
+        if '--type' in names and ((row['issue_type'].strip().lower() == 'event')
+                                != (candidate['issue_type'].strip().lower() == 'event')):
+            refuse('changing a row to or from event would change lifecycle task membership')
         if names & _STRUCTURAL and event_shape(candidate):
             refuse('creating, changing or removing a lifecycle event through raw bd is not allowed')

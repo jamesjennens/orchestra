@@ -1438,15 +1438,9 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             named=_guard_named_rows(root,path,name,args,request.get('attachments',{}),actor,strict=lifecycle_guard)
             if lifecycle_guard:
                 def lifecycle_rows(tokens):
-                    # Reuse the complete read above for canonical IDs and suffixes.
-                    # The native resolver handles other accepted ID spellings; do
-                    # not guess which row a substring token meant.
-                    found=[]
-                    for token in tokens:
-                        matches={row['id']:row for row in (named or []) if row['id']==token or row['id'].endswith('.'+token) or row['id'].endswith('-'+token)}
-                        if len(matches)!=1:break
-                        found.append(next(iter(matches.values())))
-                    else:return found
+                    # Ask bd for the actual tokens this particular guard reads.
+                    # A suffix of another named row is not proof of what bd's
+                    # substring resolver selected for a positional operand.
                     rows,problem=_resolve_rows(root,path,actor,tokens,strict=True)
                     if problem:raw_lifecycle.refuse('the affected tasks could not be read completely')
                     return rows

@@ -5,6 +5,16 @@
 Contributor raw `bd` requests cannot create, convert, edit or remove native
 lifecycle state events, including through `close` and `reopen`, or add, remove,
 replace or inherit their reserved labels.
+Raw `update` cannot change **any** row to or from `event`, including an ordinary
+task or event with no lifecycle content. Existing rows cannot be made ephemeral:
+native exports omit ephemeral rows. Ordinary event creation stays allowed;
+closing a task with facts stays allowed and its facts stay readable.
+Native status changes to `open`, `in_progress`, `blocked`, `deferred` and
+`closed`, `--defer` and `--persistent` also keep the task's facts readable.
+The pinned native tool rejects `tombstone` and `deleted` as status values;
+the raw interface refuses unsupported `--delete` and deletion verbs before
+writing. References supplied through `--parent`, `--deps` and `--waits-for`
+are checked too: a new or existing row cannot be linked to a lifecycle event.
 The namespace comprises the six fact dimensions, `lifecycle-scope`, `enabled`
 and `live`. The endpoint judges old and final row content under the project
 lock before invoking a native writer. Incomplete reads and ambiguous mutation
@@ -14,6 +24,31 @@ Use `lifecycle.py record` for assertions and corrections. Ordinary descriptions
 that discuss lifecycle states, ordinary events, and the legacy `review-ready`
 and `reviewed` labels remain writable. The write boundary is always active on
 the contributor route, independently of optional authority rules.
+
+### Raw command surface
+
+The endpoint allow-list is `list`, `show`, `ready`, `search`, `count`, `create`,
+`update`, `close`, `reopen`, `comments`, `dep`, `state` and `lint`. This does
+not authorize every spelling: existing read/write, identity, file, record-anchor
+and command guards still apply; raw `delete`, `remove` and `tombstone` verbs
+are outside this interface. Native lifecycle setting uses its dedicated action.
+The lifecycle guard judges `create`, `update`, `close`, `reopen` and writing
+`dep` forms: `add`, `remove`/`rm`, `relate`, `unrelate` and the parent
+`dep ID --blocks ID` form, including transported edge files. Read-only
+dependency forms retain their existing route. Every affected reference is
+resolved by native `show`; substring spellings are not guessed from suffixes
+of other rows named in the same call. Missing, ambiguous or incomplete reads
+refuse before any native writer or operation journal.
+
+### Children of scoped tasks
+
+Use `create ... --parent TASK --no-inherit-labels` for a child of a task carrying
+lifecycle labels, including `lifecycle-scope:HASH`. Without that flag the native
+create would copy the parent's scope/facts, so the guard refuses and names the
+flag. This intentionally keeps the existing explicit no-inheritance option;
+there is no post-create label-stripping write that could fail after the child
+was made, and no change to inheritance of other reserved namespaces. Explicit
+ordinary labels on the child remain allowed.
 
 ## Writer inventory
 
@@ -49,5 +84,9 @@ The regression tests exercise final scalar flag values, hidden label aliases,
 attachments, inheritance, replacement, multi-target writes, incomplete reads,
 ordinary prose, close/reopen event protection, ordinary task status changes,
 listed operator writes and genuine dedicated lifecycle writes.
+The ordinary all-off worker flow covers claim, comment, status, label,
+checkpoint, contribution and implemented/tested recording. A comparison beside
+main retains exact return codes, stdout and stderr, normalizing only native
+IDs, native timestamps, the activity cursor derived from them and server time.
 Native checks use a disposable tracker; private review evidence retains its
 synthetic export and the baseline/tip reader comparison.
