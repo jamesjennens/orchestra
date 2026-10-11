@@ -28,7 +28,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from admin import ConfigurationUnreadable,deployment_document,deployment_password,environment,project_dir,root_path,operators as configured_operators,verifiers as configured_verifiers,review_workflow_writes as configured_review_writes
+from admin import ConfigurationUnreadable,deployment_document,deployment_password,environment,project_dir,root_path,operators as configured_operators,verifiers as configured_verifiers,review_workflow_writes as configured_review_writes,coordinator_rules as configured_coordinator_rules
 import bd_refusals
 import native
 from coordination import is_merge_slot, merge_slot_sentence
@@ -41,7 +41,34 @@ from reserved_comments import (carries_record_label, check_raw_request, comment_
                                is_merge_slot_id, shown_token, write_targets, MERGE_SLOT_LABEL, MERGE_SLOT_SUFFIX,
                                reserved_label_in_args, refuse_http_actor, status_change_targets, title_change_targets,
                                unresolved_bd_flags)
-from http_authority import AuthorityConfig, NativeRunner, CAP_PROJECT_ADMIN, descriptor_actor_denial, http_actor_denial, journal_path, run_guarded, stamp_write
+from http_authority import AuthorityConfig, NativeRunner, CAP_APPROVE, CAP_PROJECT_ADMIN, descriptor_actor_denial, http_actor_denial, journal_path, run_guarded, stamp_write
+
+#: One warning per line on stderr (kittrial-5bb.197 review request 01a12894, item 6):
+#: the configuration warnings and the native warnings are collected in one list, and
+#: three joined warnings with no separator read as one run-on line.
+def warning_text(warnings):
+    """The stderr text of a warning list, one line per warning."""
+    return ''.join(line if line.endswith('\n') else line+'\n' for line in warnings)
+
+
+def owner_loader(path,rule):
+    """A zero-argument reader of the project's actor -> principal map.
+
+    The map (``sessions.owners``) is read ONLY when a rule needs it, and only for the
+    writes that need it, so a damaged registry never stops ``work``, ``review``,
+    ``contribute`` or a listed operator's operation (kittrial-5bb.197 review request
+    01a12894, item 4c). A registry that cannot be read raises with the way to turn
+    ``rule`` off; the caller adds nothing.
+    """
+    def load():
+        import sessions
+        try:
+            return sessions.owners(path)
+        except (ValueError,OSError) as exc:
+            raise ValueError('%s An operator turns the rule off with `admin.py coordinator-rules off --rule %s '
+                             '--actor OPERATOR`, or repairs the session registry; nothing was changed.'
+                             %(exc,rule)) from None
+    return load
 
 ALLOWED={'list','show','ready','search','count','create','update','close','reopen','comments','dep','state','lint'}
 # Legacy name kept for operators reading this file; enforcement is the
@@ -776,17 +803,35 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
         # failing every work/review action (kittrial-5bb.110 item 2).
         switch_warnings=[]
         review_writes=configured_review_writes(root,warnings=switch_warnings)
+        rules=configured_coordinator_rules(root,warnings=switch_warnings)
         run_warnings.extend(switch_warnings)
+        # The principal rule of slice 7 and the party comparison of rule 3 both need the
+        # project's actor -> principal map, and only when a rule that consults it is on:
+        # an installation that configures nothing reads no registry here, and a damaged
+        # registry does not stop work, review, contribute or a listed operator's own
+        # operation (kittrial-5bb.197 review request 01a12894, items 1 and 4c).
+        registry_rule='coordinator_writes' if rules['coordinator_writes'] else 'independent_approval'
+        owners=(owner_loader(path,registry_rule)
+                if (rules['coordinator_writes'] or rules['independent_approval']) else None)
+        # A verified web-owner approval capability: the web service already established
+        # who the caller is, so `coordinator_writes` does not refuse an owner approving
+        # through the web route (kittrial-5bb.199). The merge slot is not on that route.
+        web_owner=(authority_config is not None and action=='review'
+                   and isinstance(request.get('authority'),dict)
+                   and request['authority'].get('capability')==CAP_APPROVE)
         def work_effect():
             result=work_execute(path,actor,action,args,request.get('attachments',{}),runner,
                                 operators=configured_operators(root),
                                 verifiers=configured_verifiers(root),
-                                review_writes=review_writes)
+                                review_writes=review_writes,
+                                independent_approval=rules['independent_approval'],
+                                coordinator_writes=rules['coordinator_writes'],
+                                owners=owners,web_owner=web_owner)
             # A handoff request and a decline are recorded in the kit's handoff journal and move
             # nothing in bd, so the runner saw no write; they are writes all the same (review
             # of kittrial-5bb.97). One that was already recorded (`reconciled`) wrote nothing.
             if action=='handoff' and len(args)==2 and isinstance(result,dict) and result.get('reconciled') is False:runner.wrote=True
-            return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False,indent=2)+'\n','stderr':''.join(run_warnings)}
+            return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False,indent=2)+'\n','stderr':warning_text(run_warnings)}
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
             return guarded_write(root,request,journal_path(path),work_effect,
@@ -1257,16 +1302,36 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             if warnings:run_warnings.append(warnings)
             return stdout
         runner=NativeRunner(run)
+        # Slices 6 and 7 (kittrial-5bb.197): the three rules are read once, from the
+        # installation's own file, and an installation that configures nothing reads
+        # them all as OFF. A malformed value reads as OFF with a warning, as
+        # review_workflow_writes does, rather than failing every lifecycle write.
+        switch_warnings=[]
+        rules=configured_coordinator_rules(root,warnings=switch_warnings)
+        run_warnings.extend(switch_warnings)
+        # The registry is read only when a rule that needs it is on, and for the
+        # lifecycle write only when `lifecycle_authors` is on: with the rules OFF a
+        # malformed `operators` value must not stop `coordinate`, and a damaged
+        # registry must not stop the reads or a listed operator's operation
+        # (kittrial-5bb.197 review request 01a12894, item 4).
+        coordinate_operators=(configured_operators(root)
+                              if (rules['coordinator_writes'] or rules['independent_approval']) else None)
         def lifecycle_effect():
             if action=='lifecycle':result=apply_native(payload,actor,runner,
-                                                       operators=configured_operators(root),journal=path)
+                                                       operators=configured_operators(root),journal=path,
+                                                       lifecycle_authors=rules['lifecycle_authors'],
+                                                       independent_approval=rules['independent_approval'],
+                                                       owners=owner_loader(path,'lifecycle_authors'))
             elif action=='coordinate':
                 from coordination import apply_native as coordinate
-                result=coordinate(payload,actor,runner,path)
+                result=coordinate(payload,actor,runner,path,operators=coordinate_operators,
+                                  coordinator_writes=rules['coordinator_writes'],
+                                  independent_approval=rules['independent_approval'],
+                                  owners=owner_loader(path,'coordinator_writes'))
             else:
                 from requirement_records import apply_native as requirement_apply
                 result=requirement_apply(payload,actor,runner,path)
-            return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
+            return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':warning_text(run_warnings)}
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
             return guarded_write(root,request,journal_path(path),lifecycle_effect,
