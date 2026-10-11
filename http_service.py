@@ -1524,10 +1524,17 @@ class EndpointBackend:
                 '--service-namespace', self.actor_namespace]
         if require_authority:
             argv.append('--require-authority')
+        if action == 'owner-requirements':
+            argv.extend(['--terminal-endpoint-timeout', str(timeout or self.timeout)])
         try:
-            completed = subprocess.run(argv,
-                                       input=json.dumps(payload), text=True, encoding='utf-8',
-                                       capture_output=True, timeout=timeout or self.timeout)
+            if action == 'owner-requirements':
+                import endpoint_process
+                completed = endpoint_process.run(argv, input=json.dumps(payload),
+                                                 timeout=timeout or self.timeout)
+            else:
+                completed = subprocess.run(argv,
+                                           input=json.dumps(payload), text=True, encoding='utf-8',
+                                           capture_output=True, timeout=timeout or self.timeout)
         except subprocess.TimeoutExpired:
             raise uncertain('Canonical endpoint timed out; outcome may be unknown')
         if completed.returncode:
@@ -2047,6 +2054,10 @@ class EndpointBackend:
         if isinstance(reply,dict) and reply.get('returncode')==2 and 'Requirement was not found' in (reply.get('stderr') or ''):
             raise not_found('Requirement not found')
         return self._checked(reply, reading=True)
+
+    def requirement_operator_audits(self, project_id):
+        from requirement_terminal import operator_audits
+        return operator_audits(Path(self.root)/'projects'/project_id, project_id)
 
     def owner_requirements(self, principal, project_id, action, fields, key, task=None):
         operation_id=self._result_key(principal,project_id,'requirements.'+action,key,task)
@@ -5809,10 +5820,18 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     def _requirements_names(self, result):
         items=result.get('items', [result])
-        names=self.service.actor_names([(item.get('state') or {}).get('account_id') for item in items])
+        accounts = [(item.get('state') or {}).get('account_id') for item in items]
+        accounts += [(item.get('completion') or {}).get('actor') for item in items]
+        accounts += [((item.get('pending_transition') or {}).get('state') or {}).get('account_id') for item in items]
+        names=self.service.actor_names(accounts)
         for item in items:
             if item.get('state'):
                 item['state_author_name']=names.get(item['state']['account_id']) or 'Former project owner'
+            if item.get('completion'):
+                item['completion_author_name']=names.get(item['completion']['actor']) or 'Host operator or former project owner'
+            if item.get('pending_transition'):
+                pending = item['pending_transition']
+                pending['author_name']=names.get(pending['state']['account_id']) or 'Former project owner'
 
     def _requirements_write(self, ctx, action, status=200):
         self._requirements_backend()
@@ -5847,7 +5866,9 @@ class ApiHandler(BaseHTTPRequestHandler):
                 with self.service.store.lock:
                     recorded=self.service.state.setdefault('requirement_terminal_audits',{})
                     if token not in recorded:
-                        self.service.audit(ctx.request_id,ctx.principal,'requirements.'+action,'committed',project_id=pid)
+                        self.service.audit(ctx.request_id,ctx.principal,'requirements.'+action,'committed',project_id=pid,
+                                           requirement_id=result['id'], original_operation_id=result['operation_id'],
+                                           recovery_operation_id=(result.get('completion') or {}).get('operation_id') or result.get('recovery_operation_id'))
                         recorded[token]=ctx.request_id
             return result,result
         return self._mutate(ctx,'requirements.'+action,pid,write,status=status,
@@ -6747,6 +6768,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         self._project(ctx, CAP_PROJECT_ADMIN)
         limit, state = self._page(ctx, ctx.query)
         events = [e for e in self.service.state['audit'] if e.get('project_id') == ctx.params['pid']]
+        if hasattr(self.backend, 'requirement_operator_audits'):
+            events += self.backend.requirement_operator_audits(ctx.params['pid'])
+            events.sort(key=lambda event:(event['time'],event.get('request_id') or ''))
         page = events[state['o']:state['o'] + limit]
         names = self.service.actor_names([e.get('user_id') for e in page])
         body = {'items': [dict(e, user_name=names.get(e.get('user_id')), detail=e.get('reason'))

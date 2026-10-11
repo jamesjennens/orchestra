@@ -208,6 +208,7 @@ class OwnerContext:
     project: str
     account_id: str
     governance: dict
+    terminal_window: dict = None
 
 
 def owner_context(project_path, project, request, authority_config, simple=True):
@@ -233,7 +234,9 @@ def owner_context(project_path, project, request, authority_config, simple=True)
     current = governance.current(project_path, project)
     if simple and current['mode'] != 'simple':
         raise ValueError('This project uses governed requirements. Ask its owner to enable simple editing.')
-    return OwnerContext(project, account, current)
+    from requirement_terminal import write_window
+    return OwnerContext(project, account, current, write_window(
+        descriptor.get('now'), authority_config.terminal_endpoint_timeout))
 
 
 def checked_body(body, action):
@@ -447,13 +450,16 @@ def apply(project_path, context, action, body, operation_id, run, task=None):
     identifier(operation_id)
     if action in ('finish', 'abandon'):
         from requirement_terminal import recover
-        return recover(project_path, context, action, task, body, run)
+        return recover(project_path, context, action, task, body, run,
+                       recovery_operation_id=operation_id)
     if action in ('withdraw', 'supersede'):
         from requirement_terminal import apply as apply_terminal
         return apply_terminal(project_path, context, action, body, operation_id, run, task)
     if task is not None:
-        from requirement_terminal import pending_ids
-        pending, uncertain = pending_ids(project_path, context.project)
+        from requirement_terminal import pending_ids, require_unreserved_successor
+        transition_rows = records.read_rows(run)
+        require_unreserved_successor(project_path, context.project, task, transition_rows)
+        pending, uncertain = pending_ids(project_path, context.project, transition_rows)
         if task in uncertain:
             raise ValueError('Requirement transition receipt is damaged; ask the host operator to reconcile it')
         if task in pending:
@@ -654,7 +660,7 @@ def read(project_path, project, args, run, operators=None):
     # membership probes must use the supported label filters.
     rows = record_json.classify(records.read_rows(run), run, labels)
     from requirement_terminal import pending_ids, projection
-    pending, pending_error = pending_ids(project_path, project)
+    pending, pending_error = pending_ids(project_path, project, rows)
     items, decisions = [], []
     for row in rows:
         if not (records.TYPE_LABELS.intersection(row.get('labels') or [])
@@ -721,6 +727,7 @@ def read(project_path, project, args, run, operators=None):
     recoveries = projection(project_path, project, rows, run)
     for item in items:
         item['pending_transition'] = next((r for r in recoveries['items'] if r['id'] == item['id']), None)
+        item['completion'] = recoveries['completions'].get(item['id'])
     if args[0] == 'get':
         found = next((item for item in items if item['id'] == args[1]), None)
         if found is None:

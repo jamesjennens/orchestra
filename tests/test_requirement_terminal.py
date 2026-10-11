@@ -3,6 +3,7 @@ import copy
 import json
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import admin
@@ -64,6 +65,11 @@ class TerminalTests(unittest.TestCase):
     def recovery(self, item):
         return self.read(item)['pending_transition']
 
+    def after_writer(self, item):
+        saved = terminal.read_receipt(terminal.receipt_path(self.path, self.recovery(item)['operation_id']))
+        clock = mock.patch('requirement_terminal.time.time', return_value=saved['write_window']['abandon_after']+1)
+        clock.start(); self.addCleanup(clock.stop)
+
     def recover(self, item, action, saved, context=None):
         body=dict(original_operation_id=saved['operation_id'], expected_receipt_sha256=saved['expected_receipt_sha256'])
         if action=='abandon': body['reason']='No state was written; retain the attempted intent.'
@@ -78,18 +84,22 @@ class TerminalTests(unittest.TestCase):
         context=http.OwnerContext('alpha',second,governance.current(self.path,'alpha'))
         before=len(self.native.writes()); completed=self.recover(item,'finish',saved,context)
         self.assertEqual(completed['reason'],saved['reason']); self.assertEqual(completed['state'],saved['state'])
+        self.assertEqual(completed['completion']['actor'],second)
+        self.assertTrue(completed['completion']['at'])
         self.assertEqual(len(self.native.writes()),before+2)
         again=self.recover(item,'finish',saved,context); self.assertEqual(again['state'],completed['state'])
         self.assertEqual(len(self.native.writes()),before+2)
         comments=[c for c in self.native.row(item['id'])['comments'] if c['text'].startswith((owner.STATE_PREFIX,owner.REASON_PREFIX))]
         self.assertEqual([c['author'] for c in comments],[ACCOUNT,ACCOUNT])
         receipt=terminal.read_receipt(terminal.receipt_path(self.path,saved['operation_id']))
+        self.assertEqual(receipt['completion'],completed['completion'])
         current=dict(operation_id=saved['operation_id'],expected_receipt_sha256=terminal.receipt_sha256(receipt))
         with self.assertRaisesRegex(ValueError,'already written'): self.recover(item,'abandon',current)
 
     def test_abandon_keeps_disposition_and_allows_new_transition_but_not_old_key(self):
         item=self.accepted(); self.native.fail_comment_prefix=owner.STATE_PREFIX
         with self.assertRaises(ValueError): self.act(item)
+        self.after_writer(item)
         saved=self.recovery(item); self.assertTrue(saved['can_abandon']); self.assertTrue(saved['can_finish'])
         before=len(self.native.writes()); released=self.recover(item,'abandon',saved)
         self.assertEqual(released['disposition'],'released'); self.assertEqual(len(self.native.writes()),before)
@@ -101,23 +111,100 @@ class TerminalTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'abandoned'): self.act(item)
         self.native.fail_comment_prefix=None; self.assertEqual(self.act(item,operation='new-terminal')['requirement_state'],'withdrawn')
 
-    def test_abandon_refuses_any_state_even_when_successor_is_no_longer_eligible(self):
+    def test_pending_supersession_reserves_successor_for_edit_withdraw_and_supersede(self):
         for prefix in (owner.STATE_PREFIX,owner.REASON_PREFIX):
             with self.subTest(prefix=prefix):
                 self.setUp(); item=self.accepted(); target=self.accepted('replacement')
                 self.native.fail_comment_prefix=prefix
                 with self.assertRaises(ValueError): self.act(item,'supersede',successor={k:target[k] for k in ('id','revision','sha256')})
-                self.native.fail_comment_prefix=None; self.act(target,operation='target-terminal')
-                saved=self.recovery(item); self.assertFalse(saved['can_finish'])
-                self.assertEqual(saved['can_abandon'],prefix==owner.STATE_PREFIX)
-                with self.assertRaisesRegex(ValueError,'successor.*eligible'): self.recover(item,'finish',saved)
-                if prefix==owner.STATE_PREFIX: self.recover(item,'abandon',saved)
-                else:
-                    with self.assertRaisesRegex(ValueError,'already written'): self.recover(item,'abandon',saved)
+                self.native.fail_comment_prefix=None
+                third=self.accepted('third')
+                before=len(self.native.writes())
+                actions=[('revise',dict(expected_revision=target['revision'],expected_sha256=target['sha256'],title='Changed')),
+                         ('withdraw',self.expected(target)),
+                         ('supersede',dict(self.expected(target),successor={k:third[k] for k in ('id','revision','sha256')}))]
+                for action,body in actions:
+                    with self.subTest(action=action),self.assertRaisesRegex(ValueError,'pending transition '+item['id']):
+                        http.apply(self.path,self.context,action,body,'blocked-'+action,self.native,target['id'])
+                self.assertEqual(len(self.native.writes()),before)
+                self.recover(item,'finish',self.recovery(item))
+                self.assertEqual(self.act(target,operation='target-terminal')['requirement_state'],'withdrawn')
+
+    def test_written_supersession_finishes_recorded_pointer_after_successor_changes(self):
+        for action in ('revise','withdraw','supersede'):
+            with self.subTest(action=action):
+                self.setUp();item=self.accepted();target=self.accepted('replacement');third=self.accepted('third')
+                reference={k:target[k] for k in ('id','revision','sha256')}
+                self.native.fail_comment_prefix=owner.REASON_PREFIX
+                with self.assertRaises(ValueError):self.act(item,'supersede',successor=reference)
+                self.native.fail_comment_prefix=None
+                # Model a change already made by the preceding writer. The
+                # separate reservation test proves current routes refuse it.
+                with mock.patch.object(terminal,'require_unreserved_successor'):
+                    if action=='revise':
+                        http.apply(self.path,self.context,action,dict(expected_revision=target['revision'],
+                            expected_sha256=target['sha256'],title='Changed successor'),'legacy-edit',self.native,target['id'])
+                    else:
+                        extra={'successor':{k:third[k] for k in ('id','revision','sha256')}} if action=='supersede' else {}
+                        self.act(target,action,operation='legacy-target',**extra)
+                saved=self.recovery(item);self.assertTrue(saved['can_finish']);self.assertFalse(saved['can_abandon'])
+                self.assertIn('successor has changed',saved['message'])
+                self.assertEqual(saved['successor_title'],'replacement')
+                with self.assertRaisesRegex(ValueError,'already written'):self.recover(item,'abandon',saved)
+                completed=self.recover(item,'finish',saved)
+                self.assertEqual(completed['state']['superseded_by'],reference)
+                self.assertEqual(completed['reason'],saved['reason'])
+
+    def test_abandon_deadline_matches_projection_and_released_late_state_is_finishable(self):
+        item=self.accepted();self.native.fail_comment_prefix=owner.STATE_PREFIX
+        with self.assertRaises(ValueError):self.act(item)
+        pending=self.recovery(item);self.assertFalse(pending['can_abandon'])
+        self.assertIn('retry abandonment after',pending['abandon_unavailable'])
+        with self.assertRaisesRegex(ValueError,'retry abandonment after'):self.recover(item,'abandon',pending)
+        self.after_writer(item);pending=self.recovery(item);self.assertTrue(pending['can_abandon'])
+        self.recover(item,'abandon',pending)
+        self.native.fail_comment_prefix=None
+        # A prior writer's late native state beats a valid release receipt.
+        self.native(['comments','add',item['id'],owner.body(pending['state'],state=True),'--json'])
+        view=self.read(item);self.assertEqual(view['requirement_state'],'unknown')
+        late=view['pending_transition'];self.assertIsNotNone(late)
+        self.assertTrue(late['can_finish']);self.assertFalse(late['can_abandon'])
+        with self.assertRaisesRegex(ValueError,'already written'):self.recover(item,'abandon',late)
+        with self.assertRaisesRegex(ValueError,'pending'):
+            self.act(item,operation='new-late-terminal')
+        finished=self.recover(item,'finish',late)
+        self.assertEqual(finished['state'],pending['state'])
+        saved=terminal.read_receipt(terminal.receipt_path(self.path,pending['operation_id']))
+        self.assertEqual(saved['status'],'complete');self.assertIn('terminal_disposition',saved)
+
+    def test_restore_refuses_status_disposition_and_completion_tampering(self):
+        item=self.accepted();self.native.fail_comment_prefix=owner.STATE_PREFIX
+        with self.assertRaises(ValueError):self.act(item)
+        self.after_writer(item);pending=self.recovery(item);self.recover(item,'abandon',pending)
+        path=terminal.receipt_path(self.path,pending['operation_id']);released=json.loads(path.read_text())
+        altered=dict(released,status='pending');altered.pop('terminal_disposition')
+        with self.assertRaisesRegex(ValueError,'status or history'):
+            admin.validate_coordination_files({http.JOURNAL+'/'+path.name:altered})
+        self.native.fail_comment_prefix=None;self.native(['comments','add',item['id'],owner.body(pending['state'],state=True),'--json'])
+        self.recover(item,'finish',self.recovery(item));completed=json.loads(path.read_text())
+        altered=copy.deepcopy(completed);altered['completion']['actor']='usr_'+'c'*16
+        with self.assertRaisesRegex(ValueError,'status or history'):
+            admin.validate_coordination_files({http.JOURNAL+'/'+path.name:altered})
+
+    def test_multiple_pending_projection_reads_native_membership_once(self):
+        for key in ('first','second','third'):
+            item=self.accepted(key);self.native.fail_comment_prefix=owner.STATE_PREFIX
+            with self.assertRaises(ValueError):self.act(item,operation='pending-'+key)
+            self.native.fail_comment_prefix=None
+        before=len(self.native.calls);view=http.read(self.path,'alpha',['list'],self.native)
+        membership=[args for args in self.native.calls[before:] if args[:1]==['list'] and '--label' not in args]
+        self.assertEqual(len(membership),1,membership)
+        self.assertEqual(sum(item['pending_transition'] is not None for item in view['items']),3)
 
     def test_abandon_requires_complete_native_absence_and_refuses_unreadable_export(self):
         item=self.accepted(); self.native.fail_comment_prefix=owner.STATE_PREFIX
         with self.assertRaises(ValueError): self.act(item)
+        self.after_writer(item)
         saved=self.recovery(item); self.native.rows.append(dict(id='unreadable',malformed=True,labels=[],comments=[]))
         before=len(self.native.writes())
         with self.assertRaisesRegex(ValueError,'absence'): self.recover(item,'abandon',saved)
@@ -342,6 +429,7 @@ class TerminalTests(unittest.TestCase):
         self.assertEqual(result['state'],saved['state']);self.assertEqual(result['reason'],saved['reason'])
         empty=self.accepted('restore-empty');self.native.fail_comment_prefix=owner.STATE_PREFIX
         with self.assertRaises(ValueError):self.act(empty,operation='restore-pending')
+        self.after_writer(empty)
         self.native.fail_comment_prefix=None
         receipts={http.JOURNAL+'/'+p.name:json.loads(p.read_text()) for p in (self.path/http.JOURNAL).glob('*.json')}
         restored=governance.restored_files(governance.snapshot(self.path,'alpha'),'alpha','beta')

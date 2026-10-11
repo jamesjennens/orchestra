@@ -9,6 +9,7 @@ from unittest import mock
 import requirement_http as http
 import requirement_owner_records as owner
 import requirement_records as records
+import requirement_terminal as terminal
 from http_authority import journal_path
 from test_http_review_fixes import EndpointCase
 import test_http_requirements_owner as owner_fixture
@@ -48,6 +49,12 @@ class TerminalHttpTests(EndpointCase):
         return self.request('POST',self.base+'/requirements/'+item['id']+'/transition/'+action,body,
                             token=token or self.owner_token,key=key)
 
+    def after_writer(self,item):
+        pending=self.pending_transition(item)
+        saved=terminal.read_receipt(terminal.receipt_path(self.path,pending['operation_id']))
+        clock=mock.patch('requirement_terminal.time.time',return_value=saved['write_window']['abandon_after']+1)
+        clock.start();self.addCleanup(clock.stop)
+
     def test_second_owner_after_departure_finishes_from_reloaded_receipt_and_audits_once(self):
         first=self.accepted(); self.backend.native.fail_comment_prefix=owner.REASON_PREFIX
         failed=self.transition(first); self.assertEqual(failed.status,503,failed.data)
@@ -60,6 +67,8 @@ class TerminalHttpTests(EndpointCase):
         denied=self.recover_transition(first,saved,token=self.owner_token);self.assertEqual(denied.status,403,denied.data)
         finished=self.recover_transition(first,saved,token=token);self.assertEqual(finished.status,200,finished.data)
         self.assertEqual(finished.data['state'],saved['state']);self.assertEqual(finished.data['reason'],saved['reason'])
+        self.assertEqual(finished.data['completion']['actor'],second)
+        self.assertTrue(finished.data['completion']['at'])
         writes=len(self.backend.native.writes())
         for key in ('finish-transition','fresh-owner-finish'):
             replay=self.recover_transition(first,saved,token=token,key=key);self.assertEqual(replay.status,200,replay.data)
@@ -67,18 +76,37 @@ class TerminalHttpTests(EndpointCase):
         self.assertEqual(len(self.backend.native.writes()),writes)
         events=[e for e in self.service.state['audit'] if e['action']=='requirements.finish' and e['outcome']=='committed']
         self.assertEqual(len(events),1,events)
+        self.assertEqual(events[0]['requirement_id'],first['id'])
+        self.assertEqual(events[0]['original_operation_id'],saved['operation_id'])
+        self.assertEqual(events[0]['recovery_operation_id'],finished.data['completion']['operation_id'])
         row=self.backend.native.row(first['id'])
         self.assertEqual([c['author'] for c in row['comments'] if c['text'].startswith((owner.STATE_PREFIX,owner.REASON_PREFIX))],
                          [self.account,self.account])
         shown=self.request('GET',self.base+'/requirements/'+first['id'],token=token)
         self.assertEqual(shown.data['state_author_name'],'alex')
+        self.assertEqual(shown.data['completion_author_name'],'recovery-owner')
+        self.service.state['users'].pop(self.account);self.service.store.save()
+        shown=self.request('GET',self.base+'/requirements/'+first['id'],token=token)
+        self.assertEqual(shown.status,200,shown.data)
+        self.assertEqual(shown.data['state_author_name'],'Former project owner')
+        self.assertNotEqual(shown.data['state_author_name'],self.account)
 
     def test_abandon_before_state_and_refusal_after_state_keep_new_intents_usable(self):
         item=self.accepted();self.backend.native.fail_comment_prefix=owner.STATE_PREFIX
         failed=self.transition(item);self.assertEqual(failed.status,503,failed.data)
+        pending=self.pending_transition(item);self.assertFalse(pending['can_abandon'])
+        denied=self.recover_transition(item,pending,'abandon',key='early-abandon')
+        self.assertEqual(denied.status,422,denied.data);self.assertIn('retry abandonment after',str(denied.data))
+        self.after_writer(item)
         saved=self.pending_transition(item);self.assertTrue(saved['can_abandon'])
         released=self.recover_transition(item,saved,'abandon');self.assertEqual(released.status,200,released.data)
         self.assertEqual(released.data['disposition'],'released')
+        events=[e for e in self.service.state['audit'] if e['action']=='requirements.abandon' and e['outcome']=='committed']
+        self.assertEqual(len(events),1,events)
+        self.assertEqual(events[0]['requirement_id'],item['id'])
+        self.assertEqual(events[0]['original_operation_id'],saved['operation_id'])
+        self.assertEqual(events[0]['recovery_operation_id'],released.data['recovery_operation_id'])
+        self.assertTrue(events[0]['recovery_operation_id'])
         self.backend.native.fail_comment_prefix=None
         new=self.transition(item,key='after-abandon');self.assertEqual(new.status,200,new.data)
         other=self.accepted('second');self.backend.native.fail_comment_prefix=owner.REASON_PREFIX
@@ -105,6 +133,93 @@ class TerminalHttpTests(EndpointCase):
         body=dict(original_operation_id=saved['operation_id'],expected_receipt_sha256=saved['expected_receipt_sha256'],reason='Forged')
         result=self.request('POST',self.base+'/requirements/'+item['id']+'/transition/finish',body,token=self.owner_token,key='forged-finish')
         self.assertEqual(result.status,422,result.data);self.assertEqual(len(self.backend.native.writes()),before)
+
+    def test_recovery_route_and_adapter_refuse_nonowner_superuser_governed_and_stale_hash(self):
+        from http_authority import AuthorityConfig, NativeRunner, authority_request, run_guarded, CAP_PROJECT_ADMIN
+        item=self.accepted();self.backend.native.fail_comment_prefix=owner.STATE_PREFIX
+        self.assertEqual(self.transition(item).status,503)
+        self.backend.native.fail_comment_prefix=None
+        self.after_writer(item)
+        pending=self.pending_transition(item);before=len(self.backend.native.writes())
+        admin=self.admin_token();outsider=self.create_account(admin,'outsider','outsider-password-1')
+        outsider_token=self.login('outsider','outsider-password-1')[0]
+        self.assertEqual(self.request('PUT',self.base+'/members/'+outsider,{'role':'contributor'},token=admin).status,200)
+        self.service.state['memberships'][self.project].pop(self.service.authenticate(admin).user_id,None)
+        self.service.store.save()
+        def adapter(token,action,body,key):
+            principal=self.service.authenticate(token)
+            request=dict(project=self.project,actor=principal.user_id,action='owner-requirements',
+                args=[action,item['id']],attachments={'payload':{'flag':'--file','text':json.dumps(body)}},
+                operation_id=key,authority=authority_request(principal,self.project,CAP_PROJECT_ADMIN,now=self.service._expiry_now()),
+                route='requirements.'+action)
+            def guarded(root,built,journal,effect,**options):return run_guarded(built,journal,effect,**options)
+            return http.web_action(Path(self.canonical_root),self.path,self.project,request,
+                AuthorityConfig(str(self.service.store.path)),NativeRunner(self.backend.native),guarded)
+        for action in ('finish','abandon'):
+            fields=dict(original_operation_id=pending['operation_id'],expected_receipt_sha256=pending['expected_receipt_sha256'])
+            if action=='abandon':fields['reason']='Synthetic absence decision'
+            for index,token in enumerate((outsider_token,admin)):
+                self.assertEqual(self.recover_transition(item,pending,action,token=token,key='route-denied-'+action+str(index)).status,403)
+                with self.assertRaisesRegex(ValueError,'signed-in project owner'):
+                    adapter(token,action,fields,'adapter-denied-'+action+str(index))
+            stale=dict(fields,expected_receipt_sha256='0'*64)
+            denied=self.request('POST',self.base+'/requirements/'+item['id']+'/transition/'+action,stale,
+                                token=self.owner_token,key='stale-'+action)
+            self.assertEqual(denied.status,422,denied.data)
+            with self.assertRaisesRegex(ValueError,'changed'):
+                adapter(self.owner_token,action,stale,'adapter-stale-'+action)
+        mode=self.request('GET',self.base+'/requirements/governance',token=self.owner_token).data
+        self.assertEqual(self.request('PUT',self.base+'/requirements/governance',dict(self.expected(mode),mode='governed'),
+                                     token=self.owner_token,key='recovery-governed').status,200)
+        for action in ('finish','abandon'):
+            self.assertEqual(self.recover_transition(item,pending,action,key='governed-'+action).status,422)
+            fields=dict(original_operation_id=pending['operation_id'],expected_receipt_sha256=pending['expected_receipt_sha256'])
+            if action=='abandon':fields['reason']='Synthetic absence decision'
+            with self.assertRaisesRegex(ValueError,'governed requirements'):
+                adapter(self.owner_token,action,fields,'adapter-governed-'+action)
+        self.assertEqual(len(self.backend.native.writes()),before)
+        shown=self.pending_transition(item);self.assertFalse(shown['can_finish']);self.assertFalse(shown['can_abandon'])
+        self.assertIn('Enable simple editing',shown['message'])
+
+    def test_operator_completion_reason_is_durable_and_visible_in_service_audit(self):
+        item=self.accepted();self.backend.native.fail_comment_prefix=owner.REASON_PREFIX
+        self.assertEqual(self.transition(item).status,503)
+        self.backend.native.fail_comment_prefix=None;pending=self.pending_transition(item)
+        completed=records.reconcile(self.path,pending['operation_id'],'configured-operator',
+            'Finished after checking the exact native state.','complete',self.backend.native)
+        self.assertEqual(completed['completion']['actor'],'configured-operator')
+        self.assertEqual(completed['completion']['reason'],'Finished after checking the exact native state.')
+        self.assertEqual(completed['completion']['via'],'operator')
+        self.assertFalse(any(event['action']=='requirements.operator.finish' for event in self.service.state['audit']))
+        for _ in range(2):
+            audit=self.request('GET',self.base+'/audit',token=self.owner_token)
+            self.assertEqual(audit.status,200,audit.data)
+            events=[event for event in audit.data['items'] if event['action']=='requirements.operator.finish']
+            self.assertEqual(len(events),1,events)
+            self.assertEqual(events[0]['requirement_id'],item['id'])
+            self.assertEqual(events[0]['original_operation_id'],pending['operation_id'])
+            self.assertEqual(events[0]['reason'],completed['completion']['reason'])
+
+    def test_operator_abandon_alias_keeps_reason_and_recovery_audit_identity(self):
+        item=self.accepted();self.backend.native.fail_comment_prefix=owner.STATE_PREFIX
+        self.assertEqual(self.transition(item).status,503)
+        self.backend.native.fail_comment_prefix=None;self.after_writer(item)
+        pending=self.pending_transition(item)
+        released=records.reconcile(self.path,pending['operation_id'],'configured-operator',
+            'No native state after the writer deadline.','failed',self.backend.native)
+        self.assertEqual(released['disposition'],'released')
+        saved=terminal.read_receipt(terminal.receipt_path(self.path,pending['operation_id']))
+        self.assertEqual(saved['terminal_disposition']['reason'],'No native state after the writer deadline.')
+        self.assertEqual(saved['terminal_disposition']['operation_id'],released['recovery_operation_id'])
+        for _ in range(2):
+            audit=self.request('GET',self.base+'/audit',token=self.owner_token)
+            self.assertEqual(audit.status,200,audit.data)
+            events=[event for event in audit.data['items'] if event['action']=='requirements.operator.abandon']
+            self.assertEqual(len(events),1,events)
+            self.assertEqual(events[0]['requirement_id'],item['id'])
+            self.assertEqual(events[0]['original_operation_id'],pending['operation_id'])
+            self.assertEqual(events[0]['recovery_operation_id'],released['recovery_operation_id'])
+            self.assertEqual(events[0]['reason'],saved['terminal_disposition']['reason'])
 
     def transition(self,item,action='withdraw',key='terminal',token=None,body=None):
         return self.request('POST',self.base+'/requirements/'+item['id']+'/'+action,
@@ -252,10 +367,13 @@ class TerminalHttpTests(EndpointCase):
         node=shutil.which('node')
         if not node:self.skipTest('Node.js is required for transition recovery page checks')
         finish=self.accepted('page-finish');abandon=self.accepted('page-abandon');edit=self.accepted('page-edit')
+        replacement=self.accepted('page-replacement')
         self.backend.native.fail_comment_prefix=owner.REASON_PREFIX
-        self.assertEqual(self.transition(finish,key='page-finish').status,503)
+        self.assertEqual(self.transition(finish,'supersede',key='page-finish',body=self.terminal_body(finish,
+            successor={k:replacement[k] for k in ('id','revision','sha256')})).status,503)
         self.backend.native.fail_comment_prefix=owner.STATE_PREFIX
         self.assertEqual(self.transition(abandon,key='page-abandon').status,503)
+        self.after_writer(abandon)
         self.backend.native.fail_comment_prefix=None
         pending=self.request('PATCH',self.base+'/requirements/'+edit['id'],dict(self.expected(edit),description='Pending edit'),
             token=self.owner_token,key='page-pending-edit');self.assertEqual(pending.status,200,pending.data)

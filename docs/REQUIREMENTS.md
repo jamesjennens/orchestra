@@ -66,17 +66,32 @@ from the old record's pointer. A failed or conflicting transition reads as
 transition belongs to the project. Any current human owner in simple mode can
 finish the exact saved transition, including after a page reload or the original
 owner's departure. No remembered key or new reason/successor is used. Abandon
-only when a complete native read under the same locks proves no state was written;
-the receipt keeps a released disposition. Once a state was written, finish is the
-only action. A supersession whose successor is no longer eligible cannot be
-finished; abandon is available only before any state was written. Damaged receipts
+only after the saved server deadline (service time plus the endpoint and native
+timeouts), when a complete native read under the same locks proves no state was
+written. The page gives the retry time. The service stops the endpoint process group,
+including native children, on timeout or return. The receipt keeps its released disposition.
+Once a state was written, finish is the only action. A written supersession retains
+its exact replacement even if that successor later changes; its missing reason or
+label can still be finished. Before the state is written, the successor must still
+be eligible. A pending predecessor reserves its successor against editing,
+withdrawal and supersession until the predecessor is finished or abandoned.
+If a prior writer's state appears after release, that native decision overrides
+release: the transition is pending again and remains finishable. Damaged receipts
 are identified separately and affect their own requirement only; unidentifiable
 files are operator diagnostics, never evidence that every requirement is pending.
 `admin.py requirement-reconcile` finds the terminal receipt by its operation ID.
 For this recovery, the host operator supplies `--state` with the existing web
 service state document. The command takes its authority lock and the project lock,
 then either finishes the saved evidence (`--disposition complete`) or retains an
-abandonment disposition (`--disposition released`) after proving native absence.
+abandonment disposition (`--disposition released`) after the same deadline and
+native absence proof. For terminal recovery, `failed` is an alias for `released`;
+neither permits reuse of the abandoned transition's original key. Use a new intent.
+Completion retains the finisher, time and operator `--reason`, separately from
+the immutable original decision author and reason. The service audit includes
+the requirement, original operation and recovery operation. Operator audit entries
+are derived from verified durable receipt history, so a running service cannot
+overwrite them with an older in-memory audit tail. Receipt integrity covers
+status, release and completion history; restore refuses altered metadata.
 Before withdrawal or supersession of a pending edit, accept the pending edit first.
 
 | Consumer | Terminal requirement behavior |
@@ -90,14 +105,16 @@ Before withdrawal or supersession of a pending edit, accept the pending edit fir
 
 Backup/restore carries native evidence, the exact request receipts and governance
 source ranges. It preserves terminal hashes when the project is restored under a
-new name. Projects with no terminal records retain preceding-release compatibility.
-After the first withdrawal or supersession, **do not serve the project from an
-older kit**. The preceding reader refuses terminal evidence, but its writer does
+new name. Projects with no attempted terminal transitions retain preceding-release compatibility.
+From the first **attempted** withdrawal or supersession, **do not serve or restore
+the project with an older kit**, including an attempt interrupted before any native
+state was written. The preceding reader refuses terminal evidence, but its writer does
 not: editing and accepting can succeed and permanently damage terminal history.
 The preceding kit can also restore a backup with terminal records without warning,
 then read those records as unreadable. Use this release or a later compatible one
 for those backups. Do not strip evidence to make it readable. Restore a pre-transition
-backup if a rollback is required, retaining the post-transition backup separately. Named
+backup taken before the first attempted transition if a rollback is required,
+retaining the later backup separately. Named
 baselines and Markdown download/comparison are a separate later delivery.
 
 An interrupted acceptance uses its recorded generated decision ID. Editable

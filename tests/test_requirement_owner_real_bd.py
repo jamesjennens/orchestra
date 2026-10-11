@@ -776,6 +776,14 @@ except ValueError as error:
             empty=accepted('abandon-empty');self.fault('fail-one-terminal-state')
             self.assertEqual(transition(empty,'native-abandon-empty').status,503)
             pending=harness.request('GET',base+'/requirements/'+empty['id'],token=second_token).data['pending_transition']
+            self.assertFalse(pending['can_abandon'])
+            self.assertEqual(recover(empty,pending,'abandon',key='abandon-too-early').status,422)
+            from requirement_terminal import read_receipt,receipt_path
+            deadline=read_receipt(receipt_path(self.project,pending['operation_id']))['write_window']['abandon_after']
+            import time
+            while time.time()<=deadline:
+                time.sleep(min(1,deadline-time.time()+0.05))
+            pending=harness.request('GET',base+'/requirements/'+empty['id'],token=second_token).data['pending_transition']
             self.assertTrue(pending['can_abandon']);before_empty=self.rows()
             self.assertEqual(recover(empty,pending,'abandon',key='abandon-empty').status,200)
             self.assertEqual(self.rows(),before_empty)
@@ -797,6 +805,12 @@ except ValueError as error:
             done=subprocess.run(command,env=fixture.admin.environment(root),capture_output=True,text=True,timeout=120)
             self.assertEqual(done.returncode,0,done.stdout+'\n'+done.stderr)
             self.assertEqual(json.loads(done.stdout)['reason'],pending['reason'])
+            self.assertEqual(json.loads(done.stdout)['completion']['reason'],'Finish saved evidence.')
+            self.assertEqual(json.loads(done.stdout)['completion']['actor'],operator)
+            audit=harness.request('GET',base+'/audit',token=token)
+            self.assertEqual(audit.status,200,audit.data)
+            self.assertTrue(any(event['action']=='requirements.operator.finish' and event['requirement_id']==operate['id']
+                                for event in audit.data['items']))
             viewer_id=harness.create_account(admin,'terminal-viewer','terminal-viewer-password-1')
             viewer=harness.login('terminal-viewer','terminal-viewer-password-1')[0]
             self.assertEqual(harness.request('PUT',base+'/members/'+viewer_id,{'role':'viewer'},token=admin).status,200)

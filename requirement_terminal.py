@@ -4,6 +4,9 @@ The exact pair is saved before either native comment. A retry reads native state
 and writes only missing evidence. Acceptance and content are never rewritten.
 """
 import hashlib
+import math
+import time
+from datetime import datetime, timezone
 import keyed_records as core
 import requirement_governance as governance
 import requirement_owner_records as owner
@@ -12,6 +15,50 @@ from coordination import atomic, identifier
 from requirements import canonical_bytes, content_hash, load_json
 
 JOURNAL = '.requirement-owner-requests'
+NATIVE_TIMEOUT = 120
+
+
+def write_window(service_now=None, endpoint_timeout=150):
+    """Server launch configuration and service time, never browser request fields."""
+    moment = time.time() if service_now is None else service_now
+    if (isinstance(moment, bool) or not isinstance(moment, (int, float))
+            or not math.isfinite(moment)):
+        raise ValueError('Terminal service time cannot be verified')
+    # Starting the full window again at effect time is conservative when the
+    # endpoint spent time waiting for its locks. Native descendants have their
+    # own timeout; the service also terminates their process group on timeout.
+    return dict(service_started_at=moment, endpoint_timeout=endpoint_timeout,
+                native_timeout=NATIVE_TIMEOUT,
+                abandon_after=max(moment, time.time()) + endpoint_timeout + NATIVE_TIMEOUT)
+
+
+def seal(receipt):
+    saved = dict(receipt)
+    saved.pop('terminal_sha256', None)
+    saved['terminal_sha256'] = hashlib.sha256(canonical_bytes(saved)).hexdigest()
+    return saved
+
+
+def abandonment_wait(saved):
+    until = saved['write_window']['abandon_after']
+    if time.time() < until:
+        retry = datetime.fromtimestamp(until, timezone.utc).isoformat(timespec='seconds')
+        return 'The original writer may still be running. Reload and retry abandonment after %s.' % retry
+    return None
+
+
+def state_written(saved, row):
+    if row is None:
+        return False
+    try:
+        state, _ = owner.state_ledger(row, allow_partial=True)
+    except (ValueError, TypeError, KeyError):
+        return False
+    return state == saved['owner_state']
+
+
+def effective_pending(saved, row=None):
+    return saved['status'] == 'pending' or saved['status'] == 'released' and state_written(saved, row)
 
 
 def receipt_path(project_path, operation):
@@ -34,6 +81,16 @@ def read_receipt(path):
 
 def validate_receipt(receipt):
     core.validate_receipt(receipt)
+    if seal(receipt)['terminal_sha256'] != receipt.get('terminal_sha256'):
+        raise ValueError('Terminal receipt status or history cannot be verified')
+    window = receipt.get('write_window')
+    if (not isinstance(window, dict)
+            or set(window) != {'service_started_at', 'endpoint_timeout', 'native_timeout', 'abandon_after'}
+            or any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
+                   for value in window.values())
+            or window['endpoint_timeout'] <= 0 or window['native_timeout'] != NATIVE_TIMEOUT
+            or window['abandon_after'] < window['service_started_at'] + window['endpoint_timeout'] + NATIVE_TIMEOUT):
+        raise ValueError('Invalid terminal write deadline')
     state = owner.validate(receipt.get('owner_state'), state=True)
     reason = owner.validate_reason(receipt.get('owner_state_reason'))
     if (receipt.get('operation') not in ('withdraw', 'supersede')
@@ -55,19 +112,33 @@ def validate_receipt(receipt):
                         receipt['operation'], state['id'], body) != receipt['sha256']):
         raise ValueError('Terminal receipt conflicts with its exact request')
     disposition = receipt.get('terminal_disposition')
-    if receipt['status'] == 'released':
-        fields = {'project', 'actor', 'at', 'prior_receipt_sha256', 'reason', 'sha256'}
+    if disposition is not None:
+        fields = {'project', 'actor', 'at', 'operation_id', 'prior_receipt_sha256', 'reason', 'via', 'sha256'}
         if (not isinstance(disposition, dict) or set(disposition) != fields
                 or disposition['project'] != state['project']
                 or not isinstance(disposition['at'], str) or not disposition['at'].strip()
                 or not isinstance(disposition['reason'], str) or not disposition['reason'].strip()
                 or len(disposition['reason']) > 1000
+                or disposition['via'] not in ('owner', 'operator')
                 or content_hash(disposition) != disposition['sha256']):
             raise ValueError('Invalid terminal abandonment disposition')
         governance.digest(disposition['prior_receipt_sha256'])
         identifier(disposition['actor'])
-    elif disposition is not None:
-        raise ValueError('Unexpected terminal abandonment disposition')
+        identifier(disposition['operation_id'])
+    elif receipt['status'] == 'released':
+        raise ValueError('Missing terminal abandonment disposition')
+    completion = receipt.get('completion')
+    if receipt['status'] == 'complete':
+        if (not isinstance(completion, dict)
+                or set(completion) != {'actor', 'at', 'operation_id', 'reason', 'via', 'pending_receipt_sha256'}
+                or not isinstance(completion['at'], str) or not completion['at'].strip()
+                or not isinstance(completion['reason'], str) or len(completion['reason']) > 1000
+                or completion['via'] not in ('owner', 'operator')):
+            raise ValueError('Invalid terminal completion history')
+        identifier(completion['actor']); identifier(completion['operation_id'])
+        governance.digest(completion['pending_receipt_sha256'])
+    elif completion is not None:
+        raise ValueError('Unexpected terminal completion history')
     return receipt
 
 
@@ -86,7 +157,8 @@ def checked_current(project_path, context, row, body):
     return record
 
 
-def apply(project_path, context, action, body, operation, run, task):
+def apply(project_path, context, action, body, operation, run, task,
+          finished_by=None, recovery_operation_id=None, completion_reason='', completion_via='owner'):
     identifier(task); identifier(operation)
     rows = records.read_rows(run)
     row = records.find(rows, task)
@@ -101,12 +173,13 @@ def apply(project_path, context, action, body, operation, run, task):
     digest = identity(context, action, task, body)
     if prior and prior['sha256'] != digest:
         raise ValueError('This operation was used for different requirement content')
-    pending, uncertain = pending_ids(project_path, context.project)
+    pending, uncertain = pending_ids(project_path, context.project, rows)
+    require_unreserved_successor(project_path, context.project, task, rows)
     if task in uncertain:
         raise ValueError('Requirement transition receipt is damaged; ask the host operator to reconcile it')
     if task in pending and prior is None:
         raise ValueError('A requirement transition is pending; finish or abandon it on the requirements page')
-    if prior and prior['status'] == 'released':
+    if prior and prior['status'] == 'released' and state != prior['owner_state']:
         raise ValueError('This requirement transition was abandoned; start a new transition')
     if body['expected_state_sha256'] is not None:
         raise ValueError('A terminal requirement cannot be changed or reactivated; create a new requirement')
@@ -115,11 +188,11 @@ def apply(project_path, context, action, body, operation, run, task):
         raise ValueError('Requirement already has a different terminal transition')
     if prior and prior['status'] == 'complete' and (state, reason) != (prior['owner_state'], prior['owner_state_reason']):
         raise ValueError('Completed terminal evidence is missing; ask the host operator to reconcile it')
-    # A completed historical replay keeps the exact pointer even if its successor
-    # later becomes terminal. An incomplete operation rechecks its live target.
+    # The native state is the irreversible decision, even when its reason write
+    # was interrupted. Its exact successor must never be selected again.
     successor = body.get('successor')
-    proved_pair = prior and (state, reason) == (prior['owner_state'], prior['owner_state_reason'])
-    if successor is not None and not proved_pair:
+    proved_state = prior and state == prior['owner_state']
+    if successor is not None and not proved_state:
         if successor['id'] in uncertain:
             raise ValueError('Supersession target receipt is damaged; ask the host operator to reconcile it')
         if successor['id'] in pending:
@@ -138,7 +211,9 @@ def apply(project_path, context, action, body, operation, run, task):
             'withdrawn' if action == 'withdraw' else 'superseded', successor, body['reason'], core.now())
         prior = dict(sha256=digest, status='pending', actor=context.account_id, id=task,
                      revision=record['revision'], operation=action, request=body,
-                     owner_state=evidence, owner_state_reason=explanation)
+                     owner_state=evidence, owner_state_reason=explanation,
+                     write_window=context.terminal_window or write_window())
+        prior = seal(prior)
         validate_receipt(prior); atomic(path, prior)
     evidence, explanation = prior['owner_state'], prior['owner_state_reason']
     governance.validate_evidence(project_path, context.project, evidence)
@@ -156,10 +231,17 @@ def apply(project_path, context, action, body, operation, run, task):
     if label not in (confirmed.get('labels') or []):
         run(['update', task, '--add-label', label, '--json'])
     if prior['status'] != 'complete':
-        atomic(path, dict(prior, status='complete'))
+        completion = dict(actor=finished_by or context.account_id, at=core.now(),
+                          operation_id=recovery_operation_id or operation, reason=completion_reason,
+                          via=completion_via, pending_receipt_sha256=receipt_sha256(prior))
+        completed = seal(dict(prior, status='complete', completion=completion))
+        validate_receipt(completed); atomic(path, completed)
+    else:
+        completed = prior
     return dict(id=task, operation_id=operation, revision=record['revision'], sha256=record['sha256'],
                 acceptance_state='accepted', requirement_state=evidence['state'],
-                state=evidence, reason=explanation, reconciled=state is not None)
+                state=evidence, reason=explanation, completion=completed['completion'],
+                reconciled=state is not None)
 
 
 def recoverable(project_path, context, action, task, body, operation):
@@ -216,15 +298,29 @@ def scan(project_path, project):
     return found, damaged
 
 
-def pending_ids(project_path, project):
+def pending_ids(project_path, project, rows=None):
     receipts, damaged = scan(project_path, project)
-    return {r['id'] for r in receipts if r['status'] == 'pending'}, {r['id'] for r in damaged if r['id'] is not None}
+    return {r['id'] for r in receipts if effective_pending(r, records.find(rows, r['id']) if rows is not None else None)}, {r['id'] for r in damaged if r['id'] is not None}
 
 
-def absence(row, rows, run):
+def require_unreserved_successor(project_path, project, task, rows=None):
+    """A pending predecessor owns its exact successor until finish or abandon."""
+    receipts, _ = scan(project_path, project)
+    predecessors = sorted(r['id'] for r in receipts if effective_pending(r, records.find(rows, r['id']) if rows is not None else None)
+                          and r['owner_state']['superseded_by'] is not None
+                          and r['owner_state']['superseded_by']['id'] == task)
+    if predecessors:
+        raise ValueError('Requirement is the successor of pending transition %s; '
+                         'finish or abandon that predecessor before changing this requirement'
+                         % ', '.join(predecessors))
+
+
+def absence(row, rows, run, native_ids=None, native_error=None):
     """A complete export AND membership read, under the caller's existing locks."""
     import record_json
-    ids = record_json.native_ids(run)
+    if native_error:
+        raise ValueError(native_error)
+    ids = record_json.native_ids(run) if native_ids is None else native_ids
     if (any(r.get('malformed') for r in rows) or set(ids) != {r.get('id') for r in rows}
             or row is None):
         raise ValueError('Native absence cannot be proved from this read; reload before abandoning')
@@ -232,20 +328,23 @@ def absence(row, rows, run):
     return state is None and reason is None
 
 
-def recover(project_path, context, action, task, body, run):
+def recover(project_path, context, action, task, body, run, recovery_operation_id=None, completion_via='owner'):
     """The current owner authorizes the action; stored evidence keeps its author."""
     path = receipt_path(project_path, body['original_operation_id'])
     saved = read_receipt(path)
     if saved['id'] != task:
         raise ValueError('Terminal recovery does not belong to this requirement')
     governance.validate_evidence(project_path, context.project, saved['owner_state'])
-    if saved['status'] == 'released':
+    rows = records.read_rows(run); row = records.find(rows, task)
+    written = state_written(saved, row)
+    if saved['status'] == 'released' and not written:
         if action == 'abandon' and body['expected_receipt_sha256'] in (receipt_sha256(saved), saved['terminal_disposition']['prior_receipt_sha256']):
-            return dict(id=task, operation_id=body['original_operation_id'], disposition='released', reconciled=True)
+            return dict(id=task, operation_id=body['original_operation_id'], disposition='released',
+                        recovery_operation_id=saved['terminal_disposition']['operation_id'], reconciled=True)
         raise ValueError('This requirement transition was abandoned; start a new transition')
     if (receipt_sha256(saved) != body['expected_receipt_sha256']
             and not (saved['status'] == 'complete'
-                     and receipt_sha256(dict(saved, status='pending')) == body['expected_receipt_sha256'])):
+                     and saved['completion']['pending_receipt_sha256'] == body['expected_receipt_sha256'])):
         raise ValueError('Requirement transition changed; reload before recovering')
     if action == 'finish':
         from requirement_http import OwnerContext
@@ -256,32 +355,43 @@ def recover(project_path, context, action, task, body, run):
             if argv[:2] == ['comments', 'add']:
                 argv = [*argv, '--actor', saved['actor']]
             return run(argv)
-        try:
-            return apply(project_path, original, saved['operation'], saved['request'],
-                         body['original_operation_id'], attributed, task)
-        except ValueError as error:
-            if saved['operation'] == 'supersede' and any(word in str(error).lower() for word in ('target', 'accepted', 'changed')):
-                raise ValueError('The supersession successor is no longer eligible; finish is unavailable. Abandon only if no state was written.') from None
-            raise
-    rows = records.read_rows(run); row = records.find(rows, task)
+        return apply(project_path, original, saved['operation'], saved['request'],
+                     body['original_operation_id'], attributed, task,
+                     finished_by=context.account_id, recovery_operation_id=recovery_operation_id,
+                     completion_reason=body.get('reason', ''), completion_via=completion_via)
+    if written:
+        raise ValueError('A terminal state was already written; finish this transition instead of abandoning')
+    wait = abandonment_wait(saved)
+    if wait:
+        raise ValueError(wait)
     if not absence(row, rows, run):
         raise ValueError('A terminal state was already written; finish this transition instead of abandoning')
     if saved['status'] != 'pending':
         raise ValueError('This requirement transition is already complete')
     disposition = dict(project=saved['owner_state']['project'], actor=context.account_id, at=core.now(),
-                       prior_receipt_sha256=receipt_sha256(saved), reason=body['reason'])
+                       operation_id=recovery_operation_id or body['original_operation_id'],
+                       prior_receipt_sha256=receipt_sha256(saved), reason=body['reason'], via=completion_via)
     disposition['sha256'] = content_hash(disposition)
-    released = dict(saved, status='released', terminal_disposition=disposition)
+    released = seal(dict(saved, status='released', terminal_disposition=disposition))
     validate_receipt(released); atomic(path, released)
     if hasattr(run, 'wrote'): run.wrote = True
-    return dict(id=task, operation_id=body['original_operation_id'], disposition='released', reconciled=False)
+    return dict(id=task, operation_id=body['original_operation_id'], disposition='released',
+                recovery_operation_id=disposition['operation_id'], reconciled=False)
 
 
 def projection(project_path, project, rows, run):
     receipts, damaged = scan(project_path, project)
     items = []
-    for saved in receipts:
-        if saved['status'] != 'pending': continue
+    native_ids = None
+    native_error = None
+    candidates = [saved for saved in receipts if effective_pending(saved, records.find(rows, saved['id']))]
+    if candidates:
+        import record_json
+        try:
+            native_ids = record_json.native_ids(run)
+        except (ValueError, OSError, TypeError, KeyError):
+            native_error = 'Native absence cannot be proved from this read; reload before abandoning'
+    for saved in candidates:
         row = records.find(rows, saved['id'])
         item = dict(id=saved['id'], operation_id=saved['owner_state']['operation_id'],
                     expected_receipt_sha256=receipt_sha256(saved), state=saved['owner_state'],
@@ -295,19 +405,67 @@ def projection(project_path, project, rows, run):
             state, reason = owner.state_ledger(row, allow_partial=True)
             if state is not None and (state != saved['owner_state'] or reason is not None and reason != saved['owner_state_reason']):
                 raise ValueError('Requirement state conflicts with its transition receipt; ask the host operator')
-            item['can_abandon'] = absence(row, rows, run)
+            try:
+                item['can_abandon'] = absence(row, rows, run, native_ids, native_error)
+                item['abandon_unavailable'] = abandonment_wait(saved)
+                if item['abandon_unavailable']:
+                    item['can_abandon'] = False
+                elif not item['can_abandon']:
+                    item['abandon_unavailable'] = 'A state was written. Finish this recorded transition.'
+            except (ValueError, OSError, TypeError, KeyError):
+                item['abandon_unavailable'] = 'Native absence cannot be proved; reload or ask the host operator.'
             successor = original_body.get('successor')
-            if successor and (state, reason) != (saved['owner_state'], saved['owner_state_reason']):
+            if successor:
+                target = records.find(rows, successor['id'])
+                target_revisions = records.existing_revisions(target) if target else {}
+                target_record = target_revisions.get(successor['revision'])
+                item['successor_title'] = target_record['title'] if target_record else 'Unavailable requirement'
+            if successor and state != saved['owner_state']:
                 target = records.find(rows, successor['id'])
                 checked_current(project_path, context, target, dict(expected_revision=successor['revision'], expected_sha256=successor['sha256']))
                 if owner.state_ledger(target)[0] is not None:
                     raise ValueError('The supersession successor is no longer eligible; finish is unavailable.')
-                pending, broken = pending_ids(project_path, project)
+                pending, broken = pending_ids(project_path, project, rows)
                 if successor['id'] in pending or successor['id'] in broken:
                     raise ValueError('The supersession successor is unavailable; finish after its recovery.')
             item['can_finish'] = True
+            if context.governance['mode'] != 'simple':
+                item['can_finish'] = item['can_abandon'] = False
+                item['message'] = 'This project uses governed requirements. Enable simple editing to finish this saved transition, or ask the host operator.'
+            if successor and state == saved['owner_state']:
+                try:
+                    checked_current(project_path, context, target, dict(expected_revision=successor['revision'], expected_sha256=successor['sha256']))
+                    changed = owner.state_ledger(target)[0] is not None
+                except (ValueError, TypeError, KeyError):
+                    changed = True
+                if changed and context.governance['mode'] == 'simple':
+                    item['message'] = 'The successor has changed. Finish will retain the replacement recorded by this transition; its written decision cannot be abandoned.'
         except (ValueError, OSError, TypeError, KeyError) as error:
-            # All errors emitted above are fixed kit sentences, never path data.
-            item['message'] = 'This transition cannot be finished now. Reload; if its successor is no longer eligible, abandon only when no state was written.'
+            item['message'] = str(error) if isinstance(error, ValueError) else 'This transition cannot be verified; reload or ask the host operator to reconcile it.'
+            item['finish_unavailable'] = item['message']
         items.append(item)
-    return dict(items=items, damaged=damaged, total=len(items))
+    return dict(items=items, damaged=damaged, total=len(items),
+                completions={saved['id']:saved['completion'] for saved in receipts if saved['status'] == 'complete'})
+
+
+def operator_audits(project_path, project):
+    """Service audit entries derived from the verified durable operator history.
+
+    The receipt is the shared source: a host process never edits the running
+    service's in-memory audit tail, where its write could later be overwritten.
+    """
+    receipts, _ = scan(project_path, project)
+    events = []
+    for saved in receipts:
+        for disposition, history in (('released', saved.get('terminal_disposition')),
+                                     ('complete', saved.get('completion'))):
+            if not history or history['via'] != 'operator':
+                continue
+            operation = saved['owner_state']['operation_id']
+            events.append(dict(time=history['at'], request_id='operator-terminal-'+content_hash({
+                'operation':operation,'disposition':disposition,'history':history}),
+                user_id=None, actor=history['actor'], credential_id=None, project_id=project,
+                action='requirements.operator.'+('finish' if disposition=='complete' else 'abandon'),
+                outcome='committed', reason=history['reason'], requirement_id=saved['id'],
+                original_operation_id=operation, recovery_operation_id=history.get('operation_id')))
+    return sorted(events, key=lambda event:(event['time'],event['request_id']))

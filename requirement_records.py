@@ -682,8 +682,12 @@ def apply_native(payload, actor, run, project, operator=False, operators=None):
     # Reject invalid caller shapes before receipt discovery or guarded execution
     # can translate an attribute error into an uncertain write outcome.
     validate_payload(payload, operator=operator)
-    from requirement_terminal import pending_ids
-    pending, uncertain = pending_ids(Path(project), Path(project).name)
+    from requirement_terminal import pending_ids, require_unreserved_successor, scan
+    terminal_receipts, _ = scan(Path(project), Path(project).name)
+    transition_rows = read_rows(run) if any(r['status']=='released' for r in terminal_receipts) else None
+    if payload.get('task') is not None:
+        require_unreserved_successor(Path(project), Path(project).name, payload['task'], transition_rows)
+    pending, uncertain = pending_ids(Path(project), Path(project).name, transition_rows)
     if payload.get('task') in uncertain:
         raise ValueError('Requirement transition receipt is damaged; ask the host operator to reconcile it')
     if payload.get('task') in pending:
@@ -832,7 +836,8 @@ def reconcile(project, operation_id, actor, reason, disposition, run, issue_id=N
             raise ValueError('Terminal recovery requires simple requirements; preserve the receipt for operator reconciliation')
         return recover(Path(project), context, 'finish' if disposition == 'complete' else 'abandon',
                        receipt['id'], dict(original_operation_id=operation_id,
-                       expected_receipt_sha256=receipt_sha256(receipt), reason=reason), run)
+                       expected_receipt_sha256=receipt_sha256(receipt), reason=reason), run,
+                       completion_via='operator')
     return core.reconcile(project, operation_id, actor, reason, disposition, run, SPEC,
                           issue_id=issue_id)
 

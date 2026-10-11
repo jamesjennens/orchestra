@@ -18,7 +18,8 @@ function terminalStatus(ctx, pid, item) {
   h('p', null, item.state_message || displayText(item.reason?.reason)),
   successor ? h('p', null, 'Replaced by ', h('a', { href: ctx.href(`/p/${pid}/requirements/${successor.id}`) }, successor.id),
     ` · revision ${successor.revision}`, h('code', null, successor.sha256)) : null,
-  item.state ? h('p', { class: 'small' }, `Recorded by ${item.state_author_name || 'Former project owner'} · ${item.state.at}`) : null);
+  item.state ? h('p', { class: 'small' }, `Decided by ${item.state_author_name || 'Former project owner'} · ${item.state.at}`) : null,
+  item.completion ? h('p', { class: 'small' }, `Finished by ${item.completion_author_name || 'Host operator or former project owner'} · ${item.completion.at}`) : null);
 }
 
 function transitionRecovery(ctx, pid, item) {
@@ -26,11 +27,17 @@ function transitionRecovery(ctx, pid, item) {
   if (!saved) return null;
   const message = h('p', { role: 'status' }, saved.message);
   const reason = h('textarea', { maxlength: 1000, rows: 2 });
+  const confirm = h('input', { type: 'checkbox' });
+  const finish = h('button', { type: 'button', disabled: true, onclick: (event) => act(event, 'finish') }, 'Finish transition');
+  confirm.addEventListener('change', () => { finish.disabled = !saved.can_finish || !confirm.checked; });
   const body = { original_operation_id: saved.operation_id, expected_receipt_sha256: saved.expected_receipt_sha256 };
   const act = async (event, action) => {
     const button = event.currentTarget || event.target; button.disabled = true;
     try {
-      if (action === 'finish') await ctx.api.finishRequirementTransition(pid, item.id, body);
+      if (action === 'finish') {
+        if (!confirm.checked || !saved.can_finish) throw new Error('Confirm the irreversible saved transition before finishing.');
+        await ctx.api.finishRequirementTransition(pid, item.id, body);
+      }
       else {
         if (!reason.value.trim()) throw new Error('Explain why this transition should be abandoned.');
         await ctx.api.abandonRequirementTransition(pid, item.id, { ...body, reason: reason.value });
@@ -38,11 +45,16 @@ function transitionRecovery(ctx, pid, item) {
       ctx.go(`/p/${pid}/requirements/${item.id}`);
     } catch (error) { message.textContent = describe(error); button.disabled = false; }
   };
-  return h('section', { class: 'panel stack' }, h('h2', null, 'Pending requirement transition'),
-    h('p', null, 'Any current owner can finish the saved transition. Abandon only when no state was written. The original reason and replacement remain unchanged.'),
+  return h('section', { class: 'panel stack' }, h('h2', null, saved.state?.state === 'superseded' ? 'Pending supersession' : 'Pending withdrawal'),
+    saved.state?.superseded_by ? h('p', null, 'Replacement: ', h('a', { href: ctx.href(`/p/${pid}/requirements/${saved.state.superseded_by.id}`) }, displayText(saved.successor_title || 'Unavailable requirement'))) : null,
+    h('p', { class: 'small' }, `Started by ${saved.author_name || 'Former project owner'} · ${saved.state.at}`),
+    h('p', null, 'Finish retains the saved reason and replacement. This cannot be undone in the browser. Abandon is available only after the original writer has stopped and a complete read proves no state was written.'),
     h('p', null, displayText(saved.reason?.reason)), message,
-    h('button', { type: 'button', disabled: !saved.can_finish, onclick: (event) => act(event, 'finish') }, 'Finish transition'),
+    !saved.can_finish ? h('p', null, saved.finish_unavailable || saved.message) : null,
+    item.governance?.mode !== 'simple' ? h('a', { href: ctx.href(`/p/${pid}/requirements`) }, 'Open requirements to enable simple editing') : null,
+    h('label', null, confirm, ' I understand finishing this saved transition cannot be undone in the browser.'), finish,
     h('label', null, 'Why abandon this transition?', reason),
+    !saved.can_abandon ? h('p', null, saved.abandon_unavailable || saved.message) : null,
     h('button', { type: 'button', disabled: !saved.can_abandon, onclick: (event) => act(event, 'abandon') }, 'Abandon transition'));
 }
 
@@ -215,7 +227,7 @@ export async function requirement(ctx, { pid, rid }, project, data) {
     crumbs: [{ label: 'Requirements', href: ctx.href(`/p/${pid}/requirements`) }] }),
   h('div', { class: 'actions' }, state(main), accept, message),
   terminalStatus(ctx, pid, data),
-  data.can_edit && data.governance.mode === 'simple' ? transitionRecovery(ctx, pid, data) : null,
+  data.can_edit ? transitionRecovery(ctx, pid, data) : null,
   editable && data.kind === 'requirement' && data.pending_draft ? h('p', null, 'To withdraw or supersede this requirement, accept the pending edit first.') : null,
   h('p', { class: 'small' }, revision(main)),
   h('div', { class: 'panel-body', style: 'white-space:pre-wrap;unicode-bidi:plaintext' }, displayText(main.description)),
