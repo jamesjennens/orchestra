@@ -503,10 +503,12 @@ whether the rules are on or off.
 **Where the rules are enforced.** `independent_approval` and `coordinator_writes` are host
 (endpoint/SSH) settings for the review write path, and between them they cover `reviewed`,
 `integrated` and the merge slot. The **web route** has its own authority model
-([WEB_COORDINATOR_DESIGN.md](WEB_COORDINATOR_DESIGN.md)); a signed-in **owner** of the
-project may still approve through it under `coordinator_writes`, because the service has
-already established who the caller is and passes that verified principal to the endpoint
-(never a name the caller sends). `independent_approval` applies to the web route as well: an
+([WEB_COORDINATOR_DESIGN.md](WEB_COORDINATOR_DESIGN.md)), and under `coordinator_writes`
+that model decides, not the list: a signed-in **owner** of the project, a **coordinator by
+role**, or a personal **agent with the project's coordinator grant** approves through it,
+because the endpoint reads that authority again from the web service's live state for
+every such request and never goes by a name the caller sends. An agent without the grant
+is refused there. `independent_approval` applies to the web route as well: an
 owner approving their **own** web contribution is refused, and the refusal names the setting.
 The merge slot is not on the web route and stays with listed actors.
 

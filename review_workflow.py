@@ -2007,7 +2007,7 @@ def open_review_requests_by(rows, actor, operators=None, journal=None):
 
 
 def execute(rows, task, actor, payload, run, operators=None, journal=None, review_writes=None,
-            independent_approval=False, coordinator_writes=False, owners=None, web_owner=False):
+            independent_approval=False, coordinator_writes=False, owners=None, web_approval=False):
     """Validate, CAS and append once; return receipt and projected review state.
 
     ``journal`` is the project directory holding the host-issued
@@ -2025,7 +2025,7 @@ def execute(rows, task, actor, payload, run, operators=None, journal=None, revie
     both default OFF, so an installation that configures nothing behaves as before).
     ``owners`` is the project's actor -> principal map (``sessions.owners``), or a
     callable returning it so the registry is read only when a rule needs it, used by
-    the principal half of both rules. ``web_owner`` says the request came through the
+    the principal half of both rules. ``web_approval`` says the request came through the
     web route with a verified owner approval capability: the web service has already
     established who the caller is (kittrial-5bb.199), so ``coordinator_writes`` does
     not refuse it; the merge slot is not on that route and stays with listed actors.
@@ -2126,7 +2126,7 @@ def execute(rows, task, actor, payload, run, operators=None, journal=None, revie
         # stamped and before the sole native write, so a refusal writes nothing.
         if independent_approval or coordinator_writes:
             contribution=state.get('contribution') or {}
-            if coordinator_writes and not web_owner and not listed_operator_actor(actor,operators,owners):
+            if coordinator_writes and not web_approval and not listed_operator_actor(actor,operators,owners):
                 raise ValueError('approve refused: the installation setting coordinator_writes is on, so only a '
                                  'listed operator of this project may approve a contribution (or an actor of a '
                                  'listed operator\'s principal), and %s is neither. A worker still contributes, '

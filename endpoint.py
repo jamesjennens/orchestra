@@ -817,10 +817,13 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
         registry_rule='coordinator_writes' if rules['coordinator_writes'] else 'independent_approval'
         owners=(owner_loader(path,registry_rule)
                 if (rules['coordinator_writes'] or rules['independent_approval']) else None)
-        # A verified web-owner approval capability: the web service already established
-        # who the caller is, so `coordinator_writes` does not refuse an owner approving
-        # through the web route (kittrial-5bb.199). The merge slot is not on that route.
-        web_owner=(authority_config is not None and action=='review'
+        # A verified approval capability of the web route: the web service established who the
+        # caller is and that it may approve there (an owner, a coordinator by role, or an agent
+        # with the project's coordinator grant; `decide` above re-read that from the live
+        # authority store), so `coordinator_writes`, which is about names on the HOST route,
+        # does not refuse it (kittrial-5bb.199, kittrial-5bb.209). The merge slot is not on
+        # that route.
+        web_approval=(authority_config is not None and action=='review'
                    and isinstance(request.get('authority'),dict)
                    and request['authority'].get('capability')==CAP_APPROVE)
         def work_effect():
@@ -830,7 +833,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                                 review_writes=review_writes,
                                 independent_approval=rules['independent_approval'],
                                 coordinator_writes=rules['coordinator_writes'],
-                                owners=owners,web_owner=web_owner)
+                                owners=owners,web_approval=web_approval)
             # A handoff request and a decline are recorded in the kit's handoff journal and move
             # nothing in bd, so the runner saw no write; they are writes all the same (review
             # of kittrial-5bb.97). One that was already recorded (`reconciled`) wrote nothing.

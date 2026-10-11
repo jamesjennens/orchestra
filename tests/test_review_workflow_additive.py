@@ -1073,12 +1073,12 @@ class EndpointReviewSwitchTests(unittest.TestCase):
 
         def fake_work(path, actor, action, args, attachments, runner, operators=None,
                       verifiers=None, review_writes=None, independent_approval=False,
-                      coordinator_writes=False, owners=None, web_owner=False):
+                      coordinator_writes=False, owners=None, web_approval=False):
             seen['review_writes'] = review_writes
             seen['independent_approval'] = independent_approval
             seen['coordinator_writes'] = coordinator_writes
             seen['owners'] = owners
-            seen['web_owner'] = web_owner
+            seen['web_approval'] = web_approval
             return {'task': 'example-1', 'review_state': 'awaiting-review'}
 
         with patch.object(work, 'execute', side_effect=fake_work):
@@ -1100,7 +1100,7 @@ class EndpointReviewSwitchTests(unittest.TestCase):
         self.assertFalse(seen['independent_approval'])
         self.assertFalse(seen['coordinator_writes'])
         self.assertIsNone(seen['owners'])
-        self.assertFalse(seen['web_owner'])
+        self.assertFalse(seen['web_approval'])
         seen, _ = self._run(False, independent_approval=True, coordinator_writes=True)
         self.assertTrue(seen['independent_approval'])
         self.assertTrue(seen['coordinator_writes'])
