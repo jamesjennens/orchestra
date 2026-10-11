@@ -1429,7 +1429,9 @@ class DocumentationTests(unittest.TestCase):
         for phrase in ('### Accept bound keys only',
                        'bound-keys-only on --actor OPERATOR',
                        'Clean `authorized_keys` by hand',
-                       'which know nothing of this setting',
+                       # kittrial-5bb.250 r2 item 6: the passage now says which releases know
+                       # nothing and which refuse an unbound line themselves.
+                       'A release older than bound keys only knows nothing of the setting',
                        'admin.py authorized-keys-list',
                        'bound_keys_only',
                        'setup-status',
@@ -1449,6 +1451,12 @@ class DocumentationTests(unittest.TestCase):
                        'would_be_refused_more',
                        'its LAST `--root`',
                        'does not move the line out of this kit',
+                       # The r2 additions: the three groups, the hint and its bound, the flag.
+                       'may be refused',
+                       'may_be_refused',
+                       'a HINT',
+                       'first 64 KiB',
+                       '--without-preview',
                        'the setting is not why',
                        'VALID `deployment.private.json` larger than 1 MiB'):
             with self.subTest(phrase=phrase):
