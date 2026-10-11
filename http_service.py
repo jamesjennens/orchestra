@@ -1625,8 +1625,14 @@ class EndpointBackend:
             # a real timeout of the endpoint or of bd, OR any other exception that followed
             # a possible write (kittrial-5bb.173 item 3). Only the first is a timeout; the
             # rest get their own sentence so a person is not told the command timed out.
-            if 'Command timed out' in stderr:
+            if 'Command timed out' in stderr or '(TimeoutExpired:' in stderr:
+                # The first is endpoint.py's own timeout (outside run_guarded); the second is a
+                # bd timeout caught inside run_guarded and reported as Effect raised after the
+                # reservation (TimeoutExpired: ...) -- still a timeout (review 01a1288a).
                 raise uncertain('Canonical command timed out; outcome may be unknown')
+            if 'no effect was attempted' in stderr:
+                # Journal full before any effect: nothing was reserved and nothing was tried.
+                raise uncertain('Canonical command could not be reserved; no effect was attempted')
             raise uncertain('Canonical command failed after it was reserved; outcome may be unknown')
         if code == 75:
             # The endpoint was occupied (a wait for a lock ran out): the request may simply be
