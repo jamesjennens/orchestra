@@ -21,7 +21,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -722,15 +722,25 @@ class SettingsCommandTests(unittest.TestCase):
             self.switch('on')
 
     def test_a_non_operator_reads_no_authorized_keys_and_no_preview(self):
-        """N17: the preview (which opens the keys file) is read only AFTER the operator check."""
+        """N17: the preview (which opens the keys file and any wrapper it names) is read only
+        AFTER the operator check - patching what the switch actually calls, with a counting
+        open underneath, so a mutant that reads for a non-operator fails (kittrial-5bb.250
+        r2 item 5: the old shape patched a helper nothing calls)."""
         file = Path(self.tmp.name)/'authorized_keys'
         file.write_text('', encoding='utf-8')
-        with mock.patch.object(admin, 'bound_keys_only_would_refuse',
-                               side_effect=AssertionError('read before the operator check')) as preview:
+        opened = []
+        real_open = builtins.open
+        def counting_open(target, *args, **kwargs):
+            opened.append(str(target))
+            return real_open(target, *args, **kwargs)
+        with mock.patch.object(admin, 'authorized_keys_preview',
+                               side_effect=AssertionError('read before the operator check')) as preview, \
+                mock.patch.object(builtins, 'open', counting_open):
             for action in ('status', 'on', 'off'):
                 with self.assertRaises(ValueError):
                     admin.bound_keys_only_switch(self.root, action, 'mallory', str(file))
         preview.assert_not_called()
+        self.assertEqual([], opened)
 
     def test_status_reports_the_preview(self):
         """N11c: `status` must name the lines `on` would refuse, not None."""
@@ -814,21 +824,33 @@ class SettingsCommandTests(unittest.TestCase):
         self.assertFalse(admin.bound_keys_only(self.root))
         self.assertNotIn(admin.BOUND_KEYS_ONLY_KEY, self.document())
 
-    def test_a_wrapper_of_a_later_kit_that_knows_the_setting_decides_the_line(self):
-        """kittrial-5bb.250 F3: a line whose wrapper is not this kit's file but names the
-        setting (every release from .196 on) is decided by the setting - it counts in
-        would_be_refused - instead of being waved through as another kit's business."""
-        other = Path(self.tmp.name)/'other-release'
-        other.mkdir()
-        shutil.copy(KIT/'ssh_forced_command.py', other/'ssh_forced_command.py')
-        self.assertIn(b'bound_keys_only', (other/'ssh_forced_command.py').read_bytes()[:65536])
+    def test_a_foreign_wrapper_that_names_the_setting_is_a_hint_not_a_decision(self):
+        """kittrial-5bb.250 r2 item 3, the coordinator's decision: a wrapper outside this kit
+        carrying the word is a HINT. Line 92's shape (the word only in a comment) and line
+        95's (the word beyond 64 KiB) are served before and after on: never stated refused.
+        The line lands in group two - may be refused, wrapper_names_setting saying the hint."""
+        naming = Path(self.tmp.name)/'naming-release'
+        naming.mkdir()
+        shutil.copy(KIT/'ssh_forced_command.py', naming/'ssh_forced_command.py')
+        self.assertIn(b'bound_keys_only', (naming/'ssh_forced_command.py').read_bytes()[:65536])
+        commented = Path(self.tmp.name)/'comment-only'
+        commented.mkdir()
+        (commented/'ssh_forced_command.py').write_text(
+            '# a comment that says bound_keys_only and nothing else\n#!/bin/sh\necho hi\n', encoding='utf-8')
+        delayed = Path(self.tmp.name)/'word-past-the-bound'
+        delayed.mkdir()
+        (delayed/'ssh_forced_command.py').write_text(
+            '#' + 'x' * 70000 + ' bound_keys_only\n', encoding='utf-8')
         file = Path(self.tmp.name)/'authorized_keys'
-        file.write_text(key_line_text(self.root, kit=other) + '\n', encoding='utf-8')
+        file.write_text('\n'.join(key_line_text(self.root, kit=kit) for kit in (naming, commented, delayed)) + '\n',
+                        encoding='utf-8')
         listing = admin.authorized_keys_listing(self.root, str(file))
-        self.assertEqual([1], listing['would_be_refused'])
-        self.assertEqual([], listing.get('not_reached') or [])
+        self.assertEqual([], listing['would_be_refused'])
+        self.assertEqual([1, 2, 3], listing['may_be_refused'])
+        self.assertEqual({1: True, 2: True, 3: False}, listing['wrapper_names_setting'])
         status = admin.bound_keys_only_switch(self.root, 'status', OPERATOR, str(file))
-        self.assertEqual([1], status['would_be_refused'])
+        self.assertEqual([], status['would_be_refused'])
+        self.assertEqual([1, 2, 3], status['may_be_refused'])
 
     def test_a_wrapper_outside_every_kit_of_this_line_may_be_refused_never_not_reached(self):
         """kittrial-5bb.250 F3: a line whose wrapper cannot be read or names nothing is not
@@ -841,7 +863,7 @@ class SettingsCommandTests(unittest.TestCase):
         file.write_text(key_line_text(self.root, kit=other) + '\n', encoding='utf-8')
         listing = admin.authorized_keys_listing(self.root, str(file))
         self.assertEqual([], listing['would_be_refused'])
-        self.assertIn(1, listing.get('not_reached') or [1])
+        self.assertEqual([1], listing['may_be_refused'])
         notes = ' '.join(listing['notes'])
         self.assertIn('may refuse it', notes)
         self.assertNotIn('not refused by this setting at all', notes)
@@ -861,10 +883,133 @@ class SettingsCommandTests(unittest.TestCase):
         self.assertEqual([1, 2], [entry['line'] for entry in listing['lines']])
         self.assertEqual([2], listing['would_be_refused'])
 
+    def test_a_wrapper_that_is_a_fifo_is_never_opened(self):
+        """kittrial-5bb.250 r2 item 1: a key line can name ANY path ending in
+        ssh_forced_command.py; a fifo (or a symlink to one) there must not hang status, on or
+        the listing - the hint read opens regular files only, after lstat."""
+        fifo_dir = Path(tempfile.mkdtemp(prefix='bound-keys-wrapper-fifo-'))
+        self.addCleanup(shutil.rmtree, fifo_dir, ignore_errors=True)
+        os.mkfifo(fifo_dir/'ssh_forced_command.py')
+        symlinked = Path(self.tmp.name)/'via-symlink'
+        symlinked.mkdir(exist_ok=True)
+        (symlinked/'ssh_forced_command.py').symlink_to(fifo_dir/'ssh_forced_command.py')
+        for label, kit in (('a fifo', fifo_dir), ('a symlink to one', symlinked)):
+            file = Path(self.tmp.name)/'authorized_keys'
+            file.write_text(key_line_text(self.root, kit=kit) + '\n', encoding='utf-8')
+            with self.subTest(shape=label):
+                with self.assertWarns(None) if False else self.subTest(action='status'):
+                    pass
+                # The listing answers, with the line in group two, and never blocks.
+                listing = admin.authorized_keys_listing(self.root, str(file))
+                self.assertEqual([1], listing['may_be_refused'])
+                self.assertIsNone(listing['wrapper_names_setting'].get(1))
+                said = io.StringIO()
+                with mock.patch.object(sys, 'stderr', said):
+                    status = admin.bound_keys_only_switch(self.root, 'status', OPERATOR, str(file))
+                self.assertEqual([1], status['may_be_refused'])
+                self.assertIn('were not decided', said.getvalue())
+
+    def test_the_wrapper_hint_is_read_once_per_path_and_bounded(self):
+        """kittrial-5bb.250 r2 item 2: one read per distinct wrapper path per run (3,000
+        lines must not become 2,505 opens), and only the first 64 KiB of it."""
+        other = Path(self.tmp.name)/'one-release'
+        other.mkdir()
+        shutil.copy(KIT/'ssh_forced_command.py', other/'ssh_forced_command.py')
+        file = Path(self.tmp.name)/'authorized_keys'
+        file.write_text(''.join(key_line_text(self.root, kit=other) + '\n' for _ in range(300)), encoding='utf-8')
+        real_open = builtins.open
+        opens = []
+        def counting(target, *args, **kwargs):
+            if str(target).endswith('one-release/ssh_forced_command.py'):
+                opens.append(str(target))
+            return real_open(target, *args, **kwargs)
+        with mock.patch.object(builtins, 'open', counting):
+            admin.authorized_keys_listing(self.root, str(file))
+        self.assertEqual(1, len(opens))
+        # The 64 KiB bound: a wrapper whose word sits beyond it says hint False, not True.
+        delayed = Path(self.tmp.name)/'word-past-the-bound-2'
+        delayed.mkdir()
+        (delayed/'ssh_forced_command.py').write_text('#' + 'y' * 70000 + ' bound_keys_only\n', encoding='utf-8')
+        file2 = Path(self.tmp.name)/'authorized_keys-2'
+        file2.write_text(key_line_text(self.root, kit=delayed) + '\n', encoding='utf-8')
+        listing = admin.authorized_keys_listing(self.root, str(file2))
+        self.assertEqual({1: False}, listing['wrapper_names_setting'])
+
+    def test_a_relative_wrapper_path_is_not_decided(self):
+        """kittrial-5bb.250 r2 item 2: a relative wrapper path is group two wherever the
+        command runs from - never resolved against the caller's directory."""
+        file = Path(self.tmp.name)/'authorized_keys'
+        file.write_text(key_line_text(self.root, kit=Path('relative-kit')) + '\n', encoding='utf-8')
+        listing = admin.authorized_keys_listing(self.root, str(file))
+        self.assertEqual([], listing['would_be_refused'])
+        self.assertEqual([1], listing['may_be_refused'])
+        self.assertIsNone(listing['wrapper_names_setting'].get(1))
+
+    def test_status_and_on_say_the_undecided_lines(self):
+        """kittrial-5bb.250 r2 item 4: the shapes of the review's lines 58 (relative), 71
+        ($HOME), 72/84 (shell text), 94 (a shim) and 95 (the word beyond 64 KiB) are printed
+        by status AND on, in the JSON and on stderr - not cut off unnamed."""
+        shim = Path(self.tmp.name)/'shim'
+        shim.mkdir()
+        (shim/'ssh_forced_command.py').write_text('#!/bin/sh\nexec %s/ssh_forced_command.py "$@"\n'
+                                                  % KIT.as_posix(), encoding='utf-8')
+        lines = [key_line_text(self.root),                                                # 1: this kit, bound? no: unbound
+                 key_line_text(self.root, kit=Path('rel/kit')),                           # 2: relative
+                 key_line_text(self.root).replace('/usr/bin/python3', '$HOME/venv/bin/python3'),  # 3: $HOME
+                 key_line_text(self.root).replace('endpoint.py"', 'endpoint.py ; true"'),   # 4: shell text
+                 key_line_text(self.root, kit=shim),                                      # 5: shim
+                 key_line_text(self.root, bound=' --project alpha --principal ' + MINE)]  # 6: bound
+        file = Path(self.tmp.name)/'authorized_keys'
+        file.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+        said = io.StringIO()
+        with mock.patch.object(sys, 'stderr', said):
+            status = admin.bound_keys_only_switch(self.root, 'status', OPERATOR, str(file))
+        self.assertEqual([1], status['would_be_refused'])          # this kit's own wrapper only
+        self.assertEqual([2, 3, 4, 5], status['may_be_refused'])
+        self.assertIn('were not decided: 2, 3, 4, 5', said.getvalue())
+        self.assertIn('the kit that serves them may refuse them', said.getvalue())
+        said = io.StringIO()
+        with mock.patch.object(sys, 'stderr', said):
+            result = admin.bound_keys_only_switch(self.root, 'on', OPERATOR, str(file))
+        self.assertTrue(result['changed'])
+        self.assertEqual([2, 3, 4, 5], result['may_be_refused'])
+        self.assertIn('were not decided: 2, 3, 4, 5', said.getvalue())
+        admin.bound_keys_only_switch(self.root, 'off', OPERATOR)
+
+    def test_the_command_line_carries_the_without_preview_flag(self):
+        """kittrial-5bb.250 r2 item 5: main() drives --without-preview, and the small
+        things of item 7: --file '' is refused, the flag is refused on status and off, and a
+        no-op on with an unreadable keys file does not say 'Refusing to turn on'."""
+        missing = Path(self.tmp.name)/'no-keys-here'
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(sys, 'argv', ['admin.py', '--root', str(self.root), 'bound-keys-only', 'on',
+                                             '--actor', OPERATOR, '--file', str(missing),
+                                             '--without-preview']), \
+                redirect_stdout(out), redirect_stderr(err):
+            admin.main()
+        self.assertTrue(json.loads(out.getvalue())['changed'])
+        self.assertIn('could not be read', err.getvalue())
+        admin.bound_keys_only_switch(self.root, 'off', OPERATOR)
+        # --file '' is refused, not silently the default path.
+        with self.assertRaises(ValueError) as refused:
+            admin.bound_keys_only_switch(self.root, 'on', OPERATOR, '')
+        self.assertIn('--file is empty', str(refused.exception))
+        # The flag belongs to `on` only.
+        for action in ('status', 'off'):
+            with self.subTest(action=action):
+                with self.assertRaises(ValueError) as refused:
+                    admin.bound_keys_only_switch(self.root, action, OPERATOR, str(missing),
+                                                 without_preview=True)
+                self.assertIn('--without-preview belongs to bound-keys-only on', str(refused.exception))
+        # A no-op on with the setting already on and an unreadable keys file: no refusal text.
+        admin.bound_keys_only_switch(self.root, 'on', OPERATOR, without_preview=True)
+        noop = admin.bound_keys_only_switch(self.root, 'on', OPERATOR, str(missing), without_preview=True)
+        self.assertFalse(noop['changed'])
+        admin.bound_keys_only_switch(self.root, 'off', OPERATOR)
+
     def test_status_bounds_the_audit_entries_it_prints(self):
         """kittrial-5bb.250 F7: the audit list is hand-editable; the entries status prints
         on stdout are escaped and bounded as the stderr warnings are, not whole."""
-        self.switch('on') if False else None
         admin.bound_keys_only_switch(self.root, 'on', OPERATOR, without_preview=True)
         document = self.document()
         document[admin.BOUND_KEYS_ONLY_AUDIT_KEY][0]['actor'] = '\x1b[1M' + 'x' * 200000
@@ -943,11 +1088,18 @@ class SettingsCommandTests(unittest.TestCase):
         self.assertIn('could not be read', said.getvalue())
         self.assertTrue(admin.bound_keys_only(self.root))
 
-    @staticmethod
-    def fifo():
-        path = Path(tempfile.mkdtemp(prefix='bound-keys-fifo-'))/'authorized_keys'
+    FIFO_FOLDERS = []
+    @classmethod
+    def fifo(cls):
+        folder = Path(tempfile.mkdtemp(prefix='bound-keys-fifo-'))
+        cls.FIFO_FOLDERS.append(folder)          # removed at class teardown: nothing left in TMPDIR
+        path = folder/'authorized_keys'
         os.mkfifo(path)
         return path
+    @classmethod
+    def tearDownClass(cls):
+        for folder in cls.FIFO_FOLDERS:
+            shutil.rmtree(folder, ignore_errors=True)
 
     def test_the_status_command_prints_what_the_reader_says(self):
         said = io.StringIO()

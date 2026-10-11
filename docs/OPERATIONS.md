@@ -357,10 +357,16 @@ turn the setting on when the keys file cannot be read or was only partly inspect
 is missing, a directory, a fifo (which this command refuses to wait on), or larger than the 1 MiB
 bound: an operator who cannot see what will be cut off must say so deliberately, with
 `--without-preview`, and the refusal names that option; nothing is changed by the refusal
-(kittrial-5bb.250 F2, the coordinator's decision). A line whose forced command runs another kit's
-wrapper is not decided by this preview: a kit from this design line refuses an unbound line
-itself, so such a line **may be refused** by the kit that serves it - the notes never say it is
-not reached (kittrial-5bb.250 F3). It is operator-gated (`--actor` must be
+(kittrial-5bb.250 F2, the coordinator's decision). The preview decides in three groups
+(kittrial-5bb.250 r2): **refused** - a line of this kit's own wrapper file and this root, on a
+command that needs no shell and names no relative path; **may be refused** - every other wrapper
+or root, a command that needs the shell (`cd KIT && ...`, `2>/dev/null`, `; true`), and a
+relative or `$HOME` path, not decided here, with whether the wrapper file names the setting said
+as a HINT (the kit reads up to 64 KiB of a regular wrapper file a key line names, once per file
+per run - a word in a file is a hint, not a decision); and lines the wrapper refuses for another
+reason, refused either way. `status` and `on` PRINT the second group - its count and line
+numbers, in the JSON as `may_be_refused` and `may_be_refused_more` and on stderr - so no line is
+cut off unnamed. It is operator-gated (`--actor` must be
 on the deployment operator allowlist) and every flip is recorded in the deployment document's
 `bound_keys_only_audit`, with the value it replaced, keeping the last 20 flips; a flip that changes
 nothing writes nothing. `off` on a value that is not true or false is a real flip: it writes false,
@@ -384,9 +390,10 @@ unrestricted key, another program's `command=`, a project's rules, and rules 1 a
 
 **What it does not do, said plainly.** A line printed before an upgrade names the wrapper and the
 endpoint of the release it was printed from, by absolute path, and on an office installation that
-path carries the release. Such a line runs THAT release's wrapper and endpoint - which know
-nothing of this setting, or of rules 1 to 3 - against the live runtime, for as long as that
-release's directory is there, and nothing in the new kit can refuse it. **Clean
+path carries the release. Such a line runs THAT release's wrapper and endpoint against the live
+runtime, for as long as that release's directory is there. A release older than bound keys only
+knows nothing of the setting; every release from it on refuses an unbound line itself - which is
+why the preview reports such a line as **may be refused**, not decided here. **Clean
 `authorized_keys` by hand**: remove or reprint every line that points at another release. The
 setting closes a forgotten line of the CURRENT kit; it does nothing about an older release's.
 `admin.py authorized-keys-list` flags each line that points at a kit other than the installed one
@@ -397,8 +404,10 @@ setting is on or off, so it is the preview before `on`. The setting is decided b
 wrapper's own command line decides: the wrapper FILE the line runs and its LAST `--root` (its
 argparse takes the last when a line names it twice); an `--endpoint` argument that names another
 kit's file does not move the line out of this kit's reach. A line that runs another kit's wrapper,
-or whose last `--root` is another runtime, is never counted as refused: this setting does not reach
-it (that line is served by the release or the root it names), and the note says so. A named line
+or whose last `--root` is another runtime, or whose command needs the shell or names a relative
+path, is not decided by this preview: it is reported as one the kit that serves it **may refuse**
+(`may_be_refused`, with whether its wrapper file names the setting as a hint in the first 64 KiB
+of that regular file), never as refused by this setting and never as out of its reach. A named line
 the wrapper refuses for another reason (a bad or unknown argument, a binding named twice) is listed
 as refused with a sentence saying the setting is not why.
 

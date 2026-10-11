@@ -1,15 +1,20 @@
 {
   "schema_version": 1,
-  "operation_id": "capnew-5bb196-bound-keys-only-0001",
+  "operation_id": "caprev-5bb250-bound-keys-r2-0004",
   "key": "ssh.bound-keys-only",
-  "name": "An installation can accept bound keys only",
+  "revision": 3,
+  "expected_sha256": "abb850aca4b448b28a8bc2be52a6080371280dde639ea01f6f195a05f5343bd0",
+  "name": "Bound keys only: the setting, its audited switch, and a preview that says what it did not decide",
   "aliases": [
     "bound keys only",
-    "the bound-keys-only installation setting",
-    "an authorized_keys line without a project or a principal is refused",
-    "coordinators per project slice 4"
+    "bound-keys-only setting",
+    "bound_keys_only key",
+    "without-preview option",
+    "would be refused lines",
+    "may be refused lines",
+    "wrapper names setting hint"
   ],
-  "summary": "One installation setting: deployment.private.json's bound_keys_only, absent or false meaning off, so a bare installation is unchanged. admin.py bound-keys-only status|on|off --actor OPERATOR [--file FILE] is operator-gated, holds the deployment config lock, writes nothing when nothing changes, and appends to bound_keys_only_audit, keeping the last 20 flips. status reports audit_agrees and would_be_refused - the lines of this kit and root the setting refuses, or would refuse while off - and on prints that list. With it on, ssh_forced_command.py reads the runtime's own settings file (at most 1 MiB) and refuses, before selecting or running anything, a line naming no --project or no --principal: exit 2, the missing part named, nothing run; a line naming both runs as before. A settings file that cannot be read refuses every forced-command key, saying the installation setting could not be read (no path or value to the contributor); a non-bool value reads as off with a flushed warning. setup-status reports a bound_keys_only block; authorized-keys refuses to print a line the setting would refuse; authorized-keys-list flags such lines and names other-kit or other-root lines as not reached.",
+  "summary": "The setting bound_keys_only (deployment.private.json; absent or false is off) makes the forced command of an authorized_keys line refuse a line that names no project and no principal; the switch (admin.py bound-keys-only status/on/off, operator-gated, audited, off by default) previews what on would cut off, in three groups. REFUSED: a line of this kit's own wrapper file and this root, a command needing no shell on no relative path - would_be_refused (twenty numbers, would_be_refused_more, truncated with its warning) in status, on and the listing. MAY BE REFUSED: every other wrapper or root, a command needing the shell, a relative or $HOME path - not decided, printed by status and on as may_be_refused with may_be_refused_more, with whether the wrapper file names the setting said as a HINT from its first 64 KiB (once per file; a fifo never opened); a word in a file is a hint, not a decision. on REFUSES to flip when the keys file cannot be read or was only partly inspected (an empty or non-regular --file refused) unless the operator says so with --without-preview. Line numbers follow the line feed alone; the audit status prints is bounded.",
   "requirements": [],
   "anchors": [
     "docs/OPERATIONS.md#accept-bound-keys-only"
@@ -18,8 +23,6 @@
     "admin.py::bound_keys_only",
     "admin.py::bound_keys_only_switch",
     "admin.py::bound_keys_only_audit",
-    "admin.py::bound_keys_only_would_refuse",
-    "admin.py::project_setup_status",
     "admin.py::authorized_keys",
     "admin.py::authorized_keys_listing",
     "ssh_forced_command.py::bound_keys_only",
