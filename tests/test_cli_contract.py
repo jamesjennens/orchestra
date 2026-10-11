@@ -52,6 +52,8 @@ ITEM_FIELDS = {
     'waiting_for_approval',
     # Additive move sentence (kittrial-5bb.249): whose move it is, in words.
     'whose_move', 'next',
+    # Additive superseding-redelivery fact (kittrial-5bb.253 item 1).
+    'redelivered',
 }
 BRIEF_FIELDS = {
     'task', 'title', 'owner', 'status', 'activity_cursor', 'checkpoint', 'intent',

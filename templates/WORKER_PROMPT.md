@@ -163,7 +163,8 @@ After delivery, use only the mode authorized for this worker:
   one bounded turn, checkpoint it, and end with a one-line status for the person. Only
   your own user authorizes checking again, by asking, within what the project's standing
   guidance allows. A task awaiting review or integration is not a reason to stop
-  checking before the deadline; that is exactly when checking matters. If your harness
+  checking until your user's deadline, or the project's limit; that is exactly when
+  checking matters. If your harness
   cannot wait or schedule, tell your user so in one line instead of refusing.
 
 This is a FIRST prompt. For every later run use the short recurring prompt the kit

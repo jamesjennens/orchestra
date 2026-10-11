@@ -1068,10 +1068,17 @@ class InProcessBackend:
         unreadable=saved is not None and (not isinstance(saved,list) or
                    (bool(saved) and (last is None or not isinstance(last.get('open_items'),list))))
         at=last.get('created_at') if last and not unreadable else None
+        # The superseding-redelivery fact of the canonical row (kittrial-5bb.253 item 1), so
+        # the next-actions answer can hand it to `review_move` as the `work` row does.
+        open_requests=[r for r in review['requests'] if r['status']=='open']
+        contribution_id=(review['contribution'] or {}).get('id')
+        redelivered=bool(contribution_id) and bool(open_requests) and all(
+            str(r.get('contribution') or '')!=str(contribution_id) for r in open_requests)
         return {'pending_change_requests':[r['id'] for r in review['requests'] if r['status']=='open'][:20],
                 'open_items':None if unreadable else (len(last.get('open_items') or []) if last else 0),
                 'blocking_items':None if unreadable else sum(item.get('kind') in ('blocker','dependency')
                                                             for item in (last.get('open_items') or []) if isinstance(item,dict)) if last else 0,
+                'redelivered':redelivered,
                 'checkpoint_at':at,
                 'newer_activity':self._other_agent_activity(task,last) if last and not unreadable else None}
 
@@ -1288,6 +1295,9 @@ def own_queue_tasks(queue, actor=None):
                       'pending_review_items':row.get('open_requests'),
                       'open_items':fields.get('open_items',0),
                       'blocking_items':attention_blocking_items(fields),
+                      # The superseding-redelivery fact the canonical row carries
+                      # (kittrial-5bb.253 item 1), for `review_move`.
+                      'redelivered':fields.get('redelivered'),
                       'checkpoint_at':fields.get('checkpoint_at'),
                       'newer_activity':fields.get('newer_activity')})
     return {'tasks':tasks,'complete':bool(queue.get('complete'))}
@@ -2690,13 +2700,17 @@ class EndpointBackend:
 
     @staticmethod
     def _attention_fields(row):
-        """The four attention fields of one canonical ``work`` row, type-checked."""
+        """The attention fields of one canonical ``work`` row, type-checked."""
         open_items = row.get('open_items', 0)
         blocking_items = attention_blocking_items(row)
+        redelivered = row.get('redelivered')
         return {'pending_change_requests': [value for value in row.get('pending_change_requests') or []
                                             if isinstance(value, str)][:20],
                 'open_items': open_items if type(open_items) is int and open_items>=0 else None,
                 'blocking_items':blocking_items if type(blocking_items) is int and blocking_items>=0 else None,
+                # An older endpoint omits it: unknown, which `review_move` reads as not redelivered
+                # (kittrial-5bb.253 item 1).
+                'redelivered': redelivered if type(redelivered) is bool else None,
                 'checkpoint_at': row.get('checkpoint_at') if isinstance(row.get('checkpoint_at'), str) else None,
                 'newer_activity': row.get('newer_activity') if type(row.get('newer_activity')) is bool else None}
 
@@ -2737,6 +2751,8 @@ class EndpointBackend:
                              'pending_review_items': item.get('open_requests'),
                              'open_items': attention.get('open_items',0),
                              'blocking_items':attention_blocking_items(attention),
+                             # The superseding-redelivery fact (kittrial-5bb.253 item 1).
+                             'redelivered': attention.get('redelivered'),
                              'checkpoint_at': attention.get('checkpoint_at'),
                              'newer_activity': attention.get('newer_activity')})
             return {'tasks': rows, 'complete': bool(queue.get('complete'))}
@@ -5337,6 +5353,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                   'status': task.get('status'), 'review_state': task.get('review_state'),
                   'assignee': task.get('assignee'), 'reason': reason,
                   'links': {'task': base, 'brief': base + '/brief', 'history': base + '/history',
+                            'reviews': base + '/reviews',
                             'project': '/v1/projects/%s' % project_id}}
         action.update(extra)
         return action
@@ -5458,15 +5475,21 @@ class ApiHandler(BaseHTTPRequestHandler):
                            'blocked_since': task.get('checkpoint_at') if blocked else None,
                            'newer_activity': task.get('newer_activity') if blocked or in_progress else None}
                 # Whose move it is, in the same words as the canonical `work --mine` row
-                # (kittrial-5bb.249): one helper, so the two answers cannot disagree. N is the
-                # canonical open-item count where the backend carries it. The named-reviewer
+                # (kittrial-5bb.249): one helper, so the two answers cannot disagree about the
+                # move, the item count or the redelivery fact. The one deliberate difference is
+                # the way back: a web agent cannot run the client's `review TASK`, so the
+                # sentence names this task's brief route instead (kittrial-5bb.253 item 4). N is
+                # the canonical open-item count where the backend carries it. The named-reviewer
                 # case is not reachable here: these are the agent's own tasks.
                 item_count = task.get('pending_review_items')
                 if type(item_count) is not int or item_count < 0:
                     item_count = len(details['requests'])
+                task_base = '/v1/projects/%s/tasks/%s' % (project_id, task.get('id'))
                 move, move_text = review_move(review, task.get('id'),
                                               task.get('assignee') == actor,
-                                              pending_items=item_count)
+                                              pending_items=item_count,
+                                              redelivered=bool(task.get('redelivered')),
+                                              way_back='`%s`' % (task_base + '/brief'))
                 details['whose_move'], details['next'] = move, move_text
                 if review != 'changes-requested':
                     # The task asked for the two fields only where the kind is
