@@ -10,7 +10,7 @@ Self-contained briefs (intent, deliverable, scope, acceptance and working rules)
 
 ### 1. Queryable lifecycle facts
 
-Use the pinned Beads `set-state` / `state` mechanism rather than introducing an independent status database. Its help documents an event record plus a dimension:value label used for current lookup. Keep Beads' normal open/in-progress/closed task status separate.
+Use `lifecycle.py record` for contributor lifecycle assertions. Its host implementation uses the pinned Beads `set-state` mechanism, an event record plus a dimension:value label, rather than an independent status database. Raw contributor event and label writes in that namespace are refused. Keep Beads' normal open/in-progress/closed task status separate.
 
 Proposed dimensions: `implemented`, `tested`, `reviewed`, `integrated`, `deployed`, `live-verified`. Proposed values: `unknown`, `pending`, `passed`, `failed`, `not-applicable`. A missing legacy dimension means unknown, never false or passed. A successful fact requires an evidence reference and the relevant source commit/artifact or deployment identity. Preserve whether a fact was performed, reported by another worker, or imported.
 

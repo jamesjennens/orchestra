@@ -328,7 +328,8 @@ class NativeLabelResolutionTests(unittest.TestCase):
         # one reaches the native write instead of being refused by the status guard.
         (self.path / '.beads').mkdir()
         (self.path / '.beads' / 'metadata.json').write_text('{}', encoding='utf-8')
-        rows = [{'id': 'pp-req.1', 'status': 'in_progress', 'assignee': 'lane-a',
+        rows = [{'id': 'pp-req.1', 'issue_type': 'task', 'title': 'ordinary requirement',
+                 'description': '', 'status': 'in_progress', 'assignee': 'lane-a',
                  'labels': ['requirement', 'requirement:accepted'],
                  'comments': [{'id': 'c-1', 'author': 'ops-james',
                                'created_at': '2026-10-01T00:00:00Z',
@@ -629,6 +630,9 @@ class EndpointLabelAliasGuardTests(_EndpointRootMixin, unittest.TestCase):
 
     def test_ordinary_labels_still_reach_the_native_client_once(self):
         def proc(argv, **kwargs):
+            if 'show' in argv:
+                return _Proc(0, json.dumps([{'id': 'pp-1', 'issue_type': 'task',
+                                           'title': 'ordinary', 'description': '', 'labels': []}]), '')
             return _Proc(0, '{"id": "pp-1"}', '')
 
         for args in (['create', 'x', '--label', 'frontend,bug', '--json'],
