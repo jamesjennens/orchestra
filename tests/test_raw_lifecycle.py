@@ -96,6 +96,21 @@ class RawLifecycleTests(unittest.TestCase):
         self.guard(['update', 'pp-task', '--description=Discuss State change: tested → passed'])
         self.guard(['update', 'pp-task', '--description=Set reviewed to passed'])
 
+    def test_terminal_commands_protect_every_named_event(self):
+        for command in ('close', 'reopen'):
+            for event in (row(issue_type='event', title='State change: reviewed → passed'),
+                          row(issue_type='event', description='Changed tested from pending to passed')):
+                for args in ([command, 'pp-task'], [command, '-rordinary', 'pp-task', '--json'],
+                             [command, '--', 'pp-task']):
+                    self.rejected(args, rows=[event])
+                    self.guard(args)
+                self.rejected([command, 'pp-other', 'pp-task'], rows=[row(id='pp-other'), event])
+            self.rejected([command, 'pp-task'], rows=[row(title=None)])
+            self.rejected([command])
+            self.rejected([command, 'pp-task', '--unknown'])
+        self.rejected(['close', '-qf', 'pp-task'], rows=[row(issue_type='event', title='State change: live → passed')])
+        self.guard(['close', '-qf', 'pp-task'])
+
 
 if __name__ == '__main__':
     unittest.main()

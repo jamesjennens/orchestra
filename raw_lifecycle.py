@@ -81,16 +81,16 @@ def guard(args, attachments, read):
     this helper; configured operators keep the original raw route.
     """
     command = args[0]
-    if command not in ('create', 'update', 'dep'):
+    if command not in ('create', 'update', 'dep', 'close', 'reopen'):
         return
-    if command == 'dep':
+    if command in ('dep', 'close', 'reopen'):
         request = write_targets(args, attachments)
         if request is None:
             return
         if request['refusal']:
-            refuse('the dependency effect cannot be resolved')
+            refuse('the affected rows cannot be resolved')
         if any(event_shape(row) for row in checked_rows(read, request['targets'])):
-            refuse('dependencies of a lifecycle event cannot be changed through raw bd')
+            refuse('editing a lifecycle event through raw bd is not allowed')
         return
 
     # Resolve transported description bytes before scanning, without consulting

@@ -90,6 +90,34 @@ class NativeLifecycleTests(fixture.RealBdLabelAliasTests):
             self.assertEqual(answer['returncode'], 0, answer)
         self.assertIn('reviewed:passed', next(r for r in self.export_rows() if r['id']==target)['labels'])
 
+    def test_terminal_event_edits_refuse_before_native_write(self):
+        target = self.target()
+        result = self.bd('set-state', target, 'reviewed=passed', '--reason', 'synthetic legacy fact', '--json')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        fact = next(r for r in self.export_rows() if r.get('issue_type') == 'event'
+                    and r.get('title') == 'State change: reviewed → passed')
+        ordinary = self.target()
+        for command in ('reopen', 'close'):
+            for args in ([command, fact['id'], '--json'],
+                         [command, '-rsynthetic reason', fact['id'].split('-')[-1]],
+                         [command, '--', fact['id']],
+                         [command, ordinary, fact['id'], '--json']):
+                self.no_write(args)
+        self.no_write(['close', '-qf', fact['id']])
+        for command, status in (('close', 'closed'), ('reopen', 'open')):
+            answer = self.raw([command, ordinary, '--json'])
+            self.assertEqual(answer['returncode'], 0, answer)
+            self.assertEqual(next(r for r in self.export_rows() if r['id'] == ordinary)['status'], status)
+        config = self.root/'deployment.private.json'
+        original = config.read_bytes()
+        self.addCleanup(config.write_bytes, original)
+        document = json.loads(original); document['operators'] = ['op']
+        config.write_text(json.dumps(document), encoding='utf-8')
+        with mock.patch('raw_lifecycle.guard', side_effect=AssertionError('operator must bypass contributor guard')):
+            for command in ('reopen', 'close'):
+                answer = self.raw([command, fact['id'], '--json'], actor='op')
+                self.assertEqual(answer['returncode'], 0, answer)
+
 
 if __name__ == '__main__':
     unittest.main()
