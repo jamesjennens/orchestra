@@ -1194,6 +1194,15 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                 from http_authority import server_time as now_stamp
                 target=path/'ONBOARDING.md'
                 previous=None
+                if target.is_dir():
+                    # A directory at the document's name used to reach os.replace INSIDE the guarded
+                    # write, and an OSError there is not a refusal: the identity stayed reserved and
+                    # the caller got rc 124 "outcome unknown", which a caller with no shell cannot
+                    # reconcile (kittrial-5bb.242 item 5). Refused here, before anything is written,
+                    # as a refusal with a sentence.
+                    raise ValueError('Project onboarding cannot be written: %s is a directory, not a file. '
+                                     'Remove the directory, or write the document by hand on the host. '
+                                     'Nothing was written.'%target.name)
                 if target.is_file() and not target.is_symlink():
                     try:
                         previous=target.read_text(encoding='utf-8-sig')
@@ -1203,9 +1212,11 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                         # replaces it, and a caller with no shell has no other way. The unreadable
                         # previous text is treated as changed, and the answer says so in a sentence
                         # rather than the bare UnicodeDecodeError that used to answer rc 2 with
-                        # nothing written.
+                        # nothing written. The sentence ends in a newline like every other warning
+                        # the route joins: without one the client printed "...and replacedserver_time:
+                        # ..." on one line (kittrial-5bb.242 item 4).
                         run_warnings.append('the previous ONBOARDING.md could not be read as UTF-8 text; '
-                                            'it was treated as changed and replaced')
+                                            'it was treated as changed and replaced\n')
                 write_project(target,text)
                 # This route does NOT probe the text for endpoint paths (review of 958e883, item 3b):
                 # probe_endpoints resolves and reads every absolute *.py path the text names and
@@ -1459,6 +1470,8 @@ def main():
     p.add_argument('--service-namespace',
                    help="the web service's own actor namespace (default http): a name the "
                         'service was started under is refused at use too (kittrial-5bb.188 item 3)')
+    p.add_argument('--terminal-endpoint-timeout', type=float, default=150,
+                   help='trusted service launch timeout for terminal write abandonment fencing')
     p.add_argument('--key-project',action='append',metavar='NAME',
                    help='a project the calling SSH key is bound to (repeatable; passed only by '
                         'ssh_forced_command.py from the authorized_keys line): every request for '
@@ -1472,7 +1485,8 @@ def main():
     a=p.parse_args()
     authority_config=None
     if a.authority_store:
-        authority_config=AuthorityConfig(a.authority_store,a.authority_lock,a.service_namespace)
+        authority_config=AuthorityConfig(a.authority_store,a.authority_lock,a.service_namespace,
+                                         a.terminal_endpoint_timeout)
     try:
         if a.key_project is not None and a.authority_store:
             # A key line is not the web service, and the service passes no such flag.

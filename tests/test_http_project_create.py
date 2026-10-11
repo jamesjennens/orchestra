@@ -1836,6 +1836,35 @@ class HeldLockTests(Case):
                                                          key='account-zoe-2'))
         self.assertEqual(self.said(answer), (503, 'busy', self.BUSY))
 
+    def test_a_non_timeout_reservation_failure_does_not_say_timed_out(self):
+        """kittrial-5bb.173 item 3: 124 after a reservation is not only a timeout.
+
+        run_guarded reports 124 for a real timeout AND for any other exception that followed
+        a possible write. Both timeout texts say timed out; a journal-full refusal that
+        attempted nothing does not say "failed after it was reserved".
+        """
+        from http_service import HttpError
+        cases = [
+            ({'returncode': 124, 'stdout': '', 'stderr': 'Command timed out; mutation outcome may be uncertain.\n'},
+             'Canonical command timed out; outcome may be unknown'),
+            ({'returncode': 124, 'stdout': '',
+              'stderr': 'Effect raised after the reservation (TimeoutExpired: Command [...] timed out after 120 seconds); '
+                        'outcome unknown. Reconcile canonical state before retrying.\n'},
+             'Canonical command timed out; outcome may be unknown'),
+            ({'returncode': 124, 'stdout': '',
+              'stderr': 'Effect raised after the reservation (OSError: disk full); '
+                        'outcome unknown. Reconcile canonical state before retrying.\n'},
+             'Canonical command failed after it was reserved; outcome may be unknown'),
+            ({'returncode': 124, 'stdout': '',
+              'stderr': 'Journal is full; no effect was attempted. Reconcile state or reclaim the journal first.\n'},
+             'Canonical command could not be reserved; no effect was attempted'),
+        ]
+        for reply, sentence in cases:
+            with self.subTest(stderr=reply['stderr'][:40]):
+                with self.assertRaises(HttpError) as caught:
+                    self.backend._checked(reply, 'bd')
+                self.assertEqual(str(caught.exception), sentence)
+
     def test_an_outcome_the_endpoint_left_unknown_names_the_key_only_when_there_is_one(self):
         self.assertEqual(201, self.create(self.olive, 'alpha').status)
         real = self.backend._endpoint

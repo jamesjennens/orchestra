@@ -291,9 +291,9 @@ class NoUnguardedParseTests(unittest.TestCase):
             # kittrial-5bb.221 revision 2 moved tracker_actors' export rows to
             # record_json.loads_rows (the row bound), so four remain.
             'briefing.py': 3, 'coordination.py': 3, 'endpoint.py': 4, 'export_requirements.py': 1, 'feedback.py': 3, 'guidance.py': 3,
-            'handoff.py': 1, 'http_service.py': 2, 'lifecycle.py': 1, 'recovery.py': 1, 'requirements.py': 1, 'requirement_records.py': 1, 'reserved_comments.py': 1,
-            # The simple owner adapter guards bd's decision-create receipt and
-            # its bounded, regular-file owner receipt reader.
+            # Requirements request bodies use the guard and reject duplicate fields.
+            'handoff.py': 1, 'http_service.py': 3, 'lifecycle.py': 1, 'recovery.py': 1, 'requirements.py': 1, 'requirement_records.py': 1, 'reserved_comments.py': 1,
+            # The simple owner adapter guards bd's decision-create receipt too.
             'requirement_http.py': 2,
             'review_recommendations.py': 2, 'review_workflow.py': 4, 'work.py': 1, 'worker_gate.py': 1})
 

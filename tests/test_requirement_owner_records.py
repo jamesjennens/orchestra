@@ -25,6 +25,12 @@ class OwnerNative(Native):
         self.seed('job-1', issue_type='job')
 
     def __call__(self, args):
+        if '--actor' in args:
+            prior = self.actor
+            self.actor = args[args.index('--actor') + 1]
+            clean = list(args); del clean[clean.index('--actor'):clean.index('--actor') + 2]
+            try: return self(clean)
+            finally: self.actor = prior
         if args[0] == 'list':
             self.calls.append(list(args))
             rows = self.rows

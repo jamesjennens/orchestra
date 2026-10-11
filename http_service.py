@@ -82,6 +82,12 @@ AGENT_MAX_PAGES = 200
 #: an agent's own changes-requested, blocked or awaiting-review task is always collected
 #: however many claimable tasks sit beside it.
 AGENT_CLAIMABLE_LIMIT = MAX_PAGE
+#: Cap on the fall-through candidates a REFUSED claim offers (kittrial-5bb.6 review item
+#: 4). It is deliberately far smaller than the attention cap: a refusal is an error
+#: answer, not a listing, and a hundred candidate titles with a hostile one among them is
+#: both a size and a prompt-injection problem. When the cap cuts the list, the detail says
+#: so (``candidates_truncated``) instead of silently dropping rows.
+CLAIM_CANDIDATES_LIMIT = 10
 #: Bound on the projects one ``GET /v1/me/work`` read walks (the caller's own
 #: memberships, each read once). Reaching it reports ``truncated``.
 ME_WORK_MAX_PROJECTS = 50
@@ -1137,7 +1143,8 @@ class InProcessBackend:
                 waiting_since=review['latest_at'],
                 attention=self._agent_fields(task, review),
                 recommended_by=[r['author'] for r in review['recommendations']],
-                contribution_author=(review['contribution'] or {}).get('author')))
+                contribution_author=(review['contribution'] or {}).get('author'),
+                claimable=claimable_task(task, review)))
         items.sort(key=queue_order)
         return {'items': items, 'complete': True, 'warnings': []}
 
@@ -1226,7 +1233,8 @@ def queue_order(item):
 
 def queue_item(project_id, task, review_state, contribution, open_requests,
                pending_request_ids=None, waiting_since=None, integration=None,
-               integration_warnings=None, attention=None, recommended_by=None, contribution_author=None):
+               integration_warnings=None, attention=None, recommended_by=None, contribution_author=None,
+               claimable=None):
     """One review-queue row, in the shape both backends return.
 
     ``pending_request_ids`` and ``waiting_since`` (time of the latest review record)
@@ -1238,7 +1246,16 @@ def queue_item(project_id, task, review_state, contribution, open_requests,
     the canonical backend passes the ``work`` row's integration block and its
     any-pass-wins disagreement warnings through; the disposable backend records no
     lifecycle evidence and leaves them ``None``/empty.
+
+    ``claimable`` is additive (kittrial-5bb.6): the one bounded interpretation of
+    claimable work (``work.claimable``), so agent attention, My work and the claim
+    fall-through offer exactly the rows the canonical ``work --claimable`` view
+    offers. Advisory, never a reservation. ``None`` means the row's endpoint did not
+    state it (a staged upgrade or rollback): the older "open and unassigned" reading
+    is kept, so such an endpoint loses no suggestion it used to offer.
     """
+    if claimable is None:
+        claimable = task.get('status') == 'open' and task.get('assignee') is None
     return {'id': task.get('id'), 'project_id': project_id, 'title': task.get('title'),
             'status': task.get('status'), 'assignee': task.get('assignee'),
             'priority': task.get('priority'), 'created_at': task.get('created_at'),
@@ -1249,6 +1266,7 @@ def queue_item(project_id, task, review_state, contribution, open_requests,
             'waiting_since': waiting_since,
             'integration': integration,
             'integration_warnings': list(integration_warnings or []),
+            'claimable': bool(claimable),
             # What agent attention needs from the canonical ``work`` row (kittrial-5bb.114):
             # the request-changes record ids, and the latest checkpoint's open items,
             # time and whether anything is newer. None where the backend does not say.
@@ -1260,6 +1278,21 @@ def queue_item(project_id, task, review_state, contribution, open_requests,
             # Additive (kittrial-5bb.115 review): who delivered the current contribution, so
             # the person rule can be applied to a row as it is to a brief.
             'contribution_author': contribution_author}
+
+
+def claimable_task(task, review):
+    """One in-process task's bounded claimability, from the shared ``work.claimable``.
+
+    The disposable backend knows each row's issue type directly; the canonical backend
+    reads the ``claimable`` field the ``work`` projection already computed, so both
+    answer the same question (kittrial-5bb.6 deliverable b).
+    """
+    from work import claimable
+    contribution = review.get('contribution') if isinstance(review, dict) else None
+    return claimable(task.get('issue_type'), task.get('status'), task.get('assignee'),
+                     (contribution or {}).get('id'),
+                     review.get('state') if isinstance(review, dict) else None,
+                     labels=task.get('labels'))
 
 
 def attention_blocking_items(fields):
@@ -1524,10 +1557,17 @@ class EndpointBackend:
                 '--service-namespace', self.actor_namespace]
         if require_authority:
             argv.append('--require-authority')
+        if action == 'owner-requirements':
+            argv.extend(['--terminal-endpoint-timeout', str(timeout or self.timeout)])
         try:
-            completed = subprocess.run(argv,
-                                       input=json.dumps(payload), text=True, encoding='utf-8',
-                                       capture_output=True, timeout=timeout or self.timeout)
+            if action == 'owner-requirements':
+                import endpoint_process
+                completed = endpoint_process.run(argv, input=json.dumps(payload),
+                                                 timeout=timeout or self.timeout)
+            else:
+                completed = subprocess.run(argv,
+                                           input=json.dumps(payload), text=True, encoding='utf-8',
+                                           capture_output=True, timeout=timeout or self.timeout)
         except subprocess.TimeoutExpired:
             raise uncertain('Canonical endpoint timed out; outcome may be unknown')
         if completed.returncode:
@@ -1635,7 +1675,19 @@ class EndpointBackend:
         if code == 124:
             if reading:
                 raise cls._unread()
-            raise uncertain('Canonical command timed out; outcome may be unknown')
+            # 124 is "the identity is reserved and the outcome is unknown" (run_guarded):
+            # a real timeout of the endpoint or of bd, OR any other exception that followed
+            # a possible write (kittrial-5bb.173 item 3). Only the first is a timeout; the
+            # rest get their own sentence so a person is not told the command timed out.
+            if 'Command timed out' in stderr or '(TimeoutExpired:' in stderr:
+                # The first is endpoint.py's own timeout (outside run_guarded); the second is a
+                # bd timeout caught inside run_guarded and reported as Effect raised after the
+                # reservation (TimeoutExpired: ...) -- still a timeout (review 01a1288a).
+                raise uncertain('Canonical command timed out; outcome may be unknown')
+            if 'no effect was attempted' in stderr:
+                # Journal full before any effect: nothing was reserved and nothing was tried.
+                raise uncertain('Canonical command could not be reserved; no effect was attempted')
+            raise uncertain('Canonical command failed after it was reserved; outcome may be unknown')
         if code == 75:
             # The endpoint was occupied (a wait for a lock ran out): the request may simply be
             # sent again. Its line names the lock file it waited for, a path of the host, so it
@@ -2055,6 +2107,10 @@ class EndpointBackend:
         if isinstance(reply,dict) and reply.get('returncode')==2 and 'Requirement was not found' in (reply.get('stderr') or ''):
             raise not_found('Requirement not found')
         return self._checked(reply, reading=True)
+
+    def requirement_operator_audits(self, project_id):
+        from requirement_terminal import operator_audits
+        return operator_audits(Path(self.root)/'projects'/project_id, project_id)
 
     def owner_requirements(self, principal, project_id, action, fields, key, task=None):
         operation_id=self._result_key(principal,project_id,'requirements.'+action,key,task)
@@ -2798,7 +2854,9 @@ class EndpointBackend:
                                         recommended_by=[name for name in row.get('recommended_by') or []
                                                         if isinstance(name, str)],
                                         contribution_author=row.get('contribution_author')
-                                        if isinstance(row.get('contribution_author'), str) else None))
+                                        if isinstance(row.get('contribution_author'), str) else None,
+                                        claimable=row.get('claimable')
+                                        if isinstance(row.get('claimable'), bool) else None))
             offset = page.get('next_offset')
             if offset is None:
                 complete = True
@@ -2806,8 +2864,7 @@ class EndpointBackend:
             # Over-bound single-agent reads recover own tasks separately. Stop
             # once claimable suggestions fill; a review-heavy first page must
             # not hide all unclaimed work. Keep the same bounded page walk.
-            claimable = sum(item.get('status') == 'open' and item.get('assignee') is None
-                            for item in items)
+            claimable = sum(item.get('claimable') is True for item in items)
             if (stop_if_over_bound and type(page.get('total')) is int
                     and page['total'] > self.QUEUE_MAX_PAGES * MAX_PAGE
                     and claimable >= min(AGENT_CLAIMABLE_LIMIT, AGENT_ACTION_LIMIT)):
@@ -3428,7 +3485,13 @@ class ApiHandler(BaseHTTPRequestHandler):
                 # Bounded nesting (kittrial-5bb.108): a body nested deeper than the kit ever
                 # writes is refused here, as bad JSON, and never reaches a route or the
                 # operation journal. It used to be an HTTP 500.
-                payload = record_json.loads(body)
+                # Duplicate requirement fields must not silently choose one of
+                # two reasons or successors before closed-schema validation.
+                if re.fullmatch(r'/v1/projects/[^/]+/requirements(?:/.*)?', urlsplit(self.path).path):
+                    from export_requirements import _unique
+                    payload = record_json.loads(body, object_pairs_hook=_unique)
+                else:
+                    payload = record_json.loads(body)
             except (ValueError, UnicodeError):
                 raise invalid('Request body is not valid JSON')
             if not isinstance(payload, dict):
@@ -3962,6 +4025,35 @@ class ApiHandler(BaseHTTPRequestHandler):
         """
         return self._cached_read('queue', project_id,
                                  lambda: self._independent_queue(self.backend.review_queue(project_id), project_id), shared)
+
+    def _claim_candidates(self, project_id, exclude, limit=None):
+        """Bounded claimable rows to fall through to when a claim is refused.
+
+        The same rows the canonical ``work --claimable`` view lists (kittrial-5bb.6
+        deliverable b), taken from this request's bounded queue read, in the queue's own
+        order and excluding the task just refused. Advisory only: a candidate is not a
+        reservation and the next claim is still atomic. A read failure supplies no
+        candidates and never changes the refusal.
+
+        Returns ``(candidates, truncated)``: at most ``limit`` (default
+        :data:`CLAIM_CANDIDATES_LIMIT`, ten) rows, and whether the read held more
+        claimable rows than the cap allowed, so the caller can say the list was cut
+        (kittrial-5bb.6 review item 4).
+        """
+        try:
+            read = self._review_queue(project_id)
+        except (HttpError, ValueError):
+            return [], False
+        if not isinstance(read, dict):
+            return [], False
+        bound = CLAIM_CANDIDATES_LIMIT if limit is None else limit
+        found = []
+        for task in read.get('items') or []:
+            if not isinstance(task, dict) or task.get('id') == exclude:
+                continue
+            if task.get('claimable') is True:
+                found.append({'task': task.get('id'), 'title': task.get('title')})
+        return found[:bound], len(found) > bound
 
     def _cached_read(self, kind, project_id, load, shared=False):
         """One canonical read per request, optionally reused across requests.
@@ -5551,7 +5643,11 @@ class ApiHandler(BaseHTTPRequestHandler):
                         'Review state %s: %s.' % (review or 'unknown', action['text']),
                         who=action['who'], **details))
             for task in read['tasks']:
-                if task.get('status') == 'open' and task.get('assignee') is None:
+                # The one bounded interpretation (kittrial-5bb.6 deliverable b): a row the
+                # shared predicate calls claimable, not "any open unassigned task". Epics,
+                # decisions, gates, jobs, record anchors, delivered work and owned work are
+                # therefore never offered as claimable suggestions.
+                if task.get('claimable') is True:
                     counts['claimable'] += 1
                     if len(claimable_actions) < AGENT_CLAIMABLE_LIMIT:
                         claimable_actions.append(self._agent_action(
@@ -5865,6 +5961,24 @@ class ApiHandler(BaseHTTPRequestHandler):
                 or self.service.state.get('memberships',{}).get(pid,{}).get(ctx.principal.user_id)!='owner'):
             raise forbidden('Requirements editing needs the signed-in project owner')
 
+    def _requirements_names(self, result):
+        items=result.get('items', [result])
+        accounts = [(item.get('state') or {}).get('account_id') for item in items]
+        accounts += [(item.get('completion') or {}).get('actor') for item in items]
+        accounts += [((item.get('pending_transition') or {}).get('state') or {}).get('account_id') for item in items]
+        names=self.service.actor_names(accounts)
+        # The shared resolver returns the identifier for unknown accounts.
+        # Historical human attribution must use neutral text on this page.
+        names={account:name for account,name in names.items() if name != account}
+        for item in items:
+            if item.get('state'):
+                item['state_author_name']=names.get(item['state']['account_id']) or 'Former project owner'
+            if item.get('completion'):
+                item['completion_author_name']=names.get(item['completion']['actor']) or 'Host operator or former project owner'
+            if item.get('pending_transition'):
+                pending = item['pending_transition']
+                pending['author_name']=names.get(pending['state']['account_id']) or 'Former project owner'
+
     def _requirements_write(self, ctx, action, status=200):
         self._requirements_backend()
         self._requirements_owner(ctx)
@@ -5872,7 +5986,11 @@ class ApiHandler(BaseHTTPRequestHandler):
             'create':('kind','parent','title','description','key'),
             'revise':('expected_revision','expected_sha256','title','description'),
             'accept':('expected_revision','expected_sha256'),
+            'withdraw':('expected_revision','expected_sha256','expected_state_sha256','reason'),
+            'supersede':('expected_revision','expected_sha256','expected_state_sha256','reason','successor'),
             'release':('original_operation_id','expected_receipt_sha256','reason'),
+            'finish':('original_operation_id','expected_receipt_sha256'),
+            'abandon':('original_operation_id','expected_receipt_sha256','reason'),
             'governance':('mode','expected_revision','expected_sha256')}[action],'Requirements')
         import requirement_http
         try: requirement_http.checked_body(fields,action)
@@ -5880,12 +5998,32 @@ class ApiHandler(BaseHTTPRequestHandler):
         if operation_id is not None:
             raise invalid('Use the Idempotency-Key header for requirements writes')
         pid=ctx.params['pid']
+        if action in ('withdraw','supersede','finish','abandon'):
+            # Give immediate mode advice; the canonical adapter repeats the
+            # check under the project/authority locks, including exact replays.
+            if self.backend.requirements_read(pid,['governance'])['mode']!='simple':
+                raise invalid('This project uses governed requirements. Ask its owner to enable simple editing.')
         def write():
             result=self.backend.owner_requirements(ctx.principal,pid,action,fields,
                                                     ctx.idempotency_key or ctx.request_id,ctx.params.get('rid'))
+            if action in ('withdraw','supersede','finish','abandon'):
+                token=request_hash({'project':pid,'operation_id':result['operation_id'],
+                                    'disposition':result.get('disposition','complete')})
+                with self.service.store.lock:
+                    recorded=self.service.state.setdefault('requirement_terminal_audits',{})
+                    if token not in recorded:
+                        self.service.audit(ctx.request_id,ctx.principal,'requirements.'+action,'committed',project_id=pid,
+                                           requirement_id=result['id'], original_operation_id=result['operation_id'],
+                                           recovery_operation_id=(result.get('completion') or {}).get('operation_id') or result.get('recovery_operation_id'))
+                        recorded[token]=ctx.request_id
             return result,result
         return self._mutate(ctx,'requirements.'+action,pid,write,status=status,
-                            capability=CAP_PROJECT_ADMIN,serialize=False,canonical=True)
+                            capability=CAP_PROJECT_ADMIN,serialize=False,canonical=True,
+                            # Terminal replay authority belongs to the canonical
+                            # owner adapter. Its durable identity still deduplicates
+                            # effects; a service response must not bypass that check.
+                            idempotent=action not in ('withdraw','supersede','finish','abandon'),
+                            audit_success=action not in ('withdraw','supersede','finish','abandon'))
 
     @route('GET', r'/v1/projects/(?P<pid>'+ID+r')/requirements/governance')
     def requirements_governance_read(self,ctx):
@@ -5910,6 +6048,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         self._requirements_backend(); self._project(ctx,CAP_READ)
         result=dict(self.backend.requirements_read(ctx.params['pid'],['list']))
         result['items']=[self._requirement_author(ctx,item) for item in result.get('items',[])]
+        self._requirements_names(result)
         result['can_edit']=(ctx.principal.via=='session' and not ctx.principal.agent_id
                             and self.service.state.get('memberships',{}).get(ctx.params['pid'],{}).get(ctx.principal.user_id)=='owner')
         return 200,result
@@ -5923,6 +6062,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         self._requirements_backend(); self._project(ctx,CAP_READ)
         result=dict(self.backend.requirements_read(ctx.params['pid'],['get',ctx.params['rid']]))
         result=self._requirement_author(ctx,result)
+        self._requirements_names(result)
         result['governance']=self.backend.requirements_read(ctx.params['pid'],['governance'])
         result['can_edit']=(ctx.principal.via=='session' and not ctx.principal.agent_id
                             and self.service.state.get('memberships',{}).get(ctx.params['pid'],{}).get(ctx.principal.user_id)=='owner')
@@ -5958,11 +6098,28 @@ class ApiHandler(BaseHTTPRequestHandler):
     def requirements_accept(self,ctx):
         return self._requirements_write(ctx,'accept')
 
+    @route('POST', r'/v1/projects/(?P<pid>'+ID+r')/requirements/(?P<rid>'+ID+r')/withdraw')
+    def requirements_withdraw(self,ctx):
+        return self._requirements_write(ctx,'withdraw')
+
+    @route('POST', r'/v1/projects/(?P<pid>'+ID+r')/requirements/(?P<rid>'+ID+r')/supersede')
+    def requirements_supersede(self,ctx):
+        return self._requirements_write(ctx,'supersede')
+
+    @route('POST', r'/v1/projects/(?P<pid>'+ID+r')/requirements/(?P<rid>'+ID+r')/transition/finish')
+    def requirements_finish_transition(self,ctx):
+        return self._requirements_write(ctx,'finish')
+
+    @route('POST', r'/v1/projects/(?P<pid>'+ID+r')/requirements/(?P<rid>'+ID+r')/transition/abandon')
+    def requirements_abandon_transition(self,ctx):
+        return self._requirements_write(ctx,'abandon')
+
     @route('GET', r'/v1/projects/(?P<pid>'+ID+r')/brd')
     def requirements_brd(self,ctx):
         self._requirements_backend(); self._project(ctx,CAP_READ)
         result=self.backend.requirements_read(ctx.params['pid'],['brd'])
         result['items']=[self._requirement_author(ctx,item) for item in result.get('items',[])]
+        self._requirements_names(result)
         return 200,result
 
     # -- contributed requirement proposals (.58 slice 1b, kittrial-5bb.70) -----------
@@ -6372,7 +6529,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         payload = dict(ctx.payload or {})
         # A field the route does not take is refused, not dropped (kittrial-5bb.183 item 2).
         refuse_unknown_fields(payload, self.TASK_CLAIM_FIELDS, 'A task claim')
-        self._refuse_record_anchor(self.backend.get_task(ctx.params['pid'], ctx.params['tid']), write=True)
+        task = self.backend.get_task(ctx.params['pid'], ctx.params['tid'])
+        self._refuse_record_anchor(task, write=True)
         payload['task_id'] = ctx.params['tid']
         actor = self.service.bind_actor(ctx.principal, payload.pop('actor', None))
         payload['actor'] = actor
@@ -6385,12 +6543,40 @@ class ApiHandler(BaseHTTPRequestHandler):
                                              capability=CAP_TASKS)
             except HttpError as refusal:
                 held_by = getattr(refusal, 'held_by', None)
-                if held_by is None:
+                if held_by is None and refusal.code != 'conflict':
                     raise
+                # Candidate fall-through (kittrial-5bb.6 deliverable b, review item 4): a
+                # refused claim on a task that is still OPEN answers with the next BOUNDED
+                # claimable rows so an agent need not re-read the queue. It is not attached
+                # to a refusal about a task nobody could take anyway: the fall-through read
+                # is made ONLY while the refused task is OPEN, so `Task is not open` -- a
+                # closed task, even one that still has an assignee and therefore reports
+                # `held_by` -- carries no candidates and costs no read (round-3 review
+                # finding 4). The refused task itself is never among the candidates.
+                # Advisory: claimability is not a reservation and the next claim is still
+                # atomic. When there is nothing to fall through to, the refusal is
+                # re-raised byte for byte, so every existing sentence and detail is kept.
+                candidates, truncated = [], False
+                if str((task or {}).get('status')) == 'open':
+                    candidates, truncated = self._claim_candidates(ctx.params['pid'], ctx.params['tid'])
+                if not candidates and held_by is None:
+                    raise
+                detail = dict(refusal.detail) if isinstance(refusal.detail, dict) else {}
+                if held_by is not None:
+                    detail['held_by'] = held_by
+                if candidates:
+                    detail['candidates'] = candidates
+                    if truncated:
+                        # Say when the list was cut instead of dropping rows silently.
+                        detail['candidates_truncated'] = True
+                        detail['candidates_notice'] = ('More claimable tasks remain; at most %d '
+                                                       'candidates are listed.' % CLAIM_CANDIDATES_LIMIT)
+                if held_by is None:
+                    raise conflict(refusal.message, detail) from None
                 # Somebody else has it. Nobody takes a task over through a claim, an owner
                 # included (kittrial-5bb.187); said with the holder's name as people know it.
                 shown = self.service.actor_names([held_by]).get(held_by) or held_by
-                raise conflict('Task is already claimed by %s' % shown, {'held_by': held_by}) from None
+                raise conflict('Task is already claimed by %s' % shown, detail) from None
             return result, result
         return self._mutate(ctx, 'tasks.claim', ctx.params['pid'], claim,
                             capability=CAP_TASKS, serialize=False, canonical=True)
@@ -6798,6 +6984,14 @@ class ApiHandler(BaseHTTPRequestHandler):
         self._project(ctx, CAP_PROJECT_ADMIN)
         limit, state = self._page(ctx, ctx.query)
         events = [e for e in self.service.state['audit'] if e.get('project_id') == ctx.params['pid']]
+        if hasattr(self.backend, 'requirement_operator_audits'):
+            operator_events = self.backend.requirement_operator_audits(ctx.params['pid'])
+            if operator_events:
+                events += operator_events
+                # Same-time service events retain their append order. Sorting
+                # their random request IDs can move an earlier event across a
+                # page boundary and make a later event disappear from a slice.
+                events.sort(key=lambda event:event['time'])
         page = events[state['o']:state['o'] + limit]
         names = self.service.actor_names([e.get('user_id') for e in page])
         body = {'items': [dict(e, user_name=names.get(e.get('user_id')), detail=e.get('reason'))

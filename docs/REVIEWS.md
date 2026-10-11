@@ -571,9 +571,13 @@ b work --mine
 b work --state changes-requested
 b work --state awaiting-review
 b work --state awaiting-integration
+b work --state reconciliation-needed
+b work --claimable
 b brief example-task
 b review example-task
 ```
+
+`--state` filters on the review state the row SHOWS, so a row is always found under the review state it displays — including a follow-on contribution whose recorded evidence lags it. The one additive value, `--state reconciliation-needed`, selects the rows whose recorded evidence must be reconciled first, whatever review state they show; it clears nothing. `--claimable` lists only the rows the one bounded claimability rule marks claimable.
 
 The queue sorts requested changes first and shows task status, owner, review state, exact contribution commit and separate lifecycle values/scope. `--owner ACTOR`, `--limit` and `--offset` support coordinator scans. Pages are fresh views, not immutable history snapshots. Closing a task clears its `awaiting-review`/legacy `review-ready` queue entry (see "Withdrawing or superseding a contribution"); a closed task with outstanding requested changes or an approved-but-unintegrated revision stays visible, and closure is still not acceptance. Check the scope-match field before applying historical lifecycle evidence to the current contribution.
 
@@ -582,6 +586,11 @@ The queue sorts requested changes first and shows task status, owner, review sta
 - `review_state` is the effective state and may now be `integrated`, or `withdrawn`/`superseded` after a `withdraw` operation.
 - `workflow_state` is the raw append-only workflow state, kept clearly separate (`none`, `awaiting-review`, `changes-requested`, `awaiting-integration`, `withdrawn`, `superseded`, or `legacy-review-ready` for the legacy label).
 - `integration` reports `fact`, `scope`, `scope_token`, `source_commit`, `integration_commit`, `matches_contribution`, `newest_fact`, `newest_scope_token`, `newest_scope`, `reverted`, `reverted_commits` (bounded) and `reverted_total` for the current contribution. Each `prior_contributions` entry carries the same block for its own FULL commit, so a follow-on read also answers whether the replaced revision is integrated. A top-level `integration_disagreements` list (and, in `brief`/`work`, a matching human-readable warning) names both facts and both scopes whenever `newest_fact` differs from `fact`, and carries a `reverted` entry naming the removed commit(s) whenever a host-issued revert applies to the contribution.
+- `next_actor` is the next-action actor as a caller-neutral ROLE (`assignee`, `reviewer`, `coordinator`, `operator`, `anyone`, `none`, `unknown`) from the same decision that gives `work`'s `whose_move`: `whose_move` is the caller-relative answer, `next_actor` is that decision's role, and both say `unknown` where the decision cannot be told (integrated work; a withdrawn or superseded final revision with no open item). It is never null: a malformed chain or row reads `operator`. It is deliberately separate from the assignee and never a person.
+- `work_state` is the review state shown, or `reconciliation-needed` when the shared projection found recorded evidence that must be reconciled first; `reconciliation_needed` is true exactly for those rows and `reconciliation_reasons` names the facts (`integration-facts-disagree`, with both scopes and both values; or `lifecycle-scope-lags`, naming the current contribution's commit and the prior commit the newest recorded scope names). Both are selection signals: they never replace `review_state`, never clear an item or blocker, and infer neither abandonment nor deployment. The `Reconciliation needed: ...` line is added to the EXISTING `warnings`/`integration_warnings`, not to a new field.
+- `claimable` is the bounded claimability answer (see FINDING_WORK.md) when the read states it, and every `work` row carries it.
+
+What the review read does NOT do, stated rather than implied: reconciliation is raised only by the two evidence-backed signals above, so **a checkpoint's prose or `source_commit` that contradicts the evidence is not detected**, and **a scope naming a 7-character commit, or a different full commit sharing seven characters, reads its normal state with no reconciliation prompt**. Only a scope naming a PRIOR revision of the current contribution raises `lifecycle-scope-lags`. `claimable` does not consider open dependencies or parent tasks, and a re-contribution of the SAME commit reads `integrated` after its own approval.
 
 Exactly what each match field means:
 
