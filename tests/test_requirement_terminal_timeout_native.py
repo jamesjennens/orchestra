@@ -5,6 +5,7 @@ import os
 import shutil
 import sys
 import time
+import unittest
 from pathlib import Path
 from unittest import mock
 
@@ -121,3 +122,10 @@ os.execv(str(p.with_name('bd-real-timed')),[str(p.with_name('bd-real-timed')),*a
                 self.assertEqual(finished.status, 200, finished.data)
         finally:
             harness.tearDown()
+
+
+def load_tests(loader, tests, pattern):
+    # Borrow the native server fixture without rerunning its label-guard tests
+    # after this test has deliberately created requirement labels in the tracker.
+    return unittest.TestSuite([TerminalTimeoutNativeTests(
+        'test_endpoint_timeout_cannot_leave_an_abandonable_live_writer')])

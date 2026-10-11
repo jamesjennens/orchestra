@@ -807,10 +807,23 @@ except ValueError as error:
             self.assertEqual(json.loads(done.stdout)['reason'],pending['reason'])
             self.assertEqual(json.loads(done.stdout)['completion']['reason'],'Finish saved evidence.')
             self.assertEqual(json.loads(done.stdout)['completion']['actor'],operator)
-            audit=harness.request('GET',base+'/audit',token=token)
-            self.assertEqual(audit.status,200,audit.data)
-            self.assertTrue(any(event['action']=='requirements.operator.finish' and event['requirement_id']==operate['id']
-                                for event in audit.data['items']))
+            # This native scenario creates more events than the first audit page.
+            # Follow the service's cursor so the newest durable operator entry is
+            # checked even when it is beyond that page.
+            from urllib.parse import quote
+            events=[];route=base+'/audit'
+            while route:
+                audit=harness.request('GET',route,token=token)
+                self.assertEqual(audit.status,200,audit.data)
+                events.extend(audit.data['items'])
+                cursor=audit.data['next_cursor']
+                route=base+'/audit?cursor='+quote(cursor,safe='') if cursor else None
+            finished=[event for event in events if event['action']=='requirements.operator.finish'
+                      and event['requirement_id']==operate['id']]
+            self.assertEqual(len(finished),1,finished)
+            self.assertEqual(finished[0]['actor'],operator)
+            self.assertEqual(finished[0]['original_operation_id'],pending['operation_id'])
+            self.assertEqual(finished[0]['reason'],'Finish saved evidence.')
             viewer_id=harness.create_account(admin,'terminal-viewer','terminal-viewer-password-1')
             viewer=harness.login('terminal-viewer','terminal-viewer-password-1')[0]
             self.assertEqual(harness.request('PUT',base+'/members/'+viewer_id,{'role':'viewer'},token=admin).status,200)
