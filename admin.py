@@ -7623,6 +7623,7 @@ def main():
         from keyed_records import require_configured_operator
         from http_authority import file_lock, read_state
         from requirement_terminal import receipt_path
+        require_configured_operator(args.actor,operators(root,strict=True),'reconcile a requirement operation')
         path=project_dir(root,args.project)
         if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
         def run(argv):return run_bd(root,args.project,['--actor',args.actor,*argv])
