@@ -877,10 +877,23 @@ except ValueError as error:
                 self.assertEqual(harness.request('PUT','/v1/projects/terminalcopy/members/'+account,{'role':'owner'},token=admin).status,200)
                 previous_backend=http_service.EndpointBackend(sys.executable,str(Path(previous)/'endpoint.py'),str(root),service=harness.service)
                 principal=harness.service.authenticate(token)
-                draft=previous_backend.owner_requirements(principal,'terminalcopy','revise',dict(expected(first),title='Unsafe previous-kit edit'),
-                                                         'previous-terminal-edit',first['id'])
-                accepted_old=previous_backend.owner_requirements(principal,'terminalcopy','accept',expected(draft),
-                                                                'previous-terminal-accept',first['id'])
+                # Exercise the real preceding endpoint with its preceding CLI
+                # shape: its service did not send the new terminal timeout flag.
+                # Keep authority validation and native effects intact. The new
+                # service correctly refuses this old endpoint's unknown option;
+                # that refusal does not prove the old writer is rollback-safe.
+                import endpoint_process
+                from unittest import mock
+                launch=endpoint_process.run
+                def previous_launch(argv,**kwargs):
+                    self.assertEqual(argv[1],str(Path(previous)/'endpoint.py'))
+                    index=argv.index('--terminal-endpoint-timeout')
+                    return launch(argv[:index]+argv[index+2:],**kwargs)
+                with mock.patch('endpoint_process.run',side_effect=previous_launch):
+                    draft=previous_backend.owner_requirements(principal,'terminalcopy','revise',dict(expected(first),title='Unsafe previous-kit edit'),
+                                                             'previous-terminal-edit',first['id'])
+                    accepted_old=previous_backend.owner_requirements(principal,'terminalcopy','accept',expected(draft),
+                                                                    'previous-terminal-accept',first['id'])
                 self.assertGreater(accepted_old['revision'],first['revision'])
                 current=fixture.endpoint.execute(root,dict(project='terminalcopy',actor='reader',action='requirements',args=['get',first['id']]))
                 self.assertEqual(current['returncode'],0,current)

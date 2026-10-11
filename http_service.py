@@ -6772,8 +6772,13 @@ class ApiHandler(BaseHTTPRequestHandler):
         limit, state = self._page(ctx, ctx.query)
         events = [e for e in self.service.state['audit'] if e.get('project_id') == ctx.params['pid']]
         if hasattr(self.backend, 'requirement_operator_audits'):
-            events += self.backend.requirement_operator_audits(ctx.params['pid'])
-            events.sort(key=lambda event:(event['time'],event.get('request_id') or ''))
+            operator_events = self.backend.requirement_operator_audits(ctx.params['pid'])
+            if operator_events:
+                events += operator_events
+                # Same-time service events retain their append order. Sorting
+                # their random request IDs can move an earlier event across a
+                # page boundary and make a later event disappear from a slice.
+                events.sort(key=lambda event:event['time'])
         page = events[state['o']:state['o'] + limit]
         names = self.service.actor_names([e.get('user_id') for e in page])
         body = {'items': [dict(e, user_name=names.get(e.get('user_id')), detail=e.get('reason'))

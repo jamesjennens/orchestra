@@ -191,9 +191,16 @@ class TerminalHttpTests(EndpointCase):
         self.assertEqual(completed['completion']['reason'],'Finished after checking the exact native state.')
         self.assertEqual(completed['completion']['via'],'operator')
         self.assertFalse(any(event['action']=='requirements.operator.finish' for event in self.service.state['audit']))
+        fixed_time=self.service._now()
+        with mock.patch.object(self.service,'_now',return_value=fixed_time):
+            self.service.audit('z-service-first',None,'tasks.update','committed',project_id=self.project)
+            self.service.audit('a-service-second',None,'tasks.update','committed',project_id=self.project)
         for _ in range(2):
             audit=self.request('GET',self.base+'/audit',token=self.owner_token)
             self.assertEqual(audit.status,200,audit.data)
+            same_time=[event['request_id'] for event in audit.data['items']
+                       if event['request_id'] in ('z-service-first','a-service-second')]
+            self.assertEqual(same_time,['z-service-first','a-service-second'])
             events=[event for event in audit.data['items'] if event['action']=='requirements.operator.finish']
             self.assertEqual(len(events),1,events)
             self.assertEqual(events[0]['requirement_id'],item['id'])
