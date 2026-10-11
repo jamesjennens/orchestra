@@ -420,7 +420,7 @@ class ListingTests(unittest.TestCase):
             'other_kit': False, 'other_root': False, 'missing': False, 'unknown_arguments': [], 'names_release': False,
             'unknown_projects': [],
             # kittrial-5bb.250 r3: the two rule fields every command line now carries.
-            'needs_shell': False, 'relative_path': False})
+            'needs_shell': False, 'relative_path': False, 'foreign_invocation': False})
 
     def test_the_binding_is_the_arguments_and_never_the_comment(self):
         entry = self.one(self.line(comment='alex@laptop orchestra-projects=alpha'))

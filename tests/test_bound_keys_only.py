@@ -87,6 +87,14 @@ def write_settings(root, value=None, operators=(OPERATOR,)):
     (root/'deployment.private.json').write_text(json.dumps(document), encoding='utf-8')
 
 
+def make_symlink(target, link):
+    """Make a symlink, or raise SkipTest where the platform refuses it (r4 item 4)."""
+    try:
+        link.symlink_to(target)
+    except (OSError, NotImplementedError):
+        raise unittest.SkipTest('a symlink cannot be made here: the shape needs it')
+
+
 def key_line_text(root, kit=None, bound='', extra='', comment='scratch'):
     """One authorized_keys line whose forced command runs this kit's wrapper on ``root``."""
     kit = KIT if kit is None else kit
@@ -811,7 +819,7 @@ class SettingsCommandTests(unittest.TestCase):
         and `on` refuses (nothing flipped)."""
         directory = Path(self.tmp.name)
         dangling = Path(self.tmp.name)/'dangling'
-        dangling.symlink_to(Path(self.tmp.name)/'no-such-target')
+        make_symlink(Path(self.tmp.name)/'no-such-target', dangling)
         shapes = [('a directory', directory, 'not a regular file'),
                   ('a dangling symlink', dangling, 'No such file')]
         try:
@@ -908,7 +916,7 @@ class SettingsCommandTests(unittest.TestCase):
         os.mkfifo(fifo_dir/'ssh_forced_command.py')
         symlinked = Path(self.tmp.name)/'via-symlink'
         symlinked.mkdir(exist_ok=True)
-        (symlinked/'ssh_forced_command.py').symlink_to(fifo_dir/'ssh_forced_command.py')
+        make_symlink(fifo_dir/'ssh_forced_command.py', symlinked/'ssh_forced_command.py')
         for label, kit in (('a fifo', fifo_dir), ('a symlink to one', symlinked)):
             file = Path(self.tmp.name)/'authorized_keys'
             file.write_text(key_line_text(self.root, kit=kit) + '\n', encoding='utf-8')
@@ -1164,7 +1172,7 @@ class SettingsCommandTests(unittest.TestCase):
         # A19: an unreadable wrapper names nothing - hint None, never True.
         ghost = Path(self.tmp.name)/'ghost-kit'
         ghost.mkdir()
-        (ghost/'ssh_forced_command.py').symlink_to(Path(self.tmp.name)/'no-wrapper-there')
+        make_symlink(Path(self.tmp.name)/'no-wrapper-there', ghost/'ssh_forced_command.py')
         file = Path(self.tmp.name)/'authorized_keys'
         file.write_text(key_line_text(self.root, kit=ghost) + '\n', encoding='utf-8')
         listing = admin.authorized_keys_listing(self.root, str(file))
@@ -1175,6 +1183,153 @@ class SettingsCommandTests(unittest.TestCase):
         with self.assertRaises(ValueError) as refused:
             admin.bound_keys_only_switch(self.root, 'on', OPERATOR, str(big))
         self.assertIn('Split the file and preview each part', str(refused.exception))
+
+    def test_a_program_in_front_of_the_wrapper_is_never_decided(self):
+        """kittrial-5bb.250 r4 item 1: a false 'decided'. A relay, ssh, /bin/sh -s, env,
+        nice, timeout, exec or an assignment before the wrapper token makes the command
+        another program's decision: group two, whatever the wrapper token says - an
+        unbound line the operator was told is cut off must not stay alive."""
+        prefixes = ['/usr/bin/python3 X/relay', '/usr/bin/ssh host', '/bin/sh -s',
+                    '/usr/bin/env LC_ALL=C', '/usr/bin/nice -n 5', '/usr/bin/timeout 30',
+                    '/usr/bin/exec', 'W=1']
+        for prefix in prefixes:
+            line = key_line_text(self.root).replace(
+                '/usr/bin/python3 -E -s ', prefix + ' ' + KIT.as_posix() + '/ssh_forced_command.py ')
+            with self.subTest(prefix=prefix.split()[-1]):
+                file = Path(self.tmp.name)/'authorized_keys'
+                file.write_text(line + '\n', encoding='utf-8')
+                listing = admin.authorized_keys_listing(self.root, str(file))
+                self.assertEqual([], listing['would_be_refused'])
+                self.assertEqual([1], listing['may_be_refused'])
+        # The kit's own invocation, interpreter flags only, stays decided.
+        file = Path(self.tmp.name)/'authorized_keys'
+        file.write_text(key_line_text(self.root) + '\n', encoding='utf-8')
+        listing = admin.authorized_keys_listing(self.root, str(file))
+        self.assertEqual([1], listing['would_be_refused'])
+        self.assertEqual([], listing['may_be_refused'])
+
+    def test_the_wrapper_is_opened_once_with_the_guarding_flags_and_never_lstat_first(self):
+        """kittrial-5bb.250 r4 item 3: each mutant dies by an assertion, never by a hang.
+        The wrapper and the keys file are opened with O_NONBLOCK (a fifo is never waited
+        on) and the wrapper with O_NOFOLLOW (a symlinked wrapper is not followed), and no
+        lstat or stat of the wrapper path precedes the open (round 2's race)."""
+        other = Path(self.tmp.name)/'once-release'
+        other.mkdir()
+        shutil.copy(KIT/'ssh_forced_command.py', other/'ssh_forced_command.py')
+        file = Path(self.tmp.name)/'authorized_keys'
+        file.write_text(key_line_text(self.root, kit=other) + '\n', encoding='utf-8')
+        events = []
+        real_open, real_lstat, real_stat = os.open, os.lstat, os.stat
+        def spy_open(path, flags, *args, **kwargs):
+            if str(path).endswith('once-release/ssh_forced_command.py') or str(path).endswith('authorized_keys'):
+                events.append(('open', str(path), flags))
+            return real_open(path, flags, *args, **kwargs)
+        def spy_lstat(path, *args, **kwargs):
+            if str(path).endswith('ssh_forced_command.py'):
+                events.append(('lstat', str(path)))
+            return real_lstat(path, *args, **kwargs)
+        def spy_stat(path, *args, **kwargs):
+            if str(path).endswith('ssh_forced_command.py'):
+                events.append(('stat', str(path)))
+            return real_stat(path, *args, **kwargs)
+        with mock.patch.object(os, 'open', spy_open), \
+                mock.patch.object(os, 'lstat', spy_lstat), \
+                mock.patch.object(os, 'stat', spy_stat):
+            listing = admin.authorized_keys_listing(self.root, str(file))   # the listing, once
+        first_open = next(i for i, e in enumerate(events) if e[0] == 'open')
+        # The hint read opens ONCE, with the guarding flags, and no lstat/stat of the
+        # wrapper path happens between the listing's own missing-check and that open or
+        # after it (the r2 race shape: lstat-then-open).
+        wrapper_opens = [e for e in events if e[0] == 'open' and 'once-release' in e[1]]
+        keys_opens = [e for e in events if e[0] == 'open' and e[1].endswith('authorized_keys')]
+        self.assertEqual(1, len(wrapper_opens))                    # once
+        self.assertTrue(wrapper_opens[0][2] & os.O_NONBLOCK)      # a fifo never waited on
+        self.assertTrue(wrapper_opens[0][2] & os.O_NOFOLLOW)      # a symlink not followed
+        self.assertEqual(1, len(keys_opens))                      # ONE listing per command
+        self.assertTrue(keys_opens[0][2] & os.O_NONBLOCK)
+        # The listing's own missing-check stats the wrapper path before the open (a
+        # listing fact, bounded); the r2 race shape - a stat AFTER or BETWEEN the hint
+        # read's own calls - must not exist: nothing stats the wrapper path once the
+        # descriptor is open, and the descriptor is judged by fstat alone.
+        stats = [i for i, e in enumerate(events) if e[0] in ('lstat', 'stat')]
+        open_index = events.index(wrapper_opens[0])
+        self.assertTrue(all(i < open_index for i in stats), events)
+
+    def test_both_groups_are_printed_before_the_flip_is_written(self):
+        """kittrial-5bb.250 r4 item 3: the ORDER of the stderr write against the rename is
+        recorded, not the document's words alone (r3's test checked the words only)."""
+        file = Path(self.tmp.name)/'authorized_keys'
+        file.write_text(key_line_text(self.root) + '\n' + key_line_text(self.root, kit=Path('rel/kit')) + '\n',
+                        encoding='utf-8')
+        events = []
+        real_write = sys.stderr.write
+        def spy_write(text):
+            events.append(('stderr', text[:40]))
+            return real_write(text)
+        real_replace = os.replace
+        def spy_replace(source, target):
+            events.append(('rename', str(target)))
+            return real_replace(source, target)
+        with mock.patch.object(sys.stderr, 'write', spy_write), \
+                mock.patch.object(os, 'replace', spy_replace):
+            admin.bound_keys_only_switch(self.root, 'on', OPERATOR, str(file))
+        admin.bound_keys_only_switch(self.root, 'off', OPERATOR)
+        first_stderr = next(i for i, e in enumerate(events) if e[0] == 'stderr' and 'refuse' in e[1])
+        first_rename = next((i for i, e in enumerate(events) if e[0] == 'rename'), len(events))
+        self.assertLess(first_stderr, first_rename, events)
+        undecided_at = next((i for i, e in enumerate(events)
+                             if e[0] == 'stderr' and ('cannot judge' in e[1] or 'this prev' in e[1])), None)
+        self.assertIsNotNone(undecided_at, events)
+        self.assertLess(undecided_at, first_rename, events)
+
+    def test_a_tab_or_a_non_ascii_letter_is_shell_and_group_two(self):
+        """kittrial-5bb.250 r4 item 3: a tab whitelisted, or str.isalnum used as the
+        whitelist, puts shell commands in group one - both mutants die here."""
+        tab = key_line_text(self.root).replace('/usr/bin/python3 -E -s ',
+                                                '/usr/bin/python3\t-E -s ')
+        nonascii = key_line_text(self.root).replace('/usr/bin/python3 -E -s ',
+                                                    '/usr/bin/python3 -E -sé ')
+        for label, line in (('a tab', tab), ('a non-ASCII letter', nonascii)):
+            with self.subTest(shape=label):
+                file = Path(self.tmp.name)/'authorized_keys'
+                file.write_text(line + '\n', encoding='utf-8')
+                listing = admin.authorized_keys_listing(self.root, str(file))
+                self.assertEqual([], listing['would_be_refused'])
+                self.assertEqual([1], listing['may_be_refused'])
+
+    def test_the_status_and_on_hints_keys_exist_and_on_carries_the_count(self):
+        """kittrial-5bb.250 r4 item 3: the hint is present in status AND on, the key is
+        wrapper_names_setting, and on's JSON carries may_be_refused_more."""
+        other = Path(self.tmp.name)/'hinted-release'
+        other.mkdir()
+        shutil.copy(KIT/'ssh_forced_command.py', other/'ssh_forced_command.py')
+        file = Path(self.tmp.name)/'authorized_keys'
+        file.write_text(key_line_text(self.root, kit=other) + '\n', encoding='utf-8')
+        status = admin.bound_keys_only_switch(self.root, 'status', OPERATOR, str(file))
+        self.assertIn('wrapper_names_setting', status)
+        self.assertEqual({1: True}, status['wrapper_names_setting'])
+        self.assertIn('may_be_refused_more', status)
+        result = admin.bound_keys_only_switch(self.root, 'on', OPERATOR, str(file))
+        self.assertIn('wrapper_names_setting', result)
+        self.assertEqual({1: True}, result['wrapper_names_setting'])
+        self.assertIn('may_be_refused_more', result)
+        admin.bound_keys_only_switch(self.root, 'off', OPERATOR)
+
+    def test_an_unreadable_wrapper_on_the_read_failure_gives_hint_none_not_true(self):
+        """kittrial-5bb.250 r4 item 3 (A19's other half): a wrapper that OPENS but whose
+        read fails answers hint None - a mutant answering True dies here."""
+        other = Path(self.tmp.name)/'unreadable-read'
+        other.mkdir()
+        wrapper = other/'ssh_forced_command.py'
+        wrapper.write_bytes(b'bound_keys_only' * 10)
+        wrapper.chmod(0o000)
+        if os.access(str(wrapper), os.R_OK):            # running as root: the shape cannot be built
+            raise unittest.SkipTest('this account reads 0o000 files; the shape cannot be built')
+        file = Path(self.tmp.name)/'authorized_keys'
+        file.write_text(key_line_text(self.root, kit=other) + '\n', encoding='utf-8')
+        listing = admin.authorized_keys_listing(self.root, str(file))
+        self.assertEqual([1], listing['may_be_refused'])
+        self.assertIsNone(listing['wrapper_names_setting'].get(1))
 
     def test_status_bounds_the_audit_entries_it_prints(self):
         """kittrial-5bb.250 F7: the audit list is hand-editable; the entries status prints
@@ -1631,6 +1786,13 @@ class DocumentationTests(unittest.TestCase):
                        'a HINT',
                        'first 64 KiB',
                        '--without-preview',
+                       # The r4 additions: the invocation rule, the bounds, the outside set.
+                       "IS this kit's wrapper",
+                       'at most 512',
+                       'an absolute `--root`',
+                       'a fifo is opened',
+                       'one',
+                       'BOUND line of this kit',
                        'the setting is not why',
                        'VALID `deployment.private.json` larger than 1 MiB'):
             with self.subTest(phrase=phrase):

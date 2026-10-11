@@ -1221,19 +1221,6 @@ def _may_sentence_for(numbers, more):
               's' if one else '', 'was' if one else 'were', 'it' if one else 'they',
               'es' if one else '', 'it is' if one else 'they are'))
 
-def authorized_keys_hints(root,file=None):
-    """``{line number: hint or None}`` for the lines the preview does not decide.
-
-    The hint is whether the wrapper file a line names carries the word 'bound_keys_only' in
-    its first 64 KiB (open-then-fstat, once per path per run): a hint about the kit that
-    serves the line, never a decision. Status and on carry it beside may_be_refused so they
-    say what the listing says (kittrial-5bb.250 r3, item 5).
-    """
-    try:
-        return authorized_keys_listing(root,file).get('wrapper_names_setting') or {}
-    except (OSError,ValueError,RecursionError):
-        return {}
-
 def bound_keys_only_switch(root,action,actor,file=None,without_preview=False):
     """Read or flip ``bound_keys_only`` with its operator audit (kittrial-5bb.196, slice 4).
 
@@ -1367,7 +1354,7 @@ def bound_keys_only_switch(root,action,actor,file=None,without_preview=False):
                                                for key,value in entry.items()}
         # The hints travel with the group they explain (r3 item 5): a module-level read of
         # the same listing, so status and on say what the listing says.
-        hints=authorized_keys_hints(root,file) if preview_info is not None else {}
+        hints=(preview_info[5] if preview_info is not None else {})
         return dict(bound_keys_only=current,audit=_shown(last),audit_history=[_shown(e) for e in audit],
                     audit_records=len(audit),
                     audit_readable=damage is None,audit_agrees=agrees,audit_note=audit_note,
@@ -1411,9 +1398,12 @@ def bound_keys_only_switch(root,action,actor,file=None,without_preview=False):
     preview_truncated=False if preview_info is None else preview_info[2]
     may_refuse=[] if preview_info is None else preview_info[3]
     may_refuse_more=0 if preview_info is None else preview_info[4]
-    if enabled and preview is not None:
+    if enabled and preview is not None and bound_keys_only(root) is not True:
         # BOTH groups are printed BEFORE the flip is written (kittrial-5bb.250 r3 item 5):
         # whatever happens to the write, the operator has already seen every line it names.
+        # A no-op on (the setting is already on; r4 item 4) prints no preview: nothing is
+        # about to change, and the preview of an already-on installation is `status`'s
+        # business.
         if preview:
             print('WARNING: turning this setting on refuses %d authorized_keys line(s) of this kit and this '
                   'root: %s%s. Print each such line again with `admin.py authorized-keys --project ... '
@@ -1464,7 +1454,7 @@ def bound_keys_only_switch(root,action,actor,file=None,without_preview=False):
         result['would_be_refused_more']=preview_more
         result['may_be_refused']=may_refuse
         result['may_be_refused_more']=may_refuse_more
-        result['wrapper_names_setting']=authorized_keys_hints(root,file) if preview_info is not None else {}
+        result['wrapper_names_setting']=(preview_info[5] if preview_info is not None else {})
         result['truncated']=preview_truncated
         # Both groups printed BEFORE the flip was written (above, r3 item 5); only the
         # unreadable-file truth is said here, after it.
@@ -5435,7 +5425,13 @@ def _realpath_or_self(path):
         return Path(str(path))
 
 def _wrapper_exists(wrapper):
-    """Whether the wrapper path names anything, without raising on a NUL or an over-long name."""
+    """Whether the wrapper path names anything, without raising on a NUL or an over-long name.
+
+    A RELATIVE wrapper path is not asked at all (r4 item 2): stat would answer by the
+    caller's directory, so the listing's missing flag would differ by directory.
+    """
+    if not os.path.isabs(str(wrapper)) or str(wrapper).startswith('~') or len(str(wrapper)) > 512:
+        return False
     try:
         return Path(wrapper).is_file()
     except (OSError, ValueError):
@@ -5483,7 +5479,35 @@ def key_line(line,root,kit):
     # relative here too. Both put the line in group two, hint None.
     plain=set('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.+/=,: ')
     entry['needs_shell']=any(character not in plain for character in command)
-    entry['relative_path']=not os.path.isabs(wrapper) or wrapper.startswith('~')
+    relative_path=(not os.path.isabs(wrapper) or wrapper.startswith('~')
+                   or len(wrapper) > 512)              # r4: a 60,000-component path is not judged
+    entry['relative_path']=relative_path
+    # kittrial-5bb.250 r4 item 1: a false 'decided'. The words BEFORE the wrapper token
+    # decide too: the invocation must BE this kit's wrapper - an interpreter by absolute
+    # path (or the wrapper itself) followed only by interpreter flags of the shape the kit
+    # prints (-E, -s), nothing else. A relay, ssh HOST, /bin/sh -s, env, nice, timeout,
+    # exec, an assignment or any other program in front runs the wrapper under somebody
+    # else's decision: group two, whatever the wrapper token says.
+    prefix=tokens[:at]
+    def _interpreter_invocation(prefix):
+        if not prefix:
+            return True                                   # the wrapper is invoked directly
+        if len(prefix) > 4:
+            return False
+        # The interpreter must BE python (any absolute path to a python, or python3/python
+        # by name) - /bin/sh, /usr/bin/exec or a relay is another program even with short
+        # flags after it (r4 item 1: '/bin/sh -s' and '/usr/bin/exec' in front were
+        # wrongly decided by the first cut of this check).
+        head=prefix[0]
+        if head.startswith('~'):
+            return False
+        if os.path.isabs(head):
+            if not re.search(r'(^|/)python[0-9.]*\Z', head):
+                return False
+        elif head not in ('python3', 'python'):
+            return False
+        return all(re.fullmatch(r'-[A-Za-z0-9]{1,3}', word) for word in prefix[1:])
+    entry['foreign_invocation']=not _interpreter_invocation(prefix)
     values={'--root':[],'--endpoint':[],'--python':[],'--project':[],'--principal':[]};unknown=[]
     arguments=tokens[at+1:];index=0
     while index<len(arguments):
@@ -5497,8 +5521,10 @@ def key_line(line,root,kit):
     endpoints=values['--endpoint'] or [wrapper.rsplit('/',1)[0]+'/endpoint.py']
     # The wrapper's argparse takes the LAST --root when the line names it twice, so that is the
     # root it will actually read its setting from (kittrial-5bb.196 review, item 2): the listing
-    # must decide by the same one.
+    # must decide by the same one. A RELATIVE --root is resolved by the wrapper against its
+    # own directory at run time, so this preview does not decide it (r4 small-things).
     line_root=values['--root'][-1] if values['--root'] else None
+    relative_root=line_root is not None and (not os.path.isabs(line_root) or line_root.startswith('~'))
     principals=values['--principal']
     entry.update({
         # A line bound to a principal is bound, not merely confined (kittrial-5bb.194 review,
@@ -5512,16 +5538,20 @@ def key_line(line,root,kit):
         # A line names its wrapper and endpoint by path. One printed by an earlier release of an
         # office installation still runs THAT release's kit, which knows none of the rules of
         # this one, for as long as its folder is there (the design, Migration, step 6).
-        'other_kit':(_realpath_or_self(wrapper)!=here/'ssh_forced_command.py'
+        'other_kit':(relative_path
+                     or _realpath_or_self(wrapper)!=here/'ssh_forced_command.py'
                      or any(_realpath_or_self(endpoint)!=here/'endpoint.py' for endpoint in endpoints)),
-        'other_root':line_root is None or _realpath_or_self(line_root)!=_realpath_or_self(str(root)),
-        # A path with a NUL or an over-long name makes any stat raise (r3 item 7): the
-        # wrapper is simply not there, one line, not a dead preview.
-        'missing':not _wrapper_exists(wrapper),
+        'other_root':line_root is None or relative_root
+                     or _realpath_or_self(line_root)!=_realpath_or_self(str(root)),
+        # A path with a NUL or an over-long name makes any stat raise (r3 item 7), and a
+        # RELATIVE path would be stat-ed against the caller's directory (r4 item 2): both
+        # answer safely - not there, one line, not a dead preview and not a
+        # directory-dependent fact.
+        'missing':relative_path or not _wrapper_exists(wrapper),
         'unknown_arguments':unknown})
     # It is this kit today and names its release folder: after the next upgrade it is another kit.
     link=install_current_link(here)
-    entry['names_release']=bool(link is not None and not entry['other_kit']
+    entry['names_release']=bool(link is not None and not entry['other_kit'] and not relative_path
                                 and not all(str(path).startswith(str(link)+'/') for path in [wrapper,*endpoints]))
     if not entry['other_root']:
         entry['unknown_projects']=[name for name in values['--project']
@@ -5672,7 +5702,7 @@ def authorized_keys_listing(root,file=None):
         wrapper=entry.get('wrapper')
         return (bool(wrapper) and entry.get('kind') in ('bound','confined')
                 and not entry.get('other_root') and not entry.get('needs_shell')
-                and not entry.get('relative_path')
+                and not entry.get('relative_path') and not entry.get('foreign_invocation')
                 and Path(os.path.realpath(wrapper))==here/'ssh_forced_command.py')
     def _refused_before_the_setting(entry):
         """Whether the wrapper refuses this line before it ever reads the setting."""
@@ -5779,19 +5809,22 @@ def authorized_keys_listing(root,file=None):
             'truncated':truncated,'warnings':read_warnings,'notes':notes}
 
 def authorized_keys_preview(root,file=None):
-    """``(would_be_refused, more, truncated)`` for the preview, or None if the file cannot be read.
+    """The preview tuple, or None if the file cannot be read.
 
     Read-only and bounded; the one place the preview is computed, so ``status``, ``on`` and the
     listing cannot disagree (kittrial-5bb.196 review, item 5). ``would_be_refused`` names at most
     ``WOULD_BE_REFUSED_NAMED_MAX`` lines and ``more`` counts the rest; ``truncated`` is true when
     the file is larger than ``AUTHORIZED_KEYS_MAX_BYTES`` and only its first part was inspected.
+    The hints ride along (r4 item 2: 'once per file per run' must be true), so status and on
+    make ONE listing each, not two.
     """
     try:
         listing=authorized_keys_listing(root,file)
     except (OSError,ValueError,RecursionError):
         return None
     return (listing['would_be_refused'],listing['would_be_refused_more'],listing['truncated'],
-            listing['may_be_refused'],listing['may_be_refused_more'])
+            listing['may_be_refused'],listing['may_be_refused_more'],
+            listing['wrapper_names_setting'])
 
 def authorized_keys(root,key_file,role='both',python=None,comment=None,projects=None,principal=None):
     """Print the installable lines for one public key as JSON (see authorized_key_lines).
