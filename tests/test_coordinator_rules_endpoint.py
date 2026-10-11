@@ -196,6 +196,28 @@ class CoordinatorRulesEndpointTests(RulesHelpers, unittest.TestCase):
         allowed = self.approve(task, 'w2', contribution)
         self.assertEqual(json.loads(allowed['stdout'])['review_state'], 'awaiting-integration')
 
+    def test_endpoint_refuses_a_same_principal_approval(self):
+        # Item 1's wiring: with independent_approval ALONE the endpoint must still read
+        # the registry, so a second actor of the author's principal is one party.
+        self.deployment(independent_approval=True)
+        (self.project / '.sessions.json').write_text(
+            json.dumps({'schema_version': 1, 'records': {},
+                        'owners': {'w2': 'lane:kit', 'w2b': 'lane:kit'}}), encoding='utf-8')
+        task = self.task('principal ' + uuid.uuid4().hex[:8], assignee='w2')
+        made = self.contribute(task, 'w2')
+        contribution = json.loads(made['stdout'])['comment_id']
+        before = self.rows()
+        with self.assertRaises(ValueError) as caught:
+            self.approve(task, 'w2b', contribution)
+        self.assertIn('independent_approval', str(caught.exception))
+        self.assertEqual(self.rows(), before)
+        # An actor of another principal (or of none) may approve.
+        other = self.task('principal two ' + uuid.uuid4().hex[:8], assignee='w2')
+        second = self.contribute(other, 'w2')
+        second_id = json.loads(second['stdout'])['comment_id']
+        allowed = self.approve(other, 'w9', second_id)
+        self.assertEqual(json.loads(allowed['stdout'])['review_state'], 'awaiting-integration')
+
     def test_endpoint_honours_the_second_refusal_of_rule_three(self):
         """Part (b): reviewed/integrated need another party's approval of THIS contribution."""
         self.deployment(independent_approval=True)

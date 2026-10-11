@@ -805,12 +805,14 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
         review_writes=configured_review_writes(root,warnings=switch_warnings)
         rules=configured_coordinator_rules(root,warnings=switch_warnings)
         run_warnings.extend(switch_warnings)
-        # The principal rule of slice 7 needs the project's actor -> principal map, and
-        # only when the rule is on AND a write actually consults it: an installation
-        # that configures nothing reads no registry here, and a damaged registry does
-        # not stop work, review, contribute or a listed operator's own operation
-        # (kittrial-5bb.197 review request 01a12894, item 4c).
-        owners=owner_loader(path,'coordinator_writes') if rules['coordinator_writes'] else None
+        # The principal rule of slice 7 and the party comparison of rule 3 both need the
+        # project's actor -> principal map, and only when a rule that consults it is on:
+        # an installation that configures nothing reads no registry here, and a damaged
+        # registry does not stop work, review, contribute or a listed operator's own
+        # operation (kittrial-5bb.197 review request 01a12894, items 1 and 4c).
+        registry_rule='coordinator_writes' if rules['coordinator_writes'] else 'independent_approval'
+        owners=(owner_loader(path,registry_rule)
+                if (rules['coordinator_writes'] or rules['independent_approval']) else None)
         # A verified web-owner approval capability: the web service already established
         # who the caller is, so `coordinator_writes` does not refuse an owner approving
         # through the web route (kittrial-5bb.199). The merge slot is not on that route.
