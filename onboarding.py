@@ -46,11 +46,9 @@ START_LIMIT = 8000
 #: protects against a different thing: the file at that path being replaced by something
 #: that is not the document (a log, a dump, a device), which the endpoint would otherwise
 #: read and send without limit. One megabyte is eight times the longest document today
-#: (CLI_CONTRACT.md, 118 KB) and half of what one request or answer may carry on the wire
-#: the request limit (2 MB; client.py MAX_WIRE) -- there is no answer cap of that size, and
-#: a 1 MB document can be several MB once a JSON envelope encodes it. The bound is on the
-#: file, not on what an answer may carry. tests/test_document_catalog.py fails when a
-#: catalogued document is missing, empty or over its bound, so a document cannot outgrow it unnoticed.
+#: (CLI_CONTRACT.md, 118 KB). The 2 MB figure in client.py MAX_WIRE is a limit on requests only;
+#: there is no answer cap of that size. tests/test_document_catalog.py fails when a catalogued
+#: document is missing, empty or over its bound, so a document cannot outgrow it unnoticed.
 #: The limit this replaces, 64,000 bytes, was one number for the kit's documents and for
 #: text people write; REVIEWS.md and CLI_CONTRACT.md outgrew it and were refused on every
 #: installation (kittrial-5bb.151).
@@ -216,8 +214,18 @@ def read_document(base, relative, limit, kit_document=None):
         raise ValueError('Document outside configured root')
     if not path.is_file():
         raise ValueError('Onboarding document missing; ask the operator to configure/update this installation')
-    with path.open('rb') as f:
-        data = f.read(limit + 1)
+    try:
+        with path.open('rb') as f:
+            data = f.read(limit + 1)
+    except OSError as error:
+        # Never the absolute path of a host file (review 01a12be9).
+        reason = getattr(error, 'strerror', None) or type(error).__name__
+        raise ValueError('cannot be read on this installation (%s); ask the operator' % reason.lower()) from None
+    if len(data) > limit and kit_document == 'start':
+        raise ValueError('The start document is larger than the start document may be (over %d bytes), so the file at '
+                         'that place in this installation is not the one the kit ships. Nothing was returned; ask the '
+                         'operator to reinstall the kit. The same text is in the repository (%s)'
+                         % (limit, relative))
     if len(data) > limit and kit_document is not None:
         raise ValueError('The kit document "%s" is larger than a kit document can be (over %d bytes), so the file at '
                          'that place in this installation is not the one the kit ships. Nothing was returned; ask the '
@@ -248,11 +256,23 @@ def catalog_status(kit, project_path=None):
         try:
             if name == 'project':
                 text = read_document(project_path, 'ONBOARDING.md', PROJECT_LIMIT)
+                size = (Path(project_path) / 'ONBOARDING.md').stat().st_size
+            elif name == 'start':
+                # onboard reads start with the tighter START_LIMIT: a live check that only
+                # asked --status would pass where no worker can start (review 01a12be9).
+                text = read_document(kit, DOCUMENTS['start'], START_LIMIT, kit_document='start')
+                size = (Path(kit) / DOCUMENTS['start']).stat().st_size
             else:
                 text = read_kit_document(kit, name)
-            rows.append({'name': name, 'served': True, 'bytes': len(text.encode('utf-8-sig'))})
-        except (ValueError, OSError) as error:
+                size = (Path(kit) / DOCUMENTS[name]).stat().st_size
+            rows.append({'name': name, 'served': True, 'bytes': size})
+        except ValueError as error:
             rows.append({'name': name, 'served': False, 'refused': str(error)})
+        except OSError as error:
+            # Never the absolute path of a host file (review 01a12be9): the short reason only.
+            reason = getattr(error, 'strerror', None) or type(error).__name__
+            rows.append({'name': name, 'served': False,
+                         'refused': 'cannot be read on this installation (%s); ask the operator' % reason.lower()})
     return rows
 
 
@@ -332,7 +352,8 @@ def probe_endpoints(text, project, kit):
 def execute(kit, project_path, project, actor, action, args, endpoint=None):
     if not isinstance(args, list) or any(not isinstance(a, str) for a in args):
         raise ValueError('Expected argument list')
-    catalog = '\n'.join('  docs '+key for key in ['project', *DOCUMENTS])
+    catalog = '\n'.join(['  docs --status  (every name as served or refused, with its size)']
+                       + ['  docs '+key for key in ['project', *DOCUMENTS]])
     if action == 'docs':
         if not args:return 'Installed onboarding documents (use your existing client prefix):\n'+catalog+'\n'
         if args == ['--status']:

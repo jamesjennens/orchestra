@@ -44,10 +44,6 @@ class CatalogueTests(unittest.TestCase):
     def test_the_bounds_are_what_the_docs_say(self):
         self.assertEqual((onboarding.PROJECT_LIMIT, onboarding.START_LIMIT, onboarding.KIT_DOCUMENT_LIMIT),
                          (8000, 8000, 1_000_000))
-        # The 2 MB figure is the REQUEST limit (client.py MAX_WIRE), not an answer cap: a
-        # 1 MB document can be 2 to 6 MB once a JSON envelope encodes it (kittrial-5bb.153
-        # item 2). The kit document bound is about the file, not about what an answer carries.
-        self.assertLess(onboarding.KIT_DOCUMENT_LIMIT, 1_000_001)
 
     def test_the_two_documents_that_were_refused_are_over_the_old_limit_and_are_served(self):
         for name in ('reviews', 'cli-contract'):
@@ -144,29 +140,102 @@ class BoundTests(unittest.TestCase):
             self.docs('workflow')
 
     def test_a_fifo_in_place_of_a_kit_document_is_refused(self):
+        # A mutant that drops the regular-file check blocks for ever on a FIFO; the read
+        # must finish quickly and leave nothing behind (review 01a12be9).
         import os
+        import threading
         path = self.kit / onboarding.DOCUMENTS['workflow']
         path.unlink()
         os.mkfifo(path)
-        with self.assertRaisesRegex(ValueError, 'Onboarding document missing'):
-            self.docs('workflow')
+        self.addCleanup(path.unlink, missing_ok=True)
+        outcome = {}
+        def run():
+            try:
+                outcome['text'] = self.docs('workflow')
+            except Exception as error:
+                outcome['error'] = error
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        worker.join(5)
+        self.assertFalse(worker.is_alive(), 'the read blocked on a FIFO instead of refusing')
+        self.assertIsInstance(outcome.get('error'), ValueError)
+        self.assertRegex(str(outcome['error']), 'Onboarding document missing')
 
     def test_docs_status_reports_every_catalogued_name(self):
         # One read for release live verification (kittrial-5bb.153 item 4).
         import json
+        (self.kit / onboarding.DOCUMENTS['workflow']).write_bytes(b'hello\n')
         shown = json.loads(onboarding.execute(self.kit, self.project, 'example', 'worker', 'docs', ['--status']))
         names = [row['name'] for row in shown['documents']]
         self.assertEqual(names, ['project', *onboarding.DOCUMENTS])
-        for row in shown['documents']:
-            self.assertTrue(row['served'], row)
-            self.assertGreater(row['bytes'], 0)
+        by_name = {row['name']: row for row in shown['documents']}
+        self.assertEqual(by_name['workflow']['bytes'], 6)          # the file as read, not utf-8-sig
+        self.assertTrue(by_name['start']['served'])
         # A refusal is a row, not a raise.
         (self.kit / onboarding.DOCUMENTS['workflow']).unlink()
         shown = json.loads(onboarding.execute(self.kit, self.project, 'example', 'worker', 'docs', ['--status']))
         by_name = {row['name']: row for row in shown['documents']}
         self.assertFalse(by_name['workflow']['served'])
         self.assertIn('missing', by_name['workflow']['refused'])
-        self.assertTrue(by_name['start']['served'])
+
+    def test_docs_status_refuses_a_start_document_over_the_onboard_bound(self):
+        import json
+        (self.kit / onboarding.DOCUMENTS['start']).write_bytes(b'x' * (onboarding.START_LIMIT + 1))
+        shown = json.loads(onboarding.execute(self.kit, self.project, 'example', 'worker', 'docs', ['--status']))
+        by_name = {row['name']: row for row in shown['documents']}
+        self.assertFalse(by_name['start']['served'])
+        self.assertIn('larger than the start document may be', by_name['start']['refused'])
+
+    def test_docs_status_refuses_a_symlink_directory_or_fifo_without_hanging(self):
+        import json
+        import os
+        import threading
+        path = self.kit / onboarding.DOCUMENTS['workflow']
+        def clear():
+            if path.is_symlink() or path.is_file():
+                path.unlink(missing_ok=True)
+            elif path.is_dir():
+                path.rmdir()
+        self.addCleanup(clear)
+        for kind in ('symlink', 'directory', 'fifo'):
+            with self.subTest(kind=kind):
+                clear()
+                if kind == 'symlink':
+                    path.symlink_to(self.kit / onboarding.DOCUMENTS['reviews'])
+                    want = 'must not use symlinks'
+                elif kind == 'directory':
+                    path.mkdir()
+                    want = 'Onboarding document missing'
+                else:
+                    os.mkfifo(path)
+                    want = 'Onboarding document missing'
+                outcome = {}
+                def run():
+                    try:
+                        outcome['shown'] = json.loads(onboarding.execute(
+                            self.kit, self.project, 'example', 'worker', 'docs', ['--status']))
+                    except Exception as error:
+                        outcome['error'] = error
+                worker = threading.Thread(target=run, daemon=True)
+                worker.start()
+                worker.join(5)
+                self.assertFalse(worker.is_alive(), '%s blocked instead of refusing' % kind)
+                self.assertNotIn('error', outcome, outcome.get('error'))
+                by_name = {row['name']: row for row in outcome['shown']['documents']}
+                self.assertFalse(by_name['workflow']['served'], kind)
+                self.assertIn(want, by_name['workflow']['refused'])
+
+    def test_docs_status_never_reports_a_host_path(self):
+        import json
+        path = self.kit / onboarding.DOCUMENTS['workflow']
+        path.chmod(0)
+        self.addCleanup(path.chmod, 0o644)
+        shown = json.loads(onboarding.execute(self.kit, self.project, 'example', 'worker', 'docs', ['--status']))
+        by_name = {row['name']: row for row in shown['documents']}
+        self.assertFalse(by_name['workflow']['served'])
+        self.assertNotIn(str(path), by_name['workflow']['refused'])
+        self.assertNotIn(str(self.kit), by_name['workflow']['refused'])
+        self.assertIn('ask the operator', by_name['workflow']['refused'])
 
     def test_read_document_has_no_default_bound(self):
         with self.assertRaises(TypeError):
@@ -195,12 +264,11 @@ class EndpointTests(unittest.TestCase):
                 answer = self.ask(name)
                 self.assertEqual((answer['returncode'], answer['stderr']), (0, ''), answer['stderr'][-300:])
                 self.assertEqual(answer['stdout'], (KIT / relative).read_text(encoding='utf-8-sig'))
-                # There is no 2 MB answer cap (kittrial-5bb.153 item 2): the answer is a JSON
-                # envelope around the document's own bytes, not something that must fit a
-                # request-sized bound.
+                # There is no cap on the size of an answer; the 2 MB limit is on requests only
+                # (kittrial-5bb.153 item 2). The value is the request bound, kept as a loose
+                # sanity figure for these documents, not an answer cap.
                 encoded = json.dumps(answer, ensure_ascii=False).encode('utf-8')
-                self.assertGreaterEqual(len(encoded), len(answer['stdout'].encode('utf-8')))
-                self.assertLess(len(encoded), 8_000_000, 'envelope plus a 1 MB document must stay bounded')
+                self.assertLess(len(encoded), 2_000_000)
 
     def test_the_project_text_and_the_catalogue_are_answered(self):
         self.assertEqual(self.ask('project')['stdout'], 'Start with the README.\n')
