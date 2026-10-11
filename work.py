@@ -222,8 +222,9 @@ def help_payload(action='work'):
             'item_move': 'items[].whose_move is you, reviewer, coordinator or unknown, relative to the '
                          'calling actor, derived only from the validated review state the row already '
                          'shows; items[].next is one plain sentence saying the same in words, and '
-                         'quotes the caller\'s own checkpoint when the caller waits for a person by '
-                         'it. Items where the move is the caller\'s sort first; top-level your_move '
+                         'quotes the next action of the caller\'s own checkpoint when that checkpoint records '
+                         'a blocker or dependency (no person is inferred; the move stays the caller\'s). '
+                         'Items where the move is the caller\'s sort first; top-level your_move '
                          'carries their count for the filtered queue. Nothing is inferred from a title, a '
                          'comment or an actor name.',
             'item_fields': ['task', 'title', 'owner', 'status', 'review_state', 'whose_move', 'next',

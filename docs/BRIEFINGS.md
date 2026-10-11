@@ -51,10 +51,10 @@ Each `work --mine` item also carries `whose_move` (`you`, `reviewer`, `coordinat
 move it is in words, both derived only from the validated review state the item already
 shows. A task with changes requested is the caller's work until a revision is delivered;
 one waiting for review or integration is the reviewer's or the coordinator's move. Where
-the caller waits for a person by its own current checkpoint, `next` quotes that
-checkpoint's own next action, and the move itself is not the caller's until the person
-answers. Items where the move is the caller's sort first, and top-level `your_move`
-carries their count in the answer.
+the caller's own current checkpoint records a blocker or dependency, `next` quotes that
+checkpoint's own next action, escaped; no person is inferred, and the move and the count
+stay the caller's. Items where the move is the caller's sort first, and top-level
+`your_move` carries their count in the answer.
 
 Read `brief --json`, reconcile relevant history and repository state, and save a UTF-8 JSON file using [the template](../templates/CHECKPOINT.json). Set `previous` to the current checkpoint's `comment_id` (or null for the first checkpoint) and copy the briefing's top-level `activity_cursor`. Fill in the real source commit and branch, or leave them empty when unknown.
 
