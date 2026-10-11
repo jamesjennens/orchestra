@@ -358,14 +358,19 @@ is missing, a directory, a fifo (which this command refuses to wait on), or larg
 bound: an operator who cannot see what will be cut off must say so deliberately, with
 `--without-preview`, and the refusal names that option; nothing is changed by the refusal
 (kittrial-5bb.250 F2, the coordinator's decision). The preview decides by ONE rule, in three
-groups (kittrial-5bb.250 r4): **refused** - a line whose command IS this kit's wrapper
-invocation (an interpreter by absolute path, or the wrapper itself, with only short
-interpreter flags in front - a relay, `ssh`, `/bin/sh -s`, `env`, `nice`, `timeout` or an
-assignment in front is another program's decision), on a command that needs no shell at all
-(a whitelist of plain characters: letters, digits, `-_.+/=,:` and space - a tab or a
-non-ASCII letter is shell), naming this kit's wrapper by an absolute path of at most 512
-bytes, an absolute `--root` serving this root, parsing as unbound; **may be refused** - every
-OTHER line that has a `command=` at all:
+groups (kittrial-5bb.250 r5): **refused** - a line whose command is EXACTLY the shape
+`authorized-keys` prints: one ABSOLUTE interpreter path, then zero or more of the two words
+`-E` and `-s` each alone (no other flag, no combined `-Es`, no `-W` that takes the wrapper
+path as its own value, no `-i`), then this kit's wrapper by absolute path as the next word -
+or the wrapper path as the first word. The interpreter's NAME is not judged: the preview
+trusts the first word to be the interpreter the kit printed, and a line of that shape whose
+interpreter is not Python is the operator's own doing. The command must need no shell at all
+(a whitelist of plain ASCII characters: letters, digits, `-_.+/=,:` and space - a tab or a
+non-ASCII letter is shell), name the wrapper by an absolute path of at most 512 bytes, and
+carry an absolute `--root` serving this root, parsing as unbound. Group one means **not
+served once on**, not served today: a wrapper file that is not executable, a relative
+`--endpoint` or an ill-formed project name serve nothing now and are still group one.
+**may be refused** - every OTHER line that has a `command=` at all:
 any other wrapper or root, shell syntax (`cd KIT && ...`, `2>/dev/null`, `; true`, `&`, `#`, a
 glob, an assignment, `/bin/sh -c`, quotes), a relative or `$HOME` path, and lines that run
 another program - not decided here, with whether the wrapper file names the setting said as a

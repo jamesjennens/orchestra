@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "operation_id": "caprev-5bb250-bound-keys-r4-0006",
+  "operation_id": "caprev-5bb250-bound-keys-r5-0006",
   "key": "ssh.bound-keys-only",
   "revision": 3,
   "expected_sha256": "abb850aca4b448b28a8bc2be52a6080371280dde639ea01f6f195a05f5343bd0",
@@ -14,7 +14,7 @@
     "may be refused lines",
     "wrapper names setting hint"
   ],
-  "summary": "bound_keys_only (deployment.private.json; absent/false is off) makes the wrapper refuse a line lacking a project or a principal; the switch (status/on/off, operator-gated, audited, off) previews what on would cut off, in three groups. REFUSED: the command IS this kit's wrapper invocation (interpreter + short flags only; a relay, ssh, env or an assignment is group two), no shell (whitelist: alnum, -_.+/=,: space; a tab or non-ASCII letter is shell), this kit's wrapper by an absolute path of at most 512 bytes, an absolute --root, unbound - would_be_refused (twenty numbers, _more, truncated) everywhere. MAY BE REFUSED: every other command= line - another wrapper/root, shell syntax, a relative path, another program - printed by status and on as may_be_refused with _more, both groups printed BEFORE the write, wrapper_names_setting saying as a HINT whether the wrapper names the setting in its first 64 KiB of the OPEN descriptor (once per file; a fifo never opened); a word in a file is a hint, not a decision. on REFUSES to flip on an unreadable or partly-inspected keys file unless --without-preview is said; a NUL or over-long wrapper path costs one line.",
+  "summary": "bound_keys_only (deployment.private.json; absent/false is off) makes the wrapper refuse a line lacking a project or a principal; the switch (status/on/off, operator-gated, audited, off) previews what on would cut off, in three groups. REFUSED: the command is EXACTLY what authorized-keys prints - an absolute interpreter path (name not judged), then -E/-s alone, then this kit's wrapper (or wrapper first); no -W/-X/-i, no relay, shell-free (plain ASCII whitelist), wrapper path of at most 512 bytes, an absolute --root, unbound; group one = not-served-once-on, not served today would_be_refused (twenty numbers, _more, truncated) everywhere. MAY BE REFUSED: every other command= line - another wrapper/root, shell syntax, a relative path, another program - printed by status and on as may_be_refused with _more, both groups printed BEFORE the write, wrapper_names_setting saying as a HINT whether the wrapper names the setting in its first 64 KiB of the OPEN descriptor (once per file; a fifo never opened); a word in a file is a hint, not a decision. on REFUSES to flip on an unreadable or partly-inspected keys file unless --without-preview is said; a NUL or over-long wrapper path costs one line.",
   "requirements": [],
   "anchors": [
     "docs/OPERATIONS.md#accept-bound-keys-only"

@@ -103,6 +103,22 @@ def key_line_text(root, kit=None, bound='', extra='', comment='scratch'):
             % (kit.as_posix(), root.as_posix(), kit.as_posix(), extra, bound, KEY_BODY, comment))
 
 
+def ssh_line_of_key():
+    """One public key file line, of the shape authorized_keys reads."""
+    return 'ssh-ed25519 %s scratch' % KEY_BODY
+
+
+def printed_lines(printed):
+    """The command= lines admin.authorized_keys prints, as authorized_keys rows (r5 item 1:
+    every line the kit prints must be decided by the preview)."""
+    document = printed if isinstance(printed, dict) else json.loads(printed['stdout'])
+    lines = []
+    for value in (document.get('contributor'), document.get('operator')):
+        if isinstance(value, str) and value.startswith('command="'):
+            lines.append(value)
+    return [line for line in lines if line.strip()]
+
+
 class ScratchHomeGuardTests(unittest.TestCase):
     """Item 1: no test of this module may read the runner's real key file.
 
@@ -541,6 +557,7 @@ class FlushTests(unittest.TestCase):
         self.assertGreaterEqual(said.flushes, 1, 'the refusal was not flushed')
 
 
+@unittest.skipIf(os.name == 'nt', 'the bound-keys preview and its fixtures assume POSIX paths (r5 item 4: the CI-red Windows run); the Linux suite holds them')
 class SettingsCommandTests(unittest.TestCase):
     """``admin.py bound-keys-only``: operator-gated, audited, and off by default."""
 
@@ -835,11 +852,15 @@ class SettingsCommandTests(unittest.TestCase):
                 self.assertIn(wording, str(refused.exception))
                 said = io.StringIO()
                 with mock.patch.object(sys, 'stderr', said):
-                    status = admin.bound_keys_only_switch(self.root, 'status', OPERATOR, str(path))
+                    status = self.run_with_timeout(
+                        lambda p=path: admin.bound_keys_only_switch(self.root, 'status', OPERATOR, str(p)),
+                        label='status with a non-regular keys file')
                 self.assertIsNone(status['would_be_refused'])
                 self.assertIn('could not be read', said.getvalue())
                 with self.assertRaises(ValueError) as on_refused:
-                    admin.bound_keys_only_switch(self.root, 'on', OPERATOR, str(path))
+                    self.run_with_timeout(
+                        lambda p=path: admin.bound_keys_only_switch(self.root, 'on', OPERATOR, str(p)),
+                        label='on with a non-regular keys file')
                 self.assertIn('Refusing to turn bound-keys-only on', str(on_refused.exception))
                 self.assertIn('--without-preview', str(on_refused.exception))
         self.assertFalse(admin.bound_keys_only(self.root))
@@ -922,7 +943,9 @@ class SettingsCommandTests(unittest.TestCase):
             file.write_text(key_line_text(self.root, kit=kit) + '\n', encoding='utf-8')
             with self.subTest(shape=label):
                 # The listing answers, with the line in group two, and never blocks.
-                listing = admin.authorized_keys_listing(self.root, str(file))
+                listing = self.run_with_timeout(
+                    lambda f=file: admin.authorized_keys_listing(self.root, str(f)),
+                    label='the listing with a fifo wrapper')
                 self.assertEqual([1], listing['may_be_refused'])
                 self.assertIsNone(listing['wrapper_names_setting'].get(1))
                 said = io.StringIO()
@@ -1185,28 +1208,56 @@ class SettingsCommandTests(unittest.TestCase):
         self.assertIn('Split the file and preview each part', str(refused.exception))
 
     def test_a_program_in_front_of_the_wrapper_is_never_decided(self):
-        """kittrial-5bb.250 r4 item 1: a false 'decided'. A relay, ssh, /bin/sh -s, env,
-        nice, timeout, exec or an assignment before the wrapper token makes the command
-        another program's decision: group two, whatever the wrapper token says - an
-        unbound line the operator was told is cut off must not stay alive."""
-        prefixes = ['/usr/bin/python3 X/relay', '/usr/bin/ssh host', '/bin/sh -s',
-                    '/usr/bin/env LC_ALL=C', '/usr/bin/nice -n 5', '/usr/bin/timeout 30',
-                    '/usr/bin/exec', 'W=1']
-        for prefix in prefixes:
+        """kittrial-5bb.250 r5 item 1, the FINAL rule: group one only when the command is
+        EXACTLY the shape the kit prints - one absolute interpreter path, then -E/-s each
+        alone, then this kit's wrapper as the next word (or the wrapper first). The
+        interpreter's NAME is not judged (an absolute /bin/sh -s or exec line of that
+        shape is the operator's own doing); the flag tricks are group two: -W takes the
+        wrapper path as ITS value and what follows runs instead, -X, -i, -Esi, a combined
+        -Es, a relay or a second program between."""
+        group_two = ['/usr/bin/python3 X/relay',                # a relay between interpreter and wrapper
+                     '/usr/bin/python3 -W',                     # -W swallows the wrapper path
+                     '/usr/bin/python3 -X',                     # -X takes the rest
+                     '/usr/bin/python3 -i',                     # stdin runs after the refusal
+                     '/usr/bin/python3 -Esi',                   # -i hidden in a cluster
+                     '/usr/bin/python3 -Es',                    # a combined flag
+                     'python3',                                 # a bare name, not absolute
+                     'W=1']
+        for prefix in group_two:
             line = key_line_text(self.root).replace(
                 '/usr/bin/python3 -E -s ', prefix + ' ' + KIT.as_posix() + '/ssh_forced_command.py ')
-            with self.subTest(prefix=prefix.split()[-1]):
+            with self.subTest(prefix=prefix):
                 file = Path(self.tmp.name)/'authorized_keys'
                 file.write_text(line + '\n', encoding='utf-8')
                 listing = admin.authorized_keys_listing(self.root, str(file))
-                self.assertEqual([], listing['would_be_refused'])
-                self.assertEqual([1], listing['may_be_refused'])
-        # The kit's own invocation, interpreter flags only, stays decided.
+                self.assertEqual([], listing['would_be_refused'], prefix)
+                self.assertEqual([1], listing['may_be_refused'], prefix)
+        # The printed shape stays decided whatever the interpreter is NAMED, with each
+        # flag alone and in any number - the operator's own doing if it is not python.
+        for interpreter in ('/usr/bin/python3', '/bin/sh', '/usr/bin/exec'):
+            for flags in ('', '-E ', '-s ', '-E -s '):
+                line = key_line_text(self.root).replace(
+                    '/usr/bin/python3 -E -s ',
+                    interpreter + ' ' + flags + KIT.as_posix() + '/ssh_forced_command.py ')
+                with self.subTest(interpreter=interpreter, flags=flags.strip()):
+                    file = Path(self.tmp.name)/'authorized_keys'
+                    file.write_text(line + '\n', encoding='utf-8')
+                    listing = admin.authorized_keys_listing(self.root, str(file))
+                    self.assertEqual([1], listing['would_be_refused'])
+                    self.assertEqual([], listing['may_be_refused'])
+        # And every line authorized-keys PRINTS is decided: drive the printer itself.
+        pub = Path(self.tmp.name)/'pub'
+        pub.write_text(ssh_line_of_key(), encoding='utf-8')
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            admin.authorized_keys(self.root, str(pub), projects=['alpha'], principal=MINE)
+        printed = {'stdout': out.getvalue()}
         file = Path(self.tmp.name)/'authorized_keys'
-        file.write_text(key_line_text(self.root) + '\n', encoding='utf-8')
-        listing = admin.authorized_keys_listing(self.root, str(file))
-        self.assertEqual([1], listing['would_be_refused'])
-        self.assertEqual([], listing['may_be_refused'])
+        for line in printed_lines(printed):
+            file.write_text(line + '\n', encoding='utf-8')
+            listing = admin.authorized_keys_listing(self.root, str(file))
+            self.assertEqual([], listing['may_be_refused'], line[:60])
+            self.assertIn(listing['would_be_refused'], ([1], []))
 
     def test_the_wrapper_is_opened_once_with_the_guarding_flags_and_never_lstat_first(self):
         """kittrial-5bb.250 r4 item 3: each mutant dies by an assertion, never by a hang.
@@ -1243,10 +1294,12 @@ class SettingsCommandTests(unittest.TestCase):
         wrapper_opens = [e for e in events if e[0] == 'open' and 'once-release' in e[1]]
         keys_opens = [e for e in events if e[0] == 'open' and e[1].endswith('authorized_keys')]
         self.assertEqual(1, len(wrapper_opens))                    # once
-        self.assertTrue(wrapper_opens[0][2] & os.O_NONBLOCK)      # a fifo never waited on
-        self.assertTrue(wrapper_opens[0][2] & os.O_NOFOLLOW)      # a symlink not followed
+        self.assertTrue(wrapper_opens[0][2] & getattr(os, 'O_NONBLOCK', 0),
+                        'a fifo never waited on (where the platform has O_NONBLOCK)')
+        self.assertTrue(wrapper_opens[0][2] & getattr(os, 'O_NOFOLLOW', 0),
+                        'a symlink not followed (where the platform has O_NOFOLLOW)')
         self.assertEqual(1, len(keys_opens))                      # ONE listing per command
-        self.assertTrue(keys_opens[0][2] & os.O_NONBLOCK)
+        self.assertTrue(keys_opens[0][2] & getattr(os, 'O_NONBLOCK', 0) or not hasattr(os, 'O_NONBLOCK'))
         # The listing's own missing-check stats the wrapper path before the open (a
         # listing fact, bounded); the r2 race shape - a stat AFTER or BETWEEN the hint
         # read's own calls - must not exist: nothing stats the wrapper path once the
@@ -1331,6 +1384,58 @@ class SettingsCommandTests(unittest.TestCase):
         self.assertEqual([1], listing['may_be_refused'])
         self.assertIsNone(listing['wrapper_names_setting'].get(1))
 
+    def test_flag_value_shapes_and_survivors(self):
+        """kittrial-5bb.250 r5 item 3, the named survivors, each pinned once: on's
+        may_be_refused_more always present (0 when the group is empty); a non-ASCII letter
+        (str.isalnum mutants); a wrapper READ failure hint None (a WRITE-failure 513-byte
+        path hint None too - the bound applies at the hint open); a relative --root group
+        two; a no-op on printing no preview."""
+        # on's JSON carries may_be_refused_more even when the group is empty.
+        file = Path(self.tmp.name)/'authorized_keys'
+        file.write_text(key_line_text(self.root) + '\n', encoding='utf-8')
+        result = admin.bound_keys_only_switch(self.root, 'on', OPERATOR, str(file))
+        self.assertEqual(0, result['may_be_refused_more'])
+        admin.bound_keys_only_switch(self.root, 'off', OPERATOR)
+        # A non-ASCII letter anywhere in the command: group two (str.isalnum is not the
+        # whitelist - the plain set is ASCII-only).
+        nonascii = key_line_text(self.root).replace('/usr/bin/python3 -E -s ',
+                                                    '/usr/bin/python3 -E -s\u00e9 ')
+        file.write_text(nonascii + '\n', encoding='utf-8')
+        listing = admin.authorized_keys_listing(self.root, str(file))
+        self.assertEqual([1], listing['may_be_refused'])
+        self.assertEqual([], listing['would_be_refused'])
+        # A wrapper path over the bound: hint None at the hint open (a 513-byte path under
+        # a real directory gave True before the bound was applied there).
+        long_kit = Path(self.tmp.name)/('x' * 480)
+        try:
+            long_kit.mkdir()
+        except OSError:
+            long_kit = None
+        if long_kit is not None:
+            shutil.copy(KIT/'ssh_forced_command.py', long_kit/'ssh_forced_command.py')
+            wrapper = long_kit/'ssh_forced_command.py'
+            if len(str(wrapper)) > 512:
+                file.write_text(key_line_text(self.root, kit=long_kit) + '\n', encoding='utf-8')
+                listing = admin.authorized_keys_listing(self.root, str(file))
+                self.assertEqual([1], listing['may_be_refused'])
+                self.assertIsNone(listing['wrapper_names_setting'].get(1))
+        # A relative --root is group two.
+        relative_root = key_line_text(self.root).replace(
+            '--root ' + self.root.as_posix(), '--root ' + 'rel-root')
+        file.write_text(relative_root + '\n', encoding='utf-8')
+        listing = admin.authorized_keys_listing(self.root, str(file))
+        self.assertEqual([], listing['would_be_refused'])
+        self.assertEqual([1], listing['may_be_refused'])
+        # A no-op on prints no preview (not even the refused group's warning).
+        file.write_text(key_line_text(self.root) + '\n', encoding='utf-8')
+        admin.bound_keys_only_switch(self.root, 'on', OPERATOR, str(file))
+        said = io.StringIO()
+        with mock.patch.object(sys, 'stderr', said):
+            noop = admin.bound_keys_only_switch(self.root, 'on', OPERATOR, str(file))
+        self.assertFalse(noop['changed'])
+        self.assertNotIn('refuse', said.getvalue())
+        admin.bound_keys_only_switch(self.root, 'off', OPERATOR)
+
     def test_status_bounds_the_audit_entries_it_prints(self):
         """kittrial-5bb.250 F7: the audit list is hand-editable; the entries status prints
         on stdout are escaped and bounded as the stderr warnings are, not whole."""
@@ -1385,6 +1490,27 @@ class SettingsCommandTests(unittest.TestCase):
             admin.bound_keys_only_switch(self.root, 'on', OPERATOR, str(file))
         self.assertEqual(events[:2], ['preview', 'write'])
 
+    @staticmethod
+    def run_with_timeout(function, seconds=20, label='call'):
+        """Run function() with a wall-clock timeout (r5 item 3): a mutant that re-opens a
+        fifo WITHOUT O_NONBLOCK must fail this test by assertion, not hang the module and
+        every test after it."""
+        import threading
+        box = {}
+        def target():
+            try:
+                box['value'] = function()
+            except BaseException as error:              # noqa: BLE001 - ferried to the caller
+                box['error'] = error
+        thread = threading.Thread(target=target, daemon=True)
+        thread.start()
+        thread.join(seconds)
+        if thread.is_alive():
+            raise AssertionError('%s did not answer in %ds: a fifo was opened blocking' % (label, seconds))
+        if 'error' in box:
+            raise box['error']
+        return box.get('value')
+
     def test_a_keys_file_that_cannot_be_read_refuses_on_without_flipping(self):
         """Item 1, and kittrial-5bb.250 F2 with the coordinator's decision: the REAL cases of an
         unreadable keys file - missing, a directory, a fifo, no permission - make `on` refuse
@@ -1400,7 +1526,9 @@ class SettingsCommandTests(unittest.TestCase):
         for label, path in shapes:
             with self.subTest(shape=label):
                 with self.assertRaises(ValueError) as refused:
-                    admin.bound_keys_only_switch(self.root, 'on', OPERATOR, str(path))
+                    self.run_with_timeout(
+                        lambda p=path: admin.bound_keys_only_switch(self.root, 'on', OPERATOR, str(p)),
+                        label='on with a fifo keys file')
                 self.assertIn('Refusing to turn bound-keys-only on', str(refused.exception))
                 self.assertIn('--without-preview', str(refused.exception))
                 self.assertFalse(admin.bound_keys_only(self.root))
@@ -1787,7 +1915,7 @@ class DocumentationTests(unittest.TestCase):
                        'first 64 KiB',
                        '--without-preview',
                        # The r4 additions: the invocation rule, the bounds, the outside set.
-                       "IS this kit's wrapper",
+                       "EXACTLY the shape",
                        'at most 512',
                        'an absolute `--root`',
                        'a fifo is opened',

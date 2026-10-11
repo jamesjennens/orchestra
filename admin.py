@@ -5935,32 +5935,28 @@ def key_line(line,root,kit):
     relative_path=(not os.path.isabs(wrapper) or wrapper.startswith('~')
                    or len(wrapper) > 512)              # r4: a 60,000-component path is not judged
     entry['relative_path']=relative_path
-    # kittrial-5bb.250 r4 item 1: a false 'decided'. The words BEFORE the wrapper token
-    # decide too: the invocation must BE this kit's wrapper - an interpreter by absolute
-    # path (or the wrapper itself) followed only by interpreter flags of the shape the kit
-    # prints (-E, -s), nothing else. A relay, ssh HOST, /bin/sh -s, env, nice, timeout,
-    # exec, an assignment or any other program in front runs the wrapper under somebody
-    # else's decision: group two, whatever the wrapper token says.
-    prefix=tokens[:at]
-    def _interpreter_invocation(prefix):
+    # kittrial-5bb.250 r5 item 1, THE RULE final: group one only when the command is
+    # EXACTLY the shape authorized_key_lines prints - taken from that function's own
+    # constants, so the preview and the printer cannot drift. One ABSOLUTE interpreter
+    # path (any name: the preview trusts the first word to be the interpreter the kit
+    # printed), then zero or more of the two words -E and -s EACH ALONE (no other flag,
+    # no combined -Es, no -W value that swallows the wrapper), then this kit's wrapper by
+    # absolute path as the NEXT word - or the wrapper path as the first word. Everything
+    # else - -W X, -X, -i, -Esi, a bare interpreter name - is group two: -W takes the
+    # wrapper path as its own value and what follows runs instead, -i makes Python run
+    # what stdin says once the wrapper has refused.
+    def _printed_invocation(prefix):
         if not prefix:
-            return True                                   # the wrapper is invoked directly
-        if len(prefix) > 4:
+            return True                                   # the wrapper invoked directly
+        if len(prefix) > 1 + len(AUTHORIZED_KEY_PYTHON_FLAGS):
             return False
-        # The interpreter must BE python (any absolute path to a python, or python3/python
-        # by name) - /bin/sh, /usr/bin/exec or a relay is another program even with short
-        # flags after it (r4 item 1: '/bin/sh -s' and '/usr/bin/exec' in front were
-        # wrongly decided by the first cut of this check).
-        head=prefix[0]
-        if head.startswith('~'):
-            return False
-        if os.path.isabs(head):
-            if not re.search(r'(^|/)python[0-9.]*\Z', head):
-                return False
-        elif head not in ('python3', 'python'):
-            return False
-        return all(re.fullmatch(r'-[A-Za-z0-9]{1,3}', word) for word in prefix[1:])
-    entry['foreign_invocation']=not _interpreter_invocation(prefix)
+        if not os.path.isabs(prefix[0]) or prefix[0].startswith('~'):
+            return False                                  # the printed interpreter is absolute
+        flags = prefix[1:]
+        allowed = list(AUTHORIZED_KEY_PYTHON_FLAGS)       # (-E, -s): each alone, in any number
+        return all(word in allowed for word in flags)
+    prefix=tokens[:at]
+    entry['foreign_invocation']=not _printed_invocation(prefix)
     values={'--root':[],'--endpoint':[],'--python':[],'--project':[],'--principal':[]};unknown=[]
     arguments=tokens[at+1:];index=0
     while index<len(arguments):
@@ -6116,7 +6112,8 @@ def authorized_keys_listing(root,file=None):
         if str(wrapper) in _wrapper_hint_cache:
             return _wrapper_hint_cache[str(wrapper)]
         hint=None
-        if os.path.isabs(str(wrapper)) and not str(wrapper).startswith('~'):
+        if (os.path.isabs(str(wrapper)) and not str(wrapper).startswith('~')
+                and len(str(wrapper)) <= 512):
             # Open FIRST, judge the OPEN FILE (r3 item 2): between an lstat and an open the
             # path can become a fifo, and the review's race hung status in 2 of 5 runs.
             # O_NONBLOCK never waits on a fifo, O_NOFOLLOW refuses a symlinked wrapper, and
