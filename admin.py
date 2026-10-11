@@ -3379,6 +3379,9 @@ def validate_record_receipt(name,record):
     if name.startswith('.requirement-owner-requests/'):
         from requirement_http import validate_receipt as validate_owner_receipt
         validate_owner_receipt(record)
+        if 'owner_state' in record and name != '.requirement-owner-requests/' + content_hash(
+                {'operation_id': record['owner_state']['operation_id']}) + '.json':
+            raise ValueError('Owner terminal receipt path mismatch')
         if 'owner_decision' in record and name != '.requirement-owner-requests/' + content_hash(
                 {'operation_id': record['owner_decision']['operation_id']}) + '.json':
             raise ValueError('Owner decision receipt path mismatch')
@@ -7351,6 +7354,7 @@ def main():
     a.add_argument('--disposition',choices=['failed','released','complete'],default='released')
     a.add_argument('--issue-id',dest='issue_id',default=None,
                    help='with --disposition complete, the exact native record to confirm')
+    a.add_argument('--state',help='the existing web service state document; required for terminal recovery')
     a=sub.add_parser('capability-apply',help='accept a batch of capabilities, or a direct revision 1 (operator allowlist, F3 evidence)')
     a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('capability-retire',help='retire a capability in favour of a successor key (operator allowlist, F3 evidence)')
@@ -7829,17 +7833,30 @@ def main():
             fcntl.flock(lock,fcntl.LOCK_EX)
             print(json.dumps(apply_native(payload,args.actor,run,path,operator=True,operators=authority)))
     elif args.command=='requirement-reconcile':
+        import contextlib
         import fcntl
         from requirement_records import reconcile
         from keyed_records import require_configured_operator
+        from http_authority import file_lock, read_state
+        from requirement_terminal import receipt_path
         require_configured_operator(args.actor,operators(root,strict=True),'reconcile a requirement operation')
         path=project_dir(root,args.project)
         if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
         def run(argv):return run_bd(root,args.project,['--actor',args.actor,*argv])
+        # The host operator supplies the trusted service document, never an HTTP
+        # request field. Match endpoint's project-then-authority lock order.
+        if args.state:
+            state=Path(args.state)
+            if state.is_symlink() or not state.is_file():raise ValueError('Use the existing web service state document')
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
-            print(json.dumps(reconcile(path,args.operation_id,args.actor,args.reason,
-                                       args.disposition,run,issue_id=args.issue_id)))
+            with file_lock(str(state)+'.lock') if args.state else contextlib.nullcontext():
+                if args.state:read_state(state)
+                require_configured_operator(args.actor,operators(root,strict=True),'reconcile a requirement operation')
+                if receipt_path(path,args.operation_id).exists() and not args.state:
+                    raise ValueError('Owner requirement recovery needs --state with the existing web service state document')
+                print(json.dumps(reconcile(path,args.operation_id,args.actor,args.reason,
+                                           args.disposition,run,issue_id=args.issue_id)))
     elif args.command=='reference-apply':
         import contextlib
         import fcntl

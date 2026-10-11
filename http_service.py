@@ -1524,10 +1524,17 @@ class EndpointBackend:
                 '--service-namespace', self.actor_namespace]
         if require_authority:
             argv.append('--require-authority')
+        if action == 'owner-requirements':
+            argv.extend(['--terminal-endpoint-timeout', str(timeout or self.timeout)])
         try:
-            completed = subprocess.run(argv,
-                                       input=json.dumps(payload), text=True, encoding='utf-8',
-                                       capture_output=True, timeout=timeout or self.timeout)
+            if action == 'owner-requirements':
+                import endpoint_process
+                completed = endpoint_process.run(argv, input=json.dumps(payload),
+                                                 timeout=timeout or self.timeout)
+            else:
+                completed = subprocess.run(argv,
+                                           input=json.dumps(payload), text=True, encoding='utf-8',
+                                           capture_output=True, timeout=timeout or self.timeout)
         except subprocess.TimeoutExpired:
             raise uncertain('Canonical endpoint timed out; outcome may be unknown')
         if completed.returncode:
@@ -2055,6 +2062,10 @@ class EndpointBackend:
         if isinstance(reply,dict) and reply.get('returncode')==2 and 'Requirement was not found' in (reply.get('stderr') or ''):
             raise not_found('Requirement not found')
         return self._checked(reply, reading=True)
+
+    def requirement_operator_audits(self, project_id):
+        from requirement_terminal import operator_audits
+        return operator_audits(Path(self.root)/'projects'/project_id, project_id)
 
     def owner_requirements(self, principal, project_id, action, fields, key, task=None):
         operation_id=self._result_key(principal,project_id,'requirements.'+action,key,task)
@@ -3428,7 +3439,13 @@ class ApiHandler(BaseHTTPRequestHandler):
                 # Bounded nesting (kittrial-5bb.108): a body nested deeper than the kit ever
                 # writes is refused here, as bad JSON, and never reaches a route or the
                 # operation journal. It used to be an HTTP 500.
-                payload = record_json.loads(body)
+                # Duplicate requirement fields must not silently choose one of
+                # two reasons or successors before closed-schema validation.
+                if re.fullmatch(r'/v1/projects/[^/]+/requirements(?:/.*)?', urlsplit(self.path).path):
+                    from export_requirements import _unique
+                    payload = record_json.loads(body, object_pairs_hook=_unique)
+                else:
+                    payload = record_json.loads(body)
             except (ValueError, UnicodeError):
                 raise invalid('Request body is not valid JSON')
             if not isinstance(payload, dict):
@@ -5815,6 +5832,24 @@ class ApiHandler(BaseHTTPRequestHandler):
                 or self.service.state.get('memberships',{}).get(pid,{}).get(ctx.principal.user_id)!='owner'):
             raise forbidden('Requirements editing needs the signed-in project owner')
 
+    def _requirements_names(self, result):
+        items=result.get('items', [result])
+        accounts = [(item.get('state') or {}).get('account_id') for item in items]
+        accounts += [(item.get('completion') or {}).get('actor') for item in items]
+        accounts += [((item.get('pending_transition') or {}).get('state') or {}).get('account_id') for item in items]
+        names=self.service.actor_names(accounts)
+        # The shared resolver returns the identifier for unknown accounts.
+        # Historical human attribution must use neutral text on this page.
+        names={account:name for account,name in names.items() if name != account}
+        for item in items:
+            if item.get('state'):
+                item['state_author_name']=names.get(item['state']['account_id']) or 'Former project owner'
+            if item.get('completion'):
+                item['completion_author_name']=names.get(item['completion']['actor']) or 'Host operator or former project owner'
+            if item.get('pending_transition'):
+                pending = item['pending_transition']
+                pending['author_name']=names.get(pending['state']['account_id']) or 'Former project owner'
+
     def _requirements_write(self, ctx, action, status=200):
         self._requirements_backend()
         self._requirements_owner(ctx)
@@ -5822,7 +5857,11 @@ class ApiHandler(BaseHTTPRequestHandler):
             'create':('kind','parent','title','description','key'),
             'revise':('expected_revision','expected_sha256','title','description'),
             'accept':('expected_revision','expected_sha256'),
+            'withdraw':('expected_revision','expected_sha256','expected_state_sha256','reason'),
+            'supersede':('expected_revision','expected_sha256','expected_state_sha256','reason','successor'),
             'release':('original_operation_id','expected_receipt_sha256','reason'),
+            'finish':('original_operation_id','expected_receipt_sha256'),
+            'abandon':('original_operation_id','expected_receipt_sha256','reason'),
             'governance':('mode','expected_revision','expected_sha256')}[action],'Requirements')
         import requirement_http
         try: requirement_http.checked_body(fields,action)
@@ -5830,12 +5869,32 @@ class ApiHandler(BaseHTTPRequestHandler):
         if operation_id is not None:
             raise invalid('Use the Idempotency-Key header for requirements writes')
         pid=ctx.params['pid']
+        if action in ('withdraw','supersede','finish','abandon'):
+            # Give immediate mode advice; the canonical adapter repeats the
+            # check under the project/authority locks, including exact replays.
+            if self.backend.requirements_read(pid,['governance'])['mode']!='simple':
+                raise invalid('This project uses governed requirements. Ask its owner to enable simple editing.')
         def write():
             result=self.backend.owner_requirements(ctx.principal,pid,action,fields,
                                                     ctx.idempotency_key or ctx.request_id,ctx.params.get('rid'))
+            if action in ('withdraw','supersede','finish','abandon'):
+                token=request_hash({'project':pid,'operation_id':result['operation_id'],
+                                    'disposition':result.get('disposition','complete')})
+                with self.service.store.lock:
+                    recorded=self.service.state.setdefault('requirement_terminal_audits',{})
+                    if token not in recorded:
+                        self.service.audit(ctx.request_id,ctx.principal,'requirements.'+action,'committed',project_id=pid,
+                                           requirement_id=result['id'], original_operation_id=result['operation_id'],
+                                           recovery_operation_id=(result.get('completion') or {}).get('operation_id') or result.get('recovery_operation_id'))
+                        recorded[token]=ctx.request_id
             return result,result
         return self._mutate(ctx,'requirements.'+action,pid,write,status=status,
-                            capability=CAP_PROJECT_ADMIN,serialize=False,canonical=True)
+                            capability=CAP_PROJECT_ADMIN,serialize=False,canonical=True,
+                            # Terminal replay authority belongs to the canonical
+                            # owner adapter. Its durable identity still deduplicates
+                            # effects; a service response must not bypass that check.
+                            idempotent=action not in ('withdraw','supersede','finish','abandon'),
+                            audit_success=action not in ('withdraw','supersede','finish','abandon'))
 
     @route('GET', r'/v1/projects/(?P<pid>'+ID+r')/requirements/governance')
     def requirements_governance_read(self,ctx):
@@ -5860,6 +5919,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         self._requirements_backend(); self._project(ctx,CAP_READ)
         result=dict(self.backend.requirements_read(ctx.params['pid'],['list']))
         result['items']=[self._requirement_author(ctx,item) for item in result.get('items',[])]
+        self._requirements_names(result)
         result['can_edit']=(ctx.principal.via=='session' and not ctx.principal.agent_id
                             and self.service.state.get('memberships',{}).get(ctx.params['pid'],{}).get(ctx.principal.user_id)=='owner')
         return 200,result
@@ -5873,6 +5933,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         self._requirements_backend(); self._project(ctx,CAP_READ)
         result=dict(self.backend.requirements_read(ctx.params['pid'],['get',ctx.params['rid']]))
         result=self._requirement_author(ctx,result)
+        self._requirements_names(result)
         result['governance']=self.backend.requirements_read(ctx.params['pid'],['governance'])
         result['can_edit']=(ctx.principal.via=='session' and not ctx.principal.agent_id
                             and self.service.state.get('memberships',{}).get(ctx.params['pid'],{}).get(ctx.principal.user_id)=='owner')
@@ -5908,11 +5969,28 @@ class ApiHandler(BaseHTTPRequestHandler):
     def requirements_accept(self,ctx):
         return self._requirements_write(ctx,'accept')
 
+    @route('POST', r'/v1/projects/(?P<pid>'+ID+r')/requirements/(?P<rid>'+ID+r')/withdraw')
+    def requirements_withdraw(self,ctx):
+        return self._requirements_write(ctx,'withdraw')
+
+    @route('POST', r'/v1/projects/(?P<pid>'+ID+r')/requirements/(?P<rid>'+ID+r')/supersede')
+    def requirements_supersede(self,ctx):
+        return self._requirements_write(ctx,'supersede')
+
+    @route('POST', r'/v1/projects/(?P<pid>'+ID+r')/requirements/(?P<rid>'+ID+r')/transition/finish')
+    def requirements_finish_transition(self,ctx):
+        return self._requirements_write(ctx,'finish')
+
+    @route('POST', r'/v1/projects/(?P<pid>'+ID+r')/requirements/(?P<rid>'+ID+r')/transition/abandon')
+    def requirements_abandon_transition(self,ctx):
+        return self._requirements_write(ctx,'abandon')
+
     @route('GET', r'/v1/projects/(?P<pid>'+ID+r')/brd')
     def requirements_brd(self,ctx):
         self._requirements_backend(); self._project(ctx,CAP_READ)
         result=self.backend.requirements_read(ctx.params['pid'],['brd'])
         result['items']=[self._requirement_author(ctx,item) for item in result.get('items',[])]
+        self._requirements_names(result)
         return 200,result
 
     # -- contributed requirement proposals (.58 slice 1b, kittrial-5bb.70) -----------
@@ -6739,6 +6817,14 @@ class ApiHandler(BaseHTTPRequestHandler):
         self._project(ctx, CAP_PROJECT_ADMIN)
         limit, state = self._page(ctx, ctx.query)
         events = [e for e in self.service.state['audit'] if e.get('project_id') == ctx.params['pid']]
+        if hasattr(self.backend, 'requirement_operator_audits'):
+            operator_events = self.backend.requirement_operator_audits(ctx.params['pid'])
+            if operator_events:
+                events += operator_events
+                # Same-time service events retain their append order. Sorting
+                # their random request IDs can move an earlier event across a
+                # page boundary and make a later event disappear from a slice.
+                events.sort(key=lambda event:event['time'])
         page = events[state['o']:state['o'] + limit]
         names = self.service.actor_names([e.get('user_id') for e in page])
         body = {'items': [dict(e, user_name=names.get(e.get('user_id')), detail=e.get('reason'))

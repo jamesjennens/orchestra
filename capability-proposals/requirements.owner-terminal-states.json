@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "operation_id": "capnew-requirements-owner-terminal-v1",
+  "key": "requirements.owner-terminal-states",
+  "name": "Human owner withdrawal and exact supersession preserve requirement history",
+  "aliases": [
+    "withdraw requirement",
+    "supersede requirement",
+    "terminal requirement history"
+  ],
+  "summary": "A signed-in current human owner in simple mode may withdraw or supersede an accepted requirement. Recovery uses the exact durable receipt and current authority: written decisions remain finishable; pending predecessors reserve successors. Abandon requires the saved server deadline and complete native absence proof. A late native state overrides release. Hashed status, disposition and completion history retain the decider and finisher. Pages show the saved operation, replacement title, author, time, reason and unavailable-action advice; finishing requires irreversible confirmation. Member readers retain historical content and distinguish terminal and unknown state. New incorporation is refused; contributor submission on terminal requirements is outside this delivery. Backup/restore preserves receipt integrity and lineage. From the first attempted terminal transition, serving or restoring with an older kit requires a backup taken before that attempt.",
+  "requirements": [],
+  "anchors": [
+    "docs/REQUIREMENTS.md#withdraw-or-supersede-an-accepted-requirement"
+  ],
+  "code": [
+    "requirement_terminal.py::apply",
+    "requirement_owner_records.py::state_ledger",
+    "requirement_http.py::read",
+    "http_service.py::ApiHandler.requirements_withdraw",
+    "endpoint_process.py::run",
+    "requirement_terminal.py::operator_audits"
+  ],
+  "tests": [
+    "tests/test_requirement_terminal.py",
+    "tests/test_http_requirement_terminal.py",
+    "tests/test_requirement_owner_real_bd.py",
+    "tests/web_requirement_terminal.mjs",
+    "tests/test_requirement_terminal_timeout_native.py",
+    "tests/web_requirement_transition_recovery.mjs",
+    "tests/test_endpoint_process.py"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "requirements",
+    "history",
+    "replay"
+  ]
+}

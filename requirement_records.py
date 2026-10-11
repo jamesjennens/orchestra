@@ -328,7 +328,7 @@ def resolved_acceptance(row, record, operators=None):
     accepted label nor an accepted revision can substitute for that evidence.
     Older host-only snapshots retain their declared v1 acceptance semantics.
     """
-    from requirement_owner_records import ACCEPTANCE_PREFIX as owner_prefix, STATE_PREFIX, HUMAN, parse
+    from requirement_owner_records import ACCEPTANCE_PREFIX as owner_prefix, HUMAN
     from reserved_comments import _reserved_prefix_view
     owner_claim = False
     for comment in row.get('comments') or []:
@@ -341,17 +341,16 @@ def resolved_acceptance(row, record, operators=None):
                 owner_claim = True
         view = _reserved_prefix_view(body) if isinstance(body, str) else ''
         if view.startswith('Kind: requirement-owner-'):
-            owner_claim = True
+            # Terminal evidence controls current activity, never the validity
+            # of an earlier immutable acceptance. Its independent reader marks
+            # a malformed/partial state unknown while retaining that history.
+            if view.startswith('Kind: requirement-owner-state'):
+                continue
             if view != body:
                 raise ValueError('Malformed owner requirement evidence')
-            if not body.startswith((owner_prefix, STATE_PREFIX)):
+            if not body.startswith(owner_prefix):
                 raise ValueError('Unsupported owner requirement evidence')
-            if body.startswith(STATE_PREFIX):
-                # Reserved future state evidence cannot make a record accepted.
-                # An unimplemented state operation is never silently ignored.
-                if parse(body, state=True) is None:
-                    raise ValueError('Malformed owner requirement state evidence')
-                raise ValueError('Owner requirement state is not supported by this kit')
+            owner_claim = True
     evidence = existing_acceptances(row, operators).get(record['revision'])
     if record.get('id') != row.get('id') or record.get('acceptance_state') != 'accepted':
         return False
@@ -519,6 +518,13 @@ def _check_revision(payload, revision, existing, record, task):
 
 def _current_acceptance(row, existing):
     """Whether the record is currently accepted, from state label and revisions."""
+    from requirement_owner_records import state_ledger
+    try:
+        terminal, _ = state_ledger(row)
+    except (ValueError, TypeError, KeyError):
+        return 'unknown'
+    if terminal is not None:
+        return terminal['state']
     from requirement_owner_records import HUMAN
     if any(isinstance(c, dict) and isinstance(c.get('text'), str)
            and (c['text'].startswith('Kind: requirement-owner-')
@@ -601,6 +607,9 @@ def _require_selectable(row, payload, operator, existing):
     allow_untyped = (operator and payload['operation'] == 'draft'
                      and payload['acceptance_state'] == 'accepted' and not existing)
     require_typed(row, payload, allow_untyped=allow_untyped)
+    from requirement_owner_records import state_ledger
+    if state_ledger(row)[0] is not None:
+        raise ValueError('A terminal requirement cannot be revised or reactivated; create a new requirement')
 
 
 def _result(payload, task, revision, record, created, reconciled, bound, comment_id=None):
@@ -670,6 +679,19 @@ def apply_native(payload, actor, run, project, operator=False, operators=None):
     The steps are the shared keyed-record core's (keyed_records.apply_native)
     with this module's REQUIREMENT spec.
     """
+    # Reject invalid caller shapes before receipt discovery or guarded execution
+    # can translate an attribute error into an uncertain write outcome.
+    validate_payload(payload, operator=operator)
+    from requirement_terminal import pending_ids, require_unreserved_successor, scan
+    terminal_receipts, _ = scan(Path(project), Path(project).name)
+    transition_rows = read_rows(run) if any(r['status']=='released' for r in terminal_receipts) else None
+    if payload.get('task') is not None:
+        require_unreserved_successor(Path(project), Path(project).name, payload['task'], transition_rows)
+    pending, uncertain = pending_ids(Path(project), Path(project).name, transition_rows)
+    if payload.get('task') in uncertain:
+        raise ValueError('Requirement transition receipt is damaged; ask the host operator to reconcile it')
+    if payload.get('task') in pending:
+        raise ValueError('Requirement transition is pending; finish or abandon it on the requirements page')
     spec = SPEC
     if not operator:
         # The caller holds the project lock. Recheck mode and the exact latest
@@ -717,6 +739,12 @@ def backfill(payload, actor, run, project, operators=None):
     """
     _require_configured_operator(actor, operators, 'backfill requirement records')
     validate_backfill(payload)
+    from requirement_terminal import pending_ids
+    pending, uncertain = pending_ids(Path(project), Path(project).name)
+    if any(entry['task'] in uncertain for entry in payload['records']):
+        raise ValueError('Requirement transition receipt is damaged; ask the host operator to reconcile it')
+    if any(entry['task'] in pending for entry in payload['records']):
+        raise ValueError('Requirement transition is pending; finish or abandon it on the requirements page')
     identity = content_hash({'operation_id': payload['operation_id']})
     digest = content_hash({'actor': actor, 'payload': payload})
     journal = _journal(project, BACKFILL_JOURNAL)
@@ -731,6 +759,9 @@ def backfill(payload, actor, run, project, operators=None):
         row = find(rows, entry['task'])
         if row is None:
             raise ValueError('Unknown requirement record: ' + entry['task'])
+        from requirement_owner_records import state_ledger
+        if state_ledger(row)[0] is not None:
+            raise ValueError('A terminal requirement cannot be relabelled or reactivated')
         present = set(row.get('labels') or [])
         desired = controlled(entry['kind'], entry['acceptance_state'])
         added = sorted(desired - present)
@@ -794,6 +825,19 @@ def reconcile(project, operation_id, actor, reason, disposition, run, issue_id=N
       can be resubmitted.
     * Repeating an identical reconciliation is idempotent.
     """
+    from requirement_terminal import receipt_path, read_receipt, recover, receipt_sha256
+    path = receipt_path(Path(project), operation_id)
+    if path.is_file() or path.is_symlink():
+        receipt = read_receipt(path)
+        from requirement_http import OwnerContext
+        from requirement_governance import current
+        context = OwnerContext(Path(project).name, actor, current(Path(project), Path(project).name))
+        if context.governance['mode'] != 'simple':
+            raise ValueError('Terminal recovery requires simple requirements; preserve the receipt for operator reconciliation')
+        return recover(Path(project), context, 'finish' if disposition == 'complete' else 'abandon',
+                       receipt['id'], dict(original_operation_id=operation_id,
+                       expected_receipt_sha256=receipt_sha256(receipt), reason=reason), run,
+                       completion_via='operator')
     return core.reconcile(project, operation_id, actor, reason, disposition, run, SPEC,
                           issue_id=issue_id)
 

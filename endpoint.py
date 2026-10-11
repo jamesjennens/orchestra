@@ -1459,6 +1459,8 @@ def main():
     p.add_argument('--service-namespace',
                    help="the web service's own actor namespace (default http): a name the "
                         'service was started under is refused at use too (kittrial-5bb.188 item 3)')
+    p.add_argument('--terminal-endpoint-timeout', type=float, default=150,
+                   help='trusted service launch timeout for terminal write abandonment fencing')
     p.add_argument('--key-project',action='append',metavar='NAME',
                    help='a project the calling SSH key is bound to (repeatable; passed only by '
                         'ssh_forced_command.py from the authorized_keys line): every request for '
@@ -1472,7 +1474,8 @@ def main():
     a=p.parse_args()
     authority_config=None
     if a.authority_store:
-        authority_config=AuthorityConfig(a.authority_store,a.authority_lock,a.service_namespace)
+        authority_config=AuthorityConfig(a.authority_store,a.authority_lock,a.service_namespace,
+                                         a.terminal_endpoint_timeout)
     try:
         if a.key_project is not None and a.authority_store:
             # A key line is not the web service, and the service passes no such flag.

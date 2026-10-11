@@ -1023,7 +1023,7 @@ class Service:
         return True
 
     def audit(self, request_id, principal, action, outcome, *, project_id=None, reason=None,
-              actor=None):
+              actor=None, requirement_id=None, original_operation_id=None, recovery_operation_id=None):
         """Append one redacted audit event. Secrets and payloads must never reach here."""
         event = {
             'time': now_iso(self._now()),
@@ -1036,6 +1036,9 @@ class Service:
             'outcome': outcome,
             'reason': (str(reason)[:200] if reason else None),
         }
+        if requirement_id is not None:
+            event.update(requirement_id=requirement_id, original_operation_id=original_operation_id,
+                         recovery_operation_id=recovery_operation_id)
         with self.store.lock:
             self.state['audit'].append(event)
             if not self._audit_defer_trim and len(self.state['audit']) > AUDIT_LIMIT:
