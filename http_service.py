@@ -1546,6 +1546,9 @@ class EndpointBackend:
     #: The follow-on base refusal is handed on whole (kittrial-5bb.158): cut at 200 it lost the
     #: reason, the recorder's name and what an operator must do.
     BASE_REFUSAL_LIMIT = 1500
+    #: A refusal by one of the coordinator rules is handed on whole too (kittrial-5bb.197 review
+    #: request 01a12894, item 2): it must name the setting and the way to turn it off.
+    RULE_REFUSAL_LIMIT = 1500
 
     @classmethod
     def _detail_limit(cls, action, said):
@@ -1554,10 +1557,15 @@ class EndpointBackend:
         The larger limit is for the kit's own sentence only, never for a caller's text echoed
         back at length: the line must BE the follow-on base refusal, whole, as
         ``review_workflow.BASE_REFUSAL`` describes it (the kit's words, hexadecimal commit
-        ids, a recorder name of a constrained shape). Anything else keeps the limit it had.
+        ids, a recorder name of a constrained shape), or one of the coordinator-rule
+        refusals, which are fixed kit text naming the setting. Anything else keeps the limit
+        it had.
         """
         if action == 'review' and cls.base_refusal(said) is not None:
             return cls.BASE_REFUSAL_LIMIT            # the longest form of the sentence is well below it
+        if action in ('review', 'coordinate', 'lifecycle') and isinstance(said, str) \
+                and 'the installation setting' in said:
+            return cls.RULE_REFUSAL_LIMIT
         return cls.DETAIL_LIMITS.get(action, cls.DETAIL_LIMIT)
 
     @staticmethod
@@ -6410,6 +6418,13 @@ class ApiHandler(BaseHTTPRequestHandler):
                 # nothing else of theirs), so it is the message, not only the detail.
                 if recommending and refusal.status == 422 and isinstance(refusal.detail, str) \
                         and refusal.detail.startswith('ValueError: '):
+                    raise invalid(refusal.detail[len('ValueError: '):], refusal.detail) from None
+                # A refusal by one of the coordinator rules names the setting it came from
+                # (kittrial-5bb.197 review request 01a12894, item 2): the web caller must see
+                # that sentence, not the generic "Canonical command rejected the request".
+                if refusal.status == 422 and isinstance(refusal.detail, str) \
+                        and refusal.detail.startswith('ValueError: ') \
+                        and 'the installation setting' in refusal.detail:
                     raise invalid(refusal.detail[len('ValueError: '):], refusal.detail) from None
                 # So does a refused follow-on base (kittrial-5bb.158): the sentence says which
                 # base is acceptable, why this one is not and what an operator does about it.

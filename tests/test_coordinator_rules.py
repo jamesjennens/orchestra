@@ -106,6 +106,30 @@ class SelfApprovalTests(unittest.TestCase):
             chain.approve_as('alice/session',independent_approval=True)
         self.assertEqual(len(chain.issue()['comments']),1)
 
+    def test_the_author_comparison_is_not_exact_name_only(self):
+        # M07c: a case variant of the author's name is the same party and is refused.
+        chain=Chain(assignee='somebody-else',contribution_author=AUTHOR)
+        with self.assertRaises(ValueError) as caught:
+            chain.approve_as(AUTHOR.upper(),independent_approval=True)
+        self.assertIn('independent_approval',str(caught.exception))
+        self.assertEqual(len(chain.issue()['comments']),1)
+
+    def test_two_actors_of_one_principal_are_one_party(self):
+        # Item 1: compare PRINCIPALS where the registry gives one (sessions.owners).
+        chain=Chain(assignee='somebody-else',contribution_author='w2')
+        owners={'w2':'lane:w2','w2b':'lane:w2'}
+        with self.assertRaises(ValueError):
+            chain.approve_as('w2b',operators=['ops'],independent_approval=True,owners=owners)
+        self.assertEqual(len(chain.issue()['comments']),1)
+
+    def test_a_name_only_actor_and_a_principal_actor_cannot_be_told_apart(self):
+        # The documented limit: they are treated as distinct parties, so the approval
+        # counts (the task says names only for an actor with no principal).
+        chain=Chain(assignee='somebody-else',contribution_author='w2')
+        owners={'w2b':'lane:other'}
+        chain.approve_as('w2b',operators=['ops'],independent_approval=True,owners=owners)
+        self.assertEqual(len(chain.issue()['comments']),2)
+
 
 class CoordinatorWritesTests(unittest.TestCase):
     def test_off_by_default_an_unlisted_actor_still_approves(self):
@@ -176,6 +200,40 @@ class ListedActorTests(unittest.TestCase):
         self.assertEqual(rw.named_rule_actor('bad name\x1b[31m'),'an actor')
         self.assertEqual(rw.named_rule_actor('ops'),'"ops"')
 
+    def test_a_plain_listed_name_needs_no_registry_read(self):
+        # Item 4c: a listed operator is decided without reading the registry, so a
+        # damaged registry never stops their operation.
+        def broken():raise ValueError('The session registry cannot be read')
+        self.assertTrue(rw.listed_operator_actor('ops',['ops'],broken))
+
+    def test_an_unlisted_name_reads_the_registry_lazily(self):
+        reads=[]
+        def loader():
+            reads.append(1)
+            return {'ops':'lane:kit','cp':'lane:kit'}
+        self.assertTrue(rw.listed_operator_actor('cp',['ops'],loader))
+        self.assertEqual(len(reads),1)
+        reads.clear()
+        self.assertFalse(rw.listed_operator_actor('nobody',['ops'],loader))
+        self.assertEqual(len(reads),1)
+
+    def test_party_key_compares_principals_then_names(self):
+        owners={'ops':'lane:kit','ops/session':'lane:kit','other':'lane:other'}
+        self.assertEqual(rw.party_key('ops',owners),('principal','lane:kit'))
+        self.assertEqual(rw.party_key('ops/session',owners),('principal','lane:kit'))
+        self.assertEqual(rw.party_key('other',owners),('principal','lane:other'))
+        # A name-only actor falls back to the normalised name; a principal actor and a
+        # name-only actor are never the same party.
+        self.assertEqual(rw.party_key('OPS/x',{}),('name','ops'))
+        self.assertNotEqual(rw.party_key('ops',owners),rw.party_key('OPS/x',{}))
+        self.assertTrue(rw.same_party('ops','ops/session',owners))
+        self.assertFalse(rw.same_party('ops','other',owners))
+
+    def test_party_key_falls_back_to_names_when_the_registry_is_unreadable(self):
+        def broken():raise ValueError('The session registry cannot be read')
+        self.assertEqual(rw.party_key('ops',broken),('name','ops'))
+        self.assertTrue(rw.same_party('OPS','ops',broken))
+
 
 class MergeSlotTests(unittest.TestCase):
     """Slice 7 also covers taking the merge slot (coordination.apply_native)."""
@@ -223,7 +281,7 @@ class MergeSlotTests(unittest.TestCase):
                                 encoding='utf-8')
             calls=[]
             result=self.merge(Path(temp),self.slot_run(calls),'ops/session',operators=[OPERATOR],
-                              coordinator_writes=True)
+                              coordinator_writes=True,owners=lambda: {'ops':'lane:kit','ops/session':'lane:kit'})
             self.assertTrue(result.get('acquired'))
 
 
@@ -312,6 +370,50 @@ class SwitchTests(unittest.TestCase):
         self.assertEqual(len(warnings),1)
         self.assertIn('lifecycle_authors',warnings[0])
 
+    def test_a_huge_or_escaped_malformed_value_is_bounded_and_escaped(self):
+        # Item 6: the warning must not repeat a 200 kB value whole or print ESC raw.
+        root=self.root({'lifecycle_authors':'x'*200000+'\x1b[31m'})
+        warnings=[]
+        admin.coordinator_rules(root,warnings=warnings)
+        self.assertEqual(len(warnings),1)
+        self.assertLess(len(warnings[0]),400)
+        self.assertNotIn('\x1b',warnings[0])
+        self.assertNotIn('x'*1000,warnings[0])
+
+    def test_off_on_a_non_bool_value_writes_false(self):
+        # Item 6: `off` on a non-bool is a real flip, not a no-op that leaves the value.
+        root=self.root({'lifecycle_authors':'on'})
+        flipped=self.switch(root,'off','lifecycle_authors')
+        self.assertTrue(flipped['changed'])
+        self.assertNotIn('lifecycle_authors',self.document(root))
+        self.assertFalse(admin.coordinator_rules(root)['lifecycle_authors'])
+
+    def test_status_bounds_a_hand_edited_audit_entry(self):
+        # Item 6: a hand-edited entry (huge actor) is printed bounded and escaped.
+        root=self.root({'coordinator_rules_audit':[{'at':'2026-01-01T00:00:00Z','actor':'a'*200000,
+                                                    'rule':'lifecycle_authors','action':'on','previous':False}]})
+        status=self.switch(root,'status')
+        self.assertLess(len(status['audit']['actor']),400)
+        self.assertNotIn('a'*1000,status['audit']['actor'])
+
+    def test_a_flip_takes_the_deployment_lock(self):
+        # M19: a flip without the lock leaves two simultaneous flips able to lose each
+        # other. The lock must be entered by a real flip.
+        root=self.root()
+        with mock.patch.object(admin,'review_writes_lock',wraps=admin.review_writes_lock) as lock:
+            flipped=self.switch(root,'on','coordinator_writes')
+        self.assertTrue(flipped['changed'])
+        self.assertTrue(lock.called)
+
+    def test_the_switch_gate_reads_the_operator_list_strictly(self):
+        # M11b: a non-strict gate would authorize an actor from the environment while
+        # the deployment list says otherwise. The strict gate refuses the mismatch.
+        root=self.root()
+        with mock.patch.dict(os.environ,{'ORCHESTRA_OPERATORS':'somebody-else'}):
+            with self.assertRaises(ValueError):
+                admin.coordinator_rules_switch(root,'on','lifecycle_authors','ops')
+        self.assertNotIn('lifecycle_authors',self.document(root))
+
     def test_a_damaged_audit_is_kept_aside_and_the_flip_still_works(self):
         root=self.root({'coordinator_rules_audit':'hand edited'})
         status=self.switch(root,'status')
@@ -336,6 +438,45 @@ class SwitchTests(unittest.TestCase):
         self.assertEqual(sorted(admin.coordinator_rules(root)),sorted(admin.COORDINATOR_RULE_KEYS))
         with self.assertRaises(ValueError):
             admin.coordinator_rule(root,'nonsense')
+
+
+class SetupStatusTests(unittest.TestCase):
+    def test_setup_status_reports_the_three_rules(self):
+        temp=tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        root=Path(temp.name)
+        (root/'deployment.private.json').write_text(
+            json.dumps({'operators':['ops'],'password':'x','independent_approval':True}),encoding='utf-8')
+        (root/'projects'/'demo').mkdir(parents=True)
+        status=admin.project_setup_status(root,'demo')
+        self.assertEqual(status['coordinator_rules']['rules'],
+                         {'lifecycle_authors':False,'independent_approval':True,'coordinator_writes':False})
+        self.assertTrue(status['coordinator_rules']['enabled'])
+        self.assertIn('independent_approval',status['coordinator_rules']['detail'])
+
+    def test_setup_status_says_none_when_all_are_off(self):
+        temp=tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        root=Path(temp.name)
+        (root/'deployment.private.json').write_text(json.dumps({'operators':['ops'],'password':'x'}),encoding='utf-8')
+        (root/'projects'/'demo').mkdir(parents=True)
+        status=admin.project_setup_status(root,'demo')
+        self.assertFalse(status['coordinator_rules']['enabled'])
+        self.assertIn('none of the coordinator rules',status['coordinator_rules']['detail'])
+
+
+class CommandLineTests(unittest.TestCase):
+    def test_rule_given_twice_is_refused(self):
+        temp=tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        root=Path(temp.name)
+        (root/'deployment.private.json').write_text(json.dumps({'operators':['ops'],'password':'x'}),encoding='utf-8')
+        argv=['admin.py','--root',str(root),'coordinator-rules','on','--rule','lifecycle_authors',
+              '--rule','independent_approval','--actor','ops']
+        with mock.patch.object(admin,'root_path',return_value=root), mock.patch.object(sys,'argv',argv):
+            with self.assertRaises(SystemExit) as caught:
+                admin.run_main()
+        self.assertIn('--rule may be given only once',str(caught.exception))
 
 
 if __name__=='__main__':

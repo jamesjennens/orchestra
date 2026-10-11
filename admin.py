@@ -709,8 +709,11 @@ def coordinator_rules(root,warnings=None):
     A value that is neither true nor false is read as OFF with a warning, as
     `review_workflow_writes` is (kittrial-5bb.110 item 2): raising here would fail
     every review and every lifecycle write on the installation while the other
-    readers kept answering. There is deliberately no `ORCHESTRA_*` fallback: these
-    are deployment rules, not authority lists.
+    readers kept answering. The warning NAMES the setting and shows the value ESCAPED
+    and BOUNDED with `audit_field`, so a 200 kB hand-edited value cannot flood stderr
+    on every request (kittrial-5bb.197 review request 01a12894, item 6). There is
+    deliberately no `ORCHESTRA_*` fallback: these are deployment rules, not authority
+    lists.
     """
     values={key:False for key in COORDINATOR_RULE_KEYS}
     marker=root/'deployment.private.json'
@@ -720,10 +723,10 @@ def coordinator_rules(root,warnings=None):
             value=document.get(key)
             if isinstance(value,bool):values[key]=value
             elif value is not None:
-                message=('deployment %s is %r, not true or false; reading it as off (the rule refuses nothing)'
-                         %(key,value))
-                if warnings is not None:warnings.append('WARNING: '+message)
-                else:print('WARNING: '+message,file=sys.stderr)
+                message=('WARNING: deployment %s is %s, not true or false; reading it as off (the rule refuses '
+                         'nothing)'%(key,audit_field(value)))
+                if warnings is not None:warnings.append(message)
+                else:print(message,file=sys.stderr)
     return values
 
 
@@ -749,6 +752,20 @@ def coordinator_rules_audit(cfg):
     return kept,None
 
 
+def coordinator_rules_audit_entry(entry):
+    """One audit entry as ``status`` reports it: hand-editable strings bounded and escaped.
+
+    The audit lives in `deployment.private.json`, which an operator (or a mistake) can
+    edit by hand, so the entry is printed through `audit_field`: a 200 kB `actor` or a
+    value carrying ESC must not flood or rewrite the operator's terminal
+    (kittrial-5bb.197 review request 01a12894, item 6).
+    """
+    if not isinstance(entry,dict):return None
+    return {'at':audit_field(entry.get('at')),'actor':audit_field(entry.get('actor')),
+            'rule':audit_field(entry.get('rule')),'action':audit_field(entry.get('action')),
+            'previous':entry.get('previous') if isinstance(entry.get('previous'),bool) else None}
+
+
 def coordinator_rules_switch(root,action,rule,actor):
     """Read or flip one slices 6/7 rule, with its operator audit.
 
@@ -756,8 +773,11 @@ def coordinator_rules_switch(root,action,rule,actor):
     on kittrial-5bb.106 is an operator's. A flip holds `review_writes_lock` across the
     whole read-modify-write of `deployment.private.json`, as the other deployment
     switches do, so two simultaneous flips cannot lose each other. A flip that changes
-    nothing writes nothing. A damaged audit is warned about and started afresh with the
-    damaged value kept aside under a dated key, as the checkpoint switch does.
+    nothing writes nothing. `off` on a value that is not a bool is a REAL flip that
+    writes false, not a no-op that leaves the bad value in the file
+    (kittrial-5bb.197 review request 01a12894, item 6). A damaged audit is warned about
+    and started afresh with the damaged value kept aside under a dated key, as the
+    checkpoint switch does; `status` bounds every hand-edited audit field.
     """
     from recovery import identity
     marker=root/'deployment.private.json'
@@ -772,7 +792,8 @@ def coordinator_rules_switch(root,action,rule,actor):
             print('WARNING: the coordinator-rules audit is damaged (%s); it reads as an empty history. The next '
                   'on/off keeps it aside in deployment.private.json under %s_damaged_<UTC stamp> and starts a '
                   'fresh list.'%(damage,COORDINATOR_RULES_AUDIT_KEY),file=sys.stderr)
-        return dict(coordinator_rules=coordinator_rules(root),audit=audit[-1] if audit else None,
+        return dict(coordinator_rules=coordinator_rules(root),
+                    audit=coordinator_rules_audit_entry(audit[-1]) if audit else None,
                     audit_records=len(audit),audit_readable=damage is None,changed=False,rule=rule)
     if rule not in COORDINATOR_RULE_KEYS:
         raise ValueError('coordinator-rules %s requires --rule with one of: %s'
@@ -782,8 +803,13 @@ def coordinator_rules_switch(root,action,rule,actor):
         current=coordinator_rules(root)[rule]
         cfg=config(root)
         audit,damage=coordinator_rules_audit(cfg)
-        if enabled==current:
-            return dict(coordinator_rules=coordinator_rules(root),audit=audit[-1] if audit else None,
+        # `off` must also be a real flip when the file holds a value that is not a bool:
+        # reading it as off makes `on`==`off` a no-op that leaves the bad value and its
+        # warning in place (the rule `bound-keys-only` follows, review item 6).
+        stale_value=rule in cfg and not isinstance(cfg.get(rule),bool)
+        if enabled==current and not (not enabled and stale_value):
+            return dict(coordinator_rules=coordinator_rules(root),
+                        audit=coordinator_rules_audit_entry(audit[-1]) if audit else None,
                         audit_records=len(audit),audit_readable=damage is None,changed=False,rule=rule)
         if damage is not None:
             kept='%s_damaged_%s'%(COORDINATOR_RULES_AUDIT_KEY,utc_stamp().replace(':','').replace('-',''))
@@ -815,7 +841,10 @@ def lifecycle_authors_command(root,project,limit=None):
     if not isinstance(limit,int) or isinstance(limit,bool) or limit<0:raise ValueError('Invalid --limit')
     def run(argv):return run_bd(root,project,argv)
     rows=lifecycle.read_event_rows(run)
-    report=lifecycle.lifecycle_authors_report(rows,operators(root),limit=limit)
+    import sessions
+    try:owners=sessions.owners(project_dir(root,project))
+    except (ValueError,OSError):owners=None
+    report=lifecycle.lifecycle_authors_report(rows,operators(root),owners=owners,limit=limit)
     report['project']=project
     report['setting']={'lifecycle_authors':coordinator_rule(root,'lifecycle_authors')}
     return report
@@ -915,6 +944,17 @@ BOUND_KEYS_ONLY_DETAIL_OFF=('This installation accepts a line that names no proj
     'release it names and is not refused by it.')
 BOUND_KEYS_ONLY_DETAIL_UNKNOWN=('The installation setting for bound keys only could not be read; an operator '
     'must look at deployment.private.json on the server.')
+
+#: What `setup-status` says about the three coordinator rules (kittrial-5bb.197, review request
+#: 01a12894 item 6), in the same shape as the bound-keys-only block. The rules are per
+#: installation, so every project reports the same words.
+COORDINATOR_RULES_DETAIL_ON=('This installation enforces the coordinator rules (%s). An operator turns one off '
+    'with `admin.py coordinator-rules off --rule NAME --actor OPERATOR`.')
+COORDINATOR_RULES_DETAIL_OFF=('This installation enforces none of the coordinator rules (all three are off, the '
+    'default). An operator turns one on with `admin.py coordinator-rules on --rule NAME --actor OPERATOR`; read '
+    '`admin.py lifecycle-authors PROJECT` before turning lifecycle_authors on.')
+COORDINATOR_RULES_DETAIL_UNKNOWN=('The installation settings for the coordinator rules could not be read; an '
+    'operator must look at deployment.private.json on the server.')
 
 #: The key of the checkpoint switch's audit list inside deployment.private.json, and the
 #: prefix a damaged value is kept aside under (kittrial-5bb.131).
@@ -2726,6 +2766,17 @@ def project_setup_status(root,name,path=None):
         # A deeply nested file must say unknown with a reason, not raise here (kittrial-5bb.196
         # review, item 3). RecursionError is not a ValueError.
         result['bound_keys_only']={'enabled':None,'detail':BOUND_KEYS_ONLY_DETAIL_UNKNOWN}
+    # The three coordinator rules (kittrial-5bb.197, slices 6 and 7), in the same shape as
+    # the bound-keys-only block: `enabled` is None with its own sentence when the file cannot
+    # be read, so this part never fails the others (review request 01a12894, item 6).
+    try:
+        rules=coordinator_rules(root)
+        on=[key for key in COORDINATOR_RULE_KEYS if rules[key]]
+        result['coordinator_rules']={'enabled':bool(on),'rules':rules,
+                                     'detail':(COORDINATOR_RULES_DETAIL_ON%', '.join(on)) if on
+                                     else COORDINATOR_RULES_DETAIL_OFF}
+    except (OSError,ValueError,RecursionError):
+        result['coordinator_rules']={'enabled':None,'rules':None,'detail':COORDINATOR_RULES_DETAIL_UNKNOWN}
     # How full the server is (kittrial-5bb.118 part 2 revision): every project database on it
     # counts, and every bd write gets slower as they grow. The web service shows it to a
     # superuser only.
@@ -7394,8 +7445,10 @@ def main():
                                               'listed actor of the project (all OFF by default; an installation '
                                               'that configures nothing behaves exactly as before)')
     a.add_argument('action',choices=['status','on','off'])
-    a.add_argument('--rule',default=None,choices=list(COORDINATOR_RULE_KEYS),
-                   help='which rule to flip (required for on/off): '
+    # `action='append'` so a repeated `--rule` can be REFUSED rather than silently letting
+    # the last one win (kittrial-5bb.197 review request 01a12894, item 6).
+    a.add_argument('--rule',default=None,action='append',choices=list(COORDINATOR_RULE_KEYS),metavar='RULE',
+                   help='which rule to flip (required for on/off, at most once): '
                         +'; '.join('%s: %s'%(key,COORDINATOR_RULE_HELP[key]) for key in COORDINATOR_RULE_KEYS))
     a.add_argument('--actor',required=True,help='an actor on the deployment operator allowlist')
     a=sub.add_parser('lifecycle-authors',help='read-only: every recorded lifecycle fact of a project, the actor who '
@@ -8095,7 +8148,10 @@ def main():
         for line in warnings:print(line,file=sys.stderr)
         print(json.dumps(result))
     elif args.command=='coordinator-rules':
-        print(json.dumps(coordinator_rules_switch(root,args.action,args.rule,args.actor)))
+        rules=args.rule or []
+        if len(rules)>1:
+            raise ValueError('--rule may be given only once')
+        print(json.dumps(coordinator_rules_switch(root,args.action,rules[0] if rules else None,args.actor)))
     elif args.command=='lifecycle-authors':
         print(json.dumps(lifecycle_authors_command(root,args.project,args.limit)))
     elif args.command=='authorized-keys':

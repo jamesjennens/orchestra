@@ -87,9 +87,9 @@ def payload(dimension,value,actor=ASSIGNEE,scope=None,operation_id=None,**extra)
     return body
 
 
-def record_scope(tracker,actor=ASSIGNEE,enforce=True,warnings=None):
+def record_scope(tracker,actor=ASSIGNEE,enforce=True,owners=None):
     return lifecycle.apply_native(payload('lifecycle-scope',None,actor=actor),actor,tracker,
-                                  operators=[OPERATOR],lifecycle_authors=enforce,warnings=warnings)
+                                  operators=[OPERATOR],lifecycle_authors=enforce,owners=owners)
 
 
 class AuthorityTests(unittest.TestCase):
@@ -117,10 +117,19 @@ class AuthorityTests(unittest.TestCase):
         self.assertFalse(lifecycle.dimension_authority('reviewed','Ops',None,['ops'])[0])
         self.assertTrue(lifecycle.dimension_authority('reviewed','ops',None,['ops'])[0])
 
-    def test_the_assignee_comparison_is_the_normalisation_rule_3_uses(self):
-        for name in ('Worker','worker/sub',' WORKER ','team/worker'):
-            self.assertEqual(lifecycle.attribution_key(name),review_workflow.author_key(name),name)
-        self.assertTrue(lifecycle.dimension_authority('implemented','worker/sub','Worker',[])[0])
+    def test_the_assignee_is_compared_exactly_not_folded(self):
+        # Item 3c: another case or a /-suffix must NOT pass as the assignee.
+        self.assertFalse(lifecycle.dimension_authority('implemented','worker/sub','Worker',[])[0])
+        self.assertFalse(lifecycle.dimension_authority('implemented',' Worker ','Worker',[])[0])
+        self.assertFalse(lifecycle.dimension_authority('implemented','WORKER','Worker',[])[0])
+        self.assertTrue(lifecycle.dimension_authority('implemented','Worker','Worker',[])[0])
+
+    def test_an_unlisted_actor_of_a_listed_operators_principal_is_listed(self):
+        # Item 3a: ONE rule for "listed" in review_workflow and lifecycle alike.
+        owners={'ops':'lane:kit','cp':'lane:kit','other':'lane:other'}
+        self.assertTrue(lifecycle.dimension_authority('reviewed','cp',None,['ops'],owners)[0])
+        self.assertFalse(lifecycle.dimension_authority('reviewed','other',None,['ops'],owners)[0])
+        self.assertTrue(lifecycle.dimension_authority('reviewed','ops',None,['ops'],owners)[0])
 
     def test_a_name_that_is_not_a_plain_actor_is_not_repeated_in_the_reason(self):
         _,reason=lifecycle.dimension_authority('reviewed','bad name\x1b[31m',None,[])
@@ -138,18 +147,14 @@ class RuleTests(unittest.TestCase):
         self.assertIn(TASK,message)
         self.assertIn('admin.py lifecycle-authors PROJECT',message)
 
-    def test_while_off_a_write_that_would_be_refused_is_only_warned_about(self):
-        warnings=[]
-        self.assertFalse(lifecycle.lifecycle_authors_rule('integrated',ASSIGNEE,None,[],enforce=False,warnings=warnings))
-        self.assertEqual(len(warnings),1)
-        self.assertTrue(warnings[0].startswith('WARNING: '))
-        self.assertIn('lifecycle_authors is off',warnings[0])
+    def test_while_off_the_same_write_is_allowed_and_nothing_is_printed(self):
+        # Item 4b: all-off is main. The read-only report is the preview; no warning is
+        # produced on a write the rule WOULD refuse.
+        self.assertFalse(lifecycle.lifecycle_authors_rule('integrated',ASSIGNEE,None,[],enforce=False))
 
-    def test_an_allowed_actor_is_never_warned_about(self):
-        warnings=[]
-        self.assertTrue(lifecycle.lifecycle_authors_rule('implemented',ASSIGNEE,ASSIGNEE,[],warnings=warnings))
-        self.assertTrue(lifecycle.lifecycle_authors_rule('integrated',OPERATOR,None,[OPERATOR],warnings=warnings))
-        self.assertEqual(warnings,[])
+    def test_an_allowed_actor_is_allowed(self):
+        self.assertTrue(lifecycle.lifecycle_authors_rule('implemented',ASSIGNEE,ASSIGNEE,[],enforce=True))
+        self.assertTrue(lifecycle.lifecycle_authors_rule('integrated',OPERATOR,None,[OPERATOR],enforce=True))
 
     def test_a_direct_caller_with_no_list_to_report_into_is_not_printed_at(self):
         self.assertFalse(lifecycle.lifecycle_authors_rule('integrated',ASSIGNEE,None,[]))
@@ -182,15 +187,12 @@ class EnforcedWriteTests(unittest.TestCase):
         self.assertIn('integrated',str(caught.exception))
         self.assertEqual(len(tracker.writes),1)             # only the scope was written
 
-    def test_with_the_rule_off_the_same_write_succeeds_and_is_warned_about(self):
-        tracker=Tracker();warnings=[]
-        record_scope(tracker,warnings=warnings)
-        self.assertEqual(warnings,[])                       # the assignee's own scope is allowed
+    def test_with_the_rule_off_the_same_write_succeeds_silently(self):
+        tracker=Tracker()
+        record_scope(tracker)
         lifecycle.apply_native(payload('integrated','passed'),ASSIGNEE,tracker,operators=[OPERATOR],
-                               lifecycle_authors=False,warnings=warnings)
+                               lifecycle_authors=False)
         self.assertEqual(len(tracker.writes),2)             # the write happened as before
-        self.assertEqual(len(warnings),1)
-        self.assertIn('lifecycle_authors is off',warnings[0])
 
     def test_with_the_rule_on_an_unlisted_actor_cannot_start_a_release(self):
         tracker=Tracker()
@@ -269,6 +271,29 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(report['counts']['tasks_listed'],1)
         self.assertEqual(report['counts']['tasks_with_facts'],2)
         self.assertEqual(report['counts']['would_be_refused'],2)
+
+    def test_the_report_includes_the_enabled_and_live_dimensions(self):
+        # M12a and M12d: the report must not omit `live` or `enabled`.
+        scope={'source_commit':'a'*40,'integration_commit':'','release_id':'rel-1','environment':'prod'}
+        token=lifecycle.content_hash(scope)
+        rows=[task_row()]
+        rows[0]['labels']=['lifecycle-scope:'+token,'enabled:enabled','live:live']
+        rows.append(event_row(TASK,'lifecycle-scope',token,OPERATOR,1,scope=scope))
+        rows.append(event_row(TASK,'enabled','enabled',OPERATOR,2,scope=scope))
+        rows.append(event_row(TASK,'live','live',OPERATOR,3,scope=scope))
+        report=lifecycle.lifecycle_authors_report(rows,operators=[OPERATOR])
+        facts=self.facts(report)
+        self.assertIn('enabled',facts)
+        self.assertIn('live',facts)
+        self.assertTrue(facts['enabled']['allowed'])
+
+    def test_the_report_uses_the_one_listed_rule_with_the_owners_map(self):
+        # Item 3a: the report judges "listed" by the same rule as the writer.
+        rows=self.rows_for(recorded=(('reviewed','cp'),),scope_actor=OPERATOR)
+        owners={'ops':'lane:kit','cp':'lane:kit'}
+        report=lifecycle.lifecycle_authors_report(rows,operators=[OPERATOR],owners=owners)
+        self.assertFalse(self.facts(report)['reviewed']['would_be_refused'])
+        self.assertEqual(self.facts(report)['reviewed']['authority'],'operator')
 
     def test_the_report_uses_the_dimension_table_recorded_on_5bb106(self):
         report=lifecycle.lifecycle_authors_report([],operators=[])

@@ -194,19 +194,22 @@ def named_actor(value):
     return 'an actor'
 
 
-def dimension_authority(dimension,actor,assignee,operators=None):
+def dimension_authority(dimension,actor,assignee,operators=None,owners=None):
     """``(allowed, reason)`` for one recorded fact under the ``lifecycle_authors`` rule.
 
     True when the naming rule lets ``actor`` record ``dimension`` for a task whose
-    current assignee is ``assignee``; ``reason`` is the clause a refusal or a
-    warning uses when it does not, and None when it does. The operator allowlist
-    is compared by whole name and case, as every other check of that list is; the
-    assignee by ``attribution_key``, the terms the design's rule 3 compares an
-    author and an assignee on.
+    current assignee is ``assignee``; ``reason`` is the clause a refusal uses when it
+    does not, and None when it does. "Listed operator" is the ONE rule of
+    ``review_workflow.listed_operator_actor`` (kittrial-5bb.197 review request
+    01a12894, item 3a): a name on the installation's operator allowlist, or an actor
+    whose principal the project's session registry gives to a listed operator. The
+    assignee is compared EXACTLY, not case-folded and not with a ``/``-suffix dropped
+    (item 3c): ``Worker`` and ``worker/sub`` are not the assignee ``worker``.
     """
-    if actor in set(operators or ()):return True,None
+    from review_workflow import listed_operator_actor
+    if listed_operator_actor(actor,operators,owners):return True,None
     if dimension in ASSIGNEE_DIMENSIONS:
-        if isinstance(assignee,str) and assignee and attribution_key(actor)==attribution_key(assignee):
+        if isinstance(assignee,str) and assignee and actor==assignee:
             return True,None
         return False,('only the task\'s assignee or a listed operator may record %s, and %s is neither%s'
                       %(dimension,named_actor(actor),
@@ -216,44 +219,42 @@ def dimension_authority(dimension,actor,assignee,operators=None):
                   %(dimension,named_actor(actor)))
 
 
-def lifecycle_authors_rule(dimension,actor,assignee,operators=None,enforce=False,warnings=None,subject=None):
+def lifecycle_authors_rule(dimension,actor,assignee,operators=None,owners=None,enforce=False,subject=None):
     """The one place slices 6 and 7 judge who may write which fact.
 
-    Raises ValueError when ``enforce`` is true and the rule does not allow the
-    actor; when it is false and the rule does not allow the actor, appends the
-    preview to ``warnings`` (the list the transport reports on stderr) and lets the
-    write through, because the decision on kittrial-5bb.106 asks for the refusal to
-    be reported as a warning while the setting is off. Returns True when the actor
-    is allowed. A refusal and the warning that previews it can never disagree: both
-    come from ``dimension_authority``.
+    Raises ValueError when ``enforce`` is true and the rule does not allow the actor;
+    otherwise it returns False and lets the write through unchanged, so an
+    installation with the setting OFF behaves exactly as an installation that never
+    had the rule. The preview of what the rule WOULD refuse is the read-only
+    ``admin.py lifecycle-authors PROJECT`` report, never a warning on every write:
+    all-off must be byte-identical to main (kittrial-5bb.197 review request 01a12894,
+    item 4b). Returns True when the actor is allowed.
     """
-    allowed,reason=dimension_authority(dimension,actor,assignee,operators)
+    if not enforce:
+        # OFF is main: do not even judge, so no registry is read and nothing is added
+        # to stderr (kittrial-5bb.197 review request 01a12894, items 4b and 4c).
+        return False
+    allowed,reason=dimension_authority(dimension,actor,assignee,operators,owners)
     if allowed:return True
     where=' on %s'%subject if subject else ''
-    if enforce:
-        raise ValueError('Refusing to record %s%s: the installation setting lifecycle_authors is on, and %s. '
-                         'The read-only preview is `admin.py lifecycle-authors PROJECT`; an operator turns the '
-                         'rule off with `admin.py coordinator-rules off --rule lifecycle_authors --actor OPERATOR`.'
-                         %(dimension,where,reason))
-    message=('WARNING: %s%s was recorded although the installation setting lifecycle_authors is off; once it is '
-             'on this fact would be refused, because %s. Run `admin.py lifecycle-authors PROJECT` before turning '
-             'it on.'%(dimension,where,reason))
-    # Only a caller that offered a list to report into is told: the transport (the endpoint)
-    # always does, a direct caller in a test or a tool does not, so this changes no answer.
-    if warnings is not None:warnings.append(message)
-    return False
+    raise ValueError('Refusing to record %s%s: the installation setting lifecycle_authors is on, and %s. '
+                     'The read-only preview is `admin.py lifecycle-authors PROJECT`; an operator turns the '
+                     'rule off with `admin.py coordinator-rules off --rule lifecycle_authors --actor OPERATOR`.'
+                     %(dimension,where,reason))
 
 
-def _reported_fact(dimension,value,actor,assignee,authority):
+def _reported_fact(dimension,value,actor,assignee,operators,owners=None):
     """One row of ``lifecycle_authors_report``: who recorded a fact and its verdict."""
-    allowed,reason=dimension_authority(dimension,actor,assignee,authority)
+    from review_workflow import listed_operator_actor
+    allowed,reason=dimension_authority(dimension,actor,assignee,operators,owners)
+    listed=listed_operator_actor(actor,operators,owners)
     return {'dimension':dimension,'value':value,'actor':actor,
             'allowed':allowed,'would_be_refused':not allowed,
-            'authority':'operator' if actor in authority else ('assignee' if allowed else 'refused'),
+            'authority':'operator' if listed else ('assignee' if allowed else 'refused'),
             'reason':reason}
 
 
-def lifecycle_authors_report(rows,operators=None,limit=AUTHORS_REPORT_TASK_LIMIT):
+def lifecycle_authors_report(rows,operators=None,owners=None,limit=AUTHORS_REPORT_TASK_LIMIT):
     """Read-only: who recorded each trusted lifecycle fact, and who would be refused.
 
     The report the decision on kittrial-5bb.106 names (``admin.py lifecycle-authors
@@ -262,8 +263,10 @@ def lifecycle_authors_report(rows,operators=None,limit=AUTHORS_REPORT_TASK_LIMIT
     under ``lifecycle_authors``, and the totals. The same reading every other reader
     uses decides trust (``trusted_payloads``), so an unattributed, unscoped,
     ambiguous or tampered event is not reported as a fact. It writes nothing and
-    reads no setting: the caller says which rule it previews. At most ``limit``
-    tasks are listed, and the counts cover every task either way.
+    reads no setting: the caller says which rule it previews. ``owners`` is the
+    project's actor -> principal map, so the report judges "listed" by the same one
+    rule the writer applies. At most ``limit`` tasks are listed, and the counts cover
+    every task either way.
     """
     authority=set(operators or ())
     events=events_by_dimension(rows)
@@ -278,11 +281,11 @@ def lifecycle_authors_report(rows,operators=None,limit=AUTHORS_REPORT_TASK_LIMIT
         if (scope_event is not None and scope_event['payload'] is not None
                 and label_agrees(labels,scope_event,'lifecycle-scope')):
             payload=scope_event['payload']
-            facts.append(_reported_fact('lifecycle-scope',payload['value'],payload['actor'],assignee,authority))
+            facts.append(_reported_fact('lifecycle-scope',payload['value'],payload['actor'],assignee,operators,owners))
         for dim in (*DIMENSIONS,ENABLED,LIVE):
             state=trusted[task][dim];payload=state['payload']
             if payload is None or state['value']=='unknown':continue
-            facts.append(_reported_fact(dim,state['value'],payload['actor'],assignee,authority))
+            facts.append(_reported_fact(dim,state['value'],payload['actor'],assignee,operators,owners))
         if not facts:continue
         tasks_with_facts+=1
         refused=sum(1 for fact in facts if fact['would_be_refused'])
@@ -1522,7 +1525,7 @@ def _check_release_operations(plans,negative,op_index,evidence,operation_id):
             raise ValueError('operation ID was already used for a state that has since changed; a new operation ID is needed: '+operation_id)
 
 
-def apply_release(payload,actor,run,operators=None,journal=None,lifecycle_authors=False,warnings=None):
+def apply_release(payload,actor,run,operators=None,journal=None,lifecycle_authors=False,owners=None):
     """Preflight one release against one native export, then apply its facts.
 
     Validate all target/supersede identities, integrations, scopes and derived
@@ -1549,8 +1552,8 @@ def apply_release(payload,actor,run,operators=None,journal=None,lifecycle_author
     # A release deploy writes `deployed`/`live-verified`/`live`/scope facts for every
     # target at once, so slices 6 and 7 judge it as one operator-only fact, before
     # the first write (kittrial-5bb.197; the decision on kittrial-5bb.106).
-    lifecycle_authors_rule(RELEASE,actor,None,operators,
-                           enforce=lifecycle_authors,warnings=warnings,
+    lifecycle_authors_rule(RELEASE,actor,None,operators,owners,
+                           enforce=lifecycle_authors,
                            subject=payload['scope'].get('release_id') or None)
     rows=read_event_rows(run)
     if payload.get('rollback'):require_rollback_target_deployed(rows,payload['scope'])
@@ -1678,20 +1681,26 @@ def release_query(payload,actor,run,operators=None,journal=None):
             'live_releases':live}
 
 
-def apply_native(payload, actor, run, operators=None, journal=None, lifecycle_authors=False, warnings=None):
+def apply_native(payload, actor, run, operators=None, journal=None, lifecycle_authors=False,
+                 independent_approval=False, owners=None):
     """Caller holds project lock; run(argv) invokes pinned bd and returns stdout.
 
-    ``lifecycle_authors`` is the per-installation setting of slices 6 and 7
-    (``admin.coordinator_rules``, supplied by the endpoint from
-    ``deployment.private.json``; absent/false is OFF). ``warnings`` is the list the
-    caller surfaces on stderr: while the setting is off, the refusal that would
-    apply is appended there instead of raising.
+    ``lifecycle_authors`` and ``independent_approval`` are the per-installation
+    settings of slices 6 and 7 (``admin.coordinator_rules``, supplied by the endpoint
+    from ``deployment.private.json``; absent/false is OFF), and ``owners`` is the
+    project's actor -> principal map, or a callable returning it so the registry is
+    read only when a rule needs it. While a setting is OFF the write is not refused
+    and no warning is printed: all-off is byte-identical to main, and the read-only
+    ``admin.py lifecycle-authors PROJECT`` report is the preview (kittrial-5bb.197
+    review request 01a12894, item 4b). ``independent_approval`` adds the task's rule
+    3: ``reviewed`` and ``integrated`` need the CURRENT contribution approved by a
+    party other than its author and the task's assignee (part b).
     """
     if isinstance(payload,dict) and payload.get('dimension')==RELEASE_QUERY:
         return release_query(payload,actor,run,operators,journal)
     if isinstance(payload,dict) and payload.get('dimension')==RELEASE:
         return apply_release(payload,actor,run,operators,journal,
-                             lifecycle_authors=lifecycle_authors,warnings=warnings)
+                             lifecycle_authors=lifecycle_authors,owners=owners)
     validate_payload(payload)
     if payload['actor']!=actor:raise ValueError('payload actor must match request actor')
     rows=read_event_rows(run)
@@ -1700,9 +1709,20 @@ def apply_native(payload, actor, run, operators=None, journal=None, lifecycle_au
     current_scope=state['scope'] if state else None
     # Slices 6 and 7: who may record THIS fact, judged before the write so a refusal
     # leaves nothing behind. The assignee comes from the native task row (the same
-    # row `validate_payload`'s task identity resolves to), never from the payload.
+    # row `validate_payload`'s task identity resolves to), never from the payload,
+    # and is compared exactly (item 3c).
     lifecycle_authors_rule(payload['dimension'],actor,(issues.get(payload['task']) or {}).get('assignee'),
-                           operators,enforce=lifecycle_authors,warnings=warnings,subject=payload['task'])
+                           operators,owners,enforce=lifecycle_authors,subject=payload['task'])
+    # Part (b) (kittrial-5bb.197): `reviewed` and `integrated` need the CURRENT
+    # contribution approved by another party. Judged before any write, from the same
+    # review chain every reader uses, so an approval of an older contribution cannot
+    # satisfy a newer one.
+    if independent_approval and payload['dimension'] in ('reviewed','integrated'):
+        issue=issues.get(payload['task'])
+        if issue is not None:
+            from review_workflow import require_independent_approval
+            require_independent_approval(issue,payload['dimension'],payload['task'],
+                                         operators=operators,owners=owners,journal=journal)
     # A SINGLE fact must name the task's CURRENT scope: a fact recorded under an
     # older, previously recorded scope is refused here with main's rule (rev3 item
     # 2). Only the release operation may write a fact under an already-recorded
