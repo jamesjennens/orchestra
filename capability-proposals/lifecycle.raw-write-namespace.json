@@ -8,7 +8,7 @@
     "lifecycle reserved labels",
     "native state event write guard"
   ],
-  "summary": "Contributor raw create, update and dependency requests cannot create, convert, change or remove native lifecycle state events, or add, remove, replace or inherit labels for the six fact dimensions, lifecycle-scope, enabled and live. The endpoint checks final effects under the project lock and refuses incomplete reads before native writes, naming lifecycle.py record. Hidden label aliases, attachments and multi-target requests are covered. Ordinary prose, ordinary events and legacy review-ready/reviewed labels stay writable. Listed operator raw writes and dedicated lifecycle/host operations retain their routes. This always-on write boundary leaves legacy lifecycle reads unchanged; it establishes no strict reader provenance or historical repair.",
+  "summary": "Contributor raw create, update, close, reopen and dependency requests cannot create, convert, change or remove native lifecycle state events, or add, remove, replace or inherit labels for the six fact dimensions, lifecycle-scope, enabled and live. The endpoint checks final effects under the project lock and refuses incomplete reads before native writes, naming lifecycle.py record. Hidden label aliases, attachments and multi-target requests are covered. Ordinary prose, ordinary events, ordinary task status changes and legacy review-ready/reviewed labels stay writable. Listed operator raw writes and dedicated lifecycle/host operations retain their routes. This always-on write boundary leaves legacy lifecycle reads unchanged; it establishes no strict reader provenance or historical repair.",
   "requirements": [],
   "anchors": [
     "docs/LIFECYCLE_RAW_WRITES.md#contributor-boundary",

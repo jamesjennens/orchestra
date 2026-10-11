@@ -1434,7 +1434,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             fcntl.flock(lock,fcntl.LOCK_EX)
             # First the rows the write names (an existing id given to create, a write that names
             # none, the merge slot); then the guards that read what those rows carry.
-            lifecycle_guard=args[0] in ('create','update','dep') and actor not in configured_operators(root)
+            lifecycle_guard=args[0] in ('create','update','dep','close','reopen') and actor not in configured_operators(root)
             named=_guard_named_rows(root,path,name,args,request.get('attachments',{}),actor,strict=lifecycle_guard)
             if lifecycle_guard:
                 def lifecycle_rows(tokens):
