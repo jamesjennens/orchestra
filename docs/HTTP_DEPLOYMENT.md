@@ -284,6 +284,13 @@ a `proj_...` record until a superuser decides. After every upgrade to this kit o
    - **archives** it (`POST /v1/projects/{id}/archive`).
 3. Archive each `no-canonical` entry (a `proj_...` id).
 
+Registration saves its complete registration mark, and confirmation saves its
+confirmation and backfilled mark, before committing a success receipt. A crash
+after that receipt can replay only a durable effect. A crash after the effect
+but before the receipt can leave an in-progress request that refuses retry.
+See [HTTP mutation persistence](HTTP_MUTATION_PERSISTENCE.md) for the caller
+inventory, crash probes and remaining audit persistence limit.
+
 **The backfill's limit (a known exposure, not closed).** A confirmation backfills
 `registered_by` only for a record that has no such mark, and a record can only be
 confirmed while the backend will not serve it. A record whose creator is still a
@@ -1947,7 +1954,10 @@ revoked one that was wider then seeded the next renewal once nothing worked).
   `target_credential_id`, `credential_scopes`, `scopes_before`/`scopes_after` and their
   sources, alongside the acting account, request ID and time. Each successful issue
   or first revocation leaves one event, including scope changes in that event. Revoking
-  an already revoked credential returns success without a second revocation event. These contain no
+  an already revoked credential returns success without a second revocation event. Its route still
+  saves the state and, when keyed, commits an idempotency receipt: an earlier failed save can have
+  left the revocation only in memory, and this retry must be able to persist it. An exact replay
+  adds neither a route save nor another receipt. These events contain no
   labels, secrets, token hashes or working directories. Pruning credentials does not
   remove their audit entries; retention eventually does. HTTP disable events
   (`agents.disable`, `agents.update` with `enabled: false`, `accounts.disable`) include

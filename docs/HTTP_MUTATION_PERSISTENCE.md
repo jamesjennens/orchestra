@@ -1,0 +1,52 @@
+# HTTP mutation persistence
+
+The following inventory counts call sites, including wrapper forwarding paths; one handler can cover several operations. It is a source inventory, not a promise of a transaction across JSON, SQLite and the canonical backend.
+
+## Project registration and confirmation
+
+The registration callback saves its `registered_by` mark after `create_project` has saved the project. The confirmation callback saves `confirmed_by`, `confirmed_at` and any backfilled `registered_by` before its success receipt. A process killed after a committed receipt therefore replays only a durable complete effect. A kill before the effect save cannot replay success; a kill after the effect save but before the receipt leaves an in-progress identity and refuses the retry. Ordinary route retry behavior is otherwise unchanged. The final route audit save follows the receipt, so a crash can still omit that audit entry; these fixes do not claim cross-store atomic audit persistence.
+
+## Call-site inventory
+
+| Handler | Operation | Persistence contract |
+| --- | --- | --- |
+| `accounts_create` | `accounts.create` | Service method has an inner save; conditional paths need route-specific proof. |
+| `account_password` | `accounts.password` | Service method has an inner save; conditional paths need route-specific proof. |
+| `account_reset` | `accounts.reset` | Service method has an inner save; conditional paths need route-specific proof. |
+| `account_disable` | `accounts.disable` | Service method has an inner save; conditional paths need route-specific proof. |
+| `projects_create` | `projects.create` | Service method has an inner save; conditional paths need route-specific proof. |
+| `_project_host_create` | `projects.host-create` | Canonical backend operation/journal; local receipt alone does not prove external atomicity. |
+| `_project_register` | `projects.create` | Complete JSON effect saved in callback before receipt; subprocess crash/restart covered. |
+| `_refuse_unless_replay` | `route_name` | Refusal or receipt replay; no new effect. |
+| `project_confirm` | `projects.confirm` | Complete JSON effect saved in callback before receipt; subprocess crash/restart covered. |
+| `project_update` | `projects.update` | Service method has an inner save; conditional paths need route-specific proof. |
+| `_onboarding_write` | `projects.onboarding` | Canonical backend operation/journal; local receipt alone does not prove external atomicity. |
+| `project_archive` | `projects.archive` | Service method has an inner save; conditional paths need route-specific proof. |
+| `member_set` | `members.set` | Service method has an inner save; conditional paths need route-specific proof. |
+| `member_remove` | `members.remove` | Service method has an inner save; conditional paths need route-specific proof. |
+| `credential_issue` | `credentials.issue` | Service method has an inner save; conditional paths need route-specific proof. |
+| `credential_revoke` | `credentials.revoke` | Service method has an inner save; conditional paths need route-specific proof. |
+| `agents_create` | `agents.create` | Service method has an inner save; conditional paths need route-specific proof. |
+| `agents_update` | `agents.update` | Service method has an inner save; conditional paths need route-specific proof. |
+| `agents_disable` | `agents.disable` | Service method has an inner save; conditional paths need route-specific proof. |
+| `agents_enable` | `agents.enable` | Service method has an inner save; conditional paths need route-specific proof. |
+| `agents_credential_issue` | `agents.credentials.issue` | Credential transaction: JSON save before receipt; absent-agent path refuses. |
+| `agents_credential_revoke` | `agents.credentials.revoke` | Credential transaction: JSON save before receipt; absent-agent path refuses. |
+| `_mutate_agent_credential` | `operation` | Credential transaction: JSON save before receipt; absent-agent path refuses. |
+| `_mutate_agent_credential` | `operation` | Credential transaction: JSON save before receipt; absent-agent path refuses. |
+| `project_agent_revoke` | `agents.project.revoke` | Service method has an inner save; conditional paths need route-specific proof. |
+| `tasks_create` | `tasks.create` | Canonical backend operation/journal; local receipt alone does not prove external atomicity. |
+| `tasks_update` | `tasks.update` | Canonical backend operation/journal; local receipt alone does not prove external atomicity. |
+| `_requirements_write` | `requirements.' + action` | Canonical backend operation/journal; local receipt alone does not prove external atomicity. |
+| `proposals_submit` | `proposals.submit` | Canonical backend operation/journal; local receipt alone does not prove external atomicity. |
+| `proposals_dispose` | `proposals.dispose` | Canonical backend operation/journal; local receipt alone does not prove external atomicity. |
+| `tasks_claim` | `tasks.claim` | Canonical backend operation/journal; local receipt alone does not prove external atomicity. |
+| `checkpoints_add` | `checkpoints.add` | Canonical backend operation/journal; local receipt alone does not prove external atomicity. |
+| `reviews_add` | `reviews.add` | Canonical backend operation/journal; local receipt alone does not prove external atomicity. |
+| `feedback_add` | `feedback.add` | Canonical backend operation/journal; local receipt alone does not prove external atomicity. |
+
+There are 32 direct `_mutate` call sites and two credential-wrapper call sites. Backend operations require their own journal and recovery evidence; an inner-save witness does not prove every conditional path.
+
+## Regression evidence
+
+`tests/test_project_receipt_durability.py` uses actual loopback HTTP, SQLite receipts, subprocess termination and a fresh service restart. Its canonical existence check uses the synthetic endpoint stub, not a live database. It covers both project effects before their JSON save, before receipt commit and after receipt commit, as well as failed confirmation persistence and conflicting retries. No private review evidence is required to run these probes.
