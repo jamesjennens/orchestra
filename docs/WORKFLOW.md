@@ -37,7 +37,7 @@ Complete the [independent-worker preflight](WORKER_GUIDE.md) before claiming imp
 
 ```sh
 b create "Job: intended outcome" --type epic --body-file job.md --json
-b create "Implement bounded part" --parent JOB --body-file task.md --json
+b create "Implement bounded part" --parent JOB --no-inherit-labels --body-file task.md --json
 b update TASK --claim --json
 b comments add TASK --file checkpoint.md --json
 b refresh
