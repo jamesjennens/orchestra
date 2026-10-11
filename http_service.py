@@ -5824,6 +5824,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         accounts += [(item.get('completion') or {}).get('actor') for item in items]
         accounts += [((item.get('pending_transition') or {}).get('state') or {}).get('account_id') for item in items]
         names=self.service.actor_names(accounts)
+        # The shared resolver returns the identifier for unknown accounts.
+        # Historical human attribution must use neutral text on this page.
+        names={account:name for account,name in names.items() if name != account}
         for item in items:
             if item.get('state'):
                 item['state_author_name']=names.get(item['state']['account_id']) or 'Former project owner'
