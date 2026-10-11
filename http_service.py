@@ -1684,9 +1684,24 @@ class EndpointBackend:
                 # bd timeout caught inside run_guarded and reported as Effect raised after the
                 # reservation (TimeoutExpired: ...) -- still a timeout (review 01a1288a).
                 raise uncertain('Canonical command timed out; outcome may be unknown')
+            if 'Connection timed out' in stderr:
+                # A socket timeout after the reservation (F2): the same class as a timed-out
+                # command, not a failure whose cause is unknown.
+                raise uncertain('Canonical command timed out; outcome may be unknown')
+            if 'is committed' in stderr or 'committed but' in stderr:
+                # The write WAS committed; only its response was not kept (F1). The reader
+                # must reload, not wonder whether anything happened.
+                raise uncertain('Canonical command was committed; reload to see its result')
             if 'no effect was attempted' in stderr:
                 # Journal full before any effect: nothing was reserved and nothing was tried.
                 raise uncertain('Canonical command could not be reserved; no effect was attempted')
+            if 'identity reserved' in stderr:
+                # A repeat of a reserved key (F1): the outcome of the first attempt is
+                # unknown, not a failure of this one after it began.
+                raise uncertain('Canonical command was already reserved; reconcile state before retrying')
+            if not stderr.strip():
+                # An empty stderr (F1) is not a known failure after a reservation.
+                raise uncertain('Canonical command returned no explanation; outcome may be unknown')
             raise uncertain('Canonical command failed after it was reserved; outcome may be unknown')
         if code == 75:
             # The endpoint was occupied (a wait for a lock ran out): the request may simply be
