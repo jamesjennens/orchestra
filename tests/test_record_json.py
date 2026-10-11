@@ -294,7 +294,7 @@ class NoUnguardedParseTests(unittest.TestCase):
             # Requirements request bodies use the guard and reject duplicate fields.
             'handoff.py': 1, 'http_service.py': 3, 'lifecycle.py': 1, 'recovery.py': 1, 'requirements.py': 1, 'requirement_records.py': 1, 'reserved_comments.py': 1,
             # The simple owner adapter guards bd's decision-create receipt too.
-            'requirement_http.py': 1,
+            'requirement_http.py': 2,
             'review_recommendations.py': 2, 'review_workflow.py': 4, 'work.py': 1, 'worker_gate.py': 1})
 
     def test_the_parsers_that_do_not_call_it_directly_reach_it(self):

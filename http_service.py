@@ -5904,6 +5904,7 @@ class ApiHandler(BaseHTTPRequestHandler):
     def requirements_list(self,ctx):
         self._requirements_backend(); self._project(ctx,CAP_READ)
         result=dict(self.backend.requirements_read(ctx.params['pid'],['list']))
+        result['items']=[self._requirement_author(ctx,item) for item in result.get('items',[])]
         self._requirements_names(result)
         result['can_edit']=(ctx.principal.via=='session' and not ctx.principal.agent_id
                             and self.service.state.get('memberships',{}).get(ctx.params['pid'],{}).get(ctx.principal.user_id)=='owner')
@@ -5917,11 +5918,34 @@ class ApiHandler(BaseHTTPRequestHandler):
     def requirements_get(self,ctx):
         self._requirements_backend(); self._project(ctx,CAP_READ)
         result=dict(self.backend.requirements_read(ctx.params['pid'],['get',ctx.params['rid']]))
+        result=self._requirement_author(ctx,result)
         self._requirements_names(result)
         result['governance']=self.backend.requirements_read(ctx.params['pid'],['governance'])
         result['can_edit']=(ctx.principal.via=='session' and not ctx.principal.agent_id
                             and self.service.state.get('memberships',{}).get(ctx.params['pid'],{}).get(ctx.principal.user_id)=='owner')
         return 200,result
+
+    def _requirement_author(self,ctx,item):
+        result=dict(item)
+        if not result.get('pending_draft'):
+            result['pending_author']=None
+            return result
+        author=result.get('pending_author')
+        if not isinstance(author,dict) or author.get('kind')!='account':
+            return result
+        account=author.get('text')
+        user=self.service.state.get('users',{}).get(account)
+        role=self.service.state.get('memberships',{}).get(ctx.params['pid'],{}).get(account)
+        if not isinstance(user,dict) or role!='owner':
+            result['pending_author']={'kind':'unknown','text':'', 'omitted_chars':0,'at':author.get('at')}
+            return result
+        name=user.get('display_name') or user.get('username')
+        if not isinstance(name,str) or not name.strip():
+            result['pending_author']={'kind':'unknown','text':'','omitted_chars':0,'at':author.get('at')}
+            return result
+        result['pending_author']=dict(author,kind='owner-account',text=name[:200],
+            omitted_chars=max(0,len(name)-200),is_self=account==ctx.principal.user_id)
+        return result
 
     @route('PATCH', r'/v1/projects/(?P<pid>'+ID+r')/requirements/(?P<rid>'+ID+r')')
     def requirements_revise(self,ctx):
@@ -5951,6 +5975,7 @@ class ApiHandler(BaseHTTPRequestHandler):
     def requirements_brd(self,ctx):
         self._requirements_backend(); self._project(ctx,CAP_READ)
         result=self.backend.requirements_read(ctx.params['pid'],['brd'])
+        result['items']=[self._requirement_author(ctx,item) for item in result.get('items',[])]
         self._requirements_names(result)
         return 200,result
 

@@ -1702,14 +1702,6 @@ class OperationJournal:
                                      (operation_id,)).fetchone()
         return self._row_record(row) if row is not None else None
 
-    def pending_owner_creates(self, principal):
-        """Bounded candidates for the owner adapter's empty-create recovery read.
-
-        This is only discovery. The adapter must validate the inner receipt and
-        prove native absence under its project and authority locks before release.
-        """
-        return self.pending_owner_creates_snapshot(principal, limit=21)['items']
-
     def pending_owner_creates_snapshot(self, principal, limit=20):
         """Bounded candidates and their exact total from one read snapshot."""
         if type(limit) is not int or not 1 <= limit <= 21:
