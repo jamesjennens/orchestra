@@ -8,6 +8,8 @@ principal and actors belong to principals (kittrial-5bb.194; see "Bind a key to
 its principal" in [OPERATIONS.md](OPERATIONS.md)); and slice 3, the acceptance
 commands a confined coordinator runs through the endpoint (kittrial-5bb.195; see
 "A confined coordinator runs the acceptance commands through the endpoint" in
+[OPERATIONS.md](OPERATIONS.md)); and slice 4, the installation setting that
+accepts bound keys only (kittrial-5bb.196; see "Accept bound keys only" in
 [OPERATIONS.md](OPERATIONS.md)). The rest of this note describes the design and
 the state of main when it was written, not what is built.**
 

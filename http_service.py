@@ -6707,7 +6707,10 @@ class ApiHandler(BaseHTTPRequestHandler):
         My agents set-up dialog shows its SHA-256 fingerprint and saves the file). A service without
         a certificate of its own -- plain http, or the first-install tunnel -- and a context against
         which the in-memory handshake cannot be made serve nothing here: the ordinary not-found
-        answer, as if the route did not exist.
+        answer, as if the route did not exist. The route serves what a client receives first only
+        while the context holds one certificate and has no ``sni_callback``; with a second RSA or
+        ECDSA certificate, or an SNI switch, the client can receive a different one and the route
+        must follow what the handshake presents.
         """
         certificate = getattr(self.server, 'tls_certificate_pem', None)
         if not certificate:

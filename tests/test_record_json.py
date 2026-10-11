@@ -230,6 +230,11 @@ class NoUnguardedParseTests(unittest.TestCase):
         'sessions.py': (1, 'the session registry the kit writes in read_registry (which turns a '
                            'damaged or nested file into one plain sentence; kittrial-5bb.194 revision 2 made '
                            'execute read through it)'),
+        'ssh_forced_command.py': (1, "one installation setting read from the runtime's own "
+                                     'deployment.private.json (kittrial-5bb.196): the wrapper cannot import the kit '
+                                     '(it must start on any interpreter the account has), so it reads that '
+                                     'host-written file itself and refuses a file it cannot read, a deeply nested '
+                                     'one included'),
         'version.py': (1, "the kit's own version file"),
         'work.py': (1, 'the request files the kit writes'),
         'worker.py': (2, "the endpoint's answer, on the caller's machine"),
@@ -275,7 +280,11 @@ class NoUnguardedParseTests(unittest.TestCase):
             # The fifth (kittrial-5bb.192) reads the authority-changes audit, which the
             # operator/verifier list commands append to and an operator reads: a nested or
             # unreadable file must be a refusal naming it, not a traceback.
-            'admin.py': 5,
+            # The sixth (kittrial-5bb.220 F1) reads the backup-schedule note an operator
+            # records; a damaged or nested note reads as no note, never a traceback.
+            # The seventh (kittrial-5bb.220 review 2 item 4a) reads one line of the
+            # backup-schedule log the kit writes; a damaged line is skipped.
+            'admin.py': 7,
             # endpoint.py's fifth (kittrial-5bb.195): the JSON payload of a coordinator
             # acceptance command, which the caller transports as a file attachment. It is
             # the caller's text, so it is parsed through the guard.
