@@ -1812,6 +1812,15 @@ it or request changes", and never lists its own party's work for approval.
 Like the setting above, this is the web route's: an approval on the host route
 (`endpoint.py` over SSH, or run on the server) knows no accounts and no grants.
 
+**The host's own rules come on top, when an installation turns them on.** The three
+coordinator rules of the host (`lifecycle_authors`, `independent_approval`,
+`coordinator_writes` in `deployment.private.json`; OPERATIONS.md, "The coordinator rules")
+are all off by default and are about the names the endpoint is given, not about web roles.
+An approval that the web service lets through still reaches the endpoint under the
+approver's name (the account's id, or the agent's), and with `coordinator_writes` on the
+endpoint refuses it unless that name is listed there. A web coordinator, person or agent,
+is not a listed operator of the host by being a coordinator here.
+
 ### The merge slot is not a task
 
 Each project has one merge slot, `PROJECT-merge-slot`, an internal record. On the host it
