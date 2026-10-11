@@ -124,9 +124,15 @@ export async function requirement(ctx, { pid, rid }, project, data) {
   const record = data.current;
   const main = data.accepted || record;
   const message = h('p', { role: 'status' });
-  const author = data.pending_draft ? h('span', { class: 'small' },
-    data.pending_author ? `Pending wording author: ${displayText(data.pending_author.text)}${data.pending_author.omitted_chars ? '…' : ''}`
-      : 'Pending wording author could not be confirmed.') : null;
+  const attribution = data.pending_author;
+  const authorText = attribution?.kind === 'owner-account'
+    ? (attribution.is_self ? 'Pending wording: your own edit'
+      : `Pending wording: written by project owner ${displayText(attribution.text)}${attribution.omitted_chars ? '…' : ''}`)
+    : attribution?.kind === 'contributor-name'
+      ? `Pending wording: written by a contributor who gave the name ${displayText(attribution.text)}${attribution.omitted_chars ? '…' : ''} (not verified)`
+      : 'Pending wording author could not be confirmed.';
+  const author = data.pending_draft ? h('span', { class: 'small' }, authorText,
+    attribution?.at ? ` · Recorded ${displayText(attribution.at)}` : ' · Revision time unavailable') : null;
   const accept = data.can_edit && data.governance.mode === 'simple' && record.acceptance_state !== 'accepted'
     ? h('button', { type: 'button', class: 'primary', onclick: async (event) => {
       const button = event.currentTarget || event.target; button.disabled = true;

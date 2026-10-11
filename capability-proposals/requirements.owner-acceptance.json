@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "operation_id": "caprev-c15a87bf286b49ee908ed228b290347f",
+  "operation_id": "caprev-542be106627246f6abe3aec04068c011",
   "key": "requirements.owner-acceptance",
   "name": "Human owner acceptance binds exact content and supports account-bound replay",
   "aliases": [
@@ -10,7 +10,7 @@
     "same owner new session retry",
     "immutable requirement decision"
   ],
-  "summary": "A signed-in project owner accepts exact current requirements content in simple mode without operator membership. Native decisions bind account/project/governance, revision and content hash; replay rechecks live authority. Confirmed decision bindings survive interrupted evidence writes; missing bindings remain unknown and cannot fabricate success. The page offers reload and Accept, or edit a legacy draft and accept its new revision. Validated native attribution for the current pending wording appears beside Accept, including after a governance mode switch; actor spelling does not establish account identity. Returned acceptance evidence names the accepted revision and hash even after a later draft. Raw evidence is reserved; governed and machine credential policies remain unchanged. Backup/restore retains bindings.",
+  "summary": "A signed-in project owner accepts exact current requirements content in simple mode without operator membership. Native decisions bind account/project/governance, revision and content hash; replay rechecks live authority. Confirmed decision bindings survive interrupted evidence writes; missing bindings remain unknown and cannot fabricate success. The page offers reload and Accept, or edit a legacy draft and accept its new revision. Pending wording shows author kind and the validated native revision time beside Accept. Known owner accounts use display names or your own edit; contributor-supplied names are explicitly not verified, including near-account spellings. Attribution is null without a pending draft and missing metadata remains unknown. Returned acceptance evidence names the accepted revision and hash even after a later draft. Raw evidence is reserved; governed and machine credential policies remain unchanged. Backup/restore retains bindings.",
   "requirements": [],
   "anchors": [
     "docs/REQUIREMENTS.md#editing-a-projects-requirements-in-the-web-interface"

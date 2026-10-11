@@ -20,7 +20,7 @@ from coordination import atomic, identifier
 from requirements import canonical_bytes, content_hash, load_json
 
 JOURNAL = '.requirement-owner-requests'
-RECOVERY_READ_ERROR = 'Failed creation recovery is unreadable. Ask the host operator to reconcile it.'
+RECOVERY_READ_ERROR = 'Requirement operation receipt is unreadable. Ask the host operator to reconcile it.'
 RECOVERY_WRITE_ERROR = 'Failed creation recovery could not be completed. Reload; if it still fails, ask the host operator.'
 RECOVERY_RELOAD_ERROR = 'Failed creation recovery could not be read now. Reload; if it still fails, ask the host operator.'
 NOTHING_WRITTEN = 'No creation receipt was written. Clear this failed creation, then start a new creation.'
@@ -552,7 +552,7 @@ def apply(project_path, context, action, body, operation_id, run, task=None):
 
 def web_action(root, project_path, project, request, authority_config, runner, guarded_write):
     """Keep receipt failure details inside every creation recovery route."""
-    recovery = request.get('args') in (['recoveries'], ['release'], ['create'])
+    recovery = request.get('args') in (['recoveries'], ['release'])
     try:
         answer = _web_action(root, project_path, project, request, authority_config, runner, guarded_write)
     except (ValueError, OSError) as error:
@@ -765,7 +765,7 @@ def read(project_path, project, args, run, operators=None):
 
 
 def pending_revision_author(row, record):
-    """Bounded native attribution of this validated revision, never account inference."""
+    """Exact revision attribution; ordinary endpoint labels are not verified names."""
     from reserved_comments import parse_requirement_record
     authors = set()
     for comment in row.get('comments') or []:
@@ -777,8 +777,21 @@ def pending_revision_author(row, record):
         author = comment.get('author')
         if not isinstance(author, str) or not author.strip() or '\0' in author:
             return None
-        authors.add(author)
+        at = comment.get('created_at')
+        try:
+            if not isinstance(at, str) or len(at) > 80:
+                raise ValueError('No usable revision time')
+            parsed = datetime.fromisoformat(at.replace('Z', '+00:00'))
+            if parsed.tzinfo is None:
+                raise ValueError('Revision time has no timezone')
+        except ValueError:
+            at = None
+        authors.add((author, at))
     if len(authors) != 1:
         return None
-    author = next(iter(authors))
-    return {'text': author[:200], 'omitted_chars': max(0, len(author) - 200)}
+    author, at = next(iter(authors))
+    # Exact HTTP account IDs require live authority on every endpoint action
+    # (http_actor_denial). Near matches remain ordinary caller-supplied labels.
+    kind = 'account' if owner_records.HUMAN.fullmatch(author) else 'contributor-name'
+    return {'kind': kind, 'text': author[:200],
+            'omitted_chars': max(0, len(author) - 200), 'at': at}

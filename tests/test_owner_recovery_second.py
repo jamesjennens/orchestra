@@ -82,8 +82,10 @@ class SecondRecoveryHttpTests(EndpointCase):
         self.assertIn('prewrite_identity', saved)
         self.assertEqual(len(self.backend.native.writes()), before)
         self.assertFalse(self.listing()['items'])
-        self.assertEqual(self.request('POST', self.base + '/requirements', fields,
-                                     token=self.owner_token, key='before-receipt').status, 422)
+        replay = self.request('POST', self.base + '/requirements', fields,
+                              token=self.owner_token, key='before-receipt')
+        self.assertEqual(replay.status, 422, replay.data)
+        self.assertIn('Failed creation was cleared without a native write. Start a new creation.', str(replay.data))
         self.assertEqual(self.request('POST', self.base + '/requirements', fields,
                                      token=self.owner_token, key='new-after-prewrite').status, 201)
 
@@ -150,7 +152,8 @@ r.read_owner_receipt(p)
         route = self.base + '/requirements/' + first['id']
         detail = self.request('GET', route, token=self.owner_token)
         self.assertEqual(detail.status, 200, detail.data)
-        self.assertEqual(detail.data['pending_author'], dict(text=author, omitted_chars=0))
+        self.assertEqual(detail.data['pending_author'], dict(kind='contributor-name', text=author,
+            omitted_chars=0, at='2026-09-25T00:00:00Z'))
         node = shutil.which('node')
         if node:
             root = Path(__file__).resolve().parents[1]
@@ -164,6 +167,158 @@ r.read_owner_receipt(p)
         accepted = self.request('POST', route + '/accept', dict(expected_revision=2,
             expected_sha256=detail.data['current']['sha256']), token=self.owner_token, key='accept-contributor')
         self.assertEqual(accepted.status, 200, accepted.data)
+
+    def test_native_labels_are_not_owner_identity_and_owner_uses_display_name(self):
+        first = self.request('POST', self.base + '/requirements', dict(kind='requirement',
+            parent='job-1', title='Owner draft', description='Wording.'),
+            token=self.owner_token, key='author-kind').data
+        route = self.base + '/requirements/' + first['id']
+        own = self.request('GET', route, token=self.owner_token).data['pending_author']
+        self.assertEqual(own['kind'], 'owner-account')
+        self.assertTrue(own['is_self'])
+        self.assertEqual(own['text'], self.service.state['users'][self.account]['display_name'])
+        self.assertEqual(own['at'], '2026-09-25T00:00:00Z')
+        for suffix in ('/requirements', '/brd'):
+            author = self.request('GET', self.base + suffix, token=self.owner_token).data['items'][0]['pending_author']
+            self.assertEqual(author, own)
+        row = self.backend.native.row(first['id'])
+        from reserved_comments import parse_requirement_record
+        comment = next(c for c in row['comments'] if parse_requirement_record(c['text']))
+        for label in ('olga', 'owner', self.account[:-1]):
+            with self.subTest(label=label):
+                comment['author'] = label
+                author = self.request('GET', route, token=self.owner_token).data['pending_author']
+                self.assertEqual(author, dict(kind='contributor-name', text=label,
+                    omitted_chars=0, at='2026-09-25T00:00:00Z'))
+
+    def test_no_pending_revision_has_no_author_even_if_attribution_helper_returns_one(self):
+        first = self.request('POST', self.base + '/requirements', dict(kind='requirement',
+            parent='job-1', title='Accepted content', description='Wording.'),
+            token=self.owner_token, key='author-none').data
+        route = self.base + '/requirements/' + first['id']
+        accepted = self.request('POST', route + '/accept', dict(expected_revision=first['revision'],
+            expected_sha256=first['sha256']), token=self.owner_token, key='author-none-accept')
+        self.assertEqual(accepted.status, 200, accepted.data)
+        with mock.patch.object(requirements, 'pending_revision_author', return_value={'kind':'contributor-name',
+                'text':'invented', 'omitted_chars':0, 'at':'2026-09-25T00:00:00Z'}) as helper:
+            item = requirements.read(self.path, self.project, ['get', first['id']], self.backend.native)
+        self.assertIsNone(item['pending_draft'])
+        self.assertIsNone(item['pending_author'])
+        helper.assert_not_called()
+
+    def test_receipt_read_cap_accepts_exact_boundary_and_rejects_one_more_byte(self):
+        _, _, path = self.failed()
+        payload = path.read_bytes()
+        padded = payload + b' ' * (1024 * 1024 - len(payload))
+        path.write_bytes(padded)
+        self.assertEqual(requirements.read_owner_receipt(path)['status'], 'pending')
+        path.write_bytes(padded + b' ')
+        with self.assertRaisesRegex(ValueError, 'operation receipt is unreadable'):
+            requirements.read_owner_receipt(path)
+
+    def test_create_duplicate_key_and_missing_parent_keep_their_specific_sentences(self):
+        fields = dict(kind='requirement', parent='job-1', key='req-shared', title='First', description='Wording.')
+        first = self.request('POST', self.base + '/requirements', fields,
+            token=self.owner_token, key='specific-first')
+        self.assertEqual(first.status, 201, first.data)
+        duplicate = self.request('POST', self.base + '/requirements', fields,
+            token=self.owner_token, key='specific-duplicate')
+        self.assertEqual(duplicate.status, 422, duplicate.data)
+        self.assertIn('already used by record', str(duplicate.data))
+        self.assertIn('requirement keys must be unique', str(duplicate.data))
+        fields.pop('parent'); fields['key']='req-parentless'
+        parentless = self.request('POST', self.base + '/requirements', fields,
+            token=self.owner_token, key='specific-parentless')
+        self.assertEqual(parentless.status, 422, parentless.data)
+        self.assertIn('draft without an existing task needs a parent job', str(parentless.data))
+
+    def test_reserved_create_without_a_visible_row_preserves_uncertainty_advice(self):
+        fields, _, path = self.failed()
+        answer = self.request('POST', self.base + '/requirements', fields,
+            token=self.owner_token, key='failed-create')
+        self.assertEqual(answer.status, 422, answer.data)
+        self.assertIn('Reserved requirement request has no visible record; outcome uncertain', str(answer.data))
+        self.assertNotIn(requirements.RECOVERY_WRITE_ERROR, str(answer.data))
+        saved = json.loads(path.read_text()); saved['id']='no-visible-row'
+        path.write_text(json.dumps(saved))
+        answer = self.request('POST', self.base + '/requirements', fields,
+            token=self.owner_token, key='failed-create')
+        self.assertEqual(answer.status, 422, answer.data)
+        self.assertIn('Recorded native requirement record no-visible-row is not visible; outcome uncertain', str(answer.data))
+
+    def test_create_preserves_a_native_command_failure_sentence(self):
+        original = type(self.backend.native).__call__
+        def refuse(native, args):
+            if args[0] == 'create' and '--dry-run' in args:
+                raise ValueError('Native command failed (1): harmless refusal')
+            return original(native, args)
+        with mock.patch.object(type(self.backend.native), '__call__', refuse):
+            answer = self.request('POST', self.base + '/requirements', dict(kind='requirement',
+                parent='job-1', title='Refused creation', description='Wording.'),
+                token=self.owner_token, key='native-refusal')
+        self.assertEqual(answer.status, 422, answer.data)
+        self.assertIn('Native command failed (1): harmless refusal', str(answer.data))
+        self.assertNotIn(requirements.RECOVERY_WRITE_ERROR, str(answer.data))
+
+    def test_damaged_accept_and_edit_receipts_use_an_operation_noun(self):
+        first = self.request('POST', self.base + '/requirements', dict(kind='requirement',
+            parent='job-1', title='Draft', description='Wording.'),
+            token=self.owner_token, key='noun-draft').data
+        route = self.base + '/requirements/' + first['id']
+        for action, method, suffix in (('accept', 'POST', '/accept'), ('revise', 'PATCH', '')):
+            with self.subTest(action=action):
+                key='noun-' + action
+                operation=self.backend._result_key(self.service.authenticate(self.owner_token),
+                    self.project, 'requirements.' + action, key, first['id'])
+                path=self.path / requirements.JOURNAL / (content_hash({'operation_id':operation}) + '.json')
+                path.write_bytes(b'{broken')
+                fields=dict(expected_revision=first['revision'], expected_sha256=first['sha256'])
+                if action=='revise': fields['description']='Later wording.'
+                answer=self.request(method, route + suffix, fields, token=self.owner_token, key=key)
+                self.assertEqual(answer.status, 422, answer.data)
+                self.assertIn('Requirement operation receipt is unreadable', str(answer.data))
+                self.assertNotIn('Failed creation recovery', str(answer.data))
+                self.assertNotIn(path.name, str(answer.data))
+
+    def test_revision_attribution_keeps_valid_server_time_and_rejects_ambiguity(self):
+        first = self.request('POST', self.base + '/requirements', dict(kind='requirement',
+            parent='job-1', title='Timed edit', description='Wording.'),
+            token=self.owner_token, key='author-time').data
+        row = self.backend.native.row(first['id'])
+        record = records.existing_revisions(row)[1]
+        comment = next(c for c in row['comments'] if c['text'].startswith(records.REVISION_PREFIX))
+        stamp = '2026-09-25T01:00:00.125+01:00'; comment['created_at']=stamp
+        self.assertEqual(requirements.pending_revision_author(row, record)['at'], stamp)
+        comment['created_at']='2026-09-25T01:00:00'
+        self.assertIsNone(requirements.pending_revision_author(row, record)['at'])
+        comment['author']=''
+        self.assertIsNone(requirements.pending_revision_author(row, record))
+        comment['author']='alice'; comment['created_at']=stamp
+        row['comments'].append(dict(comment, id='ambiguous-author', author='bob'))
+        self.assertIsNone(requirements.pending_revision_author(row, record))
+
+    def test_creation_metadata_is_strict_and_legacy_absence_remains_valid(self):
+        import copy
+        _, _, path = self.failed()
+        saved = json.loads(path.read_text())
+        self.assertEqual(requirements.validate_receipt(saved), saved)
+        legacy = copy.deepcopy(saved); legacy.pop('creation_metadata')
+        self.assertEqual(requirements.validate_receipt(legacy), legacy)
+        invalid = [None, {}, {'title':'', 'at':'2026-09-25T00:00:00Z'},
+            {'title':'x' * 201, 'at':'2026-09-25T00:00:00Z'},
+            {'title':'bad\0name', 'at':'2026-09-25T00:00:00Z'},
+            {'title':'Good', 'at':'not a date'},
+            {'title':'Good', 'at':'2026-09-25T00:00:00Z', 'extra':True}]
+        for metadata in invalid:
+            with self.subTest(metadata=metadata):
+                broken = copy.deepcopy(saved); broken['creation_metadata'] = metadata
+                with self.assertRaises(ValueError):
+                    requirements.validate_receipt(broken)
+        for change in ({'operation':'revise'}, {'revision':2}):
+            with self.subTest(change=change):
+                broken = copy.deepcopy(saved); broken.update(change)
+                with self.assertRaises(ValueError):
+                    requirements.validate_receipt(broken)
 
     def test_same_key_create_never_exposes_damaged_receipt_paths(self):
         fields, _, path = self.failed()

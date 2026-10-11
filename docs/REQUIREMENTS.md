@@ -45,6 +45,17 @@ write has its own **No creation receipt was written** message. An allocated row,
 even an empty one, cannot be cleared here: reload the requirements and, if the
 creation is still incomplete, ask the host operator to reconcile it.
 
+Clearing has no age gate. The receipt is written before the native create, and
+a live endpoint holds the project lock, so clearing a never-written receipt
+does not widen that race. A native create outliving the service's time limit
+while an already-written pending receipt is cleared was not reproduced with
+the pinned tracker. This does not prove that every timed-out process has ended.
+If a requirement row appears after a clear, the host operator should inspect
+the original operation receipt, retained release audit, native row request
+label and revision comments, and the endpoint/native process outcome before
+reconciling it. Do not clear an allocated row or infer its absence from a failed
+native read.
+
 An interrupted acceptance uses its recorded generated decision ID. Editable
 native titles, descriptions, labels and creator metadata cannot substitute a
 different decision. A missing or unreadable recorded decision, or an older
@@ -57,9 +68,12 @@ history. Reads and writes continue; revision numbers and hashes order authority,
 and the service does not rewrite the stored history.
 
 The generated document shows the last accepted text first. A newer draft is a
-separate pending edit, with its validated native author beside **Accept** when
-that attribution is available. Changing modes preserves that attribution; an
-actor name does not establish a human account identity. Its Decisions section
+separate pending edit, with its author kind and native revision time beside
+**Accept** when available. The owner's account uses its display name, or
+**your own edit** for that owner. A contributor's supplied name is explicitly
+**not verified**, including names resembling an account ID. Missing or ambiguous
+attribution remains unknown; an unavailable time is stated. Changing modes
+preserves the revision. Its Decisions section
 uses immutable acceptance evidence for the accepted revision, including when a
 later draft exists. An unreadable requirement is marked by ID;
 healthy requirements remain readable and an affected acceptance is never trusted.

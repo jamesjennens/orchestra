@@ -186,7 +186,10 @@ class NativeOwnerTests(fixture.RealBdLabelAliasTests):
             self.assertEqual([r['acceptance_state'] for r in detail.data['history']], ['draft','accepted','draft'])
             self.assertEqual(detail.data['acceptance']['revision'], accepted.data['revision'])
             self.assertEqual(detail.data['acceptance']['record_sha256'], accepted.data['sha256'])
-            self.assertEqual(detail.data['pending_author'], {'text': account, 'omitted_chars': 0})
+            self.assertEqual(detail.data['pending_author']['kind'], 'owner-account')
+            self.assertTrue(detail.data['pending_author']['is_self'])
+            self.assertEqual(detail.data['pending_author']['text'], harness.service.state['users'][account]['display_name'])
+            self.assertIsNotNone(detail.data['pending_author']['at'])
             for revision in detail.data['history']:
                 from requirements import content_hash
                 self.assertEqual(content_hash(revision), revision['sha256'])
@@ -221,7 +224,9 @@ class NativeOwnerTests(fixture.RealBdLabelAliasTests):
             self.assertEqual(contribution['returncode'], 0, contribution)
             pending = harness.request('GET', route, token=token)
             self.assertEqual(pending.status, 200, pending.data)
-            self.assertEqual(pending.data['pending_author'], {'text':'alice','omitted_chars':0})
+            self.assertEqual(pending.data['pending_author']['kind'], 'contributor-name')
+            self.assertEqual(pending.data['pending_author']['text'], 'alice')
+            self.assertIsNotNone(pending.data['pending_author']['at'])
             before = self.rows()
             denied = harness.request('POST', route+'/accept', expected(changed.data), token=token, key='native-governed-accept')
             self.assertEqual(denied.status, 422, denied.data)
@@ -235,7 +240,9 @@ class NativeOwnerTests(fixture.RealBdLabelAliasTests):
                 dict(expected(governed.data), mode='simple'), token=token, key='native-page-simple')
             self.assertEqual(enabled.status, 200, enabled.data)
             pending = harness.request('GET', route, token=token)
-            self.assertEqual(pending.data['pending_author'], {'text':'alice','omitted_chars':0})
+            self.assertEqual(pending.data['pending_author']['kind'], 'contributor-name')
+            self.assertEqual(pending.data['pending_author']['text'], 'alice')
+            self.assertIsNotNone(pending.data['pending_author']['at'])
             # Kill this real endpoint process before its first receipt write.
             # The native adapter and both authority checks remain unchanged.
             prewrite_endpoint = root/'prewrite-endpoint.py'
