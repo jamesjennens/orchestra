@@ -1,0 +1,101 @@
+"""Contributor lifecycle namespace: final effects, aliases and failed reads."""
+import sys
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import raw_lifecycle as raw
+
+
+def row(**changes):
+    return dict(dict(id='pp-task', title='ordinary', issue_type='task', description='', labels=[]), **changes)
+
+
+class RawLifecycleTests(unittest.TestCase):
+    def guard(self, args, rows=None, attachments=None):
+        raw.guard(args, attachments or {}, lambda tokens: rows if rows is not None else [row()])
+
+    def rejected(self, args, **kwargs):
+        with self.assertRaisesRegex(ValueError, 'lifecycle action.*no native write'):
+            self.guard(args, **kwargs)
+
+    def test_every_namespace_and_label_spelling(self):
+        for dim in raw.NAMES:
+            for value in (dim+':passed', 'plain,'+dim+':passed', '"'+dim+':passed"'):
+                for flag in ('--label', '--labels', '-l'):
+                    for tokens in ([flag, value], [flag+'='+value]):
+                        self.rejected(['create', 'ordinary', *tokens])
+                for flag in ('--add-label', '--set-labels', '--remove-label'):
+                    self.rejected(['update', 'pp-task', flag+'='+value])
+        self.rejected(['create', 'ordinary', '-qlreviewed:passed'])
+
+    def test_string_flag_values_are_not_scanned_as_flags(self):
+        self.guard(['create', 'ordinary', '--description', '--labels=reviewed:passed'])
+        self.guard(['create', '--', '--labels=reviewed:passed'])
+
+    def test_both_event_spellings_without_parent_or_payload(self):
+        for dim in raw.NAMES:
+            for typeflag in (['--type', 'event'], ['--type=event'], ['-tevent'], ['-t=event'], ['-qtevent']):
+                self.rejected(['create', 'State change: '+dim+' → passed', *typeflag])
+                self.rejected(['create', 'ordinary', *typeflag, '-dChanged '+dim+' from unknown to passed'])
+        self.rejected(['create', '--title=State change: reviewed → passed', '-tevent'])
+
+    def test_conversion_and_mutation_judge_old_and_final_rows(self):
+        plain = row(description='Set reviewed to passed')
+        self.rejected(['update', 'pp-task', '-tevent'], rows=[plain])
+        event = row(issue_type='event', title='State change: reviewed → passed')
+        for args in (['--title', 'ordinary'], ['--type', 'task'], ['--description', 'ordinary'], ['--parent', 'pp-other']):
+            self.rejected(['update', 'pp-task', *args], rows=[event])
+        self.rejected(['update', 'pp-task', '--title=State change: deployed → failed'], rows=[row(issue_type='event')])
+        self.rejected(['dep', 'remove', 'pp-task', 'pp-other'], rows=[event, row(id='pp-other')])
+        self.rejected(['update', 'pp-task', 'pp-other', '-tevent'], rows=[row(), row(id='pp-other', description='Set tested to passed')])
+        # Duplicate scalar flags have native last-value semantics.
+        self.rejected(['create', 'State change: reviewed → passed', '-ttask', '--type=event'])
+        self.guard(['create', 'State change: reviewed → passed', '-tevent', '--type=task'])
+
+    def test_inheritance_replacement_and_legacy_labels(self):
+        holder = row(labels=['reviewed:passed', 'review-ready'])
+        self.rejected(['create', 'child', '--parent=pp-task'], rows=[holder])
+        self.rejected(['create', 'child', '--parent=pp-task', '--no-inherit-labels=false'], rows=[holder])
+        self.guard(['create', 'child', '--parent=pp-task', '--no-inherit-labels=true'], rows=[holder])
+        self.rejected(['update', 'pp-task', '--set-labels=review-ready'], rows=[holder])
+        for label in ('review-ready', 'reviewed', 'live:resolved-other'):
+            if label.startswith('live:'):
+                self.rejected(['update', 'pp-task', '--add-label', label])
+            else:
+                self.guard(['update', 'pp-task', '--add-label', label], rows=[holder])
+        self.guard(['update', 'pp-task', '--set-labels=reviewed,review-ready'])
+
+    def test_description_attachment_and_ambiguities(self):
+        item = {'body': {'flag': '--body-file', 'text': 'Set integrated to passed'}}
+        self.rejected(['create', 'ordinary', '-tevent', '@attachment:body'], attachments=item)
+        self.rejected(['update', 'pp-task', '@attachment:body'], rows=[row(issue_type='event')], attachments=item)
+        self.rejected(['create', 'ordinary', '-tevent', '-dordinary', '@attachment:body'], attachments=item)
+        for args in (['create', 'ordinary', '--stdin'], ['update', 'pp-task', '--type'], ['create', 'one', 'two'], ['create', 'one', '--title=two'], ['create', 'child', '--parent=pp-task', '--no-inherit-labels=maybe']):
+            self.rejected(args)
+
+    def test_incomplete_or_ambiguous_reads_refuse(self):
+        for rows in ([], {}, [None], [row(issue_type=None)], [row(title=None)], [row(description=1)], [row(labels='reviewed:passed')], [row(labels=[None])], [row(malformed=True)], [row(), row()]):
+            self.rejected(['update', 'pp-task', '--title=ordinary'], rows=rows)
+
+    def test_two_resolved_tokens_for_one_healthy_row_are_allowed(self):
+        self.guard(['update', 'pp-task', 'task', '--title=ordinary'], rows=[row(), row()])
+        self.rejected(['update', 'pp-task', 'task', '--title=ordinary'], rows=[row(), row(description='disagrees')])
+
+    def test_nonstructural_updates_cannot_edit_lifecycle_events(self):
+        event = row(issue_type='event', title='State change: reviewed → passed')
+        for flags in (['--priority=2'], ['--assignee=mallory'], ['--status=open'],
+                      ['--add-label=ordinary'], ['--notes=ordinary'], []):
+            self.rejected(['update', 'pp-task', *flags], rows=[event])
+            self.guard(['update', 'pp-task', *flags])
+
+    def test_ordinary_prose_and_non_lifecycle_events(self):
+        self.guard(['create', 'Discuss State change: reviewed → passed', '-tevent', '-dWe discussed Set reviewed to passed'])
+        self.guard(['create', 'State change: traffic → green', '-tevent', '-dSet traffic to green'])
+        self.guard(['create', 'State change: reviewed → passed', '-ttask', '-dSet reviewed to passed'])
+        self.guard(['update', 'pp-task', '--description=Discuss State change: tested → passed'])
+        self.guard(['update', 'pp-task', '--description=Set reviewed to passed'])
+
+
+if __name__ == '__main__':
+    unittest.main()

@@ -155,7 +155,7 @@ class GuardTests(unittest.TestCase):
 
     def test_the_bd_action_hands_the_guard_the_rows_it_read(self):
         source = (KIT / 'endpoint.py').read_text(encoding='utf-8')
-        self.assertIn("named=_guard_named_rows(root,path,name,args,request.get('attachments',{}),actor)", source)
+        self.assertIn("named=_guard_named_rows(root,path,name,args,request.get('attachments',{}),actor,strict=lifecycle_guard)", source)
         self.assertIn('_guard_record_anchor_title(root,path,args,actor,named)', source)
 
     def test_a_title_change_that_names_no_row_is_refused(self):

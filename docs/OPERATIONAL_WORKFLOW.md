@@ -88,6 +88,9 @@ Refresh generates `CURRENT.md`, `COORDINATION.md`, issue pages and journals. Do 
 
 ## Six independent lifecycle facts
 
+See [lifecycle write routes](LIFECYCLE_RAW_WRITES.md) for the contributor raw
+namespace boundary, legitimate writer inventory and legacy read compatibility.
+
 The dimensions are `implemented`, `tested`, `reviewed`, `integrated`, `deployed` and `live-verified`. Each accepts `unknown`, `pending`, `passed`, `failed` or `not-applicable`. Closing an issue implies none of them; requirement acceptance is separate.
 
 First register the exact scope to which subsequent evidence applies. Save this as `scope-event.json`:
@@ -150,6 +153,8 @@ Passed implementation/test/review facts require `source_commit`; integration req
 Use a new operation ID for each new assertion or correction. After an uncertain response, inspect canonical events/state first; any retry must use the **same operation ID and exact payload**. Reusing an ID with different content is refused. An interrupted repeat-value update may temporarily appear unknown until reconciled. Never invent a successful outcome from a timeout.
 
 Raw `bd` labels alone are insufficient evidence: an old `tested:passed` label can remain after scope changes. The contextual `lifecycle.py list` output is the authoritative lifecycle view; it checks scope, native event order, payload attribution and label agreement. Missing, mismatched or ambiguous evidence becomes unknown.
+
+Contributors write these facts through the dedicated `lifecycle` action, using `lifecycle.py record` above. The raw `bd` path reserves the six dimension label prefixes, `lifecycle-scope:`, `enabled:` and `live:`, including inherited labels and replacement of a holder's labels. It also refuses creation, conversion or alteration of lifecycle state events, including legacy events without a structured payload. The check runs under the project lock before any native write, regardless of optional workflow policy settings; an ambiguous effect or incomplete native read is refused. `review-ready` and `reviewed` remain ordinary labels, and prose discussing a state change remains writable. Configured operators and the host's structured lifecycle writers retain their existing routes. This write boundary does not change how historical facts are read.
 
 Three payload fields are optional and additive: `note` (a per-task note, any fact), `trigger` (a free-text next trigger, only on a `pending` fact) and `defect_task` (only on `enabled=enabled-with-known-defect`, below). Every payload that validated before still validates; a kit that does not know one of these fields reads that fact as `unknown`, never as `passed`.
 
