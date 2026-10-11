@@ -1208,6 +1208,32 @@ def audit_agreement(damage,last,current):
     return False,'stale'
 
 
+def _may_sentence_for(numbers, more):
+    """The one group-two sentence for the switch's warnings (kittrial-5bb.250 r3 item 5)."""
+    if not numbers and not more:
+        return 'No line runs a command this preview cannot judge'
+    named=', '.join(str(number) for number in numbers) or ''
+    one=len(numbers)==1 and not more
+    return ('Line%s %s%s run%s a command this preview cannot judge (another wrapper or root, shell '
+            'syntax, a relative path, or another program) and %s not decided: if %s reach%s a kit '
+            'that has bound keys only on, %s refused unless bound'
+            %('s' if not one else '', named, '' if not more else ' and %d more'%more,
+              's' if one else '', 'was' if one else 'were', 'it' if one else 'they',
+              'es' if one else '', 'it is' if one else 'they are'))
+
+def authorized_keys_hints(root,file=None):
+    """``{line number: hint or None}`` for the lines the preview does not decide.
+
+    The hint is whether the wrapper file a line names carries the word 'bound_keys_only' in
+    its first 64 KiB (open-then-fstat, once per path per run): a hint about the kit that
+    serves the line, never a decision. Status and on carry it beside may_be_refused so they
+    say what the listing says (kittrial-5bb.250 r3, item 5).
+    """
+    try:
+        return authorized_keys_listing(root,file).get('wrapper_names_setting') or {}
+    except (OSError,ValueError,RecursionError):
+        return {}
+
 def bound_keys_only_switch(root,action,actor,file=None,without_preview=False):
     """Read or flip ``bound_keys_only`` with its operator audit (kittrial-5bb.196, slice 4).
 
@@ -1315,24 +1341,20 @@ def bound_keys_only_switch(root,action,actor,file=None,without_preview=False):
         preview_truncated=False if preview_info is None else preview_info[2]
         may_refuse=[] if preview_info is None else preview_info[3]
         may_refuse_more=0 if preview_info is None else preview_info[4]
-        says=('refuses' if current else 'turning this setting on would refuse')
         if preview:
-            print('WARNING: this installation %s %d authorized_keys line(s) of this kit and this '
-                  'root: %s%s. Print each such line again with `admin.py authorized-keys --project ... '
-                  '--principal ...` and replace it%s.'
-                  %(says,len(preview)+preview_more,', '.join(str(number) for number in preview),
+            print('WARNING: %s %d authorized_keys line(s) of this kit and this root: %s%s. Print each such '
+                  'line again with `admin.py authorized-keys --project ... --principal ...` and replace it%s.'
+                  %('this installation refuses' if current else 'turning this setting on would refuse',
+                    len(preview)+preview_more,', '.join(str(number) for number in preview),
                     ' and %d more'%preview_more if preview_more else '',
                     '' if current else ' before turning the setting on'),file=sys.stderr)
         elif preview is None:
             print('WARNING: the authorized_keys file could not be read, so the lines turning this setting on '
                   'would cut off could not be listed.',file=sys.stderr)
         if may_refuse or may_refuse_more:
-            # Group two (kittrial-5bb.250 r2 item 4): the lines this preview does NOT decide,
-            # printed here and carried in the JSON, bounded like group one.
-            print('WARNING: %d authorized_keys line(s) run another wrapper or another root, or a command this '
-                  'preview cannot judge, and were not decided: %s%s; the kit that serves them may refuse them.'
-                  %(len(may_refuse)+may_refuse_more,', '.join(str(number) for number in may_refuse),
-                    ' and %d more'%may_refuse_more if may_refuse_more else ''),file=sys.stderr)
+            # Group two (kittrial-5bb.250 r3 item 5): the one sentence, the same as the
+            # listing's, carried in the JSON with the hints.
+            print('WARNING: %s.'%_may_sentence_for(may_refuse, may_refuse_more),file=sys.stderr)
         if preview_truncated:
             print('WARNING: the authorized_keys file is larger than the %d bytes this command reads, so only its '
                   'first part was inspected; a line beyond that was not listed and would still be refused '
@@ -1343,13 +1365,16 @@ def bound_keys_only_switch(root,action,actor,file=None,without_preview=False):
         def _shown(entry):
             return None if entry is None else {key:(audit_field(value) if key in ('actor','at') else value)
                                                for key,value in entry.items()}
+        # The hints travel with the group they explain (r3 item 5): a module-level read of
+        # the same listing, so status and on say what the listing says.
+        hints=authorized_keys_hints(root,file) if preview_info is not None else {}
         return dict(bound_keys_only=current,audit=_shown(last),audit_history=[_shown(e) for e in audit],
                     audit_records=len(audit),
                     audit_readable=damage is None,audit_agrees=agrees,audit_note=audit_note,
                     audit_max=BOUND_KEYS_ONLY_AUDIT_MAX,
                     would_be_refused=preview,would_be_refused_more=preview_more,
                     may_be_refused=may_refuse,may_be_refused_more=may_refuse_more,
-                    truncated=preview_truncated,changed=False)
+                    wrapper_names_setting=hints,truncated=preview_truncated,changed=False)
     enabled=action=='on'
     warnings=[]
     if enabled and bound_keys_only(root) is True:
@@ -1384,6 +1409,23 @@ def bound_keys_only_switch(root,action,actor,file=None,without_preview=False):
     preview=None if preview_info is None else preview_info[0]
     preview_more=0 if preview_info is None else preview_info[1]
     preview_truncated=False if preview_info is None else preview_info[2]
+    may_refuse=[] if preview_info is None else preview_info[3]
+    may_refuse_more=0 if preview_info is None else preview_info[4]
+    if enabled and preview is not None:
+        # BOTH groups are printed BEFORE the flip is written (kittrial-5bb.250 r3 item 5):
+        # whatever happens to the write, the operator has already seen every line it names.
+        if preview:
+            print('WARNING: turning this setting on refuses %d authorized_keys line(s) of this kit and this '
+                  'root: %s%s. Print each such line again with `admin.py authorized-keys --project ... '
+                  '--principal ...` and replace it.'
+                  %(len(preview)+preview_more,', '.join(str(number) for number in preview),
+                    ' and %d more'%preview_more if preview_more else ''),file=sys.stderr)
+        if may_refuse or may_refuse_more:
+            print('WARNING: %s.'%_may_sentence_for(may_refuse, may_refuse_more),file=sys.stderr)
+        if preview_truncated:
+            print('WARNING: the authorized_keys file is larger than the %d bytes this command reads, so only '
+                  'its first part was inspected; a line beyond that was not listed and would still be '
+                  'refused after on.'%AUTHORIZED_KEYS_MAX_BYTES,file=sys.stderr)
     with review_writes_lock(root):
         cfg=config(root)
         current=bound_keys_only(root,warnings=warnings)
@@ -1420,30 +1462,15 @@ def bound_keys_only_switch(root,action,actor,file=None,without_preview=False):
     if enabled:
         result['would_be_refused']=preview
         result['would_be_refused_more']=preview_more
-        result['may_be_refused']=[] if preview_info is None else preview_info[3]
-        result['may_be_refused_more']=0 if preview_info is None else preview_info[4]
+        result['may_be_refused']=may_refuse
+        result['may_be_refused_more']=may_refuse_more
+        result['wrapper_names_setting']=authorized_keys_hints(root,file) if preview_info is not None else {}
         result['truncated']=preview_truncated
-        if result['may_be_refused'] or result['may_be_refused_more']:
-            # Group two (kittrial-5bb.250 r2 item 4): listed before the flip is reported done.
-            print('WARNING: %d authorized_keys line(s) run another wrapper or another root, or a command this '
-                  'preview cannot judge, and were not decided: %s%s; the kit that serves them may refuse them.'
-                  %(len(result['may_be_refused'])+result['may_be_refused_more'],
-                    ', '.join(str(number) for number in result['may_be_refused']),
-                    ' and %d more'%result['may_be_refused_more'] if result['may_be_refused_more'] else ''),
-                  file=sys.stderr)
-        if preview:
-            print('WARNING: turning this setting on now refuses %d authorized_keys line(s) of this kit and this '
-                  'root: %s%s. Print each such line again with `admin.py authorized-keys --project ... '
-                  '--principal ...` and replace it.'
-                  %(len(preview)+preview_more,', '.join(str(number) for number in preview),
-                    ' and %d more'%preview_more if preview_more else ''),file=sys.stderr)
-        elif preview is None:
+        # Both groups printed BEFORE the flip was written (above, r3 item 5); only the
+        # unreadable-file truth is said here, after it.
+        if preview is None:
             print('WARNING: the authorized_keys file could not be read, so the lines turning this setting on '
                   'would cut off could not be listed.',file=sys.stderr)
-        if preview_truncated:
-            print('WARNING: the authorized_keys file is larger than the %d bytes this command reads, so only its '
-                  'first part was inspected; a line beyond that was not listed.'%AUTHORIZED_KEYS_MAX_BYTES,
-                  file=sys.stderr)
     for line in warnings:print(line,file=sys.stderr)
     return result
 
@@ -5400,6 +5427,20 @@ def _key_line_command(options):
         if equals and name.strip().lower()=='command':return value
     return None
 
+def _realpath_or_self(path):
+    """os.path.realpath that answers the path unchanged when the name cannot even be asked."""
+    try:
+        return Path(os.path.realpath(str(path)))
+    except (OSError, ValueError):
+        return Path(str(path))
+
+def _wrapper_exists(wrapper):
+    """Whether the wrapper path names anything, without raising on a NUL or an over-long name."""
+    try:
+        return Path(wrapper).is_file()
+    except (OSError, ValueError):
+        return False
+
 def key_line(line,root,kit):
     """What one line of authorized_keys is, for this runtime and this kit; None for a blank or # line.
 
@@ -5433,12 +5474,16 @@ def key_line(line,root,kit):
         entry['kind']='other-command'
         return entry
     wrapper=tokens[at]
-    # kittrial-5bb.250 r2 item 3: a command that needs the shell to run (a 'cd KIT && ...'
-    # chain, a redirection, '; true', a $HOME or ~ path), or names the wrapper relatively,
-    # is NOT decided by this preview - the token stream alone does not say what sshd runs.
-    entry['needs_shell']=any(metachar in command for metachar in ('&&','||',';','|','>','<','$','`')) \
-        or wrapper.startswith('~')
-    entry['relative_path']=os.sep not in wrapper or wrapper.startswith('~')
+    # kittrial-5bb.250 r3 item 4, THE RULE: a command is decided only when it needs no
+    # shell at all. A whitelist of plain characters decides that - letters, digits and the
+    # few punctuation marks an authorized_keys command never needs beyond them - because a
+    # blacklist always misses one more thing the shell treats specially (&, #, a glob, an
+    # assignment, quotes). Relative means NOT ABSOLUTE (r3 item 3): './x' and 'dir/x' were
+    # resolved against the caller's directory and wrongly decided; a leading ~ or $ is
+    # relative here too. Both put the line in group two, hint None.
+    plain=set('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.+/=,: ')
+    entry['needs_shell']=any(character not in plain for character in command)
+    entry['relative_path']=not os.path.isabs(wrapper) or wrapper.startswith('~')
     values={'--root':[],'--endpoint':[],'--python':[],'--project':[],'--principal':[]};unknown=[]
     arguments=tokens[at+1:];index=0
     while index<len(arguments):
@@ -5467,10 +5512,12 @@ def key_line(line,root,kit):
         # A line names its wrapper and endpoint by path. One printed by an earlier release of an
         # office installation still runs THAT release's kit, which knows none of the rules of
         # this one, for as long as its folder is there (the design, Migration, step 6).
-        'other_kit':(Path(os.path.realpath(wrapper))!=here/'ssh_forced_command.py'
-                     or any(Path(os.path.realpath(endpoint))!=here/'endpoint.py' for endpoint in endpoints)),
-        'other_root':line_root is None or Path(os.path.realpath(line_root))!=Path(os.path.realpath(str(root))),
-        'missing':not Path(wrapper).is_file(),
+        'other_kit':(_realpath_or_self(wrapper)!=here/'ssh_forced_command.py'
+                     or any(_realpath_or_self(endpoint)!=here/'endpoint.py' for endpoint in endpoints)),
+        'other_root':line_root is None or _realpath_or_self(line_root)!=_realpath_or_self(str(root)),
+        # A path with a NUL or an over-long name makes any stat raise (r3 item 7): the
+        # wrapper is simply not there, one line, not a dead preview.
+        'missing':not _wrapper_exists(wrapper),
         'unknown_arguments':unknown})
     # It is this kit today and names its release folder: after the next upgrade it is another kit.
     link=install_current_link(here)
@@ -5502,19 +5549,30 @@ def authorized_keys_listing(root,file=None):
     """
     path=Path(file) if file else Path.home()/'.ssh'/'authorized_keys'
     kit=Path(__file__).resolve().parent
-    # A file that is there but is not a regular file - a directory, a fifo, a dangling
-    # symlink - is refused BEFORE it is opened: opening a fifo blocks for ever, on
-    # `status` and on `on` alike (kittrial-5bb.250 F2).
-    if os.path.lexists(str(path)) and not path.is_file():
-        raise ValueError('Cannot read %s: it is not a regular file (a directory, a fifo or a '
-                         'dangling link), and this command will not wait on it'%path)
     # The file is read at most AUTHORIZED_KEYS_MAX_BYTES, whole lines only: it is read on every
     # `status`/`on`, and a hand-written file with thousands of unbound lines must not be read
     # whole or flood the operator's terminal (kittrial-5bb.196 review, item 5).
+    # Open FIRST, judge the OPEN FILE (kittrial-5bb.250 r3 item 2, the r2 lstat pre-check
+    # lost a race to a path swapped into a fifo between the two calls): O_NONBLOCK never
+    # waits on a fifo, fstat judges the descriptor, and a file that is not regular is
+    # refused fast instead of hanging `status` and `on` for ever.
+    import stat as stat_module
     try:
-        with open(path,'rb') as handle:raw=handle.read(AUTHORIZED_KEYS_MAX_BYTES+1)
+        descriptor=os.open(str(path), os.O_RDONLY | getattr(os, 'O_NONBLOCK', 0)
+                           | getattr(os, 'O_CLOEXEC', 0))
     except OSError as error:
         raise ValueError('Cannot read %s: %s'%(path,error.strerror or error)) from None
+    try:
+        if not stat_module.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError('Cannot read %s: it is not a regular file (a directory, a fifo or '
+                             'a dangling link), and this command will not wait on it'%path)
+        with os.fdopen(descriptor,'rb',closefd=False) as handle:
+            raw=handle.read(AUTHORIZED_KEYS_MAX_BYTES+1)
+    except OSError as error:
+        raise ValueError('Cannot read %s: %s'%(path,error.strerror or error)) from None
+    finally:
+        try: os.close(descriptor)
+        except OSError: pass
     truncated=len(raw)>AUTHORIZED_KEYS_MAX_BYTES
     if truncated:
         raw=raw[:AUTHORIZED_KEYS_MAX_BYTES]
@@ -5572,34 +5630,48 @@ def authorized_keys_listing(root,file=None):
         symlink to one named by a key line must not hang this read (item 1) - and never a
         relative path, which would be resolved against the caller's directory (item 2).
         """
-        real=os.path.realpath(str(wrapper))
-        if real in _wrapper_hint_cache:
-            return _wrapper_hint_cache[real]
+        if str(wrapper) in _wrapper_hint_cache:
+            return _wrapper_hint_cache[str(wrapper)]
         hint=None
-        try:
-            mode=os.lstat(real).st_mode
-        except OSError:
-            mode=0
-        import stat as stat_module
-        if stat_module.S_ISREG(mode) and os.path.isabs(str(wrapper)) and not str(wrapper).startswith('~'):
+        if os.path.isabs(str(wrapper)) and not str(wrapper).startswith('~'):
+            # Open FIRST, judge the OPEN FILE (r3 item 2): between an lstat and an open the
+            # path can become a fifo, and the review's race hung status in 2 of 5 runs.
+            # O_NONBLOCK never waits on a fifo, O_NOFOLLOW refuses a symlinked wrapper, and
+            # fstat judges the descriptor that was opened - not the path again. A path with
+            # a NUL or an over-long name is one unreadable line, not a dead preview (r3
+            # item 7): ValueError/OSError say hint None like any other unreadable file.
+            import stat as stat_module
             try:
-                with open(real,'rb') as handle:body=handle.read(64*1024)
-                hint=b'bound_keys_only' in body
-            except OSError:
-                hint=None
-        _wrapper_hint_cache[real]=hint
+                descriptor=os.open(str(wrapper), os.O_RDONLY | getattr(os, 'O_NONBLOCK', 0)
+                                   | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_CLOEXEC', 0))
+            except (OSError, ValueError):
+                descriptor = -1
+            if descriptor >= 0:
+                try:
+                    if stat_module.S_ISREG(os.fstat(descriptor).st_mode):
+                        body=os.read(descriptor, 64 * 1024)
+                        hint=b'bound_keys_only' in body
+                except (OSError, ValueError):
+                    hint=None
+                finally:
+                    try: os.close(descriptor)
+                    except OSError: pass
+        _wrapper_hint_cache[str(wrapper)]=hint
         return hint
     def _setting_decided(entry):
-        """Whether THIS preview decides the line (group one; kittrial-5bb.250 r2 item 3).
+        """Whether THIS preview decides the line (group one; THE RULE of kittrial-5bb.250
+        r3 item 4, which replaces shape-hunting).
 
-        Decided only for this kit's own wrapper file and this root, on a command that needs
-        no shell and names no relative path: there the wrapper is known to read this root's
-        setting. Every other wrapper or root, a command that needs the shell, and a relative
-        or $HOME path are group two - MAY be refused, with the word in the wrapper file said
-        as the hint it is - and a line refused before the setting is refused either way.
+        Decided ONLY when the command needs no shell at all (a whitelist of plain
+        characters in key_line), names this kit's wrapper by an ABSOLUTE path, serves this
+        root, and parses as a line of the wrapper. EVERY other line that has a command= at
+        all is group two - whatever it parses as, bound included, and other programs too -
+        and a line refused before the setting is refused either way (group three). Only a
+        line with no command= (the account's shell) is outside the three groups.
         """
         wrapper=entry.get('wrapper')
-        return (bool(wrapper) and not entry.get('other_root') and not entry.get('needs_shell')
+        return (bool(wrapper) and entry.get('kind') in ('bound','confined')
+                and not entry.get('other_root') and not entry.get('needs_shell')
                 and not entry.get('relative_path')
                 and Path(os.path.realpath(wrapper))==here/'ssh_forced_command.py')
     def _refused_before_the_setting(entry):
@@ -5614,9 +5686,14 @@ def authorized_keys_listing(root,file=None):
     # the setting are refused either way and stay named in group one's list.
     would_be_refused=sorted({entry['line'] for entry in lines
                              if _setting_decided(entry) and _unbound(entry)})
+    # Group two is every OTHER line that has a command= at all (r3 item 5): bound lines the
+    # shell decides, lines of another wrapper or root, shell syntax, relative paths, and
+    # lines that run another program - none of them is decided here, and no such line is
+    # cut off unnamed. Only a line with no command= is outside the groups.
+    decided={entry['line'] for entry in lines if _setting_decided(entry)}
     may_be_refused=sorted({entry['line'] for entry in lines
-                           if not _setting_decided(entry) and _unbound(entry)}
-                          - set(would_be_refused))
+                           if ('wrapper' in entry or entry.get('kind')=='other-command')
+                           and entry['line'] not in decided})
     would_be_refused_total=len(would_be_refused)
     would_be_refused=would_be_refused[:WOULD_BE_REFUSED_NAMED_MAX]
     would_be_refused_more=would_be_refused_total-len(would_be_refused)
@@ -5651,27 +5728,36 @@ def authorized_keys_listing(root,file=None):
            'other_root: the line serves another runtime than --root (or names none); its projects were not looked up here.']
     def _named(numbers):
         return 'line%s %s'%('s' if len(numbers)!=1 else '',', '.join(str(number) for number in numbers))
+    def _may_sentence(numbers, more):
+        """The one group-two sentence (kittrial-5bb.250 r3 item 5): what was not decided and
+        why, bounded like group one, said the same way by the listing, status and on."""
+        if not numbers and not more:
+            return 'No line runs a command this preview cannot judge'
+        named=', '.join(str(number) for number in numbers)
+        one=len(numbers)==1 and not more
+        return ('Line%s %s%s run%s a command this preview cannot judge (another wrapper or root, '
+                'shell syntax, a relative path, or another program) and %s not decided: if %s '
+                'reach%s a kit that has bound keys only on, %s refused unless bound'
+                %('s' if not one else '', named, '' if not more else ' and %d more'%more,
+                  's' if one else '', 'was' if one else 'were', 'it' if one else 'they',
+                  'es' if one else '', 'it is' if one else 'they are'))
     more_text=' and %d more'%would_be_refused_more if would_be_refused_more else ''
     if setting:
         notes.append('bound_keys_only: this installation accepts bound keys only, so the forced command refuses '
-                     'a line of this kit and this root that names no project or no principal%s. Print each such '
-                     'line again with authorized-keys --project ... --principal ... and replace it. A line that '
-                     'runs a wrapper of another kit or of another root is not decided here: the kit that serves '
-                     'it may refuse it%s.'
+                     'a line of this kit and this root that lacks a project or a principal%s. Print each such '
+                     'line again with authorized-keys --project ... --principal ... and replace it. %s.'
                      %(' (%s%s)'%(_named(refused),more_text) if refused else ' (no line here is such a line)',
-                       ' (%s may be refused)'%_named(may_be_refused) if may_be_refused else ''))
+                       _may_sentence(may_be_refused, may_be_refused_more)))
     else:
         # The preview before `on` (kittrial-5bb.196 review, item 4c): with the setting off nothing
         # is refused, but the operator must see what turning it on would cut off, all at once.
         notes.append('would_be_refused: the setting is off, so nothing is refused today; `admin.py '
                      'bound-keys-only on --actor OPERATOR` would refuse the line(s) of this kit and this root '
-                     'that name no project or no principal%s. Print each such line again with authorized-keys '
-                     '--project ... --principal ... and replace it before turning the setting on. A line that '
-                     'runs a wrapper of another kit or of another root is not decided here: the kit that serves '
-                     'it may refuse it%s.'
+                     'that lack a project or a principal%s. Print each such line again with authorized-keys '
+                     '--project ... --principal ... and replace it before turning the setting on. %s.'
                      %(' (%s%s)'%(_named(would_be_refused),more_text) if would_be_refused
                        else ' (no line here is such a line)',
-                       ' (%s may be refused)'%_named(may_be_refused) if may_be_refused else ''))
+                       _may_sentence(may_be_refused, may_be_refused_more)))
     if refused_for_another_reason:
         # Named because `on` would still not serve them, but the SETTING is not the reason: the
         # reviewer asked for that to be said rather than implied (kittrial-5bb.196 review, item 2).

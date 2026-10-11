@@ -346,9 +346,9 @@ audit entry does not read as agreeing, and `status` says so. Both `status` and
 `on` read the authorized_keys file named by `--file` (default this account's
 `~/.ssh/authorized_keys`) and report `would_be_refused`: the lines of this kit and this root that
 the setting refuses, or would refuse while it is off. So the operator sees what `on` is about to
-cut off before it happens, and `on` prints that list - after reading and building it and before it
-writes the flip, so a slow or failing read of the keys file never leaves the setting on with
-nothing printed. The keys file is read at most its first 1 MiB, and `would_be_refused` names at most
+cut off before it happens, and `on` prints BOTH groups after reading and building them and
+BEFORE it writes the flip, so a slow or failing read of the keys file never leaves the setting
+on with nothing printed. The keys file is read at most its first 1 MiB, and `would_be_refused` names at most
 20 line numbers with `would_be_refused_more` (and an "and N more" in the note) saying how many more
 there are, so a hand-written file cannot flood the terminal; `status` reports the same
 `would_be_refused`, `would_be_refused_more` and `truncated` fields with the same warnings, so the
@@ -357,16 +357,20 @@ turn the setting on when the keys file cannot be read or was only partly inspect
 is missing, a directory, a fifo (which this command refuses to wait on), or larger than the 1 MiB
 bound: an operator who cannot see what will be cut off must say so deliberately, with
 `--without-preview`, and the refusal names that option; nothing is changed by the refusal
-(kittrial-5bb.250 F2, the coordinator's decision). The preview decides in three groups
-(kittrial-5bb.250 r2): **refused** - a line of this kit's own wrapper file and this root, on a
-command that needs no shell and names no relative path; **may be refused** - every other wrapper
-or root, a command that needs the shell (`cd KIT && ...`, `2>/dev/null`, `; true`), and a
-relative or `$HOME` path, not decided here, with whether the wrapper file names the setting said
-as a HINT (the kit reads up to 64 KiB of a regular wrapper file a key line names, once per file
-per run - a word in a file is a hint, not a decision); and lines the wrapper refuses for another
-reason, refused either way. `status` and `on` PRINT the second group - its count and line
-numbers, in the JSON as `may_be_refused` and `may_be_refused_more` and on stderr - so no line is
-cut off unnamed. It is operator-gated (`--actor` must be
+(kittrial-5bb.250 F2, the coordinator's decision). The preview decides by ONE rule, in three
+groups (kittrial-5bb.250 r3): **refused** - a line whose command needs no shell at all (a
+whitelist of plain characters), names this kit's own wrapper by an absolute path, serves this
+root, and parses as unbound; **may be refused** - EVERY other line that has a `command=` at all:
+any other wrapper or root, shell syntax (`cd KIT && ...`, `2>/dev/null`, `; true`, `&`, `#`, a
+glob, an assignment, `/bin/sh -c`, quotes), a relative or `$HOME` path, and lines that run
+another program - not decided here, with whether the wrapper file names the setting said as a
+HINT (the kit opens the file first and judges the open descriptor - never a fifo, never a
+symlink - and reads up to 64 KiB of it, once per file per run; a word in a file is a hint, not
+a decision; `wrapper_names_setting` carries it in the listing, in `status` and in `on`); and
+lines the wrapper refuses for another reason, refused either way. Only a line with no `command=`
+at all is outside the groups. `status` and `on` PRINT the second group - its count and line
+numbers, at most twenty with `may_be_refused_more`, in the JSON and on stderr - so no line that
+has a command is cut off unnamed, whatever it runs. It is operator-gated (`--actor` must be
 on the deployment operator allowlist) and every flip is recorded in the deployment document's
 `bound_keys_only_audit`, with the value it replaced, keeping the last 20 flips; a flip that changes
 nothing writes nothing. `off` on a value that is not true or false is a real flip: it writes false,
@@ -405,9 +409,10 @@ wrapper's own command line decides: the wrapper FILE the line runs and its LAST 
 argparse takes the last when a line names it twice); an `--endpoint` argument that names another
 kit's file does not move the line out of this kit's reach. A line that runs another kit's wrapper,
 or whose last `--root` is another runtime, or whose command needs the shell or names a relative
-path, is not decided by this preview: it is reported as one the kit that serves it **may refuse**
-(`may_be_refused`, with whether its wrapper file names the setting as a hint in the first 64 KiB
-of that regular file), never as refused by this setting and never as out of its reach. A named line
+path, is not decided by this preview: it is reported in `may_be_refused` (at most twenty numbers
+with the count beyond, and `wrapper_names_setting` saying whether its wrapper file carries the
+word as a hint read from the first 64 KiB of the open regular file), never as refused by this
+setting and never as out of its reach. A named line
 the wrapper refuses for another reason (a bad or unknown argument, a binding named twice) is listed
 as refused with a sentence saying the setting is not why.
 
