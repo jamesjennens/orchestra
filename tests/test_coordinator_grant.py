@@ -245,6 +245,25 @@ class GrantTests(Grants):
             self.service.state['coordinator_grants'][self.project][self.agent_id] = True
         self.assertEqual(403, self.approve(self.agent, task, contribution).status)
 
+    def test_an_agent_is_traced_on_both_sides_whatever_the_setting(self):
+        """With the setting off a name is its person and nothing more. For an agent that approves, both sides
+        are traced in full: the work's (a name under a worker credential its account issued) and the
+        approver's own (a label under the agent's name is the agent's account)."""
+        self.assertFalse(self.service.approval_by_another_party)
+        handler = http_service.ApiHandler.__new__(http_service.ApiHandler)
+        handler.service = self.service
+        cora, carl = self.ids['cora'], self.ids['carl']
+        label = self.agent_id + '/night'
+        # By person (a signed-in approver, setting off): the label is nobody the service knows.
+        self.assertEqual(handler._independent([label], [cora], self.project), [label])
+        # In full (an agent approves): the label is cora's, so it is not independent of cora's work.
+        self.assertEqual(handler._independent([label], [cora], self.project, True), [])
+        self.assertEqual(handler._independent([label], [carl], self.project, True), [label])
+        # And the work's side: a label under ANOTHER agent of cora's is cora's too.
+        other, other_id = self.agent_with_id('cora', 'Swift')
+        self.assertEqual(handler._independent([self.agent_id], [other_id + '/x'], self.project, True), [])
+        self.assertEqual(handler._independent([self.agent_id], [other_id + '/x'], self.project), [self.agent_id])
+
     def test_work_under_a_worker_credential_its_account_issued_is_its_own_partys(self):
         """Judged in full for an agent, with the setting off: the hole of slice 1a is not open to a granted agent."""
         self.assertEqual(200, self.member('cora', 'owner', token=self.admin).status)     # only an owner issues a worker credential
