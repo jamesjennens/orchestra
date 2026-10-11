@@ -67,6 +67,10 @@ def read_owner_receipt(path, missing=False):
         if missing:
             return None
         raise ValueError(RECOVERY_READ_ERROR) from None
+    except OSError:
+        # Classify an unreadable receipt before the guarded effect can mistake
+        # the filesystem exception for an uncertain canonical write.
+        raise ValueError(RECOVERY_READ_ERROR) from None
     try:
         with os.fdopen(fd, 'rb') as handle:
             opened = os.fstat(handle.fileno())

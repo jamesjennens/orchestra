@@ -167,7 +167,8 @@ r.read_owner_receipt(p)
 
     def test_same_key_create_never_exposes_damaged_receipt_paths(self):
         fields, _, path = self.failed()
-        for number, payload in enumerate((b'{broken', b'\xff', b'[]', b'{"sha256":"bad"}',
+        for number, payload in enumerate((b'{broken', b'', b'\0', b'x' * (5 * 1024 * 1024),
+                                         b'\xff', b'[]', b'{"sha256":"bad"}',
                                          b'{"a":1,"a":2}', b'[' * 80 + b'0' + b']' * 80)):
             with self.subTest(shape=number):
                 path.write_bytes(payload)
@@ -182,6 +183,38 @@ r.read_owner_receipt(p)
                 self.assertNotIn(str(self.path), json.dumps(answer.data))
                 self.assertNotIn(path.name, json.dumps(answer.data))
                 self.assertEqual(len(self.backend.native.writes()), before)
+
+    def assert_unreadable_create_refused(self, fields, path):
+        before = len(self.backend.native.writes())
+        answer = self.request('POST', self.base + '/requirements', fields,
+                              token=self.owner_token, key='failed-create')
+        self.assertEqual(answer.status, 422, answer.data)
+        text = json.dumps(answer.data)
+        self.assertIn(requirements.RECOVERY_READ_ERROR, text)
+        self.assertNotIn(str(self.path), text)
+        self.assertNotIn(path.name, text)
+        self.assertEqual(len(self.backend.native.writes()), before)
+
+    def test_same_key_create_refuses_receipt_open_permission_error(self):
+        fields, _, path = self.failed()
+        original = os.open
+        def refused(target, flags, *args, **kwargs):
+            if Path(target) == path:
+                raise PermissionError('Private receipt cannot be opened: ' + str(path))
+            return original(target, flags, *args, **kwargs)
+        with mock.patch.object(requirements.os, 'open', side_effect=refused) as opened:
+            self.assert_unreadable_create_refused(fields, path)
+        self.assertTrue(any(Path(call.args[0]) == path for call in opened.call_args_list))
+
+    def test_same_key_create_refuses_mode_zero_receipt(self):
+        if not hasattr(os, 'geteuid') or os.geteuid() == 0:
+            self.skipTest('Mode-zero receipt permissions require an ordinary POSIX user')
+        fields, _, path = self.failed()
+        path.chmod(0)
+        try:
+            self.assert_unreadable_create_refused(fields, path)
+        finally:
+            path.chmod(0o600)
 
     def test_governed_recovery_routes_retain_the_enable_editing_advice(self):
         _, operation, path = self.failed()
