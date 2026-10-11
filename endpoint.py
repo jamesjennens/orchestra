@@ -31,6 +31,7 @@ from pathlib import Path
 from admin import ConfigurationUnreadable,deployment_document,deployment_password,environment,project_dir,root_path,operators as configured_operators,verifiers as configured_verifiers,review_workflow_writes as configured_review_writes,coordinator_rules as configured_coordinator_rules
 import bd_refusals
 import native
+import raw_lifecycle
 from coordination import is_merge_slot, merge_slot_sentence
 from render import render
 from lifecycle import apply_native
@@ -272,7 +273,7 @@ def _guard_record_anchor_title(root,path,args,actor,rows=None):
 #: means no row has exactly the id asked for (kittrial-5bb.138).
 BD_NO_MATCH_ERROR='no issues found matching the provided IDs'
 
-def _bd_read(root,path,actor,argv,resolver_absence=False):
+def _bd_read(root,path,actor,argv,resolver_absence=False,strict=False):
     """One native read for a guard: ``(rows, stderr)``, or ``(None, why)`` when the read itself failed.
 
     A read that times out, exits non-zero for any reason but "no issue found", or prints
@@ -315,12 +316,14 @@ def _bd_read(root,path,actor,argv,resolver_absence=False):
         return None,'bd could not read the tasks (%s)'%(said[-200:] or 'exit %d'%p.returncode)
     rows=[answer] if isinstance(answer,dict) else answer
     if not isinstance(rows,list):return None,'bd gave an unreadable answer'
+    if strict and any(not isinstance(row,dict) or not isinstance(row.get('id'),str) for row in rows):
+        return None,'bd gave an incomplete answer'
     rows=[row for row in rows if isinstance(row,dict) and isinstance(row.get('id'),str)]
     if p.returncode and not rows and 'no issue found' not in said and not (resolver_absence and resolver_answer and p.returncode==1):
         return None,'bd could not read the tasks (%s)'%(said[-200:] or 'exit %d'%p.returncode)
     return rows,said
 
-def _resolve_rows(root,path,actor,tokens):
+def _resolve_rows(root,path,actor,tokens,strict=False):
     """The rows bd resolves ``tokens`` to: ``(rows, problem)``.
 
     One native read for all of them. bd answers with the rows it found and names the
@@ -332,12 +335,12 @@ def _resolve_rows(root,path,actor,tokens):
     for token in tokens:
         if not isinstance(token,str) or not token.strip() or (token.startswith('-') and token!='-'):
             return [],'%s is not a task id'%shown_token(token)
-    rows,said=_bd_read(root,path,actor,['show',*tokens,'--json'])
+    rows,said=_bd_read(root,path,actor,['show',*tokens,'--json'],strict=strict)
     if rows is None:return [],said
     if len({row['id'] for row in rows})==len(tokens) and 'no issue found' not in said:return rows,None
     found=[]
     for token in tokens:
-        rows,said=_bd_read(root,path,actor,['show',token,'--json'])
+        rows,said=_bd_read(root,path,actor,['show',token,'--json'],strict=strict)
         if rows is None:return [],said
         if len(rows)!=1:return [],'%s does not name exactly one task'%shown_token(token)
         found.append(rows[0])
@@ -379,7 +382,7 @@ def _guard_new_id(root,path,name,new_id,actor):
     if any(row['id']==new_id for row in rows):
         raise ValueError('Refusing create --id %s: a task with that id exists, and bd would replace its title, description, status and assignee. Choose another id, or use update. Nothing was written.'%shown)
 
-def _guard_named_rows(root,path,name,args,attachments,actor):
+def _guard_named_rows(root,path,name,args,attachments,actor,strict=False):
     """Every contributor write must name the rows it writes, and none may be the merge slot.
 
     ``write_targets`` (reserved_comments) says which tokens of the command name rows and
@@ -399,9 +402,10 @@ def _guard_named_rows(root,path,name,args,attachments,actor):
     if request['refusal']:
         raise ValueError('Refusing %s: %s. Nothing was written.'%(command,request['refusal']))
     if not request['targets']:return
-    rows,problem=_resolve_rows(root,path,actor,request['targets'])
+    rows,problem=_resolve_rows(root,path,actor,request['targets'],strict=strict)
     if problem:
-        raise ValueError('Refusing %s: %s, so the rows this would write are not known. Name each task by its id. Nothing was written.'%(command,problem))
+        advice=(' '+raw_lifecycle.ADVICE) if strict else ''
+        raise ValueError('Refusing %s: %s, so the rows this would write are not known. Name each task by its id. Nothing was written.%s'%(command,problem,advice))
     slot=name+MERGE_SLOT_SUFFIX
     for row in rows:
         if row['id']==slot or is_merge_slot(row):
@@ -1194,6 +1198,15 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                 from http_authority import server_time as now_stamp
                 target=path/'ONBOARDING.md'
                 previous=None
+                if target.is_dir():
+                    # A directory at the document's name used to reach os.replace INSIDE the guarded
+                    # write, and an OSError there is not a refusal: the identity stayed reserved and
+                    # the caller got rc 124 "outcome unknown", which a caller with no shell cannot
+                    # reconcile (kittrial-5bb.242 item 5). Refused here, before anything is written,
+                    # as a refusal with a sentence.
+                    raise ValueError('Project onboarding cannot be written: %s is a directory, not a file. '
+                                     'Remove the directory, or write the document by hand on the host. '
+                                     'Nothing was written.'%target.name)
                 if target.is_file() and not target.is_symlink():
                     try:
                         previous=target.read_text(encoding='utf-8-sig')
@@ -1203,9 +1216,11 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                         # replaces it, and a caller with no shell has no other way. The unreadable
                         # previous text is treated as changed, and the answer says so in a sentence
                         # rather than the bare UnicodeDecodeError that used to answer rc 2 with
-                        # nothing written.
+                        # nothing written. The sentence ends in a newline like every other warning
+                        # the route joins: without one the client printed "...and replacedserver_time:
+                        # ..." on one line (kittrial-5bb.242 item 4).
                         run_warnings.append('the previous ONBOARDING.md could not be read as UTF-8 text; '
-                                            'it was treated as changed and replaced')
+                                            'it was treated as changed and replaced\n')
                 write_project(target,text)
                 # This route does NOT probe the text for endpoint paths (review of 958e883, item 3b):
                 # probe_endpoints resolves and reads every absolute *.py path the text names and
@@ -1430,7 +1445,23 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             fcntl.flock(lock,fcntl.LOCK_EX)
             # First the rows the write names (an existing id given to create, a write that names
             # none, the merge slot); then the guards that read what those rows carry.
-            named=_guard_named_rows(root,path,name,args,request.get('attachments',{}),actor)
+            lifecycle_guard=args[0] in ('create','update','dep','close','reopen') and actor not in configured_operators(root)
+            named=_guard_named_rows(root,path,name,args,request.get('attachments',{}),actor,strict=lifecycle_guard)
+            if lifecycle_guard:
+                resolved_request=write_targets(args,request.get('attachments',{}))
+                resolved_tokens=resolved_request['targets'] if resolved_request is not None else None
+                def lifecycle_rows(tokens):
+                    # This exact vector was resolved natively above, under this
+                    # lock. Reuse it without guessing which row any subset or
+                    # differently spelled token means.
+                    if tokens==resolved_tokens and isinstance(named,list):return named
+                    # Ask bd for the actual tokens this particular guard reads.
+                    # A suffix of another named row is not proof of what bd's
+                    # substring resolver selected for a positional operand.
+                    rows,problem=_resolve_rows(root,path,actor,tokens,strict=True)
+                    if problem:raw_lifecycle.refuse('the affected tasks could not be read completely')
+                    return rows
+                raw_lifecycle.guard(args,request.get('attachments',{}),lifecycle_rows)
             _guard_record_anchor_status(root,path,args,actor)
             _guard_record_anchor_title(root,path,args,actor,named)
             _guard_reserved_labels(root,path,args,actor)

@@ -52,6 +52,9 @@ ITEM_FIELDS = {
     'waiting_for_approval',
     # Additive move sentence (kittrial-5bb.249): whose move it is, in words.
     'whose_move', 'next',
+    # Additive selection facts (kittrial-5bb.6): the next-action actor role, the
+    # filterable work state, the reconciliation signal and bounded claimability.
+    'next_actor', 'work_state', 'reconciliation_needed', 'reconciliation_reasons', 'claimable',
     # Additive superseding-redelivery fact (kittrial-5bb.253 item 1).
     'redelivered',
 }
@@ -64,6 +67,11 @@ BRIEF_FIELDS = {
     'deployed_delivery', 'deployed_delivery_is_current_contribution',
     # Additive liveness (kittrial-5bb.107 rev2).
     'deployed_live',
+    # The next-action actor role (kittrial-5bb.6) is carried ONCE, in the brief's
+    # bounded `review` block -- the shared review-state projection -- together with
+    # the filterable `work_state` and the reconciliation signal (review item 2).
+    # There is deliberately no second top-level copy: it pushed the compact brief
+    # past its hard 6000-byte bound.
 }
 
 
