@@ -1156,6 +1156,19 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                 raise ValueError('coordinator %s payload must be a JSON object'%command)
             if command in ('reference-apply','capability-apply'):
                 coordinator_apply_refusal(payload,command)
+        if command=='set-onboarding':
+            # The document's name is checked BEFORE the guarded write, so no operation identity is
+            # reserved and released for a refusal and no .http-operations.sqlite3 is created for one
+            # (kittrial-5bb.259 item G1: this check used to sit inside the effect). The SYMLINK is
+            # tested FIRST (item G2): a symlink to a directory matched is_dir() and was answered with
+            # the directory sentence, where the base said the document must not be a symlink at all.
+            target=path/'ONBOARDING.md'
+            if target.is_symlink():
+                raise ValueError('Project onboarding must not be a symlink')
+            if target.is_dir():
+                raise ValueError('Project onboarding cannot be written: %s is a directory, not a file. '
+                                 'Remove the directory, or write the document by hand on the host. '
+                                 'Nothing was written.'%target.name)
         operators=configured_operators(root)
         verifiers=configured_verifiers(root)
         run_warnings=[]
@@ -1198,15 +1211,8 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                 from http_authority import server_time as now_stamp
                 target=path/'ONBOARDING.md'
                 previous=None
-                if target.is_dir():
-                    # A directory at the document's name used to reach os.replace INSIDE the guarded
-                    # write, and an OSError there is not a refusal: the identity stayed reserved and
-                    # the caller got rc 124 "outcome unknown", which a caller with no shell cannot
-                    # reconcile (kittrial-5bb.242 item 5). Refused here, before anything is written,
-                    # as a refusal with a sentence.
-                    raise ValueError('Project onboarding cannot be written: %s is a directory, not a file. '
-                                     'Remove the directory, or write the document by hand on the host. '
-                                     'Nothing was written.'%target.name)
+                # The directory and symlink refusals are made BEFORE the guarded write now
+                # (kittrial-5bb.259 items G1 and G2): see the check above coordinator_effect.
                 if target.is_file() and not target.is_symlink():
                     try:
                         previous=target.read_text(encoding='utf-8-sig')

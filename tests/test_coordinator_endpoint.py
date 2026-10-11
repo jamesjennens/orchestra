@@ -287,6 +287,36 @@ class GuidanceAndOnboardingTests(unittest.TestCase):
         self.assertNotIn('outcome unknown', str(refusal.exception))
         self.assertEqual(file_tree(self.project), before)
 
+    def test_the_directory_refusal_reserves_no_operation_identity(self):
+        # kittrial-5bb.259 item G1: the check sat inside coordinator_effect, so with an operation_id
+        # the identity was reserved and then released, and the operation journal was created if it
+        # was absent. It runs before the guarded write now: nothing is reserved.
+        (self.project/'ONBOARDING.md').mkdir()
+        built = request('set-onboarding', text='Fresh onboarding for alpha.\n')
+        built['operation_id'] = 'op-259-directory'
+        with self.assertRaises(ValueError) as refusal:
+            endpoint.execute(self.root, built, key_principal=PRINCIPAL, key_projects=['alpha'])
+        self.assertIn('is a directory', str(refusal.exception))
+        self.assertFalse((self.project/'.http-operations.sqlite3').exists(),
+                         'a refusal must not create the operation journal')
+
+    def test_a_symlink_to_a_directory_gets_the_symlink_sentence(self):
+        # kittrial-5bb.259 item G2: is_dir() follows a symlink, so a symlink to a directory was
+        # answered with the directory sentence ("Remove the directory") where the base said the
+        # document must not be a symlink at all. The symlink is tested first now.
+        directory = self.project/'elsewhere'
+        directory.mkdir()
+        link = self.project/'ONBOARDING.md'
+        try:
+            link.symlink_to(directory, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest('symlink creation is not available')
+        with self.assertRaises(ValueError) as refusal:
+            self.ask('set-onboarding', text='Fresh onboarding for alpha.\n')
+        self.assertIn('must not be a symlink', str(refusal.exception))
+        self.assertNotIn('is a directory', str(refusal.exception))
+        self.assertTrue(link.is_symlink())
+
     def test_guidance_clear_with_nothing_set_answers_changed_false_and_writes_nothing(self):
         # Review of 958e883, item 3a: this used to answer rc 124 "outcome unknown" through an
         # AttributeError (version_of(None)), and a caller with no shell cannot reconcile that.
