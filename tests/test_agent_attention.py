@@ -798,5 +798,38 @@ class ClaimCandidateTests(unittest.TestCase):
         self.assertLess(http_service.CLAIM_CANDIDATES_LIMIT, http_service.AGENT_CLAIMABLE_LIMIT)
 
 
+class ClassifyClaimableRuleTests(unittest.TestCase):
+    """`agent_prompts.classify` uses the ONE claimable rule (kittrial-5bb.6 review item 4).
+
+    Round 3's surviving mutant put classify back on the old open-and-unassigned test, which
+    offers an epic, a gate, a job or a task LABELLED decision as claimable work. These rows
+    carry no ``claimable`` field, so the fallback rule itself is exercised; the last check
+    gives them the answer explicitly, which the old rule also ignored.
+    """
+
+    def rows(self):
+        base = {'title': 'A task', 'status': 'open', 'assignee': None,
+                'review_state': 'none', 'comments': [], 'labels': [], 'priority': 3}
+        return [dict(base, id='plain', title='plain'),
+                dict(base, id='epic', title='epic', issue_type='epic'),
+                dict(base, id='gate', title='gate', issue_type='gate'),
+                dict(base, id='job', title='job', issue_type='job'),
+                dict(base, id='labelled', title='labelled', labels=['decision'])]
+
+    def claimable(self, items):
+        import agent_prompts
+        from http_authority import CAP_READ, CAP_TASKS
+        project = {'id': 'p1', 'name': 'Customer portal', 'role': 'contributor'}
+        classes = agent_prompts.classify(project, {CAP_READ, CAP_TASKS}, items, 'usr_other',
+                                         set(), agent_prompts.parse_time('2026-09-29T12:00:00Z'))
+        return [item['id'] for item in classes['classes']['claimable']]
+
+    def test_only_the_rows_the_one_rule_marks_claimable_are_offered(self):
+        self.assertEqual(self.claimable(self.rows()), ['plain'])
+        # A row that states its own answer is taken at its word, whatever its status says.
+        declared = [dict(row, claimable=False) for row in self.rows()]
+        self.assertEqual(self.claimable(declared), [])
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -50,12 +50,16 @@ and neither switches the rule to newest-wins:
 """
 
 
+#: The one integration-warning prefix that is ADDITIVE in kittrial-5bb.6. A brief appends
+#: these lines AFTER the warning lines main already had, so the first top-level warning a
+#: reader sees is still the one main showed (review item 4c).
+RECONCILIATION_WARNING_PREFIX = 'Reconciliation needed'
 #: Warning prefixes this module adds to a read's ``warnings`` list for the
 #: integration overlay and the reconciliation signal below. ``brief`` and ``work``
 #: use the predicate below to carry them into their own warning surfaces without
 #: matching strings by hand.
 INTEGRATION_WARNING_PREFIXES = ('Integration fact disagreement', 'Integration revert',
-                                'Integration after withdrawal', 'Reconciliation needed')
+                                'Integration after withdrawal', RECONCILIATION_WARNING_PREFIX)
 #: Bound on the ``integration.reverted_commits`` list a read embeds; the
 #: untruncated count stays available as ``integration.reverted_total``.
 REVERTED_COMMITS_LIMIT = 5

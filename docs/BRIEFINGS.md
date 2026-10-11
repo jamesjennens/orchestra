@@ -58,9 +58,16 @@ stay the caller's. Items where the move is the caller's sort first, and top-leve
 
 ### The selection facts: `next_actor`, `work_state`, reconciliation and `claimable`
 
-`work` items, the brief's `review` block and the `review TASK` read carry five additive
-selection facts, all computed once in the shared review-state projection, so no two
-surfaces can disagree (kittrial-5bb.6):
+`work` items, the brief's `review` block and the `review TASK` read carry the five additive
+selection facts below, all computed once in the shared review-state projection, so no two
+surfaces can disagree (kittrial-5bb.6). They are not carried by every view: each view
+carries the facts it needs, and this is the table per view:
+
+| View | `next_actor` | `work_state` | `reconciliation_needed` | `reconciliation_reasons` | `claimable` |
+| --- | --- | --- | --- | --- | --- |
+| `work` item | yes | yes | yes (boolean) | yes (empty list when there are none) | yes |
+| the brief's `review` block | yes | yes | no (`work_state == 'reconciliation-needed'` is the same fact) | only when there are any | no |
+| the `review TASK` read | yes | yes | yes (boolean) | only when there are any | no |
 
 - **`next_actor`** is the next-action actor as a caller-neutral ROLE: `assignee`,
   `reviewer`, `coordinator`, `operator`, `anyone`, `none` or `unknown`. It is deliberately
@@ -87,16 +94,25 @@ surfaces can disagree (kittrial-5bb.6):
   refused.
 
 `work --claimable` lists exactly the rows that rule marks claimable. `work --state` keeps
-its meaning on main for every value that existed there — it filters on the review state
-the row SHOWS, so a row is always found under the review state it displays, including a
-lagging-scope follow-on whose work state is `reconciliation-needed`. The ONE additive
-value, `--state reconciliation-needed`, selects the rows whose recorded evidence must be
-reconciled, whatever review state they show.
+its meaning on main for every value that existed there — it filters on the review state main
+computed, which is the state BEFORE a malformed handoff journal turns a row's shown state
+into `error`, so a row is always found under the state main showed, including a
+lagging-scope follow-on whose work state is `reconciliation-needed`. The closed-row rule is
+decided on that same state, so a malformed journal file never puts the project's closed
+tasks into a queue. Two additive cases: `--state reconciliation-needed` selects the rows
+whose recorded evidence must be reconciled, whatever review state they show, and
+`--state error` additionally finds the rows the journal override turned into a shown
+`error`.
 
 The brief carries `next_actor`, `work_state` and `reconciliation_reasons` in its bounded
 `review` block and never twice. It does not repeat the `reconciliation_needed` boolean:
-`work_state == 'reconciliation-needed'` is the same fact, and the compact brief is under a
-hard 6000-byte bound.
+`work_state == 'reconciliation-needed'` is the same fact, and a second name for it would
+spend brief bytes on nothing new. 6000 bytes is NOT an enforced bound of the brief: it is
+the size `tests/test_follow_on_contributions.py` holds for its long-chain fixture (5930
+bytes on main, 5989 here), and a one-contribution brief with disagreeing integration facts
+measures 6088 bytes here (5468 on main) and 6368 (5736 on main) — the test never builds
+that fixture. Nothing refuses or clips a brief at 6000 bytes; the number is one test's
+assertion, not a contract.
 
 What is NOT delivered, stated plainly rather than claimed:
 

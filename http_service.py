@@ -6395,14 +6395,16 @@ class ApiHandler(BaseHTTPRequestHandler):
                 # Candidate fall-through (kittrial-5bb.6 deliverable b, review item 4): a
                 # refused claim on a task that is still OPEN answers with the next BOUNDED
                 # claimable rows so an agent need not re-read the queue. It is not attached
-                # to a refusal about a task nobody could take anyway -- `Task is not open`
-                # (a closed task) makes no fall-through read at all -- and the refused task
-                # itself is never among the candidates. Advisory: claimability is not a
-                # reservation and the next claim is still atomic. When there is nothing to
-                # fall through to, the refusal is re-raised byte for byte, so every
-                # existing sentence and detail is kept.
+                # to a refusal about a task nobody could take anyway: the fall-through read
+                # is made ONLY while the refused task is OPEN, so `Task is not open` -- a
+                # closed task, even one that still has an assignee and therefore reports
+                # `held_by` -- carries no candidates and costs no read (round-3 review
+                # finding 4). The refused task itself is never among the candidates.
+                # Advisory: claimability is not a reservation and the next claim is still
+                # atomic. When there is nothing to fall through to, the refusal is
+                # re-raised byte for byte, so every existing sentence and detail is kept.
                 candidates, truncated = [], False
-                if held_by is not None or str((task or {}).get('status')) == 'open':
+                if str((task or {}).get('status')) == 'open':
                     candidates, truncated = self._claim_candidates(ctx.params['pid'], ctx.params['tid'])
                 if not candidates and held_by is None:
                     raise

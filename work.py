@@ -598,6 +598,11 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
         try:review=workflow(row,task_scopes,operators=operators,reverts=task_reverts,journal=journal,
                             invalid_reverts=revert_problems.get(row['id']));state=review['review_state'];error=None
         except ValueError as e:review={};state='error';error=str(e)[:300]
+        # The state main decided the closed-row rule and `--state` on: the validated state
+        # BEFORE the journal override (kittrial-5bb.6 review item 1). The override changes
+        # what the row SHOWS; it never moves the row into another queue, and it never
+        # exempts a closed row from the closed-row rule.
+        select_state=state
         if journal_errors:
             # A malformed handoff journal makes THIS row's review state an error, and the
             # row's other facts must say the same thing (kittrial-5bb.6 review item 3a):
@@ -648,18 +653,21 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
         # final (kittrial-5bb.110 item 4).
         closed_open_item = bool(review.get('pending_requests'))
         if (row.get('status')=='closed'
-                and state not in ('changes-requested','awaiting-integration','error')
-                and not (state in ('withdrawn','superseded') and closed_open_item)):
+                and select_state not in ('changes-requested','awaiting-integration','error')
+                and not (select_state in ('withdrawn','superseded') and closed_open_item)):
             continue
         if a.state:
             # `--state` keeps its meaning on main for every value that existed there: it
-            # filters on the review state the row SHOWS, so a row is always found under
-            # the review state it displays (kittrial-5bb.6 review item 1). The additive
-            # value `reconciliation-needed` is the ONE exception: it selects rows whose
-            # recorded evidence must be reconciled, whatever review state they show.
+            # filters on the state main computed BEFORE the journal override, so a row the
+            # journal turned into a shown error is still found under the state main showed
+            # (kittrial-5bb.6 review item 1). Two additive cases: `error` additionally finds
+            # the overridden rows, and `reconciliation-needed` selects the rows whose
+            # recorded evidence must be reconciled.
             if a.state==RECONCILIATION_STATE:
                 if not review.get('reconciliation_needed'):continue
-            elif a.state!=state:continue
+            elif a.state=='error':
+                if select_state!='error' and state!='error':continue
+            elif a.state!=select_state:continue
         contribution=review.get('contribution') or {}
         scope=facts.get(row['id'],{}).get('scope') or {}
         # Name the delivery a passed deployed fact belongs to, and whether it is
@@ -683,8 +691,9 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
         handoff_total=len(handoff_requests)
         handoff_requests=handoff_requests[a.handoff_offset:a.handoff_offset+a.handoff_limit]
         # (The malformed handoff journal was turned into this row's error state BEFORE the
-        # filter and the selection facts above, so review_state, work_state and next_actor
-        # cannot disagree -- kittrial-5bb.6 review item 3a.)
+        # selection facts above, so review_state, work_state and next_actor cannot disagree
+        # -- kittrial-5bb.6 review item 3a. The closed-row rule and `--state` were decided
+        # on `select_state`, the state before that override, exactly as main does -- item 1.)
         # Additive (kittrial-5bb.114): what an agent's attention read needs from this one
         # read. `open_items` is the number of open items in the task's latest valid
         # checkpoint (0 with none, None when its checkpoint history cannot be read);

@@ -56,6 +56,25 @@ def delivered_rows(commit=COMMIT, operation='contribute'):
     return data
 
 
+class BadRecord:
+    """One unparseable request record, as the journal reader sees it."""
+
+    name = 'bad.json'
+
+    def read_text(self, encoding=None):
+        raise ValueError('bad json')
+
+
+class BadJournal:
+    """A request directory holding only :class:`BadRecord` (no filesystem needed)."""
+
+    def is_dir(self):
+        return True
+
+    def glob(self, pattern):
+        return [BadRecord()]
+
+
 class NextActorUnitTests(unittest.TestCase):
     """`next_actor` is a role token, closed set, never the assignee field itself."""
 
@@ -252,6 +271,10 @@ class ReconciliationTests(unittest.TestCase):
         self.assertTrue(any(w.startswith('Reconciliation needed:')
                             for w in brief['review']['warnings']))
         self.assertTrue(any(w.startswith('Reconciliation needed:') for w in brief['warnings']))
+        # Item 4c: the ADDITIVE line is appended AFTER the top-level warning lines main
+        # already had, so the first warning a reader sees is still the one main showed.
+        self.assertTrue(brief['warnings'][0].startswith('Newer activity'))
+        self.assertTrue(brief['warnings'][-1].startswith('Reconciliation needed:'))
         self.assertEqual(work.queue(store.rows, 'alice/session',
                                     ['--state', 'reconciliation-needed'])['total'], 1)
         # Item 1: a lagging scope is the normal condition of a follow-on contribution, so
@@ -326,28 +349,50 @@ class ReconciliationTests(unittest.TestCase):
         The journal directory is a stub, so this pins the read's own facts rather than
         the filesystem: one unparseable request record.
         """
-        class BadRecord:
-            name = 'bad.json'
-
-            def read_text(self, encoding=None):
-                raise ValueError('bad json')
-
-        class BadJournal:
-            def is_dir(self):
-                return True
-
-            def glob(self, pattern):
-                return [BadRecord()]
-
         item = work.queue(rows(), 'alice/session', [], request_dir=BadJournal())['items'][0]
         self.assertEqual((item['review_state'], item['work_state'], item['next_actor'],
                           item['claimable']),
                          ('error', 'error', 'operator', False))
-        # The state it SHOWS is the state it is found under, and only that state.
+        # `--state` keeps main's meaning: main compares the state it computed BEFORE the
+        # journal override, so this row is still found under `none`; the additive `error`
+        # case additionally finds the row the override turned into a shown error
+        # (kittrial-5bb.6 review item 1).
+        self.assertEqual(work.queue(rows(), 'alice/session', ['--state', 'none'],
+                                    request_dir=BadJournal())['total'], 1)
         self.assertEqual(work.queue(rows(), 'alice/session', ['--state', 'error'],
                                     request_dir=BadJournal())['total'], 1)
-        self.assertEqual(work.queue(rows(), 'alice/session', ['--state', 'none'],
+        self.assertEqual(work.queue(rows(), 'alice/session', ['--state', 'changes-requested'],
                                     request_dir=BadJournal())['total'], 0)
+
+    def test_a_malformed_journal_file_does_not_list_the_closed_tasks(self):
+        """Item 1: the closed-row rule is decided on the state BEFORE the journal override.
+
+        On main the override came after the closed-row rule, so a malformed handoff journal
+        never put the project's closed tasks into a queue. The override still makes the
+        SHOWN state `error`, but the closed rows must stay out of `work --mine`.
+        """
+        data = rows()
+        data[0]['assignee'] = 'alice/session'
+        closed = []
+        for index in range(30):
+            row = copy.deepcopy(data[0])
+            row.update(id='closed-%02d' % index, title='closed-%02d' % index,
+                       status='closed', assignee=None)
+            closed.append(row)
+        data = closed + data
+        page = work.queue(data, 'alice/session', ['--mine'], request_dir=BadJournal())
+        self.assertEqual(page['total'], 1)
+        self.assertEqual([row['task'] for row in page['items']], [TASK])
+        self.assertEqual(page['items'][0]['review_state'], 'error')
+        self.assertEqual(page['items'][0]['work_state'], 'error')
+        # The closed rows are not listed unfiltered either, and `--state` still answers on
+        # the state main computed for each row.
+        self.assertEqual(work.queue(data, 'alice/session', [],
+                                    request_dir=BadJournal())['total'], 1)
+        self.assertEqual(work.queue(data, 'alice/session', ['--mine', '--state', 'none'],
+                                    request_dir=BadJournal())['total'], 1)
+        self.assertEqual(work.queue(data, 'alice/session', ['--mine', '--state', 'error'],
+                                    request_dir=BadJournal())['total'], 1)
 
     def test_a_malformed_review_chain_reads_operator_and_is_never_claimable(self):
         """Item 2/6: a review-error row is never null and is never offered as work."""
@@ -392,6 +437,26 @@ class ReconciliationTests(unittest.TestCase):
         self.assertEqual(item['blocking_items'], 1)
         self.assertEqual(item['checkpoint_wait']['items'][0]['id'], 'need-key')
         self.assertEqual(item['checkpoint_wait']['total'], 1)
+
+    def test_the_reconciliation_filter_selects_the_reconciling_rows_only(self):
+        """`--state reconciliation-needed` is a FILTER, not a blanket pass (review item 4).
+
+        Round 3's surviving mutant replaced the `reconciliation_needed` test with `pass`,
+        which made every row match. One reconciling row and one ordinary row are in the
+        queue, so a blanket pass lists both.
+        """
+        store = self.disagreeing()
+        plain = copy.deepcopy(store.rows[0])
+        plain.update(id='plain-task', title='plain-task', labels=[], comments=[],
+                     assignee='alice/session')
+        data = store.rows + [plain]
+        # Both rows are in the queue when nothing is filtered...
+        self.assertEqual(work.queue(data, 'alice/session', [])['total'], 2)
+        # ...and exactly the reconciling one is selected by the additive value.
+        selected = work.queue(data, 'alice/session', ['--state', 'reconciliation-needed'])
+        self.assertEqual(selected['total'], 1)
+        self.assertEqual([row['task'] for row in selected['items']], [TASK])
+        self.assertTrue(selected['items'][0]['reconciliation_needed'])
 
 
 class ClaimableViewTests(unittest.TestCase):

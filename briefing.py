@@ -687,7 +687,7 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
     if offset>len(items):raise ValueError('Unresolved-item offset exceeds total')
     deps=[d for d in (issue.get('dependencies') or []) if d.get('type')!='parent-child']
     from work import workflow
-    from review_state import is_integration_warning, scopes_for
+    from review_state import RECONCILIATION_WARNING_PREFIX, is_integration_warning, scopes_for
     from guidance import brief_block
     review=workflow(issue,scopes_for(rows,task),operators=operators,journal=journal)
     # ORIGINAL meaning: does the scope currently shown in `lifecycle`/`lifecycle_scope`
@@ -791,8 +791,10 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
                      'before relying on it. '+next_action)
     # The compact brief carries the next-action ROLE once, inside the shared review
     # projection block (kittrial-5bb.6 review item 2: it used to be carried twice, at the
-    # top level and in `review`). The brief is under a hard 6000-byte bound
-    # (tests/test_follow_on_contributions.py), so the reconciliation signal is carried in
+    # top level and in `review`). 6000 bytes is the size the long-chain test in
+    # tests/test_follow_on_contributions.py holds, NOT a bound the code enforces: a
+    # one-contribution brief with disagreeing integration facts measures 6088 and 6368
+    # bytes (kittrial-5bb.6 review item 2a). So the reconciliation signal is carried in
     # the one way that does not repeat itself: `work_state` is `reconciliation-needed`
     # exactly when `reconciliation_needed` is true, and `reconciliation_reasons` names the
     # mismatching facts whenever there are any. The boolean itself is carried by `work`
@@ -820,10 +822,15 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
             'dependencies':{'total':len(deps),'items':[{k:clip(d.get(k),160) for k in ('depends_on_id','type')} for d in deps[:8]],'omitted':max(0,len(deps)-8)},
             'lifecycle':{dim:dict(value=f['value'],event_id=f['event_id']) for dim,f in facts['facts'].items()},
             'lifecycle_scope':{k:clip(v,160) for k,v in (facts['scope'] or {}).items()},
-            'warnings':(['Malformed checkpoint comments ignored: '+', '.join(invalid[:5])] if invalid else [])
-                       +integration_warnings
+            # The additive `Reconciliation needed:` line is appended AFTER the top-level
+            # warning lines main already had, so the FIRST warning a reader sees is still
+            # the one main showed (kittrial-5bb.6 review item 4c). The other integration
+            # warnings keep main's place and main's order.
+            'warnings':((['Malformed checkpoint comments ignored: '+', '.join(invalid[:5])] if invalid else [])
+                       +[w for w in integration_warnings if not w.startswith(RECONCILIATION_WARNING_PREFIX)]
                        +(['Direction baseline: comments strictly before the newest legacy checkpoint have UNKNOWN coverage and are not outstanding directions; timestamp ties remain possible directions.'] if context[1] is not None else [])
-                       +['Newer activity also includes edits, deletions or changed task fields. Prose resolutions never silently clear explicit items.'],
+                       +['Newer activity also includes edits, deletions or changed task fields. Prose resolutions never silently clear explicit items.']
+                       +[w for w in integration_warnings if w.startswith(RECONCILIATION_WARNING_PREFIX)]),
             'evidence':{'issue':'show '+task,'history':'history '+task,'checkpoint_entry':task+'-c'+str(c['id']) if c else None}}
     if journal is not None:
         # The standing guidance channel (kittrial-5bb.99): every endpoint brief
