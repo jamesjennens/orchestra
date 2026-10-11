@@ -538,6 +538,14 @@ class HostStatusTests(unittest.TestCase):
                     '/srv/a\x7fb', '/srv/a\u2028b', '/srv/a\u202eb'):
             with self.assertRaisesRegex(ValueError, 'can name the path'):
                 admin.systemd_quote(bad)
+        # The path is ESCAPED in the sentence: printed raw, a control character in it rewrites the
+        # line it is shown on, on the terminal and on the page (kittrial-5bb.251 item 3).
+        with self.assertRaises(ValueError) as refusal:
+            admin.systemd_quote('/srv/a\x1bcb/py')
+        said = str(refusal.exception)
+        self.assertNotIn('\x1b', said)
+        self.assertIn('\\x1b', said)
+        self.assertIn('/srv/a', said)
 
     def test_the_operator_note_reads_the_schedule_done(self):
         """kittrial-5bb.220 F1: an operator's statement reads done; clearing it returns to not-covered.
@@ -581,6 +589,12 @@ class HostStatusTests(unittest.TestCase):
             admin.write_backup_schedule_note(self.root, 'line\u2028sep', 'operator-1')
         with self.assertRaisesRegex(ValueError, 'control or format'):
             admin.write_backup_schedule_note(self.root, 'esc\u001b[31m', 'operator-1')
+        # A byte that is not valid UTF-8 reaches the command line as a lone surrogate; written as
+        # UTF-8 it raised a UnicodeEncodeError from coordination.atomic after doing nothing
+        # (kittrial-5bb.251 item 1). One sentence instead.
+        with self.assertRaisesRegex(ValueError, 'written as UTF-8'):
+            admin.write_backup_schedule_note(self.root, 'bad \udcff note', 'operator-1')
+        self.assertIsNone(admin.read_backup_schedule_note(self.root))
         with self.assertRaisesRegex(ValueError, 'backups directory'):
             admin.write_backup_schedule_note(Path(self.tmp.name) / 'no-runtime', 'note', 'operator-1')
 
@@ -605,7 +619,17 @@ class HostStatusTests(unittest.TestCase):
                       {'schema_version': 1, 'note': ['a', 'b'], 'recorded_by': 'x', 'recorded_at': '2026-10-08T09:00:00Z'},
                       {'schema_version': 1, 'note': 'x', 'recorded_by': 'x', 'recorded_at': 'not-a-stamp'},
                       {'schema_version': 1, 'note': 'x', 'recorded_at': '2026-10-08T09:00:00Z'},
-                      {'schema_version': 2, 'note': 'x', 'recorded_by': 'x', 'recorded_at': '2026-10-08T09:00:00Z'}):
+                      {'schema_version': 2, 'note': 'x', 'recorded_by': 'x', 'recorded_at': '2026-10-08T09:00:00Z'},
+                      # Absurd but shape-valid files that used to be shown (kittrial-5bb.251 item 5):
+                      # True == 1 and 1.0 == 1 in Python, the stamp was the shape only, and the actor
+                      # was unbounded free text.
+                      {'schema_version': True, 'note': 'x', 'recorded_by': 'x', 'recorded_at': '2026-10-08T09:00:00Z'},
+                      {'schema_version': 1.0, 'note': 'x', 'recorded_by': 'x', 'recorded_at': '2026-10-08T09:00:00Z'},
+                      {'schema_version': 1, 'note': 'x', 'recorded_by': 'x', 'recorded_at': '2026-99-99T99:99:99Z'},
+                      {'schema_version': 1, 'note': 'x', 'recorded_by': 'x', 'recorded_at': '2026-10-32T00:00:00Z'},
+                      {'schema_version': 1, 'note': 'x', 'recorded_by': 'x' * 3000, 'recorded_at': '2026-10-08T09:00:00Z'},
+                      {'schema_version': 1, 'note': 'x', 'recorded_by': 'line one\nline two',
+                       'recorded_at': '2026-10-08T09:00:00Z'}):
             with self.subTest(wrong=wrong):
                 path.write_text(json.dumps(wrong), encoding='utf-8')
                 self.assertIsNone(admin.read_backup_schedule_note(self.root))
@@ -689,6 +713,37 @@ class HostStatusTests(unittest.TestCase):
         self.timer(name='beads-x-backup.timer', unit='beads-backup.service')
         self.assertEqual(self.status()['backup']['scheduled'], 'covered')
 
+    def test_a_unit_or_timer_file_that_is_not_utf8_is_read_as_unreadable(self):
+        """kittrial-5bb.251 item 2: a file that is not UTF-8 is unreadable, not a traceback."""
+        (self.units / 'beads-backup.service').write_bytes(b'\xff\xfe\x00not text')
+        # An unreadable unit is "could not check", not an exception.
+        self.assertIsNone(admin.scheduled_backup_covers(self.root, 'alpha'))
+        self.assertIn(self.status()['backup']['scheduled'], ('unknown', 'not-covered'))
+        # The coverage report reads the account's own unit directory: a file there that is not
+        # UTF-8 is named as unreadable rather than raising UnicodeDecodeError.
+        plain = Path(os.environ['HOME']) / '.config' / 'systemd' / 'user'
+        plain.mkdir(parents=True, exist_ok=True)
+        (plain / 'beads-backup.service').write_bytes(b'\xff\xfe\x00not text')
+        covered, message = admin.scheduled_backup_coverage(self.root, 'alpha')
+        self.assertFalse(covered)
+        self.assertIn('beads-backup.service', message)      # named as unreadable, not raised
+        # A timer file that is not UTF-8 is skipped the same way.
+        (self.units / 'beads-backup.service').unlink()
+        wants = self.units / 'timers.target.wants'
+        wants.mkdir(exist_ok=True)
+        (wants / 'beads-backup.timer').write_bytes(b'\xff\xfe\x00not text')
+        self.assertFalse(admin.scheduled_backup_covers(self.root, 'alpha'))
+
+    def test_a_root_with_a_space_is_one_argument_in_the_unit_line(self):
+        """kittrial-5bb.251 item 7: an unquoted root with a space reads as two arguments."""
+        import shlex
+        line = admin.scheduled_backup_execstart('/srv/my rt')
+        self.assertIn('--root "/srv/my rt" backup --all', line)
+        tokens = shlex.split(line)
+        self.assertEqual(tokens[tokens.index('--root') + 1], '/srv/my rt')
+        # A root with no space is unchanged: quoting it would change every existing line.
+        self.assertIn('--root /srv/rt backup --all', admin.scheduled_backup_execstart('/srv/rt'))
+
     def test_coverage_says_so_when_no_unit_line_can_be_printed(self):
         """kittrial-5bb.220 review 2 item 2a: a $ path does not break the report; it says why, naming it."""
         with patch.object(admin, 'install_current_path',
@@ -699,6 +754,11 @@ class HostStatusTests(unittest.TestCase):
         self.assertIn('can name the path', message)
         self.assertIn('/srv/a$b', message)                # the reason names the path
         self.assertIn('No installed scheduled backup unit', message)   # the rest of the report is still there
+        # ONE thing is said (kittrial-5bb.251 item 4): no "needs the line below" beside "no line can
+        # be printed", and the run-now and check commands the schedule text carried are kept.
+        self.assertNotIn('needs the line below', message)
+        self.assertIn('backup --all', message)            # the run-now command
+        self.assertIn('backup-status --require-complete', message)   # the check command
 
     @unittest.skipUnless(sys.platform == 'linux', 'systemd unit lines are verified on Linux')
     def test_systemd_refuses_the_characters_the_kit_refuses(self):

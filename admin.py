@@ -2428,8 +2428,11 @@ def systemd_quote(word):
     if not value:
         return '""'
     if any(unit_unspellable(ch) for ch in value):
+        # The path is named in a sentence an operator reads on a terminal and a member reads on
+        # the set-up page: printed raw, a control character in it rewrites the line it is shown
+        # on (kittrial-5bb.251 item 3). Escaped as every other hand-editable value is.
         raise ValueError('no systemd ExecStart line can name the path "%s" literally: it holds a $, a quote, a '
-                         'backslash or a control character systemd refuses or expands'%value)
+                         'backslash or a control character systemd refuses or expands'%audit_field(value))
     if any(ch.isspace() or ch=='%' for ch in value):
         return '"%s"'%value.replace('%','%%')
     return value
@@ -2442,13 +2445,19 @@ def scheduled_backup_execstart(root):
     service. A line whose interpreter came through ``current`` but whose ``admin.py``
     named ``releases/<ID>`` kept running the release that printed it after the next
     upgrade (kittrial-5bb.182 item 2). The interpreter and module are quoted for systemd,
-    not for a shell (kittrial-5bb.220 F4); ``root`` is NOT quoted because ``root_path``
-    already accepts only a path without a space, quote, backslash or specifier.
+    not for a shell (kittrial-5bb.220 F4). ``root`` is quoted only when it must be: systemd
+    splits the line on whitespace, so a runtime root with a space in it reached the unit as two
+    arguments (kittrial-5bb.251 item 7). It is NOT put through :func:`systemd_quote`, because the
+    root is not the executable name: a backslash in it is a path character, not something systemd
+    refuses, and refusing it would break every Windows root.
     """
     python=install_current_path(sys.executable)
     module=install_current_path(Path(__file__).resolve())
+    root_text=str(root)
+    if any(ch.isspace() or ch=='%' for ch in root_text):
+        root_text='"'+root_text.replace('%','%%')+'"'
     return ('ExecStart=%s %s --root %s backup --all'
-            %(systemd_quote(python),systemd_quote(module),root))
+            %(systemd_quote(python),systemd_quote(module),root_text))
 
 def host_command(root,*words):
     """A host command as the service user pastes it into a shell: interpreter, this module,
@@ -2598,7 +2607,7 @@ def scheduled_backup_enabled_timer_targets(directory):
         return targets
     for path in paths:
         try:text=path.read_text(encoding='utf-8')
-        except OSError:continue
+        except (OSError,ValueError):continue
         target=scheduled_backup_timer_target(text,path)
         if target:targets.add(target)
     return targets
@@ -2626,7 +2635,7 @@ def scheduled_backup_covers(root,name):
     covering=[]
     for path in paths:
         try:text=path.read_text(encoding='utf-8')
-        except OSError:
+        except (OSError,ValueError):
             unreadable=True;continue
         report=scheduled_backup_unit_report(text,root)
         if report['all_line'] or name in report['named'] or name in report['wrapper_projects']:
@@ -2817,30 +2826,45 @@ def scheduled_backup_coverage(root,name):
     enables a unit.
     """
     directory=scheduled_backup_unit_dir()
+    reason=None
     try:
         line=scheduled_backup_execstart(root)
         both=schedule_text(root)
     except ValueError as error:
         # A path systemd cannot name must not cut the whole report short (kittrial-5bb.220 review 2
         # item 2a): say so once, and print everything else.
+        reason=str(error)
         line=None
         both=('No line for a schedule can be printed for this installation: %s. Install the schedule by hand, or '
               'move the installation to a path systemd can name.'%error)
     # Where the unit-file line would be shown, or nothing when there is none to print.
     suggest=('\n  %s'%line) if line else ''
+    # The commands the schedule text carries, without the unit line: an installation whose path
+    # systemd cannot name still gets the run-now and check commands (kittrial-5bb.251 item 4).
+    commands_only=(f'To run a backup of every project now, as this account (a shell command):\n  '
+                   f'{backup_now_command(root)}\n'
+                   f'To check afterwards: `systemctl --user list-timers`, and\n  '
+                   f'{host_command(root,"backup-status","--require-complete")}')
     dropins=(f'Systemd drop-ins ({directory}/*.service.d/*.conf) are not inspected, so this reports the unit '
              f'files themselves.')
     # A unit file is not a schedule: an enabled timer must run it (kittrial-5bb.220 F4).
     enabled=scheduled_backup_enabled_timer_targets(directory)
     paths=scheduled_backup_unit_paths()
     if not paths:
+        if line:
+            return False,(f'No installed scheduled backup unit matching beads-*backup*.service was found in '
+                          f'{directory}, so no project of this runtime is on a schedule. A schedule that covers '
+                          f'every project, including {name}, needs the line below.\n{both}')
+        # ONE thing is said, not "needs the line below" and then "no line can be printed", and the
+        # commands the schedule text carried are kept (kittrial-5bb.251 item 4).
         return False,(f'No installed scheduled backup unit matching beads-*backup*.service was found in '
-                      f'{directory}, so no project of this runtime is on a schedule. A schedule that covers '
-                      f'every project, including {name}, needs the line below.\n{both}')
+                      f'{directory}, so no project of this runtime is on a schedule. No line for a schedule can '
+                      f'be printed for this installation, so {name} cannot be put on one from here: {reason}\n'
+                      f'{commands_only}')
     read=[];unreadable=[];durable=[];wrappers=[];named={};wrapper_projects={};foreign=[]
     for path in paths:
         try:text=path.read_text(encoding='utf-8')
-        except OSError as error:
+        except (OSError,ValueError) as error:
             unreadable.append('%s (%s)'%(path,error));continue
         read.append(str(path))
         report=scheduled_backup_unit_report(text,root)
@@ -4064,6 +4088,18 @@ def utc_timestamp(value):
     """True for the exact second-precision UTC form this file writes."""
     return isinstance(value,str) and bool(re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z',value))
 
+def real_utc_timestamp(value):
+    """True for that exact form AND a time that exists (kittrial-5bb.251 item 5).
+
+    ``utc_timestamp`` checks the shape only, so a hand-made ``2026-99-99T99:99:99Z`` passed it:
+    a month of 99, a day of 32 and a 25th hour all read as a time this kit recorded.
+    """
+    if not utc_timestamp(value):return False
+    import datetime
+    try:datetime.datetime.strptime(value,'%Y-%m-%dT%H:%M:%SZ')
+    except ValueError:return False
+    return True
+
 def open_item_labelled(labels):
     """The open items family or state labels among ``labels``: ``open-item`` and ``open-item:*``."""
     return sorted(label for label in labels or [] if isinstance(label,str)
@@ -4455,6 +4491,9 @@ BACKUP_SCHEDULE_NOTE_NAME='backup-schedule-note.json'
 #: The note is one short line of operator text, so a file much bigger than this is not read.
 BACKUP_SCHEDULE_NOTE_MAX=300
 BACKUP_SCHEDULE_NOTE_FILE_MAX=4096
+#: ``recorded_by`` is an actor name, not free text: a hand-made note carrying a 3,000-character or
+#: multi-line one is no note (kittrial-5bb.251 item 5).
+BACKUP_SCHEDULE_ACTOR_MAX=200
 #: Every set and clear is appended (who, when, which) to this bounded log beside the note
 #: (kittrial-5bb.220 review 2 item 4a): the note itself is only the current statement.
 BACKUP_SCHEDULE_LOG_NAME='backup-schedule-log.jsonl'
@@ -4517,11 +4556,17 @@ def read_backup_schedule_note(root):
         if path.stat().st_size>BACKUP_SCHEDULE_NOTE_FILE_MAX:return None
         record=record_json.loads(path.read_text(encoding='utf-8'))
     except (OSError,ValueError):return None
-    if not isinstance(record,dict) or record.get('schema_version')!=1:return None
+    # The version must be the INTEGER 1: True == 1 and 1.0 == 1 in Python, so a hand-made
+    # `schema_version: true` or `1.0` passed the plain comparison (kittrial-5bb.251 item 5).
+    if not isinstance(record,dict) or type(record.get('schema_version')) is not int \
+            or record.get('schema_version')!=1:return None
     note,by,at=record.get('note'),record.get('recorded_by'),record.get('recorded_at')
     if not isinstance(note,str) or not note.strip():return None
+    # The actor is a name: one line, bounded, as the actor field everywhere else is
+    # (kittrial-5bb.251 item 5: a 3,000-character or multi-line recorded_by was shown).
     if not isinstance(by,str) or not by.strip():return None
-    if not isinstance(at,str) or not utc_timestamp(at):return None
+    if len(by)>BACKUP_SCHEDULE_ACTOR_MAX or any(ch in '\n\r' for ch in by):return None
+    if not isinstance(at,str) or not real_utc_timestamp(at):return None
     return {'note':note.strip(),'recorded_at':at,'recorded_by':by.strip()}
 
 def write_backup_schedule_note(root,note,actor):
@@ -4535,6 +4580,12 @@ def write_backup_schedule_note(root,note,actor):
     # is refused as a newline is (kittrial-5bb.220 review 2 item 3).
     if any(unicodedata.category(ch) in ('Cc','Cf','Zl','Zp') for ch in note):
         raise ValueError('The note must not contain control or format characters')
+    # A note the shell decoded from a byte that is not valid UTF-8 holds a lone surrogate
+    # (category Cs): written as UTF-8 it raised UnicodeEncodeError from coordination.atomic, after
+    # nothing was written (kittrial-5bb.251 item 1). Refused here, in one sentence.
+    if any(unicodedata.category(ch)=='Cs' for ch in note):
+        raise ValueError('The note must be text that can be written as UTF-8; it holds a character that cannot '
+                         '(a byte that is not valid UTF-8 reached the command line)')
     actor=(actor or '').strip()
     if not actor:raise ValueError('Name the operator recording it with --actor')
     backups=root/'backups'
