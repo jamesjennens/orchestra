@@ -52,6 +52,29 @@ with their count at the top of the answer. "Nothing changed" never applies to a 
 yours with changes requested; stop without acting only when every task of yours is with the
 reviewer or the coordinator.
 
+### What each item also tells you: the role, the state and claimability
+
+Every `work` item carries `next_actor`, the next-action actor as a **role** (`assignee`,
+`reviewer`, `coordinator`, `operator`, `anyone`, `none` or `unknown`) from the same
+decision that gives `whose_move`: `whose_move` is your answer, `next_actor` is the
+caller-neutral role of that decision, and both say `unknown` where the move cannot be
+told. A malformed row reads `operator`; a closed task whose review is not still active
+reads `none`. An item also carries `work_state` (the review state it shows, or
+`reconciliation-needed`), `reconciliation_needed` and `reconciliation_reasons` (the
+mismatching facts), and `claimable` (the bounded claimability answer, see below).
+
+`work --state` filters by the review state the row SHOWS, so the item you see is the item
+you find. The one additive value is `work --state reconciliation-needed`: it selects the
+rows whose recorded evidence must be reconciled before it is read as current, whatever
+review state they show. Reconciliation clears nothing — it never replaces `review_state`,
+never clears an open item or blocker, and infers neither abandonment nor deployment. The
+same read is on the brief's `review` block, in the EXISTING warning surfaces.
+
+`work --claimable` (and the agent's claimable list) is bounded: open, unassigned, no
+contribution, and not an epic, decision, gate, job, record anchor, or a task carrying the
+`decision` label. It is a suggestion, never a reservation. Not considered, and stated here
+rather than implied: open dependencies and parent tasks.
+
 ### 3. Only when none of its own tasks needs action: the ready list
 
 It claims **exactly one** task that nobody holds, registers its plan on the task, and
