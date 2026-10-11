@@ -401,7 +401,12 @@ class HostStatusTests(unittest.TestCase):
     def setUp(self):
         use_posix_unit_source(self)
         self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
-        self.root = Path(self.tmp.name) / 'runtime'
+        # RESOLVED, as ScheduledCoverageGuidanceCase resolves its root: the unit line names the
+        # runtime root in POSIX form (runtime_unit_line), and the reader compares
+        # Path(token).resolve() with this root. On Windows an unresolved temp path (a short name,
+        # or a different letter case) is not the path the token resolves to, which is why the
+        # timer test was skipped there (kittrial-5bb.251 item 8).
+        self.root = (Path(self.tmp.name) / 'runtime').resolve()
         self.project = self.root / 'projects' / 'alpha'
         (self.project / '.beads').mkdir(parents=True)
         (self.project / '.beads' / 'metadata.json').write_text('{}', encoding='utf-8')
@@ -612,6 +617,21 @@ class HostStatusTests(unittest.TestCase):
         # A later clear reads the new log and works too.
         self.assertTrue(admin.clear_backup_schedule_note(self.root, 'operator-2'))
 
+    def test_the_log_is_bounded_by_bytes_and_says_when_one_was_set_aside(self):
+        """kittrial-5bb.251 item 6: lines alone bounded it, so the log-bound mutant survived."""
+        log = self.root / 'backups' / admin.BACKUP_SCHEDULE_LOG_NAME
+        big = json.dumps({'at': '2026-10-08T09:00:00Z', 'by': 'x' * 900, 'action': 'set'})
+        log.write_text('\n'.join([big] * 300) + '\n', encoding='utf-8')
+        self.assertGreater(log.stat().st_size, admin.BACKUP_SCHEDULE_LOG_BYTES_MAX)
+        admin.write_backup_schedule_note(self.root, 'after a big log', 'operator-1')
+        self.assertLessEqual(log.stat().st_size, admin.BACKUP_SCHEDULE_LOG_BYTES_MAX)
+        self.assertEqual(admin.backup_schedule_log(self.root)[-1]['by'], 'operator-1')
+        # A log that was set aside is SAID, not silent: the record carries the sentence.
+        log.write_bytes(b'\xff\xfe\x80')
+        record = admin.write_backup_schedule_note(self.root, 'after a damaged log', 'operator-1')
+        self.assertIn('kept aside', record['log_warning'])
+        self.assertEqual(admin.backup_schedule_log(self.root)[-1]['by'], 'operator-1')
+
     def test_a_hand_made_note_with_wrong_field_types_is_no_note(self):
         """kittrial-5bb.220 review 2 item 3: one bad file must not take the whole set-up page down."""
         path = self.root / 'backups' / admin.BACKUP_SCHEDULE_NOTE_NAME
@@ -701,10 +721,13 @@ class HostStatusTests(unittest.TestCase):
         """
         return admin.scheduled_backup_execstart(self.root).replace(str(self.root), self.root.as_posix())
 
-    @unittest.skipIf(sys.platform == 'win32', 'a unit line naming a Windows runtime root is not read back as this '
-                     'runtime (the product runs on Linux); the timer rule is tested on the POSIX runners')
     def test_a_timer_covers_only_the_unit_it_names(self):
-        """kittrial-5bb.220 review 2 item 5 (n06, n07): an enabled timer covers its unit, not any unit."""
+        """kittrial-5bb.220 review 2 item 5 (n06, n07), on every platform (kittrial-5bb.251 item 8).
+
+        No win32 skip: the unit line is built from POSIX literals (runtime_unit_line, above) and the
+        runtime root is the resolved one, so the reader resolves the token back to this runtime on a
+        Windows runner as it does on Linux.
+        """
         self.unit(self.runtime_unit_line())            # beads-backup.service covers alpha
         # An enabled timer for another unit, and one whose file name differs from the service
         # but whose Unit= names it: only the latter is coverage (n06, n07).
@@ -712,6 +735,16 @@ class HostStatusTests(unittest.TestCase):
         self.assertEqual(self.status()['backup']['scheduled'], 'not-covered')
         self.timer(name='beads-x-backup.timer', unit='beads-backup.service')
         self.assertEqual(self.status()['backup']['scheduled'], 'covered')
+
+    def test_a_covering_unit_with_an_unreadable_timer_is_not_todo(self):
+        """kittrial-5bb.251 item 7d: an unreadable timer is 'could not check', not 'todo'."""
+        self.unit(self.runtime_unit_line())
+        wants = self.units / 'timers.target.wants'
+        wants.mkdir(exist_ok=True)
+        (wants / 'beads-backup.timer').write_bytes(b'\xff\xfe\x00not text')
+        # The covering unit was read, but whether an enabled timer runs it cannot be told.
+        self.assertIsNone(admin.scheduled_backup_covers(self.root, 'alpha'))
+        self.assertEqual(self.status()['backup']['scheduled'], 'unknown')
 
     def test_a_unit_or_timer_file_that_is_not_utf8_is_read_as_unreadable(self):
         """kittrial-5bb.251 item 2: a file that is not UTF-8 is unreadable, not a traceback."""

@@ -2591,13 +2591,17 @@ def scheduled_backup_timer_target(text,path):
     base=Path(path).name
     return base[:-len('.timer')]+'.service' if base.endswith('.timer') else None
 
-def scheduled_backup_enabled_timer_targets(directory):
+def scheduled_backup_enabled_timer_targets(directory,unreadable=None):
     """The service names an enabled ``beads-*backup*.timer`` schedules, or an empty set.
 
     An enabled user timer is a unit under ``timers.target.wants`` (``systemctl enable``
     puts a symlink there, but a real file there enables it too); a timer only in the unit
     directory is installed but not enabled, so it will not run. Reading the timer through
     the symlink gives its ``[Timer] Unit=``.
+
+    A timer that cannot be read names no target, which on its own would read as "not
+    enabled": pass a list as ``unreadable`` to be told which ones those were, so the caller
+    can answer "could not check" instead (kittrial-5bb.251 item 7d).
     """
     targets=set()
     try:
@@ -2607,7 +2611,12 @@ def scheduled_backup_enabled_timer_targets(directory):
         return targets
     for path in paths:
         try:text=path.read_text(encoding='utf-8')
-        except (OSError,ValueError):continue
+        except (OSError,ValueError):
+            # A timer that cannot be read names no unit: the caller is told, so a covering unit
+            # whose timer was unreadable reads "could not check", not "todo" (kittrial-5bb.251
+            # item 7d). ``unreadable`` is an optional list the caller passes in.
+            if unreadable is not None:unreadable.append(str(path))
+            continue
         target=scheduled_backup_timer_target(text,path)
         if target:targets.add(target)
     return targets
@@ -2630,7 +2639,8 @@ def scheduled_backup_covers(root,name):
         paths=sorted(path for path in directory.glob('beads-*backup*.service') if path.is_file())
     except OSError:
         return None
-    enabled=scheduled_backup_enabled_timer_targets(directory)
+    timer_unreadable=[]
+    enabled=scheduled_backup_enabled_timer_targets(directory,unreadable=timer_unreadable)
     unreadable=False
     covering=[]
     for path in paths:
@@ -2641,7 +2651,12 @@ def scheduled_backup_covers(root,name):
         if report['all_line'] or name in report['named'] or name in report['wrapper_projects']:
             covering.append(Path(path).name)
     if covering:
-        return any(service in enabled for service in covering)
+        if any(service in enabled for service in covering):
+            return True
+        # A covering unit was read and no ENABLED timer runs it. If a timer file could not be read,
+        # its Unit= is unknown, so this is "could not check" and not "not covered"
+        # (kittrial-5bb.251 item 7d: it read "todo" before).
+        return None if timer_unreadable else False
     return None if unreadable else False
 
 def project_merge_slot_state(root,name,path=None):
@@ -2807,7 +2822,7 @@ def project_setup_status(root,name,path=None):
         result['creation_record']='The creation record of project %s could not be checked; an operator must look at it first'%name
     return result
 
-def scheduled_backup_coverage(root,name):
+def _scheduled_backup_coverage_report(root,name):
     """(durably_covers_every_project, message) for the INSTALLED schedule.
 
     ``True`` only for a schedule that durably covers every project of this runtime: an
@@ -2940,6 +2955,21 @@ def scheduled_backup_coverage(root,name):
     return False,(f'The installed scheduled backup unit(s) read ('+', '.join(read)+f') do not cover {name}'
                   +(' ('+'; '.join(details)+')' if details else '')
                   +f'. A schedule that covers every project needs the line below. '+dropins+f'\n{both}')
+
+def scheduled_backup_coverage(root,name):
+    """The report :func:`_scheduled_backup_coverage_report` builds, with the operator's note.
+
+    The note is the operator's own statement that backups are scheduled elsewhere. It is shown
+    on the set-up page, and it must be shown where add-project prints this report too
+    (kittrial-5bb.251 item 7c: add-project did not read it). The report has several returns, so
+    the sentence is added here, once, rather than in each of them.
+    """
+    covered,message=_scheduled_backup_coverage_report(root,name)
+    recorded=read_backup_schedule_note(root)
+    if recorded:
+        message=('%s\nAn operator recorded on this server that backups are scheduled elsewhere: "%s" '
+                 '(by %s at %s).'%(message,recorded['note'],recorded['recorded_by'],recorded['recorded_at']))
+    return covered,message
 
 #: Where ``retire-project`` moves a project directory, and its append-only journal.
 RETIRED_DIR='retired'
@@ -4498,6 +4528,10 @@ BACKUP_SCHEDULE_ACTOR_MAX=200
 #: (kittrial-5bb.220 review 2 item 4a): the note itself is only the current statement.
 BACKUP_SCHEDULE_LOG_NAME='backup-schedule-log.jsonl'
 BACKUP_SCHEDULE_LOG_MAX=100
+#: Bounded by BYTES as well as lines (kittrial-5bb.251 item 6): 100 lines of a bounded note and a
+#: bounded actor are small, but the bound must not rest on that, and the byte bound is what the log
+#: is trimmed to when a hand-written line makes it big.
+BACKUP_SCHEDULE_LOG_BYTES_MAX=65536
 
 def backup_schedule_log(root):
     """The recorded set and clear history, oldest first, as a read-only list of entries.
@@ -4518,27 +4552,42 @@ def backup_schedule_log(root):
     return entries
 
 def _append_backup_schedule_log(root,entry):
-    """Append one set or clear line, keeping only the newest ``BACKUP_SCHEDULE_LOG_MAX``.
+    """Append one set or clear line, keeping the newest lines within the line AND byte bounds.
 
     A convenience log, never a gate: a log that cannot be read or written does not fail the
     command that recorded the note. A log holding bytes that are not UTF-8 cannot be read
     line by line, so the damaged file is kept aside and a new log started rather than
     failing every later set and clear (kittrial-5bb.220 review 3 item 4).
+
+    Returns a sentence to show when a log was set aside, or None. It is bounded by BYTES as
+    well as lines now (kittrial-5bb.251 item 6): bounding by lines alone left the mutant that
+    dropped the bound alive, and nothing but the line count stood behind the size.
     """
     backups=root/'backups'
-    if backups.is_symlink() or not backups.is_dir():return
+    if backups.is_symlink() or not backups.is_dir():return None
     path=backups/BACKUP_SCHEDULE_LOG_NAME
-    if path.is_symlink():return
-    lines=[]
+    if path.is_symlink():return None
+    lines=[];set_aside=None
     try:
         if path.is_file():lines=[line for line in path.read_text(encoding='utf-8').splitlines() if line.strip()]
     except (OSError,ValueError):
         lines=[]
-        try:path.replace(path.with_name(path.name+'.damaged'))
-        except OSError:pass
+        # The damaged log is kept aside AND said, so an operator is not left wondering why the
+        # history starts again (kittrial-5bb.251 item 6).
+        try:
+            damaged=path.with_name(path.name+'.damaged')
+            path.replace(damaged)
+            set_aside='The backup schedule log could not be read, so it was kept aside as %s and a new log was started.'%damaged.name
+        except OSError:
+            set_aside='The backup schedule log could not be read, so a new log was started.'
     lines.append(json.dumps(entry,sort_keys=True,ensure_ascii=True))
-    try:atomic_private_write(path,'\n'.join(lines[-BACKUP_SCHEDULE_LOG_MAX:])+'\n')
+    lines=lines[-BACKUP_SCHEDULE_LOG_MAX:]
+    # The byte bound: drop the OLDEST lines while the text is too big, keeping the new entry.
+    while len(lines)>1 and len(('\n'.join(lines)+'\n').encode('utf-8'))>BACKUP_SCHEDULE_LOG_BYTES_MAX:
+        lines=lines[1:]
+    try:atomic_private_write(path,'\n'.join(lines)+'\n')
     except (OSError,ValueError):pass
+    return set_aside
 
 def read_backup_schedule_note(root):
     """The recorded statement that backups are scheduled elsewhere, or None.
@@ -4593,7 +4642,8 @@ def write_backup_schedule_note(root,note,actor):
         raise ValueError('The backups directory does not exist under this root; prepare the runtime first')
     record={'schema_version':1,'note':note,'recorded_at':utc_stamp(),'recorded_by':actor}
     atomic(backups/BACKUP_SCHEDULE_NOTE_NAME,record)
-    _append_backup_schedule_log(root,{'at':record['recorded_at'],'by':actor,'action':'set'})
+    warning=_append_backup_schedule_log(root,{'at':record['recorded_at'],'by':actor,'action':'set'})
+    if warning:record['log_warning']=warning
     return record
 
 def clear_backup_schedule_note(root,actor=None):
@@ -4606,7 +4656,8 @@ def clear_backup_schedule_note(root,actor=None):
     elif path.exists():
         raise ValueError('Backup schedule note is not a file')
     if removed and isinstance(actor,str) and actor.strip():
-        _append_backup_schedule_log(root,{'at':utc_stamp(),'by':actor.strip(),'action':'clear'})
+        warning=_append_backup_schedule_log(root,{'at':utc_stamp(),'by':actor.strip(),'action':'clear'})
+        if warning:print(warning)          # the operator asked on the command line; say it there
     return removed
 
 def degraded_projects(root,record):

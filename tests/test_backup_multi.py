@@ -541,6 +541,15 @@ class ScheduledCoverageGuidanceCase(unittest.TestCase):
         self.assertIn('backup --all', message)
         self.assertIn('ExecStart=', message)
 
+    def test_the_report_names_the_note_the_operator_recorded(self):
+        """kittrial-5bb.251 item 7c: add-project prints this report, so it reads the note too."""
+        admin.write_backup_schedule_note(self.root, 'Site cron runs it nightly.', 'operator-1')
+        covered, message = admin.scheduled_backup_coverage(self.root, 'second')
+        self.assertFalse(covered)
+        self.assertIn('scheduled elsewhere', message)
+        self.assertIn('Site cron runs it nightly.', message)
+        self.assertIn('operator-1', message)
+
     def test_unit_listing_only_other_projects_reports_this_project_missing(self):
         self.write_unit(self.line('first'))
         covered, message = admin.scheduled_backup_coverage(self.root, 'second')
