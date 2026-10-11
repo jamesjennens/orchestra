@@ -35,9 +35,9 @@ PENDING_REQUEST_IDS_MAX = 20
 #: One sentence for a contribution that waits for somebody else's approval (kittrial-5bb.197
 #: review request 01a12894, item 3b). It is carried by `work` and `brief` whether the
 #: installation's approval rules are on or off, so a reader of either learns what the
-#: contribution is waiting for without reading the setting.
-APPROVAL_WAIT = ("Waiting for somebody else's approval: the current contribution has no standing approval "
-                 "from a party other than its author and the task's assignee yet.")
+#: contribution is waiting for without reading the setting. It is deliberately short: the
+#: brief is bounded, and this field must not push a long prior chain past the bound.
+APPROVAL_WAIT = 'Waiting for somebody else\'s approval of the current contribution.'
 
 # Compact owned-work context, not a recipient or authorization inference.
 CHECKPOINT_WAIT_ITEMS_MAX = 3
