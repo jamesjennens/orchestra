@@ -5437,6 +5437,16 @@ class ApiHandler(BaseHTTPRequestHandler):
                                               task.get('assignee') == actor,
                                               pending_items=item_count)
                 details['whose_move'], details['next'] = move, move_text
+                if review != 'changes-requested':
+                    # The task asked for the two fields only where the kind is
+                    # changes-requested (review item 2b): every other kind has a mover who is
+                    # not this agent (an operator reconciles a review error or an unreadable
+                    # checkpoint; a reviewer or the coordinator holds awaiting work), so it
+                    # carries neither field instead of pairing `who: operator` with
+                    # `whose_move: you` or contradicting the queue row's blocked/waiting
+                    # sentence.
+                    details.pop('whose_move', None)
+                    details.pop('next', None)
                 if review == 'changes-requested':
                     own_actions.append(self._agent_action(
                         1, 'changes-requested', project_id, task,

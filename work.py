@@ -42,16 +42,17 @@ WHOSE_MOVE = ('you', 'reviewer', 'coordinator', 'unknown')
 UNKNOWN_MOVE_TEXT = 'Whose move this is cannot be told from the review state shown here.'
 
 
-def review_move(state, task, owned, named_reviewer=False, pending_items=0):
+def review_move(state, task, owned, named_reviewer=False, pending_items=0, redelivered=False):
     """`(whose_move, next)`: one plain sentence from the validated review state alone.
 
     Caller-relative: `'you'` only when the next move is the calling actor's, so an
     operator reading another lane's queue is never told the move is theirs, while a
     named reviewer's own open review request is. Derived only from the review state the
-    item already shows plus the two facts the row already carries: whether the caller
-    holds it as a named reviewer, and how many blocking items are open. No title, no
-    comment and no actor is read as a claim about intent, and nothing is inferred from
-    a state this function does not name (that stays `'unknown'`).
+    item already shows plus the facts the row already carries: whether the caller
+    holds it as a named reviewer, how many blocking items are open, and whether every one
+    of those items was filed on a contribution the current one supersedes (`redelivered`).
+    No title, no comment and no actor is read as a claim about intent, and nothing is
+    inferred from a state this function does not name (that stays `'unknown'`).
     """
     name = str(task or 'the task')
     items = max(0, int(pending_items or 0))
@@ -61,6 +62,13 @@ def review_move(state, task, owned, named_reviewer=False, pending_items=0):
     if not owned:
         return 'unknown', UNKNOWN_MOVE_TEXT
     if state == 'changes-requested':
+        if redelivered:
+            # A revision that supersedes the one the items were filed on is already
+            # delivered: only the responses are owed, so the worker does not redeliver
+            # again (kittrial-5bb.249 review, item 3b).
+            return 'you', ('This is your work now: %d outstanding review %s. Read `review %s` and '
+                           'respond to each item: the revision that supersedes this contribution '
+                           'has already been delivered.' % (items, plural, name))
         return 'you', ('This is your work now: %d outstanding review %s. Read `review %s`, deliver '
                        'a revision that supersedes this contribution and respond to each item.'
                        % (items, plural, name))
@@ -79,16 +87,34 @@ def review_move(state, task, owned, named_reviewer=False, pending_items=0):
     return 'unknown', UNKNOWN_MOVE_TEXT
 
 
-def waiting_move(next_action):
-    """`next` for a caller that waits for a person by its own current checkpoint.
+def quoted_checkpoint_text(value):
+    """One checkpoint line, safe inside the sentence's double quotes.
 
-    The checkpoint's own wording is quoted, so the move sentence and the
-    `checkpoint_wait` block beside it read as one thing (kittrial-5bb.219 addition c).
+    A raw backslash is doubled first; ``briefing.plain_text`` then escapes the C0/C1
+    controls (DEL included), the Unicode line/paragraph separators and the bidi controls,
+    exactly as the rest of the answer does. The double quote and a newline are escaped
+    last, so the quoted text cannot close the quote or start a second line that reads as
+    a move of its own (kittrial-5bb.249 review, item 1).
+    """
+    from briefing import plain_text
+    text = plain_text(str(value or '').replace('\\', '\\\\'))
+    return text.replace('"', '\\"').replace('\n', '\\n')
+
+
+def waiting_move(next_action):
+    """`next` for a caller whose own current checkpoint records a blocker or dependency.
+
+    What is known is the caller's own record, never an inferred person (kittrial-5bb.219):
+    the sentence says the caller recorded a blocker or dependency and quotes that
+    checkpoint's own wording, escaped so it cannot read as a move. The move is still the
+    caller's own: the row keeps ``whose_move`` 'you' and stays in ``your_move``
+    (kittrial-5bb.249 review, item 1).
     """
     text = next_action.get('text') if isinstance(next_action, dict) else next_action
     if not text:
         return None
-    return 'You are waiting for a person, by your own checkpoint: "%s"' % text
+    return ('You recorded a blocker or dependency in your own checkpoint: "%s".'
+            % quoted_checkpoint_text(text))
 
 
 def checkpoint_wait(row, actor, state, delivered=False):
@@ -548,11 +574,19 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
         pending_change_requests=[]
         for pending in review.get('pending_requests',[]):
             if pending.get('request') not in pending_change_requests:pending_change_requests.append(pending.get('request'))
-        pending_items=len(review.get('pending_requests',[]))
+        pending_requests=review.get('pending_requests',[])
+        pending_items=len(pending_requests)
+        # A superseding redelivery that has not been answered: every open item was filed on a
+        # contribution the current one replaces, so only the responses are owed
+        # (kittrial-5bb.249 review, item 3b).
+        contribution_id=contribution.get('comment_id')
+        redelivered=bool(contribution_id) and bool(pending_requests) and all(
+            str(pending.get('contribution') or '')!=str(contribution_id) for pending in pending_requests)
         # Whose move it is, and one plain sentence saying so (kittrial-5bb.249). Derived from
         # the validated review state this row already shows; no further read.
         move,move_text=review_move(state,row['id'],bool(actor) and row.get('assignee')==actor,
-                                   named_reviewer=review_request,pending_items=pending_items)
+                                   named_reviewer=review_request,pending_items=pending_items,
+                                   redelivered=redelivered)
         items.append({'open_items':open_items,'blocking_items':blocking_items,
                       'checkpoint_at':checkpoint_at,'newer_activity':newer_activity,
                       'pending_change_requests':pending_change_requests[:PENDING_REQUEST_IDS_MAX],
@@ -585,6 +619,24 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
                       # Additive (kittrial-5bb.52): the integration disagreement entries
                       # naming both facts and both scopes, and their rendered warnings.
                       'integration_disagreements':disagreements,'integration_warnings':integration_warnings})
+    from briefing import checkpoint_queue_fields
+    task_rows={row['id']:row for row in rows if isinstance(row,dict) and row.get('id')}
+    # Reconcile EVERY row's checkpoint wait BEFORE the sort and the count, not only the rows
+    # on this page (kittrial-5bb.249 review, item 2a): `checkpoint_states` is already parsed
+    # for all rows, so the move and `your_move` are the queue's, never the page's. The
+    # heavier per-row checkpoint fields stay on the displayed page below.
+    for item in items:
+        item['checkpoint_wait']=checkpoint_wait(task_rows.get(item['task'],{}),actor,
+            checkpoint_states.get(item['task']),
+            delivered=bool(item['contribution_id']) or item['review_state'] not in (None,'none'))
+        # (kittrial-5bb.219 addition c, revised for kittrial-5bb.249 item 1) Where the caller's
+        # own current checkpoint records a blocker or dependency, `next` quotes that
+        # checkpoint's own words and says no person was inferred. The move stays the caller's:
+        # `whose_move` is not rewritten and the row stays in `your_move`.
+        if item['checkpoint_wait'].get('active'):
+            wait_text=waiting_move(item['checkpoint_wait'].get('next_action'))
+            if wait_text:
+                item['next']=wait_text
     priority={'changes-requested':0,'error':1,'awaiting-review':2,'legacy-review-ready':2,'awaiting-integration':3}
     # Items where the next move is the CALLER's sort first (kittrial-5bb.249); inside each
     # group the review-state order above is unchanged, so a revision request still leads
@@ -597,27 +649,14 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
         coverage+=' %d unparseable issue row(s).'%unparseable_count
     result={'owner':owner,'total':len(items),'items':items[a.offset:a.offset+a.limit],'next_offset':a.offset+a.limit if a.offset+a.limit<len(items) else None,
             'coverage':coverage}
-    # .1 adds checkpoint attention after constructing the page. This is separate
-    # from the review/handoff/HTTP queue fields and parses only displayed tasks.
-    from briefing import checkpoint_queue_fields
-    task_rows={row['id']:row for row in rows if isinstance(row,dict) and row.get('id')}
+    # .1 adds the remaining checkpoint attention fields for the displayed page only; this is
+    # separate from the review/handoff/HTTP queue fields and parses only displayed tasks.
     for item in result['items']:
-        item['checkpoint_wait']=checkpoint_wait(task_rows.get(item['task'],{}),actor,
-            checkpoint_states.get(item['task']),
-            delivered=bool(item['contribution_id']) or item['review_state'] not in (None,'none'))
-        # (kittrial-5bb.219 addition c) Where the caller waits for a person by its own
-        # current checkpoint, the move sentence quotes that checkpoint's own words, and
-        # the move itself is not the caller's to make until the person answers.
-        if item['checkpoint_wait'].get('active'):
-            wait_text=waiting_move(item['checkpoint_wait'].get('next_action'))
-            if wait_text:
-                item['next']=wait_text
-                item['whose_move']='unknown'
         if item['task'] in task_rows:
             item.update(checkpoint_queue_fields(rows,task_rows[item['task']],checkpoint_states.get(item['task'])))
-    # The count of this answer's items where the next move is the caller's, read first.
-    # `items` holds the same row objects as the page above, so a displayed row already
-    # carries the checkpoint reconciliation and an undisplayed one keeps its move.
+    # The count of the QUEUE's items where the next move is the caller's, from the same
+    # reconciled rows the sort used, so every page reports the same number
+    # (kittrial-5bb.249 review, item 2a).
     own_move=sum(1 for item in items if item['whose_move']=='you')
     result={'owner':result['owner'],'total':result['total'],
             'your_move':{'count':own_move,'text':'%d of your tasks need your action'%own_move},

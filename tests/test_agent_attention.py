@@ -175,6 +175,51 @@ class EndpointAttentionTests(fixes.EndpointCase):
         self.assertEqual(sorted(kinds(data)[-2:]), [('awaiting-integration', third), ('awaiting-review', first)])
         self.assertEqual([action['priority'] for action in data['next_actions']], [2, 4, 5, 5])
 
+    def test_only_changes_requested_carries_the_move_and_from_the_one_queue_helper(self):
+        """Item 2b: the two answers cannot disagree, so the fields are restricted.
+
+        The task asked for `whose_move`/`next` only where the kind is changes-requested. Every
+        other kind has a mover who is not the agent (an operator reconciles a review error or an
+        unreadable checkpoint; a reviewer or the coordinator holds awaiting work), so it carries
+        neither field: kind `checkpoint-error` can no longer pair `who: operator` with
+        `whose_move: you`, and kind `blocked` no longer contradicts the queue's own sentence.
+        Where the kind IS changes-requested, the words are the canonical row's, built by the same
+        helper the queue uses.
+        """
+        from work import review_move
+        first, second, third, spare = self.tasks
+        for task in (first, second, third):
+            self.claim(task)
+        self.checkpoint(second, [{'id': 'key', 'kind': 'blocker', 'text': 'No key.',
+                                  'source': 'the build log'}])
+        contribution = self.contribute(first)
+        # A malformed chain: kind review-error, whose action owner is an operator.
+        self.native('blair')(['comments', 'add', third, 'Kind: contribution-review-v1\n{}'])
+        data = self.next()
+        kinds_seen = {action['kind'] for action in data['next_actions']}
+        self.assertIn('blocked', kinds_seen)
+        self.assertIn('review-error', kinds_seen)
+        self.assertNotIn('changes-requested', kinds_seen)
+        for action in data['next_actions']:
+            if action['kind'] == 'changes-requested':
+                self.assertIn('whose_move', action)
+            else:
+                with self.subTest(kind=action['kind']):
+                    self.assertNotIn('whose_move', action)
+                    self.assertNotIn('next', action)
+        request = self.review(self.people['blair'], first, 'request-changes', previous=contribution,
+                              contribution=contribution, items=[{'id': 'tests', 'text': 'Add a test.'}])
+        self.assertTrue(request)
+        data = self.next()
+        action = next(item for item in data['next_actions'] if item['kind'] == 'changes-requested')
+        expected = review_move('changes-requested', first, True, pending_items=1)
+        self.assertEqual((action['whose_move'], action['next']), expected)
+        for other in data['next_actions']:
+            if other['kind'] != 'changes-requested':
+                with self.subTest(kind=other['kind']):
+                    self.assertNotIn('whose_move', other)
+                    self.assertNotIn('next', other)
+
     def test_one_unfiltered_work_read_supplies_own_and_claimable_tasks(self):
         self.claim(self.tasks[0])
         actor = self.next()['agent']['actor']

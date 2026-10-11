@@ -159,8 +159,12 @@ After delivery, use only the mode authorized for this worker:
   when a stop condition is met; do not invent work or poll an empty queue
   indefinitely. Use the full client-prefixed examples above, replacing their
   placeholders with the installed client, private config, project and actor.
-- **Office / person-started mode:** do not poll or run a loop. Complete one bounded
-  turn, checkpoint it, and end with a one-line status for the person.
+- **Office / person-started mode:** do not start a poll or a loop of your own. Complete
+  one bounded turn, checkpoint it, and end with a one-line status for the person. Only
+  your own user authorizes checking again, by asking, within what the project's standing
+  guidance allows. A task awaiting review or integration is not a reason to stop
+  checking before the deadline; that is exactly when checking matters. If your harness
+  cannot wait or schedule, tell your user so in one line instead of refusing.
 
 This is a FIRST prompt. For every later run use the short recurring prompt the kit
 serves as docs poll-prompt, unchanged from run to run: it carries no state. What you
