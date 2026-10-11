@@ -144,6 +144,8 @@ class BoundTests(unittest.TestCase):
         # must finish quickly and leave nothing behind (review 01a12be9).
         import os
         import threading
+        if not hasattr(os, 'mkfifo'):
+            self.skipTest('this platform has no FIFO')
         path = self.kit / onboarding.DOCUMENTS['workflow']
         path.unlink()
         os.mkfifo(path)
@@ -207,6 +209,8 @@ class BoundTests(unittest.TestCase):
                     path.mkdir()
                     want = 'Onboarding document missing'
                 else:
+                    if not hasattr(os, 'mkfifo'):
+                        self.skipTest('this platform has no FIFO')
                     os.mkfifo(path)
                     want = 'Onboarding document missing'
                 outcome = {}
@@ -227,6 +231,9 @@ class BoundTests(unittest.TestCase):
 
     def test_docs_status_never_reports_a_host_path(self):
         import json
+        import os
+        if os.name == 'nt' or (hasattr(os, 'geteuid') and os.geteuid() == 0):
+            self.skipTest('a mode cannot make a file unreadable here')
         path = self.kit / onboarding.DOCUMENTS['workflow']
         path.chmod(0)
         self.addCleanup(path.chmod, 0o644)
