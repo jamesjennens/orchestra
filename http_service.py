@@ -3409,7 +3409,13 @@ class ApiHandler(BaseHTTPRequestHandler):
                 # Bounded nesting (kittrial-5bb.108): a body nested deeper than the kit ever
                 # writes is refused here, as bad JSON, and never reaches a route or the
                 # operation journal. It used to be an HTTP 500.
-                payload = record_json.loads(body)
+                # Duplicate requirement fields must not silently choose one of
+                # two reasons or successors before closed-schema validation.
+                if re.fullmatch(r'/v1/projects/[^/]+/requirements(?:/.*)?', urlsplit(self.path).path):
+                    from export_requirements import _unique
+                    payload = record_json.loads(body, object_pairs_hook=_unique)
+                else:
+                    payload = record_json.loads(body)
             except (ValueError, UnicodeError):
                 raise invalid('Request body is not valid JSON')
             if not isinstance(payload, dict):
@@ -5768,6 +5774,13 @@ class ApiHandler(BaseHTTPRequestHandler):
                 or self.service.state.get('memberships',{}).get(pid,{}).get(ctx.principal.user_id)!='owner'):
             raise forbidden('Requirements editing needs the signed-in project owner')
 
+    def _requirements_names(self, result):
+        items=result.get('items', [result])
+        names=self.service.actor_names([(item.get('state') or {}).get('account_id') for item in items])
+        for item in items:
+            if item.get('state'):
+                item['state_author_name']=names.get(item['state']['account_id']) or 'Former project owner'
+
     def _requirements_write(self, ctx, action, status=200):
         self._requirements_backend()
         self._requirements_owner(ctx)
@@ -5778,6 +5791,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             'withdraw':('expected_revision','expected_sha256','expected_state_sha256','reason'),
             'supersede':('expected_revision','expected_sha256','expected_state_sha256','reason','successor'),
             'release':('original_operation_id','expected_receipt_sha256','reason'),
+            'finish':('original_operation_id','expected_receipt_sha256'),
+            'abandon':('original_operation_id','expected_receipt_sha256','reason'),
             'governance':('mode','expected_revision','expected_sha256')}[action],'Requirements')
         import requirement_http
         try: requirement_http.checked_body(fields,action)
@@ -5785,7 +5800,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         if operation_id is not None:
             raise invalid('Use the Idempotency-Key header for requirements writes')
         pid=ctx.params['pid']
-        if action in ('withdraw','supersede'):
+        if action in ('withdraw','supersede','finish','abandon'):
             # Give immediate mode advice; the canonical adapter repeats the
             # check under the project/authority locks, including exact replays.
             if self.backend.requirements_read(pid,['governance'])['mode']!='simple':
@@ -5793,13 +5808,22 @@ class ApiHandler(BaseHTTPRequestHandler):
         def write():
             result=self.backend.owner_requirements(ctx.principal,pid,action,fields,
                                                     ctx.idempotency_key or ctx.request_id,ctx.params.get('rid'))
+            if action in ('withdraw','supersede','finish','abandon'):
+                token=request_hash({'project':pid,'operation_id':result['operation_id'],
+                                    'disposition':result.get('disposition','complete')})
+                with self.service.store.lock:
+                    recorded=self.service.state.setdefault('requirement_terminal_audits',{})
+                    if token not in recorded:
+                        self.service.audit(ctx.request_id,ctx.principal,'requirements.'+action,'committed',project_id=pid)
+                        recorded[token]=ctx.request_id
             return result,result
         return self._mutate(ctx,'requirements.'+action,pid,write,status=status,
                             capability=CAP_PROJECT_ADMIN,serialize=False,canonical=True,
                             # Terminal replay authority belongs to the canonical
                             # owner adapter. Its durable identity still deduplicates
                             # effects; a service response must not bypass that check.
-                            idempotent=action not in ('withdraw','supersede'))
+                            idempotent=action not in ('withdraw','supersede','finish','abandon'),
+                            audit_success=action not in ('withdraw','supersede','finish','abandon'))
 
     @route('GET', r'/v1/projects/(?P<pid>'+ID+r')/requirements/governance')
     def requirements_governance_read(self,ctx):
@@ -5823,6 +5847,7 @@ class ApiHandler(BaseHTTPRequestHandler):
     def requirements_list(self,ctx):
         self._requirements_backend(); self._project(ctx,CAP_READ)
         result=dict(self.backend.requirements_read(ctx.params['pid'],['list']))
+        self._requirements_names(result)
         result['can_edit']=(ctx.principal.via=='session' and not ctx.principal.agent_id
                             and self.service.state.get('memberships',{}).get(ctx.params['pid'],{}).get(ctx.principal.user_id)=='owner')
         return 200,result
@@ -5835,6 +5860,7 @@ class ApiHandler(BaseHTTPRequestHandler):
     def requirements_get(self,ctx):
         self._requirements_backend(); self._project(ctx,CAP_READ)
         result=dict(self.backend.requirements_read(ctx.params['pid'],['get',ctx.params['rid']]))
+        self._requirements_names(result)
         result['governance']=self.backend.requirements_read(ctx.params['pid'],['governance'])
         result['can_edit']=(ctx.principal.via=='session' and not ctx.principal.agent_id
                             and self.service.state.get('memberships',{}).get(ctx.params['pid'],{}).get(ctx.principal.user_id)=='owner')
@@ -5856,10 +5882,20 @@ class ApiHandler(BaseHTTPRequestHandler):
     def requirements_supersede(self,ctx):
         return self._requirements_write(ctx,'supersede')
 
+    @route('POST', r'/v1/projects/(?P<pid>'+ID+r')/requirements/(?P<rid>'+ID+r')/transition/finish')
+    def requirements_finish_transition(self,ctx):
+        return self._requirements_write(ctx,'finish')
+
+    @route('POST', r'/v1/projects/(?P<pid>'+ID+r')/requirements/(?P<rid>'+ID+r')/transition/abandon')
+    def requirements_abandon_transition(self,ctx):
+        return self._requirements_write(ctx,'abandon')
+
     @route('GET', r'/v1/projects/(?P<pid>'+ID+r')/brd')
     def requirements_brd(self,ctx):
         self._requirements_backend(); self._project(ctx,CAP_READ)
-        return 200,self.backend.requirements_read(ctx.params['pid'],['brd'])
+        result=self.backend.requirements_read(ctx.params['pid'],['brd'])
+        self._requirements_names(result)
+        return 200,result
 
     # -- contributed requirement proposals (.58 slice 1b, kittrial-5bb.70) -----------
     #

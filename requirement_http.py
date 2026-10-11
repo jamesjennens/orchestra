@@ -243,14 +243,17 @@ def checked_body(body, action):
                'withdraw': {'expected_revision', 'expected_sha256', 'expected_state_sha256', 'reason'},
                'supersede': {'expected_revision', 'expected_sha256', 'expected_state_sha256', 'reason', 'successor'},
                'release': {'original_operation_id', 'expected_receipt_sha256', 'reason'},
+               'finish': {'original_operation_id', 'expected_receipt_sha256'},
+               'abandon': {'original_operation_id', 'expected_receipt_sha256', 'reason'},
                'governance': {'mode', 'expected_revision', 'expected_sha256'}}
     if action not in allowed or not isinstance(body, dict) or set(body) - allowed[action]:
         raise ValueError('Unsupported requirements fields or action')
-    if action == 'release':
+    if action in ('release', 'finish', 'abandon'):
         identifier(body.get('original_operation_id')); governance.digest(body.get('expected_receipt_sha256'))
-        if (not isinstance(body.get('reason'), str) or not 1 <= len(body['reason'].strip()) <= 1000
+        if action != 'finish' and (not isinstance(body.get('reason'), str) or not body['reason'].strip() or not 1 <= len(body['reason']) <= 1000
                 or '\0' in body['reason']):
-            raise ValueError('Explain why this failed creation should be cleared (1 to 1000 characters)')
+            raise ValueError('Explain why this transition should be abandoned (1 to 1000 characters)' if action == 'abandon'
+                             else 'Explain why this failed creation should be cleared (1 to 1000 characters)')
     elif action != 'create':
         if 'expected_sha256' not in body:
             raise ValueError('Expected requirements hash is required; reload and try again')
@@ -270,7 +273,7 @@ def checked_body(body, action):
             raise ValueError('Expected requirement state hash is required; reload and try again')
         if body['expected_state_sha256'] is not None:
             governance.digest(body['expected_state_sha256'])
-        if (not isinstance(body.get('reason'), str) or not 1 <= len(body['reason'].strip()) <= 1000
+        if (not isinstance(body.get('reason'), str) or not body['reason'].strip() or not 1 <= len(body['reason']) <= 1000
                 or '\0' in body['reason']):
             raise ValueError('Explain this requirement change (1 to 1000 characters)')
         if action == 'supersede':
@@ -442,14 +445,19 @@ def apply(project_path, context, action, body, operation_id, run, task=None):
         raise ValueError('Owner requirements context is stale or unavailable')
     body = checked_body(body, action)
     identifier(operation_id)
+    if action in ('finish', 'abandon'):
+        from requirement_terminal import recover
+        return recover(project_path, context, action, task, body, run)
     if action in ('withdraw', 'supersede'):
         from requirement_terminal import apply as apply_terminal
         return apply_terminal(project_path, context, action, body, operation_id, run, task)
     if task is not None:
         from requirement_terminal import pending_ids
         pending, uncertain = pending_ids(project_path, context.project)
-        if uncertain or task in pending:
-            raise ValueError('Requirement transition is pending; retry its original request before editing')
+        if task in uncertain:
+            raise ValueError('Requirement transition receipt is damaged; ask the host operator to reconcile it')
+        if task in pending:
+            raise ValueError('Requirement transition is pending; finish or abandon it on the requirements page before editing')
     if action == 'governance':
         raise ValueError('Governance uses its separate owner action')
     if action == 'accept':
@@ -518,8 +526,8 @@ def _web_action(root, project_path, project, request, authority_config, runner, 
                              authority_config=authority_config, require_authority=True, runner=runner,
                              account_identity=True, identity_check=lambda: owner_context(
                                  project_path, project, request, authority_config))
-    if (not isinstance(args, list) or not args or args[0] not in ('create', 'revise', 'accept', 'governance', 'release', 'withdraw', 'supersede')
-            or len(args) != (2 if args[0] in ('revise', 'accept', 'withdraw', 'supersede') else 1)):
+    if (not isinstance(args, list) or not args or args[0] not in ('create', 'revise', 'accept', 'governance', 'release', 'withdraw', 'supersede', 'finish', 'abandon')
+            or len(args) != (2 if args[0] in ('revise', 'accept', 'withdraw', 'supersede', 'finish', 'abandon') else 1)):
         raise ValueError('Unsupported owner requirements action')
     action = args[0]
     attachment = (request.get('attachments') or {}).get('payload')
@@ -583,6 +591,8 @@ def _web_action(root, project_path, project, request, authority_config, runner, 
                 raise ValueError('No matching governance change was confirmed; keep the original operation unknown')
         elif action == 'release':
             pass  # release_creation revalidates the retained audit and original identity.
+        elif action in ('finish', 'abandon'):
+            pass  # Exact receipt and effect-time owner are checked by recover.
         elif action in ('withdraw', 'supersede'):
             from requirement_terminal import recoverable
             recoverable(project_path, context, action, args[1], body, operation_id)
@@ -643,7 +653,7 @@ def read(project_path, project, args, run, operators=None):
     # tracker has no requirement/brd-section issue types, so its unreadable-row
     # membership probes must use the supported label filters.
     rows = record_json.classify(records.read_rows(run), run, labels)
-    from requirement_terminal import pending_ids
+    from requirement_terminal import pending_ids, projection
     pending, pending_error = pending_ids(project_path, project)
     items, decisions = [], []
     for row in rows:
@@ -677,11 +687,15 @@ def read(project_path, project, args, run, operators=None):
                 if state is not None:
                     governance.validate_evidence(project_path, project, state)
                     status = state['state']
-                if pending_error or row['id'] in pending:
-                    raise ValueError('Requirement transition is pending or cannot be verified; retry its original request')
+                if row['id'] in pending_error:
+                    raise ValueError('Requirement transition receipt is damaged; ask the host operator to reconcile it')
+                if row['id'] in pending:
+                    raise ValueError('Requirement transition is pending; finish or abandon it on the requirements page')
             except (ValueError, TypeError, KeyError):
                 status = 'unknown'
-                state_error = 'Requirement status cannot be verified; ask the project owner to reconcile it'
+                state_error = ('Requirement transition receipt is damaged; ask the host operator to reconcile it' if row['id'] in pending_error
+                               else 'Requirement transition is pending; finish or abandon it on the requirements page' if row['id'] in pending
+                               else 'Requirement status cannot be verified; ask the project owner to reconcile it')
             items.append({'id': row['id'], 'kind': kind, 'current': latest,
                           'accepted': accepted, 'pending_draft': latest if latest['acceptance_state'] == 'draft' else None,
                           'history': history, 'acceptance': evidence.get(latest['revision']),
@@ -704,6 +718,9 @@ def read(project_path, project, args, run, operators=None):
                                   sha256=old['state']['record_sha256']) for old in items
                              if old.get('requirement_state') == 'superseded'
                              and old['state']['superseded_by']['id'] == item['id']]
+    recoveries = projection(project_path, project, rows, run)
+    for item in items:
+        item['pending_transition'] = next((r for r in recoveries['items'] if r['id'] == item['id']), None)
     if args[0] == 'get':
         found = next((item for item in items if item['id'] == args[1]), None)
         if found is None:
@@ -713,7 +730,8 @@ def read(project_path, project, args, run, operators=None):
         return found
     result = {'project': project, 'governance': governance.read_state(project_path, project),
               'items': items, 'total': len(items),
-              'active_ids': [item['id'] for item in items if item.get('requirement_state') == 'active'],
+              'nonterminal_ids': [item['id'] for item in items if item.get('requirement_state') == 'active'],
+              'terminal_recoveries': recoveries,
               'jobs': [{'id': row['id'], 'title': row.get('title', '')}
                        for row in rows if row.get('issue_type') in ('epic', 'job', 'task')
                        and not records.TYPE_LABELS.intersection(row.get('labels') or [])

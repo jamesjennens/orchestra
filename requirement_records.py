@@ -519,7 +519,10 @@ def _check_revision(payload, revision, existing, record, task):
 def _current_acceptance(row, existing):
     """Whether the record is currently accepted, from state label and revisions."""
     from requirement_owner_records import state_ledger
-    terminal, _ = state_ledger(row)
+    try:
+        terminal, _ = state_ledger(row)
+    except (ValueError, TypeError, KeyError):
+        return 'unknown'
     if terminal is not None:
         return terminal['state']
     from requirement_owner_records import HUMAN
@@ -681,8 +684,10 @@ def apply_native(payload, actor, run, project, operator=False, operators=None):
     validate_payload(payload, operator=operator)
     from requirement_terminal import pending_ids
     pending, uncertain = pending_ids(Path(project), Path(project).name)
-    if uncertain or payload.get('task') in pending:
-        raise ValueError('Requirement transition is pending; retry its original owner request')
+    if payload.get('task') in uncertain:
+        raise ValueError('Requirement transition receipt is damaged; ask the host operator to reconcile it')
+    if payload.get('task') in pending:
+        raise ValueError('Requirement transition is pending; finish or abandon it on the requirements page')
     spec = SPEC
     if not operator:
         # The caller holds the project lock. Recheck mode and the exact latest
@@ -732,8 +737,10 @@ def backfill(payload, actor, run, project, operators=None):
     validate_backfill(payload)
     from requirement_terminal import pending_ids
     pending, uncertain = pending_ids(Path(project), Path(project).name)
-    if uncertain or any(entry['task'] in pending for entry in payload['records']):
-        raise ValueError('Requirement transition is pending; retry its original owner request')
+    if any(entry['task'] in uncertain for entry in payload['records']):
+        raise ValueError('Requirement transition receipt is damaged; ask the host operator to reconcile it')
+    if any(entry['task'] in pending for entry in payload['records']):
+        raise ValueError('Requirement transition is pending; finish or abandon it on the requirements page')
     identity = content_hash({'operation_id': payload['operation_id']})
     digest = content_hash({'actor': actor, 'payload': payload})
     journal = _journal(project, BACKFILL_JOURNAL)
@@ -814,6 +821,18 @@ def reconcile(project, operation_id, actor, reason, disposition, run, issue_id=N
       can be resubmitted.
     * Repeating an identical reconciliation is idempotent.
     """
+    from requirement_terminal import receipt_path, read_receipt, recover, receipt_sha256
+    path = receipt_path(Path(project), operation_id)
+    if path.is_file() or path.is_symlink():
+        receipt = read_receipt(path)
+        from requirement_http import OwnerContext
+        from requirement_governance import current
+        context = OwnerContext(Path(project).name, actor, current(Path(project), Path(project).name))
+        if context.governance['mode'] != 'simple':
+            raise ValueError('Terminal recovery requires simple requirements; preserve the receipt for operator reconciliation')
+        return recover(Path(project), context, 'finish' if disposition == 'complete' else 'abandon',
+                       receipt['id'], dict(original_operation_id=operation_id,
+                       expected_receipt_sha256=receipt_sha256(receipt), reason=reason), run)
     return core.reconcile(project, operation_id, actor, reason, disposition, run, SPEC,
                           issue_id=issue_id)
 

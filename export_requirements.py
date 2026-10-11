@@ -238,13 +238,17 @@ def adapt(rows, selection, acceptance=None, previous=None, previous_acceptance=N
             selected_ids.append(rid)
             sources.append({'reference': ref, 'comment_ids': sorted(locations[(rid, rev)])})
             from requirement_owner_records import state_ledger
-            terminal, explanation = state_ledger(issues[rid])
-            if terminal is not None:
-                if governance is None:
-                    raise ValueError('Terminal requirement export needs its exact governance history')
-                from requirement_governance import validate_evidence_files
-                validate_evidence_files(governance, selection['canonical_project'], terminal)
-                terminal_states[rid] = {'state': terminal, 'reason': explanation}
+            try:
+                terminal, explanation = state_ledger(issues[rid])
+                if terminal is not None:
+                    if governance is None:
+                        raise ValueError('Terminal requirement export needs its exact governance history')
+                    from requirement_governance import validate_evidence_files
+                    validate_evidence_files(governance, selection['canonical_project'], terminal)
+                    terminal_states[rid] = {'state': terminal, 'reason': explanation}
+            except (ValueError, TypeError, KeyError):
+                terminal_states[rid] = {'requirement_state': 'unknown',
+                    'message': 'Requirement status cannot be verified; historical exact content and acceptance remain readable'}
     for field in ('context_ids', 'blocking_ids'):
         values = selection[field]
         if not isinstance(values, list) or any(not isinstance(v, str) or not v for v in values) or len(set(values)) != len(values):

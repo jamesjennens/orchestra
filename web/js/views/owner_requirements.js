@@ -18,7 +18,32 @@ function terminalStatus(ctx, pid, item) {
   h('p', null, item.state_message || displayText(item.reason?.reason)),
   successor ? h('p', null, 'Replaced by ', h('a', { href: ctx.href(`/p/${pid}/requirements/${successor.id}`) }, successor.id),
     ` · revision ${successor.revision}`, h('code', null, successor.sha256)) : null,
-  item.state ? h('p', { class: 'small' }, `Recorded by ${item.state.account_id} · ${item.state.at}`) : null);
+  item.state ? h('p', { class: 'small' }, `Recorded by ${item.state_author_name || 'Former project owner'} · ${item.state.at}`) : null);
+}
+
+function transitionRecovery(ctx, pid, item) {
+  const saved = item.pending_transition;
+  if (!saved) return null;
+  const message = h('p', { role: 'status' }, saved.message);
+  const reason = h('textarea', { maxlength: 1000, rows: 2 });
+  const body = { original_operation_id: saved.operation_id, expected_receipt_sha256: saved.expected_receipt_sha256 };
+  const act = async (event, action) => {
+    const button = event.currentTarget || event.target; button.disabled = true;
+    try {
+      if (action === 'finish') await ctx.api.finishRequirementTransition(pid, item.id, body);
+      else {
+        if (!reason.value.trim()) throw new Error('Explain why this transition should be abandoned.');
+        await ctx.api.abandonRequirementTransition(pid, item.id, { ...body, reason: reason.value });
+      }
+      ctx.go(`/p/${pid}/requirements/${item.id}`);
+    } catch (error) { message.textContent = describe(error); button.disabled = false; }
+  };
+  return h('section', { class: 'panel stack' }, h('h2', null, 'Pending requirement transition'),
+    h('p', null, 'Any current owner can finish the saved transition. Abandon only when no state was written. The original reason and replacement remain unchanged.'),
+    h('p', null, displayText(saved.reason?.reason)), message,
+    h('button', { type: 'button', disabled: !saved.can_finish, onclick: (event) => act(event, 'finish') }, 'Finish transition'),
+    h('label', null, 'Why abandon this transition?', reason),
+    h('button', { type: 'button', disabled: !saved.can_abandon, onclick: (event) => act(event, 'abandon') }, 'Abandon transition'));
 }
 
 function terminalForm(ctx, pid, item, candidates) {
@@ -155,6 +180,8 @@ export async function brd(ctx, { pid }, project, data) {
   h('div', { class: 'actions' }, mode, modeMessage),
   (data.governance.warnings || []).map((warning) => h('p', { class: 'banner', role: 'status' }, warning.message)),
   !simple ? h('p', { class: 'banner' }, 'This project uses governed requirements.') : null,
+  (data.terminal_recoveries?.damaged || []).filter((item) => !item.id).map((item) =>
+    h('p', { class: 'banner', role: 'status' }, item.message)),
   data.items.filter((item) => item.kind === 'brd-section').map(card),
   data.items.filter((item) => item.kind === 'requirement' && active(item)).map(card),
   data.items.some((item) => item.kind === 'requirement' && !active(item)) ? h('section', { class: 'stack' },
@@ -188,6 +215,8 @@ export async function requirement(ctx, { pid, rid }, project, data) {
     crumbs: [{ label: 'Requirements', href: ctx.href(`/p/${pid}/requirements`) }] }),
   h('div', { class: 'actions' }, state(main), accept, message),
   terminalStatus(ctx, pid, data),
+  data.can_edit && data.governance.mode === 'simple' ? transitionRecovery(ctx, pid, data) : null,
+  editable && data.kind === 'requirement' && data.pending_draft ? h('p', null, 'To withdraw or supersede this requirement, accept the pending edit first.') : null,
   h('p', { class: 'small' }, revision(main)),
   h('div', { class: 'panel-body', style: 'white-space:pre-wrap;unicode-bidi:plaintext' }, displayText(main.description)),
   data.accepted && data.pending_draft ? h('h2', null, `Pending edit · revision ${record.revision}`) : null,

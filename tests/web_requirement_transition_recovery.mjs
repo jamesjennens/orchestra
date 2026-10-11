@@ -1,0 +1,38 @@
+// A reloaded page uses the server receipt, including when a different owner acts.
+import './web_dom_shim.mjs';
+import assert from 'node:assert/strict';
+const [apiUrl, viewUrl, base, pid, token, finishId, abandonId, editId] = process.argv.slice(2);
+const { createApi } = await import(apiUrl);
+const view = await import(viewUrl);
+const api = createApi(async (method, path, headers, body) => {
+  const response = await fetch(base + path, { method, headers: { ...headers, Authorization: 'Bearer ' + token }, body });
+  return { status: response.status, data: response.status === 204 ? null : await response.json() };
+});
+const ctx = { api, href: (path) => '#' + path, go(path) { this.destination = path; }, setDirty() {} };
+let data = await api.requirement(pid, finishId);
+const saved = data.pending_transition;
+let page = await view.requirement(ctx, { pid, rid: finishId }, {}, data);
+assert.ok(page.textContent.includes(saved.reason.reason));
+const buttons = page.querySelectorAll('button');
+assert.equal(buttons.find((button) => button.textContent === 'Abandon transition').disabled, true);
+await buttons.find((button) => button.textContent === 'Finish transition').dispatch('click');
+assert.equal(ctx.destination, `/p/${pid}/requirements/${finishId}`);
+data = await api.requirement(pid, finishId);
+assert.deepEqual(data.state, saved.state);
+assert.deepEqual(data.reason, saved.reason);
+page = await view.requirement(ctx, { pid, rid: finishId }, {}, data);
+assert.ok(page.textContent.includes(data.state_author_name));
+assert.ok(!page.textContent.includes(data.state.account_id));
+assert.ok(!page.textContent.includes('Finish transition'));
+data = await api.requirement(pid, abandonId);
+page = await view.requirement(ctx, { pid, rid: abandonId }, {}, data);
+assert.equal(page.querySelectorAll('button').find((button) => button.textContent === 'Abandon transition').disabled, false);
+page.querySelector('textarea').value = 'No state was written; abandon this saved attempt.';
+await page.querySelectorAll('button').find((button) => button.textContent === 'Abandon transition').dispatch('click');
+assert.equal((await api.requirement(pid, abandonId)).pending_transition, null);
+data = await api.requirement(pid, editId);
+page = await view.requirement(ctx, { pid, rid: editId }, {}, data);
+assert.ok(page.textContent.includes('accept the pending edit first'));
+assert.ok(!page.textContent.includes('This cannot be undone in the browser.'));
+console.log(JSON.stringify({ reloadedReceipt: true, secondOwner: true, exactFinish: true, boundedAbandon: true,
+  authorName: true, pendingEditAdvice: true }));

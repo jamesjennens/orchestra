@@ -62,25 +62,42 @@ Acceptance and status are separate. Terminal records retain their immutable
 accepted revisions and decisions. A member can read the reason, author, timestamp,
 exact replacement and revision history. Reverse “Supersedes” links are derived
 from the old record's pointer. A failed or conflicting transition reads as
-**Status unknown**, and stays out of current active selection. Retry its exact
-original request; an unproved receipt or effect needs host operator reconciliation.
+**Status unknown**, and stays out of current nonterminal selection. A pending
+transition belongs to the project. Any current human owner in simple mode can
+finish the exact saved transition, including after a page reload or the original
+owner's departure. No remembered key or new reason/successor is used. Abandon
+only when a complete native read under the same locks proves no state was written;
+the receipt keeps a released disposition. Once a state was written, finish is the
+only action. A supersession whose successor is no longer eligible cannot be
+finished; abandon is available only before any state was written. Damaged receipts
+are identified separately and affect their own requirement only; unidentifiable
+files are operator diagnostics, never evidence that every requirement is pending.
+`admin.py requirement-reconcile` finds the terminal receipt by its operation ID.
+For this recovery, the host operator supplies `--state` with the existing web
+service state document. The command takes its authority lock and the project lock,
+then either finishes the saved evidence (`--disposition complete`) or retains an
+abandonment disposition (`--disposition released`) after proving native absence.
+Before withdrawal or supersession of a pending edit, accept the pending edit first.
 
 | Consumer | Terminal requirement behavior |
 | --- | --- |
-| Requirements list, detail and generated BRD | Retain accepted content and history; display status separately. Current `active_ids` excludes terminal and unknown records. The BRD groups them separately. |
+| Requirements list, detail and generated BRD | Retain accepted content and history; display status separately. `nonterminal_ids` excludes terminal and unknown records but includes never-accepted drafts, pending edits and narrative sections; it is not an accepted-requirements selector. The BRD groups terminal records separately. |
 | Work and brief | Native requirement tasks stay visible with their status labels. A terminal transition neither closes work nor changes checkpoints, blockers or lifecycle facts. |
-| Proposal traceability | Exact old content remains readable; it no longer qualifies as the content accepted today for incorporation. |
+| Proposal list, detail, brief and traceability | Exact old content remains readable with terminal or unknown state and a sentence. These states are never presented as draft. New incorporation into any of them is refused; unrelated proposals remain readable. |
 | Capability links | An explicit historical revision remains linkable. A link without a revision requires a currently active record. |
-| Offline export and publication | Explicit historical selections retain their manifest bytes and acceptance. Provenance includes the validated state/reason pair and governance lineage; terminal status does not delete historical content. |
+| Offline export and publication | Explicit historical selections retain their manifest bytes and acceptance even while current status is unknown. Provenance includes the validated state/reason pair and governance lineage when provable, otherwise an unknown-state sentence; terminal status does not delete historical content. |
 | Impact analysis and worker launch contracts | Operate on explicitly selected immutable manifests and exact references. Terminal status does not rewrite a manifest, silently retarget work, or remove a launch requirement. A changed active selection needs a new reviewed manifest and reassessment. |
 
 Backup/restore carries native evidence, the exact request receipts and governance
 source ranges. It preserves terminal hashes when the project is restored under a
-new name. Projects with no terminal records remain compatible with the preceding
-release. A project with terminal evidence requires this release or a later one:
-the preceding reader refuses the newly activated state family. Do not roll such
-a project back and infer activity from old labels, or strip evidence to make it
-readable. Restore a pre-transition backup if a rollback is required. Named
+new name. Projects with no terminal records retain preceding-release compatibility.
+After the first withdrawal or supersession, **do not serve the project from an
+older kit**. The preceding reader refuses terminal evidence, but its writer does
+not: editing and accepting can succeed and permanently damage terminal history.
+The preceding kit can also restore a backup with terminal records without warning,
+then read those records as unreadable. Use this release or a later compatible one
+for those backups. Do not strip evidence to make it readable. Restore a pre-transition
+backup if a rollback is required, retaining the post-transition backup separately. Named
 baselines and Markdown download/comparison are a separate later delivery.
 
 An interrupted acceptance uses its recorded generated decision ID. Editable

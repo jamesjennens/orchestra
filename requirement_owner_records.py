@@ -142,7 +142,7 @@ def validate_reason(record):
         raise ValueError('State reason needs a human account')
     if not isinstance(record['at'], str) or not record['at'].strip():
         raise ValueError('State reason needs a timestamp')
-    if (not isinstance(record['reason'], str) or not 1 <= len(record['reason'].strip()) <= 1000
+    if (not isinstance(record['reason'], str) or not record['reason'].strip() or not 1 <= len(record['reason']) <= 1000
             or '\0' in record['reason']):
         raise ValueError('State reason must contain 1 to 1000 characters')
     if content_hash(record) != record['sha256']:
@@ -182,7 +182,7 @@ def state_ledger(row, allow_partial=False):
     """Immutable terminal evidence; labels cannot manufacture or undo a state.
 
     A missing reason is an interrupted transition, never an active requirement.
-    Only the writer recovering its exact receipt may inspect that partial pair.
+    A checked recovery may inspect the partial pair from its exact durable receipt.
     """
     from keyed_records import existing_ledger
     from requirement_records import existing_revisions
@@ -217,7 +217,7 @@ def state_ledger(row, allow_partial=False):
     reason = reasons.get(evidence['sha256'])
     if reason is None:
         if not allow_partial:
-            raise ValueError('Requirement terminal transition is incomplete; retry its original request')
+            raise ValueError('Requirement terminal transition is incomplete; finish it on the requirements page')
     elif (any(reason[key] != evidence[key] for key in ('project', 'id', 'account_id', 'at', 'operation_id'))):
         raise ValueError('Requirement state reason conflicts with its state evidence')
     return evidence, reason

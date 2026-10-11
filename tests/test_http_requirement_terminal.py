@@ -37,6 +37,75 @@ class TerminalHttpTests(EndpointCase):
     def terminal_body(self,item,**extra):
         return dict(self.expected(item),expected_state_sha256=None,reason='No longer needed.',**extra)
 
+    def pending_transition(self,item):
+        view=self.request('GET',self.base+'/requirements/'+item['id'],token=self.owner_token)
+        self.assertEqual(view.status,200,view.data)
+        return view.data['pending_transition']
+
+    def recover_transition(self,item,saved,action='finish',token=None,key='finish-transition'):
+        body=dict(original_operation_id=saved['operation_id'],expected_receipt_sha256=saved['expected_receipt_sha256'])
+        if action=='abandon':body['reason']='No state was written.'
+        return self.request('POST',self.base+'/requirements/'+item['id']+'/transition/'+action,body,
+                            token=token or self.owner_token,key=key)
+
+    def test_second_owner_after_departure_finishes_from_reloaded_receipt_and_audits_once(self):
+        first=self.accepted(); self.backend.native.fail_comment_prefix=owner.REASON_PREFIX
+        failed=self.transition(first); self.assertEqual(failed.status,503,failed.data)
+        saved=self.pending_transition(first); self.assertTrue(saved['can_finish']); self.assertFalse(saved['can_abandon'])
+        self.backend.native.fail_comment_prefix=None
+        admin=self.admin_token(); second=self.create_account(admin,'recovery-owner','recovery-owner-password')
+        token=self.login('recovery-owner','recovery-owner-password')[0]
+        self.assertEqual(self.request('PUT',self.base+'/members/'+second,{'role':'owner'},token=admin).status,200)
+        self.assertEqual(self.request('PUT',self.base+'/members/'+self.account,{'role':'contributor'},token=admin).status,200)
+        denied=self.recover_transition(first,saved,token=self.owner_token);self.assertEqual(denied.status,403,denied.data)
+        finished=self.recover_transition(first,saved,token=token);self.assertEqual(finished.status,200,finished.data)
+        self.assertEqual(finished.data['state'],saved['state']);self.assertEqual(finished.data['reason'],saved['reason'])
+        writes=len(self.backend.native.writes())
+        for key in ('finish-transition','fresh-owner-finish'):
+            replay=self.recover_transition(first,saved,token=token,key=key);self.assertEqual(replay.status,200,replay.data)
+            self.assertEqual(replay.data['state'],saved['state'])
+        self.assertEqual(len(self.backend.native.writes()),writes)
+        events=[e for e in self.service.state['audit'] if e['action']=='requirements.finish' and e['outcome']=='committed']
+        self.assertEqual(len(events),1,events)
+        row=self.backend.native.row(first['id'])
+        self.assertEqual([c['author'] for c in row['comments'] if c['text'].startswith((owner.STATE_PREFIX,owner.REASON_PREFIX))],
+                         [self.account,self.account])
+        shown=self.request('GET',self.base+'/requirements/'+first['id'],token=token)
+        self.assertEqual(shown.data['state_author_name'],'alex')
+
+    def test_abandon_before_state_and_refusal_after_state_keep_new_intents_usable(self):
+        item=self.accepted();self.backend.native.fail_comment_prefix=owner.STATE_PREFIX
+        failed=self.transition(item);self.assertEqual(failed.status,503,failed.data)
+        saved=self.pending_transition(item);self.assertTrue(saved['can_abandon'])
+        released=self.recover_transition(item,saved,'abandon');self.assertEqual(released.status,200,released.data)
+        self.assertEqual(released.data['disposition'],'released')
+        self.backend.native.fail_comment_prefix=None
+        new=self.transition(item,key='after-abandon');self.assertEqual(new.status,200,new.data)
+        other=self.accepted('second');self.backend.native.fail_comment_prefix=owner.REASON_PREFIX
+        self.assertEqual(self.transition(other,key='partial-second').status,503)
+        saved=self.pending_transition(other);self.assertFalse(saved['can_abandon'])
+        refused=self.recover_transition(other,saved,'abandon');self.assertEqual(refused.status,422,refused.data)
+        self.assertIn('already written',str(refused.data));self.backend.native.fail_comment_prefix=None
+        self.assertEqual(self.recover_transition(other,saved).status,200)
+
+    def test_terminal_audit_exact_replays_are_one_and_duplicate_fields_are_refused(self):
+        item=self.accepted(); fields=self.terminal_body(item)
+        text=json.dumps(fields)[:-1]+',"reason":"different reason"}'
+        before=len(self.backend.native.writes())
+        duplicate=self.transition(item,body=text,key='duplicate-reason');self.assertEqual(duplicate.status,422,duplicate.data)
+        self.assertEqual(len(self.backend.native.writes()),before)
+        for _ in range(3):self.assertEqual(self.transition(item,key='one-terminal-audit').status,200)
+        events=[e for e in self.service.state['audit'] if e['action']=='requirements.withdraw' and e['outcome']=='committed']
+        self.assertEqual(len(events),1,events)
+
+    def test_finish_body_cannot_replace_saved_evidence(self):
+        item=self.accepted();self.backend.native.fail_comment_prefix=owner.STATE_PREFIX
+        self.assertEqual(self.transition(item).status,503)
+        saved=self.pending_transition(item); before=len(self.backend.native.writes())
+        body=dict(original_operation_id=saved['operation_id'],expected_receipt_sha256=saved['expected_receipt_sha256'],reason='Forged')
+        result=self.request('POST',self.base+'/requirements/'+item['id']+'/transition/finish',body,token=self.owner_token,key='forged-finish')
+        self.assertEqual(result.status,422,result.data);self.assertEqual(len(self.backend.native.writes()),before)
+
     def transition(self,item,action='withdraw',key='terminal',token=None,body=None):
         return self.request('POST',self.base+'/requirements/'+item['id']+'/'+action,
                             self.terminal_body(item) if body is None else body,
@@ -54,7 +123,7 @@ class TerminalHttpTests(EndpointCase):
         self.assertEqual(view.status,200,view.data); self.assertEqual(view.data['state']['superseded_by'],reference)
         self.assertEqual(view.data['accepted']['sha256'],first['sha256']); self.assertEqual(len(view.data['history']),2)
         brd=self.request('GET',self.base+'/brd',token=token)
-        self.assertNotIn(first['id'],brd.data['active_ids']); self.assertIn(second['id'],brd.data['active_ids'])
+        self.assertNotIn(first['id'],brd.data['nonterminal_ids']); self.assertIn(second['id'],brd.data['nonterminal_ids'])
         self.assertEqual(self.request('GET',self.base+'/requirements/'+second['id'],token=token).data['supersedes'][0]['id'],first['id'])
 
     def test_closed_fields_state_content_cas_and_draft_refuse_before_effect(self):
@@ -177,3 +246,27 @@ class TerminalHttpTests(EndpointCase):
             'http://127.0.0.1:'+str(self.port),self.project,self.owner_token,token,first['id'],second['id'])
         self.assertEqual(output.returncode,0,output.stderr)
         self.assertTrue(all(json.loads(output.stdout).values()))
+
+    def test_browser_reloaded_second_owner_finishes_and_abandons_saved_transitions(self):
+        from test_http_web import run_node_module
+        node=shutil.which('node')
+        if not node:self.skipTest('Node.js is required for transition recovery page checks')
+        finish=self.accepted('page-finish');abandon=self.accepted('page-abandon');edit=self.accepted('page-edit')
+        self.backend.native.fail_comment_prefix=owner.REASON_PREFIX
+        self.assertEqual(self.transition(finish,key='page-finish').status,503)
+        self.backend.native.fail_comment_prefix=owner.STATE_PREFIX
+        self.assertEqual(self.transition(abandon,key='page-abandon').status,503)
+        self.backend.native.fail_comment_prefix=None
+        pending=self.request('PATCH',self.base+'/requirements/'+edit['id'],dict(self.expected(edit),description='Pending edit'),
+            token=self.owner_token,key='page-pending-edit');self.assertEqual(pending.status,200,pending.data)
+        admin=self.admin_token();second=self.create_account(admin,'page-owner','page-owner-password')
+        token=self.login('page-owner','page-owner-password')[0]
+        self.assertEqual(self.request('PUT',self.base+'/members/'+second,{'role':'owner'},token=admin).status,200)
+        self.assertEqual(self.request('PUT',self.base+'/members/'+self.account,{'role':'contributor'},token=admin).status,200)
+        root=Path(__file__).resolve().parents[1]
+        script=(root/'tests/web_requirement_transition_recovery.mjs').read_text().replace(
+            "'./web_dom_shim.mjs'",repr((root/'tests/web_dom_shim.mjs').as_uri()))
+        output=run_node_module(self,node,script,'terminal-recovery-browser',(root/'web/js/api.js').as_uri(),
+            (root/'web/js/views/owner_requirements.js').as_uri(),'http://127.0.0.1:'+str(self.port),self.project,
+            token,finish['id'],abandon['id'],edit['id'])
+        self.assertEqual(output.returncode,0,output.stderr);self.assertTrue(all(json.loads(output.stdout).values()))
