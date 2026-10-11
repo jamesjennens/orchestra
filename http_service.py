@@ -4464,6 +4464,9 @@ class ApiHandler(BaseHTTPRequestHandler):
             self.service.create_project(principal, name, project_id)
             # The mark that a superuser registered this mapping; `project_unusable` reads it.
             self.service.state['projects'][project_id]['registered_by'] = principal.user_id
+            # create_project saved before this mark existed. Persist the complete
+            # registration before _mutate can commit its success receipt.
+            self.service.store.save()
             result = self._usable(self.service.project_view(principal, project_id))
             return result, result
         return self._mutate(ctx, 'projects.create', None, register, status=201, capability=CAP_ACCOUNTS_ADMIN,
@@ -4607,6 +4610,9 @@ class ApiHandler(BaseHTTPRequestHandler):
             # behind stays usable even if that superuser is later demoted (kittrial-5bb.90).
             # A record that already names its registrant keeps it.
             record.setdefault('registered_by', principal.user_id)
+            # A replayed success must describe a durable confirmation, including
+            # the registration mark that survives the registrant's demotion.
+            self.service.store.save()
             result = {'id': project_id, 'name': record.get('name'), 'usable': True,
                       'confirmed_by': principal.user_id, 'confirmed_at': record['confirmed_at'],
                       'created_by': item['created_by'], 'members': item['members']}
