@@ -6488,19 +6488,20 @@ class ApiHandler(BaseHTTPRequestHandler):
                 held_by = getattr(refusal, 'held_by', None)
                 if held_by is None and refusal.code != 'conflict':
                     raise
-                # Candidate fall-through (kittrial-5bb.6 deliverable b, review item 4): a
-                # refused claim on a task that is still OPEN answers with the next BOUNDED
-                # claimable rows so an agent need not re-read the queue. It is not attached
-                # to a refusal about a task nobody could take anyway: the fall-through read
-                # is made ONLY while the refused task is OPEN, so `Task is not open` -- a
-                # closed task, even one that still has an assignee and therefore reports
-                # `held_by` -- carries no candidates and costs no read (round-3 review
-                # finding 4). The refused task itself is never among the candidates.
+                # Candidate fall-through (kittrial-5bb.6 deliverable b, review item 4;
+                # round-3 finding F1): a refused claim on a task that is NOT CLOSED -- OPEN,
+                # the `in_progress` a real claim leaves, or `blocked` -- answers with the next
+                # BOUNDED claimable rows so an agent need not re-read the queue. A held task
+                # is `in_progress` on a real tracker, so reading only while the task was OPEN
+                # made the fall-through vanish in the ordinary case. It is not attached to a
+                # refusal about a task nobody could take anyway: a CLOSED task, even one that
+                # still has an assignee and therefore reports `held_by`, carries no candidates
+                # and costs no read. The refused task itself is never among the candidates.
                 # Advisory: claimability is not a reservation and the next claim is still
                 # atomic. When there is nothing to fall through to, the refusal is
                 # re-raised byte for byte, so every existing sentence and detail is kept.
                 candidates, truncated = [], False
-                if str((task or {}).get('status')) == 'open':
+                if str((task or {}).get('status')) != 'closed':
                     candidates, truncated = self._claim_candidates(ctx.params['pid'], ctx.params['tid'])
                 if not candidates and held_by is None:
                     raise

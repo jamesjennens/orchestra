@@ -691,9 +691,10 @@ class InProcessAttentionTests(test_http_agents.AgentHarness):
 class RefusedClaimTests(test_http_agents.AgentHarness):
     """The refused-claim fall-through over HTTP (kittrial-5bb.6 review item 4).
 
-    ``Task is already claimed`` on an OPEN task offers at most ten candidates and says
-    the list was cut; ``Task is not open`` (a closed task) offers none and costs no
-    fall-through read at all.
+    A refusal on a task that is not closed offers at most ten candidates and says the
+    list was cut -- including a HELD task, whose status a real ``bd`` claim leaves
+    ``in_progress`` (round-3 finding F1). A CLOSED task offers none and costs no
+    fall-through read at all, even when it still has an assignee (F2).
     """
 
     def setUp(self):
@@ -742,8 +743,22 @@ class RefusedClaimTests(test_http_agents.AgentHarness):
         self.assertTrue(detail['candidates_truncated'])
         self.assertNotIn(held, [row['task'] for row in detail['candidates']])
         self.assertEqual(len(self.reads), 1)
+        # A HELD task is `in_progress` on a real tracker (bd's own claim sets it, F1): the
+        # fall-through read is still made, so the refusal still carries the bounded
+        # candidates. The in-process backend leaves a claimed task `open`; the endpoint
+        # stub in test_claim_held.py holds both the status and the named holder.
+        self.backend.state['tasks'][held]['status'] = 'in_progress'
+        self.reads.clear()
+        in_progress = self.claim(self.B, held)
+        self.assertEqual(409, in_progress.status)
+        detail = self.detail(in_progress)
+        self.assertEqual(len(detail['candidates']), http_service.CLAIM_CANDIDATES_LIMIT)
+        self.assertTrue(detail['candidates_truncated'])
+        self.assertNotIn(held, [row['task'] for row in detail['candidates']])
+        self.assertEqual(len(self.reads), 1)
         # A CLOSED task: no fall-through is possible, so no candidates and no read.
         closed = self.task('closed one')
+        self.assertEqual(200, self.claim(self.A, closed).status)
         self.backend.state['tasks'][closed]['status'] = 'closed'
         self.reads.clear()
         not_open = self.claim(self.B, closed)
