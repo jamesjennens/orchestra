@@ -766,10 +766,12 @@ class ClaimCandidateTests(unittest.TestCase):
         return handler
 
     def test_candidates_are_bounded_filtered_and_never_the_refused_task(self):
-        items = [dict(id='refused', title='the refused task', claimable=True)]
+        # The rows the rule excludes come FIRST, so an implementation that offers every row
+        # (the ``candidates-not-filtered`` mutant) puts one inside the returned ten.
+        items = [dict(id='epic', title='an epic', claimable=False),
+                 dict(id='taken', title='held by somebody', claimable=False),
+                 dict(id='refused', title='the refused task', claimable=True)]
         items += [dict(id='c%02d' % i, title='claimable %d' % i, claimable=True) for i in range(25)]
-        items += [dict(id='epic', title='an epic', claimable=False),
-                  dict(id='taken', title='held by somebody', claimable=False)]
         found, truncated = self.handler(items)._claim_candidates('proj', 'refused')
         self.assertEqual(len(found), http_service.CLAIM_CANDIDATES_LIMIT)
         self.assertEqual([row['task'] for row in found],
@@ -777,12 +779,11 @@ class ClaimCandidateTests(unittest.TestCase):
         # The list says it was cut instead of dropping rows silently.
         self.assertTrue(truncated)
         # Never the refused task, and never a row the shared rule does not call claimable.
-        self.assertNotIn('refused', [row['task'] for row in found])
-        self.assertNotIn('epic', [row['task'] for row in found])
-        self.assertNotIn('taken', [row['task'] for row in found])
+        for excluded in ('refused', 'epic', 'taken'):
+            self.assertNotIn(excluded, [row['task'] for row in found])
         # Not cut when the read holds no more than the cap.
         found, truncated = self.handler(items[:5])._claim_candidates('proj', 'other')
-        self.assertEqual([row['task'] for row in found], ['refused', 'c00', 'c01', 'c02', 'c03'])
+        self.assertEqual([row['task'] for row in found], ['refused', 'c00', 'c01'])
         self.assertFalse(truncated)
         # A read failure offers nothing and never changes the refusal.
         broken = http_service.ApiHandler.__new__(http_service.ApiHandler)
