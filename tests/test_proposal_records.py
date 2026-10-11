@@ -512,6 +512,43 @@ class LifecycleTests(ProposalCase):
         self.accept_requirement(requirement)
         self.assertEqual(self.get(key)['linked_requirement']['acceptance_state'], 'accepted')
 
+    def test_terminal_unknown_and_pending_requirement_cost_only_the_linked_item(self):
+        import requirement_governance as governance
+        import requirement_http as http
+        import requirement_owner_records as owner
+        from test_requirement_owner_records import ACCOUNT
+        governance.initialize(self.project,'demo',ACCOUNT,'create-demo')
+        requirement=self.requirement('R01',accepted=True)
+        key=self.submit()['key'];self.claim(key)
+        linked=self.incorporation(requirement,revision=2,acceptance_decision_id='dec-1')
+        self.dispose(key,'incorporated',incorporation=linked)
+        row=self.native.row(requirement);record=rq.existing_revisions(row)[2]
+        context=http.OwnerContext('demo',ACCOUNT,governance.current(self.project,'demo'))
+        self.native.actor=ACCOUNT
+        fields=dict(expected_revision=2,expected_sha256=record['sha256'],expected_state_sha256=None,reason='Retain history.')
+        result=http.apply(self.project,context,'withdraw',fields,'proposal-terminal',self.native,requirement)
+        self.assertEqual(self.get(key)['linked_requirement']['acceptance_state'],'withdrawn')
+        again=self.submit(operation_id='try-terminal-incorporation')['key'];self.claim(again)
+        before=len(self.native.writes())
+        with self.assertRaisesRegex(ValueError,'withdrawn'):self.dispose(again,'incorporated',incorporation=linked)
+        self.assertEqual(len(self.native.writes()),before)
+        comment=next(c for c in row['comments'] if c['text'].startswith(owner.REASON_PREFIX))
+        comment['text']=owner.REASON_PREFIX+'{bad'
+        detail=self.get(key);self.assertEqual(detail['linked_requirement']['acceptance_state'],'unknown')
+        self.assertIn('cannot be verified',detail['linked_requirement']['state_message'])
+        self.assertEqual(self.read('list')['total'],2)
+        block=pr.brief_attention(self.rows(),self.native.row('job-1'),COORD,OPS,self.project)
+        self.assertEqual(block['attention'],[])
+        self.assertEqual(pr.live_acceptance({requirement:row},linked),'unknown')
+        # Before the state write, only the project receipt says the status is unknown.
+        row['comments']=[c for c in row['comments'] if not c['text'].startswith((owner.STATE_PREFIX,owner.REASON_PREFIX))]
+        from requirement_terminal import receipt_path
+        saved=json.loads(receipt_path(self.project,'proposal-terminal').read_text());saved['status']='pending'
+        receipt_path(self.project,'proposal-terminal').write_text(json.dumps(saved))
+        self.assertEqual(self.get(key)['linked_requirement']['acceptance_state'],'unknown')
+        with self.assertRaisesRegex(ValueError,'cannot be verified|unknown'):self.dispose(again,'incorporated',incorporation=linked)
+        self.assertEqual(self.read('list')['total'],2)
+
     def test_an_incorporation_stops_reading_accepted_when_different_content_is_accepted(self):
         # Review 01a10180 (accepted-after-different-content).
         requirement = self.requirement('R01')

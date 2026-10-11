@@ -625,9 +625,9 @@ class AuthorityConfig:
     and only its launcher knows it (kittrial-5bb.188 item 3).
     """
 
-    __slots__ = ('store', 'lock', 'service_namespace')
+    __slots__ = ('store', 'lock', 'service_namespace', 'terminal_endpoint_timeout')
 
-    def __init__(self, store, lock=None, service_namespace=None):
+    def __init__(self, store, lock=None, service_namespace=None, terminal_endpoint_timeout=150):
         if not isinstance(store, str) or not store:
             raise ValueError('AuthorityConfig.store must be a non-empty path')
         self.store = store
@@ -636,6 +636,12 @@ class AuthorityConfig:
             import actor_names
             service_namespace = actor_names.SERVICE_NAMESPACE
         self.service_namespace = service_namespace
+        import math
+        if (isinstance(terminal_endpoint_timeout, bool)
+                or not isinstance(terminal_endpoint_timeout, (int, float))
+                or not math.isfinite(terminal_endpoint_timeout) or terminal_endpoint_timeout <= 0):
+            raise ValueError('Terminal endpoint timeout must be positive and finite')
+        self.terminal_endpoint_timeout = terminal_endpoint_timeout
 
 
 def principal_key(request, authority_configured=False, account_identity=False):
@@ -1695,14 +1701,6 @@ class OperationJournal:
             row = connection.execute('SELECT * FROM operations WHERE operation_id = ?',
                                      (operation_id,)).fetchone()
         return self._row_record(row) if row is not None else None
-
-    def pending_owner_creates(self, principal):
-        """Bounded candidates for the owner adapter's empty-create recovery read.
-
-        This is only discovery. The adapter must validate the inner receipt and
-        prove native absence under its project and authority locks before release.
-        """
-        return self.pending_owner_creates_snapshot(principal, limit=21)['items']
 
     def pending_owner_creates_snapshot(self, principal, limit=20):
         """Bounded candidates and their exact total from one read snapshot."""

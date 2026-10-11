@@ -120,6 +120,91 @@ class AgentScopeFollowupTests(AgentHarness):
         self.assertEqual(403, self.renew(aid, ['read'], token=self.admin).status)
         self.assertEqual('inferred', self.service.state['agents'][aid]['scopes_source'])
 
+    def test_actual_inference_keeps_its_zero_moment_when_clock_advances(self):
+        aid, _, made = self.agent(['read'])
+        self.legacy(aid)
+        credential = self.service.state['credentials'][made['credential']['id']]
+        credential['expires_at'] = 1
+        credential.pop('issued_raw', None)
+        agent = self.service.state['agents'][aid]
+        # A zero snapshot is a real instant. A liveness helper replacing it by
+        # a second reading (100) changes the inference during this single read.
+        with mock.patch.object(self.service, '_expiry_now', side_effect=[0, 100, 100]), \
+                mock.patch.object(self.service, '_now', return_value=100):
+            self.assertEqual((('read',), 'inferred'), self.service.agent_scopes(agent))
+        self.assertNotIn('scopes', agent)
+
+    def test_http_inference_at_zero_excludes_expired_wider_credential(self):
+        aid, _, made = self.agent(['read'])
+        wider = self.renew(aid, ['read', 'tasks']).data['credential']['id']
+        self.legacy(aid)
+        for cid, expiry in ((made['credential']['id'], 1), (wider, 0)):
+            credential = self.service.state['credentials'][cid]
+            credential['expires_at'] = expiry
+            credential.pop('issued_raw', None)
+        # Exercise the ordinary agent read, including metadata projection. Raw
+        # time is deliberately different from the captured expiry instant.
+        with mock.patch.object(self.service, '_expiry_now', return_value=0), \
+                mock.patch.object(self.service, '_now', return_value=100):
+            reply = self.request('GET', '/v1/agents/%s' % aid, token=self.owner)
+        self.assertEqual(200, reply.status, reply.data)
+        self.assertEqual((['read'], 'inferred'), (reply.data['scopes'], reply.data['scopes_source']))
+        self.assertEqual([], reply.data['scopes_differ'])
+        self.assertNotIn('scopes', self.service.state['agents'][aid])
+
+    def test_redundant_revoke_saves_and_receipts_without_duplicate_audit(self):
+        aid, _, made = self.agent(['read'])
+        cid = made['credential']['id']
+        path = '/v1/agents/%s/credentials/%s/revoke' % (aid, cid)
+        self.assertEqual(204, self.request('POST', path, {}, token=self.owner).status)
+        before = copy.deepcopy(self.service.state['audit'])
+        # Defer the best-effort authentication stamp, isolating the route's save.
+        # Authentication and live authority still run normally.
+        with mock.patch.object(self.store, 'save_soon', return_value=False), \
+                mock.patch.object(self.store, '_write', wraps=self.store._write) as saved, \
+                mock.patch.object(self.service, 'idempotency_commit', wraps=self.service.idempotency_commit) as receipt:
+            reply = self.request('POST', path, {}, token=self.owner, key='redundant-revoke')
+            self.assertEqual(204, reply.status, reply.data)
+            self.assertEqual(1, saved.call_count)
+            self.assertEqual(1, receipt.call_count)
+            self.assertEqual(204, self.request('POST', path, {}, token=self.owner, key='redundant-revoke').status)
+            self.assertEqual(1, saved.call_count)
+            self.assertEqual(1, receipt.call_count)
+        self.assertEqual(before, self.service.state['audit'])
+        reloaded = http_auth.Store(self.store.path)
+        self.assertTrue(reloaded.state['credentials'][cid]['revoked'])
+
+    def test_redundant_revoke_persists_a_prior_failed_save_before_receipt(self):
+        aid, secret, made = self.agent(['read'])
+        cid = made['credential']['id']
+        path = '/v1/agents/%s/credentials/%s/revoke' % (aid, cid)
+        write = self.store._write
+        def fail():
+            if self.service.state['credentials'][cid]['revoked']:
+                raise OSError('synthetic revoke save failure')
+            return write()
+        with mock.patch.object(self.store, '_write', side_effect=fail):
+            self.assertEqual(500, self.request('POST', path, {}, token=self.owner, key='pending-revoke').status)
+        self.assertTrue(self.service.state['credentials'][cid]['revoked'])
+        self.assertFalse(json.loads(self.store.path.read_text(encoding='utf-8'))['credentials'][cid]['revoked'])
+        events = copy.deepcopy(self.service.state['audit'])
+        commit = self.service.idempotency_commit
+        def receipt(*args, **kw):
+            self.assertTrue(json.loads(self.store.path.read_text(encoding='utf-8'))['credentials'][cid]['revoked'])
+            return commit(*args, **kw)
+        with mock.patch.object(self.store, 'save_soon', return_value=False), \
+                mock.patch.object(self.store, '_write', wraps=self.store._write) as saved, \
+                mock.patch.object(self.service, 'idempotency_commit', side_effect=receipt) as receipted:
+            reply = self.request('POST', path, {}, token=self.owner, key='pending-revoke')
+        self.assertEqual(204, reply.status, reply.data)
+        self.assertEqual((1, 1), (saved.call_count, receipted.call_count))
+        self.assertEqual(events, self.service.state['audit'])
+        self.assertIsNone(self.store.unsaved_since)
+        reloaded = http_auth.Service(http_auth.Store(self.store.path))
+        with self.assertRaises(http_auth.HttpError) as denied:
+            reloaded.authenticate(secret)
+        self.assertEqual(401, denied.exception.status)
+
     def test_label_bounds_strip_and_omit_audit_payload(self):
         aid, _, _ = self.agent(['read'])
         for label in ('x' * 65, 'line\nbreak', 'bad\x00label'):

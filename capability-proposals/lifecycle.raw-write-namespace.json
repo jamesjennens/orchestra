@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "operation_id": "capnew-84cf0ec3698c4dc5b59c66d2014ac783",
+  "key": "lifecycle.raw-write-namespace",
+  "name": "Contributors record lifecycle facts through the dedicated action",
+  "aliases": [
+    "raw bd lifecycle facts",
+    "lifecycle reserved labels",
+    "native state event write guard"
+  ],
+  "summary": "Contributor raw create, update, close, reopen and dependency requests cannot create, convert, change or remove native lifecycle state events, or add, remove, replace or inherit labels for the six fact dimensions, lifecycle-scope, enabled and live. The endpoint checks final effects under the project lock and refuses incomplete reads before native writes, naming lifecycle.py record. Hidden label aliases, attachments and multi-target requests are covered. Ordinary prose, ordinary events, ordinary task status changes and legacy review-ready/reviewed labels stay writable. Listed operator raw writes and dedicated lifecycle/host operations retain their routes. This always-on write boundary leaves legacy lifecycle reads unchanged; it establishes no strict reader provenance or historical repair.",
+  "requirements": [],
+  "anchors": [
+    "docs/LIFECYCLE_RAW_WRITES.md#contributor-boundary",
+    "docs/OPERATIONAL_WORKFLOW.md#six-independent-lifecycle-facts"
+  ],
+  "code": [
+    "raw_lifecycle.py::guard",
+    "raw_lifecycle.py::event_shape",
+    "endpoint.py::execute"
+  ],
+  "tests": [
+    "tests/test_raw_lifecycle.py",
+    "tests/test_raw_lifecycle_native.py"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "lifecycle",
+    "contributor",
+    "guard"
+  ]
+}

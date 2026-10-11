@@ -172,12 +172,12 @@ class OwnerHttpTests(EndpointCase):
         self.assertEqual(refused.status, 422, refused.data)
         self.assertNotIn(str(self.path), json.dumps(refused.data))
         # Operating-system errors can carry a private filename too.
-        load = requirements.load_json
-        def unreadable(candidate):
+        load = requirements.read_owner_receipt
+        def unreadable(candidate, **options):
             if Path(candidate) == path:
                 raise OSError('private-server-path-sentinel /private/server/receipt.json')
-            return load(candidate)
-        with mock.patch.object(requirements, 'load_json', unreadable):
+            return load(candidate, **options)
+        with mock.patch.object(requirements, 'read_owner_receipt', unreadable):
             listing = self.request('GET', self.base + '/requirements/recoveries', token=self.owner_token)
             refused = self.request('POST', self.base + '/requirements/recoveries/clear',
                 self.recovery_body(damaged), token=self.owner_token, key='unreadable-clear')
@@ -256,7 +256,7 @@ class OwnerHttpTests(EndpointCase):
         listing = self.request('GET', self.base + '/requirements/recoveries', token=self.owner_token)
         item = listing.data['items'][0]
         self.assertFalse(item['can_clear'])
-        self.assertIn('Retry the original creation', item['message'])
+        self.assertIn('Reload the requirements', item['message'])
         self.assertIn('host operator', item['message'])
         before = len(self.backend.native.writes())
         refused = self.request('POST', self.base + '/requirements/recoveries/clear',

@@ -27,6 +27,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import weakref
 from pathlib import Path
 from contextlib import contextmanager
@@ -674,6 +675,181 @@ def review_workflow_writes(root, strict=False, warnings=None):
                 print('WARNING: ' + message,file=sys.stderr)
     return enabled
 
+# ---------------------------------------------------------------------------
+# Slices 6 and 7 of docs/COORDINATORS_PER_PROJECT_DESIGN.md (kittrial-5bb.197) and
+# the decisions recorded on kittrial-5bb.106: three per-installation rules, each
+# OFF until an installation turns it on.
+#
+#   lifecycle_authors    - who may record which lifecycle fact (part a)
+#   independent_approval - nobody passes their own work, the self-approval half (part b)
+#   coordinator_writes   - approval and the merge slot only for a listed actor (part c)
+#
+# Each is its own boolean in `deployment.private.json`; absent or false means OFF,
+# so a fresh install and an installation that configures nothing behave exactly as
+# before. `admin.py coordinator-rules` reads and flips them (operator allowlist,
+# audited); `admin.py lifecycle-authors PROJECT` is the read-only preview of (a).
+# The endpoint supplies the values to the write paths; `lifecycle.py` and
+# `review_workflow.py` never read this file themselves.
+# ---------------------------------------------------------------------------
+COORDINATOR_RULE_KEYS=('lifecycle_authors','independent_approval','coordinator_writes')
+COORDINATOR_RULES_AUDIT_KEY='coordinator_rules_audit'
+#: The audit list keeps the last N flips, as `review-writes` and `bound-keys-only` bound theirs.
+COORDINATOR_RULES_AUDIT_MAX=20
+COORDINATOR_RULE_HELP={'lifecycle_authors':'record reviewed, integrated, deployed, live-verified, enabled, live and '
+                                           'a release deploy only as a listed operator, and implemented, tested and '
+                                           'the task scope only as the assignee or a listed operator',
+                       'independent_approval':'refuse an approval from the contribution\'s author or the task\'s assignee',
+                       'coordinator_writes':'allow only a listed actor of the project to approve a contribution or '
+                                            'take the merge slot'}
+
+
+def coordinator_rules(root,warnings=None):
+    """The three slices 6/7 rules at once, read once; absent or false means OFF.
+
+    A value that is neither true nor false is read as OFF with a warning, as
+    `review_workflow_writes` is (kittrial-5bb.110 item 2): raising here would fail
+    every review and every lifecycle write on the installation while the other
+    readers kept answering. The warning NAMES the setting and shows the value ESCAPED
+    and BOUNDED with `audit_field`, so a 200 kB hand-edited value cannot flood stderr
+    on every request (kittrial-5bb.197 review request 01a12894, item 6). There is
+    deliberately no `ORCHESTRA_*` fallback: these are deployment rules, not authority
+    lists.
+    """
+    values={key:False for key in COORDINATOR_RULE_KEYS}
+    marker=root/'deployment.private.json'
+    if marker.is_file():
+        document=deployment_document(marker)
+        for key in COORDINATOR_RULE_KEYS:
+            value=document.get(key)
+            if isinstance(value,bool):values[key]=value
+            elif value is not None:
+                message=('WARNING: deployment %s is %s, not true or false; reading it as off (the rule refuses '
+                         'nothing)'%(key,audit_field(value)))
+                if warnings is not None:warnings.append(message)
+                else:print(message,file=sys.stderr)
+    return values
+
+
+def coordinator_rule(root,key,warnings=None):
+    """One of the three slices 6/7 rules by name."""
+    if key not in COORDINATOR_RULE_KEYS:raise ValueError('Unknown coordinator rule %s'%key)
+    return coordinator_rules(root,warnings)[key]
+
+
+def coordinator_rules_audit(cfg):
+    """``(entries, damage)`` for the coordinator-rules audit in a deployment document."""
+    entries=cfg.get(COORDINATOR_RULES_AUDIT_KEY)
+    if entries is None:return [],None
+    if not isinstance(entries,list):return [],'not a list'
+    kept=[]
+    for position,entry in enumerate(entries):
+        if (isinstance(entry,dict) and set(entry)=={'at','actor','rule','action','previous'}
+                and all(isinstance(entry.get(key),str) for key in ('at','actor','rule','action'))
+                and isinstance(entry.get('previous'),bool)):
+            kept.append(entry)
+            continue
+        return kept,'entry %d is not a coordinator-rules audit entry'%(position+1)
+    return kept,None
+
+
+def coordinator_rules_audit_entry(entry):
+    """One audit entry as ``status`` reports it: hand-editable strings bounded and escaped.
+
+    The audit lives in `deployment.private.json`, which an operator (or a mistake) can
+    edit by hand, so the entry is printed through `audit_field`: a 200 kB `actor` or a
+    value carrying ESC must not flood or rewrite the operator's terminal
+    (kittrial-5bb.197 review request 01a12894, item 6).
+    """
+    if not isinstance(entry,dict):return None
+    return {'at':audit_field(entry.get('at')),'actor':audit_field(entry.get('actor')),
+            'rule':audit_field(entry.get('rule')),'action':audit_field(entry.get('action')),
+            'previous':entry.get('previous') if isinstance(entry.get('previous'),bool) else None}
+
+
+def coordinator_rules_switch(root,action,rule,actor):
+    """Read or flip one slices 6/7 rule, with its operator audit.
+
+    Only an actor on the deployment operator allowlist may read or flip: the decision
+    on kittrial-5bb.106 is an operator's. A flip holds `review_writes_lock` across the
+    whole read-modify-write of `deployment.private.json`, as the other deployment
+    switches do, so two simultaneous flips cannot lose each other. A flip that changes
+    nothing writes nothing. `off` on a value that is not a bool is a REAL flip that
+    writes false, not a no-op that leaves the bad value in the file
+    (kittrial-5bb.197 review request 01a12894, item 6). A damaged audit is warned about
+    and started afresh with the damaged value kept aside under a dated key, as the
+    checkpoint switch does; `status` bounds every hand-edited audit field.
+    """
+    from recovery import identity
+    marker=root/'deployment.private.json'
+    if not marker.is_file():raise ValueError('Deployment is not installed; run install first')
+    actor=identity(actor,'Invalid actor identity')
+    if actor not in operators(root,strict=True):
+        raise ValueError('coordinator-rules requires an actor on the deployment operator allowlist')
+    if action not in ('status','on','off'):raise ValueError('Invalid coordinator-rules action')
+    if action=='status':
+        audit,damage=coordinator_rules_audit(config(root))
+        if damage is not None:
+            print('WARNING: the coordinator-rules audit is damaged (%s); it reads as an empty history. The next '
+                  'on/off keeps it aside in deployment.private.json under %s_damaged_<UTC stamp> and starts a '
+                  'fresh list.'%(damage,COORDINATOR_RULES_AUDIT_KEY),file=sys.stderr)
+        return dict(coordinator_rules=coordinator_rules(root),
+                    audit=coordinator_rules_audit_entry(audit[-1]) if audit else None,
+                    audit_records=len(audit),audit_readable=damage is None,changed=False,rule=rule)
+    if rule not in COORDINATOR_RULE_KEYS:
+        raise ValueError('coordinator-rules %s requires --rule with one of: %s'
+                         %(action,', '.join(COORDINATOR_RULE_KEYS)))
+    enabled=action=='on'
+    with review_writes_lock(root):
+        current=coordinator_rules(root)[rule]
+        cfg=config(root)
+        audit,damage=coordinator_rules_audit(cfg)
+        # `off` must also be a real flip when the file holds a value that is not a bool:
+        # reading it as off makes `on`==`off` a no-op that leaves the bad value and its
+        # warning in place (the rule `bound-keys-only` follows, review item 6).
+        stale_value=rule in cfg and not isinstance(cfg.get(rule),bool)
+        if enabled==current and not (not enabled and stale_value):
+            return dict(coordinator_rules=coordinator_rules(root),
+                        audit=coordinator_rules_audit_entry(audit[-1]) if audit else None,
+                        audit_records=len(audit),audit_readable=damage is None,changed=False,rule=rule)
+        if damage is not None:
+            kept='%s_damaged_%s'%(COORDINATOR_RULES_AUDIT_KEY,utc_stamp().replace(':','').replace('-',''))
+            suffix=1
+            while kept+('' if suffix==1 else '_%d'%suffix) in cfg:suffix+=1
+            kept+=('' if suffix==1 else '_%d'%suffix)
+            cfg[kept]=cfg.pop(COORDINATOR_RULES_AUDIT_KEY)
+            print('WARNING: the coordinator-rules audit was damaged (%s); it is kept aside in '
+                  'deployment.private.json as %s and this flip starts a fresh list.'%(damage,kept),file=sys.stderr)
+        if enabled:cfg[rule]=True
+        else:cfg.pop(rule,None)
+        cfg[COORDINATOR_RULES_AUDIT_KEY]=(audit+[dict(actor=actor,at=utc_stamp(),rule=rule,action=action,
+                                                      previous=current)])[-COORDINATOR_RULES_AUDIT_MAX:]
+        atomic_private_write(marker,json.dumps(cfg))
+    return dict(coordinator_rules=coordinator_rules(root),audit_records=min(len(audit)+1,COORDINATOR_RULES_AUDIT_MAX),
+                audit_readable=True,changed=True,rule=rule)
+
+
+def lifecycle_authors_command(root,project,limit=None):
+    """``admin.py lifecycle-authors PROJECT``: the read-only preview of part (a).
+
+    Writes nothing and reads the project's own export with the reader every other
+    lifecycle read uses, so it can be run before `lifecycle_authors` is turned on
+    (the decision on kittrial-5bb.106). It is a host command: the shell is already
+    authority over the installation, so it takes no `--actor` and gates nothing.
+    """
+    import lifecycle
+    if limit is None:limit=lifecycle.AUTHORS_REPORT_TASK_LIMIT
+    if not isinstance(limit,int) or isinstance(limit,bool) or limit<0:raise ValueError('Invalid --limit')
+    def run(argv):return run_bd(root,project,argv)
+    rows=lifecycle.read_event_rows(run)
+    import sessions
+    try:owners=sessions.owners(project_dir(root,project))
+    except (ValueError,OSError):owners=None
+    report=lifecycle.lifecycle_authors_report(rows,operators(root),owners=owners,limit=limit)
+    report['project']=project
+    report['setting']={'lifecycle_authors':coordinator_rule(root,'lifecycle_authors')}
+    return report
+
+
 #: The key of the installation setting that accepts bound keys only, and the key of its short
 #: operator audit list, in the same deployment.private.json (kittrial-5bb.196, slice 4 of
 #: docs/COORDINATORS_PER_PROJECT_DESIGN.md).
@@ -768,6 +944,17 @@ BOUND_KEYS_ONLY_DETAIL_OFF=('This installation accepts a line that names no proj
     'release it names and is not refused by it.')
 BOUND_KEYS_ONLY_DETAIL_UNKNOWN=('The installation setting for bound keys only could not be read; an operator '
     'must look at deployment.private.json on the server.')
+
+#: What `setup-status` says about the three coordinator rules (kittrial-5bb.197, review request
+#: 01a12894 item 6), in the same shape as the bound-keys-only block. The rules are per
+#: installation, so every project reports the same words.
+COORDINATOR_RULES_DETAIL_ON=('This installation enforces the coordinator rules (%s). An operator turns one off '
+    'with `admin.py coordinator-rules off --rule NAME --actor OPERATOR`.')
+COORDINATOR_RULES_DETAIL_OFF=('This installation enforces none of the coordinator rules (all three are off, the '
+    'default). An operator turns one on with `admin.py coordinator-rules on --rule NAME --actor OPERATOR`; read '
+    '`admin.py lifecycle-authors PROJECT` before turning lifecycle_authors on.')
+COORDINATOR_RULES_DETAIL_UNKNOWN=('The installation settings for the coordinator rules could not be read; an '
+    'operator must look at deployment.private.json on the server.')
 
 #: The key of the checkpoint switch's audit list inside deployment.private.json, and the
 #: prefix a damaged value is kept aside under (kittrial-5bb.131).
@@ -2327,6 +2514,38 @@ def scheduled_backup_unit_paths():
     except OSError:
         return []
 
+def unit_unspellable(ch):
+    """True for a character no ``ExecStart`` word can spell literally.
+
+    systemd expands ``$VAR``/``${VAR}`` and a ``%`` specifier, and refuses a quote, a
+    backslash or a control, format or line-separator character in the executable name
+    (``systemd-analyze verify`` says "Executable name contains special characters").
+    ``%`` is not here: it is spellable as ``%%`` (kittrial-5bb.220 review 2 item 2b).
+    """
+    return ch in '$"\'\\' or unicodedata.category(ch) in ('Cc','Cf','Zl','Zp')
+
+def systemd_quote(word):
+    """``word`` as one systemd word, quoted only when it must be.
+
+    systemd splits ``ExecStart`` on whitespace and does NOT follow shell rules: a path
+    with a space must be wrapped in double quotes, or systemd takes the first fragment as
+    the program (kittrial-5bb.220 F4). A ``%`` begins a specifier, so it is doubled (``%%``)
+    inside the quotes. A word holding a ``$``, a quote, a backslash or a control, format or
+    line-separator character has no literal spelling in an ``ExecStart`` line, so it is
+    refused here (naming the path) rather than printing a line systemd would expand or
+    reject (kittrial-5bb.220 review 2 item 2b). A word that needs nothing comes back
+    unchanged, so the printed line stays readable.
+    """
+    value=str(word)
+    if not value:
+        return '""'
+    if any(unit_unspellable(ch) for ch in value):
+        raise ValueError('no systemd ExecStart line can name the path "%s" literally: it holds a $, a quote, a '
+                         'backslash or a control character systemd refuses or expands'%value)
+    if any(ch.isspace() or ch=='%' for ch in value):
+        return '"%s"'%value.replace('%','%%')
+    return value
+
 def scheduled_backup_execstart(root):
     """The exact ``ExecStart`` line that covers every project of this runtime.
 
@@ -2334,12 +2553,14 @@ def scheduled_backup_execstart(root):
     ``install/current`` link where it has one, so an upgrade moves the schedule with the
     service. A line whose interpreter came through ``current`` but whose ``admin.py``
     named ``releases/<ID>`` kept running the release that printed it after the next
-    upgrade (kittrial-5bb.182 item 2).
+    upgrade (kittrial-5bb.182 item 2). The interpreter and module are quoted for systemd,
+    not for a shell (kittrial-5bb.220 F4); ``root`` is NOT quoted because ``root_path``
+    already accepts only a path without a space, quote, backslash or specifier.
     """
     python=install_current_path(sys.executable)
     module=install_current_path(Path(__file__).resolve())
-    return (f'ExecStart={python} {module} '
-            f'--root {root} backup --all')
+    return ('ExecStart=%s %s --root %s backup --all'
+            %(systemd_quote(python),systemd_quote(module),root))
 
 def host_command(root,*words):
     """A host command as the service user pastes it into a shell: interpreter, this module,
@@ -2459,14 +2680,51 @@ def scheduled_backup_unit_report(text,root):
             report['other_runtime']=True
     return report
 
+def scheduled_backup_timer_target(text,path):
+    """The service unit a ``beads-*backup*.timer`` schedules: its ``[Timer] Unit=``, or its own base name.
+
+    A timer file normally names the service it runs in ``[Timer] Unit=``; when it does
+    not, the convention is that ``beads-backup.timer`` runs ``beads-backup.service``.
+    """
+    for raw in text.splitlines():
+        line=raw.strip()
+        if line.startswith('Unit='):
+            value=line[len('Unit='):].strip()
+            if value:return value
+    base=Path(path).name
+    return base[:-len('.timer')]+'.service' if base.endswith('.timer') else None
+
+def scheduled_backup_enabled_timer_targets(directory):
+    """The service names an enabled ``beads-*backup*.timer`` schedules, or an empty set.
+
+    An enabled user timer is a unit under ``timers.target.wants`` (``systemctl enable``
+    puts a symlink there, but a real file there enables it too); a timer only in the unit
+    directory is installed but not enabled, so it will not run. Reading the timer through
+    the symlink gives its ``[Timer] Unit=``.
+    """
+    targets=set()
+    try:
+        wants=directory/'timers.target.wants'
+        paths=sorted(path for path in wants.glob('beads-*backup*.timer') if path.is_file())
+    except OSError:
+        return targets
+    for path in paths:
+        try:text=path.read_text(encoding='utf-8')
+        except OSError:continue
+        target=scheduled_backup_timer_target(text,path)
+        if target:targets.add(target)
+    return targets
+
 def scheduled_backup_covers(root,name):
     """Whether the INSTALLED schedule backs up one project: True, False or None (unknown).
 
     The same unit files and the same classification as ``scheduled_backup_coverage``,
     reduced to one answer for the project setup page (kittrial-5bb.118): True when a
-    unit runs ``backup --all`` for this runtime or names this project, False when units
-    were read and none does (or none is installed), None when a unit could not be read
-    and nothing that was read covers the project. Drop-ins are not inspected.
+    unit runs ``backup --all`` for this runtime or names this project AND an enabled
+    ``beads-*backup*.timer`` schedules it; a unit with no timer, or a timer that is not
+    enabled, is not a schedule (kittrial-5bb.220 F4). False when units were read and none
+    covers the project (or none is installed, or none is enabled), None when a unit could
+    not be read and nothing that was read covers the project. Drop-ins are not inspected.
     """
     # The same candidates as scheduled_backup_unit_paths(), looked up in account_unit_dir.
     directory=account_unit_dir(root)
@@ -2475,14 +2733,18 @@ def scheduled_backup_covers(root,name):
         paths=sorted(path for path in directory.glob('beads-*backup*.service') if path.is_file())
     except OSError:
         return None
+    enabled=scheduled_backup_enabled_timer_targets(directory)
     unreadable=False
+    covering=[]
     for path in paths:
         try:text=path.read_text(encoding='utf-8')
         except OSError:
             unreadable=True;continue
         report=scheduled_backup_unit_report(text,root)
         if report['all_line'] or name in report['named'] or name in report['wrapper_projects']:
-            return True
+            covering.append(Path(path).name)
+    if covering:
+        return any(service in enabled for service in covering)
     return None if unreadable else False
 
 def project_merge_slot_state(root,name,path=None):
@@ -2552,8 +2814,27 @@ def project_setup_status(root,name,path=None):
         covers=scheduled_backup_covers(root,name)
     except OSError:
         covers=None
-    backup={'scheduled':'covered' if covers else 'unknown' if covers is None else 'not-covered',
-            'line':scheduled_backup_execstart(root),'last_run':None,
+    # An operator's recorded statement that backups are scheduled elsewhere (kittrial-5bb.220
+    # F1): it reads a found-nowhere answer done, but never a found-nowhere answer that was
+    # not looked for. A found unit with an enabled timer still wins.
+    note=read_backup_schedule_note(root)
+    if covers is True:scheduled='covered'
+    elif covers is None:scheduled='unknown'
+    elif note is not None:scheduled='elsewhere'
+    else:scheduled='not-covered'
+    try:
+        line=scheduled_backup_execstart(root)
+        line_reason=None
+    except ValueError as error:
+        # The path systemd cannot name, in one sentence, so the page can say why it shows no line
+        # (kittrial-5bb.220 review 2 item 2a).
+        line=None
+        line_reason=str(error)
+    backup={'scheduled':scheduled,
+            'elsewhere':(note['note'] if note else None),
+            'elsewhere_at':(note['recorded_at'] if note else None),
+            'elsewhere_by':(note['recorded_by'] if note else None),
+            'line':line,'line_reason':line_reason,'last_run':None,
             # What can be pasted into a shell, beside the unit-file line that cannot (kittrial-5bb.200).
             'run_now':backup_now_command(root),
             'check':host_command(root,'backup-status','--require-complete')}
@@ -2597,6 +2878,17 @@ def project_setup_status(root,name,path=None):
         # A deeply nested file must say unknown with a reason, not raise here (kittrial-5bb.196
         # review, item 3). RecursionError is not a ValueError.
         result['bound_keys_only']={'enabled':None,'detail':BOUND_KEYS_ONLY_DETAIL_UNKNOWN}
+    # The three coordinator rules (kittrial-5bb.197, slices 6 and 7), in the same shape as
+    # the bound-keys-only block: `enabled` is None with its own sentence when the file cannot
+    # be read, so this part never fails the others (review request 01a12894, item 6).
+    try:
+        rules=coordinator_rules(root)
+        on=[key for key in COORDINATOR_RULE_KEYS if rules[key]]
+        result['coordinator_rules']={'enabled':bool(on),'rules':rules,
+                                     'detail':(COORDINATOR_RULES_DETAIL_ON%', '.join(on)) if on
+                                     else COORDINATOR_RULES_DETAIL_OFF}
+    except (OSError,ValueError,RecursionError):
+        result['coordinator_rules']={'enabled':None,'rules':None,'detail':COORDINATOR_RULES_DETAIL_UNKNOWN}
     # How full the server is (kittrial-5bb.118 part 2 revision): every project database on it
     # counts, and every bd write gets slower as they grow. The web service shows it to a
     # superuser only.
@@ -2637,10 +2929,21 @@ def scheduled_backup_coverage(root,name):
     enables a unit.
     """
     directory=scheduled_backup_unit_dir()
-    line=scheduled_backup_execstart(root)
-    both=schedule_text(root)
+    try:
+        line=scheduled_backup_execstart(root)
+        both=schedule_text(root)
+    except ValueError as error:
+        # A path systemd cannot name must not cut the whole report short (kittrial-5bb.220 review 2
+        # item 2a): say so once, and print everything else.
+        line=None
+        both=('No line for a schedule can be printed for this installation: %s. Install the schedule by hand, or '
+              'move the installation to a path systemd can name.'%error)
+    # Where the unit-file line would be shown, or nothing when there is none to print.
+    suggest=('\n  %s'%line) if line else ''
     dropins=(f'Systemd drop-ins ({directory}/*.service.d/*.conf) are not inspected, so this reports the unit '
              f'files themselves.')
+    # A unit file is not a schedule: an enabled timer must run it (kittrial-5bb.220 F4).
+    enabled=scheduled_backup_enabled_timer_targets(directory)
     paths=scheduled_backup_unit_paths()
     if not paths:
         return False,(f'No installed scheduled backup unit matching beads-*backup*.service was found in '
@@ -2663,9 +2966,15 @@ def scheduled_backup_coverage(root,name):
     if durable:
         note=(' Read: '+', '.join(read)+'.') if read else ''
         if unreadable:note+=' Not readable: '+'; '.join(unreadable)+'.'
-        return True,(f'The installed scheduled backup unit(s) read for this runtime cover every project, '
-                      f'including {name}, so no change is needed (durable backup --all: '+', '.join(durable)+
-                      ').'+note+' '+dropins)
+        scheduled=[path for path in durable if Path(path).name in enabled]
+        if scheduled:
+            return True,(f'The installed scheduled backup unit(s) read for this runtime cover every project, '
+                          f'including {name}, so no change is needed (durable backup --all: '+', '.join(durable)+
+                          ').'+note+' '+dropins)
+        return False,(f'The installed scheduled backup unit(s) read for this runtime cover every project '
+                      f'(durable backup --all: '+', '.join(durable)+f'), but no enabled beads-*backup*.timer runs '
+                      f'them, so they will not run. Install and enable a timer for one, or record that backups '
+                      f'are scheduled elsewhere.\n{both}')
     covered=sorted({item for names in named.values() for item in names} |
                    {item for names in wrapper_projects.values() for item in names})
     individual=list(named)+list(wrapper_projects)
@@ -2675,6 +2984,10 @@ def scheduled_backup_coverage(root,name):
         if unreadable:note+=' Not readable: '+'; '.join(unreadable)+'.'
         units=', '.join(individual)
         projectless=any(not projects for projects in wrapper_projects.values())
+        # A named or wrapper line that covers this project only counts as a schedule when an
+        # enabled timer runs its unit (kittrial-5bb.220 F4).
+        covering_paths=[path for path,projects in {**named,**wrapper_projects}.items() if name in projects]
+        covers_with_timer=any(Path(path).name in enabled for path in covering_paths)
         if name in covered:
             message=(f'The installed scheduled backup unit(s) read for this runtime already include {name} '
                      f'(projects: {", ".join(covered)}) at {units}, but they name projects individually, so the '
@@ -2685,7 +2998,10 @@ def scheduled_backup_coverage(root,name):
                           f'named projects with --all in one command.')
             else:
                 message+=(f' Replace that project list with the durable form (do not combine named projects with '
-                          f'--all in one command); it is a line of the unit file, not a shell command:\n  {line}')
+                          f'--all in one command); it is a line of the unit file, not a shell command:{suggest}')
+            if not covers_with_timer:
+                message+=(f' No enabled beads-*backup*.timer runs them, so they will not run; install and enable '
+                          f'a timer for one, or record that backups are scheduled elsewhere.')
             return False,message+note+' '+dropins
         message=(f'The installed scheduled backup unit(s) read for this runtime cover only '
                  f'{", ".join(covered) if covered else "no project"}, so they do not include {name}.')
@@ -2700,7 +3016,7 @@ def scheduled_backup_coverage(root,name):
                           f'projects with --all in one command.')
         else:
             message+=(f' Add {name} there, or replace the project list with the durable form (do not combine named '
-                      f'projects with --all in one command); it is a line of the unit file, not a shell command:\n  {line}')
+                      f'projects with --all in one command); it is a line of the unit file, not a shell command:{suggest}')
         return False,message+note+' '+dropins
     details=[]
     if foreign:details.append('these units do not back up this runtime: '+', '.join(foreign))
@@ -3027,6 +3343,30 @@ def require_creatable_project(root,name):
     refuse_retired_name(root,name)
     if path.exists() and any(path.iterdir()): raise ValueError('Project already exists; use it rather than initializing again')
     require_bd_init_tools(root)
+    # The deployment configuration is read before anything is created (kittrial-5bb.173
+    # item 1): a missing file or a dangling link used to raise FileNotFoundError after
+    # ``projects/NAME`` had been made, and left that empty folder behind. One sentence,
+    # nothing left. A directory or a FIFO in its place is already one line (ConfigurationUnreadable).
+    try:
+        document = config(root)
+    except FileNotFoundError:
+        raise ValueError('Deployment is not installed; run install first. Nothing was created.') from None
+    except OSError as error:
+        raise ValueError('This host cannot read the deployment configuration %s (%s). '
+                         'Fix that file and run this command again; nothing was created.'
+                         % (root/'deployment.private.json', error.strerror or error)) from None
+    except ValueError:
+        raise
+    if not isinstance(document, dict):
+        raise ValueError('Deployment configuration %s is not a JSON object. Fix that file and run '
+                         'this command again; nothing was created.' % (root/'deployment.private.json'))
+    port = document.get('port')
+    # isinstance(True, int) is true: a bool is not a port (review 01a1288a).
+    usable = ((type(port) is int and 1 <= port <= 65535)
+              or (isinstance(port, str) and port.isdigit() and 1 <= int(port) <= 65535))
+    if not usable:
+        raise ValueError('Deployment configuration %s has no usable port. Fix that file and run '
+                         'this command again; nothing was created.' % (root/'deployment.private.json'))
     return path
 
 def initialize_requirements_governance(root,name):
@@ -3175,6 +3515,9 @@ def validate_record_receipt(name,record):
     if name.startswith('.requirement-owner-requests/'):
         from requirement_http import validate_receipt as validate_owner_receipt
         validate_owner_receipt(record)
+        if 'owner_state' in record and name != '.requirement-owner-requests/' + content_hash(
+                {'operation_id': record['owner_state']['operation_id']}) + '.json':
+            raise ValueError('Owner terminal receipt path mismatch')
         if 'owner_decision' in record and name != '.requirement-owner-requests/' + content_hash(
                 {'operation_id': record['owner_decision']['operation_id']}) + '.json':
             raise ValueError('Owner decision receipt path mismatch')
@@ -4216,6 +4559,116 @@ def read_backup_status(root):
     except (OSError,ValueError):raise ValueError('Backup status file is not readable JSON') from None
     validate_backup_status(record)
     return record
+
+#: The operator's recorded statement that this runtime's backups are scheduled elsewhere
+#: (kittrial-5bb.220 F1). A separate sidecar from backup-status.json, which a backup run
+#: rewrites; this note is an operator statement, not a run result.
+BACKUP_SCHEDULE_NOTE_NAME='backup-schedule-note.json'
+#: The note is one short line of operator text, so a file much bigger than this is not read.
+BACKUP_SCHEDULE_NOTE_MAX=300
+BACKUP_SCHEDULE_NOTE_FILE_MAX=4096
+#: Every set and clear is appended (who, when, which) to this bounded log beside the note
+#: (kittrial-5bb.220 review 2 item 4a): the note itself is only the current statement.
+BACKUP_SCHEDULE_LOG_NAME='backup-schedule-log.jsonl'
+BACKUP_SCHEDULE_LOG_MAX=100
+
+def backup_schedule_log(root):
+    """The recorded set and clear history, oldest first, as a read-only list of entries.
+
+    A log holding bytes that are not UTF-8 is no log (its lines cannot be read), never an
+    error for a caller that only wants the history (kittrial-5bb.220 review 3 item 4).
+    """
+    path=root/'backups'/BACKUP_SCHEDULE_LOG_NAME
+    if path.is_symlink() or not path.is_file():return []
+    try:lines=path.read_text(encoding='utf-8').splitlines()
+    except (OSError,ValueError):return []
+    entries=[]
+    for line in lines[-BACKUP_SCHEDULE_LOG_MAX:]:
+        if not line.strip():continue
+        try:entry=record_json.loads(line)
+        except ValueError:continue
+        if isinstance(entry,dict):entries.append(entry)
+    return entries
+
+def _append_backup_schedule_log(root,entry):
+    """Append one set or clear line, keeping only the newest ``BACKUP_SCHEDULE_LOG_MAX``.
+
+    A convenience log, never a gate: a log that cannot be read or written does not fail the
+    command that recorded the note. A log holding bytes that are not UTF-8 cannot be read
+    line by line, so the damaged file is kept aside and a new log started rather than
+    failing every later set and clear (kittrial-5bb.220 review 3 item 4).
+    """
+    backups=root/'backups'
+    if backups.is_symlink() or not backups.is_dir():return
+    path=backups/BACKUP_SCHEDULE_LOG_NAME
+    if path.is_symlink():return
+    lines=[]
+    try:
+        if path.is_file():lines=[line for line in path.read_text(encoding='utf-8').splitlines() if line.strip()]
+    except (OSError,ValueError):
+        lines=[]
+        try:path.replace(path.with_name(path.name+'.damaged'))
+        except OSError:pass
+    lines.append(json.dumps(entry,sort_keys=True,ensure_ascii=True))
+    try:atomic_private_write(path,'\n'.join(lines[-BACKUP_SCHEDULE_LOG_MAX:])+'\n')
+    except (OSError,ValueError):pass
+
+def read_backup_schedule_note(root):
+    """The recorded statement that backups are scheduled elsewhere, or None.
+
+    The statement is an explicit, attributed record written by an operator (never an
+    inference from the age of the last run, which a manual or one-off run would fake).
+    ``note``, ``recorded_by`` and ``recorded_at`` must each be a string of the expected
+    shape: an unreadable, oversized or malformed note, or a hand-made one with a wrong
+    type, reads as None, so one bad file can never take the whole set-up page down
+    (kittrial-5bb.220 review 2 item 3).
+    """
+    path=root/'backups'/BACKUP_SCHEDULE_NOTE_NAME
+    if path.is_symlink() or not path.is_file():return None
+    try:
+        if path.stat().st_size>BACKUP_SCHEDULE_NOTE_FILE_MAX:return None
+        record=record_json.loads(path.read_text(encoding='utf-8'))
+    except (OSError,ValueError):return None
+    if not isinstance(record,dict) or record.get('schema_version')!=1:return None
+    note,by,at=record.get('note'),record.get('recorded_by'),record.get('recorded_at')
+    if not isinstance(note,str) or not note.strip():return None
+    if not isinstance(by,str) or not by.strip():return None
+    if not isinstance(at,str) or not utc_timestamp(at):return None
+    return {'note':note.strip(),'recorded_at':at,'recorded_by':by.strip()}
+
+def write_backup_schedule_note(root,note,actor):
+    """Record the operator's statement that backups are scheduled elsewhere, and log the set."""
+    from coordination import atomic
+    note=(note or '').strip()
+    if not note:raise ValueError('The note must be non-empty text')
+    if any(ch in '\n\r' for ch in note) or len(note)>BACKUP_SCHEDULE_NOTE_MAX:
+        raise ValueError('The note must be one line of at most %d characters'%BACKUP_SCHEDULE_NOTE_MAX)
+    # A control, format or line-separator character would be invisible or reorder the page, so it
+    # is refused as a newline is (kittrial-5bb.220 review 2 item 3).
+    if any(unicodedata.category(ch) in ('Cc','Cf','Zl','Zp') for ch in note):
+        raise ValueError('The note must not contain control or format characters')
+    actor=(actor or '').strip()
+    if not actor:raise ValueError('Name the operator recording it with --actor')
+    backups=root/'backups'
+    if backups.is_symlink() or not backups.is_dir():
+        raise ValueError('The backups directory does not exist under this root; prepare the runtime first')
+    record={'schema_version':1,'note':note,'recorded_at':utc_stamp(),'recorded_by':actor}
+    atomic(backups/BACKUP_SCHEDULE_NOTE_NAME,record)
+    _append_backup_schedule_log(root,{'at':record['recorded_at'],'by':actor,'action':'set'})
+    return record
+
+def clear_backup_schedule_note(root,actor=None):
+    """Remove the recorded statement; True if one was removed. The clear is logged too."""
+    path=root/'backups'/BACKUP_SCHEDULE_NOTE_NAME
+    if path.is_symlink():raise ValueError('Backup schedule note must not be a symlink')
+    removed=False
+    if path.is_file():
+        path.unlink();removed=True
+    elif path.exists():
+        raise ValueError('Backup schedule note is not a file')
+    if removed and isinstance(actor,str) and actor.strip():
+        _append_backup_schedule_log(root,{'at':utc_stamp(),'by':actor.strip(),'action':'clear'})
+    return removed
 
 def degraded_projects(root,record):
     """``[(name, message)]``: the projects the last run recorded complete but degraded.
@@ -7195,6 +7648,7 @@ def main():
     a.add_argument('--disposition',choices=['failed','released','complete'],default='released')
     a.add_argument('--issue-id',dest='issue_id',default=None,
                    help='with --disposition complete, the exact native record to confirm')
+    a.add_argument('--state',help='the existing web service state document; required for terminal recovery')
     a=sub.add_parser('capability-apply',help='accept a batch of capabilities, or a direct revision 1 (operator allowlist, F3 evidence)')
     a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('capability-retire',help='retire a capability in favour of a successor key (operator allowlist, F3 evidence)')
@@ -7287,6 +7741,25 @@ def main():
     a.add_argument('--file',default=None,help='the authorized_keys file to preview (default: '
                    '~/.ssh/authorized_keys of this account): status and on name the lines of this kit and this '
                    'root that the setting refuses or would refuse')
+    a=sub.add_parser('coordinator-rules',help='read or set the three per-installation rules of the coordinators '
+                                              'design, slices 6 and 7: who may record which lifecycle fact, nobody '
+                                              'passes their own work, and approval and the merge slot only for a '
+                                              'listed actor of the project (all OFF by default; an installation '
+                                              'that configures nothing behaves exactly as before)')
+    a.add_argument('action',choices=['status','on','off'])
+    # `action='append'` so a repeated `--rule` can be REFUSED rather than silently letting
+    # the last one win (kittrial-5bb.197 review request 01a12894, item 6).
+    a.add_argument('--rule',default=None,action='append',choices=list(COORDINATOR_RULE_KEYS),metavar='RULE',
+                   help='which rule to flip (required for on/off, at most once): '
+                        +'; '.join('%s: %s'%(key,COORDINATOR_RULE_HELP[key]) for key in COORDINATOR_RULE_KEYS))
+    a.add_argument('--actor',required=True,help='an actor on the deployment operator allowlist')
+    a=sub.add_parser('lifecycle-authors',help='read-only: every recorded lifecycle fact of a project, the actor who '
+                                              'recorded it, and whether the lifecycle_authors rule would refuse it '
+                                              '(run this before turning that rule on); writes nothing')
+    a.add_argument('project')
+    a.add_argument('--limit',type=int,default=None,
+                   help='list at most this many tasks, in the order the export gives them; the counts cover '
+                        'every task either way (default 200)')
     a=sub.add_parser('capability-verify',help='record verified capability checks (operator allowlist or verifiers list)')
     a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('authorized-keys',help='print the confined contributor and unrestricted operator authorized_keys lines for one public key')
@@ -7328,6 +7801,13 @@ def main():
     a=sub.add_parser('backup');a.add_argument('projects',nargs='*',metavar='project')
     a.add_argument('--all',action='store_true',dest='all_projects',
                    help='back up every initialized project in this runtime in one run')
+    a=sub.add_parser('backup-schedule',help='record, as an operator, that this runtime\'s backups are scheduled '
+                                             'elsewhere (the project setup step then reads done; a systemd user '
+                                             'unit that covers the project still wins) (operator allowlist)')
+    a.add_argument('--note',metavar='TEXT',help='the one-line statement to record (at most %d characters); '
+                                                'with --clear it must be absent'%BACKUP_SCHEDULE_NOTE_MAX)
+    a.add_argument('--actor',required=True,metavar='OPERATOR',help='the operator recording it (operator allowlist)')
+    a.add_argument('--clear',action='store_true',help='remove the recorded statement')
     a=sub.add_parser('retire-project',help='retire a partial or drill project: move it to retired/; deletes nothing (operator allowlist)')
     a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--reason',required=True)
     a.add_argument('--force',action='store_true',
@@ -7651,17 +8131,30 @@ def main():
             fcntl.flock(lock,fcntl.LOCK_EX)
             print(json.dumps(apply_native(payload,args.actor,run,path,operator=True,operators=authority)))
     elif args.command=='requirement-reconcile':
+        import contextlib
         import fcntl
         from requirement_records import reconcile
         from keyed_records import require_configured_operator
+        from http_authority import file_lock, read_state
+        from requirement_terminal import receipt_path
         require_configured_operator(args.actor,operators(root,strict=True),'reconcile a requirement operation')
         path=project_dir(root,args.project)
         if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
         def run(argv):return run_bd(root,args.project,['--actor',args.actor,*argv])
+        # The host operator supplies the trusted service document, never an HTTP
+        # request field. Match endpoint's project-then-authority lock order.
+        if args.state:
+            state=Path(args.state)
+            if state.is_symlink() or not state.is_file():raise ValueError('Use the existing web service state document')
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
-            print(json.dumps(reconcile(path,args.operation_id,args.actor,args.reason,
-                                       args.disposition,run,issue_id=args.issue_id)))
+            with file_lock(str(state)+'.lock') if args.state else contextlib.nullcontext():
+                if args.state:read_state(state)
+                require_configured_operator(args.actor,operators(root,strict=True),'reconcile a requirement operation')
+                if receipt_path(path,args.operation_id).exists() and not args.state:
+                    raise ValueError('Owner requirement recovery needs --state with the existing web service state document')
+                print(json.dumps(reconcile(path,args.operation_id,args.actor,args.reason,
+                                           args.disposition,run,issue_id=args.issue_id)))
     elif args.command=='reference-apply':
         import contextlib
         import fcntl
@@ -7970,6 +8463,13 @@ def main():
         result,warnings=review_writes_command(root,args.actor,args.action)
         for line in warnings:print(line,file=sys.stderr)
         print(json.dumps(result))
+    elif args.command=='coordinator-rules':
+        rules=args.rule or []
+        if len(rules)>1:
+            raise ValueError('--rule may be given only once')
+        print(json.dumps(coordinator_rules_switch(root,args.action,rules[0] if rules else None,args.actor)))
+    elif args.command=='lifecycle-authors':
+        print(json.dumps(lifecycle_authors_command(root,args.project,args.limit)))
     elif args.command=='authorized-keys':
         authorized_keys(root,args.key_file,args.role,args.python,args.comment,args.project,args.principal)
     elif args.command=='authorized-keys-list':
@@ -7989,6 +8489,16 @@ def main():
         print(json.dumps(report,ensure_ascii=True,indent=2))
         if note:print(note,file=sys.stderr)
     elif args.command=='backup':backup_projects(root,args.projects,args.all_projects)
+    elif args.command=='backup-schedule':
+        from keyed_records import require_configured_operator
+        require_configured_operator(args.actor,operators(root,strict=True),'record a backup schedule note')
+        if args.clear:
+            if args.note:raise ValueError('backup-schedule --clear takes no --note')
+            print('Removed the recorded backup schedule note.' if clear_backup_schedule_note(root,args.actor)
+                  else 'No backup schedule note was recorded.')
+        else:
+            if not args.note:raise ValueError('backup-schedule needs --note TEXT, or --clear to remove it')
+            print(json.dumps(write_backup_schedule_note(root,args.note,args.actor),sort_keys=True))
     elif args.command=='backup-copy':backup_copy(root,args.destination,require_clean=args.require_clean)
     elif args.command=='backup-repoint':print(json.dumps(repoint_backup(root,args.project),sort_keys=True))
     elif args.command=='retire-project':

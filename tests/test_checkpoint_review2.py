@@ -42,13 +42,19 @@ class CheckpointSecondReviewTests(unittest.TestCase):
         result=b.save_checkpoint(data,PROJECT,TASK,payload,'alice/session',lambda _:self.fail('retry write'))
         self.assertTrue(result['reconciled'])
 
-    def test_installation_switch_is_default_off_boolean_only_and_cannot_follow_symlink(self):
+    def test_installation_switch_is_default_off_boolean_only_and_follows_a_symlink(self):
+        """One rule everywhere (kittrial-5bb.173 item 2): a symlinked deployment.private.json is followed."""
         with tempfile.TemporaryDirectory() as temp:
             root=Path(temp)
             self.assertFalse(b.checkpoint_writes_enabled(root))
             marker=root/'deployment.private.json'
             marker.write_text('{}',encoding='utf-8')
             self.assertFalse(b.checkpoint_writes_enabled(root))
+            target=root/'real.json'
+            target.write_text(json.dumps({'checkpoint_provenance_writes':True}),encoding='utf-8')
+            marker.unlink()
+            marker.symlink_to(target)
+            self.assertTrue(b.checkpoint_writes_enabled(root), 'a checkpoint must accept a link every other reader follows')
             for value in (False,True,'true',1,None):
                 marker.write_text(json.dumps({'checkpoint_provenance_writes':value}),encoding='utf-8')
                 if type(value) is bool:self.assertEqual(b.checkpoint_writes_enabled(root),value)

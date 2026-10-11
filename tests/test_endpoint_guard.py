@@ -328,7 +328,8 @@ class NativeLabelResolutionTests(unittest.TestCase):
         # one reaches the native write instead of being refused by the status guard.
         (self.path / '.beads').mkdir()
         (self.path / '.beads' / 'metadata.json').write_text('{}', encoding='utf-8')
-        rows = [{'id': 'pp-req.1', 'status': 'in_progress', 'assignee': 'lane-a',
+        rows = [{'id': 'pp-req.1', 'issue_type': 'task', 'title': 'ordinary requirement',
+                 'description': '', 'status': 'in_progress', 'assignee': 'lane-a',
                  'labels': ['requirement', 'requirement:accepted'],
                  'comments': [{'id': 'c-1', 'author': 'ops-james',
                                'created_at': '2026-10-01T00:00:00Z',
@@ -548,17 +549,25 @@ class EndpointSingleDispatchTests(_EndpointRootMixin, unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertFalse(self.out(result)['reconciled'])
         # The endpoint resolves the operator allowlist and the project journal for
-        # the release revert rule (kittrial-5bb.107 item 2) and passes both down.
-        self.assertEqual(set(passed), {'operators', 'journal'})
+        # the release revert rule (kittrial-5bb.107 item 2) and passes both down; since
+        # kittrial-5bb.197 it also passes the two coordinator-rules settings and the
+        # lazily-read principal map (no `warnings` list: all-off is main, item 4b).
+        self.assertEqual(set(passed), {'operators', 'journal', 'lifecycle_authors',
+                                       'independent_approval', 'owners'})
         self.assertEqual(passed['journal'], self.root / 'projects' / 'pp')
+        self.assertIs(passed['lifecycle_authors'], False)   # this installation configures nothing
+        self.assertIs(passed['independent_approval'], False)
+        self.assertTrue(callable(passed['owners']))
 
     def test_coordinate_dispatches_exactly_once(self):
         import coordination
         counts = {}
+        settings = {}
 
-        def apply(payload, actor, run, path):
+        def apply(payload, actor, run, path, **kwargs):
             operation = payload.get('operation')
             counts[operation] = counts.get(operation, 0) + 1
+            settings.update(kwargs)
             if operation == 'merge-release':
                 return {'released': counts[operation] == 1}
             return {'reconciled': counts[operation] > 1}
@@ -571,6 +580,10 @@ class EndpointSingleDispatchTests(_EndpointRootMixin, unittest.TestCase):
         self.assertEqual(counts, {'merge-release': 1, 'merge-acquire': 1})
         self.assertTrue(release['released'])
         self.assertFalse(acquire['reconciled'])
+        # kittrial-5bb.197: the merge slot is judged against the operator allowlist and
+        # the coordinator_writes rule, which is OFF on an installation that configures nothing.
+        self.assertIn('operators', settings)
+        self.assertIs(settings.get('coordinator_writes'), False)
 
     def test_requirement_dispatches_exactly_once_not_lifecycle(self):
         import requirement_records
@@ -617,6 +630,9 @@ class EndpointLabelAliasGuardTests(_EndpointRootMixin, unittest.TestCase):
 
     def test_ordinary_labels_still_reach_the_native_client_once(self):
         def proc(argv, **kwargs):
+            if 'show' in argv:
+                return _Proc(0, json.dumps([{'id': 'pp-1', 'issue_type': 'task',
+                                           'title': 'ordinary', 'description': '', 'labels': []}]), '')
             return _Proc(0, '{"id": "pp-1"}', '')
 
         for args in (['create', 'x', '--label', 'frontend,bug', '--json'],

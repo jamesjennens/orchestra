@@ -561,11 +561,13 @@ class AddProjectStillTests(unittest.TestCase):
     def test_the_command_runs_initialize_then_prints(self):
         calls = []
         saved = (admin.initialize_project, admin.scheduled_backup_coverage, admin.worker_client_setup,
-                 admin.require_bd_init_tools)
+                 admin.require_bd_init_tools, admin.config)
         admin.initialize_project = lambda root, name, stage=None: calls.append(('initialize', name, stage))
         admin.scheduled_backup_coverage = lambda root, name: (True, 'SCHEDULE TEXT')
         admin.worker_client_setup = lambda root, name: 'CLIENT TEXT'
         admin.require_bd_init_tools = lambda root: None
+        # add-project reads the deployment configuration before it makes anything (kittrial-5bb.173).
+        admin.config = lambda root: {'port': 3306}
         try:
             import contextlib
             import io
@@ -576,7 +578,7 @@ class AddProjectStillTests(unittest.TestCase):
                 written = pc.read_record(Path(tmp), 'alpha')
         finally:
             (admin.initialize_project, admin.scheduled_backup_coverage, admin.worker_client_setup,
-             admin.require_bd_init_tools) = saved
+             admin.require_bd_init_tools, admin.config) = saved
         # The work runs once, with a stage callback so a stop is recorded (kittrial-5bb.176).
         self.assertEqual([(name, stage is not None) for _, name, stage in calls], [('alpha', True)])
         self.assertEqual((written['state'], written['by']), ('created', pc.HOST))

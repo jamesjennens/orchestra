@@ -714,6 +714,14 @@ class ReconcileAllowlistCase(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'receipt|request'):
                     self.run_admin(command, flag, extra, OPERATOR)
 
+    def test_requirement_reconcile_rechecks_an_operator_removed_while_locking(self):
+        self.configure([OPERATOR])
+        self.flock.side_effect = lambda *_: self.configure([])
+        with self.assertRaisesRegex(ValueError, 'No operator allowlist is configured'):
+            self.run_admin('requirement-reconcile', '--operation-id', (), OPERATOR)
+        self.flock.assert_called_once()
+        self.native.assert_not_called()
+
     def test_a_shell_allowlist_that_disagrees_is_refused(self):
         self.configure([OPERATOR])
         with patch.dict(os.environ, {'ORCHESTRA_OPERATORS': 'mallory'}), \

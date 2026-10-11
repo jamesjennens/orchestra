@@ -78,6 +78,59 @@ class EndpointTests(unittest.TestCase):
         (root / 'deployment.private.json').write_text(configuration, encoding='utf-8')
         return root
 
+    def real_root(self):
+        """A temporary runtime root with a project name free and no deployment file yet."""
+        import tempfile
+        import admin
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name)
+        (root / 'projects').mkdir()
+        (root / 'bin').mkdir()
+        return root
+
+    def test_add_project_with_a_missing_configuration_is_one_sentence_and_leaves_nothing(self):
+        """kittrial-5bb.173 item 1: no traceback, and projects/NAME is never made."""
+        import admin
+        root = self.real_root()
+        with self.assertRaises(ValueError) as refused:
+            admin.require_creatable_project(root, 'alpha')
+        self.assertIn('Deployment is not installed; run install first', str(refused.exception))
+        self.assertIn('Nothing was created', str(refused.exception))
+        self.assertFalse((root / 'projects' / 'alpha').exists())
+        self.assertNotIsInstance(refused.exception, FileNotFoundError)
+
+    def test_add_project_with_a_dangling_link_is_one_sentence_and_leaves_nothing(self):
+        """A dangling symlink is the same missing-file case (kittrial-5bb.173 item 1)."""
+        import admin
+        root = self.real_root()
+        (root / 'deployment.private.json').symlink_to(root / 'gone.json')
+        with self.assertRaises(ValueError) as refused:
+            admin.require_creatable_project(root, 'alpha')
+        self.assertIn('Nothing was created', str(refused.exception))
+        self.assertFalse((root / 'projects' / 'alpha').exists())
+
+    def test_add_project_with_no_usable_port_is_refused_and_leaves_nothing(self):
+        """isinstance(True, int) is true: a bool or a non-numeric port is not usable (01a1288a)."""
+        import json
+        import admin
+        for port in (True, False, 'http', '', None, 0, 70000, '70000'):
+            with self.subTest(port=port):
+                root = self.real_root()
+                (root / 'deployment.private.json').write_text(json.dumps({'port': port, 'password': 'x'}),
+                                                              encoding='utf-8')
+                with self.assertRaises(ValueError) as refused:
+                    admin.require_creatable_project(root, 'alpha')
+                self.assertIn('no usable port', str(refused.exception))
+                self.assertFalse((root / 'projects' / 'alpha').exists())
+        for port in (5433, '5433'):
+            with self.subTest(usable=port):
+                root = self.real_root()
+                (root / 'deployment.private.json').write_text(json.dumps({'port': port, 'password': 'x'}),
+                                                              encoding='utf-8')
+                path = admin.require_creatable_project(root, 'alpha')
+                self.assertEqual(path, root / 'projects' / 'alpha')
+
     def test_a_configuration_file_cut_short_refuses_a_write_before_anything_is_reserved(self):
         """Seen on real bd (kittrial-5bb.156): read first inside the guarded write, it left the operation
         "outcome unknown" with nothing written, and the same idempotency key answered that until it expired."""

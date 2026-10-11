@@ -1,0 +1,56 @@
+// Real loopback API plus the shipped requirement views and DOM shim.
+import './web_dom_shim.mjs';
+import assert from 'node:assert/strict';
+const [apiUrl, viewUrl, base, pid, ownerToken, viewerToken, firstId, successorId] = process.argv.slice(2);
+const { createApi } = await import(apiUrl);
+const view = await import(viewUrl);
+const transport = (token) => async (method, path, headers, body) => {
+  const response = await fetch(base + path, { method, headers: { ...headers, Authorization: 'Bearer ' + token }, body });
+  return { status: response.status, data: response.status === 204 ? null : await response.json() };
+};
+const context = (token) => ({ api: createApi(transport(token)), href: (path) => '#' + path,
+  go(path) { this.destination = path; }, setDirty() {} });
+const owner = context(ownerToken), viewer = context(viewerToken);
+let first = await owner.api.requirement(pid, firstId);
+const originalHash = first.accepted.sha256;
+const successor = await owner.api.requirement(pid, successorId);
+let page = await view.requirement(owner, { pid, rid: firstId }, {}, first);
+const form = page.querySelectorAll('form').find((f) => f.textContent.includes('This cannot be undone in the browser.'));
+assert.ok(form, page.textContent);
+assert.ok(form.textContent.includes('create a new requirement'));
+assert.ok(form.textContent.includes('old wording and history remain available'));
+const select = form.querySelector('select');
+const option = select.querySelectorAll('option').find((o) => o.textContent.includes(successorId));
+assert.ok(option);
+select.value = option.value;
+await select.dispatch('change');
+assert.ok(form.textContent.includes(successor.current.sha256));
+assert.ok(form.textContent.includes(`revision ${successor.current.revision}`));
+form.querySelector('textarea').value = 'Replaced <script>reason</script>.';
+const confirm = form.querySelector('input');
+confirm.checked = false;
+await form.dispatch('submit');
+assert.equal((await owner.api.requirement(pid, firstId)).requirement_state, 'active');
+confirm.checked = true;
+await form.dispatch('submit');
+assert.equal(owner.destination, `/p/${pid}/requirements/${firstId}`);
+first = await viewer.api.requirement(pid, firstId);
+assert.equal(first.requirement_state, 'superseded');
+assert.equal(first.accepted.sha256, originalHash);
+assert.equal(first.state.superseded_by.sha256, successor.current.sha256);
+page = await view.requirement(viewer, { pid, rid: firstId }, {}, first);
+assert.ok(page.textContent.includes('Superseded'));
+assert.ok(page.textContent.includes('Replaced <script>reason</script>.'));
+assert.equal(page.querySelectorAll('script').length, 0);
+assert.equal(page.querySelectorAll('form').length, 0);
+assert.ok(page.textContent.includes('Revision history'));
+page = await view.requirement(owner, { pid, rid: firstId }, {}, await owner.api.requirement(pid, firstId));
+assert.equal(page.querySelectorAll('form').length, 0, 'Terminal owner detail must not expose edits or reactivation');
+const replacementPage = await view.requirement(viewer, { pid, rid: successorId }, {}, await viewer.api.requirement(pid, successorId));
+assert.ok(replacementPage.textContent.includes('Supersedes'));
+assert.ok(replacementPage.textContent.includes(firstId));
+const document = await view.brd(viewer, { pid }, {}, await viewer.api.requirements(pid));
+assert.ok(document.textContent.includes('Withdrawn, superseded or unverified requirements'));
+assert.ok(document.textContent.includes(first.accepted.description));
+console.log(JSON.stringify({ irreversibleAdvice: true, exactTarget: true, retainedHistory: true, escapedReason: true,
+  memberRead: true, noReactivation: true, reverseDerived: true }));

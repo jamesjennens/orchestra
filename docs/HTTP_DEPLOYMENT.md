@@ -284,6 +284,13 @@ a `proj_...` record until a superuser decides. After every upgrade to this kit o
    - **archives** it (`POST /v1/projects/{id}/archive`).
 3. Archive each `no-canonical` entry (a `proj_...` id).
 
+Registration saves its complete registration mark, and confirmation saves its
+confirmation and backfilled mark, before committing a success receipt. A crash
+after that receipt can replay only a durable effect. A crash after the effect
+but before the receipt can leave an in-progress request that refuses retry.
+See [HTTP mutation persistence](HTTP_MUTATION_PERSISTENCE.md) for the caller
+inventory, crash probes and remaining audit persistence limit.
+
 **The backfill's limit (a known exposure, not closed).** A confirmation backfills
 `registered_by` only for a record that has no such mark, and a record can only be
 confirmed while the backend will not serve it. A record whose creator is still a
@@ -371,9 +378,20 @@ the exact command for the server. `remaining` counts the `todo` ones.
 - **The backup step says which of two things is missing**: a backup that has been run,
   and a schedule that will run the next. A project that was backed up once and is on no
   schedule reads `todo` with "What is missing is the schedule"; one with neither says
-  both are missing. The step looks for a systemd unit of the service account
-  (`beads-*backup*.service`) that backs up this runtime, and says so: a schedule kept
-  anywhere else is not seen.
+  both are missing. The step looks for an **enabled** systemd user timer of the service
+  account (`beads-*backup*.timer`) that runs a `beads-*backup*.service` unit backing up
+  this runtime, and says so: a schedule kept anywhere else is not seen. An operator who
+  records that backups are scheduled elsewhere (`admin.py backup-schedule --note TEXT
+  --actor OPERATOR`, operator allowlist) makes the step read done with the operator's
+  own words, who recorded them and when; the statement is runtime-wide, never expires,
+  and the server does not check it. Every set and clear is appended, with who and when,
+  to `backups/backup-schedule-log.jsonl` (bounded to the newest 100 entries): the note
+  itself is only the current statement, and the log is what says there was one. A
+  hand-made note whose fields are not the expected strings, or that is a symlink, is
+  read as no note, so one bad file never hides the other steps. Some installation paths
+  (an interpreter or kit path holding a `$`, a quote, a backslash or a control character)
+  get no unit line at all; the step then says so, with the reason, instead of printing a
+  line systemd would reject.
 - **The page runs nothing on the server.** The host steps show a command to copy; the
   web interface does not run it. One host step can also be done on the page: an owner
   may write the project's onboarding text there (see "Onboarding text from the setup
@@ -385,16 +403,22 @@ the exact command for the server. `remaining` counts the `todo` ones.
   web service still reaches the host only through `endpoint.py`. It returns states with
   a version or a time and never guidance or onboarding text: guidance `set`, `not-set`,
   `unbound` or `unreadable` (the last two read as "to do", with the reason); onboarding
-  `set` or `not-set`; the backup schedule `covered`, `not-covered` or `unknown` (from
-  the installed `beads-*backup*.service` unit files; drop-ins are not inspected; with
-  `unknown` a `reason` of `no-account-home` or `unreadable`), the
+  `set` or `not-set`; the backup schedule `covered`, `not-covered`, `elsewhere` or
+  `unknown` (`covered` only when an enabled `beads-*backup*.timer` runs a
+  `beads-*backup*.service` unit that covers the project; `elsewhere` when an operator
+  recorded a schedule note; drop-ins are not inspected; with `unknown` a `reason` of
+  `no-account-home` or `unreadable`), the
   line that covers every project, and how the last backup run recorded the project.
   `endpoint.py` answers the action for any actor it accepts; `client.py` has no command
   for it.
 - **Where the backup units are looked for.** The supervised service runs with `HOME`
   pointed into the runtime (`<root>/home`), which holds no unit files. When the kit
   scopes `HOME` it records the account's own home in `ORCHESTRA_ACCOUNT_HOME`, and the
-  setup read looks for `beads-*backup*.service` there. The kit sets that variable
+  setup read looks for `beads-*backup*.service` and, to decide whether one is enabled, a
+  `beads-*backup*.timer` under `timers.target.wants` there. A timer is "enabled" when it
+  is under `timers.target.wants` (a symlink as `systemctl enable` makes, or a real
+  file); a unit in the base directory with no enabled timer is not a schedule. The kit
+  sets that variable
   itself, from the `HOME` it replaces, and overwrites any value it was started with; a
   contributor's SSH command never carries it (the forced command passes only locale
   variables, `PATH` and `HOME`). Run from a shell, `add-project`'s schedule report and
@@ -1930,7 +1954,10 @@ revoked one that was wider then seeded the next renewal once nothing worked).
   `target_credential_id`, `credential_scopes`, `scopes_before`/`scopes_after` and their
   sources, alongside the acting account, request ID and time. Each successful issue
   or first revocation leaves one event, including scope changes in that event. Revoking
-  an already revoked credential returns success without a second revocation event. These contain no
+  an already revoked credential returns success without a second revocation event. Its route still
+  saves the state and, when keyed, commits an idempotency receipt: an earlier failed save can have
+  left the revocation only in memory, and this retry must be able to persist it. An exact replay
+  adds neither a route save nor another receipt. These events contain no
   labels, secrets, token hashes or working directories. Pruning credentials does not
   remove their audit entries; retention eventually does. HTTP disable events
   (`agents.disable`, `agents.update` with `enabled: false`, `accounts.disable`) include
