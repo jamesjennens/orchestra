@@ -15,6 +15,7 @@ The kit pins Beads 1.2.2 and Dolt 2.2.0, verifies release checksums, installs an
 - Project direction and remaining work: [implementation plan](docs/PLAN.md).
 - Operational feedback and next priorities: [pilot follow-up](docs/PILOT_FEEDBACK.md).
 - Lifecycle evidence, activity cursors, safe child creation and merge slots: [operational commands](docs/OPERATIONAL_WORKFLOW.md).
+- Proposed lifecycle route provenance, shared reader trust, historical repair and recovery: [design for review](docs/LIFECYCLE_PROVENANCE_DESIGN.md). These mechanisms are not implemented.
 - Versioned client/endpoint JSON, help, ID, cursor and limit contract: [CLI contract](docs/CLI_CONTRACT.md).
 - Finding code and design text in a checkout: the read-only, client-side [capability lookup](docs/CLI_CONTRACT.md#capability-client-side-code-and-design-lookup) (`capability lookup "<phrase>"`, `capability resolve POINTER`). It indexes Python with the standard-library parser. graphify is optional external tooling, not a dependency: a `graphify-out/graph.json` is read when one is present ([how to produce one](docs/CLI_CONTRACT.md#producing-graphjson-optional)).
 - Compact current task state, persistent unresolved items and paginated evidence: [briefings and checkpoints](docs/BRIEFINGS.md).
