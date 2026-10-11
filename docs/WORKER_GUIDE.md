@@ -337,6 +337,15 @@ read-before-write: raw `create`/`update` label writes are refused, a raw
 forged with `update X --add-label requirement:accepted`, inherited from an
 accepted parent, or stripped by replacing a record's labels.
 
+Lifecycle facts also have a reserved raw write namespace: the six dimension
+prefixes, `lifecycle-scope:`, `enabled:` and `live:`, and their native state
+events. Use `lifecycle.py record` through the dedicated lifecycle action for
+assertions and corrections. Creating an event directly, converting a task to
+one, changing an existing lifecycle event or inheriting/replacing its labels
+is refused before native writes. The boundary stays active independently of
+optional workflow rules. Ordinary prose and legacy `review-ready`/`reviewed`
+labels remain writable. See [the operational workflow](OPERATIONAL_WORKFLOW.md).
+
 The accepted reference catalog, requirements-gathering and capability-index designs
 have their names reserved by the shared slice 0, before their writers. The reference
 catalog writer (`ref propose|revise`, `admin.py reference-apply`) now exists; the

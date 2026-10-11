@@ -1917,9 +1917,15 @@ Unreadable lifecycle events use the complete native `list --type event --all
 unreadable selected event refuses lifecycle writes with the operator repair
 sentence. Since its parent and dimension cannot be trusted, lifecycle reads of
 that snapshot report unknown instead of an older passed fact. The contributor
-endpoint currently permits creating an event and changing native type to/from
-event; a retyped ordinary row joins event membership, and a retyped event leaves
-it. Type membership alone never makes readable event content a trusted fact.
+endpoint reserves lifecycle-shaped events and lifecycle labels on the raw
+contributor path. Use the dedicated `lifecycle` action (`lifecycle.py record`)
+to assert or correct a fact. Raw creation, conversion or alteration of a
+lifecycle event and lifecycle label addition, removal, inheritance or
+replacement are refused before native writes, independently of optional policy
+rules. Ordinary events and task prose remain writable. A retyped ordinary row
+joins event membership, and a retyped ordinary event leaves it; type membership
+alone never makes readable event content a trusted fact. Configured operators
+and structured host writers keep their existing routes and legacy readers.
 
 Consumers should key on documented fields, tolerate additional fields, and treat any
 nonzero exit code as failure. The envelope, `work` top-level shape, `brief`
