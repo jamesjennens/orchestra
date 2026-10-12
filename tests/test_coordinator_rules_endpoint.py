@@ -444,10 +444,11 @@ class CoordinatorRulesWebRouteTests(RulesHelpers, unittest.TestCase):
         document=json.loads((self.root/'deployment.private.json').read_text())
         document['review_workflow_writes']=True
         (self.root/'deployment.private.json').write_text(json.dumps(document))
-        asked=self.post_review(task,author,dict(schema_version=1,operation='request-review',
-            operation_id='named-'+secrets.token_hex(8),task=task,previous=contribution,
-            contribution=contribution,reviewer=extra['named'][0],summary='Please review'))
-        self.assertEqual(asked['returncode'],0)
+        asked=harness.request('POST','/v1/projects/pp/tasks/'+task+'/reviews',
+            dict(schema_version=1,operation='request-review',operation_id='named-'+secrets.token_hex(8),
+                 previous=contribution,contribution=contribution,reviewer=extra['named'][0],summary='Please review'),
+            token=oscar)
+        self.assertEqual(asked.status,201,asked.data)
         callers=[('author',author,olga),('assignee',assignee,oscar),
                  ('third',extra['third'][0],extra['third'][1]),
                  ('coordinator',extra['coordinator'][0],extra['coordinator'][1]),
@@ -459,8 +460,13 @@ class CoordinatorRulesWebRouteTests(RulesHelpers, unittest.TestCase):
                 with self.subTest(rule=enabled,caller=role):
                     response=harness.request('GET','/v1/projects/pp/tasks/'+task+'/brief',token=token)
                     self.assertEqual(response.status,200,response.data)
-                    raw=self.endpoint('brief',actor,[task,'--json'])
-                    canonical=json.loads(raw['stdout'])['review']['waiting_for_approval']
+                    # HTTP actor names are reserved to the service, so compare
+                    # its result to the shared canonical reader, not a forged SSH
+                    # request under the account's name.
+                    import briefing, sessions
+                    canonical=briefing.brief(self.rows(),'pp',task,actor=actor,operators=['ops'],
+                        journal=self.project,independent_approval=enabled,
+                        owners=lambda:sessions.owners(self.project))['review']['waiting_for_approval']
                     self.assertEqual(response.data['review']['waiting_for_approval'],canonical)
                     expected=work.APPROVAL_WAIT if enabled and role in ('author','assignee') else work.review_move(
                         'awaiting-review',task,role=='assignee',named_reviewer=role=='named')[1]

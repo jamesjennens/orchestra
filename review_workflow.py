@@ -362,10 +362,11 @@ def owner_map(owners):
 
     ``owners`` is a mapping, or a zero-argument callable returning one. The endpoint
     passes a callable so that a request that does not need the registry never reads
-    it: with ``coordinator_writes`` ON a damaged registry must not stop ``work``,
-    ``review``, ``contribute`` or a listed operator's own operation (kittrial-5bb.197
-    review request 01a12894, item 4c). A callable that cannot read the registry
-    raises its own sentence; the caller adds the way to turn the rule off.
+    it. Listed names need no registry for the coordinator/lifecycle naming rules,
+    and exact assignees need none for their allowed facts. Independent-approval
+    writers load it strictly even for a listed operator. Readers can fall back to
+    names; contributing does not need ownership. A failing loader names its rule
+    and recovery; ``approval_owners`` supplies the independent-approval refusal.
     """
     return owners() if callable(owners) else owners
 

@@ -79,10 +79,13 @@ class RegistryAndPartyTests(unittest.TestCase):
 
     def test_exact_assignee_writes_do_not_need_registry(self):
         tracker=Tracker()
-        record_scope(tracker,owners=broken)
-        for dimension in ('implemented','tested'):
-            lifecycle.apply_native(payload(dimension,'passed'),ASSIGNEE,tracker,
-                operators=[OPERATOR],lifecycle_authors=True,owners=broken)
+        try:
+            record_scope(tracker,owners=broken)
+            for dimension in ('implemented','tested'):
+                lifecycle.apply_native(payload(dimension,'passed'),ASSIGNEE,tracker,
+                    operators=[OPERATOR],lifecycle_authors=True,owners=broken)
+        except ValueError as refusal:
+            self.fail('The exact assignee must be allowed without the registry: '+str(refusal))
         self.assertEqual(len(tracker.writes),3)
         with self.assertRaises(ValueError):
             lifecycle.apply_native(payload('reviewed','passed'),ASSIGNEE,tracker,
@@ -219,6 +222,32 @@ class EndpointWithoutServiceTests(unittest.TestCase):
                 self.assertIn('read. An operator',text)
                 self.assertEqual(text.count('nothing was changed'),1)
                 self.assertNotIn(temp,text)
+
+    def test_actual_endpoint_work_and_brief_read_the_rule_for_each_host_caller(self):
+        from test_coordinator_endpoint import runtime, deployment
+        chain=Chain(assignee='assignee',contribution_author='author')
+        chain.add(dict(schema_version=1,operation='request-review',operation_id='req-1',task=TASK,
+            previous='delivery',contribution='delivery',reviewer='named',summary='Please review'),'req','author')
+        before=copy.deepcopy(chain.rows)
+        with tempfile.TemporaryDirectory() as temp:
+            root=runtime(temp,'alpha');deployment(root,operators=(OPERATOR,))
+            def native(argv,env):
+                self.assertIn('export',argv)
+                return subprocess.CompletedProcess(argv,0,'\n'.join(json.dumps(r) for r in chain.rows),'')
+            for enabled in (False,True):
+                config=json.loads((root/'deployment.private.json').read_text())
+                config['independent_approval']=enabled
+                (root/'deployment.private.json').write_text(json.dumps(config))
+                for actor in ('author','assignee','third','ops','named'):
+                    with self.subTest(rule=enabled,actor=actor), mock.patch.object(endpoint.native,'run',side_effect=native):
+                        queue=json.loads(endpoint.execute(root,dict(project='alpha',actor=actor,action='work',args=['--json']))['stdout'])
+                        row=next(r for r in queue['items'] if r['task']==TASK)
+                        brief=json.loads(endpoint.execute(root,dict(project='alpha',actor=actor,action='brief',args=[TASK,'--json']))['stdout'])
+                        expected=work.APPROVAL_WAIT if enabled and actor in ('author','assignee') else row['next']
+                        self.assertEqual(row['waiting_for_approval'],expected)
+                        self.assertEqual(brief['review']['waiting_for_approval'],expected)
+                        self.assertEqual(brief['review']['approval_requires_other_party'],enabled)
+            self.assertEqual(chain.rows,before)
 
 
 if __name__=='__main__': unittest.main()

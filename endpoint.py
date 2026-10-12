@@ -55,11 +55,11 @@ def warning_text(warnings):
 def owner_loader(path,rule):
     """A zero-argument reader of the project's actor -> principal map.
 
-    The map (``sessions.owners``) is read ONLY when a rule needs it, and only for the
-    writes that need it, so a damaged registry never stops ``work``, ``review``,
-    ``contribute`` or a listed operator's operation (kittrial-5bb.197 review request
-    01a12894, item 4c). A registry that cannot be read raises with the way to turn
-    ``rule`` off; the caller adds nothing.
+    The map (``sessions.owners``) is read only when a rule needs it. Advisory
+    readers catch failures and retain name comparison. Independent-approval
+    writers fail closed, including listed operators. The other naming rules can
+    decide an exact assignee or directly listed name without a registry read.
+    A failure names the setting and recovery once, without registry contents.
     """
     def load():
         import sessions
@@ -812,9 +812,9 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
         run_warnings.extend(switch_warnings)
         # The principal rule of slice 7 and the party comparison of rule 3 both need the
         # project's actor -> principal map, and only when a rule that consults it is on:
-        # an installation that configures nothing reads no registry here, and a damaged
-        # registry does not stop work, review, contribute or a listed operator's own
-        # operation (kittrial-5bb.197 review request 01a12894, items 1 and 4c).
+        # an installation that configures nothing reads no registry here. Advisory
+        # reads retain name comparison on failure; independent-approval writers
+        # must load ownership strictly, even for a directly listed operator.
         registry_rule='coordinator_writes' if rules['coordinator_writes'] else 'independent_approval'
         owners=(owner_loader(path,registry_rule)
                 if (rules['coordinator_writes'] or rules['independent_approval']) else None)
