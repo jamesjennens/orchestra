@@ -1672,6 +1672,14 @@ recorded wrote nothing and carries no `server_time`.
 **Refusals.** An unknown subcommand, or a host-only command named here, is refused with
 "Unknown coordinator command" and the list of the ten. A refused operation changes nothing.
 
+## `docs` and `onboard`: the installed documents
+
+`docs` lists the catalogued documents and serves one whole; `docs --status` reports every
+catalogued document as served with its size or refused with its sentence; whoever may call
+`docs` may call it, and the web route does not offer it. `onboard` serves the start document
+and the project entry point together. A document that cannot be read is refused without
+printing a host path, and the sentence names the document.
+
 ## IDs and cursor roles
 
 - **Native task ID**: `task`/`items[].task`/the positional argument to `show`, `brief`,
@@ -1911,8 +1919,9 @@ before Python started.
 `coordinate`/`create-child` is endpoint-side: the **server kit** must be a version that
 supports the `coordinate` action (this contract, `0.1.0`+). A client on a newer kit
 talking to an older endpoint fails with `ValueError: Unknown action` from that endpoint;
-`docs --status` reports every catalogued document as served with its size or refused with its sentence; whoever may call `docs` may call it, and the web route does not offer it. `onboard` reports client/kit version and provenance parity so the mismatch is visible
-before mutating. The native `create` call uses `--no-inherit-labels` and, for
+`onboard` reports client/kit version and provenance parity so the mismatch is visible
+before mutating. The `docs` status sentence is documented with `docs` and `onboard` above.
+The native `create` call uses `--no-inherit-labels` and, for
 `type=decision`, `--validate`, both of which require the pinned Beads 1.2.2. Request IDs
 and content hashes are durable, so an uncertain create is reconciled with the same
 request ID instead of creating a duplicate.

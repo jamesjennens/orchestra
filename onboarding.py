@@ -197,6 +197,18 @@ def web_action(project_path, project, request, authority_config):
                        require_authority=True)
 
 
+def _document_unreadable(name, error):
+    """The sentence for a document this process cannot read, name or look up.
+
+    Never the absolute path of a host file (review 01a12be9), and it NAMES the document
+    (kittrial-5bb.262 C5): "cannot be read on this installation (...)" with no subject left the
+    reader guessing which document was refused.
+    """
+    reason = getattr(error, 'strerror', None) or type(error).__name__
+    return ValueError('The document "%s" cannot be read on this installation (%s); ask the operator'
+                      % (name, reason.lower()))
+
+
 def read_document(base, relative, limit, kit_document=None):
     """The whole text of one document under ``base``, or a refusal; never a part of it.
 
@@ -204,33 +216,45 @@ def read_document(base, relative, limit, kit_document=None):
     (``PROJECT_LIMIT`` for text an owner or operator wrote, ``START_LIMIT``,
     ``KIT_DOCUMENT_LIMIT``). ``kit_document`` is the catalogue name of a document the kit
     ships: a refusal for one says what is wrong with the installation, not that somebody
-    should shorten it.
+    should shorten it. A document this process cannot even look up - a directory on the way
+    in with no search permission raises from ``is_symlink``/``is_file`` before the read - is
+    refused with the same path-free sentence as a failed read, naming the document
+    (kittrial-5bb.262 C2, C5).
     """
     base = Path(base).resolve()
     path = base / relative
-    if any(p.is_symlink() for p in [path, *path.parents] if p != base and base in p.parents):
-        raise ValueError('Onboarding document must not use symlinks')
-    if not path.resolve().is_relative_to(base):
-        raise ValueError('Document outside configured root')
-    if not path.is_file():
-        raise ValueError('Onboarding document missing; ask the operator to configure/update this installation')
+    try:
+        if any(p.is_symlink() for p in [path, *path.parents] if p != base and base in p.parents):
+            raise ValueError('Onboarding document must not use symlinks')
+        if not path.resolve().is_relative_to(base):
+            raise ValueError('Document outside configured root')
+        if not path.is_file():
+            raise ValueError('Onboarding document missing; ask the operator to configure/update this installation')
+    except OSError as error:
+        raise _document_unreadable(relative, error) from None
     try:
         with path.open('rb') as f:
             data = f.read(limit + 1)
     except OSError as error:
         # Never the absolute path of a host file (review 01a12be9).
-        reason = getattr(error, 'strerror', None) or type(error).__name__
-        raise ValueError('cannot be read on this installation (%s); ask the operator' % reason.lower()) from None
-    if len(data) > limit and kit_document == 'start':
-        raise ValueError('The start document is larger than the start document may be (over %d bytes), so the file at '
-                         'that place in this installation is not the one the kit ships. Nothing was returned; ask the '
-                         'operator to reinstall the kit. The same text is in the repository (%s)'
-                         % (limit, relative))
+        raise _document_unreadable(relative, error) from None
     if len(data) > limit and kit_document is not None:
-        raise ValueError('The kit document "%s" is larger than a kit document can be (over %d bytes), so the file at '
-                         'that place in this installation is not the one the kit ships. Nothing was returned; ask the '
-                         'operator to reinstall the kit. The same text is in the repository (%s)'
-                         % (kit_document, limit, relative))
+        # The bound is NAMED for what it is (kittrial-5bb.262 C5). Two bounds apply to the start
+        # document: ``onboard`` and ``docs --status`` read it with the tighter START_LIMIT,
+        # ``docs start`` with the kit-document bound. The old sentence - "The start document is
+        # larger than the start document may be" - was circular and never said which one refused
+        # it, so ``docs start`` over the kit bound read as the start bound and the other way round.
+        if kit_document != 'start':
+            raise ValueError('The kit document "%s" is larger than a kit document can be (over %d bytes), so the file '
+                             'at that place in this installation is not the one the kit ships. Nothing was returned; '
+                             'ask the operator to reinstall the kit. The same text is in the repository (%s)'
+                             % (kit_document, limit, relative))
+        bound = ('the kit-document bound' if limit == KIT_DOCUMENT_LIMIT
+                 else 'the start bound, which is tighter than the kit-document bound')
+        raise ValueError('The kit document "%s" is larger than %s (over %d bytes), so the file at that place in this '
+                         'installation is not the one the kit ships. Nothing was returned; ask the operator to '
+                         'reinstall the kit. The same text is in the repository (%s)'
+                         % (kit_document, bound, limit, relative))
     if len(data) > limit:
         raise ValueError('Onboarding document exceeds size limit; operator must shorten it (no partial instructions returned)')
     result = data.decode('utf-8-sig')
@@ -254,25 +278,26 @@ def catalog_status(kit, project_path=None):
     rows = []
     for name in names:
         try:
+            # The text is not kept: this is a status read, and the unused binding was removed
+            # (kittrial-5bb.262 C6).
             if name == 'project':
-                text = read_document(project_path, 'ONBOARDING.md', PROJECT_LIMIT)
+                read_document(project_path, 'ONBOARDING.md', PROJECT_LIMIT)
                 size = (Path(project_path) / 'ONBOARDING.md').stat().st_size
             elif name == 'start':
                 # onboard reads start with the tighter START_LIMIT: a live check that only
                 # asked --status would pass where no worker can start (review 01a12be9).
-                text = read_document(kit, DOCUMENTS['start'], START_LIMIT, kit_document='start')
+                read_document(kit, DOCUMENTS['start'], START_LIMIT, kit_document='start')
                 size = (Path(kit) / DOCUMENTS['start']).stat().st_size
             else:
-                text = read_kit_document(kit, name)
+                read_kit_document(kit, name)
                 size = (Path(kit) / DOCUMENTS[name]).stat().st_size
             rows.append({'name': name, 'served': True, 'bytes': size})
         except ValueError as error:
             rows.append({'name': name, 'served': False, 'refused': str(error)})
         except OSError as error:
-            # Never the absolute path of a host file (review 01a12be9): the short reason only.
-            reason = getattr(error, 'strerror', None) or type(error).__name__
-            rows.append({'name': name, 'served': False,
-                         'refused': 'cannot be read on this installation (%s); ask the operator' % reason.lower()})
+            # Never the absolute path of a host file (review 01a12be9): the short reason only,
+            # and the document is named (kittrial-5bb.262 C5).
+            rows.append({'name': name, 'served': False, 'refused': str(_document_unreadable(name, error))})
     return rows
 
 
@@ -352,7 +377,7 @@ def probe_endpoints(text, project, kit):
 def execute(kit, project_path, project, actor, action, args, endpoint=None):
     if not isinstance(args, list) or any(not isinstance(a, str) for a in args):
         raise ValueError('Expected argument list')
-    catalog = '\n'.join(['  docs --status  (every name as served or refused, with its size)']
+    catalog = '\n'.join(['  docs --status  (every name as served, with its size, or as refused with its sentence)']
                        + ['  docs '+key for key in ['project', *DOCUMENTS]])
     if action == 'docs':
         if not args:return 'Installed onboarding documents (use your existing client prefix):\n'+catalog+'\n'
