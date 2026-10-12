@@ -981,8 +981,13 @@ again.
 READER's own verdict on the history being replaced and records it on the new baseline, because the
 closed baseline record (`{at,operator,reason,lists}`) has only its free-text `reason` to say it.
 The reason names the state the replaced history read as - `agrees`, `incomplete`, `mismatch` or
-`DAMAGED` - the names the trail did not explain PER LIST when it was a mismatch (the first eight of
-each list and `(+N more)`, so the reason stays inside the 400-character ceiling), and the
+`DAMAGED` - the names the trail did not explain PER LIST when it was a mismatch (as many whole names
+as fit a shared 64-character budget, at most the first eight of each list, and then `(+N more)`, so
+the reason stays inside the 400-character ceiling; at least one name is always named, and when even
+the first name does not fit, the reason says that first name's length and the count instead - for
+example `operators: 1 name of 70 characters not shown`, or `verifiers: 70-char name, +11` when an
+earlier list has nearly spent the shared budget - so a verdict never reads as names with none
+of them), and the
 `.replaced-` name it was kept under. The same verdict is printed as a `WARNING` on stderr and
 carried in the command's stdout under `previous_audit_verdict` (`{"state", "unexplained", "note"}`),
 beside `previous_audit_kept_as` naming the kept file (`null` when there was no history yet);
@@ -996,12 +1001,30 @@ refused: they need no flag. A damaged history accepted with the flag is kept as
 `.replaced-<UTC date-time>` like any other, and the reason says it was `DAMAGED` and why. The
 `--reason` the operator gives is never truncated; when it cannot fit beside the verdict the command
 refuses with the number of characters it has room for. A `--reason` holding a newline (or any other
-line separator) is refused with one sentence, because the recorded reason is one line.
+line separator) is refused with one sentence, because the recorded reason is one line, and a
+`--reason` holding `the history this replaced` is refused too: that is the marker the kit finds its
+own verdict by, and a reason holding it could read as that verdict. The verdict is always written
+BEFORE the operator's sentence, and the operator's words are never carried into another baseline.
+
+**What cannot be told, and what it needs.** Two holes need write access to the runtime's files, and
+nothing in the kit can close either. A hand edit of a list the history's baseline records as `null`
+(UNKNOWN) cannot be compared: `authority-changes-baseline` re-bases that history WITHOUT
+`--accept-unexplained` - the `incomplete` state is exactly the case the command exists for - and the
+new baseline records the verdict as `incomplete`, so the fresh history says the old one could not be
+compared rather than that it agreed. An audit file moved aside by hand - renamed, deleted, or
+replaced - reads as no trail: `authority-changes` says the trail does not begin with a baseline, and
+`authority-changes-baseline` starts a fresh history with no file to keep. A hand edit in a list the
+baseline DOES record is the one that is detected: it reads as a `mismatch`.
 
 The verdict is not lost at the cap. An audit can hold 200 entries; when the next change needs room,
 the oldest entries are folded into a fresh baseline (below), and that folded baseline CARRIES
 FORWARD the rebase note of the baseline it replaces - its state, the unexplained names it recorded
 and the `.replaced-` name - so a history that was ever re-based over a mismatch says so for good.
+A second `authority-changes-baseline` over such a history carries the FIRST re-base's note into the
+new baseline in the same way, so re-basing again cannot drop the mismatch the first one recorded.
+A squeeze keeps the marker and the state word first and cuts the names from the END of the list (the
+`(+more)` note says so) and the kept-file clause last, so what is carried is never a verdict it is
+not; the `.replaced-*` files themselves are still listed by the reader.
 
 The `.replaced-*` histories are NEVER removed and the reader lists them too, in its JSON under
 `replaced_files` beside `damaged_files` and in the note when there are any. They are NOT damaged
