@@ -16,6 +16,7 @@ import hashlib
 import io
 import json
 import os
+import posixpath
 import re
 import secrets
 import signal
@@ -27,6 +28,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import weakref
 from pathlib import Path
 from contextlib import contextmanager
@@ -674,6 +676,287 @@ def review_workflow_writes(root, strict=False, warnings=None):
                 print('WARNING: ' + message,file=sys.stderr)
     return enabled
 
+# ---------------------------------------------------------------------------
+# Slices 6 and 7 of docs/COORDINATORS_PER_PROJECT_DESIGN.md (kittrial-5bb.197) and
+# the decisions recorded on kittrial-5bb.106: three per-installation rules, each
+# OFF until an installation turns it on.
+#
+#   lifecycle_authors    - who may record which lifecycle fact (part a)
+#   independent_approval - nobody passes their own work, the self-approval half (part b)
+#   coordinator_writes   - approval and the merge slot only for a listed actor (part c)
+#
+# Each is its own boolean in `deployment.private.json`; absent or false means OFF,
+# so a fresh install and an installation that configures nothing behave exactly as
+# before. `admin.py coordinator-rules` reads and flips them (operator allowlist,
+# audited); `admin.py lifecycle-authors PROJECT` is the read-only preview of (a).
+# The endpoint supplies the values to the write paths; `lifecycle.py` and
+# `review_workflow.py` never read this file themselves.
+# ---------------------------------------------------------------------------
+COORDINATOR_RULE_KEYS=('lifecycle_authors','independent_approval','coordinator_writes')
+COORDINATOR_RULES_AUDIT_KEY='coordinator_rules_audit'
+#: The audit list keeps the last N flips, as `review-writes` and `bound-keys-only` bound theirs.
+COORDINATOR_RULES_AUDIT_MAX=20
+COORDINATOR_RULE_HELP={'lifecycle_authors':'record reviewed, integrated, deployed, live-verified, enabled, live and '
+                                           'a release deploy only as a listed operator, and implemented, tested and '
+                                           'the task scope only as the assignee or a listed operator',
+                       'independent_approval':'refuse an approval from the contribution\'s author or the task\'s assignee',
+                       'coordinator_writes':'allow only a listed actor of the project to approve a contribution or '
+                                            'take the merge slot'}
+
+
+def coordinator_rules(root,warnings=None):
+    """The three slices 6/7 rules at once, read once; absent or false means OFF.
+
+    A value that is neither true nor false is read as OFF with a warning, as
+    `review_workflow_writes` is (kittrial-5bb.110 item 2): raising here would fail
+    every review and every lifecycle write on the installation while the other
+    readers kept answering. The warning NAMES the setting and shows the value ESCAPED
+    and BOUNDED with `audit_field`, so a 200 kB hand-edited value cannot flood stderr
+    on every request (kittrial-5bb.197 review request 01a12894, item 6). There is
+    deliberately no `ORCHESTRA_*` fallback: these are deployment rules, not authority
+    lists.
+    """
+    values={key:False for key in COORDINATOR_RULE_KEYS}
+    marker=root/'deployment.private.json'
+    if marker.is_file():
+        document=deployment_document(marker)
+        for key in COORDINATOR_RULE_KEYS:
+            value=document.get(key)
+            if isinstance(value,bool):values[key]=value
+            elif value is not None:
+                message=('WARNING: deployment %s is %s, not true or false; reading it as off (the rule refuses '
+                         'nothing)'%(key,audit_field(value)))
+                if warnings is not None:warnings.append(message)
+                else:print(message,file=sys.stderr)
+    return values
+
+
+def coordinator_rule(root,key,warnings=None):
+    """One of the three slices 6/7 rules by name."""
+    if key not in COORDINATOR_RULE_KEYS:raise ValueError('Unknown coordinator rule %s'%key)
+    return coordinator_rules(root,warnings)[key]
+
+
+def coordinator_rules_audit(cfg):
+    """``(entries, damage)`` for the coordinator-rules audit in a deployment document."""
+    entries=cfg.get(COORDINATOR_RULES_AUDIT_KEY)
+    if entries is None:return [],None
+    if not isinstance(entries,list):return [],'not a list'
+    kept=[]
+    for position,entry in enumerate(entries):
+        if (isinstance(entry,dict) and set(entry)=={'at','actor','rule','action','previous'}
+                and all(isinstance(entry.get(key),str) for key in ('at','actor','rule','action'))
+                and isinstance(entry.get('previous'),bool)):
+            kept.append(entry)
+            continue
+        return kept,'entry %d is not a coordinator-rules audit entry'%(position+1)
+    return kept,None
+
+
+def coordinator_rules_audit_entry(entry):
+    """One audit entry as ``status`` reports it: hand-editable strings bounded and escaped.
+
+    The audit lives in `deployment.private.json`, which an operator (or a mistake) can
+    edit by hand, so the entry is printed through `audit_field`: a 200 kB `actor` or a
+    value carrying ESC must not flood or rewrite the operator's terminal
+    (kittrial-5bb.197 review request 01a12894, item 6).
+    """
+    if not isinstance(entry,dict):return None
+    return {'at':audit_field(entry.get('at')),'actor':audit_field(entry.get('actor')),
+            'rule':audit_field(entry.get('rule')),'action':audit_field(entry.get('action')),
+            'previous':entry.get('previous') if isinstance(entry.get('previous'),bool) else None}
+
+
+def coordinator_rules_switch(root,action,rule,actor):
+    """Read or flip one slices 6/7 rule, with its operator audit.
+
+    Only an actor on the deployment operator allowlist may read or flip: the decision
+    on kittrial-5bb.106 is an operator's. A flip holds `review_writes_lock` across the
+    whole read-modify-write of `deployment.private.json`, as the other deployment
+    switches do, so two simultaneous flips cannot lose each other. A flip that changes
+    nothing writes nothing. `off` on a value that is not a bool is a REAL flip that
+    writes false, not a no-op that leaves the bad value in the file
+    (kittrial-5bb.197 review request 01a12894, item 6). A damaged audit is warned about
+    and started afresh with the damaged value kept aside under a dated key, as the
+    checkpoint switch does; `status` bounds every hand-edited audit field.
+    """
+    from recovery import identity
+    marker=root/'deployment.private.json'
+    if not marker.is_file():raise ValueError('Deployment is not installed; run install first')
+    actor=identity(actor,'Invalid actor identity')
+    if actor not in operators(root,strict=True):
+        raise ValueError('coordinator-rules requires an actor on the deployment operator allowlist')
+    if action not in ('status','on','off'):raise ValueError('Invalid coordinator-rules action')
+    if action=='status':
+        audit,damage=coordinator_rules_audit(config(root))
+        if damage is not None:
+            print('WARNING: the coordinator-rules audit is damaged (%s); it reads as an empty history. The next '
+                  'on/off keeps it aside in deployment.private.json under %s_damaged_<UTC stamp> and starts a '
+                  'fresh list.'%(damage,COORDINATOR_RULES_AUDIT_KEY),file=sys.stderr)
+        return dict(coordinator_rules=coordinator_rules(root),
+                    audit=coordinator_rules_audit_entry(audit[-1]) if audit else None,
+                    audit_records=len(audit),audit_readable=damage is None,changed=False,rule=rule)
+    if rule not in COORDINATOR_RULE_KEYS:
+        raise ValueError('coordinator-rules %s requires --rule with one of: %s'
+                         %(action,', '.join(COORDINATOR_RULE_KEYS)))
+    enabled=action=='on'
+    with review_writes_lock(root):
+        current=coordinator_rules(root)[rule]
+        cfg=config(root)
+        audit,damage=coordinator_rules_audit(cfg)
+        # `off` must also be a real flip when the file holds a value that is not a bool:
+        # reading it as off makes `on`==`off` a no-op that leaves the bad value and its
+        # warning in place (the rule `bound-keys-only` follows, review item 6).
+        stale_value=rule in cfg and not isinstance(cfg.get(rule),bool)
+        if enabled==current and not (not enabled and stale_value):
+            return dict(coordinator_rules=coordinator_rules(root),
+                        audit=coordinator_rules_audit_entry(audit[-1]) if audit else None,
+                        audit_records=len(audit),audit_readable=damage is None,changed=False,rule=rule)
+        if damage is not None:
+            kept='%s_damaged_%s'%(COORDINATOR_RULES_AUDIT_KEY,utc_stamp().replace(':','').replace('-',''))
+            suffix=1
+            while kept+('' if suffix==1 else '_%d'%suffix) in cfg:suffix+=1
+            kept+=('' if suffix==1 else '_%d'%suffix)
+            cfg[kept]=cfg.pop(COORDINATOR_RULES_AUDIT_KEY)
+            print('WARNING: the coordinator-rules audit was damaged (%s); it is kept aside in '
+                  'deployment.private.json as %s and this flip starts a fresh list.'%(damage,kept),file=sys.stderr)
+        if enabled:cfg[rule]=True
+        else:cfg.pop(rule,None)
+        cfg[COORDINATOR_RULES_AUDIT_KEY]=(audit+[dict(actor=actor,at=utc_stamp(),rule=rule,action=action,
+                                                      previous=current)])[-COORDINATOR_RULES_AUDIT_MAX:]
+        atomic_private_write(marker,json.dumps(cfg))
+    return dict(coordinator_rules=coordinator_rules(root),audit_records=min(len(audit)+1,COORDINATOR_RULES_AUDIT_MAX),
+                audit_readable=True,changed=True,rule=rule)
+
+
+def lifecycle_authors_command(root,project,limit=None):
+    """``admin.py lifecycle-authors PROJECT``: the read-only preview of part (a).
+
+    Writes nothing and reads the project's own export with the reader every other
+    lifecycle read uses, so it can be run before `lifecycle_authors` is turned on
+    (the decision on kittrial-5bb.106). It is a host command: the shell is already
+    authority over the installation, so it takes no `--actor` and gates nothing.
+    """
+    import lifecycle
+    if limit is None:limit=lifecycle.AUTHORS_REPORT_TASK_LIMIT
+    if not isinstance(limit,int) or isinstance(limit,bool) or limit<0:raise ValueError('Invalid --limit')
+    def run(argv):return run_bd(root,project,argv)
+    rows=lifecycle.read_event_rows(run)
+    import sessions
+    try:owners=sessions.owners(project_dir(root,project))
+    except (ValueError,OSError):owners=None
+    report=lifecycle.lifecycle_authors_report(rows,operators(root),owners=owners,limit=limit)
+    report['project']=project
+    report['setting']={'lifecycle_authors':coordinator_rule(root,'lifecycle_authors')}
+    return report
+
+
+#: The key of the installation setting that accepts bound keys only, and the key of its short
+#: operator audit list, in the same deployment.private.json (kittrial-5bb.196, slice 4 of
+#: docs/COORDINATORS_PER_PROJECT_DESIGN.md).
+BOUND_KEYS_ONLY_KEY='bound_keys_only'
+BOUND_KEYS_ONLY_AUDIT_KEY='bound_keys_only_audit'
+#: The most of `deployment.private.json` the bound-keys-only reader reads, the same bound the
+#: forced command uses (kittrial-5bb.196 review, item 4a). The file is the operator's, but every
+#: connection reads it, so a huge one must not be read whole.
+BOUND_KEYS_ONLY_MAX_BYTES=1024*1024
+#: The audit list keeps the last N flips, as `review-writes` keeps `REVIEW_WRITES_AUDIT_MAX`
+#: (kittrial-5bb.196 review, item 4b): an unbounded list grew to 101 KB after 1,001 flips and
+#: `status` printed all of it. `status` reports the cap.
+BOUND_KEYS_ONLY_AUDIT_MAX=20
+#: The most line numbers the preview (`would_be_refused`) NAMES, so a hand-written
+#: authorized_keys with thousands of unbound lines cannot flood the operator's terminal
+#: (kittrial-5bb.196 review, item 5): the report says how many more there are.
+WOULD_BE_REFUSED_NAMED_MAX=20
+#: The most of an authorized_keys file the listing reads (kittrial-5bb.196 review, item 5).
+#: The file is the account's, but it is read on every `status`/`on`; a huge one must not be
+#: read whole, and the report says when the tail was not inspected.
+AUTHORIZED_KEYS_MAX_BYTES=1024*1024
+#: The most of one audit field (`actor`, `at`) a warning prints (kittrial-5bb.196 review,
+#: item 6): a hand-edited entry must not put escape sequences or 200 kB on the terminal.
+AUDIT_FIELD_MAX=80
+
+def bound_keys_only(root, warnings=None):
+    """The per-installation setting that accepts bound keys only (kittrial-5bb.196, slice 4).
+
+    `deployment.private.json`'s `bound_keys_only` is the single source. Absent or false means
+    OFF, so a fresh install, an installation that never turned it on and one that turned it
+    back off read identically. A value that is neither true nor false is read as OFF with a
+    warning, for the reason `review_workflow_writes` does it (kittrial-5bb.110 item 2): raising
+    would fail `work` and `brief` for every actor of the installation. A file that cannot be
+    read as the deployment configuration raises :class:`ConfigurationUnreadable`, as it does
+    for every other reader of that file.
+
+    A path that is there but is not a regular file - a directory, a fifo, a symlink loop, a
+    symlink to a non-regular file - or that cannot be stat'd also raises, so `setup-status` says
+    UNKNOWN with its reason instead of reading OFF while the forced command refuses every key
+    (kittrial-5bb.196 review, item 2c). A missing file (or a dangling symlink) stays OFF, which
+    is what the wrapper reads too. The reader reads at most `BOUND_KEYS_ONLY_MAX_BYTES` and
+    refuses a larger file (item 4a).
+
+    The setting is ENFORCED by `ssh_forced_command.py`: with it on, the forced command of an
+    authorized_keys line refuses a line that names no project or no principal. The wrapper
+    cannot import this module (it must start on any interpreter the account has) and has its
+    own reader of the same key; tests/test_bound_keys_only.py pins the two together.
+    """
+    enabled=False
+    marker=root/'deployment.private.json'
+    try:
+        info=os.stat(str(marker))
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        raise ConfigurationUnreadable('Deployment configuration %s cannot be read: %s'
+                                      %(marker,error.strerror or error)) from None
+    if not stat.S_ISREG(info.st_mode):
+        raise ConfigurationUnreadable('Deployment configuration %s is not a regular file'%marker)
+    if info.st_size>BOUND_KEYS_ONLY_MAX_BYTES:
+        raise ConfigurationUnreadable('Deployment configuration %s is larger than the %d bytes the '
+                                      'bound-keys-only setting reads'
+                                      %(marker,BOUND_KEYS_ONLY_MAX_BYTES))
+    try:
+        document=deployment_document(marker)
+    except RecursionError:
+        raise ConfigurationUnreadable('Deployment configuration %s nests too deeply to read'%marker) from None
+    value=document.get(BOUND_KEYS_ONLY_KEY)
+    if isinstance(value,bool):
+        enabled=value
+    elif value is not None:
+        message=('deployment %s is %r, not true or false; reading it as off (the forced command '
+                 'does NOT refuse a line without a project or a principal)'
+                 %(BOUND_KEYS_ONLY_KEY,value))
+        if warnings is not None:
+            warnings.append('WARNING: '+message)
+        else:
+            print('WARNING: '+message,file=sys.stderr)
+    return enabled
+
+#: What `setup-status` says about that setting (kittrial-5bb.196). The setting belongs to the
+#: installation, so every project reports the same words, and the sentence is what an operator
+#: needs to know before turning it on or after reading that it is on. The plainest statement of
+#: what the setting cannot do (a line printed before this kit) is in docs/OPERATIONS.md.
+BOUND_KEYS_ONLY_DETAIL_ON=('This installation accepts bound keys only: the forced command refuses an '
+    'authorized_keys line that names no project or no principal. It does nothing about a line printed before '
+    'this kit, which runs the release it names and does not know the setting: clean authorized_keys by hand, '
+    'and `admin.py authorized-keys-list` flags the lines to look at.')
+BOUND_KEYS_ONLY_DETAIL_OFF=('This installation accepts a line that names no project or no principal as before '
+    '(the setting is off). Once every line is bound, `admin.py bound-keys-only on --actor OPERATOR` turns it '
+    'on and the forced command then refuses such a line; a line printed before this kit keeps running the '
+    'release it names and is not refused by it.')
+BOUND_KEYS_ONLY_DETAIL_UNKNOWN=('The installation setting for bound keys only could not be read; an operator '
+    'must look at deployment.private.json on the server.')
+
+#: What `setup-status` says about the three coordinator rules (kittrial-5bb.197, review request
+#: 01a12894 item 6), in the same shape as the bound-keys-only block. The rules are per
+#: installation, so every project reports the same words.
+COORDINATOR_RULES_DETAIL_ON=('This installation enforces the coordinator rules (%s). An operator turns one off '
+    'with `admin.py coordinator-rules off --rule NAME --actor OPERATOR`.')
+COORDINATOR_RULES_DETAIL_OFF=('This installation enforces none of the coordinator rules (all three are off, the '
+    'default). An operator turns one on with `admin.py coordinator-rules on --rule NAME --actor OPERATOR`; read '
+    '`admin.py lifecycle-authors PROJECT` before turning lifecycle_authors on.')
+COORDINATOR_RULES_DETAIL_UNKNOWN=('The installation settings for the coordinator rules could not be read; an '
+    'operator must look at deployment.private.json on the server.')
+
 #: The key of the checkpoint switch's audit list inside deployment.private.json, and the
 #: prefix a damaged value is kept aside under (kittrial-5bb.131).
 CHECKPOINT_AUDIT_KEY='checkpoint_provenance_audit'
@@ -1069,6 +1352,305 @@ def review_writes_command(root, actor, action):
         atomic_private_write(marker,json.dumps(cfg))
         write_review_writes_audit(root,enabled,actor,previous,entries=review_writes_audit(root))
     return {'review_workflow_writes':review_workflow_writes(root),'changed':True},warnings
+
+
+def bound_keys_only_audit(cfg):
+    """``(entries, damage)`` for the bound-keys-only switch audit in a deployment document.
+
+    The entries have exactly the shape ``checkpoint-provenance-writes`` writes (actor, at,
+    action, previous, enabled), so one validator decides both lists; anything else is
+    ``([], reason)`` and the reason names what is there, never its content.
+    """
+    value=cfg.get(BOUND_KEYS_ONLY_AUDIT_KEY,[])
+    if not isinstance(value,list):
+        return [],'%s is a %s, not a list of records'%(BOUND_KEYS_ONLY_AUDIT_KEY,type(value).__name__)
+    for index,item in enumerate(value):
+        if not checkpoint_audit_entry(item):
+            return [],'entry %d of %s is not a record of the shape the switch writes'%(index,BOUND_KEYS_ONLY_AUDIT_KEY)
+    return value,None
+
+
+def audit_field(value,limit=AUDIT_FIELD_MAX):
+    """One hand-editable audit value, escaped and bounded, for a terminal message.
+
+    ``actor`` and ``at`` come from a file an operator (or a mistake) can edit by hand: printed
+    raw, a value carrying ESC or CR rewrites the terminal's line and a 200 kB one floods it
+    (kittrial-5bb.196 review, item 4). Every non-printable character is escaped and the text is
+    cut to ``limit``; nothing is executed or re-interpreted.
+    """
+    escaped=str(value).encode('unicode_escape').decode('ascii','backslashreplace')
+    return escaped if len(escaped)<=limit else escaped[:limit]+'...'
+
+
+def audit_agreement(damage,last,current):
+    """``(audit_agrees, audit_note)`` for a value and the last recorded flip.
+
+    ``audit_agrees`` is True/False when there is an entry to compare with, and ``None`` when
+    there is NO entry at all: a value hand-set to on with no recorded flip must not read as
+    agreeing (kittrial-5bb.196 review, item 4). A damaged audit is a disagreement, never "no
+    history, everything agrees".
+    """
+    if damage is not None:return False,'damaged'
+    if last is None:return None,'no entry'
+    if last['enabled']==current:return True,'agrees'
+    return False,'stale'
+
+
+def _may_sentence_for(numbers, more):
+    """The one group-two sentence for the switch's warnings (kittrial-5bb.250 r3 item 5)."""
+    if not numbers and not more:
+        return 'No line runs a command this preview cannot judge'
+    named=', '.join(str(number) for number in numbers) or ''
+    one=len(numbers)==1 and not more
+    return ('Line%s %s%s run%s a command this preview cannot judge (another wrapper or root, shell '
+            'syntax, a relative path, or another program) and %s not decided: if %s reach%s a kit '
+            'that has bound keys only on, %s refused unless bound'
+            %('s' if not one else '', named, '' if not more else ' and %d more'%more,
+              's' if one else '', 'was' if one else 'were', 'it' if one else 'they',
+              'es' if one else '', 'it is' if one else 'they are'))
+
+def bound_keys_only_switch(root,action,actor,file=None,without_preview=False):
+    """Read or flip ``bound_keys_only`` with its operator audit (kittrial-5bb.196, slice 4).
+
+    The actor must be on the deployment operator allowlist, as for the two rollout switches: a
+    contributor that reaches a host command line cannot turn the installation's key rule on or
+    off. A flip holds the deployment switch lock across the whole read-modify-write of
+    deployment.private.json (both switches rewrite that file), writes nothing when it changes
+    nothing, and keeps a damaged audit list aside as
+    ``bound_keys_only_audit_damaged_<UTC stamp>`` before it starts a fresh one, exactly as
+    ``checkpoint-provenance-writes`` does.
+
+    ``status`` reports ``audit_agrees``: whether the value and the last recorded flip agree, the
+    comparison ``review-writes`` makes (item 2b), with ``audit_note`` saying ``agrees``,
+    ``stale``, ``damaged`` or ``no entry``. ``no entry`` (and ``audit_agrees`` null) is a value
+    with no recorded flip at all: a hand-set value must not read as agreeing (item 4). ``off``
+    on a value that is not a bool is a real flip that writes false, not a no-op that leaves the
+    bad value in the file (item 2d). Both ``status`` and a flip to ``on`` report
+    ``would_be_refused``: the lines of this kit and this root that the setting refuses (or would
+    refuse while it is off), read from ``file`` or ``~/.ssh/authorized_keys`` (item 4c). The
+    preview is read and built BEFORE a flip is written, so a slow or failing read of the keys
+    file cannot leave the setting on with nothing printed (item 1). ``status`` on a settings
+    path that is there but is not a regular file (a directory, a fifo, a symlink loop) reports
+    the reader's UNKNOWN with its reason rather than "Deployment is not installed" (item 4). The
+    audit list keeps the last ``BOUND_KEYS_ONLY_AUDIT_MAX`` flips (item 4b).
+    """
+    marker=root/'deployment.private.json'
+    if not os.path.lexists(str(marker)):
+        raise ValueError('Deployment is not installed; run install first')
+    from recovery import identity
+    actor=identity(actor,'Invalid actor identity')
+    if action not in ('status','on','off'):raise ValueError('Invalid bound-keys-only switch action')
+    if file is not None and not str(file).strip():
+        # kittrial-5bb.250 r2 item 7: an empty --file silently meant the default path.
+        raise ValueError('--file is empty: name the authorized_keys file, or give no --file at all')
+    if without_preview and action!='on':
+        # Same item: the option says something about turning the setting ON only.
+        raise ValueError('--without-preview belongs to bound-keys-only on: it says the operator turned the '
+                         'setting on without the preview, and nothing else')
+    if not marker.is_file():
+        # The path is there but is not a regular file (a directory, a fifo, a symlink loop): the
+        # reader's answer for that shape is UNKNOWN (item 2c), so `status` says that with the
+        # reader's own reason, and a flip refuses. There is no readable operator allowlist to
+        # check against in this shape.
+        try:
+            bound_keys_only(root)
+        except (OSError,ValueError,RecursionError) as error:
+            reason=str(error)
+            if action!='status':
+                raise ConfigurationUnreadable(reason) from None
+            print('WARNING: '+reason,file=sys.stderr)
+            return dict(bound_keys_only=None,audit=None,audit_history=[],audit_records=0,audit_readable=False,
+                        audit_agrees=None,audit_note='unknown',audit_max=BOUND_KEYS_ONLY_AUDIT_MAX,
+                        would_be_refused=None,changed=False,unknown=reason)
+        # F10 (kittrial-5bb.250): a dangling symlink reads as absent to the value reader but as
+        # unreadable to the allowlist reader, which answered 'requires an actor on the
+        # deployment operator allowlist' to a real operator. Say what is wrong with the file.
+        reason=('%s is a dangling symlink: its target does not exist'%marker
+                if marker.is_symlink()
+                else '%s is not a regular file'%marker)
+        if action!='status':
+            raise ConfigurationUnreadable(reason) from None
+        print('WARNING: '+reason,file=sys.stderr)
+        return dict(bound_keys_only=None,audit=None,audit_history=[],audit_records=0,audit_readable=False,
+                    audit_agrees=None,audit_note='unknown',audit_max=BOUND_KEYS_ONLY_AUDIT_MAX,
+                    would_be_refused=None,changed=False,unknown=reason)
+    if actor not in operators(root,strict=True):
+        raise ValueError('bound-keys-only requires an actor on the deployment operator allowlist')
+    if action=='status':
+        warnings=[]
+        current=bound_keys_only(root,warnings=warnings)
+        audit,damage=bound_keys_only_audit(config(root))
+        last=audit[-1] if audit else None
+        # The switch and its audit are written together by a flip, so they disagree only when
+        # something else changed one of them: an older kit or a hand edit. A damaged audit is a
+        # disagreement too, not "no history, everything agrees" (the review-writes rule).
+        agrees=damage is None and (last is None or last['enabled']==current)
+        audit_note='agrees' if agrees else ('damaged' if damage is not None else 'stale')
+        if damage is None and last is None:
+            # Nothing was ever recorded: there is no entry to agree with, so a value hand-set to
+            # on must not read as `true` (item 4). Say "no entry".
+            agrees=None
+            audit_note='no entry'
+        if last is not None and not agrees:
+            print('WARNING: deployment %s is %s but the recorded audit history last says %s (set by %s at '
+                  '%s); the setting was changed without recording it here (an older kit or a hand edit), so '
+                  'the audit is stale'
+                  %(BOUND_KEYS_ONLY_KEY,'on' if current else 'off','on' if last['enabled'] else 'off',
+                    audit_field(last['actor']),audit_field(last['at'])),file=sys.stderr)
+        elif last is None and damage is None and current:
+            print('WARNING: deployment %s is on but the audit history has no entry recording it (an older kit '
+                  'or a hand edit); there is no entry for the value to agree with.'%BOUND_KEYS_ONLY_KEY,
+                  file=sys.stderr)
+        if damage is not None:
+            print('WARNING: the bound-keys-only switch audit is damaged (%s); it reads as an empty history. '
+                  'The next on/off keeps it aside in deployment.private.json under %s_damaged_<UTC stamp> and '
+                  'starts a fresh list.'%(damage,BOUND_KEYS_ONLY_AUDIT_KEY),file=sys.stderr)
+        for line in warnings:print(line,file=sys.stderr)
+        # F1 (kittrial-5bb.250): the preview before `on` says what `on` itself says - the named
+        # lines, the count beyond them (would_be_refused_more), and that only the first part of
+        # a too-large file was inspected (truncated, with the same stderr warning) - so the
+        # operator is not shown an incomplete preview without being told.
+        preview_info=authorized_keys_preview(root,file)
+        preview=None if preview_info is None else preview_info[0]
+        preview_more=0 if preview_info is None else preview_info[1]
+        preview_truncated=False if preview_info is None else preview_info[2]
+        may_refuse=[] if preview_info is None else preview_info[3]
+        may_refuse_more=0 if preview_info is None else preview_info[4]
+        if preview:
+            print('WARNING: %s %d authorized_keys line(s) of this kit and this root: %s%s. Print each such '
+                  'line again with `admin.py authorized-keys --project ... --principal ...` and replace it%s.'
+                  %('this installation refuses' if current else 'turning this setting on would refuse',
+                    len(preview)+preview_more,', '.join(str(number) for number in preview),
+                    ' and %d more'%preview_more if preview_more else '',
+                    '' if current else ' before turning the setting on'),file=sys.stderr)
+        elif preview is None:
+            print('WARNING: the authorized_keys file could not be read, so the lines turning this setting on '
+                  'would cut off could not be listed.',file=sys.stderr)
+        if may_refuse or may_refuse_more:
+            # Group two (kittrial-5bb.250 r3 item 5): the one sentence, the same as the
+            # listing's, carried in the JSON with the hints.
+            print('WARNING: %s.'%_may_sentence_for(may_refuse, may_refuse_more),file=sys.stderr)
+        if preview_truncated:
+            print('WARNING: the authorized_keys file is larger than the %d bytes this command reads, so only its '
+                  'first part was inspected; a line beyond that was not listed and would still be refused '
+                  'after on.'%AUTHORIZED_KEYS_MAX_BYTES,file=sys.stderr)
+        # F7 (kittrial-5bb.250): the audit entries are hand-editable, so what stdout prints of
+        # them is bounded and escaped exactly as the stderr warnings are (audit_field): a
+        # hand-edited 800 kB field no longer prints whole.
+        def _shown(entry):
+            return None if entry is None else {key:(audit_field(value) if key in ('actor','at') else value)
+                                               for key,value in entry.items()}
+        # The hints travel with the group they explain (r3 item 5): a module-level read of
+        # the same listing, so status and on say what the listing says.
+        hints=(preview_info[5] if preview_info is not None else {})
+        return dict(bound_keys_only=current,audit=_shown(last),audit_history=[_shown(e) for e in audit],
+                    audit_records=len(audit),
+                    audit_readable=damage is None,audit_agrees=agrees,audit_note=audit_note,
+                    audit_max=BOUND_KEYS_ONLY_AUDIT_MAX,
+                    would_be_refused=preview,would_be_refused_more=preview_more,
+                    may_be_refused=may_refuse,may_be_refused_more=may_refuse_more,
+                    wrapper_names_setting=hints,truncated=preview_truncated,changed=False)
+    enabled=action=='on'
+    warnings=[]
+    if enabled and bound_keys_only(root) is True:
+        # Same item: the setting is already on, so nothing is about to be flipped and an
+        # unreadable keys file must not answer 'Refusing to turn on' over a no-op.
+        current=True
+        with review_writes_lock(root):
+            cfg=config(root)
+            audit,damage=bound_keys_only_audit(cfg)
+            last=audit[-1] if audit else None
+            flip_agrees,flip_note=audit_agreement(damage,last,current)
+        return dict(bound_keys_only=True,audit_records=len(audit),audit_readable=damage is None,
+                    audit_agrees=flip_agrees,audit_note=flip_note,changed=False)
+    # Read and build the preview list BEFORE anything is flipped (item 1): a slow or failing read
+    # of the keys file can then not leave the setting on with nothing printed. It is read after
+    # the operator check, so a non-operator's call reads no key file at all (item 6).
+    # The coordinator's decision of kittrial-5bb.250 F2: an operator who cannot see what will
+    # be cut off must say so deliberately - `on` REFUSES when the keys file cannot be read or
+    # was only partly inspected, unless the new explicit --without-preview was given.
+    preview_info=authorized_keys_preview(root,file) if enabled else None
+    if enabled and preview_info is None and not without_preview:
+        raise ValueError('Refusing to turn bound-keys-only on: the authorized_keys file could not be read, so '
+                         'what the setting would cut off cannot be shown. Fix the file (it must be a readable '
+                         'regular file), or say so deliberately with --without-preview to turn the setting on '
+                         'without this preview. Nothing was changed.')
+    if enabled and preview_info is not None and preview_info[2] and not without_preview:
+        raise ValueError('Refusing to turn bound-keys-only on: the authorized_keys file is larger than the %d '
+                         'bytes this command reads, so only its first part was inspected and a line beyond that '
+                         'was not listed although it would be refused. Split the file and preview each part, '
+                         'or say so deliberately with --without-preview to turn the setting on without this '
+                         'preview. Nothing was changed.'%AUTHORIZED_KEYS_MAX_BYTES)
+    preview=None if preview_info is None else preview_info[0]
+    preview_more=0 if preview_info is None else preview_info[1]
+    preview_truncated=False if preview_info is None else preview_info[2]
+    may_refuse=[] if preview_info is None else preview_info[3]
+    may_refuse_more=0 if preview_info is None else preview_info[4]
+    if enabled and preview is not None and bound_keys_only(root) is not True:
+        # BOTH groups are printed BEFORE the flip is written (kittrial-5bb.250 r3 item 5):
+        # whatever happens to the write, the operator has already seen every line it names.
+        # A no-op on (the setting is already on; r4 item 4) prints no preview: nothing is
+        # about to change, and the preview of an already-on installation is `status`'s
+        # business.
+        if preview:
+            print('WARNING: turning this setting on refuses %d authorized_keys line(s) of this kit and this '
+                  'root: %s%s. Print each such line again with `admin.py authorized-keys --project ... '
+                  '--principal ...` and replace it.'
+                  %(len(preview)+preview_more,', '.join(str(number) for number in preview),
+                    ' and %d more'%preview_more if preview_more else ''),file=sys.stderr)
+        if may_refuse or may_refuse_more:
+            print('WARNING: %s.'%_may_sentence_for(may_refuse, may_refuse_more),file=sys.stderr)
+        if preview_truncated:
+            print('WARNING: the authorized_keys file is larger than the %d bytes this command reads, so only '
+                  'its first part was inspected; a line beyond that was not listed and would still be '
+                  'refused after on.'%AUTHORIZED_KEYS_MAX_BYTES,file=sys.stderr)
+    with review_writes_lock(root):
+        cfg=config(root)
+        current=bound_keys_only(root,warnings=warnings)
+        audit,damage=bound_keys_only_audit(cfg)
+        # `off` must also be a real flip when the file holds a value that is not a bool: reading it
+        # as off makes `on`==`off` a no-op that leaves the bad value and its warning in place.
+        stale_value=BOUND_KEYS_ONLY_KEY in cfg and not isinstance(cfg.get(BOUND_KEYS_ONLY_KEY),bool)
+        if enabled==current and not (not enabled and stale_value):
+            # A flip that changes nothing writes nothing: the history records changes, and a
+            # repeated `on` cannot rewrite the file or set a damaged audit aside. The report still
+            # tells the truth about whether the value and the last recorded flip agree.
+            last=audit[-1] if audit else None
+            flip_agrees,flip_note=audit_agreement(damage,last,current)
+            return dict(bound_keys_only=current,audit_records=len(audit),audit_readable=damage is None,
+                        audit_agrees=flip_agrees,audit_note=flip_note,changed=False)
+        if damage is not None:
+            kept='%s_damaged_%s'%(BOUND_KEYS_ONLY_AUDIT_KEY,utc_stamp().replace(':','').replace('-',''))
+            suffix=1
+            while kept+('' if suffix==1 else '_%d'%suffix) in cfg:suffix+=1
+            kept+=('' if suffix==1 else '_%d'%suffix)
+            cfg[kept]=cfg.pop(BOUND_KEYS_ONLY_AUDIT_KEY)
+            print('WARNING: the bound-keys-only switch audit was damaged (%s); it is kept aside in '
+                  'deployment.private.json as %s and this flip starts a fresh list.'%(damage,kept),file=sys.stderr)
+        # OFF is the absent key, so an installation that never turned it on and one that turned
+        # it back off read identically (the rule `review-writes` follows).
+        if enabled:cfg[BOUND_KEYS_ONLY_KEY]=True
+        else:cfg.pop(BOUND_KEYS_ONLY_KEY,None)
+        cfg[BOUND_KEYS_ONLY_AUDIT_KEY]=(audit+[dict(actor=actor,at=utc_stamp(),action=action,
+                                                    previous=current,enabled=enabled)])[-BOUND_KEYS_ONLY_AUDIT_MAX:]
+        atomic_private_write(marker,json.dumps(cfg))
+        records=len(cfg[BOUND_KEYS_ONLY_AUDIT_KEY])
+    result=dict(bound_keys_only=enabled,audit_records=records,audit_readable=True,
+                audit_agrees=True,changed=True)
+    if enabled:
+        result['would_be_refused']=preview
+        result['would_be_refused_more']=preview_more
+        result['may_be_refused']=may_refuse
+        result['may_be_refused_more']=may_refuse_more
+        result['wrapper_names_setting']=(preview_info[5] if preview_info is not None else {})
+        result['truncated']=preview_truncated
+        # Both groups printed BEFORE the flip was written (above, r3 item 5); only the
+        # unreadable-file truth is said here, after it.
+        if preview is None:
+            print('WARNING: the authorized_keys file could not be read, so the lines turning this setting on '
+                  'would cut off could not be listed.',file=sys.stderr)
+    for line in warnings:print(line,file=sys.stderr)
+    return result
 
 
 def stored_operators(cfg):
@@ -1937,6 +2519,38 @@ def scheduled_backup_unit_paths():
     except OSError:
         return []
 
+def unit_unspellable(ch):
+    """True for a character no ``ExecStart`` word can spell literally.
+
+    systemd expands ``$VAR``/``${VAR}`` and a ``%`` specifier, and refuses a quote, a
+    backslash or a control, format or line-separator character in the executable name
+    (``systemd-analyze verify`` says "Executable name contains special characters").
+    ``%`` is not here: it is spellable as ``%%`` (kittrial-5bb.220 review 2 item 2b).
+    """
+    return ch in '$"\'\\' or unicodedata.category(ch) in ('Cc','Cf','Zl','Zp')
+
+def systemd_quote(word):
+    """``word`` as one systemd word, quoted only when it must be.
+
+    systemd splits ``ExecStart`` on whitespace and does NOT follow shell rules: a path
+    with a space must be wrapped in double quotes, or systemd takes the first fragment as
+    the program (kittrial-5bb.220 F4). A ``%`` begins a specifier, so it is doubled (``%%``)
+    inside the quotes. A word holding a ``$``, a quote, a backslash or a control, format or
+    line-separator character has no literal spelling in an ``ExecStart`` line, so it is
+    refused here (naming the path) rather than printing a line systemd would expand or
+    reject (kittrial-5bb.220 review 2 item 2b). A word that needs nothing comes back
+    unchanged, so the printed line stays readable.
+    """
+    value=str(word)
+    if not value:
+        return '""'
+    if any(unit_unspellable(ch) for ch in value):
+        raise ValueError('no systemd ExecStart line can name the path "%s" literally: it holds a $, a quote, a '
+                         'backslash or a control character systemd refuses or expands'%value)
+    if any(ch.isspace() or ch=='%' for ch in value):
+        return '"%s"'%value.replace('%','%%')
+    return value
+
 def scheduled_backup_execstart(root):
     """The exact ``ExecStart`` line that covers every project of this runtime.
 
@@ -1944,12 +2558,14 @@ def scheduled_backup_execstart(root):
     ``install/current`` link where it has one, so an upgrade moves the schedule with the
     service. A line whose interpreter came through ``current`` but whose ``admin.py``
     named ``releases/<ID>`` kept running the release that printed it after the next
-    upgrade (kittrial-5bb.182 item 2).
+    upgrade (kittrial-5bb.182 item 2). The interpreter and module are quoted for systemd,
+    not for a shell (kittrial-5bb.220 F4); ``root`` is NOT quoted because ``root_path``
+    already accepts only a path without a space, quote, backslash or specifier.
     """
     python=install_current_path(sys.executable)
     module=install_current_path(Path(__file__).resolve())
-    return (f'ExecStart={python} {module} '
-            f'--root {root} backup --all')
+    return ('ExecStart=%s %s --root %s backup --all'
+            %(systemd_quote(python),systemd_quote(module),root))
 
 def host_command(root,*words):
     """A host command as the service user pastes it into a shell: interpreter, this module,
@@ -2069,14 +2685,51 @@ def scheduled_backup_unit_report(text,root):
             report['other_runtime']=True
     return report
 
+def scheduled_backup_timer_target(text,path):
+    """The service unit a ``beads-*backup*.timer`` schedules: its ``[Timer] Unit=``, or its own base name.
+
+    A timer file normally names the service it runs in ``[Timer] Unit=``; when it does
+    not, the convention is that ``beads-backup.timer`` runs ``beads-backup.service``.
+    """
+    for raw in text.splitlines():
+        line=raw.strip()
+        if line.startswith('Unit='):
+            value=line[len('Unit='):].strip()
+            if value:return value
+    base=Path(path).name
+    return base[:-len('.timer')]+'.service' if base.endswith('.timer') else None
+
+def scheduled_backup_enabled_timer_targets(directory):
+    """The service names an enabled ``beads-*backup*.timer`` schedules, or an empty set.
+
+    An enabled user timer is a unit under ``timers.target.wants`` (``systemctl enable``
+    puts a symlink there, but a real file there enables it too); a timer only in the unit
+    directory is installed but not enabled, so it will not run. Reading the timer through
+    the symlink gives its ``[Timer] Unit=``.
+    """
+    targets=set()
+    try:
+        wants=directory/'timers.target.wants'
+        paths=sorted(path for path in wants.glob('beads-*backup*.timer') if path.is_file())
+    except OSError:
+        return targets
+    for path in paths:
+        try:text=path.read_text(encoding='utf-8')
+        except OSError:continue
+        target=scheduled_backup_timer_target(text,path)
+        if target:targets.add(target)
+    return targets
+
 def scheduled_backup_covers(root,name):
     """Whether the INSTALLED schedule backs up one project: True, False or None (unknown).
 
     The same unit files and the same classification as ``scheduled_backup_coverage``,
     reduced to one answer for the project setup page (kittrial-5bb.118): True when a
-    unit runs ``backup --all`` for this runtime or names this project, False when units
-    were read and none does (or none is installed), None when a unit could not be read
-    and nothing that was read covers the project. Drop-ins are not inspected.
+    unit runs ``backup --all`` for this runtime or names this project AND an enabled
+    ``beads-*backup*.timer`` schedules it; a unit with no timer, or a timer that is not
+    enabled, is not a schedule (kittrial-5bb.220 F4). False when units were read and none
+    covers the project (or none is installed, or none is enabled), None when a unit could
+    not be read and nothing that was read covers the project. Drop-ins are not inspected.
     """
     # The same candidates as scheduled_backup_unit_paths(), looked up in account_unit_dir.
     directory=account_unit_dir(root)
@@ -2085,14 +2738,18 @@ def scheduled_backup_covers(root,name):
         paths=sorted(path for path in directory.glob('beads-*backup*.service') if path.is_file())
     except OSError:
         return None
+    enabled=scheduled_backup_enabled_timer_targets(directory)
     unreadable=False
+    covering=[]
     for path in paths:
         try:text=path.read_text(encoding='utf-8')
         except OSError:
             unreadable=True;continue
         report=scheduled_backup_unit_report(text,root)
         if report['all_line'] or name in report['named'] or name in report['wrapper_projects']:
-            return True
+            covering.append(Path(path).name)
+    if covering:
+        return any(service in enabled for service in covering)
     return None if unreadable else False
 
 def project_merge_slot_state(root,name,path=None):
@@ -2162,8 +2819,27 @@ def project_setup_status(root,name,path=None):
         covers=scheduled_backup_covers(root,name)
     except OSError:
         covers=None
-    backup={'scheduled':'covered' if covers else 'unknown' if covers is None else 'not-covered',
-            'line':scheduled_backup_execstart(root),'last_run':None,
+    # An operator's recorded statement that backups are scheduled elsewhere (kittrial-5bb.220
+    # F1): it reads a found-nowhere answer done, but never a found-nowhere answer that was
+    # not looked for. A found unit with an enabled timer still wins.
+    note=read_backup_schedule_note(root)
+    if covers is True:scheduled='covered'
+    elif covers is None:scheduled='unknown'
+    elif note is not None:scheduled='elsewhere'
+    else:scheduled='not-covered'
+    try:
+        line=scheduled_backup_execstart(root)
+        line_reason=None
+    except ValueError as error:
+        # The path systemd cannot name, in one sentence, so the page can say why it shows no line
+        # (kittrial-5bb.220 review 2 item 2a).
+        line=None
+        line_reason=str(error)
+    backup={'scheduled':scheduled,
+            'elsewhere':(note['note'] if note else None),
+            'elsewhere_at':(note['recorded_at'] if note else None),
+            'elsewhere_by':(note['recorded_by'] if note else None),
+            'line':line,'line_reason':line_reason,'last_run':None,
             # What can be pasted into a shell, beside the unit-file line that cannot (kittrial-5bb.200).
             'run_now':backup_now_command(root),
             'check':host_command(root,'backup-status','--require-complete')}
@@ -2195,13 +2871,39 @@ def project_setup_status(root,name,path=None):
     # The project's merge slot, so the setup page can name a missing or damaged one as a
     # step (kittrial-5bb.202 item 2). Unknown when bd cannot say; never a write.
     result['merge_slot']=project_merge_slot_state(root,name,path)
+    # The installation setting that accepts bound keys only (kittrial-5bb.196, slice 4). It is
+    # one setting for the whole installation, reported here because this is where the setup
+    # page and an operator ask; `enabled` is None with its own sentence when the file cannot be
+    # read, so this part never fails the others (kittrial-5bb.118).
+    try:
+        enabled=bound_keys_only(root)
+        result['bound_keys_only']={'enabled':enabled,
+                                   'detail':BOUND_KEYS_ONLY_DETAIL_ON if enabled else BOUND_KEYS_ONLY_DETAIL_OFF}
+    except (OSError,ValueError,RecursionError):
+        # A deeply nested file must say unknown with a reason, not raise here (kittrial-5bb.196
+        # review, item 3). RecursionError is not a ValueError.
+        result['bound_keys_only']={'enabled':None,'detail':BOUND_KEYS_ONLY_DETAIL_UNKNOWN}
+    # The three coordinator rules (kittrial-5bb.197, slices 6 and 7), in the same shape as
+    # the bound-keys-only block: `enabled` is None with its own sentence when the file cannot
+    # be read, so this part never fails the others (review request 01a12894, item 6).
+    try:
+        rules=coordinator_rules(root)
+        on=[key for key in COORDINATOR_RULE_KEYS if rules[key]]
+        result['coordinator_rules']={'enabled':bool(on),'rules':rules,
+                                     'detail':(COORDINATOR_RULES_DETAIL_ON%', '.join(on)) if on
+                                     else COORDINATOR_RULES_DETAIL_OFF}
+    except (OSError,ValueError,RecursionError):
+        result['coordinator_rules']={'enabled':None,'rules':None,'detail':COORDINATOR_RULES_DETAIL_UNKNOWN}
     # How full the server is (kittrial-5bb.118 part 2 revision): every project database on it
     # counts, and every bd write gets slower as they grow. The web service shows it to a
     # superuser only.
     try:
         import project_creation
         result['project_databases']=project_creation.server_usage(root)
-    except (ValueError,OSError):
+    except (ValueError,OSError,RecursionError):
+        # A deployment file that nests too deeply makes json.loads raise RecursionError, which is
+        # not a ValueError: setup-status must answer `null` for this part (the sentence in
+        # docs/OPERATIONS.md says so) and fail nothing else (kittrial-5bb.196 review, item 3).
         result['project_databases']=None
     # Why the web service may NOT register this project, or None (kittrial-5bb.149). The
     # endpoint serves a project whose creation record is damaged, so the register route no
@@ -2232,10 +2934,21 @@ def scheduled_backup_coverage(root,name):
     enables a unit.
     """
     directory=scheduled_backup_unit_dir()
-    line=scheduled_backup_execstart(root)
-    both=schedule_text(root)
+    try:
+        line=scheduled_backup_execstart(root)
+        both=schedule_text(root)
+    except ValueError as error:
+        # A path systemd cannot name must not cut the whole report short (kittrial-5bb.220 review 2
+        # item 2a): say so once, and print everything else.
+        line=None
+        both=('No line for a schedule can be printed for this installation: %s. Install the schedule by hand, or '
+              'move the installation to a path systemd can name.'%error)
+    # Where the unit-file line would be shown, or nothing when there is none to print.
+    suggest=('\n  %s'%line) if line else ''
     dropins=(f'Systemd drop-ins ({directory}/*.service.d/*.conf) are not inspected, so this reports the unit '
              f'files themselves.')
+    # A unit file is not a schedule: an enabled timer must run it (kittrial-5bb.220 F4).
+    enabled=scheduled_backup_enabled_timer_targets(directory)
     paths=scheduled_backup_unit_paths()
     if not paths:
         return False,(f'No installed scheduled backup unit matching beads-*backup*.service was found in '
@@ -2258,9 +2971,15 @@ def scheduled_backup_coverage(root,name):
     if durable:
         note=(' Read: '+', '.join(read)+'.') if read else ''
         if unreadable:note+=' Not readable: '+'; '.join(unreadable)+'.'
-        return True,(f'The installed scheduled backup unit(s) read for this runtime cover every project, '
-                      f'including {name}, so no change is needed (durable backup --all: '+', '.join(durable)+
-                      ').'+note+' '+dropins)
+        scheduled=[path for path in durable if Path(path).name in enabled]
+        if scheduled:
+            return True,(f'The installed scheduled backup unit(s) read for this runtime cover every project, '
+                          f'including {name}, so no change is needed (durable backup --all: '+', '.join(durable)+
+                          ').'+note+' '+dropins)
+        return False,(f'The installed scheduled backup unit(s) read for this runtime cover every project '
+                      f'(durable backup --all: '+', '.join(durable)+f'), but no enabled beads-*backup*.timer runs '
+                      f'them, so they will not run. Install and enable a timer for one, or record that backups '
+                      f'are scheduled elsewhere.\n{both}')
     covered=sorted({item for names in named.values() for item in names} |
                    {item for names in wrapper_projects.values() for item in names})
     individual=list(named)+list(wrapper_projects)
@@ -2270,6 +2989,10 @@ def scheduled_backup_coverage(root,name):
         if unreadable:note+=' Not readable: '+'; '.join(unreadable)+'.'
         units=', '.join(individual)
         projectless=any(not projects for projects in wrapper_projects.values())
+        # A named or wrapper line that covers this project only counts as a schedule when an
+        # enabled timer runs its unit (kittrial-5bb.220 F4).
+        covering_paths=[path for path,projects in {**named,**wrapper_projects}.items() if name in projects]
+        covers_with_timer=any(Path(path).name in enabled for path in covering_paths)
         if name in covered:
             message=(f'The installed scheduled backup unit(s) read for this runtime already include {name} '
                      f'(projects: {", ".join(covered)}) at {units}, but they name projects individually, so the '
@@ -2280,7 +3003,10 @@ def scheduled_backup_coverage(root,name):
                           f'named projects with --all in one command.')
             else:
                 message+=(f' Replace that project list with the durable form (do not combine named projects with '
-                          f'--all in one command); it is a line of the unit file, not a shell command:\n  {line}')
+                          f'--all in one command); it is a line of the unit file, not a shell command:{suggest}')
+            if not covers_with_timer:
+                message+=(f' No enabled beads-*backup*.timer runs them, so they will not run; install and enable '
+                          f'a timer for one, or record that backups are scheduled elsewhere.')
             return False,message+note+' '+dropins
         message=(f'The installed scheduled backup unit(s) read for this runtime cover only '
                  f'{", ".join(covered) if covered else "no project"}, so they do not include {name}.')
@@ -2295,7 +3021,7 @@ def scheduled_backup_coverage(root,name):
                           f'projects with --all in one command.')
         else:
             message+=(f' Add {name} there, or replace the project list with the durable form (do not combine named '
-                      f'projects with --all in one command); it is a line of the unit file, not a shell command:\n  {line}')
+                      f'projects with --all in one command); it is a line of the unit file, not a shell command:{suggest}')
         return False,message+note+' '+dropins
     details=[]
     if foreign:details.append('these units do not back up this runtime: '+', '.join(foreign))
@@ -2624,6 +3350,30 @@ def require_creatable_project(root,name):
     refuse_retired_name(root,name)
     if path.exists() and any(path.iterdir()): raise ValueError('Project already exists; use it rather than initializing again')
     require_bd_init_tools(root)
+    # The deployment configuration is read before anything is created (kittrial-5bb.173
+    # item 1): a missing file or a dangling link used to raise FileNotFoundError after
+    # ``projects/NAME`` had been made, and left that empty folder behind. One sentence,
+    # nothing left. A directory or a FIFO in its place is already one line (ConfigurationUnreadable).
+    try:
+        document = config(root)
+    except FileNotFoundError:
+        raise ValueError('Deployment is not installed; run install first. Nothing was created.') from None
+    except OSError as error:
+        raise ValueError('This host cannot read the deployment configuration %s (%s). '
+                         'Fix that file and run this command again; nothing was created.'
+                         % (root/'deployment.private.json', error.strerror or error)) from None
+    except ValueError:
+        raise
+    if not isinstance(document, dict):
+        raise ValueError('Deployment configuration %s is not a JSON object. Fix that file and run '
+                         'this command again; nothing was created.' % (root/'deployment.private.json'))
+    port = document.get('port')
+    # isinstance(True, int) is true: a bool is not a port (review 01a1288a).
+    usable = ((type(port) is int and 1 <= port <= 65535)
+              or (isinstance(port, str) and port.isdigit() and 1 <= int(port) <= 65535))
+    if not usable:
+        raise ValueError('Deployment configuration %s has no usable port. Fix that file and run '
+                         'this command again; nothing was created.' % (root/'deployment.private.json'))
     return path
 
 def initialize_requirements_governance(root,name):
@@ -2772,6 +3522,9 @@ def validate_record_receipt(name,record):
     if name.startswith('.requirement-owner-requests/'):
         from requirement_http import validate_receipt as validate_owner_receipt
         validate_owner_receipt(record)
+        if 'owner_state' in record and name != '.requirement-owner-requests/' + content_hash(
+                {'operation_id': record['owner_state']['operation_id']}) + '.json':
+            raise ValueError('Owner terminal receipt path mismatch')
         if 'owner_decision' in record and name != '.requirement-owner-requests/' + content_hash(
                 {'operation_id': record['owner_decision']['operation_id']}) + '.json':
             raise ValueError('Owner decision receipt path mismatch')
@@ -3813,6 +4566,116 @@ def read_backup_status(root):
     except (OSError,ValueError):raise ValueError('Backup status file is not readable JSON') from None
     validate_backup_status(record)
     return record
+
+#: The operator's recorded statement that this runtime's backups are scheduled elsewhere
+#: (kittrial-5bb.220 F1). A separate sidecar from backup-status.json, which a backup run
+#: rewrites; this note is an operator statement, not a run result.
+BACKUP_SCHEDULE_NOTE_NAME='backup-schedule-note.json'
+#: The note is one short line of operator text, so a file much bigger than this is not read.
+BACKUP_SCHEDULE_NOTE_MAX=300
+BACKUP_SCHEDULE_NOTE_FILE_MAX=4096
+#: Every set and clear is appended (who, when, which) to this bounded log beside the note
+#: (kittrial-5bb.220 review 2 item 4a): the note itself is only the current statement.
+BACKUP_SCHEDULE_LOG_NAME='backup-schedule-log.jsonl'
+BACKUP_SCHEDULE_LOG_MAX=100
+
+def backup_schedule_log(root):
+    """The recorded set and clear history, oldest first, as a read-only list of entries.
+
+    A log holding bytes that are not UTF-8 is no log (its lines cannot be read), never an
+    error for a caller that only wants the history (kittrial-5bb.220 review 3 item 4).
+    """
+    path=root/'backups'/BACKUP_SCHEDULE_LOG_NAME
+    if path.is_symlink() or not path.is_file():return []
+    try:lines=path.read_text(encoding='utf-8').splitlines()
+    except (OSError,ValueError):return []
+    entries=[]
+    for line in lines[-BACKUP_SCHEDULE_LOG_MAX:]:
+        if not line.strip():continue
+        try:entry=record_json.loads(line)
+        except ValueError:continue
+        if isinstance(entry,dict):entries.append(entry)
+    return entries
+
+def _append_backup_schedule_log(root,entry):
+    """Append one set or clear line, keeping only the newest ``BACKUP_SCHEDULE_LOG_MAX``.
+
+    A convenience log, never a gate: a log that cannot be read or written does not fail the
+    command that recorded the note. A log holding bytes that are not UTF-8 cannot be read
+    line by line, so the damaged file is kept aside and a new log started rather than
+    failing every later set and clear (kittrial-5bb.220 review 3 item 4).
+    """
+    backups=root/'backups'
+    if backups.is_symlink() or not backups.is_dir():return
+    path=backups/BACKUP_SCHEDULE_LOG_NAME
+    if path.is_symlink():return
+    lines=[]
+    try:
+        if path.is_file():lines=[line for line in path.read_text(encoding='utf-8').splitlines() if line.strip()]
+    except (OSError,ValueError):
+        lines=[]
+        try:path.replace(path.with_name(path.name+'.damaged'))
+        except OSError:pass
+    lines.append(json.dumps(entry,sort_keys=True,ensure_ascii=True))
+    try:atomic_private_write(path,'\n'.join(lines[-BACKUP_SCHEDULE_LOG_MAX:])+'\n')
+    except (OSError,ValueError):pass
+
+def read_backup_schedule_note(root):
+    """The recorded statement that backups are scheduled elsewhere, or None.
+
+    The statement is an explicit, attributed record written by an operator (never an
+    inference from the age of the last run, which a manual or one-off run would fake).
+    ``note``, ``recorded_by`` and ``recorded_at`` must each be a string of the expected
+    shape: an unreadable, oversized or malformed note, or a hand-made one with a wrong
+    type, reads as None, so one bad file can never take the whole set-up page down
+    (kittrial-5bb.220 review 2 item 3).
+    """
+    path=root/'backups'/BACKUP_SCHEDULE_NOTE_NAME
+    if path.is_symlink() or not path.is_file():return None
+    try:
+        if path.stat().st_size>BACKUP_SCHEDULE_NOTE_FILE_MAX:return None
+        record=record_json.loads(path.read_text(encoding='utf-8'))
+    except (OSError,ValueError):return None
+    if not isinstance(record,dict) or record.get('schema_version')!=1:return None
+    note,by,at=record.get('note'),record.get('recorded_by'),record.get('recorded_at')
+    if not isinstance(note,str) or not note.strip():return None
+    if not isinstance(by,str) or not by.strip():return None
+    if not isinstance(at,str) or not utc_timestamp(at):return None
+    return {'note':note.strip(),'recorded_at':at,'recorded_by':by.strip()}
+
+def write_backup_schedule_note(root,note,actor):
+    """Record the operator's statement that backups are scheduled elsewhere, and log the set."""
+    from coordination import atomic
+    note=(note or '').strip()
+    if not note:raise ValueError('The note must be non-empty text')
+    if any(ch in '\n\r' for ch in note) or len(note)>BACKUP_SCHEDULE_NOTE_MAX:
+        raise ValueError('The note must be one line of at most %d characters'%BACKUP_SCHEDULE_NOTE_MAX)
+    # A control, format or line-separator character would be invisible or reorder the page, so it
+    # is refused as a newline is (kittrial-5bb.220 review 2 item 3).
+    if any(unicodedata.category(ch) in ('Cc','Cf','Zl','Zp') for ch in note):
+        raise ValueError('The note must not contain control or format characters')
+    actor=(actor or '').strip()
+    if not actor:raise ValueError('Name the operator recording it with --actor')
+    backups=root/'backups'
+    if backups.is_symlink() or not backups.is_dir():
+        raise ValueError('The backups directory does not exist under this root; prepare the runtime first')
+    record={'schema_version':1,'note':note,'recorded_at':utc_stamp(),'recorded_by':actor}
+    atomic(backups/BACKUP_SCHEDULE_NOTE_NAME,record)
+    _append_backup_schedule_log(root,{'at':record['recorded_at'],'by':actor,'action':'set'})
+    return record
+
+def clear_backup_schedule_note(root,actor=None):
+    """Remove the recorded statement; True if one was removed. The clear is logged too."""
+    path=root/'backups'/BACKUP_SCHEDULE_NOTE_NAME
+    if path.is_symlink():raise ValueError('Backup schedule note must not be a symlink')
+    removed=False
+    if path.is_file():
+        path.unlink();removed=True
+    elif path.exists():
+        raise ValueError('Backup schedule note is not a file')
+    if removed and isinstance(actor,str) and actor.strip():
+        _append_backup_schedule_log(root,{'at':utc_stamp(),'by':actor.strip(),'action':'clear'})
+    return removed
 
 def degraded_projects(root,record):
     """``[(name, message)]``: the projects the last run recorded complete but degraded.
@@ -5014,6 +5877,26 @@ def _key_line_command(options):
         if equals and name.strip().lower()=='command':return value
     return None
 
+def _realpath_or_self(path):
+    """os.path.realpath that answers the path unchanged when the name cannot even be asked."""
+    try:
+        return Path(os.path.realpath(str(path)))
+    except (OSError, ValueError):
+        return Path(str(path))
+
+def _wrapper_exists(wrapper):
+    """Whether the wrapper path names anything, without raising on a NUL or an over-long name.
+
+    A RELATIVE wrapper path is not asked at all (r4 item 2): stat would answer by the
+    caller's directory, so the listing's missing flag would differ by directory.
+    """
+    if not os.path.isabs(str(wrapper)) or str(wrapper).startswith('~') or len(str(wrapper)) > 512:
+        return False
+    try:
+        return Path(wrapper).is_file()
+    except (OSError, ValueError):
+        return False
+
 def key_line(line,root,kit):
     """What one line of authorized_keys is, for this runtime and this kit; None for a blank or # line.
 
@@ -5046,7 +5929,44 @@ def key_line(line,root,kit):
     if at is None:
         entry['kind']='other-command'
         return entry
-    wrapper=tokens[at];values={'--root':[],'--endpoint':[],'--python':[],'--project':[],'--principal':[]};unknown=[]
+    wrapper=tokens[at]
+    # kittrial-5bb.250 r3 item 4, THE RULE: a command is decided only when it needs no
+    # shell at all. A whitelist of plain characters decides that - letters, digits and the
+    # few punctuation marks an authorized_keys command never needs beyond them - because a
+    # blacklist always misses one more thing the shell treats specially (&, #, a glob, an
+    # assignment, quotes). Relative means NOT ABSOLUTE (r3 item 3): './x' and 'dir/x' were
+    # resolved against the caller's directory and wrongly decided; a leading ~ or $ is
+    # relative here too. Both put the line in group two, hint None.
+    plain=set('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.+/=,: ')
+    entry['needs_shell']=any(character not in plain for character in command)
+    relative_path=(not os.path.isabs(wrapper) or wrapper.startswith('~')
+                   or len(wrapper) > 512)              # r4: a 60,000-component path is not judged
+    entry['relative_path']=relative_path
+    # kittrial-5bb.250 r5 item 1, THE RULE final: group one only when the command is
+    # EXACTLY the shape authorized_key_lines prints - taken from that function's own
+    # constants, so the preview and the printer cannot drift. One ABSOLUTE interpreter
+    # path (any name: the preview trusts the first word to be the interpreter the kit
+    # printed), then zero or more of the two words -E and -s EACH ALONE (no other flag,
+    # no combined -Es, no -W value that swallows the wrapper), then this kit's wrapper by
+    # absolute path as the NEXT word - or the wrapper path as the first word. Everything
+    # else - -W X, -X, -i, -Esi, a bare interpreter name - is group two: -W takes the
+    # wrapper path as its own value and what follows runs instead, -i makes Python run
+    # what stdin says once the wrapper has refused.
+    def _printed_invocation(prefix):
+        if not prefix:
+            return True                                   # the wrapper invoked directly
+        if len(prefix) > 1 + len(AUTHORIZED_KEY_PYTHON_FLAGS):
+            return False
+        # A key line's command is POSIX text whatever the host: posixpath, not os.path, so that
+        # /usr/bin/python3 is absolute on every platform (ntpath.isabs changed in Python 3.13).
+        if not posixpath.isabs(prefix[0]) or prefix[0].startswith('~'):
+            return False                                  # the printed interpreter is absolute
+        flags = prefix[1:]
+        allowed = list(AUTHORIZED_KEY_PYTHON_FLAGS)       # (-E, -s): each alone, in any number
+        return all(word in allowed for word in flags)
+    prefix=tokens[:at]
+    entry['foreign_invocation']=not _printed_invocation(prefix)
+    values={'--root':[],'--endpoint':[],'--python':[],'--project':[],'--principal':[]};unknown=[]
     arguments=tokens[at+1:];index=0
     while index<len(arguments):
         flag,equals,joined=arguments[index].partition('=')
@@ -5057,7 +5977,12 @@ def key_line(line,root,kit):
         index+=1
     here=Path(os.path.realpath(str(kit)))
     endpoints=values['--endpoint'] or [wrapper.rsplit('/',1)[0]+'/endpoint.py']
-    line_root=values['--root'][0] if values['--root'] else None
+    # The wrapper's argparse takes the LAST --root when the line names it twice, so that is the
+    # root it will actually read its setting from (kittrial-5bb.196 review, item 2): the listing
+    # must decide by the same one. A RELATIVE --root is resolved by the wrapper against its
+    # own directory at run time, so this preview does not decide it (r4 small-things).
+    line_root=values['--root'][-1] if values['--root'] else None
+    relative_root=line_root is not None and (not os.path.isabs(line_root) or line_root.startswith('~'))
     principals=values['--principal']
     entry.update({
         # A line bound to a principal is bound, not merely confined (kittrial-5bb.194 review,
@@ -5071,14 +5996,20 @@ def key_line(line,root,kit):
         # A line names its wrapper and endpoint by path. One printed by an earlier release of an
         # office installation still runs THAT release's kit, which knows none of the rules of
         # this one, for as long as its folder is there (the design, Migration, step 6).
-        'other_kit':(Path(os.path.realpath(wrapper))!=here/'ssh_forced_command.py'
-                     or any(Path(os.path.realpath(endpoint))!=here/'endpoint.py' for endpoint in endpoints)),
-        'other_root':line_root is None or Path(os.path.realpath(line_root))!=Path(os.path.realpath(str(root))),
-        'missing':not Path(wrapper).is_file(),
+        'other_kit':(relative_path
+                     or _realpath_or_self(wrapper)!=here/'ssh_forced_command.py'
+                     or any(_realpath_or_self(endpoint)!=here/'endpoint.py' for endpoint in endpoints)),
+        'other_root':line_root is None or relative_root
+                     or _realpath_or_self(line_root)!=_realpath_or_self(str(root)),
+        # A path with a NUL or an over-long name makes any stat raise (r3 item 7), and a
+        # RELATIVE path would be stat-ed against the caller's directory (r4 item 2): both
+        # answer safely - not there, one line, not a dead preview and not a
+        # directory-dependent fact.
+        'missing':relative_path or not _wrapper_exists(wrapper),
         'unknown_arguments':unknown})
     # It is this kit today and names its release folder: after the next upgrade it is another kit.
     link=install_current_link(here)
-    entry['names_release']=bool(link is not None and not entry['other_kit']
+    entry['names_release']=bool(link is not None and not entry['other_kit'] and not relative_path
                                 and not all(str(path).startswith(str(link)+'/') for path in [wrapper,*endpoints]))
     if not entry['other_root']:
         entry['unknown_projects']=[name for name in values['--project']
@@ -5106,11 +6037,41 @@ def authorized_keys_listing(root,file=None):
     """
     path=Path(file) if file else Path.home()/'.ssh'/'authorized_keys'
     kit=Path(__file__).resolve().parent
-    try:text=path.read_text(encoding='utf-8',errors='replace')
+    # The file is read at most AUTHORIZED_KEYS_MAX_BYTES, whole lines only: it is read on every
+    # `status`/`on`, and a hand-written file with thousands of unbound lines must not be read
+    # whole or flood the operator's terminal (kittrial-5bb.196 review, item 5).
+    # Open FIRST, judge the OPEN FILE (kittrial-5bb.250 r3 item 2, the r2 lstat pre-check
+    # lost a race to a path swapped into a fifo between the two calls): O_NONBLOCK never
+    # waits on a fifo, fstat judges the descriptor, and a file that is not regular is
+    # refused fast instead of hanging `status` and `on` for ever.
+    import stat as stat_module
+    try:
+        descriptor=os.open(str(path), os.O_RDONLY | getattr(os, 'O_NONBLOCK', 0)
+                           | getattr(os, 'O_CLOEXEC', 0))
     except OSError as error:
         raise ValueError('Cannot read %s: %s'%(path,error.strerror or error)) from None
+    try:
+        if not stat_module.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError('Cannot read %s: it is not a regular file (a directory, a fifo or '
+                             'a dangling link), and this command will not wait on it'%path)
+        with os.fdopen(descriptor,'rb',closefd=False) as handle:
+            raw=handle.read(AUTHORIZED_KEYS_MAX_BYTES+1)
+    except OSError as error:
+        raise ValueError('Cannot read %s: %s'%(path,error.strerror or error)) from None
+    finally:
+        try: os.close(descriptor)
+        except OSError: pass
+    truncated=len(raw)>AUTHORIZED_KEYS_MAX_BYTES
+    if truncated:
+        raw=raw[:AUTHORIZED_KEYS_MAX_BYTES]
+        raw=raw.rsplit(b'\n',1)[0] if b'\n' in raw else b''
+    text=raw.decode('utf-8',errors='replace')
     lines=[];summary={}
-    for number,raw in enumerate(text.splitlines(),1):
+    # sshd splits authorized_keys at the line feed alone, so the numbers must come from the
+    # line feed alone too: str.splitlines() also cuts at U+2028, U+0085, a form feed and a
+    # bare carriage return inside a line, shifting every later number against sshd's
+    # (kittrial-5bb.250 F6).
+    for number,raw in enumerate(text.split('\n'),1):
         entry=key_line(raw,root,kit)
         if entry is None:continue
         lines.append({'line':number,**entry})
@@ -5125,26 +6086,204 @@ def authorized_keys_listing(root,file=None):
                or entry.get('unknown_projects') or entry.get('names_release') or entry['kind']=='unreadable'
                or entry.get('principal_repeated') or entry.get('principal_ill_formed')
                or entry.get('project_repeated')]
+    # The installation setting that accepts bound keys only (kittrial-5bb.196, slice 4). While
+    # it is on, a line that runs this kit's wrapper and names no project or no principal is
+    # refused by the wrapper, so it is one more line an operator must look at: the migration
+    # cleans authorized_keys by hand, and this is the command that names the lines. An
+    # unrestricted key or another program does not run the wrapper and is not flagged for this.
+    # A settings file that cannot be read says `unknown` (None) instead of failing this read.
+    # Its warning is COLLECTED, never printed here: `status` reads the setting too and prints
+    # each warning once (kittrial-5bb.196 review, item 6, the duplicated warning).
+    read_warnings=[]
+    try:setting=bound_keys_only(root,warnings=read_warnings)
+    except (OSError,ValueError,RecursionError):setting=None
+    # The three groups of kittrial-5bb.250 r2 item 3: DECIDED and refused (this kit's own
+    # wrapper file and this root), NOT DECIDED and may be refused (any other wrapper or root,
+    # a command that needs the shell, a relative or $HOME path - with the word in the wrapper
+    # file said as a hint), and refused before the setting either way. A line of another kit
+    # is served by the wrapper it names; whether that wrapper knows the setting is a hint in
+    # its first 64 KiB, never a decision.
+    def _unbound(entry):
+        return (entry.get('kind') in ('bound','confined')
+                and (not entry.get('projects') or not entry.get('principal')))
+    here=Path(os.path.realpath(str(kit)))
+    _wrapper_hint_cache={}
+    def _wrapper_names_setting(wrapper):
+        """Whether a wrapper file OUTSIDE this kit carries the word 'bound_keys_only' in its
+        first 64 KiB - a HINT about the kit that serves the line, never a decision
+        (kittrial-5bb.250 r2 item 3: a word in a comment made a served line read refused).
+
+        Read once per distinct real path per run (item 2: 3,000 lines naming one wrapper
+        opened it 2,505 times), only through lstat-confirmed regular files - a fifo or a
+        symlink to one named by a key line must not hang this read (item 1) - and never a
+        relative path, which would be resolved against the caller's directory (item 2).
+        """
+        if str(wrapper) in _wrapper_hint_cache:
+            return _wrapper_hint_cache[str(wrapper)]
+        hint=None
+        if (os.path.isabs(str(wrapper)) and not str(wrapper).startswith('~')
+                and len(str(wrapper)) <= 512):
+            # Open FIRST, judge the OPEN FILE (r3 item 2): between an lstat and an open the
+            # path can become a fifo, and the review's race hung status in 2 of 5 runs.
+            # O_NONBLOCK never waits on a fifo, O_NOFOLLOW refuses a symlinked wrapper, and
+            # fstat judges the descriptor that was opened - not the path again. A path with
+            # a NUL or an over-long name is one unreadable line, not a dead preview (r3
+            # item 7): ValueError/OSError say hint None like any other unreadable file.
+            import stat as stat_module
+            try:
+                descriptor=os.open(str(wrapper), os.O_RDONLY | getattr(os, 'O_NONBLOCK', 0)
+                                   | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_CLOEXEC', 0))
+            except (OSError, ValueError):
+                descriptor = -1
+            if descriptor >= 0:
+                try:
+                    if stat_module.S_ISREG(os.fstat(descriptor).st_mode):
+                        body=os.read(descriptor, 64 * 1024)
+                        hint=b'bound_keys_only' in body
+                except (OSError, ValueError):
+                    hint=None
+                finally:
+                    try: os.close(descriptor)
+                    except OSError: pass
+        _wrapper_hint_cache[str(wrapper)]=hint
+        return hint
+    def _setting_decided(entry):
+        """Whether THIS preview decides the line (group one; THE RULE of kittrial-5bb.250
+        r3 item 4, which replaces shape-hunting).
+
+        Decided ONLY when the command needs no shell at all (a whitelist of plain
+        characters in key_line), names this kit's wrapper by an ABSOLUTE path, serves this
+        root, and parses as a line of the wrapper. EVERY other line that has a command= at
+        all is group two - whatever it parses as, bound included, and other programs too -
+        and a line refused before the setting is refused either way (group three). Only a
+        line with no command= (the account's shell) is outside the three groups.
+        """
+        wrapper=entry.get('wrapper')
+        return (bool(wrapper) and entry.get('kind') in ('bound','confined')
+                and not entry.get('other_root') and not entry.get('needs_shell')
+                and not entry.get('relative_path') and not entry.get('foreign_invocation')
+                and Path(os.path.realpath(wrapper))==here/'ssh_forced_command.py')
+    def _refused_before_the_setting(entry):
+        """Whether the wrapper refuses this line before it ever reads the setting."""
+        return bool(entry.get('unknown_arguments') or entry.get('principal_repeated')
+                    or entry.get('principal_ill_formed') or entry.get('project_repeated'))
+    # The three groups of kittrial-5bb.250 r2 item 3. Group one, DECIDED and refused (or
+    # to-be-refused while off): this kit's own wrapper file, this root, a command needing no
+    # shell on no relative path. Group two, NOT DECIDED and MAY be refused: every other
+    # wrapper or root, a command that needs the shell, a relative or $HOME path - each with
+    # the word in the wrapper file said as a hint, never as a decision. Lines refused before
+    # the setting are refused either way and stay named in group one's list.
+    would_be_refused=sorted({entry['line'] for entry in lines
+                             if _setting_decided(entry) and _unbound(entry)})
+    # Group two is every OTHER line that has a command= at all (r3 item 5): bound lines the
+    # shell decides, lines of another wrapper or root, shell syntax, relative paths, and
+    # lines that run another program - none of them is decided here, and no such line is
+    # cut off unnamed. Only a line with no command= is outside the groups.
+    decided={entry['line'] for entry in lines if _setting_decided(entry)}
+    may_be_refused=sorted({entry['line'] for entry in lines
+                           if ('wrapper' in entry or entry.get('kind')=='other-command')
+                           and entry['line'] not in decided})
+    would_be_refused_total=len(would_be_refused)
+    would_be_refused=would_be_refused[:WOULD_BE_REFUSED_NAMED_MAX]
+    would_be_refused_more=would_be_refused_total-len(would_be_refused)
+    may_be_refused_total=len(may_be_refused)
+    may_be_refused=may_be_refused[:WOULD_BE_REFUSED_NAMED_MAX]
+    may_be_refused_more=may_be_refused_total-len(may_be_refused)
+    by_line={entry['line']:entry for entry in lines}
+    wrapper_hints={number:_wrapper_names_setting(by_line[number]['wrapper'])
+                   for number in may_be_refused if by_line[number].get('wrapper')}
+    refused_for_another_reason=[number for number in would_be_refused
+                                if _refused_before_the_setting(by_line[number])]
+    refused=would_be_refused if setting else []
+    attention=sorted(set(attention+refused))
+    notes=['unrestricted: the key has this account\'s shell and is outside every rule of the kit, on every project.',
+           'confined: the key runs only the endpoint and may name any project and any actor.',
+           'bound: the key runs only the endpoint and only for its projects and/or its principal - the '
+           '`projects` and `principal` fields say which. A principal-bound line is `bound`, not `confined`.',
+           'principal-bound: counted separately for the lines that name a principal, so a line bound only to '
+           'a principal is not read as merely confined.',
+           'principal_ill_formed: the line names a principal that is not `lane:NAME` or `person:NAME`; the '
+           'wrapper refuses every request of that key. principal_repeated: the line names more than one '
+           'principal (the wrapper refuses it). Both are under attention and must be reprinted.',
+           'project_repeated: the line names the same project twice (`--project pa --project pa`); the '
+           'wrapper refuses the line. It is under attention and must be reprinted.',
+           'other_kit: the line runs a wrapper or an endpoint that is not this kit\'s file. Such a line is '
+           'served by that other kit, whatever its text says: a kit older than this one binds nothing, and a '
+           'kit from this design line (from bound keys only, .196, on) refuses an unbound line itself, so '
+           'such a line MAY be refused - this listing does not decide it. Print the line again with this '
+           'kit (authorized-keys) and replace it.',
+           'names_release: the line is this kit today but names its release folder, so after the next '
+           'upgrade it is other_kit. Print it again; it then goes through install/current.',
+           'other_root: the line serves another runtime than --root (or names none); its projects were not looked up here.']
+    def _named(numbers):
+        return 'line%s %s'%('s' if len(numbers)!=1 else '',', '.join(str(number) for number in numbers))
+    def _may_sentence(numbers, more):
+        """The one group-two sentence (kittrial-5bb.250 r3 item 5): what was not decided and
+        why, bounded like group one, said the same way by the listing, status and on."""
+        if not numbers and not more:
+            return 'No line runs a command this preview cannot judge'
+        named=', '.join(str(number) for number in numbers)
+        one=len(numbers)==1 and not more
+        return ('Line%s %s%s run%s a command this preview cannot judge (another wrapper or root, '
+                'shell syntax, a relative path, or another program) and %s not decided: if %s '
+                'reach%s a kit that has bound keys only on, %s refused unless bound'
+                %('s' if not one else '', named, '' if not more else ' and %d more'%more,
+                  's' if one else '', 'was' if one else 'were', 'it' if one else 'they',
+                  'es' if one else '', 'it is' if one else 'they are'))
+    more_text=' and %d more'%would_be_refused_more if would_be_refused_more else ''
+    if setting:
+        notes.append('bound_keys_only: this installation accepts bound keys only, so the forced command refuses '
+                     'a line of this kit and this root that lacks a project or a principal%s. Print each such '
+                     'line again with authorized-keys --project ... --principal ... and replace it. %s.'
+                     %(' (%s%s)'%(_named(refused),more_text) if refused else ' (no line here is such a line)',
+                       _may_sentence(may_be_refused, may_be_refused_more)))
+    else:
+        # The preview before `on` (kittrial-5bb.196 review, item 4c): with the setting off nothing
+        # is refused, but the operator must see what turning it on would cut off, all at once.
+        notes.append('would_be_refused: the setting is off, so nothing is refused today; `admin.py '
+                     'bound-keys-only on --actor OPERATOR` would refuse the line(s) of this kit and this root '
+                     'that lack a project or a principal%s. Print each such line again with authorized-keys '
+                     '--project ... --principal ... and replace it before turning the setting on. %s.'
+                     %(' (%s%s)'%(_named(would_be_refused),more_text) if would_be_refused
+                       else ' (no line here is such a line)',
+                       _may_sentence(may_be_refused, may_be_refused_more)))
+    if refused_for_another_reason:
+        # Named because `on` would still not serve them, but the SETTING is not the reason: the
+        # reviewer asked for that to be said rather than implied (kittrial-5bb.196 review, item 2).
+        notes.append('%s are refused whether the setting is on or off, for another reason (a bad or unknown '
+                     'argument, or a binding named twice); the setting is not why they are refused.'
+                     %_named(refused_for_another_reason))
+    if truncated:
+        notes.append('Only the first %d bytes of this file were read; the file is larger than that, so a '
+                     'line beyond it was not inspected.'%AUTHORIZED_KEYS_MAX_BYTES)
+    notes.append('This command reads the file and changes nothing.')
     return {'schema_version':1,'file':str(path),'root':str(root),'kit':str(kit),'lines':lines,'summary':summary,
-            'attention':attention,
-            'notes':['unrestricted: the key has this account\'s shell and is outside every rule of the kit, on every project.',
-                     'confined: the key runs only the endpoint and may name any project and any actor.',
-                     'bound: the key runs only the endpoint and only for its projects and/or its principal - the '
-                     '`projects` and `principal` fields say which. A principal-bound line is `bound`, not `confined`.',
-                     'principal-bound: counted separately for the lines that name a principal, so a line bound only to '
-                     'a principal is not read as merely confined.',
-                     'principal_ill_formed: the line names a principal that is not `lane:NAME` or `person:NAME`; the '
-                     'wrapper refuses every request of that key. principal_repeated: the line names more than one '
-                     'principal (the wrapper refuses it). Both are under attention and must be reprinted.',
-                     'project_repeated: the line names the same project twice (`--project pa --project pa`); the '
-                     'wrapper refuses the line. It is under attention and must be reprinted.',
-                     'other_kit: the line runs a wrapper or an endpoint that is not this kit\'s file. Such a line is '
-                     'served by that other kit, whatever its text says: a kit older than this one binds nothing. '
-                     'Print the line again with this kit (authorized-keys) and replace it.',
-                     'names_release: the line is this kit today but names its release folder, so after the next '
-                     'upgrade it is other_kit. Print it again; it then goes through install/current.',
-                     'other_root: the line serves another runtime than --root (or names none); its projects were not looked up here.',
-                     'This command reads the file and changes nothing.']}
+            'attention':attention,'bound_keys_only':setting,'would_be_refused':would_be_refused,
+            'would_be_refused_total':would_be_refused_total,'would_be_refused_more':would_be_refused_more,
+            # Group two of kittrial-5bb.250 r2 item 3: the lines this preview does NOT decide,
+            # bounded like group one, with the wrapper word said as the hint it is.
+            'may_be_refused':may_be_refused,'may_be_refused_total':may_be_refused_total,
+            'may_be_refused_more':may_be_refused_more,'wrapper_names_setting':wrapper_hints,
+            'would_be_refused_named_max':WOULD_BE_REFUSED_NAMED_MAX,'bytes_max':AUTHORIZED_KEYS_MAX_BYTES,
+            'truncated':truncated,'warnings':read_warnings,'notes':notes}
+
+def authorized_keys_preview(root,file=None):
+    """The preview tuple, or None if the file cannot be read.
+
+    Read-only and bounded; the one place the preview is computed, so ``status``, ``on`` and the
+    listing cannot disagree (kittrial-5bb.196 review, item 5). ``would_be_refused`` names at most
+    ``WOULD_BE_REFUSED_NAMED_MAX`` lines and ``more`` counts the rest; ``truncated`` is true when
+    the file is larger than ``AUTHORIZED_KEYS_MAX_BYTES`` and only its first part was inspected.
+    The hints ride along (r4 item 2: 'once per file per run' must be true), so status and on
+    make ONE listing each, not two.
+    """
+    try:
+        listing=authorized_keys_listing(root,file)
+    except (OSError,ValueError,RecursionError):
+        return None
+    return (listing['would_be_refused'],listing['would_be_refused_more'],listing['truncated'],
+            listing['may_be_refused'],listing['may_be_refused_more'],
+            listing['wrapper_names_setting'])
 
 def authorized_keys(root,key_file,role='both',python=None,comment=None,projects=None,principal=None):
     """Print the installable lines for one public key as JSON (see authorized_key_lines).
@@ -5163,6 +6302,15 @@ def authorized_keys(root,key_file,role='both',python=None,comment=None,projects=
     if (projects or principal is not None) and role=='operator':
         raise ValueError('--project and --principal bind the confined contributor line; an unrestricted operator '
                          'key has a shell and cannot be bound to projects or to a principal')
+    if role in ('contributor','both') and (not projects or principal is None) and bound_keys_only(root):
+        # This installation set `bound-keys-only`: the forced command refuses such a line, so
+        # printing it would hand the operator a line that cannot work (kittrial-5bb.196).
+        missing=' and '.join('no %s'%name for name,given in (('--project',bool(projects)),
+                                                            ('--principal',principal is not None)) if not given)
+        raise ValueError('This installation accepts bound keys only (deployment.private.json '
+                         'bound_keys_only is true), so a confined line must name at least one --project and one '
+                         '--principal, and this one names %s. Nothing was printed; add them, or print only '
+                         'the unrestricted operator line with --role operator.'%missing)
     path=Path(key_file)
     lines=authorized_key_lines(root,kit,*public_key_line(path.read_text(encoding='utf-8-sig'),str(path)),
                                comment=comment,python=python,projects=projects,principal=principal)
@@ -6348,12 +7496,17 @@ def credential_actors(root,state_path,service_namespace=None):
                         # checked like the 503 sentence's, and the count is a field too, so the JSON
                         # says it, not only stderr (kittrial-5bb.243 r2 review item 2). WHY the tracker
                         # was not read is a field as well, said as the thing that happened -- r3 item 1.
-                        given=[i for i in unreadable if isinstance(i,str) and i]
-                        named=[i for i in given if actor_names.ROW_ID.fullmatch(i)][:actor_names.NAMED_ROWS_MAX]
+                        # EVERY unreadable row is counted, not only those with a non-empty
+                        # string id: an error line, a number or a list among the rows is an
+                        # unreadable row with no id, and counting only the id-bearing ones
+                        # answered '0 unreadable row(s)' beside a project refused for exactly
+                        # that (kittrial-5bb.247 NEW-1). The named ids are a subset.
+                        named=[i for i in unreadable if isinstance(i,str) and i
+                               and actor_names.ROW_ID.fullmatch(i)][:actor_names.NAMED_ROWS_MAX]
                         found['unreadable_rows']=named
-                        found['unreadable_total']=len(given)
-                        found['not_read_reason']='it holds %d unreadable row(s)'%len(given)
-                        raise ValueError('the export holds %d unreadable row(s)'%len(given))
+                        found['unreadable_total']=len(unreadable)
+                        found['not_read_reason']='it holds %d unreadable row(s)'%len(unreadable)
+                        raise ValueError('the export holds %d unreadable row(s)'%len(unreadable))
                     if not rows:
                         # Which of the three happened, in the operator's words (r3 review item 1):
                         # bd answered nothing, bd answered the word null, or rows did not come.
@@ -6501,6 +7654,7 @@ def main():
     a.add_argument('--disposition',choices=['failed','released','complete'],default='released')
     a.add_argument('--issue-id',dest='issue_id',default=None,
                    help='with --disposition complete, the exact native record to confirm')
+    a.add_argument('--state',help='the existing web service state document; required for terminal recovery')
     a=sub.add_parser('capability-apply',help='accept a batch of capabilities, or a direct revision 1 (operator allowlist, F3 evidence)')
     a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('capability-retire',help='retire a capability in favour of a successor key (operator allowlist, F3 evidence)')
@@ -6581,6 +7735,37 @@ def main():
     a=sub.add_parser('checkpoint-provenance-writes',help='operator-audited reader-first checkpoint rollout switch; OFF by default, existing provenance tasks refuse legacy writes')
     a.add_argument('action',choices=['status','on','off'])
     a.add_argument('--actor',required=True,help='an actor on the deployment operator allowlist')
+    a=sub.add_parser('bound-keys-only',help='read or set the per-installation setting that accepts bound keys '
+                     'only: the forced command then refuses an authorized_keys line that names no project or no '
+                     'principal (OFF by default; operator allowlist, audited)')
+    a.add_argument('action',choices=['status','on','off'])
+    a.add_argument('--actor',required=True,help='an actor on the deployment operator allowlist')
+    a.add_argument('--without-preview',action='store_true',
+                   help='turn the setting on even when the keys file cannot be read or was only partly '
+                        'inspected: the deliberate operator answer to the refusal that otherwise stops `on` '
+                        '(kittrial-5bb.250 F2)')
+    a.add_argument('--file',default=None,help='the authorized_keys file to preview (default: '
+                   '~/.ssh/authorized_keys of this account): status and on name the lines of this kit and this '
+                   'root that the setting refuses or would refuse')
+    a=sub.add_parser('coordinator-rules',help='read or set the three per-installation rules of the coordinators '
+                                              'design, slices 6 and 7: who may record which lifecycle fact, nobody '
+                                              'passes their own work, and approval and the merge slot only for a '
+                                              'listed actor of the project (all OFF by default; an installation '
+                                              'that configures nothing behaves exactly as before)')
+    a.add_argument('action',choices=['status','on','off'])
+    # `action='append'` so a repeated `--rule` can be REFUSED rather than silently letting
+    # the last one win (kittrial-5bb.197 review request 01a12894, item 6).
+    a.add_argument('--rule',default=None,action='append',choices=list(COORDINATOR_RULE_KEYS),metavar='RULE',
+                   help='which rule to flip (required for on/off, at most once): '
+                        +'; '.join('%s: %s'%(key,COORDINATOR_RULE_HELP[key]) for key in COORDINATOR_RULE_KEYS))
+    a.add_argument('--actor',required=True,help='an actor on the deployment operator allowlist')
+    a=sub.add_parser('lifecycle-authors',help='read-only: every recorded lifecycle fact of a project, the actor who '
+                                              'recorded it, and whether the lifecycle_authors rule would refuse it '
+                                              '(run this before turning that rule on); writes nothing')
+    a.add_argument('project')
+    a.add_argument('--limit',type=int,default=None,
+                   help='list at most this many tasks, in the order the export gives them; the counts cover '
+                        'every task either way (default 200)')
     a=sub.add_parser('capability-verify',help='record verified capability checks (operator allowlist or verifiers list)')
     a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('authorized-keys',help='print the confined contributor and unrestricted operator authorized_keys lines for one public key')
@@ -6622,6 +7807,13 @@ def main():
     a=sub.add_parser('backup');a.add_argument('projects',nargs='*',metavar='project')
     a.add_argument('--all',action='store_true',dest='all_projects',
                    help='back up every initialized project in this runtime in one run')
+    a=sub.add_parser('backup-schedule',help='record, as an operator, that this runtime\'s backups are scheduled '
+                                             'elsewhere (the project setup step then reads done; a systemd user '
+                                             'unit that covers the project still wins) (operator allowlist)')
+    a.add_argument('--note',metavar='TEXT',help='the one-line statement to record (at most %d characters); '
+                                                'with --clear it must be absent'%BACKUP_SCHEDULE_NOTE_MAX)
+    a.add_argument('--actor',required=True,metavar='OPERATOR',help='the operator recording it (operator allowlist)')
+    a.add_argument('--clear',action='store_true',help='remove the recorded statement')
     a=sub.add_parser('retire-project',help='retire a partial or drill project: move it to retired/; deletes nothing (operator allowlist)')
     a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--reason',required=True)
     a.add_argument('--force',action='store_true',
@@ -6739,7 +7931,13 @@ def main():
                   'unfinished creations too. Every bd write gets slower as their number grows; see OPERATIONS, '
                   '"The cost of many projects on one server".',file=sys.stderr)
         elif args.usage:
-            print(json.dumps(project_creation.server_usage(root),sort_keys=True))
+            try:
+                print(json.dumps(project_creation.server_usage(root),sort_keys=True))
+            except RecursionError:
+                # The same deep-nesting read as setup-status (kittrial-5bb.196 review, item 3):
+                # answer with a sentence instead of a traceback.
+                raise ValueError('The server usage could not be read: deployment.private.json nests too '
+                                 'deeply to parse') from None
         else:
             found=project_creation.attention(root) if args.attention else project_creation.records(root)
             print(json.dumps(found,sort_keys=True,indent=1))
@@ -6855,7 +8053,10 @@ def main():
         # named only when at least one is printable, bounded and checked like the 503
         # sentence's), or which of bd's three non-answers arrived (r3 review item 1).
         not_read=[item for item in report['credentials'] if item.get('tracker_not_read')]
-        if not_read:
+        if not_read and report['could_not_be_judged']:
+            # Only when a credential could not be judged (kittrial-5bb.247 NEW-2): when every
+            # not-read credential was refused by a cheap rule, the refused sentence above
+            # already covers them, and '0 ... could not be judged' would say what is not so.
             # The reason a tracker was not read belongs to the PROJECT, so it is said once
             # per project, however many credentials of it there are.
             by_project={}
@@ -6936,17 +8137,30 @@ def main():
             fcntl.flock(lock,fcntl.LOCK_EX)
             print(json.dumps(apply_native(payload,args.actor,run,path,operator=True,operators=authority)))
     elif args.command=='requirement-reconcile':
+        import contextlib
         import fcntl
         from requirement_records import reconcile
         from keyed_records import require_configured_operator
+        from http_authority import file_lock, read_state
+        from requirement_terminal import receipt_path
         require_configured_operator(args.actor,operators(root,strict=True),'reconcile a requirement operation')
         path=project_dir(root,args.project)
         if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
         def run(argv):return run_bd(root,args.project,['--actor',args.actor,*argv])
+        # The host operator supplies the trusted service document, never an HTTP
+        # request field. Match endpoint's project-then-authority lock order.
+        if args.state:
+            state=Path(args.state)
+            if state.is_symlink() or not state.is_file():raise ValueError('Use the existing web service state document')
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
-            print(json.dumps(reconcile(path,args.operation_id,args.actor,args.reason,
-                                       args.disposition,run,issue_id=args.issue_id)))
+            with file_lock(str(state)+'.lock') if args.state else contextlib.nullcontext():
+                if args.state:read_state(state)
+                require_configured_operator(args.actor,operators(root,strict=True),'reconcile a requirement operation')
+                if receipt_path(path,args.operation_id).exists() and not args.state:
+                    raise ValueError('Owner requirement recovery needs --state with the existing web service state document')
+                print(json.dumps(reconcile(path,args.operation_id,args.actor,args.reason,
+                                           args.disposition,run,issue_id=args.issue_id)))
     elif args.command=='reference-apply':
         import contextlib
         import fcntl
@@ -7248,10 +8462,20 @@ def main():
         print(json.dumps({'verifiers':current}))
     elif args.command=='checkpoint-provenance-writes':
         print(json.dumps(checkpoint_provenance_switch(root,args.action,args.actor)))
+    elif args.command=='bound-keys-only':
+        print(json.dumps(bound_keys_only_switch(root,args.action,args.actor,args.file,
+                                                without_preview=getattr(args,'without_preview',False))))
     elif args.command=='review-writes':
         result,warnings=review_writes_command(root,args.actor,args.action)
         for line in warnings:print(line,file=sys.stderr)
         print(json.dumps(result))
+    elif args.command=='coordinator-rules':
+        rules=args.rule or []
+        if len(rules)>1:
+            raise ValueError('--rule may be given only once')
+        print(json.dumps(coordinator_rules_switch(root,args.action,rules[0] if rules else None,args.actor)))
+    elif args.command=='lifecycle-authors':
+        print(json.dumps(lifecycle_authors_command(root,args.project,args.limit)))
     elif args.command=='authorized-keys':
         authorized_keys(root,args.key_file,args.role,args.python,args.comment,args.project,args.principal)
     elif args.command=='authorized-keys-list':
@@ -7271,6 +8495,16 @@ def main():
         print(json.dumps(report,ensure_ascii=True,indent=2))
         if note:print(note,file=sys.stderr)
     elif args.command=='backup':backup_projects(root,args.projects,args.all_projects)
+    elif args.command=='backup-schedule':
+        from keyed_records import require_configured_operator
+        require_configured_operator(args.actor,operators(root,strict=True),'record a backup schedule note')
+        if args.clear:
+            if args.note:raise ValueError('backup-schedule --clear takes no --note')
+            print('Removed the recorded backup schedule note.' if clear_backup_schedule_note(root,args.actor)
+                  else 'No backup schedule note was recorded.')
+        else:
+            if not args.note:raise ValueError('backup-schedule needs --note TEXT, or --clear to remove it')
+            print(json.dumps(write_backup_schedule_note(root,args.note,args.actor),sort_keys=True))
     elif args.command=='backup-copy':backup_copy(root,args.destination,require_clean=args.require_clean)
     elif args.command=='backup-repoint':print(json.dumps(repoint_backup(root,args.project),sort_keys=True))
     elif args.command=='retire-project':

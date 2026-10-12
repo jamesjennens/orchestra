@@ -57,10 +57,12 @@ REVERT_BRIEF_LIMIT=5
 # complete text, so a hostile description cannot make one answer unbounded.
 FULL_CONTEXT_BUDGET=20000
 FULL_FIELD_BUDGET=8000
-# C0/C1 controls other than tab and newline are rendered as the same \uXXXX escape the
-# JSON form already uses, so the fuller-context read cannot emit a raw ESC/BEL or a bare
-# carriage return that rewrites the reader's line.
-CONTROL_TEXT_RE=re.compile('[\x00-\x08\x0b-\x1f\x7f]')
+# Text that would rewrite or reorder what a reader sees: C0 controls other than tab and
+# newline, DEL, the C1 block, the Unicode line/paragraph separators (a bare separator
+# ends the line a reader is looking at) and the bidi controls (a right-to-left override
+# can reorder the answer on screen). Each is rendered as the same \uXXXX escape the JSON
+# form already uses, so the fuller-context read cannot emit a raw ESC/BEL/CR or hide text.
+CONTROL_TEXT_RE=re.compile('[\x00-\x08\x0b-\x1f\x7f-\x9f\u2028\u2029\u202a-\u202e\u2066-\u2069]')
 
 def token(data):return base64.urlsafe_b64encode(canonical_bytes(data)).decode().rstrip('=')
 
@@ -381,9 +383,10 @@ def clip(value,limit):
     return {'text':value[:limit],'omitted_chars':max(0,len(value)-limit)}
 
 def plain_text(value):
-    """Terminal-safe text: C0/C1 controls other than tab and newline become the same
-    \\uXXXX escape the JSON form already emits, so no answer carries a raw ESC/BEL or a
-    bare CR that rewrites the line a reader is looking at."""
+    """Terminal-safe text: C0/C1 controls (DEL included) other than tab and newline, the
+    Unicode line/paragraph separators and the bidi controls become the same \\uXXXX escape
+    the JSON form already emits, so no answer carries a raw ESC/BEL, a bare CR, a
+    separator that ends the reader's line, or a bidi override that reorders it."""
     return CONTROL_TEXT_RE.sub(lambda match:'\\u%04x'%ord(match.group()),str(value or ''))
 
 def encoded_size(text):
@@ -673,7 +676,8 @@ def newer_activity_summary(data,prov,checkpoint_timestamp,owner,direction_idx=No
             'omitted':max(0,len(outstanding)-NEWER_MAX)}
     return result
 
-def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifiers=None,actor=None,full=False):
+def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifiers=None,actor=None,full=False,
+          independent_approval=False,owners=None):
     if type(offset) is not int or offset<BRIEF_ITEM_OFFSET_MIN or type(limit) is not int or not BRIEF_ITEM_LIMIT_MIN<=limit<=BRIEF_ITEM_LIMIT_MAX:
         raise ValueError('Invalid unresolved-item page: --items-offset must be >= %d and --items-limit must be %d..%d' % (BRIEF_ITEM_OFFSET_MIN,BRIEF_ITEM_LIMIT_MIN,BRIEF_ITEM_LIMIT_MAX))
     issue=task_row(rows,task);state=checkpoint_state(issue);current=state['current'];invalid=state['invalid']
@@ -684,9 +688,10 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
     if offset>len(items):raise ValueError('Unresolved-item offset exceeds total')
     deps=[d for d in (issue.get('dependencies') or []) if d.get('type')!='parent-child']
     from work import workflow
-    from review_state import is_integration_warning, scopes_for
+    from review_state import RECONCILIATION_WARNING_PREFIX, is_integration_warning, scopes_for
     from guidance import brief_block
-    review=workflow(issue,scopes_for(rows,task),operators=operators,journal=journal)
+    review=workflow(issue,scopes_for(rows,task),operators=operators,journal=journal,
+                    actor=actor,independent_approval=independent_approval,owners=owners)
     # ORIGINAL meaning: does the scope currently shown in `lifecycle`/`lifecycle_scope`
     # (the newest recorded scope) belong to the current contribution? The ANY-scope
     # answer is additive as `review.integration.matches_contribution`.
@@ -786,6 +791,26 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
         next_action=('CHECKPOINT FROM PROJECT '+taken_in+': written before this project was restored or '
                      'copied under its current name; its task content is unchanged. Confirm the history '
                      'before relying on it. '+next_action)
+    # The compact brief carries the next-action ROLE once, inside the shared review
+    # projection block (kittrial-5bb.6 review item 2: it used to be carried twice, at the
+    # top level and in `review`). 6000 bytes is the size the long-chain test in
+    # tests/test_follow_on_contributions.py holds, NOT a bound the code enforces: a
+    # one-contribution brief with disagreeing integration facts measures 6088 and 6368
+    # bytes (kittrial-5bb.6 review item 2a). So the reconciliation signal is carried in
+    # the one way that does not repeat itself: `work_state` is `reconciliation-needed`
+    # exactly when `reconciliation_needed` is true, and `reconciliation_reasons` names the
+    # mismatching facts whenever there are any. The boolean itself is carried by `work`
+    # rows and by the `review` read, which have no such bound.
+    brief_review=dict(review,pending_requests=pending[:5],pending_total=len(pending),more='review '+task if len(pending)>5 else None,
+                      prior_contributions=bounded_priors,prior_contributions_total=len(priors),
+                      prior_contributions_more='review '+task if len(priors)>PRIOR_BRIEF_LIMIT else None,
+                      reverts=reverts[-REVERT_BRIEF_LIMIT:],reverts_total=len(reverts),
+                      reverts_more='review '+task if len(reverts)>REVERT_BRIEF_LIMIT else None)
+    brief_review.pop('reconciliation_needed',None)
+    # Avoid adding off-state bytes to compact long-chain briefs. The setting
+    # is carried only when ON; absence means false, including older endpoints.
+    if not brief_review.get('approval_requires_other_party'):
+        brief_review.pop('approval_requires_other_party',None)
     result={**attention,'reference_drafts_matching':reference_drafts,'task':task,'title':clip(issue.get('title'),200),'owner':clip(issue.get('assignee') or 'unassigned',96),'status':issue.get('status'),
             'activity_cursor':activity_cursor(data),'checkpoint':None if p is None else {'comment_id':str(c['id']),'author':clip(c.get('author'),96),'timestamp':c.get('created_at'),'source_commit':p['source_commit'],'branch':p['branch'],'incorporated_activity_cursor':p['activity_cursor'],
                 'newer_activity':stale,**({'taken_in_project':taken_in} if taken_in else {})},
@@ -795,11 +820,7 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
             'current_position':p['summary'] if p else 'No checkpoint yet; current position and unresolved items have not been summarized.',
             'next_action':next_action,
             'unresolved':{'coverage':'explicit checkpoint items only; unsummarized prose is not classified','total':len(items) if p else None,'items':items[offset:offset+limit],'next_offset':offset+limit if offset+limit<len(items) else None},
-            'review':dict(review,pending_requests=pending[:5],pending_total=len(pending),more='review '+task if len(pending)>5 else None,
-                          prior_contributions=bounded_priors,prior_contributions_total=len(priors),
-                          prior_contributions_more='review '+task if len(priors)>PRIOR_BRIEF_LIMIT else None,
-                          reverts=reverts[-REVERT_BRIEF_LIMIT:],reverts_total=len(reverts),
-                          reverts_more='review '+task if len(reverts)>REVERT_BRIEF_LIMIT else None),
+            'review':brief_review,
             'lifecycle_matches_contribution':matches_contribution,
             'deployed_delivery':deployed_delivery,
             'deployed_delivery_is_current_contribution':deployed_current,
@@ -807,10 +828,15 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
             'dependencies':{'total':len(deps),'items':[{k:clip(d.get(k),160) for k in ('depends_on_id','type')} for d in deps[:8]],'omitted':max(0,len(deps)-8)},
             'lifecycle':{dim:dict(value=f['value'],event_id=f['event_id']) for dim,f in facts['facts'].items()},
             'lifecycle_scope':{k:clip(v,160) for k,v in (facts['scope'] or {}).items()},
-            'warnings':(['Malformed checkpoint comments ignored: '+', '.join(invalid[:5])] if invalid else [])
-                       +integration_warnings
+            # The additive `Reconciliation needed:` line is appended AFTER the top-level
+            # warning lines main already had, so the FIRST warning a reader sees is still
+            # the one main showed (kittrial-5bb.6 review item 4c). The other integration
+            # warnings keep main's place and main's order.
+            'warnings':((['Malformed checkpoint comments ignored: '+', '.join(invalid[:5])] if invalid else [])
+                       +[w for w in integration_warnings if not w.startswith(RECONCILIATION_WARNING_PREFIX)]
                        +(['Direction baseline: comments strictly before the newest legacy checkpoint have UNKNOWN coverage and are not outstanding directions; timestamp ties remain possible directions.'] if context[1] is not None else [])
-                       +['Newer activity also includes edits, deletions or changed task fields. Prose resolutions never silently clear explicit items.'],
+                       +['Newer activity also includes edits, deletions or changed task fields. Prose resolutions never silently clear explicit items.']
+                       +[w for w in integration_warnings if w.startswith(RECONCILIATION_WARNING_PREFIX)]),
             'evidence':{'issue':'show '+task,'history':'history '+task,'checkpoint_entry':task+'-c'+str(c['id']) if c else None}}
     if journal is not None:
         # The standing guidance channel (kittrial-5bb.99): every endpoint brief
@@ -1522,7 +1548,9 @@ def checkpoint_writes_enabled(root):
     """Reader-first rollout: only an installation operator enables new writes."""
     from admin import config
     marker=root/'deployment.private.json'
-    if marker.is_symlink():raise ValueError('Deployment configuration must not be a symlink')
+    # One rule everywhere (kittrial-5bb.173 item 2): a symlinked deployment.private.json is
+    # FOLLOWED, as every other route and host command already follows it (os.open on the
+    # path). A checkpoint no longer refuses a link that every other reader accepts.
     if not marker.exists():return False
     settings=config(root)
     if not isinstance(settings,dict):raise ValueError('Deployment configuration must be a JSON object')
@@ -1578,7 +1606,8 @@ def latest_checkpoint_read(rows,project,task,include_provenance=False):
             'invalid_checkpoint_comments':state['invalid'][:5],
             'evidence':{'history':'history '+task,'checkpoint_entry':task+'-c'+str(c['id'])}}
 
-def execute(root,path,project,actor,action,args,attachments,run,operators=None,verifiers=None):
+def execute(root,path,project,actor,action,args,attachments,run,operators=None,verifiers=None,
+            independent_approval=False,owners=None):
     """Endpoint holds project coordination lock. History caches are disposable."""
     from work import help_payload,help_requested
     if help_requested(args):
@@ -1633,7 +1662,8 @@ def execute(root,path,project,actor,action,args,attachments,run,operators=None,v
         rows=exported_rows(run)
         if action=='brief':
             result=brief(rows,project,a.task,a.items_offset,a.items_limit,operators=operators,journal=path,
-                         verifiers=verifiers,actor=actor,full=a.full)
+                         verifiers=verifiers,actor=actor,full=a.full,
+                         independent_approval=independent_approval,owners=owners)
             return json.dumps(result,ensure_ascii=False,indent=2)+'\n' if a.json else format_brief(result)
         data=snapshot(rows,project,a.task);digest=content_hash(data);cache.mkdir(exist_ok=True)
         file=cache/(digest+'.json')

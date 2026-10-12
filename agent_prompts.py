@@ -94,6 +94,28 @@ def age_hours(value, now):
 
 
 # -- classification -----------------------------------------------------------------
+def claimable_work(item, state):
+    """One queue row's bounded claimability (kittrial-5bb.6 review item 4: ONE rule).
+
+    The row's own ``claimable`` answer (the canonical ``work`` row's field, or
+    ``http_service.queue_item``'s) is authoritative when it is a bool, because it was
+    computed by ``work.claimable`` -- the same rule ``work --claimable``, the HTTP agent
+    attention list and the claim fall-through use. A row built without it (a direct
+    library caller) is put through that same rule here rather than through a second
+    open-and-unclaimed test, so an epic, a decision, a gate, a job, a task LABELLED
+    ``decision``, a delivered task or a held task is never offered as claimable work.
+    """
+    declared = item.get('claimable')
+    if isinstance(declared, bool):
+        return declared
+    from reserved_comments import is_record_anchor
+    from work import claimable
+    contribution = item.get('contribution') if isinstance(item.get('contribution'), dict) else {}
+    return claimable(item.get('issue_type'), item.get('status'), item.get('assignee'),
+                     contribution.get('id') or item.get('contribution_id'), state,
+                     record_anchor=is_record_anchor(item), labels=item.get('labels'))
+
+
 def classify(project, capabilities, items, actor, blocked, now, names=None, reviewable=()):
     """Sort one project's queue rows into the prompt's action classes.
 
@@ -146,7 +168,7 @@ def classify(project, capabilities, items, actor, blocked, now, names=None, revi
                 out['delivered'].append(item)
             elif state == 'none':
                 out['working'].append(dict(item, blocked=item.get('id') in blocked))
-        elif can_work and not closed and not item.get('assignee') and state == 'none' and \
+        elif can_work and not closed and claimable_work(item, state) and \
                 item not in out['unclaimed']:
             # (an unclaimed high-priority task is listed once, under that heading)
             out['claimable'].append(item)
@@ -219,7 +241,7 @@ CLASSES = [
          _deliverer(i), _recommended(i)),
      'waiting_since'),
     ('recommend', 'Contributions you could review: read the work, then record a recommendation or request '
-                  'changes (you cannot approve; an owner decides)',
+                  'changes (you cannot approve; an owner or a coordinator decides)',
      lambda i: 'state %s; %s; delivered by%s%s' % (
          token(i.get('review_state')), _revision(i), _deliverer(i), _recommended(i)),
      'waiting_since'),

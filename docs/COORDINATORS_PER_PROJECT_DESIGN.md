@@ -8,7 +8,14 @@ principal and actors belong to principals (kittrial-5bb.194; see "Bind a key to
 its principal" in [OPERATIONS.md](OPERATIONS.md)); and slice 3, the acceptance
 commands a confined coordinator runs through the endpoint (kittrial-5bb.195; see
 "A confined coordinator runs the acceptance commands through the endpoint" in
-[OPERATIONS.md](OPERATIONS.md)). The rest of this note describes the design and
+[OPERATIONS.md](OPERATIONS.md)); and slice 4, the installation setting that
+accepts bound keys only (kittrial-5bb.196; see "Accept bound keys only" in
+[OPERATIONS.md](OPERATIONS.md)); and slices 6 and 7 (kittrial-5bb.197; see "The
+coordinator rules" in [OPERATIONS.md](OPERATIONS.md)), including both halves of
+rule 3: the self-approval refusal (the contribution's author and the task's
+assignee, by party) and the second refusal (`reviewed` and `integrated`, and
+taking the merge slot, need a validated approval of the CURRENT contribution from
+another party). The rest of this note describes the design and
 the state of main when it was written, not what is built.**
 
 **For an installation where nobody but its owner is to have SSH (the office),
@@ -476,9 +483,16 @@ safe than before. The order is the one the review recommended.
    `docs/REVIEWS.md` and what `work` and `brief` show for a contribution that
    waits for somebody else. It takes its list of facts from the decision on
    kittrial-5bb.106 and is built with it, not before it.
+   *Built by kittrial-5bb.197 as the installation rule `independent_approval`, BOTH
+   halves: an approval from the contribution's author or the task's assignee (by
+   party) is refused, and `reviewed`/`integrated` - and taking the merge slot - are
+   refused unless the CURRENT contribution carries a validated approval from another
+   party; an approval of an older contribution does not carry over. Over an unbound
+   key this is attribution, not authentication (see OPERATIONS.md).*
 7. **Coordinator-only writes**, if James wants them (question 3): approval and
    taking the merge slot only for a listed actor of the project. Also with
    kittrial-5bb.106.
+   *Built by kittrial-5bb.197 as the installation rule `coordinator_writes`.*
 8. **The web interface** shows who coordinates a project.
 
 Slices 1, 2 and 6 are the design asked for. Not sized: a per-project operator
@@ -509,8 +523,9 @@ otherwise.
 4. **Should the web route also refuse an owner approving their own
    contribution?** The code's own comment says the contributor never approves;
    the route lets an owner who contributed approve. A project with one owner
-   would then need a second owner or a superuser for every approval of the
-   owner's own work. *Recommendation: yes, as a task of its own, with the
+   needs an authorized approver of another party for the owner's own work;
+   superuser authority alone does not make an approver independent. The web rule
+   also compares the person's own agents. *Recommendation: yes, as a task of its own, with the
    sentence that tells a sole owner what to do.*
 5. **Which host commands does a confined coordinator get back** (slice 3)?
    *Recommendation: guidance, accepting records, proposal reviews, the

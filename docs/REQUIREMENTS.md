@@ -39,9 +39,100 @@ membership are checked under the authority lock before any replay or effect.
 
 If a creation fails before any native row is allocated, the owner who attempted
 it can use **Clear failed creation**, give a reason, and start a new creation.
-The original attempt and its release audit are retained. An allocated row, even
-an empty one, cannot be cleared here: retry the original creation and, if that
-still fails, ask the host operator to reconcile it.
+The original attempt and its release audit are retained. Failed creations show
+their recorded title and time when available. An interruption before the receipt
+write has its own **No creation receipt was written** message. An allocated row,
+even an empty one, cannot be cleared here: reload the requirements and, if the
+creation is still incomplete, ask the host operator to reconcile it.
+
+Clearing has no age gate. The receipt is written before the native create, and
+a live endpoint holds the project lock, so clearing a never-written receipt
+does not widen that race. A native create outliving the service's time limit
+while an already-written pending receipt is cleared was not reproduced with
+the pinned tracker. This does not prove that every timed-out process has ended.
+If a requirement row appears after a clear, the host operator should inspect
+the original operation receipt, retained release audit, native row request
+label and revision comments, and the endpoint/native process outcome before
+reconciling it. Do not clear an allocated row or infer its absence from a failed
+native read.
+
+### Withdraw or supersede an accepted requirement
+
+In simple mode, the signed-in project owner can withdraw a currently accepted
+requirement with a reason, or supersede it with another currently active accepted
+requirement in the same project. Pending drafts and narrative sections cannot be
+terminal targets. The replacement is pinned by its ID, revision and content hash.
+It is never substituted into existing references automatically.
+
+The page requires confirmation before either action: **This cannot be undone in
+the browser. If this is a mistake, create a new requirement. The old wording and
+history remain available.** There is no reactivation route. Governed mode has no
+withdrawal or supersession command in this release; changing mode never removes
+a recorded terminal state. The governed operator acceptance and publication
+commands retain their existing authority and cannot reactivate a terminal record.
+
+Acceptance and status are separate. Terminal records retain their immutable
+accepted revisions and decisions. A member can read the reason, author, timestamp,
+exact replacement and revision history. Reverse “Supersedes” links are derived
+from the old record's pointer. A failed or conflicting transition reads as
+**Status unknown**, and stays out of current nonterminal selection. A pending
+transition belongs to the project. Any current human owner in simple mode can
+finish the exact saved transition, including after a page reload or the original
+owner's departure. No remembered key or new reason/successor is used. Abandon
+only after the saved server deadline (service time plus the endpoint and native
+timeouts), when a complete native read under the same locks proves no state was
+written. The page gives the retry time. The service stops the endpoint process group,
+including native children, on timeout or return. The receipt keeps its released disposition.
+Once a state was written, finish is the only action. A written supersession retains
+its exact replacement even if that successor later changes; its missing reason or
+label can still be finished. Before the state is written, the successor must still
+be eligible. A pending predecessor reserves its successor against editing,
+withdrawal and supersession until the predecessor is finished or abandoned.
+If a prior writer's state appears after release, that native decision overrides
+release: the transition is pending again and remains finishable, provided the
+requirement was not changed after the release. If it was edited, accepted or
+withdrawn afresh in between, the late state cannot be finished from the web and
+the requirement reads unknown until the host operator repairs it. That needs a
+native writer that outlives both the process-group stop and the deadline. Damaged receipts
+are identified separately and affect their own requirement only; unidentifiable
+files are operator diagnostics, never evidence that every requirement is pending.
+`admin.py requirement-reconcile` finds the terminal receipt by its operation ID.
+For this recovery, the host operator supplies `--state` with the existing web
+service state document. The command takes its authority lock and the project lock,
+then either finishes the saved evidence (`--disposition complete`) or retains an
+abandonment disposition (`--disposition released`) after the same deadline and
+native absence proof. For terminal recovery, `failed` is an alias for `released`;
+neither permits reuse of the abandoned transition's original key. Use a new intent.
+Completion retains the finisher, time and operator `--reason`, separately from
+the immutable original decision author and reason. The service audit includes
+the requirement, original operation and recovery operation. Operator audit entries
+are derived from verified durable receipt history, so a running service cannot
+overwrite them with an older in-memory audit tail. Receipt integrity covers
+status, release and completion history; restore refuses altered metadata.
+Before withdrawal or supersession of a pending edit, accept the pending edit first.
+
+| Consumer | Terminal requirement behavior |
+| --- | --- |
+| Requirements list, detail and generated BRD | Retain accepted content and history; display status separately. `nonterminal_ids` excludes terminal and unknown records but includes never-accepted drafts, pending edits and narrative sections; it is not an accepted-requirements selector. The BRD groups terminal records separately. |
+| Work and brief | Native requirement tasks stay visible with their status labels. A terminal transition neither closes work nor changes checkpoints, blockers or lifecycle facts. |
+| Proposal list, detail, brief and traceability | Exact old content remains readable with terminal or unknown state and a sentence. These states are never presented as draft. New incorporation into any of them is refused; unrelated proposals remain readable. |
+| Capability links | An explicit historical revision remains linkable. A link without a revision requires a currently active record. |
+| Offline export and publication | Explicit historical selections retain their manifest bytes and acceptance even while current status is unknown. Provenance includes the validated state/reason pair and governance lineage when provable, otherwise an unknown-state sentence; terminal status does not delete historical content. |
+| Impact analysis and worker launch contracts | Operate on explicitly selected immutable manifests and exact references. Terminal status does not rewrite a manifest, silently retarget work, or remove a launch requirement. A changed active selection needs a new reviewed manifest and reassessment. |
+
+Backup/restore carries native evidence, the exact request receipts and governance
+source ranges. It preserves terminal hashes when the project is restored under a
+new name. Projects with no attempted terminal transitions retain preceding-release compatibility.
+From the first **attempted** withdrawal or supersession, **do not serve or restore
+the project with an older kit**, including an attempt interrupted before any native
+state was written. The preceding reader refuses terminal evidence, but its writer does
+not: editing and accepting can succeed and permanently damage terminal history.
+The preceding kit can also restore a backup with terminal records without warning,
+then read those records as unreadable. Use this release or a later compatible one
+for those backups. Do not strip evidence to make it readable. Restore a pre-transition
+backup taken before the first attempted transition if a rollback is required,
+retaining the later backup separately. Named
+baselines and Markdown download/comparison are a separate later delivery.
 
 An interrupted acceptance uses its recorded generated decision ID. Editable
 native titles, descriptions, labels and creator metadata cannot substitute a
@@ -55,8 +146,14 @@ history. Reads and writes continue; revision numbers and hashes order authority,
 and the service does not rewrite the stored history.
 
 The generated document shows the last accepted text first. A newer draft is a
-separate pending edit. Its Decisions section uses immutable acceptance evidence,
-not editable native decision titles. An unreadable requirement is marked by ID;
+separate pending edit, with its author kind and native revision time beside
+**Accept** when available. The owner's account uses its display name, or
+**your own edit** for that owner. A contributor's supplied name is explicitly
+**not verified**, including names resembling an account ID. Missing or ambiguous
+attribution remains unknown; an unavailable time is stated. Changing modes
+preserves the revision. Its Decisions section
+uses immutable acceptance evidence for the accepted revision, including when a
+later draft exists. An unreadable requirement is marked by ID;
 healthy requirements remain readable and an affected acceptance is never trusted.
 On an empty project, **Start requirements** creates a parent task through the
 ordinary authorized task route, then the owner can add content on this page.
@@ -69,8 +166,8 @@ automatically. This does not give service credentials or agent tokens owner righ
 The host's operator requirement-apply/backfill routes remain available in both
 modes and keep their operator allowlist and exact evidence requirements.
 
-This slice supplies direct editing and acceptance. Withdrawal, supersession,
-baseline controls, downloadable baseline comparisons and proposal/room acceptance
+This slice supplies direct editing, acceptance, withdrawal and exact supersession.
+Baseline controls, downloadable baseline comparisons and proposal/room acceptance
 controls await their separate releases.
 
 For the existing host export command, selections containing owner acceptance

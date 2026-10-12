@@ -216,6 +216,30 @@ class Client:
     def get_project(self, project):
         return self.request('GET', '/v1/projects/%s' % quote(project, safe=''))
 
+    def merge_slot(self, project):
+        return self.request('GET', '/v1/projects/%s/merge-slot' % quote(project, safe=''))
+
+    def _write_merge_slot(self, project, operation, body, key):
+        identity = key or new_idempotency_key()
+        try:
+            return self.request('POST', '/v1/projects/%s/merge-slot/%s'
+                                % (quote(project, safe=''), operation), body, key=identity)
+        except OSError:
+            raise UncertainOutcome(0, 'uncertain', 'Connection lost; reconcile the identical merge-slot request',
+                                   None, None, identity) from None
+
+    def acquire_merge_slot(self, project, task, target, key=None):
+        return self._write_merge_slot(project, 'acquire', {'task_id': task, 'target': target}, key)
+
+    def release_merge_slot(self, project, key=None):
+        return self._write_merge_slot(project, 'release', {}, key)
+
+    def force_release_merge_slot(self, project, expected_holder, reason, key=None):
+        return self._write_merge_slot(project, 'force-release', {'expected_holder': expected_holder, 'reason': reason}, key)
+
+    def create_merge_slot(self, project, key=None):
+        return self._write_merge_slot(project, 'create', {}, key)
+
     def archive_project(self, project, key=None):
         return self.request('POST', '/v1/projects/%s/archive' % quote(project, safe=''), key=key)
 
@@ -372,6 +396,14 @@ def _build_parser():
                        help='environment variable holding the password (default ORCHESTRA_PASSWORD)')
     sub.add_parser('logout', help='revoke the current session')
     sub.add_parser('whoami', help='show the authenticated principal')
+    slot = sub.add_parser('merge-slot', help='read or coordinate the project merge slot')
+    slot.add_argument('project')
+    slot.add_argument('operation', choices=('read', 'acquire', 'release', 'force-release', 'create'))
+    slot.add_argument('--task')
+    slot.add_argument('--target')
+    slot.add_argument('--expected-holder')
+    slot.add_argument('--reason')
+    slot.add_argument('--idempotency-key', help='reuse exactly this key and request after an uncertain result')
     call = sub.add_parser('call', help='issue one raw JSON request')
     call.add_argument('method')
     call.add_argument('path')
@@ -405,6 +437,18 @@ def main(argv=None):
             return 0
         if args.command == 'whoami':
             print(json.dumps(client.whoami(), indent=2))
+            return 0
+        if args.command == 'merge-slot':
+            if args.operation == 'read':result = client.merge_slot(args.project)
+            elif args.operation == 'acquire':
+                if not args.task or not args.target:parser.error('acquire requires --task and --target')
+                result = client.acquire_merge_slot(args.project, args.task, args.target, args.idempotency_key)
+            elif args.operation == 'release':result = client.release_merge_slot(args.project, args.idempotency_key)
+            elif args.operation == 'create':result = client.create_merge_slot(args.project, args.idempotency_key)
+            else:
+                if not args.expected_holder or not args.reason:parser.error('force-release requires --expected-holder and --reason')
+                result = client.force_release_merge_slot(args.project, args.expected_holder, args.reason, args.idempotency_key)
+            print(json.dumps(result, indent=2))
             return 0
         if args.credential:
             client.use_credential(args.credential)

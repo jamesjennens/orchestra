@@ -664,7 +664,7 @@ class ProjectOwnerAgentTests(AgentHarness):
 
     #: The only fields a project owner may receive about an agent in their project.
     SAFE_FIELDS = {'id', 'name', 'owner', 'owner_display_name', 'actor', 'enabled',
-                   'last_seen_at'}
+                   'last_seen_at', 'coordinator'}
 
     def setUp(self):
         super().setUp()
@@ -1847,6 +1847,8 @@ class AgentsPageTests(RenewalScopeTests):
         # 1. What the card says, and what "What it may do" shows.
         self.assertEqual((first['Kestrel']['scopes'], first['Kestrel']['source'], first['Kestrel']['differ']), ('read', 'set', None))
         self.assertEqual(first['Kestrel']['line'], 'May: read.')
+        self.assertNotIn('These scopes are inferred', first['Kestrel']['panelText'])
+        self.assertNotIn('These scopes are inferred', first['Lone']['panelText'])
         self.assertEqual(first['Kestrel']['boxes'], {'read': [True, False], 'tasks': [False, False], 'checkpoints': [False, False],
                                                      'reviews': [False, False], 'feedback': [False, False], 'proposals': [False, False]})
         self.assertEqual([(row['working'], row['differs'], row['buttons'], 'Expired' in row['text']) for row in first['Kestrel']['rows']],
@@ -1867,6 +1869,7 @@ class AgentsPageTests(RenewalScopeTests):
         self.assertIn('Revoke this credential?', seen['revokeAsked'])
         after = seen['afterRevoke']
         self.assertEqual((after['scopes'], after['source'], after['differ']), ('read', 'inferred', None))
+        self.assertIn('These scopes are inferred. Saving confirms', after['panelText'])
         self.assertIn('inferred from working credentials, not confirmed', after['line'])
         self.assertIn('revocation or expiry', after['line'])
         self.assertEqual(self.read(wren)['scopes'], ['read'])
@@ -1876,6 +1879,7 @@ class AgentsPageTests(RenewalScopeTests):
         self.assertIn('Lone will have: read.', seen['loneAsked'])
         self.assertEqual(seen['loneDialog'], 1)
         self.assertEqual((seen['afterChoice']['scopes'], seen['afterChoice']['source']), ('read', 'set'))
+        self.assertNotIn('These scopes are inferred', seen['afterChoice']['panelText'])
         self.assertEqual(self.stored(nothing['Lone']), (['read'], 'set'))
         # 5. Its own account gives more; a cancelled confirmation sends nothing.
         self.assertEqual(seen['cancelSent'], 0)

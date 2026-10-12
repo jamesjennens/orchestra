@@ -19,7 +19,7 @@ loginctl show-user beads -p Linger
 systemctl --user is-active beads-team.service
 ```
 
-The database listens on loopback only. Its generated credential is stored in the runtime's `deployment.private.json` (0600); runtime permissions are 0700. **The file is required**: since kittrial-5bb.156 every write through the endpoint reads it (and the password in it) before anything else, so a runtime without it, or with a file the endpoint's user cannot read, refuses every write with the endpoint's own line naming the file (over the web: 503 `server_configuration`). `prepare` writes it; a scratch runtime made by hand for a check needs one too. Contributors do not need the SQL password. Do not publish this directory or open the database port on the network. The installer configures metrics off for this deployment.
+The database listens on loopback only. Its generated credential is stored in the runtime's `deployment.private.json` (0600); runtime permissions are 0700. **The file is required**: since kittrial-5bb.156 every write through the endpoint reads it (and the password in it) before anything else, so a runtime without it, or with a file the endpoint's user cannot read, refuses every write with the endpoint's own line naming the file (over the web: 503 `server_configuration`). `prepare` writes it; a scratch runtime made by hand for a check needs one too. Contributors do not need the SQL password. Do not publish this directory or open the database port on the network. The installer configures metrics off for this deployment. **One rule for a symlinked `deployment.private.json`: it is FOLLOWED**, by every reader of that file (host commands, the endpoint, the web service and a checkpoint alike); a link is not refused here and not refused anywhere else.
 
 The kit runs `bd`, `dolt`, the HTTP service and the endpoint with `HOME` set to `<runtime>/home` and `BD_DISABLE_METRICS=1`, so Beads keeps its configuration inside the runtime and its usage metrics stay off; the kit writes nothing to the service account's own home directory. What that variable suppresses is bd's own telemetry, not anything the kit adds: with metrics on, bd 1.2.2 leaves a detached child that writes `$HOME/.config/bd/config.yaml` (`metrics: disabled: false`, upstream's event endpoint) and queues usage events under `$HOME/.beads/eventsData/` (`*.evtq` and `eventkit.lock`) just after a command such as `bd --version` returns. `bd metrics off` and `BD_DISABLE_METRICS=1` stop that child; the release tool sets the variable for its own run checks for the same reason (kittrial-5bb.166), and starts `dolt` there with `DOLT_DISABLE_EVENT_FLUSH=1` so that `dolt version` does not re-execute itself as a detached `dolt send-metrics` child (see docs/OFFICE_SERVICE.md; dolt's `metrics.disabled` global setting alone does not stop it). A runtime created before this change keeps working without a `home` directory: the environment variable alone keeps metrics off. Rollback note: an older kit reads Beads' configuration from the account's home directory instead, so before rolling back make sure `~/.config/bd/config.yaml` there has metrics disabled (`bd metrics off` as that account), or Beads turns its metrics on for a runtime that was created by this kit. Dolt's own global configuration is pinned to the runtime by `DOLT_ROOT_PATH` and is unaffected.
 
@@ -36,7 +36,7 @@ a project; use the [requirements snapshot command](REQUIREMENTS.md) for offline
 owner-evidence export. Operator requirement-apply/backfill authority remains
 unchanged in both modes.
 
-**Rollback and restore of simple requirements.** The predecessor kit can restore
+**Rollback and restore of simple requirements.** A release predating owner requirements editing can restore
 a backup of a project that has never had these sidecars. It refuses a backup
 containing `.requirements-governance.json`, `.requirement-owner-requests/` or
 `.requirements-governance-source.json` with `Invalid coordination backup path`.
@@ -46,9 +46,20 @@ owner-accepted requirements cannot be read because their governance history is
 missing. Keep the current kit's complete backup when rolling back; an older
 kit's successful backup does not preserve owner requirement authority.
 The optional `owner_decision` binding in an existing owner request receipt does
-not change this predecessor restore limit. Current backups preserve and validate
-the binding; an interrupted legacy acceptance without one remains unknown and
-needs host operator reconciliation.
+not change this restore limit for a release predating owner requirements editing. Current backups preserve
+and validate the binding. An interrupted acceptance without a binding keeps the
+old operation unknown; the owner reloads the requirement and accepts again with a
+new request key. For a legacy interrupted acceptance with a readable draft, the owner edits that
+draft and accepts the new revision. Unreadable history still needs host operator
+reconciliation.
+Neither action completes the unbound old operation or invents its decision.
+
+The failed-creation recovery panel lists at most 20 of the current owner's pending
+creations and reports the exact total and whether more remain. A request needing an absence proof reads
+one native export and one complete native membership list, then reuses the validated
+request-label index for those items. An unreadable receipt affects its own item;
+an unreadable native absence proof refuses clearing. The clear action checks a
+fresh absence proof and the exact receipt hash under the existing locks.
 
 Configure the [server-owned project entry point](ONBOARDING.md) so new workers can start from an empty directory using a single SSH onboarding command. Its private instructions are included in coordination sidecar backups.
 
@@ -314,6 +325,291 @@ refuses every such key. The same applies to a coordination-sidecar backup taken 
 adoption. [OFFICE_SERVICE.md](OFFICE_SERVICE.md) repeats this beside "Binary pins on
 rollback".
 
+### Accept bound keys only
+
+An installation can be set to accept bound keys only, so a line that leaves a key bound to
+nothing - no project to reach, or no principal whose actors it may be - is refused by the forced
+command before the endpoint runs (kittrial-5bb.196; slice 4 of
+[COORDINATORS_PER_PROJECT_DESIGN.md](COORDINATORS_PER_PROJECT_DESIGN.md), and Migration steps 6
+and 7):
+
+```sh
+python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime \
+  bound-keys-only on --actor OPERATOR
+```
+
+The command has three actions: `status` prints the setting, the last recorded change, whether the
+two agree (`audit_agrees`, with a warning when an older kit or a hand edit changed one without the
+other) and the lines that turning it on would refuse; `on` and `off` flip it. `audit_agrees` is
+`null` with `audit_note` `no entry` when no flip was ever recorded: a value hand-set to on with no
+audit entry does not read as agreeing, and `status` says so. Both `status` and
+`on` read the authorized_keys file named by `--file` (default this account's
+`~/.ssh/authorized_keys`) and report `would_be_refused`: the lines of this kit and this root that
+the setting refuses, or would refuse while it is off. So the operator sees what `on` is about to
+cut off before it happens, and `on` prints BOTH groups after reading and building them and
+BEFORE it writes the flip, so a slow or failing read of the keys file never leaves the setting
+on with nothing printed. The keys file is read at most its first 1 MiB, and `would_be_refused` names at most
+20 line numbers with `would_be_refused_more` (and an "and N more" in the note) saying how many more
+there are, so a hand-written file cannot flood the terminal; `status` reports the same
+`would_be_refused`, `would_be_refused_more` and `truncated` fields with the same warnings, so the
+preview it prints is never incomplete without saying so (kittrial-5bb.250 F1). **`on` refuses to
+turn the setting on when the keys file cannot be read or was only partly inspected** - a file that
+is missing, a directory, a fifo (which this command refuses to wait on), or larger than the 1 MiB
+bound: an operator who cannot see what will be cut off must say so deliberately, with
+`--without-preview`, and the refusal names that option; nothing is changed by the refusal
+(kittrial-5bb.250 F2, the coordinator's decision). The preview decides by ONE rule, in three
+groups (kittrial-5bb.250 r5): **refused** - a line whose command is EXACTLY the shape
+`authorized-keys` prints: one ABSOLUTE interpreter path, then zero or more of the two words
+`-E` and `-s` each alone (no other flag, no combined `-Es`, no `-W` that takes the wrapper
+path as its own value, no `-i`), then this kit's wrapper by absolute path as the next word -
+or the wrapper path as the first word. The interpreter's NAME is not judged: the preview
+trusts the first word to be the interpreter the kit printed, and a line of that shape whose
+interpreter is not Python is the operator's own doing. The command must need no shell at all
+(a whitelist of plain ASCII characters: letters, digits, `-_.+/=,:` and space - a tab or a
+non-ASCII letter is shell), name the wrapper by an absolute path of at most 512 bytes, and
+carry an absolute `--root` serving this root, parsing as unbound. Group one means **not
+served once on**, not served today: a wrapper file that is not executable, a relative
+`--endpoint` or an ill-formed project name serve nothing now and are still group one.
+**may be refused** - every OTHER line that has a `command=` at all:
+any other wrapper or root, shell syntax (`cd KIT && ...`, `2>/dev/null`, `; true`, `&`, `#`, a
+glob, an assignment, `/bin/sh -c`, quotes), a relative or `$HOME` path, and lines that run
+another program - not decided here, with whether the wrapper file names the setting said as a
+HINT (the kit opens the file first and judges the open descriptor - a fifo is opened
+non-blocking and never read, a symlink is not followed - and reads up to 64 KiB of it, one
+listing per command, so once per file per `status` and per `on`; a word in a file is a hint,
+not a decision; `wrapper_names_setting` carries it in the listing, in `status` and in `on`);
+and lines the wrapper refuses for another reason, refused either way. A line with no
+`command=` at all, and a fully BOUND line of this kit that the setting does not touch, are
+outside the groups. `status` and `on` PRINT the second group - its count and line
+numbers, at most twenty with `may_be_refused_more`, in the JSON and on stderr - so no line that
+has a command is cut off unnamed, whatever it runs. It is operator-gated (`--actor` must be
+on the deployment operator allowlist) and every flip is recorded in the deployment document's
+`bound_keys_only_audit`, with the value it replaced, keeping the last 20 flips; a flip that changes
+nothing writes nothing. `off` on a value that is not true or false is a real flip: it writes false,
+so the bad value and its warning do not stay in the file.
+
+The setting itself is one key, `bound_keys_only`, in `deployment.private.json`; absent or false is
+off, so an installation that configures nothing behaves as it did in the ordinary case, and a fresh
+install and one that turned the setting back off read identically. The reader reads at most the
+first 1 MiB of that file and refuses a larger one, in the forced command and in `admin.py` alike:
+the file is read on every connection, so a huge one must not be read whole.
+
+With it on, a line that names no `--project` or no `--principal` is answered on stderr with exit
+status 2, the missing part is named, and nothing is run - `ssh -T HOST` on such a key answers
+this too. That message, like the non-bool warning, speaks of "the installation setting" and names
+neither the settings file's server path nor the value found: stderr reaches the connecting
+contributor. The operator's own `admin.py` commands name both. A line that names both is served
+exactly as before, and `admin.py authorized-keys`
+refuses to print a contributor line that the setting would refuse (`--role operator` still prints
+the unrestricted line: a shell is outside this setting). What the setting does not touch: an
+unrestricted key, another program's `command=`, a project's rules, and rules 1 and 2.
+
+**What it does not do, said plainly.** A line printed before an upgrade names the wrapper and the
+endpoint of the release it was printed from, by absolute path, and on an office installation that
+path carries the release. Such a line runs THAT release's wrapper and endpoint against the live
+runtime, for as long as that release's directory is there. A release older than bound keys only
+knows nothing of the setting; every release from it on refuses an unbound line itself - which is
+why the preview reports such a line as **may be refused**, not decided here. **Clean
+`authorized_keys` by hand**: remove or reprint every line that points at another release. The
+setting closes a forgotten line of the CURRENT kit; it does nothing about an older release's.
+`admin.py authorized-keys-list` flags each line that points at a kit other than the installed one
+(`other_kit`, `names_release`) and, while the setting is on, it also puts under `attention` every
+line of THIS kit and THIS root that names no project or no principal, and its `bound_keys_only`
+field says which setting it read. Its `would_be_refused` field names those lines whether the
+setting is on or off, so it is the preview before `on`. The setting is decided by what the
+wrapper's own command line decides: the wrapper FILE the line runs and its LAST `--root` (its
+argparse takes the last when a line names it twice); an `--endpoint` argument that names another
+kit's file does not move the line out of this kit's reach. A line that runs another kit's wrapper,
+or whose last `--root` is another runtime, or whose command needs the shell or names a relative
+path, is not decided by this preview: it is reported in `may_be_refused` (at most twenty numbers
+with the count beyond, and `wrapper_names_setting` saying whether its wrapper file carries the
+word as a hint read from the first 64 KiB of the open regular file), never as refused by this
+setting and never as out of its reach. A named line
+the wrapper refuses for another reason (a bad or unknown argument, a binding named twice) is listed
+as refused with a sentence saying the setting is not why.
+
+`setup-status` reports the setting: the endpoint's read-only action carries a `bound_keys_only`
+block (`enabled` true or false, and `null` with its reason when the setting cannot be read - a
+damaged file, a path that is not a regular file, or one that nests too deeply - each with a
+sentence). An endpoint older than this kit does not carry the block at all.
+
+**Before an upgrade or a rollback.** The printed lines name the release, so after every upgrade
+of an office installation print and install them again (`authorized-keys`), as Migration step 6
+says. A kit older than this one does not know the setting at all: rolling back to it silently
+stops refusing unbound lines although `bound_keys_only` is still true in
+`deployment.private.json`. It reads that file otherwise as before, and when this kit is back the
+setting applies again.
+
+**A damaged or unreadable `deployment.private.json` refuses a confined key.** The wrapper cannot
+tell whether the setting is on, so it refuses every call of a forced-command key (exit status 2,
+saying the installation setting could not be read) until an operator repairs or removes the file;
+nothing is run. The operator's own unrestricted key does not run the wrapper and still reaches a
+shell, so this can never lock the operator out. A value that is neither true nor false is read as
+off with a warning on stderr, as `review-writes` reads such a value for its own switch.
+
+**Three exceptions to "an installation that configures nothing behaves exactly as it did".** All
+three are deliberate, and all three are covered by the recovery:
+
+* **A damaged `deployment.private.json` refuses every forced-command key even where the setting
+  was never on.** The forced command cannot see whether the setting is on, so it refuses rather
+  than serve unbound (a release before this one still answered `setup-status` here). **Recovery:**
+  an operator repairs the file, or removes it - a missing file reads as off - and the confined
+  keys work again; the operator's own unrestricted key reaches a shell throughout.
+* **A line whose `--root` names a regular file is refused** (the wrapper's reader cannot look up
+  `deployment.private.json` under a regular file). **Recovery:** correct that line's `--root` to
+  the runtime directory and print it again with `admin.py authorized-keys`.
+* **A VALID `deployment.private.json` larger than 1 MiB refuses every forced-command key even
+  where the setting was never on.** Both readers read at most the first 1 MiB and refuse a larger
+  file, because neither can tell whether the setting sits beyond the bound; so a valid but oversized
+  file refuses a confined key although `bound_keys_only` was never set. **Recovery:** bring the
+  file back under 1 MiB - the kit keeps a damaged audit list aside inside that file, which is the
+  only thing in this kit that grows it - and the confined keys work again; the operator's own
+  unrestricted key reaches a shell throughout.
+
+### The coordinator rules: who may write which fact, and who may approve
+
+Slices 6 and 7 of [COORDINATORS_PER_PROJECT_DESIGN.md](COORDINATORS_PER_PROJECT_DESIGN.md)
+(kittrial-5bb.197), from the decisions recorded on kittrial-5bb.106. Three
+**per-installation** rules live in `deployment.private.json`, each absent or false = OFF.
+All-off native writes remain compatible. Reader output is additive even with all rules
+off: `work` items and `review` include `approval_requires_other_party: false`, and the web
+brief's `review` includes `waiting_for_approval` and `approval_requires_other_party`.
+The existing waiting text is caller-relative; stdout is not byte-identical to older kits.
+
+| Key | With it ON |
+|---|---|
+| `lifecycle_authors` | the lifecycle action accepts `implemented`, `tested` and the task's `lifecycle-scope` only from the task's **assignee** (compared exactly) or a listed operator, and `reviewed`, `integrated`, `deployed`, `live-verified`, `enabled`, `live` and a release deploy only from a **listed operator** |
+| `independent_approval` | the task's **rule 3**, both halves. (i) `review approve` is refused when the approver is the same **party** as the **contribution's author** or the **task's assignee**. (ii) `reviewed` and `integrated`, and taking the merge slot (`coordination merge-acquire`), are refused unless the **current** contribution carries a validated `approve` record from a party other than its author and the task's assignee; an approval of an **older** (superseded) contribution does not count for a newer one |
+| `coordinator_writes` | `review approve` and `coordination merge-acquire` (taking the merge slot) are refused unless the actor is a listed actor of the project. Workers still contribute, respond, recommend and request changes |
+
+**One rule for "listed" (item 3a).** A listed actor is an actor on the **installation's**
+operator allowlist, or an actor whose **principal** (the project's session-registry `owners`
+map, slice 2) is the principal of an actor on that list. There is no per-project operator
+list: the design gives none, because rules 1 and 2 confine a listed name to the projects of
+its principal's key, so one installation list serves every project. The same one rule is
+applied by `review_workflow.listed_operator_actor` and by `lifecycle.py`, so an unlisted
+actor of a listed operator's principal may approve, take the slot and record an
+operator-only lifecycle fact alike. Names match by whole name and case.
+
+**What this cannot tell apart.** The comparison above is attribution, not authentication. Two
+actors are one party when their known principals are equal **or** their normalised names
+are equal (case-folded, a `/`-namespace suffix dropped). A spelling variant of the author
+or assignee is refused even if only that author or assignee is bound. Ownership lookup
+uses exact actor keys: a differently cased spelling of **another** actor of the same
+principal can evade that lookup and read as a distinct name. Bound keys and principals
+are the answer; a caller must not be able to invent another spelling. Conversely,
+different principals whose names fold together are refused as one party: `Dana`/`dana`,
+`erin/laptop`/`erin`, and `team/alice`/`team/bob`. Different unowned names still cannot be linked to a
+person; a principal identifies a lane, not necessarily a person. The lifecycle **assignee**
+is compared exactly, never folded. The reviewer
+recommendation route keeps its own person rule.
+
+**Assignment trust.** `lifecycle_authors` trusts the **current assignee** for implemented,
+tested and scope. Assignment itself is unrestricted by this rule: a worker can assign a
+task to itself, just as it can claim one. This does not permit that worker to record
+reviewed or integrated. Assignment provenance and historical reader trust require a
+separate design; the raw lifecycle-write guard protects new writes, without authenticating
+all historical facts or repairing them.
+
+**How to turn the rules on, in order.** They bind only where the caller's identity is the
+server's fact, not the caller's word. **Over an UNBOUND key the rules attribute but do not
+authenticate anybody**: any caller may send a listed name, so turn on `bound_keys_only`
+(kittrial-5bb.196) and give each coordinator a key bound to its principal first; then read
+`admin.py lifecycle-authors PROJECT` and turn `lifecycle_authors` on from that evidence; then
+`independent_approval`; and `coordinator_writes` where only coordinators should approve or
+merge. A rule turned on for a project whose keys are unbound is a report, not a boundary.
+
+```sh
+python3 admin.py coordinator-rules status --actor OPERATOR
+python3 admin.py coordinator-rules on  --rule lifecycle_authors --actor OPERATOR
+python3 admin.py coordinator-rules off --rule coordinator_writes --actor OPERATOR
+python3 admin.py lifecycle-authors PROJECT          # read-only preview of part (a)
+```
+
+**Turn `lifecycle_authors` on from evidence, not from hope.** Read
+`admin.py lifecycle-authors PROJECT` first: it writes nothing, reads the project's own
+export with the reader every other lifecycle read uses, and prints, for every recorded
+trusted fact, the actor who recorded it and whether the rule would allow it
+(`counts.would_be_refused` and `counts.tasks_with_would_be_refused`; at most
+`task_limit` tasks are listed and `truncated` says when there are more). **While a rule is
+OFF no authority refusal or rule warning is added to a valid write**. Native effects remain
+compatible with an installation that never configured the rules. Additive reader fields
+are present even all-off: `work` items and `review` have `approval_requires_other_party: false`;
+the web brief's `review` has `waiting_for_approval` and `approval_requires_other_party`.
+Caller-relative waiting text can also change JSON/stdout. The read-only report is a preview. A fact
+that an unlisted actor recorded while the rule was off is not rewritten and still reads as
+recorded: nothing is migrated, and the rule applies to the next write.
+
+**The approval rules refuse before any native write** and name the rule and the setting in
+the sentence, so nothing is recorded and the retry is the same operation. An already-written
+record keeps reading as it did: nothing is migrated. The project's session registry is read
+for these authority decisions:
+
+* `coordinator_writes`: approve or merge-acquire by an actor not named directly on the
+  operator list needs the registry's listed-principal comparison.
+* `lifecycle_authors`: the exact assignee's implemented/tested/scope and a directly listed
+  operator need no registry. Other actors need it to establish listed-principal authority.
+* `independent_approval`: every new approve and every reviewed/integrated/merge-acquire
+  checks ownership before trusting independent approval, even for a listed operator.
+
+When needed, an unreadable registry refuses the write before any effect, naming the
+setting and its recovery command. The endpoint marks these and ordinary rule refusals
+as `refused: coordinator-rule`; the web response puts the sentence in `error.message`,
+as well as the diagnostic detail. An older endpoint without the marker can still give
+the web service a generic message with its refusal in the detail. A missing registry or a valid registry without owners
+uses names; damaged JSON and permission errors do not. With the rules off these writes do
+not consult the registry. Reads remain available with name comparison when ownership is
+unavailable; `work`, `brief` and `review` may consult it for advisory caller-relative text.
+Contributing does not need this registry comparison.
+
+**`work` and `brief` say what a contribution is waiting for.** While a contribution is
+`awaiting-review`, both carry one sentence (`waiting_for_approval`) saying it waits for an
+approval from another party **only to the author or assignee, when independent_approval is
+on**. Other callers, including named reviewers, see the next-move explanation from the
+same decision as `whose_move`. With the rule off, that explanation is used for everyone.
+The web brief recomputes this bounded field for its authenticated caller, rather than
+showing the service reader's explanation.
+
+**Where the rules are enforced.** `independent_approval` and `coordinator_writes` are host
+(endpoint/SSH) settings for the review write path, and between them they cover `reviewed`,
+`integrated` and the merge slot. The **web route** has its own authority model
+([WEB_COORDINATOR_DESIGN.md](WEB_COORDINATOR_DESIGN.md)), and under `coordinator_writes`
+that model decides, not the list: a signed-in **owner** of the project, a **coordinator by
+role**, or a personal **agent with the project's coordinator grant** approves through it,
+because the endpoint reads that authority again from the web service's live state for
+every such request and never goes by a name the caller sends. An agent without the grant
+is refused there. `independent_approval` applies to the web route as well: an
+owner approving their **own** web contribution is refused, and the refusal names the setting.
+The web service's separate `approval_by_another_party` rule also treats a person's agents
+and worker credentials in that project as that person's party, including own-agent work.
+A superuser's authority does not make their own party independent. Neither authority
+allows an ordinary caller to forge a web approval descriptor on the endpoint.
+The merge slot is not on the web route and stays with listed actors.
+
+**Recovery.** A rule is turned off by the same command (`... off --rule NAME`), effective
+from the next request: the endpoint reads the file on every request. Removing the key
+altogether is the same as off; `off` on a value that is not a boolean **writes false** rather
+than leaving the bad value in place. A value that is neither true nor false is read as OFF
+with a warning on stderr that shows the value escaped and bounded, as `review-writes` reads
+such a value for its own switch. The flips are audited under this installation's
+`coordinator_rules_audit` list in `deployment.private.json` (who, when, which rule, which
+action, the value replaced; the last 20 are kept), written under the same
+`.review-writes.lock` as the other deployment switches; `status` bounds every hand-edited
+audit field it prints.
+
+**What of rule 3 is built.** All of it: the self-approval half (the author and the assignee,
+by party) and the second refusal (`reviewed` and `integrated`, and the merge slot, need
+another party's approval of the **current** contribution). What remains outside the code is
+the limit above: over an unbound key this is attribution, not authentication.
+
+A task with **no contribution** cannot satisfy independent approval for reviewed,
+integrated or taking the slot. A sole coordinator cannot pass their own commit: another
+listed operator or an authorized web approver from another party must approve it. An
+operator may instead explicitly decide to turn the rule off for that release, using the
+audited recovery command above. Private review evidence is evidence, not authority to
+bypass this decision.
+
+
 ### sshd settings the boundary needs
 
 The forced command closes what the key can run; two sshd settings decide what the client can
@@ -434,6 +730,9 @@ history](#malformed-structured-history) (`void-record`).
 | `authority-changes` | read-only: the recorded changes of the operator and verifier lists - which list, the actor added or removed, the change, when, and the recorded `--actor`/`--reason` (`null` when the caller gave neither) | none: read-only |
 | `review-writes status\|on\|off --actor OPERATOR` | read or set the per-installation switch that allows **writing** the new review-workflow record shapes (`withdraw`, `request-review`, `resolve-item`, `decline-review`, an item `severity`, a request-changes `summary`). Readers in this kit understand those shapes either way; with the switch off (the default) a write of one is refused before any native write. See [Review-workflow write switch](#review-workflow-write-switch) | the deployment operator allowlist, checked before any write; `deployment.private.json` is the only source (there is no environment fallback) |
 | `checkpoint-provenance-writes status\|on\|off --actor OPERATOR` | read or set the per-installation switch that allows **writing** checkpoint provenance and direction dispositions (acknowledge, resolve, supersede). Readers in this kit understand them either way; with the switch off (the default) a checkpoint that asks for them is refused before any native write. See [Checkpoint provenance write switch](#checkpoint-provenance-write-switch) | the deployment operator allowlist, checked before any write; `deployment.private.json` is the only source |
+| `bound-keys-only status\|on\|off --actor OPERATOR [--file AUTHORIZED_KEYS]` | read or set the per-installation setting that **accepts bound keys only**: with it on, the forced command of an `authorized_keys` line refuses a line that names no project or no principal, and `setup-status` reports it. `status` and `on` report `would_be_refused` (the lines of this kit and this root the setting refuses, or would refuse while it is off) and `may_be_refused` with `may_be_refused_more` (the `command=` lines this preview does not decide, at most twenty named), read from `--file` or `~/.ssh/authorized_keys`; `on --without-preview` turns the setting on past the refusal an unreadable or partly-inspected keys file raises. Off is the default and the absent key, so an installation that configures nothing behaves as before. See [Accept bound keys only](#accept-bound-keys-only) | the deployment operator allowlist, checked before any write; `deployment.private.json` is the only source |
+| `coordinator-rules status\|on\|off [--rule lifecycle_authors\|independent_approval\|coordinator_writes] --actor OPERATOR` | read or set the three per-installation rules of the coordinators design, slices 6 and 7 (kittrial-5bb.197): who may record which lifecycle fact, that nobody passes their own work, and that approval and the merge slot belong to a listed actor of the project. `status` reports **all three**; `--rule` names the one `on`/`off` flips and is required for `on`/`off` (given at most once). Off is the default and the absent key; native writes stay compatible. All-off reader output adds `approval_requires_other_party: false` to `work` items and `review`, and `waiting_for_approval` and `approval_requires_other_party` to the web brief's `review`; waiting text is caller-relative. See [The coordinator rules](#the-coordinator-rules-who-may-write-which-fact-and-who-may-approve) | the deployment operator allowlist, checked before any write; `deployment.private.json` is the only source (there is no environment fallback) |
+| `lifecycle-authors PROJECT [--limit N]` | read-only: for every recorded trusted lifecycle fact of the project, the actor who recorded it, whether the `lifecycle_authors` rule would allow it (`allowed`, `would_be_refused`, `reason`) and the totals (`counts.would_be_refused`), plus whether the setting is currently on. Run it **before** turning `lifecycle_authors` on. It writes nothing and takes no `--actor`: shell access to the service account is already authority over the installation. At most `--limit` tasks (default 200) are listed and `truncated` says when there are more | none: read-only |
 | `proposal-review PROJECT --actor OPERATOR --file review.json` | record a coordinator disposition on a requirement proposal. The payload is `{schema_version, operation_id, key, previous, proposal_sha256, to_state, ...}`: `previous` is the `disposition_comment_id` and `proposal_sha256` the `sha256` that `proposal get` returned, so a stale read is refused before any write. `to_state` is `under-review` (the claim), `rejected` (with `reason`), `duplicate-of` (with `duplicate_of`), `needs-info` (with `question`), `escalated-to-owner` (with `escalation: {question, owner_identity, due_by}`) or `incorporated` (with `incorporation`, checked against the requirement record) | the deployment operator allowlist, checked before any read; the actor must be mapped to a person and must not be the submitter |
 | `proposal-decide PROJECT --actor OPERATOR --file decision.json` | record the owner decision on an escalated proposal: `to_state` `approved` or `rejected` (with `reason`), and `decision: {decision_id}` naming an existing native decision issue. Never a requirement id | the allowlist; the decider must be a different person than the escalator and must not be the submitter |
 | `proposal-settings PROJECT --actor OPERATOR [--map-actor ACTOR --to IDENTITY] [--namespace NAME --to IDENTITY] [--unmap-actor ACTOR] [--unmap-namespace NAME] [--add-decider IDENTITY] [--remove-decider IDENTITY]` | with no change, print the contribution settings; otherwise write the next settings record, composed from the current one and bound to its hash | the allowlist |
@@ -447,6 +746,7 @@ history](#malformed-structured-history) (`void-record`).
 | `project-creations --set-server-limit N --actor OPERATOR` | set the most project databases this server may hold (default 20); see [The cost of many projects on one server](#the-cost-of-many-projects-on-one-server) | a listed operator |
 | `remove-creation PROJECT --actor OPERATOR --reason TEXT` | remove a project creation that `add-project` or the web interface did not finish. Refuses a finished project, a name with no creation record and a running creation. An incomplete one is retired (nothing deleted, the name stays retired); a stalled one, for which nothing was made, loses only its record and its name is free. A record that cannot be read (`damaged`) is only set aside, as `project-creations/PROJECT.json.damaged-<UTC stamp>`; nothing else is touched | a listed operator |
 | `retire-project PROJECT --actor OPERATOR --reason TEXT [--force]` | retire a partial or drill project: move `projects/PROJECT` to `retired/PROJECT-<UTC stamp>`. Nothing is deleted; see [Retiring a project](#retiring-a-project) | the deployment operator allowlist, checked first |
+| `backup-schedule --note TEXT --actor OPERATOR` / `backup-schedule --clear --actor OPERATOR` | record, as an operator, that this runtime's backups are scheduled elsewhere, so the project set-up backup step reads done when no enabled systemd timer covers it (see [Set-up steps](HTTP_DEPLOYMENT.md#set-up-steps)). `--note` is one line of at most 300 characters with no control or format character; `--clear` removes the note and takes no `--note`. The statement is about the whole runtime, never expires, and the server does not check it, so the page shows the operator's words, who recorded them and when. Every set and clear is appended (who, when, which) to `backups/backup-schedule-log.jsonl`, bounded to the newest 100 entries; the note itself is only the current statement. Some installation paths (an interpreter or kit path holding a `$`, a quote, a backslash or a control character) get no systemd unit line at all: the operator is told so, with the reason, instead of a line | a listed operator, checked before any write |
 | `reference-misses-clear PROJECT` | delete the project's [reference lookup-miss log](#the-reference-lookup-miss-log). Same behaviour and output as `capability-misses-clear`, on `.reference-misses.json`, `.reference-misses.json.tmp` and `.reference-misses.lock` | none beyond the service account: it deletes telemetry only |
 | `capability-misses-clear PROJECT` | delete the project's [capability lookup-miss log](#the-capability-lookup-miss-log). It prints what was removed (`finds`, `misses`, `phrases`), and in `repaired` any symlink, directory or unopenable lock file it removed from the three miss-log names (never following a link). It writes nothing to the tracker, takes no coordination lock and calls no `bd` | none beyond the service account: it deletes telemetry only, so there is no allowlist check and no `--actor` |
 | `void-record PROJECT --actor OPERATOR --file void.json` | void a malformed or stale contribution-review record, or a malformed, foreign or conflicting reference or capability record ([below](#reference-and-capability-records)) | the deployment operator allowlist (`operators` in `deployment.private.json`) |
@@ -540,8 +840,9 @@ operations the host carries, `retire` included, not the one this route does.
 **What stays with the installation operator.** `proposal-settings`, `capability-retire`,
 `capability-alias-propose`/`-reject`, `void-record`, `revert-record`, every `*-reconcile`,
 `anchor-release`, `remove-creation`, `retire-project`, the backups, the switch commands
-(`review-writes`, `checkpoint-provenance-writes`) and the operator and verifier list commands
-are **not** reachable through this surface, for anybody: they remain `admin.py` host commands.
+(`review-writes`, `checkpoint-provenance-writes`, `bound-keys-only`, `coordinator-rules`) and the operator and
+verifier list commands are **not** reachable through this surface, for anybody: they remain
+`admin.py` host commands.
 The action refuses any name it does not know and names the ones it does.
 
 **How the power is taken away.** The operator list is checked against the name the project's

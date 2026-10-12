@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "operation_id": "caprev-5bb254-coordinator-rules-0002",
+  "key": "coordination.coordinator-rules",
+  "name": "An installation can say who may write a lifecycle fact, who may approve and who may take the merge slot",
+  "aliases": [
+    "the coordinator rules",
+    "lifecycle_authors, independent_approval and coordinator_writes",
+    "nobody passes their own work",
+    "who may record reviewed and integrated",
+    "coordinators per project slices 6 and 7"
+  ],
+  "summary": "Three per-installation rules, off by default: lifecycle_authors permits exact-current-assignee implemented/tested/scope before reading ownership, or a listed operator; other facts require a listed operator. Assignment itself is unrestricted. independent_approval refuses equal known principals OR folded actor names and requires a standing independent approval of the current contribution for reviewed/integrated/merge-acquire. Its writers fail closed on an unreadable registry; missing or valid empty ownership uses names, readers remain available. coordinator_writes permits listed actors for host approve/merge-acquire; verified web approval retains its own owner/coordinator/granted-agent authority. Forged ordinary endpoint descriptors confer none. work/brief approval waiting is caller-relative and conditional, and the web brief recomputes it for the caller. The endpoint marks rule refusals; HTTP error.message carries ordinary and registry setting/recovery sentences without paths or duplicate clauses. Native all-off writes stay compatible; additive reader fields/text are declared. No historical migration or rollout switch change.",
+  "requirements": [],
+  "anchors": [
+    "docs/OPERATIONS.md#the-coordinator-rules-who-may-write-which-fact-and-who-may-approve"
+  ],
+  "code": [
+    "admin.py::coordinator_rules",
+    "admin.py::coordinator_rule",
+    "admin.py::coordinator_rules_switch",
+    "admin.py::coordinator_rules_audit",
+    "admin.py::lifecycle_authors_command",
+    "lifecycle.py::dimension_authority",
+    "lifecycle.py::lifecycle_authors_rule",
+    "lifecycle.py::lifecycle_authors_report",
+    "lifecycle.py::apply_native",
+    "lifecycle.py::apply_release",
+    "review_workflow.py::listed_operator_actor",
+    "review_workflow.py::party_key",
+    "review_workflow.py::same_party",
+    "review_workflow.py::independent_approval_state",
+    "review_workflow.py::require_independent_approval",
+    "review_workflow.py::execute",
+    "coordination.py::apply_native",
+    "work.py::workflow",
+    "review_workflow.py::approval_owners",
+    "work.py::approval_wait",
+    "endpoint.py::owner_loader",
+    "http_service.py::EndpointBackend._detail_limit",
+    "http_service.py::EndpointBackend.task_brief",
+    "review_workflow.py::CoordinatorRuleRefusal",
+    "http_service.py::EndpointBackend._checked"
+  ],
+  "tests": [
+    "tests/test_lifecycle_authors.py",
+    "tests/test_coordinator_rules.py",
+    "tests/test_coordinator_rules_endpoint.py",
+    "tests/test_coordinator_rule_followups.py"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "coordination",
+    "operations",
+    "security"
+  ],
+  "revision": 3,
+  "expected_sha256": "be8b751c20ccc32d927f689d206604e760ac1629cef4b6c593236f038e03ddc5"
+}

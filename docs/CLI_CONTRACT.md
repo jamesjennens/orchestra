@@ -7,6 +7,21 @@ is `cli-contract-v1`; `work --help` returns it in the `contract` field. The kit 
 renaming a documented field, changing an ID's meaning, or changing the envelope
 requires a new contract version.
 
+### Approval waiting context
+
+`work` rows and the canonical `brief.review` and `review` projections carry
+`waiting_for_approval` (bounded text or null) and `approval_requires_other_party`
+(boolean, the installation's `independent_approval` setting; the compact
+`brief.review` omits it when false, and absence means false). With a current
+awaiting-review contribution and that setting on, the author/assignee sees the
+independent-party waiting sentence. Other callers, and all callers with the rule
+off, see the explanation from the same decision as `whose_move`. A named reviewer
+sees their review action. Outside awaiting-review, waiting text is null. The web
+brief exposes `review.waiting_for_approval` after recomputing it for its authenticated
+caller, also honoring the service's `approval_by_another_party` rule. These additive
+reader fields and corrected text mean all-off stdout is not byte-identical to older
+kits; all-off native write effects remain compatible.
+
 The endpoint is the program that runs beside the canonical Beads service
 (`endpoint.py` for SSH/local transport). Clients talk to it through one JSON envelope
 and never run the native `bd` binary directly.
@@ -1896,7 +1911,7 @@ before Python started.
 `coordinate`/`create-child` is endpoint-side: the **server kit** must be a version that
 supports the `coordinate` action (this contract, `0.1.0`+). A client on a newer kit
 talking to an older endpoint fails with `ValueError: Unknown action` from that endpoint;
-`onboard` reports client/kit version and provenance parity so the mismatch is visible
+`docs --status` reports every catalogued document as served with its size or refused with its sentence; whoever may call `docs` may call it, and the web route does not offer it. `onboard` reports client/kit version and provenance parity so the mismatch is visible
 before mutating. The native `create` call uses `--no-inherit-labels` and, for
 `type=decision`, `--validate`, both of which require the pinned Beads 1.2.2. Request IDs
 and content hashes are durable, so an uncertain create is reconciled with the same
@@ -1917,9 +1932,18 @@ Unreadable lifecycle events use the complete native `list --type event --all
 unreadable selected event refuses lifecycle writes with the operator repair
 sentence. Since its parent and dimension cannot be trusted, lifecycle reads of
 that snapshot report unknown instead of an older passed fact. The contributor
-endpoint currently permits creating an event and changing native type to/from
-event; a retyped ordinary row joins event membership, and a retyped event leaves
-it. Type membership alone never makes readable event content a trusted fact.
+endpoint reserves lifecycle-shaped events and lifecycle labels on the raw
+contributor path. Use the dedicated `lifecycle` action (`lifecycle.py record`)
+to assert or correct a fact. Raw creation, conversion or alteration of a
+lifecycle event and lifecycle label addition, removal, inheritance or
+replacement are refused before native writes, independently of optional policy
+rules. Ordinary event creation and task prose remain writable. Contributor raw
+updates cannot change a row to or from `event`, even without lifecycle content:
+that would change which tasks the readers include. Making an existing row
+ephemeral is also refused because native exports omit it. Create a child of a
+scoped task with `--no-inherit-labels`; inherited lifecycle labels are refused.
+Type membership alone never makes readable event content a trusted fact. Configured operators
+and structured host writers keep their existing routes and legacy readers.
 
 Consumers should key on documented fields, tolerate additional fields, and treat any
 nonzero exit code as failure. The envelope, `work` top-level shape, `brief`

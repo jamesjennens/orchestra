@@ -98,9 +98,14 @@ REPLACE_DEADLINE or, after checking both sources, when you have no actionable op
 or pending-review task and `ready` has no unheld task. Use the full
 client-prefixed command examples above; do not run bare `work --mine` or
 `ready --json` as shell commands. Do not wait on work held by other actors. In
-office/person-started mode, do not poll or loop; end each turn with a one-line
-status for the person. Do not depend on another worker's checkout or start another
-coordination database.
+office/person-started mode, do not start a poll or a loop of your own; end each turn
+with a one-line status for the person. Only the worker's own user authorizes checking
+again, by asking, within what the project's standing guidance allows. A task awaiting
+review or integration is not a reason to stop checking until your user's deadline, or the
+project's limit; that is exactly when checking matters. A harness that cannot wait or
+schedule tells its user so
+in one line instead of refusing. Do not depend on another worker's checkout or start
+another coordination database.
 ```
 
 For workers already connected, use the client `onboard` command in that prompt. The longer [worker prompt](../templates/WORKER_PROMPT.md) remains a reference, but no longer needs to be pasted into every new session.

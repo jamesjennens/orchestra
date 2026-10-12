@@ -60,6 +60,26 @@ RESERVED_VALUES = ('requirement', 'requirement:draft', 'requirement:accepted',
                    'request-content:' + 'b' * 64)
 
 
+def remove_scratch(folder):
+    """Remove a fixture's scratch folder, trying again while something still writes into it.
+
+    The scratch Dolt server has been waited for by then, but a bd that the endpoint or a test
+    started for its last command can still be writing for a moment, and the removal then fails
+    with "Directory not empty" although every test passed (seen in kittrial-5bb.208, .226 and,
+    with TMPDIR on a memory disk, in three fixtures at once in kittrial-5bb.209). Tried for ten
+    seconds, then for real, so that a folder that truly cannot be removed still fails.
+    """
+    import time
+    for attempt in range(40):
+        try:
+            folder.cleanup()
+            return
+        except OSError:
+            if attempt == 39:
+                raise
+            time.sleep(0.25)
+
+
 @unittest.skipIf(endpoint is None, 'endpoint imports fcntl (POSIX-only)')
 @unittest.skipIf(BD is None, 'no real bd binary (set ORCHESTRA_BD_BIN or put bd on PATH)')
 class RealBdLabelAliasTests(unittest.TestCase):
@@ -191,7 +211,7 @@ class RealBdLabelAliasTests(unittest.TestCase):
             signal.signal(signum, previous)
         cls._signals = {}
         cls._stop_server()
-        cls._tmp.cleanup()
+        remove_scratch(cls._tmp)
 
     def bd(self, *args, actor='op'):
         return subprocess.run(

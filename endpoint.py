@@ -28,9 +28,10 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from admin import ConfigurationUnreadable,deployment_document,deployment_password,environment,project_dir,root_path,operators as configured_operators,verifiers as configured_verifiers,review_workflow_writes as configured_review_writes
+from admin import ConfigurationUnreadable,deployment_document,deployment_password,environment,project_dir,root_path,operators as configured_operators,verifiers as configured_verifiers,review_workflow_writes as configured_review_writes,coordinator_rules as configured_coordinator_rules
 import bd_refusals
 import native
+import raw_lifecycle
 from coordination import is_merge_slot, merge_slot_sentence
 from render import render
 from lifecycle import apply_native
@@ -41,7 +42,36 @@ from reserved_comments import (carries_record_label, check_raw_request, comment_
                                is_merge_slot_id, shown_token, write_targets, MERGE_SLOT_LABEL, MERGE_SLOT_SUFFIX,
                                reserved_label_in_args, refuse_http_actor, status_change_targets, title_change_targets,
                                unresolved_bd_flags)
-from http_authority import AuthorityConfig, NativeRunner, CAP_PROJECT_ADMIN, descriptor_actor_denial, http_actor_denial, journal_path, run_guarded, stamp_write
+from http_authority import AuthorityConfig, NativeRunner, CAP_APPROVE, CAP_PROJECT_ADMIN, verified_web_authority, block_mismatch_denial, required_capability, descriptor_actor_denial, http_actor_denial, journal_path, run_guarded, stamp_write
+
+#: One warning per line on stderr (kittrial-5bb.197 review request 01a12894, item 6):
+#: the configuration warnings and the native warnings are collected in one list, and
+#: three joined warnings with no separator read as one run-on line.
+def warning_text(warnings):
+    """The stderr text of a warning list, one line per warning."""
+    return ''.join(line if line.endswith('\n') else line+'\n' for line in warnings)
+
+
+def owner_loader(path,rule):
+    """A zero-argument reader of the project's actor -> principal map.
+
+    The map (``sessions.owners``) is read only when a rule needs it. Advisory
+    readers catch failures and retain name comparison. Independent-approval
+    writers fail closed, including listed operators. The other naming rules can
+    decide an exact assignee or directly listed name without a registry read.
+    A failure names the setting and recovery once, without registry contents.
+    """
+    def load():
+        import sessions
+        try:
+            return sessions.owners(path)
+        except (ValueError,OSError):
+            from review_workflow import CoordinatorRuleRefusal
+            raise CoordinatorRuleRefusal('The installation setting %s is on, and the session registry cannot be read. '
+                             'An operator turns the rule off with `admin.py coordinator-rules off --rule %s '
+                             '--actor OPERATOR`, or repairs the session registry; nothing was changed.'
+                             %(rule,rule)) from None
+    return load
 
 ALLOWED={'list','show','ready','search','count','create','update','close','reopen','comments','dep','state','lint'}
 # Legacy name kept for operators reading this file; enforcement is the
@@ -245,7 +275,7 @@ def _guard_record_anchor_title(root,path,args,actor,rows=None):
 #: means no row has exactly the id asked for (kittrial-5bb.138).
 BD_NO_MATCH_ERROR='no issues found matching the provided IDs'
 
-def _bd_read(root,path,actor,argv,resolver_absence=False):
+def _bd_read(root,path,actor,argv,resolver_absence=False,strict=False):
     """One native read for a guard: ``(rows, stderr)``, or ``(None, why)`` when the read itself failed.
 
     A read that times out, exits non-zero for any reason but "no issue found", or prints
@@ -288,12 +318,14 @@ def _bd_read(root,path,actor,argv,resolver_absence=False):
         return None,'bd could not read the tasks (%s)'%(said[-200:] or 'exit %d'%p.returncode)
     rows=[answer] if isinstance(answer,dict) else answer
     if not isinstance(rows,list):return None,'bd gave an unreadable answer'
+    if strict and any(not isinstance(row,dict) or not isinstance(row.get('id'),str) for row in rows):
+        return None,'bd gave an incomplete answer'
     rows=[row for row in rows if isinstance(row,dict) and isinstance(row.get('id'),str)]
     if p.returncode and not rows and 'no issue found' not in said and not (resolver_absence and resolver_answer and p.returncode==1):
         return None,'bd could not read the tasks (%s)'%(said[-200:] or 'exit %d'%p.returncode)
     return rows,said
 
-def _resolve_rows(root,path,actor,tokens):
+def _resolve_rows(root,path,actor,tokens,strict=False):
     """The rows bd resolves ``tokens`` to: ``(rows, problem)``.
 
     One native read for all of them. bd answers with the rows it found and names the
@@ -305,12 +337,12 @@ def _resolve_rows(root,path,actor,tokens):
     for token in tokens:
         if not isinstance(token,str) or not token.strip() or (token.startswith('-') and token!='-'):
             return [],'%s is not a task id'%shown_token(token)
-    rows,said=_bd_read(root,path,actor,['show',*tokens,'--json'])
+    rows,said=_bd_read(root,path,actor,['show',*tokens,'--json'],strict=strict)
     if rows is None:return [],said
     if len({row['id'] for row in rows})==len(tokens) and 'no issue found' not in said:return rows,None
     found=[]
     for token in tokens:
-        rows,said=_bd_read(root,path,actor,['show',token,'--json'])
+        rows,said=_bd_read(root,path,actor,['show',token,'--json'],strict=strict)
         if rows is None:return [],said
         if len(rows)!=1:return [],'%s does not name exactly one task'%shown_token(token)
         found.append(rows[0])
@@ -352,7 +384,7 @@ def _guard_new_id(root,path,name,new_id,actor):
     if any(row['id']==new_id for row in rows):
         raise ValueError('Refusing create --id %s: a task with that id exists, and bd would replace its title, description, status and assignee. Choose another id, or use update. Nothing was written.'%shown)
 
-def _guard_named_rows(root,path,name,args,attachments,actor):
+def _guard_named_rows(root,path,name,args,attachments,actor,strict=False):
     """Every contributor write must name the rows it writes, and none may be the merge slot.
 
     ``write_targets`` (reserved_comments) says which tokens of the command name rows and
@@ -372,9 +404,10 @@ def _guard_named_rows(root,path,name,args,attachments,actor):
     if request['refusal']:
         raise ValueError('Refusing %s: %s. Nothing was written.'%(command,request['refusal']))
     if not request['targets']:return
-    rows,problem=_resolve_rows(root,path,actor,request['targets'])
+    rows,problem=_resolve_rows(root,path,actor,request['targets'],strict=strict)
     if problem:
-        raise ValueError('Refusing %s: %s, so the rows this would write are not known. Name each task by its id. Nothing was written.'%(command,problem))
+        advice=(' '+raw_lifecycle.ADVICE) if strict else ''
+        raise ValueError('Refusing %s: %s, so the rows this would write are not known. Name each task by its id. Nothing was written.%s'%(command,problem,advice))
     slot=name+MERGE_SLOT_SUFFIX
     for row in rows:
         if row['id']==slot or is_merge_slot(row):
@@ -523,7 +556,7 @@ def reserved_actors(root,path,rows=False,own=()):
     return names
 
 #: The actions that exist only for the web service: they name no existing project.
-SERVICE_ONLY_ACTIONS=('create-project','project-creations','creation-standing')
+SERVICE_ONLY_ACTIONS=('create-project','project-creations','creation-standing','web-merge-slot')
 
 def key_project_refusal(request,key_projects):
     """Refuse, for a key bound to projects, a request that is not for one of them.
@@ -704,6 +737,11 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
         answered=request.get('action') if isinstance(request,dict) else None
         if answered in SERVICE_ONLY_ACTIONS:
             raise ValueError('%s is available only to the web service'%answered)
+    # Slot requests bind the block before project, tracker, or authority reads.
+    # The shared table is the sole endpoint action/operation capability mapping.
+    if request.get('action') in ('coordinate','web-merge-slot'):
+        denied=block_mismatch_denial(request,authority_config)
+        if denied is not None:return denied
     # Two actions exist only for the web service and name no existing project
     # (kittrial-5bb.118 part 2); project_creation holds them, with what stops other callers.
     if request.get('action')=='create-project':
@@ -736,6 +774,10 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
     # And a name WITHOUT that shape, sent by the web service with a descriptor, is written only
     # by a worker credential inside a namespace that is nobody else's (kittrial-5bb.184).
     denied=descriptor_actor_denial(request,authority_config,lambda rows=False,own=():reserved_actors(root,path,rows,own))
+    if denied is not None:return denied
+    # The block must be FOR this request (kittrial-5bb.261): the project it names is this
+    # project, and the capability it names is the one this action needs. Before any action.
+    denied=block_mismatch_denial(request,authority_config)
     if denied is not None:return denied
     if request.get('action')=='session':
         from sessions import execute as session_execute
@@ -776,17 +818,29 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
         # failing every work/review action (kittrial-5bb.110 item 2).
         switch_warnings=[]
         review_writes=configured_review_writes(root,warnings=switch_warnings)
+        rules=configured_coordinator_rules(root,warnings=switch_warnings)
         run_warnings.extend(switch_warnings)
+        # The principal rule of slice 7 and the party comparison of rule 3 both need the
+        # project's actor -> principal map, and only when a rule that consults it is on:
+        # an installation that configures nothing reads no registry here. Advisory
+        # reads retain name comparison on failure; independent-approval writers
+        # must load ownership strictly, even for a directly listed operator.
+        registry_rule='coordinator_writes' if rules['coordinator_writes'] else 'independent_approval'
+        owners=(owner_loader(path,registry_rule)
+                if (rules['coordinator_writes'] or rules['independent_approval']) else None)
         def work_effect():
             result=work_execute(path,actor,action,args,request.get('attachments',{}),runner,
                                 operators=configured_operators(root),
                                 verifiers=configured_verifiers(root),
-                                review_writes=review_writes)
+                                review_writes=review_writes,
+                                independent_approval=rules['independent_approval'],
+                                coordinator_writes=rules['coordinator_writes'],
+                                owners=owners,verified_web_authority=verified_web_authority(request,authority_config,CAP_APPROVE,name))
             # A handoff request and a decline are recorded in the kit's handoff journal and move
             # nothing in bd, so the runner saw no write; they are writes all the same (review
             # of kittrial-5bb.97). One that was already recorded (`reconciled`) wrote nothing.
             if action=='handoff' and len(args)==2 and isinstance(result,dict) and result.get('reconciled') is False:runner.wrote=True
-            return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False,indent=2)+'\n','stderr':''.join(run_warnings)}
+            return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False,indent=2)+'\n','stderr':warning_text(run_warnings)}
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
             return guarded_write(root,request,journal_path(path),work_effect,
@@ -1042,8 +1096,8 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
         # everything that rests on the operator allowlist is a host command (admin.py
         # proposal-review, proposal-decide, proposal-settings). The HTTP service is the
         # other authority: launched by it, with live authority required, review and
-        # decide run for a signed-in member whose reviews.approve the guard has just
-        # re-validated, and a submission's submitter is bound to the verified account.
+        # decide run for a signed-in member whose capability the guard has just re-validated
+        # (reviews.approve for a review, project.admin for a decide: kittrial-5bb.261), and a submission's submitter is bound to the verified account.
         import proposal_records
         args=request.get('args',[])
         if not isinstance(args,list) or any(not isinstance(x,str) or '\0' in x for x in args):raise ValueError('Expected argument list')
@@ -1149,6 +1203,15 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                 from http_authority import server_time as now_stamp
                 target=path/'ONBOARDING.md'
                 previous=None
+                if target.is_dir():
+                    # A directory at the document's name used to reach os.replace INSIDE the guarded
+                    # write, and an OSError there is not a refusal: the identity stayed reserved and
+                    # the caller got rc 124 "outcome unknown", which a caller with no shell cannot
+                    # reconcile (kittrial-5bb.242 item 5). Refused here, before anything is written,
+                    # as a refusal with a sentence.
+                    raise ValueError('Project onboarding cannot be written: %s is a directory, not a file. '
+                                     'Remove the directory, or write the document by hand on the host. '
+                                     'Nothing was written.'%target.name)
                 if target.is_file() and not target.is_symlink():
                     try:
                         previous=target.read_text(encoding='utf-8-sig')
@@ -1158,9 +1221,11 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                         # replaces it, and a caller with no shell has no other way. The unreadable
                         # previous text is treated as changed, and the answer says so in a sentence
                         # rather than the bare UnicodeDecodeError that used to answer rc 2 with
-                        # nothing written.
+                        # nothing written. The sentence ends in a newline like every other warning
+                        # the route joins: without one the client printed "...and replacedserver_time:
+                        # ..." on one line (kittrial-5bb.242 item 4).
                         run_warnings.append('the previous ONBOARDING.md could not be read as UTF-8 text; '
-                                            'it was treated as changed and replaced')
+                                            'it was treated as changed and replaced\n')
                 write_project(target,text)
                 # This route does NOT probe the text for endpoint paths (review of 958e883, item 3b):
                 # probe_endpoints resolves and reads every absolute *.py path the text names and
@@ -1239,14 +1304,70 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             return stdout
         runner=NativeRunner(run)
         def briefing_effect():
+            rules=configured_coordinator_rules(root,warnings=run_warnings)
             return {'returncode':0,'stdout':briefing_execute(root,path,name,actor,action,args,request.get('attachments',{}),runner,
                                                              operators=configured_operators(root),
-                                                             verifiers=configured_verifiers(root)),'stderr':''.join(run_warnings)}
+                                                             verifiers=configured_verifiers(root),
+                                                             independent_approval=rules['independent_approval'],
+                                                             owners=owner_loader(path,'independent_approval')
+                                                             if rules['independent_approval'] else None),'stderr':''.join(run_warnings)}
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
             return guarded_write(root,request,journal_path(path),briefing_effect,
                                authority_config=authority_config,
                                require_authority=require_authority,runner=runner)
+    if action=='web-merge-slot':
+        from http_authority import CAP_READ, CAP_COORDINATE, file_lock
+        from web_merge_slot import SlotError, validate as slot_validate, apply as slot_apply
+        from review_workflow import CoordinatorRuleRefusal
+        args=request.get('args',[])
+        run_warnings=[]
+        def slot_run(argv):
+            stdout,warnings=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
+            if warnings:run_warnings.append(warnings)
+            return stdout
+        runner=NativeRunner(slot_run)
+        try:
+            if not isinstance(args,list) or len(args)!=1 or not isinstance(args[0],str):
+                raise SlotError(422,'Expected one merge-slot JSON payload')
+            payload=record_json.loads(args[0]);operation=slot_validate(payload)
+            capability=required_capability(request)
+            if capability is None:raise SlotError(403,'This merge-slot operation has no endpoint capability binding')
+            denied_status=[]
+            def slot_authority():
+                descriptor=request.get('authority') or {}
+                if (not verified_web_authority(request,authority_config,capability,name)
+                        or (operation in ('create','force-release') and descriptor.get('via')!='session')):
+                    denied_status.append(403)
+                    raise SlotError(403,'Verified web authority required for this merge-slot operation in this project')
+            rules=configured_coordinator_rules(root,warnings=run_warnings)
+            def slot_effect():
+                result=slot_apply(payload,actor,runner,path,request.get('operation_id'),
+                                  operators=(configured_operators(root) if rules['independent_approval'] else None),
+                                  coordinator_writes=rules['coordinator_writes'],
+                                  independent_approval=rules['independent_approval'],
+                                  owners=owner_loader(path,'independent_approval'))
+                return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':warning_text(run_warnings)}
+            with (path/'.coordination.lock').open('a') as lock:
+                fcntl.flock(lock,fcntl.LOCK_EX)
+                if operation=='check':
+                    if authority_config is None:raise SlotError(403,'Verified web authority required for the merge-slot read')
+                    with file_lock(authority_config.lock):
+                        slot_authority()
+                        return slot_effect()
+                if not request.get('operation_id'):
+                    raise SlotError(422,'A stable operation identity is required for a merge-slot write')
+                answer=guarded_write(root,request,journal_path(path),slot_effect,
+                                     authority_config=authority_config,require_authority=True,
+                                     runner=runner,identity_check=slot_authority)
+                if denied_status and answer.get('returncode')==2:answer['merge_slot_status']=403
+                return answer
+        except CoordinatorRuleRefusal as error:
+            # Preserve the slot's conflict status and identify the native rule refusal.
+            return {'returncode':2,'stdout':'','stderr':str(error)+'\n',
+                    'merge_slot_status':409,'refused':'coordinator-rule'}
+        except SlotError as error:
+            return {'returncode':2,'stdout':'','stderr':str(error)+'\n','merge_slot_status':error.status}
     if action in ('lifecycle','coordinate','requirement'):
         args=request.get('args',[])
         if not isinstance(args,list) or len(args)!=1 or not isinstance(args[0],str):raise ValueError('Expected one JSON payload')
@@ -1257,16 +1378,36 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             if warnings:run_warnings.append(warnings)
             return stdout
         runner=NativeRunner(run)
+        # Slices 6 and 7 (kittrial-5bb.197): the three rules are read once, from the
+        # installation's own file, and an installation that configures nothing reads
+        # them all as OFF. A malformed value reads as OFF with a warning, as
+        # review_workflow_writes does, rather than failing every lifecycle write.
+        switch_warnings=[]
+        rules=configured_coordinator_rules(root,warnings=switch_warnings)
+        run_warnings.extend(switch_warnings)
+        # The registry is read only when a rule that needs it is on, and for the
+        # lifecycle write only when `lifecycle_authors` is on: with the rules OFF a
+        # malformed `operators` value must not stop `coordinate`, and a damaged
+        # registry must not stop the reads or a listed operator's operation
+        # (kittrial-5bb.197 review request 01a12894, item 4).
+        coordinate_operators=(configured_operators(root)
+                              if (rules['coordinator_writes'] or rules['independent_approval']) else None)
         def lifecycle_effect():
             if action=='lifecycle':result=apply_native(payload,actor,runner,
-                                                       operators=configured_operators(root),journal=path)
+                                                       operators=configured_operators(root),journal=path,
+                                                       lifecycle_authors=rules['lifecycle_authors'],
+                                                       independent_approval=rules['independent_approval'],
+                                                       owners=owner_loader(path,'lifecycle_authors'))
             elif action=='coordinate':
                 from coordination import apply_native as coordinate
-                result=coordinate(payload,actor,runner,path)
+                result=coordinate(payload,actor,runner,path,operators=coordinate_operators,
+                                  coordinator_writes=rules['coordinator_writes'],
+                                  independent_approval=rules['independent_approval'],
+                                  owners=owner_loader(path,'coordinator_writes'))
             else:
                 from requirement_records import apply_native as requirement_apply
                 result=requirement_apply(payload,actor,runner,path)
-            return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
+            return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':warning_text(run_warnings)}
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
             return guarded_write(root,request,journal_path(path),lifecycle_effect,
@@ -1365,7 +1506,23 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             fcntl.flock(lock,fcntl.LOCK_EX)
             # First the rows the write names (an existing id given to create, a write that names
             # none, the merge slot); then the guards that read what those rows carry.
-            named=_guard_named_rows(root,path,name,args,request.get('attachments',{}),actor)
+            lifecycle_guard=args[0] in ('create','update','dep','close','reopen') and actor not in configured_operators(root)
+            named=_guard_named_rows(root,path,name,args,request.get('attachments',{}),actor,strict=lifecycle_guard)
+            if lifecycle_guard:
+                resolved_request=write_targets(args,request.get('attachments',{}))
+                resolved_tokens=resolved_request['targets'] if resolved_request is not None else None
+                def lifecycle_rows(tokens):
+                    # This exact vector was resolved natively above, under this
+                    # lock. Reuse it without guessing which row any subset or
+                    # differently spelled token means.
+                    if tokens==resolved_tokens and isinstance(named,list):return named
+                    # Ask bd for the actual tokens this particular guard reads.
+                    # A suffix of another named row is not proof of what bd's
+                    # substring resolver selected for a positional operand.
+                    rows,problem=_resolve_rows(root,path,actor,tokens,strict=True)
+                    if problem:raw_lifecycle.refuse('the affected tasks could not be read completely')
+                    return rows
+                raw_lifecycle.guard(args,request.get('attachments',{}),lifecycle_rows)
             _guard_record_anchor_status(root,path,args,actor)
             _guard_record_anchor_title(root,path,args,actor,named)
             _guard_reserved_labels(root,path,args,actor)
@@ -1394,6 +1551,8 @@ def main():
     p.add_argument('--service-namespace',
                    help="the web service's own actor namespace (default http): a name the "
                         'service was started under is refused at use too (kittrial-5bb.188 item 3)')
+    p.add_argument('--terminal-endpoint-timeout', type=float, default=150,
+                   help='trusted service launch timeout for terminal write abandonment fencing')
     p.add_argument('--key-project',action='append',metavar='NAME',
                    help='a project the calling SSH key is bound to (repeatable; passed only by '
                         'ssh_forced_command.py from the authorized_keys line): every request for '
@@ -1407,7 +1566,8 @@ def main():
     a=p.parse_args()
     authority_config=None
     if a.authority_store:
-        authority_config=AuthorityConfig(a.authority_store,a.authority_lock,a.service_namespace)
+        authority_config=AuthorityConfig(a.authority_store,a.authority_lock,a.service_namespace,
+                                         a.terminal_endpoint_timeout)
     try:
         if a.key_project is not None and a.authority_store:
             # A key line is not the web service, and the service passes no such flag.
@@ -1435,6 +1595,12 @@ def main():
         answer={'returncode':75,'stdout':'','stderr':'Busy: %s. Nothing was done; try again shortly.\n'%waited}
     except Exception as e:
         answer={'returncode':2,'stdout':'','stderr':f'{type(e).__name__}: {e}\n'}
+        from review_workflow import CoordinatorRuleRefusal
+        if isinstance(e,CoordinatorRuleRefusal):
+            # Preserve the host's ValueError sentence while identifying a kit rule
+            # refusal explicitly. HTTP never decides this from words in stderr.
+            answer['stderr']=f'ValueError: {e}\n'
+            answer['refused']='coordinator-rule'
         import actor_names
         if isinstance(e,actor_names.TrackerUnreadable):
             # The export could not be read (bd failed, or answered something that is not

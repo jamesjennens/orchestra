@@ -125,8 +125,8 @@ class BoundEndpointTests(unittest.TestCase):
                 self.refused(request)
 
     def test_the_web_only_actions_are_refused_before_their_name_is_looked_at(self):
-        self.assertEqual(sorted(endpoint.SERVICE_ONLY_ACTIONS), ['create-project', 'creation-standing', 'project-creations'])
-        for action in ('create-project', 'project-creations', 'creation-standing'):
+        self.assertEqual(sorted(endpoint.SERVICE_ONLY_ACTIONS), ['create-project', 'creation-standing', 'project-creations', 'web-merge-slot'])
+        for action in ('create-project', 'project-creations', 'creation-standing', 'web-merge-slot'):
             for project in ('alpha', 'beta', 'Not A Name', None):
                 with self.subTest(action=action, project=project):
                     self.refused({'project': project, 'actor': 'a', 'action': action},
@@ -418,7 +418,9 @@ class ListingTests(unittest.TestCase):
             'kind': 'bound', 'projects': ['alpha', 'beta'], 'principal': None, 'root': self.root.as_posix(),
             'wrapper': self.kit.as_posix() + '/ssh_forced_command.py', 'endpoints': [self.kit.as_posix() + '/endpoint.py'],
             'other_kit': False, 'other_root': False, 'missing': False, 'unknown_arguments': [], 'names_release': False,
-            'unknown_projects': []})
+            'unknown_projects': [],
+            # kittrial-5bb.250 r3: the two rule fields every command line now carries.
+            'needs_shell': False, 'relative_path': False, 'foreign_invocation': False})
 
     def test_the_binding_is_the_arguments_and_never_the_comment(self):
         entry = self.one(self.line(comment='alex@laptop orchestra-projects=alpha'))

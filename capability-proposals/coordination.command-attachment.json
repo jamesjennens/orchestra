@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "operation_id": "capnew-5bb242-command-attachment-0001",
+  "key": "coordination.command-attachment",
+  "name": "A confined coordinator command carries one attachment, and the token must name it",
+  "aliases": [
+    "the coordinator attachment token",
+    "one attachment for a coordinator command",
+    "the token names the attachment that is used",
+    "a directory at ONBOARDING.md is a refusal"
+  ],
+  "summary": "A confined coordinator command carries one local file as a single @attachment:N token, with the flag kept on the attachment (the older two-token --file form is still accepted for a hand-built request); the token names the attachment that is used, and a token naming an attachment that is not there is refused, never answered by falling back to another attachment. On set-onboarding a directory at ONBOARDING.md is refused before anything is written, as a sentence with rc 2, instead of reaching os.replace inside the guarded write where the OSError is not a refusal and the answer was rc 124 'outcome unknown' with the identity reserved. A payload operation the route does not name (draft) is refused on the payload, single or beside items, before any library is called.",
+  "requirements": [],
+  "anchors": [],
+  "code": [
+    "endpoint.py::coordinator_payload",
+    "endpoint.py::coordinator_apply_refusal"
+  ],
+  "tests": [
+    "tests/test_coordinator_endpoint.py"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "coordination",
+    "endpoint",
+    "attachments"
+  ]
+}

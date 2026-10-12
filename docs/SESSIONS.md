@@ -46,8 +46,12 @@ stop just because the previous task was delivered. Stop at the configured deadli
 or, after checking both sources, when there is no actionable open or pending-review
 task owned by this actor and no unheld task in `ready`. Use the full
 client-prefixed examples above, and do not wait on other actors' held tasks or poll
-an empty queue indefinitely. Office/person-started turns do not poll or loop; end
-each turn with a one-line status for the person.
+an empty queue indefinitely. Office/person-started turns do not start a poll or a loop
+of their own: end each turn with a one-line status for the person. Only the worker's own
+user authorizes checking again, by asking, within what the project's standing guidance
+allows. A task awaiting review or integration is not a reason to stop checking until your
+user's deadline, or the project's limit; that is exactly when checking matters. A harness
+that cannot wait or schedule tells its user so in one line instead of refusing.
 
 ## Register with an installed client
 

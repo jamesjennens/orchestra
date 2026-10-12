@@ -75,6 +75,7 @@ function seen(page, name) {
   return {
     scopes: line ? line.attributes['data-scopes'] : null, source: line ? line.attributes['data-scopes-source'] : null,
     line: line ? line.textContent : null, differ: banner ? banner.attributes['data-scopes-differ'] : null,
+    panelText: panel ? panel.textContent : null,
     summary: panel ? panel.all((e) => e.tagName === 'SUMMARY')[0].textContent : null,
     rows: panel ? panel.all((e) => e.tagName === 'LI' && e.attributes['data-credential']).map((li) => ({
       working: li.attributes['data-working'], differs: li.attributes['data-differs'], text: li.textContent,

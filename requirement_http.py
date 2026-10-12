@@ -6,6 +6,9 @@ used to impersonate host authority.
 """
 import json
 import hashlib
+import os
+import stat
+from datetime import datetime, timezone
 from dataclasses import dataclass
 
 import keyed_records as core
@@ -17,11 +20,96 @@ from coordination import atomic, identifier
 from requirements import canonical_bytes, content_hash, load_json
 
 JOURNAL = '.requirement-owner-requests'
+RECOVERY_READ_ERROR = 'Requirement operation receipt is unreadable. Ask the host operator to reconcile it.'
+RECOVERY_WRITE_ERROR = 'Failed creation recovery could not be completed. Reload; if it still fails, ask the host operator.'
+RECOVERY_RELOAD_ERROR = 'Failed creation recovery could not be read now. Reload; if it still fails, ask the host operator.'
+NOTHING_WRITTEN = 'No creation receipt was written. Clear this failed creation, then start a new creation.'
+EMPTY_CREATION_ERROR = ('Cannot clear this failed creation. Reload the requirements; '
+                        'if the creation is still incomplete, ask the host operator to reconcile it.')
+RECOVERY_PUBLIC_ERRORS = {
+    EMPTY_CREATION_ERROR,
+    EMPTY_CREATION_ERROR + ' Native absence cannot be proved from this read.',
+    EMPTY_CREATION_ERROR + ' A native row already carries this request.',
+    'Failed creation recovery changed; reload before trying again',
+    'No failed creation was found; ask the host operator to reconcile it',
+    'Only the owner account that attempted this creation can clear it',
+    'The original creation identity cannot be verified; ask the host operator',
+    'The original creation is not recoverable; ask the host operator',
+    'This failed creation needs host operator reconciliation.',
+    'This project uses governed requirements. Ask its owner to enable simple editing.',
+    'Owner recovery receipts need host operator repair',
+    'Requirements editing needs the signed-in project owner',
+    'Unsupported requirements fields or action',
+    'Requirements action needs its attached content',
+    'Requirement title must contain 1 to 200 characters',
+    'Requirement description must contain 1 to 20000 characters',
+    RECOVERY_READ_ERROR, RECOVERY_WRITE_ERROR, RECOVERY_RELOAD_ERROR, NOTHING_WRITTEN,
+}
+
+
+def recovery_error(error, message=RECOVERY_READ_ERROR):
+    """Only our fixed public sentences may cross this recovery boundary."""
+    text = str(error).strip()
+    return text if text in RECOVERY_PUBLIC_ERRORS else message
+
+
+def read_owner_receipt(path, missing=False):
+    """A FIFO/raced special file must never block the canonical locks."""
+    from requirements import _unique_object
+    try:
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError(RECOVERY_READ_ERROR)
+        flags = os.O_RDONLY | getattr(os, 'O_BINARY', 0) | getattr(os, 'O_NONBLOCK', 0)
+        flags |= getattr(os, 'O_NOFOLLOW', 0)
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        if missing:
+            return None
+        raise ValueError(RECOVERY_READ_ERROR) from None
+    except OSError:
+        # Classify an unreadable receipt before the guarded effect can mistake
+        # the filesystem exception for an uncertain canonical write.
+        raise ValueError(RECOVERY_READ_ERROR) from None
+    try:
+        with os.fdopen(fd, 'rb') as handle:
+            opened = os.fstat(handle.fileno())
+            if (not stat.S_ISREG(opened.st_mode)
+                    or (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino)):
+                raise ValueError(RECOVERY_READ_ERROR)
+            payload = handle.read(1024 * 1024 + 1)
+        if len(payload) > 1024 * 1024:
+            raise ValueError(RECOVERY_READ_ERROR)
+        receipt = record_json.loads(payload.decode('utf-8'), object_pairs_hook=_unique_object)
+        canonical_bytes(receipt)
+        return validate_receipt(receipt)
+    except (ValueError, OSError):
+        raise ValueError(RECOVERY_READ_ERROR) from None
 
 
 def validate_receipt(receipt):
     """Legacy receipts remain valid; optional decision bindings are strict."""
     core.validate_receipt(receipt)
+    if receipt.get('operation') in ('withdraw', 'supersede') or 'owner_state' in receipt or 'owner_state_reason' in receipt:
+        from requirement_terminal import validate_receipt as validate_terminal_receipt
+        validate_terminal_receipt(receipt)
+    if 'creation_metadata' in receipt:
+        metadata = receipt['creation_metadata']
+        if (not isinstance(metadata, dict) or set(metadata) != {'title', 'at'}
+                or receipt.get('operation') != 'draft' or receipt.get('revision') != 1
+                or not isinstance(metadata['title'], str) or not 1 <= len(metadata['title']) <= 200
+                or '\0' in metadata['title']):
+            raise ValueError('Invalid creation recovery metadata')
+        core_stamp(metadata['at'])
+    if 'prewrite_identity' in receipt:
+        identity = receipt['prewrite_identity']
+        if (not isinstance(identity, dict) or set(identity) != {'project', 'operation_id', 'account_id', 'request_sha256'}
+                or identity['account_id'] != receipt.get('actor') or receipt.get('id') is not None
+                or receipt.get('operation') != 'draft' or receipt.get('revision') != 1
+                or receipt.get('sha256') != content_hash({'prewrite_identity': identity})):
+            raise ValueError('Invalid missing creation receipt identity')
+        identifier(identity['project']); identifier(identity['operation_id'])
+        governance.digest(identity['request_sha256'])
     if 'owner_decision' in receipt:
         binding = owner_records.validate(receipt['owner_decision'])
         if (binding['account_id'] != receipt.get('actor')
@@ -57,32 +145,59 @@ def validate_receipt(receipt):
     return receipt
 
 
+def core_stamp(value):
+    if not isinstance(value, str):
+        raise ValueError('Invalid creation recovery time')
+    try:
+        datetime.strptime(value, core.STAMP)
+    except ValueError:
+        raise ValueError('Invalid creation recovery time') from None
+    return value
+
+
+def missing_creation_receipt(entry, context, operation):
+    """Terminal-cache identity from the original journal, not an invented payload hash."""
+    if (entry.get('principal') != 'owner-account:' + context.account_id
+            or entry.get('route') != 'requirements.create' or entry.get('actor') != context.account_id
+            or entry.get('state') not in ('unknown', 'in_progress')):
+        raise ValueError('The original creation identity cannot be verified; ask the host operator')
+    identity = dict(project=context.project, operation_id=operation, account_id=context.account_id,
+                    request_sha256=entry['request_hash'])
+    saved = dict(sha256=content_hash({'prewrite_identity': identity}), status='pending',
+                 actor=context.account_id, operation='draft', revision=1, prewrite_identity=identity)
+    return validate_receipt(saved)
+
+
 def receipt_sha256(receipt):
     return hashlib.sha256(canonical_bytes(receipt)).hexdigest()
 
 
-def empty_creation(receipt, context, operation_id, run):
-    """Prove no native row was allocated; caller holds both canonical locks."""
-    validate_receipt(receipt)
-    message = ('Cannot clear this failed creation. Retry the original creation; '
-               'if it still fails, ask the host operator to reconcile it.')
-    if (receipt.get('actor') != context.account_id or receipt['status'] != 'pending'
-            or receipt.get('operation') != 'draft' or receipt.get('revision') != 1
-            or receipt.get('id') is not None or receipt.get('created')
-            or receipt.get('acceptance') is not None or 'owner_decision' in receipt):
-        raise ValueError(message)
+def creation_request_labels(run):
+    """One complete export/membership proof and request index per read."""
     rows = records.read_rows(run)
     ids = record_json.native_ids(run)
     row_ids = [row.get('id') for row in rows]
     if (any(not isinstance(value, str) or not value for value in row_ids)
             or len(row_ids) != len(set(row_ids)) or set(row_ids) != ids
-            # Pinned bd omits labels entirely on ordinary unlabeled rows.
-            # A present null/non-list value still cannot prove absence.
             or any(row.get('malformed') or not isinstance(row.get('labels', []), list)
                    or any(not isinstance(label, str) for label in row.get('labels', [])) for row in rows)):
-        raise ValueError(message + ' Native absence cannot be proved from this read.')
+        raise ValueError(EMPTY_CREATION_ERROR + ' Native absence cannot be proved from this read.')
+    return {label for row in rows for label in row.get('labels', []) if label.startswith('request:')}
+
+
+def empty_creation(receipt, context, operation_id, run, native_labels=None):
+    """Prove no native row was allocated; caller holds both canonical locks."""
+    validate_receipt(receipt)
+    message = EMPTY_CREATION_ERROR
+    if (receipt.get('actor') != context.account_id or receipt['status'] != 'pending'
+            or receipt.get('operation') != 'draft' or receipt.get('revision') != 1
+            or receipt.get('id') is not None or receipt.get('created')
+            or receipt.get('acceptance') is not None or 'owner_decision' in receipt):
+        raise ValueError(message)
+    if native_labels is None:
+        native_labels = creation_request_labels(run)
     label = 'request:' + content_hash({'operation_id': operation_id})
-    if any(label in row.get('labels', []) for row in rows):
+    if label in native_labels:
         raise ValueError(message + ' A native row already carries this request.')
 
 
@@ -91,22 +206,29 @@ def recovery_projection(project_path, context, run):
     path = project_path / JOURNAL
     if path.is_symlink():
         raise ValueError('Owner recovery receipts need host operator repair')
-    if not path.exists():
-        return {'items': [], 'truncated': False}
     journal = OperationJournal(journal_path(project_path))
-    candidates = journal.pending_owner_creates('owner-account:' + context.account_id)
+    snapshot = journal.pending_owner_creates_snapshot('owner-account:' + context.account_id)
+    candidates = snapshot['items']
     items = []
-    for entry in candidates[:20]:
+    native_labels = None
+    native_error = None
+    native_loaded = False
+    for entry in candidates:
         operation = entry['operation_id']
-        receipt = core.receipt_path(path, content_hash({'operation_id': operation}), 'requirement')
-        if not receipt.is_file():
-            continue
-        saved = validate_receipt(load_json(receipt))
-        if saved.get('actor') != context.account_id or saved.get('operation') != 'draft':
-            continue
-        item = {'operation_id': operation, 'expected_receipt_sha256': receipt_sha256(saved),
-                'can_clear': False}
+        item = {'operation_id': operation, 'can_clear': False}
         try:
+            receipt = core.receipt_path(path, content_hash({'operation_id': operation}), 'requirement')
+            saved = read_owner_receipt(receipt, missing=True)
+            if saved is None:
+                saved = missing_creation_receipt(entry, context, operation)
+                item['message'] = NOTHING_WRITTEN
+            if saved.get('actor') != context.account_id or saved.get('operation') != 'draft':
+                raise ValueError(RECOVERY_READ_ERROR)
+            item['expected_receipt_sha256'] = receipt_sha256(saved)
+            if 'creation_metadata' in saved:
+                item.update(title=saved['creation_metadata']['title'], at=saved['creation_metadata']['at'])
+            elif type(entry.get('at')) in (int, float) and 0 <= entry['at'] <= 253402300799:
+                item['at'] = datetime.fromtimestamp(entry['at'], timezone.utc).strftime(core.STAMP)
             if journal.expired(entry):
                 raise ValueError('This failed creation needs host operator reconciliation.')
             if saved['status'] == 'released' and 'release_history' in saved:
@@ -115,12 +237,21 @@ def recovery_projection(project_path, context, run):
                     raise ValueError('This failed creation needs host operator reconciliation.')
                 item.update(expected_receipt_sha256=audit['prior_receipt_sha256'], reason=audit['reason'])
             else:
-                empty_creation(saved, context, operation, run)
+                if not native_loaded:
+                    native_loaded = True
+                    try:
+                        native_labels = creation_request_labels(run)
+                    except (ValueError, OSError) as error:
+                        native_error = recovery_error(error, RECOVERY_RELOAD_ERROR)
+                if native_error:
+                    raise ValueError(native_error)
+                empty_creation(saved, context, operation, run, native_labels=native_labels)
             item['can_clear'] = True
-        except ValueError as error:
-            item['message'] = str(error)
+        except (ValueError, OSError) as error:
+            item['message'] = recovery_error(error)
         items.append(item)
-    return {'items': items, 'truncated': len(candidates) > 20}
+    return {'items': items, 'listed': len(items), 'total': snapshot['total'],
+            'truncated': snapshot['total'] > len(items)}
 
 
 def release_creation(project_path, context, body, run, runner):
@@ -129,15 +260,15 @@ def release_creation(project_path, context, body, run, runner):
     operation = body['original_operation_id']
     path = core.receipt_path(core.journal_dir(project_path, JOURNAL),
                              content_hash({'operation_id': operation}), 'requirement')
-    if not path.is_file():
-        raise ValueError('No failed creation was found; ask the host operator to reconcile it')
-    saved = validate_receipt(load_json(path))
-    if saved.get('actor') != context.account_id:
-        raise ValueError('Only the owner account that attempted this creation can clear it')
     journal = OperationJournal(journal_path(project_path)); entry = journal.lookup(operation)
     if (entry is None or entry.get('principal') != 'owner-account:' + context.account_id
             or entry.get('route') != 'requirements.create'):
         raise ValueError('The original creation identity cannot be verified; ask the host operator')
+    saved = read_owner_receipt(path, missing=True)
+    if saved is None:
+        saved = missing_creation_receipt(entry, context, operation)
+    if saved.get('actor') != context.account_id:
+        raise ValueError('Only the owner account that attempted this creation can clear it')
     if saved['status'] == 'released' and 'release_history' in saved:
         audit = saved['release_history'][0]
         if (audit['project'] != context.project or audit['operation_id'] != operation
@@ -170,6 +301,7 @@ class OwnerContext:
     project: str
     account_id: str
     governance: dict
+    terminal_window: dict = None
 
 
 def owner_context(project_path, project, request, authority_config, simple=True):
@@ -195,22 +327,29 @@ def owner_context(project_path, project, request, authority_config, simple=True)
     current = governance.current(project_path, project)
     if simple and current['mode'] != 'simple':
         raise ValueError('This project uses governed requirements. Ask its owner to enable simple editing.')
-    return OwnerContext(project, account, current)
+    from requirement_terminal import write_window
+    return OwnerContext(project, account, current, write_window(
+        descriptor.get('now'), authority_config.terminal_endpoint_timeout))
 
 
 def checked_body(body, action):
     allowed = {'create': {'kind', 'parent', 'title', 'description', 'key'},
                'revise': {'expected_revision', 'expected_sha256', 'title', 'description'},
                'accept': {'expected_revision', 'expected_sha256'},
+               'withdraw': {'expected_revision', 'expected_sha256', 'expected_state_sha256', 'reason'},
+               'supersede': {'expected_revision', 'expected_sha256', 'expected_state_sha256', 'reason', 'successor'},
                'release': {'original_operation_id', 'expected_receipt_sha256', 'reason'},
+               'finish': {'original_operation_id', 'expected_receipt_sha256'},
+               'abandon': {'original_operation_id', 'expected_receipt_sha256', 'reason'},
                'governance': {'mode', 'expected_revision', 'expected_sha256'}}
     if action not in allowed or not isinstance(body, dict) or set(body) - allowed[action]:
         raise ValueError('Unsupported requirements fields or action')
-    if action == 'release':
+    if action in ('release', 'finish', 'abandon'):
         identifier(body.get('original_operation_id')); governance.digest(body.get('expected_receipt_sha256'))
-        if (not isinstance(body.get('reason'), str) or not 1 <= len(body['reason'].strip()) <= 1000
+        if action != 'finish' and (not isinstance(body.get('reason'), str) or not body['reason'].strip() or not 1 <= len(body['reason']) <= 1000
                 or '\0' in body['reason']):
-            raise ValueError('Explain why this failed creation should be cleared (1 to 1000 characters)')
+            raise ValueError('Explain why this transition should be abandoned (1 to 1000 characters)' if action == 'abandon'
+                             else 'Explain why this failed creation should be cleared (1 to 1000 characters)')
     elif action != 'create':
         if 'expected_sha256' not in body:
             raise ValueError('Expected requirements hash is required; reload and try again')
@@ -225,6 +364,17 @@ def checked_body(body, action):
         if field in body and (not isinstance(body[field], str) or not body[field].strip()
                               or len(body[field]) > limit or '\0' in body[field]):
             raise ValueError('Requirement %s must contain 1 to %d characters' % (field, limit))
+    if action in ('withdraw', 'supersede'):
+        if 'expected_state_sha256' not in body:
+            raise ValueError('Expected requirement state hash is required; reload and try again')
+        if body['expected_state_sha256'] is not None:
+            governance.digest(body['expected_state_sha256'])
+        if (not isinstance(body.get('reason'), str) or not body['reason'].strip() or not 1 <= len(body['reason']) <= 1000
+                or '\0' in body['reason']):
+            raise ValueError('Explain this requirement change (1 to 1000 characters)')
+        if action == 'supersede':
+            from export_requirements import exact_reference
+            exact_reference(body.get('successor')); identifier(body['successor']['id'])
     return dict(body)
 
 
@@ -305,7 +455,7 @@ def _spec(context, body, action, operation_id, prior=None, run=None):
                        'The project owner accepted this content in simple mode.\n\n'
                        '## Alternatives Considered\nLeave it as a draft.\n\n'
                        'Requirement: %s revision %d sha256 %s\n' % (task, revision, record['sha256']))
-        saved = validate_receipt(load_json(receipt))
+        saved = read_owner_receipt(receipt)
         if 'owner_decision' in saved:
             decision_id = saved['owner_decision']['decision']['decision_id']
             decision = records.find(records.read_rows(run), decision_id)
@@ -330,9 +480,9 @@ def _spec(context, body, action, operation_id, prior=None, run=None):
 
     def receipt_metadata(receipt):
         if receipt is None:
-            return {}
+            return {'creation_metadata': {'title': body['title'], 'at': core.now()}} if action == 'create' else {}
         validate_receipt(receipt)
-        return {'owner_decision': receipt['owner_decision']} if 'owner_decision' in receipt else {}
+        return {name: receipt[name] for name in ('owner_decision', 'creation_metadata') if name in receipt}
 
     def acceptance_evidence(bound, task, revision, record, actor):
         evidence = owner_records.acceptance(context.project, record, actor, operation_id,
@@ -344,10 +494,16 @@ def _spec(context, body, action, operation_id, prior=None, run=None):
                 'sha256': record['sha256'], 'acceptance_state': record['acceptance_state'],
                 'created': created, 'reconciled': reconciled}
 
+    def selectable(row, payload, operator, existing):
+        records.require_typed(row, payload)
+        if owner_records.state_ledger(row)[0] is not None:
+            raise ValueError('A terminal requirement cannot be revised or reactivated; create a new requirement')
+
     values.update(validate=validate, build_record=build, check_acceptance=check_acceptance,
-                  require_selectable=lambda row, payload, operator, existing: records.require_typed(row, payload),
+                  require_selectable=selectable,
                   acceptance_evidence=acceptance_evidence, before_evidence=before_evidence,
                   receipt_metadata=receipt_metadata,
+                  read_receipt=read_owner_receipt,
                   live_acceptances=lambda row, operators: owner_records.existing_acceptances(row), result=result)
     return core.RecordSpec(**values)
 
@@ -386,10 +542,28 @@ def apply(project_path, context, action, body, operation_id, run, task=None):
         raise ValueError('Owner requirements context is stale or unavailable')
     body = checked_body(body, action)
     identifier(operation_id)
+    if action in ('finish', 'abandon'):
+        from requirement_terminal import recover
+        return recover(project_path, context, action, task, body, run,
+                       recovery_operation_id=operation_id)
+    if action in ('withdraw', 'supersede'):
+        from requirement_terminal import apply as apply_terminal
+        return apply_terminal(project_path, context, action, body, operation_id, run, task)
+    if task is not None:
+        from requirement_terminal import pending_ids, require_unreserved_successor
+        transition_rows = records.read_rows(run)
+        require_unreserved_successor(project_path, context.project, task, transition_rows)
+        pending, uncertain = pending_ids(project_path, context.project, transition_rows)
+        if task in uncertain:
+            raise ValueError('Requirement transition receipt is damaged; ask the host operator to reconcile it')
+        if task in pending:
+            raise ValueError('Requirement transition is pending; finish or abandon it on the requirements page before editing')
     if action == 'governance':
         raise ValueError('Governance uses its separate owner action')
     if action == 'accept':
         row = records.find(records.read_rows(run), task)
+        if row is not None and owner_records.state_ledger(row)[0] is not None:
+            raise ValueError('A terminal requirement cannot be changed or reactivated; create a new requirement')
         revisions = records.existing_revisions(row) if row else {}
         latest = revisions.get(max(revisions)) if revisions else None
         if (latest and latest['revision'] == body['expected_revision']
@@ -406,12 +580,13 @@ def apply(project_path, context, action, body, operation_id, run, task=None):
     payload = _payload(action, body, operation_id, run, task)
     receipt = core.receipt_path(core.journal_dir(project_path, JOURNAL),
                                 content_hash({'operation_id': operation_id}), 'requirement')
-    prior = validate_receipt(load_json(receipt)) if receipt.exists() else None
+    prior = read_owner_receipt(receipt, missing=True)
     if prior and prior['status'] == 'released':
         raise ValueError('Failed creation was cleared. Start a new creation with a new operation ID.')
     if action == 'accept' and prior and prior['status'] == 'pending' and 'owner_decision' not in prior:
         raise ValueError('Pending requirement acceptance has no recorded decision binding; '
-                         'keep this operation unknown and ask the host operator to reconcile it')
+                         'Reload the requirement and press Accept again. '
+                         'For a legacy interrupted acceptance, edit the draft and accept the new revision.')
     if task is not None:
         row = records.find(records.read_rows(run), task)
         for evidence in owner_records.existing_acceptances(row).values():
@@ -421,6 +596,20 @@ def apply(project_path, context, action, body, operation_id, run, task=None):
 
 
 def web_action(root, project_path, project, request, authority_config, runner, guarded_write):
+    """Keep receipt failure details inside every creation recovery route."""
+    recovery = request.get('args') in (['recoveries'], ['release'])
+    try:
+        answer = _web_action(root, project_path, project, request, authority_config, runner, guarded_write)
+    except (ValueError, OSError) as error:
+        if not recovery:
+            raise
+        raise ValueError(recovery_error(error, RECOVERY_WRITE_ERROR)) from None
+    if recovery and answer.get('returncode') and answer.get('stderr'):
+        answer = dict(answer, stderr=recovery_error(answer['stderr'], RECOVERY_WRITE_ERROR))
+    return answer
+
+
+def _web_action(root, project_path, project, request, authority_config, runner, guarded_write):
     """Endpoint adapter; caller holds project lock, guarded_write holds authority lock."""
     from http_authority import OperationJournal, journal_path, operation_hash, principal_key, stamp_write
     # Stable account identity applies only to this checked owner adapter; keep
@@ -437,8 +626,8 @@ def web_action(root, project_path, project, request, authority_config, runner, g
                              authority_config=authority_config, require_authority=True, runner=runner,
                              account_identity=True, identity_check=lambda: owner_context(
                                  project_path, project, request, authority_config))
-    if (not isinstance(args, list) or not args or args[0] not in ('create', 'revise', 'accept', 'governance', 'release')
-            or len(args) != (2 if args[0] in ('revise', 'accept') else 1)):
+    if (not isinstance(args, list) or not args or args[0] not in ('create', 'revise', 'accept', 'governance', 'release', 'withdraw', 'supersede', 'finish', 'abandon')
+            or len(args) != (2 if args[0] in ('revise', 'accept', 'withdraw', 'supersede', 'finish', 'abandon') else 1)):
         raise ValueError('Unsupported owner requirements action')
     action = args[0]
     attachment = (request.get('attachments') or {}).get('payload')
@@ -502,14 +691,18 @@ def web_action(root, project_path, project, request, authority_config, runner, g
                 raise ValueError('No matching governance change was confirmed; keep the original operation unknown')
         elif action == 'release':
             pass  # release_creation revalidates the retained audit and original identity.
+        elif action in ('finish', 'abandon'):
+            pass  # Exact receipt and effect-time owner are checked by recover.
+        elif action in ('withdraw', 'supersede'):
+            from requirement_terminal import recoverable
+            recoverable(project_path, context, action, args[1], body, operation_id)
         else:
-            from requirements import load_json
             payload = _payload(action, body, operation_id, runner, args[1] if len(args) == 2 else None)
             path = core.receipt_path(core.journal_dir(project_path, JOURNAL),
                                      content_hash({'operation_id': operation_id}), 'requirement')
             if not path.is_file():
                 raise ValueError('No matching requirement receipt was confirmed; keep the original operation unknown')
-            receipt = core.validate_receipt(load_json(path))
+            receipt = read_owner_receipt(path)
             if (receipt.get('actor') != context.account_id
                     or receipt.get('sha256') != content_hash({'actor': context.account_id, 'payload': payload})
                     or receipt.get('status') not in ('pending', 'complete')):
@@ -559,6 +752,8 @@ def read(project_path, project, args, run, operators=None):
     # tracker has no requirement/brd-section issue types, so its unreadable-row
     # membership probes must use the supported label filters.
     rows = record_json.classify(records.read_rows(run), run, labels)
+    from requirement_terminal import pending_ids, projection
+    pending, pending_error = pending_ids(project_path, project, rows)
     items, decisions = [], []
     for row in rows:
         if not (records.TYPE_LABELS.intersection(row.get('labels') or [])
@@ -585,9 +780,28 @@ def read(project_path, project, args, run, operators=None):
             evidence = records.existing_acceptances(row, operators)
             latest = history[-1]
             accepted = accepted_history[-1] if accepted_history else None
+            state, reason, status, state_error = None, None, 'active', None
+            try:
+                state, reason = owner_records.state_ledger(row)
+                if state is not None:
+                    governance.validate_evidence(project_path, project, state)
+                    status = state['state']
+                if row['id'] in pending_error:
+                    raise ValueError('Requirement transition receipt is damaged; ask the host operator to reconcile it')
+                if row['id'] in pending:
+                    raise ValueError('Requirement transition is pending; finish or abandon it on the requirements page')
+            except (ValueError, TypeError, KeyError):
+                status = 'unknown'
+                state_error = ('Requirement transition receipt is damaged; ask the host operator to reconcile it' if row['id'] in pending_error
+                               else 'Requirement transition is pending; finish or abandon it on the requirements page' if row['id'] in pending
+                               else 'Requirement status cannot be verified; ask the project owner to reconcile it')
+            pending_draft = latest if latest['acceptance_state'] == 'draft' else None
             items.append({'id': row['id'], 'kind': kind, 'current': latest,
-                          'accepted': accepted, 'pending_draft': latest if latest['acceptance_state'] == 'draft' else None,
-                          'history': history, 'acceptance': evidence.get(latest['revision'])})
+                          'accepted': accepted, 'pending_draft': pending_draft,
+                          'pending_author': pending_revision_author(row, pending_draft) if pending_draft else None,
+                          'history': history, 'acceptance': evidence.get(accepted['revision']) if accepted else None,
+                          'requirement_state': status, 'state': state, 'reason': reason,
+                          'state_message': state_error, 'state_history': [state] if state else []})
             for record in accepted_history:
                 proof = evidence.get(record['revision'])
                 if proof is not None:
@@ -600,6 +814,15 @@ def read(project_path, project, args, run, operators=None):
                           'message': 'Requirement %s cannot be read or its acceptance cannot be verified; ask the project owner to reconcile it' % row['id'],
                           'current': None, 'accepted': None, 'pending_draft': None, 'history': []})
     items.sort(key=lambda item: (item['kind'], (item['current'] or {}).get('key', ''), item['id']))
+    for item in items:
+        item['supersedes'] = [dict(id=old['id'], revision=old['state']['revision'],
+                                  sha256=old['state']['record_sha256']) for old in items
+                             if old.get('requirement_state') == 'superseded'
+                             and old['state']['superseded_by']['id'] == item['id']]
+    recoveries = projection(project_path, project, rows, run)
+    for item in items:
+        item['pending_transition'] = next((r for r in recoveries['items'] if r['id'] == item['id']), None)
+        item['completion'] = recoveries['completions'].get(item['id'])
     if args[0] == 'get':
         found = next((item for item in items if item['id'] == args[1]), None)
         if found is None:
@@ -609,6 +832,8 @@ def read(project_path, project, args, run, operators=None):
         return found
     result = {'project': project, 'governance': governance.read_state(project_path, project),
               'items': items, 'total': len(items),
+              'nonterminal_ids': [item['id'] for item in items if item.get('requirement_state') == 'active'],
+              'terminal_recoveries': recoveries,
               'jobs': [{'id': row['id'], 'title': row.get('title', '')}
                        for row in rows if row.get('issue_type') in ('epic', 'job', 'task')
                        and not records.TYPE_LABELS.intersection(row.get('labels') or [])
@@ -617,3 +842,36 @@ def read(project_path, project, args, run, operators=None):
     if args[0] == 'brd':
         result['decisions'] = decisions
     return result
+
+
+def pending_revision_author(row, record):
+    """Exact revision attribution; ordinary endpoint labels are not verified names."""
+    from reserved_comments import parse_requirement_record
+    authors = set()
+    for comment in row.get('comments') or []:
+        body = comment.get('text')
+        if not isinstance(body, str) or not body.startswith(records.REVISION_PREFIX):
+            continue
+        if parse_requirement_record(body) != record:
+            continue
+        author = comment.get('author')
+        if not isinstance(author, str) or not author.strip() or '\0' in author:
+            return None
+        at = comment.get('created_at')
+        try:
+            if not isinstance(at, str) or len(at) > 80:
+                raise ValueError('No usable revision time')
+            parsed = datetime.fromisoformat(at.replace('Z', '+00:00'))
+            if parsed.tzinfo is None:
+                raise ValueError('Revision time has no timezone')
+        except ValueError:
+            at = None
+        authors.add((author, at))
+    if len(authors) != 1:
+        return None
+    author, at = next(iter(authors))
+    # Exact HTTP account IDs require live authority on every endpoint action
+    # (http_actor_denial). Near matches remain ordinary caller-supplied labels.
+    kind = 'account' if owner_records.HUMAN.fullmatch(author) else 'contributor-name'
+    return {'kind': kind, 'text': author[:200],
+            'omitted_chars': max(0, len(author) - 200), 'at': at}

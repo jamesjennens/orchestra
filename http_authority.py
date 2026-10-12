@@ -323,6 +323,9 @@ CAP_APPROVE = 'reviews.approve'
 #: member or an agent can propose. Triage and decisions need CAP_APPROVE, which no
 #: credential ever holds.
 CAP_PROPOSALS = 'proposals.write'
+#: What a project's coordinator may do beyond approving (slice 1b of docs/WEB_COORDINATOR_DESIGN.md,
+#: kittrial-5bb.209). Web merge-slot acquire/release use it; lifecycle facts follow separately.
+CAP_COORDINATE = 'coordinate'
 CAP_PROJECT_ADMIN = 'project.admin'
 CAP_PROJECT_CREATE = 'project.create'
 CAP_ACCOUNTS_ADMIN = 'accounts.admin'
@@ -338,8 +341,8 @@ GRANT_LIMIT_DEFAULT = 5
 #: credential ever holds it (an agent cannot create or widen another identity).
 CAP_AGENTS = 'agents.manage'
 
-ROLES = ('viewer', 'contributor', 'owner')
-RANK = {'viewer': 0, 'contributor': 1, 'owner': 2}
+ROLES = ('viewer', 'contributor', 'coordinator', 'owner')
+RANK = {'viewer': 0, 'contributor': 1, 'coordinator': 2, 'owner': 3}
 
 SCOPE_CAPABILITIES = {
     'read': frozenset({CAP_READ}),
@@ -357,9 +360,15 @@ ROLE_CAPABILITIES = {
     'viewer': frozenset({CAP_READ}),
     'contributor': frozenset({CAP_READ, CAP_TASKS, CAP_CHECKPOINTS, CAP_REVIEWS, CAP_FEEDBACK,
                               CAP_PROPOSALS}),
+    # Between contributor and owner: approves and coordinates; does not administer the
+    # project (members, worker credentials, archive and the audit stay the owner's).
+    'coordinator': frozenset({CAP_READ, CAP_TASKS, CAP_CHECKPOINTS, CAP_REVIEWS, CAP_FEEDBACK,
+                              CAP_PROPOSALS, CAP_APPROVE, CAP_COORDINATE}),
     'owner': frozenset({CAP_READ, CAP_TASKS, CAP_CHECKPOINTS, CAP_REVIEWS, CAP_FEEDBACK,
-                        CAP_PROPOSALS, CAP_APPROVE, CAP_PROJECT_ADMIN}),
+                        CAP_PROPOSALS, CAP_APPROVE, CAP_COORDINATE, CAP_PROJECT_ADMIN}),
 }
+#: What the coordinator grant adds to an agent's credential in the project of the grant.
+GRANT_CAPABILITIES = frozenset({CAP_APPROVE, CAP_COORDINATE})
 CREDENTIAL_FORBIDDEN_CAPABILITIES = frozenset({CAP_APPROVE, CAP_PROJECT_ADMIN,
                                                CAP_PROJECT_CREATE, CAP_ACCOUNTS_ADMIN,
                                                CAP_AGENTS})
@@ -404,12 +413,46 @@ def credential_capabilities(state, credential, issuer, project_id):
         caps |= SCOPE_CAPABILITIES.get(scope, frozenset())
     caps -= CREDENTIAL_FORBIDDEN_CAPABILITIES
     if issuer.get('superuser'):
-        return frozenset(caps)
+        return frozenset(caps | coordinator_grant_capabilities(state, credential, project_id, ROLE_CAPABILITIES['owner']))
     role = state.get('memberships', {}).get(project_id, {}).get(issuer['id'])
     if role is None:
         raise deny(403, 'forbidden',
                    'The credential issuer is no longer a member of this project')
-    return frozenset(cap for cap in caps if cap in ROLE_CAPABILITIES.get(role, frozenset()))
+    held = ROLE_CAPABILITIES.get(role, frozenset())
+    return frozenset({cap for cap in caps if cap in held}
+                     | coordinator_grant_capabilities(state, credential, project_id, held))
+
+
+def coordinator_grant(state, project_id, agent_id):
+    """The coordinator grant of one agent in one project, or None.
+
+    Kept with the PROJECT, not on any credential (an agent's scopes sit on its credential,
+    one list for all its projects, set by its own account): ``coordinator_grants[project]
+    [agent] = {'granted_by', 'granted_at'}``, written by an owner of that project or a
+    superuser. A record of any other shape is no grant: the check fails closed.
+    """
+    grants = state.get('coordinator_grants')
+    grant = (grants.get(project_id) or {}).get(agent_id) if isinstance(grants, dict) and \
+        isinstance(grants.get(project_id), dict) else None
+    if not isinstance(grant, dict) or not isinstance(grant.get('granted_by'), str):
+        return None
+    return grant
+
+
+def coordinator_grant_capabilities(state, credential, project_id, held):
+    """What the grant adds to this credential here: approving and coordinating, or nothing.
+
+    Only for an agent's credential, only in the project of the grant, and only while the
+    agent's account itself holds them there (``held``: it is a coordinator or an owner of
+    the project, or a superuser). It is the one place where "a credential never approves"
+    is lifted. Read from the present state on every decision, by the web service and again
+    by the endpoint before it writes: removing the grant, lowering the account's role or
+    taking the agent out of the project ends it at the next request.
+    """
+    agent_id = credential.get('agent_id')
+    if not agent_id or coordinator_grant(state, project_id, agent_id) is None:
+        return frozenset()
+    return frozenset(cap for cap in GRANT_CAPABILITIES if cap in held)
 
 
 def project_grant(user):
@@ -625,9 +668,9 @@ class AuthorityConfig:
     and only its launcher knows it (kittrial-5bb.188 item 3).
     """
 
-    __slots__ = ('store', 'lock', 'service_namespace')
+    __slots__ = ('store', 'lock', 'service_namespace', 'terminal_endpoint_timeout')
 
-    def __init__(self, store, lock=None, service_namespace=None):
+    def __init__(self, store, lock=None, service_namespace=None, terminal_endpoint_timeout=150):
         if not isinstance(store, str) or not store:
             raise ValueError('AuthorityConfig.store must be a non-empty path')
         self.store = store
@@ -636,6 +679,12 @@ class AuthorityConfig:
             import actor_names
             service_namespace = actor_names.SERVICE_NAMESPACE
         self.service_namespace = service_namespace
+        import math
+        if (isinstance(terminal_endpoint_timeout, bool)
+                or not isinstance(terminal_endpoint_timeout, (int, float))
+                or not math.isfinite(terminal_endpoint_timeout) or terminal_endpoint_timeout <= 0):
+            raise ValueError('Terminal endpoint timeout must be positive and finite')
+        self.terminal_endpoint_timeout = terminal_endpoint_timeout
 
 
 def principal_key(request, authority_configured=False, account_identity=False):
@@ -1696,19 +1745,22 @@ class OperationJournal:
                                      (operation_id,)).fetchone()
         return self._row_record(row) if row is not None else None
 
-    def pending_owner_creates(self, principal):
-        """Bounded candidates for the owner adapter's empty-create recovery read.
-
-        This is only discovery. The adapter must validate the inner receipt and
-        prove native absence under its project and authority locks before release.
-        """
+    def pending_owner_creates_snapshot(self, principal, limit=20):
+        """Bounded candidates and their exact total from one read snapshot."""
+        if type(limit) is not int or not 1 <= limit <= 21:
+            raise ValueError("Owner creation discovery limit must be between 1 and 21")
         self._ensure_store()
         with self._connection() as connection:
+            connection.execute('BEGIN')
+            total = connection.execute(
+                "SELECT COUNT(*) FROM operations WHERE principal = ? AND route = 'requirements.create' "
+                "AND state IN ('unknown', 'in_progress')", (principal,)).fetchone()[0]
             rows = connection.execute(
                 "SELECT * FROM operations WHERE principal = ? AND route = 'requirements.create' "
-                "AND state IN ('unknown', 'in_progress') ORDER BY operation_id LIMIT 21",
-                (principal,)).fetchall()
-        return [dict(self._row_record(row), operation_id=row['operation_id']) for row in rows]
+                "AND state IN ('unknown', 'in_progress') ORDER BY operation_id LIMIT ?",
+                (principal, limit)).fetchall()
+        return {'items': [dict(self._row_record(row), operation_id=row['operation_id']) for row in rows],
+                'total': total}
 
     # -- mutations -------------------------------------------------------------
     def reserve(self, operation_id, request_hash, principal):
@@ -1945,6 +1997,24 @@ def http_shaped_names(names):
     return [name for name in names or [] if isinstance(name, str) and http_actor_id(name) is not None]
 
 
+def verified_web_authority(request, authority_config, capability, project):
+    """Whether the configured service grants this capability in this exact project.
+
+    A descriptor is never authority by itself. Mutations call this inside the
+    guarded effect, under the live authority lock; reads hold that lock too.
+    This helper does not infer a capability from an actor name or an SSH payload.
+    """
+    descriptor = request.get('authority')
+    if (authority_config is None or not isinstance(descriptor, dict)
+            or request.get('project') != project
+            or descriptor.get('project') != project
+            or descriptor.get('capability') != capability):
+        return False
+    descriptor = {k: v for k, v in descriptor.items() if k not in ('store', 'lock')}
+    decide(read_state(authority_config.store), descriptor)
+    return True
+
+
 def http_actor_denial(request, authority_config):
     """Why a request under an HTTP-shaped actor is refused, as the envelope, or None.
 
@@ -2086,6 +2156,105 @@ def descriptor_actor_denial(request, authority_config, reserved):
             return _envelope(2, stderr='%s\n' % missing, fault='merge-slot')
     if reason is not None:
         return _envelope(126, stderr='%s\n' % actor_names.refusal(namespace, reason), authority_status=403)
+    return None
+
+
+#: The ONE table of what a request the web service sends must be authorized for
+#: (kittrial-5bb.261): endpoint action -> the capability ``http_service.py`` asks for the
+#: route that sends it. A mapping value is keyed by the action's operation (the first
+#: argument; for ``review`` the ``operation`` of the attached record), with ``None`` for
+#: every other operation of that action. An action or operation that is not here is not
+#: judged for its capability by ``block_mismatch_denial``. The five service-only actions
+#: are not judged there at all: they carry their own exact check
+#: (``project_creation.SERVICE_ACTIONS``).
+BLOCK_CAPABILITIES = {
+    'bd': {'create': CAP_TASKS,            # tasks.create
+           'update': CAP_TASKS},           # tasks.update, tasks.claim
+    'checkpoint': CAP_CHECKPOINTS,         # checkpoints.add
+    'coordinate': {'merge-check': CAP_READ, 'merge-acquire': CAP_COORDINATE,
+                   'merge-release': CAP_COORDINATE, 'merge-create': CAP_PROJECT_ADMIN},
+    'web-merge-slot': {'check': CAP_READ, 'acquire': CAP_COORDINATE,
+                       'release': CAP_COORDINATE, 'force-release': CAP_PROJECT_ADMIN,
+                       'create': CAP_PROJECT_ADMIN},
+    'review': {'approve': CAP_APPROVE,     # reviews.add, operation approve
+               None: CAP_REVIEWS},         # reviews.add, every other operation
+    'proposal': {'submit': CAP_PROPOSALS, 'revise': CAP_PROPOSALS,     # proposals.submit
+                 'review': CAP_APPROVE,                               # proposals.dispose, triage
+                 'decide': CAP_PROJECT_ADMIN},                        # proposals.dispose, the owner decision
+}
+
+
+def required_capability(request):
+    """The capability the action of ``request`` needs by ``BLOCK_CAPABILITIES``, or None.
+
+    None means "not in the table": an action the table does not know, a read, or a request
+    so malformed that the action's own validation refuses it before it writes. The review
+    record is found and parsed exactly as ``work.execute`` does it, so the operation judged
+    here is the operation carried out.
+    """
+    needed = BLOCK_CAPABILITIES.get(request.get('action', 'bd'))
+    if needed is None or not isinstance(needed, dict):
+        return needed
+    args = request.get('args')
+    if not isinstance(args, list) or not args or any(not isinstance(token, str) for token in args):
+        return None
+    action = request.get('action')
+    if action in ('coordinate', 'web-merge-slot'):
+        if len(args) != 1:
+            return None
+        item = {'text': args[0]}
+    elif action != 'review':
+        return needed.get(args[0])
+    else:
+        args = [token for token in args if token != '--json']
+        attachments = request.get('attachments', {})
+        if len(args) != 2 or not args[1].startswith('@attachment:') or not isinstance(attachments, dict):
+            return None                              # `review TASK` reads; anything else is refused there
+        item = attachments.get(args[1].partition(':')[2], {})
+    if not isinstance(item, dict) or not isinstance(item.get('text'), str):
+        return None
+    import record_json
+    try:
+        payload = record_json.loads(item['text'])
+    except ValueError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    operation = payload.get('operation')
+    return needed.get(operation if isinstance(operation, str) else None, needed.get(None))
+
+
+def block_mismatch_denial(request, authority_config):
+    """Why a request whose authority block does not fit what it asks for is refused, or None.
+
+    The block says for which project and which capability the web service authorized the
+    caller, and ``decide`` re-reads exactly that from the live state. Nothing compared it
+    with the request it travels with (kittrial-5bb.261, an older gap): an approval sent with
+    a block naming ``reviews.write`` was carried out where ``coordinator_writes`` is off, and
+    a block naming project A on a request for project B was carried out in B. Launched by
+    the service, a request with a block is refused here, before any lock, tracker read or
+    write, when the block's project is not the request's project, or when the block's
+    capability is not the one ``BLOCK_CAPABILITIES`` gives for the action. Over SSH there is
+    no launch configuration and a block a caller sends is ignored, as before.
+    """
+    if authority_config is None:
+        return None
+    authority = request.get('authority')
+    if not isinstance(authority, dict):
+        return None
+    from project_creation import SERVICE_ACTIONS
+    if request.get('action') in SERVICE_ACTIONS:
+        # The service-only actions hold this rule themselves, with their own sentences
+        # (``project_creation.service_descriptor``: exactly the capability of the action; and
+        # the project, where the action has one). They are answered as before.
+        return None
+    if authority.get('project') != request.get('project'):
+        return _envelope(126, stderr='The live-authority descriptor names another project than the one this request '
+                                     'is for; nothing was changed\n', authority_status=403)
+    needed = required_capability(request)
+    if needed is not None and authority.get('capability') != needed:
+        return _envelope(126, stderr='The live-authority descriptor does not name the capability this request needs '
+                                     '(%s); nothing was changed\n' % needed, authority_status=403)
     return None
 
 

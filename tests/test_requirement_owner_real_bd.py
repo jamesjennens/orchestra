@@ -4,6 +4,7 @@ The borrowed fixture starts and stops its own disposable loopback SQL server.
 No native adapter is mocked. ORCHESTRA_BD_BIN selects the pinned test binaries.
 """
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -26,10 +27,12 @@ class NativeOwnerTests(fixture.RealBdLabelAliasTests):
     def install_fault_boundary(self):
         """Inject one failure around a real command; every successful effect is bd."""
         real = self.bd_path.with_name('bd-real')
-        shutil.copy(self.bd_path, real)
+        if not real.exists():
+            shutil.copy(self.bd_path, real)
         self.bd_path.write_text(
-            '#!/usr/bin/env python3\nimport os,sys,subprocess\nfrom pathlib import Path\n'
+            '#!/usr/bin/env python3\nimport os,sys,subprocess,json\nfrom pathlib import Path\n'
             'p=Path(sys.argv[0]); args=sys.argv[1:]; real=p.with_name("bd-real")\n'
+            'with p.with_name("native-calls.jsonl").open("a") as log: log.write(json.dumps(args)+"\\n")\n'
             'def once(name):\n'
             ' marker=p.with_name(name)\n'
             ' if not marker.exists(): return False\n'
@@ -47,10 +50,20 @@ class NativeOwnerTests(fixture.RealBdLabelAliasTests):
             '  text=args[i+3]\n'
             '  name="fail-one-owner-revision" if text.startswith("Kind: requirement-revision-v1\\n") else "fail-one-owner-evidence" if text.startswith("Kind: requirement-owner-acceptance-v1\\n") else None\n'
             '  if name and once(name): print("synthetic interruption before comment",file=sys.stderr); sys.exit(1)\n'
+            '  family="state" if text.startswith("Kind: requirement-owner-state-v1\\n") else "reason" if text.startswith("Kind: requirement-owner-state-reason-v1\\n") else None\n'
+            '  if family and once("fail-one-terminal-"+family): print("synthetic interruption before terminal comment",file=sys.stderr); sys.exit(1)\n'
+            '  if family and once("lose-one-terminal-"+family):\n'
+            '   done=subprocess.run([str(real),*args],capture_output=True,text=True)\n'
+            '   sys.stderr.write(done.stderr)\n'
+            '   if done.returncode: sys.stdout.write(done.stdout); sys.exit(done.returncode)\n'
+            '   print("synthetic lost terminal answer",file=sys.stderr); sys.exit(1)\n'
+            'if "update" in args and "requirement:withdrawn" in args and once("fail-one-terminal-label"):\n'
+            ' print("synthetic interruption before terminal label",file=sys.stderr); sys.exit(1)\n'
             'os.execv(str(real),[str(real),*args])\n', encoding='utf-8')
 
     def fault(self, name):
         self.bd_path.with_name(name).write_text('one synthetic interruption', encoding='utf-8')
+
 
     def test_owner_without_operator_grant_accepts_and_preserves_native_history(self):
         import http_service
@@ -183,6 +196,12 @@ class NativeOwnerTests(fixture.RealBdLabelAliasTests):
             detail = harness.request('GET', route, token=token)
             self.assertEqual(detail.status, 200, detail.data)
             self.assertEqual([r['acceptance_state'] for r in detail.data['history']], ['draft','accepted','draft'])
+            self.assertEqual(detail.data['acceptance']['revision'], accepted.data['revision'])
+            self.assertEqual(detail.data['acceptance']['record_sha256'], accepted.data['sha256'])
+            self.assertEqual(detail.data['pending_author']['kind'], 'owner-account')
+            self.assertTrue(detail.data['pending_author']['is_self'])
+            self.assertEqual(detail.data['pending_author']['text'], harness.service.state['users'][account]['display_name'])
+            self.assertIsNotNone(detail.data['pending_author']['at'])
             for revision in detail.data['history']:
                 from requirements import content_hash
                 self.assertEqual(content_hash(revision), revision['sha256'])
@@ -209,6 +228,17 @@ class NativeOwnerTests(fixture.RealBdLabelAliasTests):
             governed = harness.request('PUT', base+'/requirements/governance', dict(expected(simple.data), mode='governed'),
                                        token=token, key='native-governed-mode')
             self.assertEqual(governed.status, 200, governed.data)
+            # Governed contributor wording retains its native attribution when
+            # the owner switches back to simple editing.
+            contributor_payload.update(operation_id='native-governed-pending-author', revision=latest['revision']+1)
+            contribution = fixture.endpoint.execute(root, {'project':'pp','actor':'alice',
+                'action':'requirement','args':[json.dumps(contributor_payload)]})
+            self.assertEqual(contribution['returncode'], 0, contribution)
+            pending = harness.request('GET', route, token=token)
+            self.assertEqual(pending.status, 200, pending.data)
+            self.assertEqual(pending.data['pending_author']['kind'], 'contributor-name')
+            self.assertEqual(pending.data['pending_author']['text'], 'alice')
+            self.assertIsNotNone(pending.data['pending_author']['at'])
             before = self.rows()
             denied = harness.request('POST', route+'/accept', expected(changed.data), token=token, key='native-governed-accept')
             self.assertEqual(denied.status, 422, denied.data)
@@ -221,6 +251,53 @@ class NativeOwnerTests(fixture.RealBdLabelAliasTests):
             enabled = harness.request('PUT', base+'/requirements/governance',
                 dict(expected(governed.data), mode='simple'), token=token, key='native-page-simple')
             self.assertEqual(enabled.status, 200, enabled.data)
+            pending = harness.request('GET', route, token=token)
+            self.assertEqual(pending.data['pending_author']['kind'], 'contributor-name')
+            self.assertEqual(pending.data['pending_author']['text'], 'alice')
+            self.assertIsNotNone(pending.data['pending_author']['at'])
+            # Kill this real endpoint process before its first receipt write.
+            # The native adapter and both authority checks remain unchanged.
+            prewrite_endpoint = root/'prewrite-endpoint.py'
+            prewrite_marker = root/'fail-prewrite-once'
+            prewrite_endpoint.write_text(
+                'import os,sys\nfrom pathlib import Path\n'
+                'sys.path.insert(0, '+repr(str(KIT))+')\n'
+                'import endpoint,keyed_records\n'
+                'original=keyed_records.atomic\n'
+                'marker=Path('+repr(str(prewrite_marker))+')\n'
+                'def interrupted(path,value):\n'
+                ' if path.parent.name==".requirement-owner-requests" and marker.exists():\n'
+                '  marker.unlink(); os._exit(17)\n'
+                ' return original(path,value)\n'
+                'keyed_records.atomic=interrupted\nendpoint.main()\n', encoding='utf-8')
+            prewrite_marker.write_text('one prewrite process exit', encoding='utf-8')
+            original_endpoint = harness.backend.endpoint
+            before_prewrite = self.rows()
+            prewrite_fields = dict(kind='requirement',parent=job,title='Prewrite process crash',description='No allocation.')
+            try:
+                harness.backend.endpoint = str(prewrite_endpoint)
+                interrupted = harness.request('POST',base+'/requirements',prewrite_fields,
+                    token=token,key='native-prewrite-process-exit')
+                self.assertEqual(interrupted.status, 503, interrupted.data)
+            finally:
+                harness.backend.endpoint = original_endpoint
+            self.assertFalse(prewrite_marker.exists())
+            self.assertEqual(self.rows(), before_prewrite)
+            prewrite_listing = harness.request('GET',base+'/requirements/recoveries',token=token)
+            self.assertEqual(prewrite_listing.status, 200, prewrite_listing.data)
+            self.assertEqual(len(prewrite_listing.data['items']), 1)
+            prewrite_item = prewrite_listing.data['items'][0]
+            self.assertIn('No creation receipt was written',prewrite_item['message'])
+            self.assertTrue(prewrite_item['can_clear'],prewrite_item)
+            prewrite_clear = harness.request('POST',base+'/requirements/recoveries/clear',dict(
+                original_operation_id=prewrite_item['operation_id'],
+                expected_receipt_sha256=prewrite_item['expected_receipt_sha256'],reason='Endpoint exited before receipt write.'),
+                token=token,key='native-prewrite-clear')
+            self.assertEqual(prewrite_clear.status, 200, prewrite_clear.data)
+            self.assertEqual(self.rows(), before_prewrite)
+            self.assertEqual(harness.request('POST',base+'/requirements',prewrite_fields,
+                token=token,key='native-prewrite-process-exit').status, 422)
+            print('NATIVE_PREWRITE_PROCESS_EXIT '+json.dumps(dict(exit_status=17, released=True, native_writes=0)),flush=True)
             # Two distinct owner clicks on one immutable draft serialize at the
             # actual endpoint lock. Only one creates acceptance evidence.
             from concurrent.futures import ThreadPoolExecutor
@@ -256,9 +333,93 @@ class NativeOwnerTests(fixture.RealBdLabelAliasTests):
             self.assertEqual(listing.status, 200, listing.data)
             self.assertEqual(len(listing.data['items']), 1)
             empty = listing.data['items'][0]; self.assertTrue(empty['can_clear'], empty)
+            self.assertEqual(empty['title'], fields['title'])
+            self.assertRegex(empty['at'], r'^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$')
+            # The production discovery journal holds 25 synthetic owner
+            # intents; real bd supplies the complete export/membership proof.
+            import time
+            from http_authority import OperationJournal, journal_path
+            receipt_path = self.project/requirement_http.JOURNAL/(content_hash(
+                {'operation_id': empty['operation_id']})+'.json')
+            receipt_bytes = receipt_path.read_bytes()
+            journal = OperationJournal(journal_path(self.project))
+            origin = journal.lookup(empty['operation_id'])
+            synthetic = []
+            for n in range(24):
+                operation = 'synthetic-bounded-' + str(n)
+                journal._actor = origin['actor']; journal._route = origin['route']
+                journal.reserve(operation, origin['request_hash'], origin['principal'])
+                journal.mark_unknown(operation)
+                path = self.project/requirement_http.JOURNAL/(content_hash({'operation_id':operation})+'.json')
+                path.write_bytes(receipt_bytes); synthetic.append((operation, path))
+            calls_path = self.bd_path.with_name('native-calls.jsonl')
+            for repeat in range(2):
+                start = len(calls_path.read_text().splitlines())
+                clock = time.perf_counter()
+                bounded = harness.request('GET', base+'/requirements/recoveries', token=token)
+                elapsed = time.perf_counter() - clock
+                self.assertEqual(bounded.status, 200, bounded.data)
+                self.assertEqual((bounded.data['listed'], bounded.data['total'], bounded.data['truncated']),
+                                 (20, 25, True))
+                self.assertTrue(all(i['can_clear'] for i in bounded.data['items']))
+                calls = [json.loads(line) for line in calls_path.read_text().splitlines()[start:]]
+                self.assertEqual(sum('export' in args for args in calls), 1, calls)
+                self.assertEqual(sum('list' in args for args in calls), 1, calls)
+                print('NATIVE_RECOVERY_COUNTS ' + json.dumps(dict(repeat=repeat, seconds=elapsed,
+                    native_rows=len(before_empty), listed=20, total=25, export=1, membership=1)), flush=True)
+            damaged_operation, damaged_path = synthetic[0]
+            damaged_path.write_text('{damaged JSON')
+            isolated = harness.request('GET', base+'/requirements/recoveries', token=token)
+            self.assertEqual(isolated.status, 200, isolated.data)
+            damaged = next(i for i in isolated.data['items'] if i['operation_id']==damaged_operation)
+            self.assertFalse(damaged['can_clear'])
+            self.assertTrue(any(i['can_clear'] for i in isolated.data['items']))
+            self.assertNotIn(str(self.project), json.dumps(isolated.data))
+            refused = harness.request('POST', base+'/requirements/recoveries/clear', dict(
+                original_operation_id=damaged_operation, expected_receipt_sha256='0'*64,
+                reason='Damaged receipts cannot be cleared.'), token=token, key='native-damaged-clear')
+            self.assertEqual(refused.status, 422, refused.data)
+            self.assertNotIn(str(self.project), json.dumps(refused.data))
+            # Remove only these synthetic discovery intents after asserting
+            # isolation, so the existing real recovery flow stays independent.
+            for operation, path in synthetic:
+                journal.complete(operation, {'returncode':2,'stdout':'','stderr':'synthetic fixture complete'},
+                                 origin['request_hash'], origin['principal'])
+                path.unlink()
+            # The old-key retry uses the same actual HTTP/endpoint route. A
+            # damaged receipt cannot expose its private filename or directory.
+            try:
+                receipt_path.write_bytes(b'{damaged native receipt')
+                retried_damage = harness.request('POST', base+'/requirements', fields,
+                    token=token, key='native-empty-create')
+                self.assertEqual(retried_damage.status, 422, retried_damage.data)
+                self.assertNotIn(receipt_path.name, str(retried_damage.data))
+                self.assertNotIn(str(self.project), str(retried_damage.data))
+                # A FIFO has no writer. Reading it while holding the endpoint
+                # locks must still return promptly and isolate this item.
+                import os
+                receipt_path.unlink(); os.mkfifo(receipt_path)
+                started = time.perf_counter()
+                fifo_listing = harness.request('GET', base+'/requirements/recoveries', token=token)
+                elapsed = time.perf_counter() - started
+                self.assertEqual(fifo_listing.status, 200, fifo_listing.data)
+                fifo_item = next(i for i in fifo_listing.data['items'] if i['operation_id']==empty['operation_id'])
+                self.assertFalse(fifo_item['can_clear'])
+                self.assertIn('unreadable', fifo_item['message'])
+                self.assertLess(elapsed, 15)
+                print('NATIVE_FIFO_RECOVERY '+json.dumps(dict(seconds=elapsed, can_clear=False)), flush=True)
+            finally:
+                if receipt_path.exists(): receipt_path.unlink()
+                receipt_path.write_bytes(receipt_bytes)
             clear_body = dict(original_operation_id=empty['operation_id'],
                               expected_receipt_sha256=empty['expected_receipt_sha256'],
                               reason='Complete native reads prove no row was written.')
+            refused = harness.request('POST', base+'/requirements/recoveries/clear',
+                dict(clear_body, expected_receipt_sha256='0'*64), token=token, key='native-wrong-clear-hash')
+            self.assertEqual(refused.status, 422, refused.data)
+            self.assertIn('reload', str(refused.data).lower())
+            self.assertEqual(receipt_path.read_bytes(), receipt_bytes)
+            self.assertEqual(self.rows(), before_empty)
             cleared = harness.request('POST', base+'/requirements/recoveries/clear', clear_body,
                                       token=token, key='native-empty-clear')
             self.assertEqual(cleared.status, 200, cleared.data)
@@ -286,7 +447,7 @@ class NativeOwnerTests(fixture.RealBdLabelAliasTests):
             self.assertEqual(listing.status, 200, listing.data)
             self.assertEqual(len(listing.data['items']), 1)
             item = listing.data['items'][0]; self.assertFalse(item['can_clear'])
-            self.assertIn('Retry the original creation', item['message'])
+            self.assertIn('Reload the requirements', item['message'])
             self.assertIn('host operator', item['message'])
             before_allocated = self.rows()
             refused = harness.request('POST', base+'/requirements/recoveries/clear',
@@ -349,6 +510,17 @@ class NativeOwnerTests(fixture.RealBdLabelAliasTests):
             self.assertIn('no recorded decision binding', str(lost_retry.data))
             self.assertEqual(self.rows(), before_lost)
             self.assertFalse(owner.existing_acceptances(next(r for r in before_lost if r['id']==lost.data['id'])))
+            self.assertIn('Reload', str(lost_retry.data))
+            current = harness.request('GET', base+'/requirements/'+lost.data['id'], token=token)
+            self.assertEqual(current.status, 200, current.data)
+            fresh_accept = harness.request('POST', lost_route, expected(current.data['current']),
+                                          token=token, key='native-lost-fresh-accept')
+            self.assertEqual(fresh_accept.status, 200, fresh_accept.data)
+            self.assertEqual(fresh_accept.data['acceptance_state'], 'accepted')
+            pending_lost = [load_json(p) for p in (self.project/requirement_http.JOURNAL).glob('*.json')
+                            if load_json(p).get('id')==lost.data['id'] and load_json(p).get('status')=='pending']
+            self.assertEqual(len(pending_lost), 1)
+            self.assertNotIn('owner_decision', pending_lost[0])
             partial = harness.request('POST', base+'/requirements', {
                 'kind':'requirement', 'parent':job, 'title':'Recoverable owner content',
                 'description':'The evidence survives an interrupted revision.'},
@@ -560,5 +732,268 @@ class NativeOwnerTests(fixture.RealBdLabelAliasTests):
             harness._stop_server(); harness.doCleanups()
 
 
+
+
+class NativeTerminalTests(fixture.RealBdLabelAliasTests):
+    """Separate disposable native deployment from the older owner suite.
+
+    A browser subtest skip cannot leave malformed native anchors for this class.
+    """
+    rows = NativeOwnerTests.rows
+    install_fault_boundary = NativeOwnerTests.install_fault_boundary
+    fault = NativeOwnerTests.fault
+
+    def test_terminal_routes_recovery_browser_restore_and_previous_reader(self):
+        import http_service
+        import requirement_governance as governance
+        import requirement_http as http
+        import requirement_records as records
+        import requirement_owner_records as owner
+        import test_http_review_fixes as fixes
+        root=self.root
+        for key,value in fixture.admin.PROJECT_SETTINGS:
+            configured=self.bd('config','set',key,value)
+            self.assertEqual(configured.returncode,0,configured.stderr)
+        if self.bd('show','pp-merge-slot','--json').returncode:
+            slot=self.bd('create','Merge Slot','--id','pp-merge-slot','--labels','gt:slot','--json')
+            self.assertEqual(slot.returncode,0,slot.stderr)
+        made=self.bd('create','Terminal owner job','--type','epic','--json')
+        self.assertEqual(made.returncode,0,made.stderr); job=json.loads(made.stdout)['id']
+        class Harness(fixes.Harness):
+            def make_backend(self):
+                return http_service.EndpointBackend(sys.executable,str(KIT/'endpoint.py'),str(root),service=self.service)
+        harness=Harness(methodName='runTest'); harness.setUp()
+        try:
+            admin=harness.admin_token(); account=harness.create_account(admin,'terminal-owner','terminal-password-1')
+            token=harness.login('terminal-owner','terminal-password-1')[0]; base='/v1/projects/pp'
+            self.assertEqual(harness.request('POST','/v1/projects',{'project_id':'pp','name':'Terminal fixture'},token=admin).status,201)
+            self.assertEqual(harness.request('PUT',base+'/members/'+account,{'role':'owner'},token=admin).status,200)
+            mode=harness.request('GET',base+'/requirements/governance',token=token).data
+            if mode['mode']!='simple':
+                changed=harness.request('PUT',base+'/requirements/governance',dict(mode='simple',
+                    expected_revision=mode['revision'],expected_sha256=mode['sha256']),token=token,key='terminal-simple')
+                self.assertEqual(changed.status,200,changed.data)
+            expected=lambda item: dict(expected_revision=item['revision'],expected_sha256=item['sha256'])
+            def accepted(key,kind='requirement'):
+                draft=harness.request('POST',base+'/requirements',dict(kind=kind,parent=job,
+                    title='Terminal '+key,description='Retained '+key),token=token,key='terminal-create-'+key)
+                self.assertEqual(draft.status,201,draft.data)
+                result=harness.request('POST',base+'/requirements/'+draft.data['id']+'/accept',expected(draft.data),
+                    token=token,key='terminal-accept-'+key)
+                self.assertEqual(result.status,200,result.data); return result.data
+            body=lambda item: dict(expected(item),expected_state_sha256=None,reason='No longer needed.')
+            def transition(item,key,action='withdraw',fields=None,principal=None):
+                return harness.request('POST',base+'/requirements/'+item['id']+'/'+action,fields or body(item),
+                    token=principal or token,key=key)
+            first=accepted('first'); replacement=accepted('replacement'); narrative=accepted('narrative','brd-section')
+            before=self.rows(); previous=os.environ.get('ORCHESTRA_PREVIOUS_KIT')
+            if not previous:
+                with self.subTest(probe='previous-release compatibility'):
+                    self.skipTest('ORCHESTRA_PREVIOUS_KIT is not supplied; previous-reader/writer/restore compatibility was not exercised')
+            # Read with the exact preceding source in a separate interpreter;
+            # the supplied export is captured from the actual pinned native DB.
+            def previous_read(item):
+                if not previous:
+                    return None
+                exported=self.bd('export','--all'); self.assertEqual(exported.returncode,0,exported.stderr)
+                snapshot=root/'previous-reader-rows.json'; snapshot.write_text(exported.stdout,encoding='utf-8')
+                code='''import json,sys
+from pathlib import Path
+sys.path.insert(0,sys.argv[1])
+import requirement_http
+rows=Path(sys.argv[3]).read_text()
+try:
+ result=requirement_http.read(Path(sys.argv[2]),'pp',['get',sys.argv[4]],lambda args: rows)
+ print(json.dumps({'ok':True,'result':result}))
+except ValueError as error:
+ print(json.dumps({'ok':False,'message':str(error)}))
+'''
+                done=subprocess.run([sys.executable,'-c',code,previous,str(self.project),str(snapshot),item['id']],
+                    capture_output=True,text=True,timeout=30)
+                self.assertEqual(done.returncode,0,done.stderr); return json.loads(done.stdout)
+            old=previous_read(first)
+            if old is not None:
+                self.assertTrue(old['ok'],old); self.assertEqual(old['result']['accepted']['sha256'],first['sha256'])
+            else:
+                print('Previous-reader compatibility not run: ORCHESTRA_PREVIOUS_KIT was not supplied',flush=True)
+            self.assertNotIn(account,fixture.admin.operators(root))
+            for fields in (dict(body(first),expected_sha256='0'*64),dict(body(first),reason='')):
+                self.assertEqual(transition(first,'native-bad-cas',fields=fields).status,422)
+            self.assertEqual(transition(narrative,'native-narrative').status,422)
+            self.assertEqual(transition(first,'native-self','supersede',dict(body(first),successor={k:first[k] for k in ('id','revision','sha256')})).status,422)
+            self.assertEqual(self.rows(),before)
+            self.install_fault_boundary()
+            second=harness.create_account(admin,'terminal-recovery-owner','terminal-recovery-password-1')
+            second_token=harness.login('terminal-recovery-owner','terminal-recovery-password-1')[0]
+            self.assertEqual(harness.request('PUT',base+'/members/'+second,{'role':'owner'},token=admin).status,200)
+            def recover(item,pending,action='finish',principal=None,key='native-finish'):
+                fields=dict(original_operation_id=pending['operation_id'],expected_receipt_sha256=pending['expected_receipt_sha256'])
+                if action=='abandon':fields['reason']='A complete native read proves no state was written.'
+                return harness.request('POST',base+'/requirements/'+item['id']+'/transition/'+action,fields,
+                    token=principal or second_token,key=key)
+            for index,marker in enumerate(('fail-one-terminal-state','lose-one-terminal-state','lose-one-terminal-reason','fail-one-terminal-label')):
+                item=accepted('interrupted-'+str(index)); row=next(r for r in self.rows() if r['id']==item['id'])
+                history=records.existing_revisions(row); acceptance=owner.existing_acceptances(row)
+                self.fault(marker); key='native-terminal-'+str(index)
+                failed=transition(item,key); self.assertEqual(failed.status,503,failed.data)
+                detail=harness.request('GET',base+'/requirements/'+item['id'],token=token)
+                self.assertEqual(detail.status,200,detail.data); self.assertEqual(detail.data['requirement_state'],'unknown')
+                wrong=transition(item,key,fields=dict(body(item),reason='Different request'))
+                self.assertEqual(wrong.status,409,wrong.data)
+                pending=detail.data['pending_transition'];self.assertTrue(pending['can_finish'])
+                self.assertEqual(harness.request('PUT',base+'/members/'+account,{'role':'contributor'},token=admin).status,200)
+                self.assertEqual(recover(item,pending,principal=token,key='departed-'+str(index)).status,403)
+                if index:
+                    self.assertFalse(pending['can_abandon'])
+                    self.assertEqual(recover(item,pending,'abandon',key='cannot-abandon-'+str(index)).status,422)
+                recovered=recover(item,pending,key='second-owner-finish-'+str(index));self.assertEqual(recovered.status,200,recovered.data)
+                self.assertEqual(recovered.data['state'],pending['state']);self.assertEqual(recovered.data['reason'],pending['reason'])
+                row=next(r for r in self.rows() if r['id']==item['id'])
+                state,reason=owner.state_ledger(row)
+                self.assertEqual(state['account_id'],account); self.assertEqual(reason['account_id'],account)
+                self.assertEqual(records.existing_revisions(row),history); self.assertEqual(owner.existing_acceptances(row),acceptance)
+                for prefix in (owner.STATE_PREFIX,owner.REASON_PREFIX):
+                    comments=[c for c in row['comments'] if c['text'].startswith(prefix)]
+                    self.assertEqual(len(comments),1); self.assertEqual(comments[0]['author'],account)
+                saved=self.rows()
+                for replay_key in ('second-owner-finish-'+str(index),'fresh-finish-'+str(index)):
+                    replay=recover(item,pending,key=replay_key);self.assertEqual(replay.status,200,replay.data)
+                    self.assertEqual(replay.data['state'],pending['state']);self.assertEqual(self.rows(),saved)
+                self.assertEqual(harness.request('PUT',base+'/members/'+account,{'role':'owner'},token=admin).status,200)
+                self.assertEqual(transition(item,key).status,200);self.assertEqual(self.rows(),saved)
+                self.assertEqual(harness.request('PATCH',base+'/requirements/'+item['id'],dict(expected(item),title='Undo'),
+                    token=token,key='native-no-undo-'+str(index)).status,422)
+                self.assertEqual(self.rows(),saved)
+            empty=accepted('abandon-empty');self.fault('fail-one-terminal-state')
+            self.assertEqual(transition(empty,'native-abandon-empty').status,503)
+            pending=harness.request('GET',base+'/requirements/'+empty['id'],token=second_token).data['pending_transition']
+            self.assertFalse(pending['can_abandon'])
+            self.assertEqual(recover(empty,pending,'abandon',key='abandon-too-early').status,422)
+            from requirement_terminal import read_receipt,receipt_path
+            deadline=read_receipt(receipt_path(self.project,pending['operation_id']))['write_window']['abandon_after']
+            import time
+            while time.time()<=deadline:
+                time.sleep(min(1,deadline-time.time()+0.05))
+            pending=harness.request('GET',base+'/requirements/'+empty['id'],token=second_token).data['pending_transition']
+            self.assertTrue(pending['can_abandon']);before_empty=self.rows()
+            self.assertEqual(recover(empty,pending,'abandon',key='abandon-empty').status,200)
+            self.assertEqual(self.rows(),before_empty)
+            from requirement_terminal import read_receipt,receipt_path
+            self.assertEqual(read_receipt(receipt_path(self.project,pending['operation_id']))['status'],'released')
+            self.assertEqual(transition(empty,'new-after-abandon').status,200)
+            # The host operator finds the saved terminal receipt, including after a
+            # lost reason write. It uses the service authority lock and project lock.
+            operator='terminal-operator'
+            config_path=root/'deployment.private.json'
+            configured=json.loads(config_path.read_text());configured['operators']=[operator]
+            config_path.write_text(json.dumps(configured))
+            operate=accepted('operator-finish');self.fault('fail-one-terminal-reason')
+            self.assertEqual(transition(operate,'native-operator-finish').status,503)
+            pending=harness.request('GET',base+'/requirements/'+operate['id'],token=token).data['pending_transition']
+            command=[sys.executable,str(KIT/'admin.py'),'--root',str(root),'requirement-reconcile','pp',
+                     '--actor',operator,'--operation-id',pending['operation_id'],'--reason','Finish saved evidence.',
+                     '--disposition','complete','--state',str(harness.service.store.path)]
+            done=subprocess.run(command,env=fixture.admin.environment(root),capture_output=True,text=True,timeout=120)
+            self.assertEqual(done.returncode,0,done.stdout+'\n'+done.stderr)
+            self.assertEqual(json.loads(done.stdout)['reason'],pending['reason'])
+            self.assertEqual(json.loads(done.stdout)['completion']['reason'],'Finish saved evidence.')
+            self.assertEqual(json.loads(done.stdout)['completion']['actor'],operator)
+            # This native scenario creates more events than the first audit page.
+            # Follow the service's cursor so the newest durable operator entry is
+            # checked even when it is beyond that page.
+            from urllib.parse import quote
+            events=[];route=base+'/audit'
+            while route:
+                audit=harness.request('GET',route,token=token)
+                self.assertEqual(audit.status,200,audit.data)
+                events.extend(audit.data['items'])
+                cursor=audit.data['next_cursor']
+                route=base+'/audit?cursor='+quote(cursor,safe='') if cursor else None
+            finished=[event for event in events if event['action']=='requirements.operator.finish'
+                      and event['requirement_id']==operate['id']]
+            self.assertEqual(len(finished),1,finished)
+            self.assertEqual(finished[0]['actor'],operator)
+            self.assertEqual(finished[0]['original_operation_id'],pending['operation_id'])
+            self.assertEqual(finished[0]['reason'],'Finish saved evidence.')
+            viewer_id=harness.create_account(admin,'terminal-viewer','terminal-viewer-password-1')
+            viewer=harness.login('terminal-viewer','terminal-viewer-password-1')[0]
+            self.assertEqual(harness.request('PUT',base+'/members/'+viewer_id,{'role':'viewer'},token=admin).status,200)
+            denied=transition(first,'native-viewer-terminal',principal=viewer)
+            self.assertEqual(denied.status,403,denied.data)
+            node=shutil.which('node')
+            if node:
+                done=subprocess.run([node,'--experimental-default-type=module',str(KIT/'tests/web_requirement_terminal.mjs'),
+                    (KIT/'web/js/api.js').as_uri(),(KIT/'web/js/views/owner_requirements.js').as_uri(),
+                    'http://127.0.0.1:'+str(harness.port),'pp',token,viewer,first['id'],replacement['id']],
+                    capture_output=True,text=True,timeout=180)
+                self.assertEqual(done.returncode,0,done.stderr); self.assertTrue(all(json.loads(done.stdout).values()))
+            else:
+                fields=dict(body(first),successor={k:replacement[k] for k in ('id','revision','sha256')})
+                self.assertEqual(transition(first,'native-supersede','supersede',fields).status,200)
+                print('Native browser probe not run: Node.js unavailable',flush=True)
+            detail=harness.request('GET',base+'/requirements/'+first['id'],token=viewer)
+            self.assertEqual(detail.status,200,detail.data); self.assertEqual(detail.data['requirement_state'],'superseded')
+            self.assertEqual(detail.data['accepted']['sha256'],first['sha256'])
+            old=previous_read(first)
+            if old is not None:
+                self.assertFalse(old['ok'],old); self.assertLess(len(old['message']),500)
+            before=self.rows(); inner={p.name:p.read_bytes() for p in (self.project/http.JOURNAL).glob('*.json')}
+            (root/'backups').mkdir(exist_ok=True)
+            if not (root/'backups/pp').exists():
+                initialized=self.bd('backup','init',str(root/'backups/pp')); self.assertEqual(initialized.returncode,0,initialized.stderr)
+            for command in (['backup','pp'],['restore-new','pp','terminalcopy']):
+                done=subprocess.run([sys.executable,str(KIT/'admin.py'),'--root',str(root),*command],
+                    env=fixture.admin.environment(root),capture_output=True,text=True,timeout=180)
+                self.assertEqual(done.returncode,0,done.stdout+'\n'+done.stderr)
+            cloned=root/'projects/terminalcopy'
+            self.assertEqual({p.name:p.read_bytes() for p in (cloned/http.JOURNAL).glob('*.json')},inner)
+            restored=fixture.endpoint.execute(root,dict(project='terminalcopy',actor='reader',action='requirements',args=['get',first['id']]))
+            self.assertEqual(restored['returncode'],0,restored); restored=json.loads(restored['stdout'])
+            self.assertEqual(restored['state'],detail.data['state']); self.assertEqual(restored['reason'],detail.data['reason'])
+            self.assertEqual(restored['accepted']['sha256'],first['sha256']); self.assertEqual(restored['requirement_state'],'superseded')
+            self.assertEqual(self.rows(),before)
+            if previous:
+                # Exercise the preceding kit against restored disposable copies,
+                # preserving the source project and its terminal proof unchanged.
+                done=subprocess.run([sys.executable,str(Path(previous)/'admin.py'),'--root',str(root),
+                    'restore-new','pp','olderterminalcopy'],env=fixture.admin.environment(root),
+                    capture_output=True,text=True,timeout=180)
+                self.assertEqual(done.returncode,0,done.stdout+'\n'+done.stderr)
+                old_endpoint=subprocess.run([sys.executable,str(Path(previous)/'endpoint.py'),'--root',str(root)],
+                    input=json.dumps(dict(project='olderterminalcopy',actor='reader',action='requirements',args=['get',first['id']])),
+                    env=fixture.admin.environment(root),capture_output=True,text=True,timeout=60)
+                self.assertEqual(old_endpoint.returncode,0,old_endpoint.stderr)
+                answer=json.loads(old_endpoint.stdout);self.assertNotEqual(answer['returncode'],0,answer)
+                self.assertEqual(harness.request('POST','/v1/projects',{'project_id':'terminalcopy','name':'Disposable rollback writer copy'},token=admin).status,201)
+                self.assertEqual(harness.request('PUT','/v1/projects/terminalcopy/members/'+account,{'role':'owner'},token=admin).status,200)
+                previous_backend=http_service.EndpointBackend(sys.executable,str(Path(previous)/'endpoint.py'),str(root),service=harness.service)
+                principal=harness.service.authenticate(token)
+                # Exercise the real preceding endpoint with its preceding CLI
+                # shape: its service did not send the new terminal timeout flag.
+                # Keep authority validation and native effects intact. The new
+                # service correctly refuses this old endpoint's unknown option;
+                # that refusal does not prove the old writer is rollback-safe.
+                import endpoint_process
+                from unittest import mock
+                launch=endpoint_process.run
+                def previous_launch(argv,**kwargs):
+                    self.assertEqual(argv[1],str(Path(previous)/'endpoint.py'))
+                    index=argv.index('--terminal-endpoint-timeout')
+                    return launch(argv[:index]+argv[index+2:],**kwargs)
+                with mock.patch('endpoint_process.run',side_effect=previous_launch):
+                    draft=previous_backend.owner_requirements(principal,'terminalcopy','revise',dict(expected(first),title='Unsafe previous-kit edit'),
+                                                             'previous-terminal-edit',first['id'])
+                    accepted_old=previous_backend.owner_requirements(principal,'terminalcopy','accept',expected(draft),
+                                                                    'previous-terminal-accept',first['id'])
+                self.assertGreater(accepted_old['revision'],first['revision'])
+                current=fixture.endpoint.execute(root,dict(project='terminalcopy',actor='reader',action='requirements',args=['get',first['id']]))
+                self.assertEqual(current['returncode'],0,current)
+                self.assertEqual(json.loads(current['stdout'])['requirement_state'],'unknown')
+                self.assertEqual(self.rows(),before)
+        finally:
+            harness._stop_server(); harness.doCleanups()
+
+
 def load_tests(loader, tests, pattern):
-    return unittest.TestSuite([NativeOwnerTests('test_owner_without_operator_grant_accepts_and_preserves_native_history')])
+    return unittest.TestSuite([NativeOwnerTests('test_owner_without_operator_grant_accepts_and_preserves_native_history'),
+                              NativeTerminalTests('test_terminal_routes_recovery_browser_restore_and_previous_reader')])

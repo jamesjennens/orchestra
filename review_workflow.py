@@ -340,6 +340,114 @@ def author_key(value):
     return value.strip().casefold().partition('/')[0]
 
 
+#: The most of an actor name a slice 6/7 refusal repeats (kittrial-5bb.197), the
+#: same bound docs/REVIEWS.md states for the base refusal.
+RULE_NAME_MAX = 80
+
+
+def named_rule_actor(value):
+    """An actor name as a slices 6/7 refusal may repeat it, or ``an actor``.
+
+    A name the endpoint accepts (letters, digits and ``_.@/-``, at most
+    ``RULE_NAME_MAX``) is repeated; anything else is called an actor, so a
+    hand-written name cannot put escape sequences or a long line in a refusal.
+    """
+    if isinstance(value, str) and 0 < len(value) <= RULE_NAME_MAX and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.@/-]*', value):
+        return '"%s"' % value
+    return 'an actor'
+
+
+def owner_map(owners):
+    """The project's actor -> principal map, reading it only when a rule needs it.
+
+    ``owners`` is a mapping, or a zero-argument callable returning one. The endpoint
+    passes a callable so that a request that does not need the registry never reads
+    it. Listed names need no registry for the coordinator/lifecycle naming rules,
+    and exact assignees need none for their allowed facts. Independent-approval
+    writers load it strictly even for a listed operator. Readers can fall back to
+    names; contributing does not need ownership. A failing loader names its rule
+    and recovery; ``approval_owners`` supplies the independent-approval refusal.
+    """
+    return owners() if callable(owners) else owners
+
+
+def party_key(actor, owners=None):
+    """The party an actor belongs to (kittrial-5bb.197, the task's rule 3).
+
+    The principal the project's session registry gives the actor when it has one
+    (``sessions.owners``, as slice 2 does), otherwise the actor's own name under the
+    same normalisation the follows gate uses (case-folded, a ``/``-namespace suffix
+    dropped). This key describes available attribution; :func:`same_party` also
+    compares folded names, so binding just one name cannot evade that comparison.
+    A registry that cannot be read falls back to the name-only comparison rather
+    than stopping a read: the same-name refusal survives, only the principal
+    refinement is unavailable.
+    """
+    try:
+        mapping = owner_map(owners)
+    except (ValueError, OSError):
+        mapping = None
+    if isinstance(mapping, dict):
+        principal = mapping.get(actor)
+        if isinstance(principal, str) and principal:
+            return ('principal', principal)
+    return ('name', author_key(actor))
+
+
+def same_party(first, second, owners=None):
+    """Equal folded names OR equal known principals identify the same party.
+
+    Readers retain name comparison when ownership is unavailable. Writers that
+    require independent approval first load the registry with :func:`approval_owners`.
+    This helper is not used by the older follows or recommendation gates.
+    """
+    if author_key(first) == author_key(second):
+        return True
+    return party_key(first, owners) == party_key(second, owners)
+
+
+class CoordinatorRuleRefusal(ValueError):
+    """A rule refused before any effect; the endpoint marks this for HTTP callers."""
+
+
+def approval_owners(owners):
+    """Load ownership before an independent-approval write; never guess on failure."""
+    try:
+        return owner_map(owners)
+    except (ValueError, OSError):
+        raise CoordinatorRuleRefusal('The installation setting independent_approval is on, and the session registry '
+                         'cannot be read. An operator turns the rule off with '
+                         '`admin.py coordinator-rules off --rule independent_approval --actor OPERATOR`, '
+                         'or repairs the session registry; nothing was changed.') from None
+
+
+def listed_operator_actor(actor, operators=None, owners=None):
+    """Whether slice 7 lets ``actor`` approve or take the merge slot in this project.
+
+    ONE rule, used by ``review_workflow`` and ``lifecycle.py`` alike (kittrial-5bb.197
+    review request 01a12894, item 3a): an actor on the installation's operator
+    allowlist, or an actor of a listed principal for this project, meaning an actor
+    whose entry in the project's session-registry ``owners`` map names the same
+    principal as some listed operator. A plain listed name is decided WITHOUT reading
+    the registry, so a damaged registry never stops a listed operator; only an actor
+    that is not a plain listed name needs the map. Names match by whole name and
+    case, as every other check of the allowlist does; the list is the installation's,
+    because the design gives no project its own operator list (rules 1 and 2 confine
+    the name to its principal's projects). A project with no ``owners`` map has no
+    principals and is judged on the allowlist alone. Read-only: nothing is written.
+    """
+    authority = set(recovery.configured_operators(operators))
+    if actor in authority:
+        return True
+    mapping = owner_map(owners)
+    if not isinstance(mapping, dict):
+        return False
+    principal = mapping.get(actor)
+    if not isinstance(principal, str) or not principal:
+        return False
+    return any(mapping.get(name) == principal for name in authority)
+
+
 def fields(value, expected):
     if not isinstance(value, dict) or set(value) != expected:
         raise ValueError('Invalid review workflow fields')
@@ -1588,6 +1696,61 @@ def approving_record(ordered, contribution_id):
     return entry[1] if entry else None
 
 
+def independent_approval_state(issue, operators=None, owners=None, journal=None):
+    """``(True, None)`` when the CURRENT contribution carries an approve from another party.
+
+    The second half of the task's rule 3 (kittrial-5bb.197, part b): ``reviewed`` and
+    ``integrated`` may be recorded, and the merge slot taken, only while the CURRENT
+    contribution carries a validated ``approve`` record from a party other than the
+    contribution's author AND the task's assignee. The projection already resets an
+    approval when a new contribution supersedes or follows the old one, so an
+    approval of an OLDER contribution cannot satisfy a newer one; a void applied
+    after the approval clears it the same way. The approving party is compared with
+    ``same_party``: equal known principals OR equal normalised names. This reader
+    remains available when the registry cannot be read; writers load ownership
+    strictly before using it. Returns ``(False, reason)`` when the contribution does not qualify, so the
+    caller can refuse with the setting named.
+    """
+    ordered, voids, invalid, refused, positions, reverts, invalid_reverts = history(
+        issue, operators, journal)
+    state = projection(ordered, voids, invalid, refused, positions, reverts, invalid_reverts,
+                       closed=issue.get('status') == 'closed')
+    contribution = state.get('contribution') or {}
+    if not contribution:
+        return False, 'this task has no contribution to record that fact against'
+    if state.get('review_state') != 'awaiting-integration' or state.get('pending_requests'):
+        return False, 'the current contribution has no standing approval from another party'
+    entry = approving_entry(ordered, contribution['comment_id'])
+    if entry is None:
+        return False, 'the current contribution has no approval record'
+    approving, approval = entry
+    author = contribution.get('author')
+    approver = approval.get('author')
+    if same_party(approver, author, owners):
+        return False, ("its approval came from the contribution author's party")
+    assignee = issue.get('assignee')
+    if isinstance(assignee, str) and assignee and same_party(approver, assignee, owners):
+        return False, ("its approval came from the task assignee's party")
+    return True, None
+
+
+APPROVAL_REFUSAL = ('%s refused: the installation setting independent_approval is on, and nobody passes their '
+                    'own work that way; the CURRENT contribution of %s must carry a validated approve record from '
+                    'a party other than its author and the task\'s assignee before %s. %s. An operator or a '
+                    'reviewer of another party approves it with `review TASK --file approve.json`, or an operator '
+                    'turns the rule off with `admin.py coordinator-rules off --rule independent_approval --actor '
+                    'OPERATOR`.')
+
+
+def require_independent_approval(issue, what, task, operators=None, owners=None, journal=None):
+    """Raise the one refusal for part (b), or return when the contribution qualifies."""
+    owners = approval_owners(owners)
+    allowed, reason = independent_approval_state(issue, operators, owners, journal)
+    if allowed:
+        return
+    raise CoordinatorRuleRefusal(APPROVAL_REFUSAL % (what, task, what, reason))
+
+
 def require_integrated_follow_on(payload, state, ordered, rows, task, assignee=None, operators=None,
                                  journal=None):
     """Refuse an additive follow-on whose prior revision is not genuinely approved.
@@ -1867,7 +2030,8 @@ def open_review_requests_by(rows, actor, operators=None, journal=None):
     return total
 
 
-def execute(rows, task, actor, payload, run, operators=None, journal=None, review_writes=None):
+def execute(rows, task, actor, payload, run, operators=None, journal=None, review_writes=None,
+            independent_approval=False, coordinator_writes=False, owners=None, verified_web_authority=False):
     """Validate, CAS and append once; return receipt and projected review state.
 
     ``journal`` is the project directory holding the host-issued
@@ -1879,6 +2043,17 @@ def execute(rows, task, actor, payload, run, operators=None, journal=None, revie
     shapes (``admin.review_workflow_writes``, supplied by the endpoint from
     ``deployment.private.json``; the default is OFF). The readers understand the
     new operations and fields either way - see the module docstring.
+
+    ``independent_approval`` and ``coordinator_writes`` are the two per-installation
+    settings of slices 6 and 7 (``admin.coordinator_rules``, supplied by the endpoint;
+    both default OFF, so an installation that configures nothing behaves as before).
+    ``owners`` is the project's actor -> principal map (``sessions.owners``), or a
+    callable returning it so the registry is read only when a rule needs it, used by
+    the principal half of both rules. ``verified_web_authority`` says the request came through the
+    web route with a verified approval capability for an owner, coordinator, or granted
+    agent. The configured live authority establishes the caller (kittrial-5bb.199,
+    kittrial-5bb.209), so ``coordinator_writes`` does not refuse it. Web slot operations
+    use the same helper for their capability; host operations retain listed actors.
     """
     for row in rows or []:
         if isinstance(row, dict) and row.get('id') == task and is_merge_slot(row):
@@ -1966,6 +2141,41 @@ def execute(rows, task, actor, payload, run, operators=None, journal=None, revie
     # The assignee an approval is judged against is recorded server-side, from the
     # task row, so a caller cannot forge it to open the follow-on gate.
     if payload['operation'] == 'approve':
+        # Slices 6 and 7 (kittrial-5bb.197), each behind an installation setting that
+        # is OFF until it is turned on. (b) nobody passes their own work: the approver
+        # may not be the contribution's author or the task's assignee by PARTY - the
+        # principal the registry gives the actor where it has one, its normalised name
+        # otherwise (the task's rule 3). (c) coordinator writes: only a listed actor of
+        # this project may approve, unless a verified web approval (owner, coordinator, or
+        # agent with the grant) already established the caller (kittrial-5bb.199, .209).
+        # Judged before the snapshot is stamped and before the sole native write, so a
+        # refusal writes nothing.
+        if independent_approval or coordinator_writes:
+            contribution=state.get('contribution') or {}
+            if coordinator_writes and not verified_web_authority and not listed_operator_actor(actor,operators,owners):
+                raise CoordinatorRuleRefusal('approve refused: the installation setting coordinator_writes is on, so only a '
+                                 'listed operator of this project may approve a contribution (or an actor of a '
+                                 'listed operator\'s principal), and %s is neither. A worker still contributes, '
+                                 'responds, recommends and requests changes; an operator turns the rule off with '
+                                 '`admin.py coordinator-rules off --rule coordinator_writes --actor OPERATOR`.'
+                                 %named_rule_actor(actor))
+            if independent_approval:
+                owners = approval_owners(owners)
+                if same_party(actor,contribution.get('author'),owners):
+                    raise CoordinatorRuleRefusal('approve refused: the installation setting independent_approval is on, and '
+                                     'nobody passes their own work; %s is the contribution\'s author\'s party, so '
+                                     'it may not approve its own contribution. Another party must approve it, or an '
+                                     'operator turns the rule off with `admin.py coordinator-rules off --rule '
+                                     'independent_approval --actor OPERATOR`.'
+                                     %named_rule_actor(actor))
+                assignee=issue.get('assignee')
+                if isinstance(assignee,str) and assignee and same_party(actor,assignee,owners):
+                    raise CoordinatorRuleRefusal('approve refused: the installation setting independent_approval is on, and '
+                                     'nobody passes their own work; %s is the task\'s assignee\'s party, so it may '
+                                     'not approve the contribution on its own task. Another party must approve it, '
+                                     'or an operator turns the rule off with `admin.py coordinator-rules off --rule '
+                                     'independent_approval --actor OPERATOR`.'
+                                     %named_rule_actor(actor))
         payload = dict(payload, **{ASSIGNEE_SNAPSHOT: issue.get('assignee')})
         validate(payload, task)
     # Validate the entire transition before the sole native mutation.
