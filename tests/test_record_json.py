@@ -219,6 +219,7 @@ class NoUnguardedParseTests(unittest.TestCase):
                                "call), and _row_id parses single string literals (one call)"),
         'keyed_records.py': (2, 'bd output'),
         'lifecycle.py': (3, "bd output, plus the endpoint's release-query and group answers on the caller's machine (kittrial-5bb.107 rev3)"),
+        'lifecycle_voids.py': (1, 'the bd comments-add receipt; native record bodies and bounded host journal files use the guard'),
         'native.py': (2, 'bd output'),
         'office_service.py': (1, 'host configuration'),
         'proposal_records.py': (4, 'bd output, the host session file, and a copy of a structure the kit built'),
@@ -299,6 +300,9 @@ class NoUnguardedParseTests(unittest.TestCase):
             # The simple owner adapter guards bd's decision-create receipt too.
             'requirement_http.py': 2,
             'web_merge_slot.py': 4,
+            # F0: bounded host entries/restore marker and native correction/comment
+            # bodies use the guard; none is trusted merely because it parses.
+            'lifecycle_voids.py': 4,
             'review_recommendations.py': 2, 'review_workflow.py': 4, 'work.py': 1, 'worker_gate.py': 1})
 
     def test_the_parsers_that_do_not_call_it_directly_reach_it(self):

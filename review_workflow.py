@@ -436,7 +436,12 @@ def listed_operator_actor(actor, operators=None, owners=None):
     the name to its principal's projects). A project with no ``owners`` map has no
     principals and is judged on the allowlist alone. Read-only: nothing is written.
     """
-    authority = set(recovery.configured_operators(operators))
+    # Explicit identity collections already came from the installation. Preserve
+    # their exact names; trimming one can turn a malformed entry into authority.
+    # The environment/text form uses the configuration parser for its delimiters.
+    authority = (set(recovery.configured_operators(operators))
+                 if operators is None or isinstance(operators, str)
+                 else {name for name in operators if isinstance(name, str) and name == name.strip()})
     if actor in authority:
         return True
     mapping = owner_map(owners)
