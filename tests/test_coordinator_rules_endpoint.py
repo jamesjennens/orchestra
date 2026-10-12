@@ -145,6 +145,11 @@ class CoordinatorRulesEndpointTests(RulesHelpers, unittest.TestCase):
             task=self.seeded_task(assignee=author,actor=author)
             made=self.contribute(task,author)
             contribution=json.loads(made['stdout'])['comment_id']
+            # Neither half can mask the other: for the author case, w1 is
+            # still the author/approver but no longer the task's assignee.
+            if subject=='author':
+                reassigned=self.r.bd('update',task,'--assignee','w3','--json')
+                self.assertEqual(reassigned.returncode,0,reassigned.stderr)
             if subject=='assignee':
                 reassigned=self.r.bd('update',task,'--assignee','w1','--json')
                 self.assertEqual(reassigned.returncode,0,reassigned.stderr)
@@ -409,11 +414,11 @@ class CoordinatorRulesWebRouteTests(RulesHelpers, unittest.TestCase):
             dict(operation='approve',schema_version=1,operation_id='bad-reg-'+secrets.token_hex(8),
                  previous=contribution,contribution=contribution,summary='Review accepts'),token=olga)
         self.assertEqual(response.status,422,response.data)
-        text=json.dumps(response.data)
+        text=response.data['error']['message']
         self.assertIn('independent_approval',text)
         self.assertIn('--rule independent_approval --actor OPERATOR',text)
         self.assertEqual(text.lower().count('nothing was changed'),1)
-        self.assertNotIn(str(self.project),text)
+        self.assertNotIn(str(self.project),json.dumps(response.data))
         self.assertEqual(self.rows(),before)
 
     def test_actual_web_brief_wait_is_caller_relative_and_matches_canonical_brief(self):
@@ -505,8 +510,9 @@ class CoordinatorRulesWebRouteTests(RulesHelpers, unittest.TestCase):
                                'previous': contribution, 'contribution': contribution,
                                'summary': 'Own approval'}, token=olga)
         self.assertEqual(422, own.status, own.data)
-        # The refusal names the setting (today the web refusal names nothing).
-        self.assertIn('independent_approval', json.dumps(own.data))
+        # The person sees this sentence in message, not only the diagnostic detail.
+        self.assertIn('independent_approval', own.data['error']['message'])
+        self.assertIn('--rule independent_approval --actor OPERATOR', own.data['error']['message'])
         other = harness.request('POST', '/v1/projects/pp/tasks/%s/reviews' % task,
                                 {'operation': 'approve', 'schema_version': 1,
                                  'operation_id': 'wx-' + secrets.token_hex(8),

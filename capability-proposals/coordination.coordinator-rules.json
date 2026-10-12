@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "operation_id": "caprev-5bb254-coordinator-rules-0001",
+  "operation_id": "caprev-5bb254-coordinator-rules-0002",
   "key": "coordination.coordinator-rules",
   "name": "An installation can say who may write a lifecycle fact, who may approve and who may take the merge slot",
   "aliases": [
@@ -10,7 +10,7 @@
     "who may record reviewed and integrated",
     "coordinators per project slices 6 and 7"
   ],
-  "summary": "Three per-installation rules, off by default: lifecycle_authors permits exact-current-assignee implemented/tested/scope before reading ownership, or a listed operator; other facts require a listed operator. Assignment itself is unrestricted. independent_approval refuses equal known principals OR folded actor names and requires a standing independent approval of the current contribution for reviewed/integrated/merge-acquire. Its writers fail closed on an unreadable registry; missing or valid empty ownership uses names, readers remain available. coordinator_writes permits listed actors for host approve/merge-acquire; verified web approval retains its own owner/coordinator/granted-agent authority. Forged ordinary endpoint descriptors confer none. work/brief approval waiting is caller-relative and conditional, and the web brief recomputes it for the caller. Registry refusals preserve setting/recovery punctuation without paths or duplicate clauses. Native all-off writes stay compatible; additive reader fields/text are declared. No historical migration or rollout switch change.",
+  "summary": "Three per-installation rules, off by default: lifecycle_authors permits exact-current-assignee implemented/tested/scope before reading ownership, or a listed operator; other facts require a listed operator. Assignment itself is unrestricted. independent_approval refuses equal known principals OR folded actor names and requires a standing independent approval of the current contribution for reviewed/integrated/merge-acquire. Its writers fail closed on an unreadable registry; missing or valid empty ownership uses names, readers remain available. coordinator_writes permits listed actors for host approve/merge-acquire; verified web approval retains its own owner/coordinator/granted-agent authority. Forged ordinary endpoint descriptors confer none. work/brief approval waiting is caller-relative and conditional, and the web brief recomputes it for the caller. The endpoint marks rule refusals; HTTP error.message carries ordinary and registry setting/recovery sentences without paths or duplicate clauses. Native all-off writes stay compatible; additive reader fields/text are declared. No historical migration or rollout switch change.",
   "requirements": [],
   "anchors": [
     "docs/OPERATIONS.md#the-coordinator-rules-who-may-write-which-fact-and-who-may-approve"
@@ -38,7 +38,9 @@
     "work.py::approval_wait",
     "endpoint.py::owner_loader",
     "http_service.py::EndpointBackend._detail_limit",
-    "http_service.py::EndpointBackend.task_brief"
+    "http_service.py::EndpointBackend.task_brief",
+    "review_workflow.py::CoordinatorRuleRefusal",
+    "http_service.py::EndpointBackend._checked"
   ],
   "tests": [
     "tests/test_lifecycle_authors.py",
@@ -51,5 +53,7 @@
     "coordination",
     "operations",
     "security"
-  ]
+  ],
+  "revision": 3,
+  "expected_sha256": "be8b751c20ccc32d927f689d206604e760ac1629cef4b6c593236f038e03ddc5"
 }

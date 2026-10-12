@@ -1607,20 +1607,19 @@ class EndpointBackend:
     RULE_REFUSAL_LIMIT = 1500
 
     @classmethod
-    def _detail_limit(cls, action, said):
+    def _detail_limit(cls, action, said, refused=None):
         """How much of a canonical refusal's last line is handed on.
 
         The larger limit is for the kit's own sentence only, never for a caller's text echoed
         back at length: the line must BE the follow-on base refusal, whole, as
         ``review_workflow.BASE_REFUSAL`` describes it (the kit's words, hexadecimal commit
-        ids, a recorder name of a constrained shape), or one of the coordinator-rule
-        refusals, which are fixed kit text naming the setting. Anything else keeps the limit
+        ids, a recorder name of a constrained shape), or the endpoint marks it as a
+        coordinator-rule refusal. Those are fixed kit text naming the setting. Anything else keeps the limit
         it had.
         """
         if action == 'review' and cls.base_refusal(said) is not None:
             return cls.BASE_REFUSAL_LIMIT            # the longest form of the sentence is well below it
-        if action in ('review', 'coordinate', 'lifecycle') and isinstance(said, str) \
-                and 'the installation setting' in said.lower():
+        if refused == 'coordinator-rule':
             return cls.RULE_REFUSAL_LIMIT
         return cls.DETAIL_LIMITS.get(action, cls.DETAIL_LIMIT)
 
@@ -1707,8 +1706,11 @@ class EndpointBackend:
             raise busy()
         if code:
             said = stderr.strip().split('\n')[-1] if stderr.strip() else None
-            detail = said[:cls._detail_limit(action, said)] if said else None
+            detail = said[:cls._detail_limit(action, said, reply.get('refused'))] if said else None
             if code == 2:
+                if reply.get('refused') == 'coordinator-rule' and isinstance(detail, str) \
+                        and detail.startswith('ValueError: '):
+                    raise invalid(detail[len('ValueError: '):], detail)
                 if reply.get('refused') == 'not-found':
                     # bd found no row of that name (bd_refusals): the thing asked about is not there.
                     raise not_found('Task not found')
@@ -6783,13 +6785,6 @@ class ApiHandler(BaseHTTPRequestHandler):
                 # nothing else of theirs), so it is the message, not only the detail.
                 if recommending and refusal.status == 422 and isinstance(refusal.detail, str) \
                         and refusal.detail.startswith('ValueError: '):
-                    raise invalid(refusal.detail[len('ValueError: '):], refusal.detail) from None
-                # A refusal by one of the coordinator rules names the setting it came from
-                # (kittrial-5bb.197 review request 01a12894, item 2): the web caller must see
-                # that sentence, not the generic "Canonical command rejected the request".
-                if refusal.status == 422 and isinstance(refusal.detail, str) \
-                        and refusal.detail.startswith('ValueError: ') \
-                        and 'the installation setting' in refusal.detail:
                     raise invalid(refusal.detail[len('ValueError: '):], refusal.detail) from None
                 # So does a refused follow-on base (kittrial-5bb.158): the sentence says which
                 # base is acceptable, why this one is not and what an operator does about it.

@@ -66,7 +66,8 @@ def owner_loader(path,rule):
         try:
             return sessions.owners(path)
         except (ValueError,OSError):
-            raise ValueError('The installation setting %s is on, and the session registry cannot be read. '
+            from review_workflow import CoordinatorRuleRefusal
+            raise CoordinatorRuleRefusal('The installation setting %s is on, and the session registry cannot be read. '
                              'An operator turns the rule off with `admin.py coordinator-rules off --rule %s '
                              '--actor OPERATOR`, or repairs the session registry; nothing was changed.'
                              %(rule,rule)) from None
@@ -1542,6 +1543,12 @@ def main():
         answer={'returncode':75,'stdout':'','stderr':'Busy: %s. Nothing was done; try again shortly.\n'%waited}
     except Exception as e:
         answer={'returncode':2,'stdout':'','stderr':f'{type(e).__name__}: {e}\n'}
+        from review_workflow import CoordinatorRuleRefusal
+        if isinstance(e,CoordinatorRuleRefusal):
+            # Preserve the host's ValueError sentence while identifying a kit rule
+            # refusal explicitly. HTTP never decides this from words in stderr.
+            answer['stderr']=f'ValueError: {e}\n'
+            answer['refused']='coordinator-rule'
         import actor_names
         if isinstance(e,actor_names.TrackerUnreadable):
             # The export could not be read (bd failed, or answered something that is not

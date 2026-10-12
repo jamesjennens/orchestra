@@ -238,7 +238,8 @@ def lifecycle_authors_rule(dimension,actor,assignee,operators=None,owners=None,e
     allowed,reason=dimension_authority(dimension,actor,assignee,operators,owners)
     if allowed:return True
     where=' on %s'%subject if subject else ''
-    raise ValueError('Refusing to record %s%s: the installation setting lifecycle_authors is on, and %s. '
+    from review_workflow import CoordinatorRuleRefusal
+    raise CoordinatorRuleRefusal('Refusing to record %s%s: the installation setting lifecycle_authors is on, and %s. '
                      'The read-only preview is `admin.py lifecycle-authors PROJECT`; an operator turns the '
                      'rule off with `admin.py coordinator-rules off --rule lifecycle_authors --actor OPERATOR`.'
                      %(dimension,where,reason))

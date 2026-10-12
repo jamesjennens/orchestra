@@ -406,12 +406,16 @@ def same_party(first, second, owners=None):
     return party_key(first, owners) == party_key(second, owners)
 
 
+class CoordinatorRuleRefusal(ValueError):
+    """A rule refused before any effect; the endpoint marks this for HTTP callers."""
+
+
 def approval_owners(owners):
     """Load ownership before an independent-approval write; never guess on failure."""
     try:
         return owner_map(owners)
     except (ValueError, OSError):
-        raise ValueError('The installation setting independent_approval is on, and the session registry '
+        raise CoordinatorRuleRefusal('The installation setting independent_approval is on, and the session registry '
                          'cannot be read. An operator turns the rule off with '
                          '`admin.py coordinator-rules off --rule independent_approval --actor OPERATOR`, '
                          'or repairs the session registry; nothing was changed.') from None
@@ -1744,7 +1748,7 @@ def require_independent_approval(issue, what, task, operators=None, owners=None,
     allowed, reason = independent_approval_state(issue, operators, owners, journal)
     if allowed:
         return
-    raise ValueError(APPROVAL_REFUSAL % (what, task, what, reason))
+    raise CoordinatorRuleRefusal(APPROVAL_REFUSAL % (what, task, what, reason))
 
 
 def require_integrated_follow_on(payload, state, ordered, rows, task, assignee=None, operators=None,
@@ -2147,7 +2151,7 @@ def execute(rows, task, actor, payload, run, operators=None, journal=None, revie
         if independent_approval or coordinator_writes:
             contribution=state.get('contribution') or {}
             if coordinator_writes and not web_approval and not listed_operator_actor(actor,operators,owners):
-                raise ValueError('approve refused: the installation setting coordinator_writes is on, so only a '
+                raise CoordinatorRuleRefusal('approve refused: the installation setting coordinator_writes is on, so only a '
                                  'listed operator of this project may approve a contribution (or an actor of a '
                                  'listed operator\'s principal), and %s is neither. A worker still contributes, '
                                  'responds, recommends and requests changes; an operator turns the rule off with '
@@ -2156,7 +2160,7 @@ def execute(rows, task, actor, payload, run, operators=None, journal=None, revie
             if independent_approval:
                 owners = approval_owners(owners)
                 if same_party(actor,contribution.get('author'),owners):
-                    raise ValueError('approve refused: the installation setting independent_approval is on, and '
+                    raise CoordinatorRuleRefusal('approve refused: the installation setting independent_approval is on, and '
                                      'nobody passes their own work; %s is the contribution\'s author\'s party, so '
                                      'it may not approve its own contribution. Another party must approve it, or an '
                                      'operator turns the rule off with `admin.py coordinator-rules off --rule '
@@ -2164,7 +2168,7 @@ def execute(rows, task, actor, payload, run, operators=None, journal=None, revie
                                      %named_rule_actor(actor))
                 assignee=issue.get('assignee')
                 if isinstance(assignee,str) and assignee and same_party(actor,assignee,owners):
-                    raise ValueError('approve refused: the installation setting independent_approval is on, and '
+                    raise CoordinatorRuleRefusal('approve refused: the installation setting independent_approval is on, and '
                                      'nobody passes their own work; %s is the task\'s assignee\'s party, so it may '
                                      'not approve the contribution on its own task. Another party must approve it, '
                                      'or an operator turns the rule off with `admin.py coordinator-rules off --rule '

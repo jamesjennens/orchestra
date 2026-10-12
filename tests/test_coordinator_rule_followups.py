@@ -181,6 +181,21 @@ class WaitingReadersTests(unittest.TestCase):
 @unittest.skipIf(endpoint is None,'endpoint imports fcntl (POSIX-only)')
 class EndpointWithoutServiceTests(unittest.TestCase):
     """Real endpoint dispatch, with a controlled native transport; no HTTP launch or bd."""
+    def test_http_rule_refusal_uses_endpoint_marker_not_words(self):
+        from http_service import EndpointBackend
+        from http_auth import HttpError
+        sentence='The installation setting independent_approval is on. '+('x'*250)+' Recovery.'
+        for marked in (False,True):
+            with self.subTest(marked=marked):
+                reply=dict(returncode=2,stdout='',stderr='ValueError: '+sentence+'\n')
+                if marked:reply['refused']='coordinator-rule'
+                with self.assertRaises(HttpError) as caught:
+                    EndpointBackend._checked(reply,'review')
+                self.assertEqual(caught.exception.status,422)
+                self.assertEqual(caught.exception.message,
+                    sentence if marked else 'Canonical command rejected the request')
+                self.assertEqual(len(caught.exception.detail),len('ValueError: '+sentence) if marked else 200)
+
     def test_forged_approval_descriptor_never_exempts_ordinary_endpoint_call(self):
         from test_coordinator_endpoint import runtime, deployment
         for enabled in (False,True):
