@@ -146,6 +146,19 @@ const control = (root, id) => root.querySelector('#' + id);
   out.retry.otherKey = sent.slice(again).filter(([method]) => method === 'POST')[0][2];
 }
 
+// 2b. The owner-decision form is an owner's (kittrial-5bb.261): a coordinator, who triages,
+//     opens the escalated proposal and is told who decides; an owner gets the form.
+if (who.cora) {
+  const forms = (panel) => panel.all((e) => e.tagName === 'FORM').length;
+  const coordinator = await screens.detailPanel(who.cora.ctx, project, escalated);
+  const owner = await screens.detailPanel(who.dana.ctx, project, escalated);
+  const triage = await screens.detailPanel(who.cora.ctx, project, fresh);
+  out.decide = { coordinator: { forms: forms(coordinator), text: coordinator.textContent },
+    owner: { forms: forms(owner), heading: owner.textContent.includes('Owner decision') },
+    triage: { forms: forms(triage), heading: triage.textContent.includes('Triage') },
+    reads: [(await who.cora.ctx.api.proposal(project, escalated)).can_decide, (await who.dana.ctx.api.proposal(project, escalated)).can_decide] };
+}
+
 // 3. A rule refusal shows the server's reason; a stale read says to reload.
 {
   const { ctx, seen } = who.dana;

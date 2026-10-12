@@ -2026,9 +2026,10 @@ def execute(rows, task, actor, payload, run, operators=None, journal=None, revie
     ``owners`` is the project's actor -> principal map (``sessions.owners``), or a
     callable returning it so the registry is read only when a rule needs it, used by
     the principal half of both rules. ``verified_web_authority`` says the request came through the
-    web route with a verified owner approval capability: the web service has already
-    established who the caller is (kittrial-5bb.199), so ``coordinator_writes`` does
-    not refuse it; the merge slot is not on that route and stays with listed actors.
+    web route with a verified approval capability for an owner, coordinator, or granted
+    agent. The configured live authority establishes the caller (kittrial-5bb.199,
+    kittrial-5bb.209), so ``coordinator_writes`` does not refuse it. Web slot operations
+    use the same helper for their capability; host operations retain listed actors.
     """
     for row in rows or []:
         if isinstance(row, dict) and row.get('id') == task and is_merge_slot(row):
@@ -2121,9 +2122,10 @@ def execute(rows, task, actor, payload, run, operators=None, journal=None, revie
         # may not be the contribution's author or the task's assignee by PARTY - the
         # principal the registry gives the actor where it has one, its normalised name
         # otherwise (the task's rule 3). (c) coordinator writes: only a listed actor of
-        # this project may approve, unless the verified web owner route already
-        # established the caller (kittrial-5bb.199). Judged before the snapshot is
-        # stamped and before the sole native write, so a refusal writes nothing.
+        # this project may approve, unless a verified web approval (owner, coordinator, or
+        # agent with the grant) already established the caller (kittrial-5bb.199, .209).
+        # Judged before the snapshot is stamped and before the sole native write, so a
+        # refusal writes nothing.
         if independent_approval or coordinator_writes:
             contribution=state.get('contribution') or {}
             if coordinator_writes and not verified_web_authority and not listed_operator_actor(actor,operators,owners):

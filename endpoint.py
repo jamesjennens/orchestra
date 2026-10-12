@@ -42,7 +42,7 @@ from reserved_comments import (carries_record_label, check_raw_request, comment_
                                is_merge_slot_id, shown_token, write_targets, MERGE_SLOT_LABEL, MERGE_SLOT_SUFFIX,
                                reserved_label_in_args, refuse_http_actor, status_change_targets, title_change_targets,
                                unresolved_bd_flags)
-from http_authority import AuthorityConfig, NativeRunner, CAP_APPROVE, CAP_PROJECT_ADMIN, verified_web_authority, descriptor_actor_denial, http_actor_denial, journal_path, run_guarded, stamp_write
+from http_authority import AuthorityConfig, NativeRunner, CAP_APPROVE, CAP_PROJECT_ADMIN, verified_web_authority, block_mismatch_denial, required_capability, descriptor_actor_denial, http_actor_denial, journal_path, run_guarded, stamp_write
 
 #: One warning per line on stderr (kittrial-5bb.197 review request 01a12894, item 6):
 #: the configuration warnings and the native warnings are collected in one list, and
@@ -735,6 +735,11 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
         answered=request.get('action') if isinstance(request,dict) else None
         if answered in SERVICE_ONLY_ACTIONS:
             raise ValueError('%s is available only to the web service'%answered)
+    # Slot requests bind the block before project, tracker, or authority reads.
+    # The shared table is the sole endpoint action/operation capability mapping.
+    if request.get('action') in ('coordinate','web-merge-slot'):
+        denied=block_mismatch_denial(request,authority_config)
+        if denied is not None:return denied
     # Two actions exist only for the web service and name no existing project
     # (kittrial-5bb.118 part 2); project_creation holds them, with what stops other callers.
     if request.get('action')=='create-project':
@@ -767,6 +772,10 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
     # And a name WITHOUT that shape, sent by the web service with a descriptor, is written only
     # by a worker credential inside a namespace that is nobody else's (kittrial-5bb.184).
     denied=descriptor_actor_denial(request,authority_config,lambda rows=False,own=():reserved_actors(root,path,rows,own))
+    if denied is not None:return denied
+    # The block must be FOR this request (kittrial-5bb.261): the project it names is this
+    # project, and the capability it names is the one this action needs. Before any action.
+    denied=block_mismatch_denial(request,authority_config)
     if denied is not None:return denied
     if request.get('action')=='session':
         from sessions import execute as session_execute
@@ -1085,8 +1094,8 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
         # everything that rests on the operator allowlist is a host command (admin.py
         # proposal-review, proposal-decide, proposal-settings). The HTTP service is the
         # other authority: launched by it, with live authority required, review and
-        # decide run for a signed-in member whose reviews.approve the guard has just
-        # re-validated, and a submission's submitter is bound to the verified account.
+        # decide run for a signed-in member whose capability the guard has just re-validated
+        # (reviews.approve for a review, project.admin for a decide: kittrial-5bb.261), and a submission's submitter is bound to the verified account.
         import proposal_records
         args=request.get('args',[])
         if not isinstance(args,list) or any(not isinstance(x,str) or '\0' in x for x in args):raise ValueError('Expected argument list')
@@ -1315,8 +1324,8 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             if not isinstance(args,list) or len(args)!=1 or not isinstance(args[0],str):
                 raise SlotError(422,'Expected one merge-slot JSON payload')
             payload=record_json.loads(args[0]);operation=slot_validate(payload)
-            capability=(CAP_READ if operation=='check' else
-                        CAP_PROJECT_ADMIN if operation in ('create','force-release') else CAP_COORDINATE)
+            capability=required_capability(request)
+            if capability is None:raise SlotError(403,'This merge-slot operation has no endpoint capability binding')
             denied_status=[]
             def slot_authority():
                 descriptor=request.get('authority') or {}

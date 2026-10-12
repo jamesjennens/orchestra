@@ -30,6 +30,52 @@ class BoundaryTests(unittest.TestCase):
             with self.subTest(body=body), self.assertRaises(web_merge_slot.SlotError):web_merge_slot.validate(body)
         self.assertEqual(web_merge_slot.validate({'operation': 'acquire', 'task': 'pp-1', 'target': 'main'}), 'acquire')
 
+    def test_slot_operations_share_the_endpoint_capability_table(self):
+        cases = {
+            'coordinate': {'merge-check': http_authority.CAP_READ,
+                           'merge-acquire': http_authority.CAP_COORDINATE,
+                           'merge-release': http_authority.CAP_COORDINATE,
+                           'merge-create': http_authority.CAP_PROJECT_ADMIN},
+            'web-merge-slot': {'check': http_authority.CAP_READ,
+                               'acquire': http_authority.CAP_COORDINATE,
+                               'release': http_authority.CAP_COORDINATE,
+                               'force-release': http_authority.CAP_PROJECT_ADMIN,
+                               'create': http_authority.CAP_PROJECT_ADMIN}}
+        for action, operations in cases.items():
+            for operation, capability in operations.items():
+                with self.subTest(action=action, operation=operation):
+                    request = {'project': 'pp', 'action': action, 'args': [json.dumps({'operation': operation})]}
+                    self.assertEqual(http_authority.required_capability(request), capability)
+                    request['authority'] = {'project': 'pp', 'capability': capability}
+                    config = SimpleNamespace(store=Path('never-read-slot-authority-file'))
+                    self.assertIsNone(http_authority.block_mismatch_denial(request, config))
+
+
+@unittest.skipIf(fixture.endpoint is None, 'endpoint imports fcntl (POSIX-only)')
+class EarlySlotBindingTests(unittest.TestCase):
+    def test_wrong_capability_or_project_is_refused_before_project_authority_or_tracker_reads(self):
+        from unittest.mock import patch
+        endpoint = fixture.endpoint
+        config = SimpleNamespace(store=Path('never-read-slot-authority-file'))
+        operations = {'coordinate': ('merge-check', 'merge-acquire', 'merge-release', 'merge-create'),
+                      'web-merge-slot': ('check', 'acquire', 'release', 'force-release', 'create')}
+        for action, names in operations.items():
+            for operation in names:
+                request = {'project': 'pp', 'actor': 'usr_' + '0' * 16, 'action': action,
+                           'args': [json.dumps({'operation': operation})], 'operation_id': 'early-slot-binding'}
+                needed = http_authority.required_capability(request)
+                wrong = http_authority.CAP_TASKS if needed != http_authority.CAP_TASKS else http_authority.CAP_READ
+                for block in ({'project': 'pp', 'capability': wrong},
+                              {'project': 'foreign', 'capability': needed}):
+                    with self.subTest(action=action, operation=operation, block=block), \
+                         patch.object(endpoint, 'project_dir', side_effect=AssertionError('A mismatch reached the project reader')) as project, \
+                         patch.object(endpoint.native, 'run', side_effect=AssertionError('A mismatch reached the tracker')) as native, \
+                         patch.object(http_authority, 'read_state', side_effect=AssertionError('A mismatch reached the authority store')) as authority:
+                        refused = endpoint.execute(Path('absent-slot-root'), dict(request, authority=block),
+                                                   authority_config=config, require_authority=True)
+                        self.assertEqual((refused['returncode'], refused['authority_status']), (126, 403))
+                        project.assert_not_called();native.assert_not_called();authority.assert_not_called()
+
 
 @unittest.skipIf(fixture.endpoint is None, 'endpoint imports fcntl (POSIX-only)')
 @unittest.skipIf(fixture.BD is None, 'no real bd binary (set ORCHESTRA_BD_BIN or put bd on PATH)')

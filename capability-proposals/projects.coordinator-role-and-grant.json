@@ -16,7 +16,7 @@
     "owner force release",
     "web coordinator slice 2 merge slot"
   ],
-  "summary": "Coordinator roles and personal-agent grants supply reviews.approve and coordinate while the account holds them; worker credentials do not. Agents never approve their own party. Supported single-process live checks remain; inherited endpoint-binding and second-process faults are not repaired. GET merge-slot reads native holder/context. Acquire/release use coordinate and bound usr_/agent_ names. Force-release with expected_holder/reason and explicit create/repair need a signed-in owner or superuser, never an agent. One verified_web_authority helper checks exact project/capability against configured live state; ordinary host payloads/answers and independent_approval remain. No silent creation; missing/damaged/unread slots get recovery. Stable keys reconcile confirmed retries without releasing a later holder. Each confirmed write saves one deduplicated web audit with project/task/actor/before-after holder/opid before its HTTP receipt. Existing native/context/journal/service stores are reused. Page and named client ship together. No lifecycle writer, integration action, provenance mark, new store or switch.",
+  "summary": "Coordinator roles and personal-agent grants supply reviews.approve and coordinate while the account holds them; worker credentials do not. Agents never approve their own party. The endpoint table binds action/operation to required capability and project; slot mismatches are refused before tracker or authority reads. One verified_web_authority helper checks configured live authority. GET slot reads native holder/context. Take/release use coordinate and bound usr_/agent_ names; force-release with expected holder/reason and explicit repair need a signed-in owner or superuser, never an agent. Native context/guarded receipts/web audit are reused. No silent creation; missing/damaged slots have recovery. Stable retries cannot release a later holder; each write saves deduplicated project/task/actor/opid/before-after audit before its HTTP receipt. Page and named client ship together; repeated uncertain repairs keep their retry. Host answers and independent_approval remain. Approved .261 is an explicit dependency; unknown table actions and second-process authority remain separate. No facts/integration action/provenance/new store/switch.",
   "requirements": [],
   "anchors": [
     "docs/HTTP_DEPLOYMENT.md#coordinators-a-role-and-a-grant-that-lets-an-agent-approve",
@@ -40,14 +40,22 @@
     "http_service.py::EndpointBackend.merge_slot_read",
     "http_service.py::ApiHandler.merge_slot_get",
     "http_service.py::ApiHandler._merge_slot_write",
-    "http_client.py::Client.acquire_merge_slot"
+    "http_client.py::Client.acquire_merge_slot",
+    "http_auth.py::Service._end_coordinator_grants",
+    "http_auth.py::Service.remove_member",
+    "http_authority.py::block_mismatch_denial",
+    "http_service.py::ApiHandler._decides",
+    "http_service.py::ApiHandler.proposals_dispose",
+    "http_authority.py::required_capability"
   ],
   "tests": [
     "tests/test_coordinator_grant.py",
     "tests/test_coordinator_grant_real.py",
     "tests/test_web_merge_slot.py",
     "tests/web_merge_slot_screen.mjs",
-    "tests/web_merge_slot_repair_screen.mjs"
+    "tests/web_merge_slot_repair_screen.mjs",
+    "tests/test_endpoint_authority_block.py",
+    "tests/test_http_proposals.py"
   ],
   "owner": "person:orchestra-coordinator",
   "tags": [

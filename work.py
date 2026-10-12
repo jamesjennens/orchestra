@@ -922,8 +922,9 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
     6 and 7 settings and the project's actor -> principal map (kittrial-5bb.197),
     supplied by the endpoint; all default OFF/absent, so nothing changes for an
     installation that configures nothing. ``owners`` may be a callable, so the
-    registry is read only when a rule needs it. ``verified_web_authority`` says a verified web
-    owner approved through the web route (kittrial-5bb.199)."""
+    registry is read only when a rule needs it. ``verified_web_authority`` says the configured
+    web authority verified an owner, coordinator, or agent with the project grant
+    (kittrial-5bb.199, kittrial-5bb.209)."""
     # Help is recognised anywhere as a standalone token and never touches the
     # native export, the coordination lock or an attachment.
     if help_requested(args):

@@ -2021,6 +2021,14 @@ class Service:
                     raise forbidden('Only a superuser may remove a project owner')
                 self._assert_not_final_owner(user_id)
             del members[user_id]
+            # An account that leaves a project takes its agents' coordinator grants there with
+            # it (kittrial-5bb.261): a grant left on record was effective again, with no new
+            # decision, once an owner added the account back as a coordinator. Lowering a role
+            # keeps the grant on record without effect, as before.
+            for agent in list((self.state.get('agents') or {}).values()):
+                if isinstance(agent, dict) and agent.get('owner') == user_id and isinstance(agent.get('id'), str):
+                    self._end_coordinator_grants(agent, [project_id], principal, request_id,
+                                                 'the account was removed from the project')
             self.store.save()
         return {'project': project_id, 'user': user_id, 'removed': True}
 
@@ -2781,7 +2789,10 @@ class Service:
             if not self._may_coordinate(project_id, agent):
                 raise conflict(self.NOT_A_COORDINATOR)
             stored = self.state.get('coordinator_grants')
-            if stored is not None and (not isinstance(stored, dict) or not isinstance(stored.get(project_id, {}), dict)):
+            # An ABSENT key is every installation before its first grant, and the grant below
+            # creates it. A key that is there with anything but an object, an explicit null
+            # included, is damage (kittrial-5bb.261): null used to pass this check and answer 500.
+            if 'coordinator_grants' in self.state and (not isinstance(stored, dict) or not isinstance(stored.get(project_id, {}), dict)):
                 raise HttpError(503, 'unavailable',
                                 'The record of coordinator grants in the service state is damaged (it is not an object), '
                                 'so no grant was written. An operator must repair the state file')
@@ -3203,7 +3214,7 @@ class Service:
             agent = self._agent(principal.agent_id)
             return self.agent_view(agent, principal)
 
-    def update_agent(self, principal, agent_id, payload):
+    def update_agent(self, principal, agent_id, payload, request_id=None):
         if principal is None or principal.via == 'credential':
             raise forbidden('Session authority required to change an agent')
         with self.store.lock:
@@ -3233,7 +3244,7 @@ class Service:
             # An agent that leaves a project by THIS route leaves its coordinators too (review of
             # kittrial-5bb.209): the grant stayed in the state, unseen by the project's owner, and
             # took effect again when the project was put back, with no owner's decision.
-            self._end_coordinator_grants(agent, left, principal, None,
+            self._end_coordinator_grants(agent, left, principal, request_id,
                                          'the agent\'s projects were changed (PATCH /v1/agents)')
             if changes.get('enabled') is False:
                 self._revoke_agent_credentials(agent)
