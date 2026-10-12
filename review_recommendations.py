@@ -231,14 +231,26 @@ def _standing(issue, state):
 
 def block(issue, state):
     """The additive reader fields: the newest standing recommendation and who recommends."""
-    views = standing(issue, state)
+    every = _standing(issue, state)
+    views = [_view(payload, comment) for _, payload, comment in every[:READ_MAX]]
     # Every entry names who and when. The newest FULL_MAX also carry their whole content
     # (additive): the web service leaves out a recommendation by the author's own person,
     # and then shows the next one, which it could not do from a name and a time.
     brief = lambda view: {'comment_id': view['comment_id'], 'author': view['author'], 'timestamp': view['timestamp']}
-    return {'recommendation': views[0] if views else None,
-            'recommendations': [dict(view) if index < FULL_MAX else brief(view) for index, view in enumerate(views)],
-            'recommended': bool(views)}
+    fields = {'recommendation': views[0] if views else None,
+              'recommendations': [dict(view) if index < FULL_MAX else brief(view) for index, view in enumerate(views)],
+              'recommended': bool(views)}
+    if every:
+        # Additive (kittrial-5bb.164): EVERY standing recommendation, uncapped, as the author
+        # and the operation id of its record, newest first. The list above is cut at READ_MAX
+        # for display; a writer's check must see every one, or a person whose record is not
+        # among the newest READ_MAX gets a second one recorded through another agent, and it
+        # must recognise the record an exact retry names by its operation id. The same records
+        # the list above shows, only not cut. Absent when there is none, as the other
+        # off-state additive fields are: a brief with nothing to add gains no bytes.
+        fields['recommendation_keys'] = [{'author': comment['author'], 'operation_id': payload['operation_id']}
+                                         for _, payload, comment in every]
+    return fields
 
 
 def execute(rows, task, actor, payload, run, operators=None, journal=None):

@@ -189,6 +189,63 @@ class Shared:
         self.assertEqual(201, self.recommend(self.owner, task, contribution, commit).status)
         self.assertEqual(len(self.review(self.owner, task)['recommendations']), 2)
 
+    def stored(self, task):
+        """How many recommendation records the task holds; each backend says it its own way."""
+        raise NotImplementedError
+
+    def plant_many(self, task, contribution, commit, names):
+        """A standing recommendation by each name, in order: the FIRST of them is the oldest."""
+        raise NotImplementedError
+
+    def test_an_exact_retry_under_a_new_key_is_answered_as_recorded(self):
+        """kittrial-5bb.164 item 1: the operation id, not the Idempotency-Key, is the identity."""
+        commit = test_http_agents.COMMIT
+        task, contribution = self.deliver('first', commit)
+        body = {'operation': 'recommend', 'schema_version': 1, 'operation_id': 'rec-retry-new-key',
+                'contribution': contribution, 'commit': commit, 'verdict': 'approve',
+                'summary': SUMMARY, 'items': []}
+        first = self.request('POST', self.base(task) + '/reviews', body, token=self.reviewer, key='retry-key-1')
+        self.assertEqual(201, first.status, first.data)
+        self.assertEqual(self.stored(task), 1)
+        # The same record under a NEW Idempotency-Key is answered as recorded and writes nothing:
+        # a client that lost its key (a reload, a restarted agent) is not told it already did.
+        again = self.request('POST', self.base(task) + '/reviews', body, token=self.reviewer, key='retry-key-2')
+        self.assertEqual(201, again.status, again.data)
+        self.assertIs(True, again.data.get('reconciled'), again.data)
+        first_id = first.data.get('comment_id') or (first.data.get('recommendation') or {}).get('id')
+        again_id = again.data.get('comment_id') or (again.data.get('recommendation') or {}).get('id')
+        self.assertTrue(first_id, first.data)
+        self.assertEqual(again_id, first_id)
+        self.assertEqual(self.stored(task), 1)
+        # The same operation id carrying other content is refused as an operation id already used
+        # (422, as before the person rule), not as a standing recommendation the caller holds.
+        refused = self.request('POST', self.base(task) + '/reviews', dict(body, summary='A second reading.'),
+                               token=self.reviewer, key='retry-key-3')
+        self.assertEqual(422, refused.status, refused.data)
+        self.assertIn('Operation ID already used', refused.data['error']['message'])
+        self.assertEqual(self.stored(task), 1)
+        # Another agent of the same person is still refused while the record stands.
+        plover = self.second_agent()
+        second = self.recommend(plover, task, contribution, commit)
+        self.assertEqual(409, second.status, second.data)
+        self.assertTrue(second.data['error']['message'].endswith(self.ALREADY))
+
+    def test_the_person_check_reads_every_standing_one_not_only_the_newest_twenty(self):
+        """kittrial-5bb.164 item 3: a record past the twentieth the brief shows is still found."""
+        commit = test_http_agents.COMMIT
+        task, contribution = self.deliver('first', commit)
+        plover = self.second_agent()
+        # Twenty standing records by other people, all newer than one by the caller's own person,
+        # so the capped read (20) leaves that one out and only the full list can find it.
+        self.plant_many(task, contribution, commit,
+                        [self.reviewer_actor] + ['other-%02d' % index for index in range(20)])
+        shown = [entry['author'] for entry in self.review(plover, task)['recommendations']]
+        self.assertEqual(len(shown), 20)
+        self.assertNotIn(self.reviewer_actor, shown)
+        answer = self.recommend(plover, task, contribution, commit)
+        self.assertEqual(409, answer.status, answer.data)
+        self.assertEqual(answer.data['error']['detail'], {'recommended_by': self.reviewer_actor})
+
     def test_a_reviewer_who_is_not_the_owner_changes_their_mind_by_requesting_changes(self):
         """From recommending to asking for changes: the earlier recommendation stops counting, for every reader."""
         commit = test_http_agents.COMMIT
@@ -330,6 +387,19 @@ class InProcessTests(Shared, test_http_agents.AgentHarness):
         stored.append({'id': 'rec_planted', 'task_id': task, 'kind': 'recommendation', 'contribution_id': contribution,
                        'commit': commit, 'verdict': 'approve', 'summary': 'planted', 'items': [], 'actor': actor,
                        'created_at': '2099-01-01T00:00:00Z', 'after': len(records)})
+
+    def stored(self, task):
+        return len(self.backend.state.get('recommendations', {}).get(task) or [])
+
+    def plant_many(self, task, contribution, commit, names):
+        """In order of ``names``: the clock rises with the position, as a later write does."""
+        stored = self.backend.state.setdefault('recommendations', {}).setdefault(task, [])
+        records = self.backend.state['contributions'][task]
+        for number, name in enumerate(names):
+            stored.append({'id': 'rec_planted_%02d' % number, 'task_id': task, 'kind': 'recommendation',
+                           'contribution_id': contribution, 'commit': commit, 'verdict': 'approve',
+                           'summary': 'planted %s' % name, 'items': [], 'actor': name,
+                           'created_at': '2099-01-01T00:00:%02dZ' % number, 'after': len(records)})
 
     def reassign(self, task, actor):
         self.backend._task(self.project, task)['assignee'] = actor
@@ -504,8 +574,11 @@ class EndpointTests(Shared, fixes.EndpointCase):
 
     def plant_recommendation(self, task, contribution, commit, actor):
         """A record written natively, as over SSH: only the name rule stood in its way."""
+        self.plant_many(task, contribution, commit, [actor], prefix='planted')
+
+    def _plant(self, task, contribution, commit, actor, operation_id):
         from requirements import canonical_bytes
-        payload = {'schema_version': 1, 'operation': 'recommend', 'operation_id': 'planted-1', 'task': task,
+        payload = {'schema_version': 1, 'operation': 'recommend', 'operation_id': operation_id, 'task': task,
                    'contribution': contribution, 'commit': commit, 'verdict': 'approve', 'summary': 'planted',
                    'items': []}
         rec.validate(payload, task)
@@ -517,6 +590,16 @@ class EndpointTests(Shared, fixes.EndpointCase):
                                     'created_at': '2099-01-01T00:00:00Z',
                                     'text': rec.PREFIX + canonical_bytes(payload).decode()})
         self._canonical(change)
+
+    def stored(self, task):
+        rows = json.loads((self.canonical_root / 'canonical.json').read_text(encoding='utf-8'))['rows']
+        return len([c for c in next(r for r in rows if r['id'] == task)['comments']
+                    if c['text'].startswith(rec.PREFIX)])
+
+    def plant_many(self, task, contribution, commit, names, prefix='planted'):
+        """One comment each, in order: a later comment is a later position, so a newer record."""
+        for number, name in enumerate(names):
+            self._plant(task, contribution, commit, name, '%s-%02d' % (prefix, number))
 
     def reassign(self, task, actor):
         def change(state):

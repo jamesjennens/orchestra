@@ -781,20 +781,39 @@ class InProcessBackend:
         if raw is not None and not isinstance(raw, list):
             raise invalid('Recommendation items must be a list')
         items = self._review_items(raw)
+        actor = payload.get('actor') or principal.actor
+        # An exact retry is answered as recorded whatever the Idempotency-Key (kittrial-5bb.164
+        # item 1): the canonical writer's operation-id identity, not the transport key, is what
+        # says "this is the same recommendation". Same id with other content is refused, as
+        # canonically. Checked before every rule below, as ``review_recommendations.execute`` does.
+        operation_id = payload.get('operation_id')
+        if isinstance(operation_id, str) and operation_id:
+            for stored in (self.state.get('recommendations', {}).get(task['id']) or []):
+                if stored.get('operation_id') != operation_id:
+                    continue
+                if stored.get('actor') == actor and stored.get('contribution_id') == payload.get('contribution') \
+                        and stored.get('commit') == payload.get('commit') \
+                        and stored.get('verdict') == payload.get('verdict') \
+                        and stored.get('summary') == summary.strip() and stored.get('items') == items:
+                    return {'recommendation': self._recommendation_view(stored), 'reconciled': True,
+                            'comment_id': stored['id'], 'task_version': task['version']}
+                # The canonical writer's own sentence, and its 422: the operation id is the
+                # record's identity, so it may not carry other content.
+                raise invalid('Operation ID already used with different payload or actor')
         try:
             plain_text(summary, 'summary')
             for item in items:
                 plain_text(item['text'], 'note text')
         except ValueError as error:
             raise invalid(str(error))
-        actor = payload.get('actor') or principal.actor
         if author_key(actor) in (author_key(contribution['actor']), author_key(task.get('assignee'))):
             raise forbidden('Nobody recommends their own contribution')
-        if author_key(actor) in {author_key(view['author']) for view in self._standing_recommendations(task, records)}:
+        if author_key(actor) in {author_key(record['actor']) for record in self._standing_recommendations(task, records)}:
             raise conflict(rec.ALREADY_RECOMMENDED % actor)
         record = {'id': 'rec_' + secrets.token_hex(6), 'task_id': task['id'], 'kind': 'recommendation',
                   'contribution_id': contribution['id'], 'commit': contribution['commit'],
                   'verdict': payload['verdict'], 'summary': summary.strip(), 'items': items, 'actor': actor,
+                  'operation_id': operation_id,
                   'created_at': now_iso(self.service._now()),
                   # Its place among the review records, so a later decision makes it lapse.
                   'after': len(records)}
@@ -810,7 +829,13 @@ class InProcessBackend:
                 'items': [dict(item) for item in record['items']]}
 
     def _standing_recommendations(self, task, records):
-        """The recommendations that stand for the task's current contribution, newest first."""
+        """The recommendation RECORDS that stand for the current contribution, newest first.
+
+        EVERY standing one, not only those a read shows: the write check and the operation-id
+        retry of :meth:`_recommend` need the whole list (kittrial-5bb.164), and the readers cut
+        it to ``review_recommendations.READ_MAX`` themselves. The records, not views, so a
+        caller has each one's ``operation_id`` as well as its author.
+        """
         from review_workflow import author_key
         current = [r for r in records if r['kind'] == 'contribution']
         if not current or (task.get('review_state') or 'none') != 'awaiting-review' \
@@ -830,8 +855,7 @@ class InProcessBackend:
             if author_key(record['actor']) in excluded:
                 continue
             newest[author_key(record['actor'])] = record
-        ordered = sorted(newest.values(), key=lambda record: (record['after'], record['created_at']), reverse=True)
-        return [self._recommendation_view(record) for record in ordered[:20]]
+        return sorted(newest.values(), key=lambda record: (record['after'], record['created_at']), reverse=True)
 
     @staticmethod
     def _requests(records, open_only=False):
@@ -994,12 +1018,18 @@ class InProcessBackend:
                             'commit': current['commit'], 'base_commit': current['base_commit'],
                             'branch': current.get('branch'), 'summary': current['summary'],
                             'author': current['actor'], 'at': current['created_at']}
-        standing = self._standing_recommendations(task, records)
+        records_standing = self._standing_recommendations(task, records)
+        standing = [self._recommendation_view(record) for record in records_standing]
+        import review_recommendations as rec
         return {'state': task.get('review_state') or 'none', 'contribution': contribution,
                 # Additive (kittrial-5bb.115): advice to approve the current contribution.
                 'recommendation': standing[0] if standing else None,
                 # Each in full: the brief route leaves out the author's own person and shows the next.
-                'recommendations': [dict(r) for r in standing],
+                'recommendations': [dict(r) for r in standing[:rec.READ_MAX]],
+                # Additive (kittrial-5bb.164): EVERY standing one's author and operation id,
+                # uncapped, for the write check (the readers cut the list above for display).
+                'recommendation_keys': [{'author': record['actor'], 'operation_id': record.get('operation_id')}
+                                        for record in records_standing],
                 'requests': requests,
                 'open_requests': sum(1 for r in requests if r['status'] == 'open'),
                 'latest_id': records[-1]['id'] if records else None,
@@ -2493,6 +2523,15 @@ class EndpointBackend:
                                                 'at': entry.get('timestamp')}
                                                for entry in review.get('recommendations') or []
                                                if isinstance(entry, dict)],
+                           # Additive (kittrial-5bb.164): EVERY standing one's author and
+                           # operation id, uncapped, for the write check. ``None`` on an endpoint
+                           # that predates the field, so the caller falls back to the capped
+                           # names above (and an exact retry is then refused as before).
+                           'recommendation_keys': ([{'author': entry.get('author'),
+                                                     'operation_id': entry.get('operation_id')}
+                                                    for entry in review['recommendation_keys']
+                                                    if isinstance(entry, dict)]
+                                                   if isinstance(review.get('recommendation_keys'), list) else None),
                            'revisions': priors + 1 if contribution else 0,
                            'warnings': review.get('warnings') or [],
                            # Additive (kittrial-5bb.52): the machine-readable
@@ -6631,6 +6670,10 @@ class ApiHandler(BaseHTTPRequestHandler):
         review['recommendation'] = newest
         review['recommendations'] = [{'id': entry.get('id'), 'author': entry.get('author'), 'at': entry.get('at')}
                                      for entry in shown]
+        # The uncapped (author, operation id) list is for THIS SERVICE's write check
+        # (kittrial-5bb.164), not for the page: it names records by the author's own person,
+        # which the two lines above leave out of every read. It never leaves the service.
+        review.pop('recommendation_keys', None)
         advice = [review.get('recommendation')] if review.get('recommendation') else []
         advice += review.get('recommendations') or []
         actors += [entry.get('author') for entry in advice]
@@ -6894,12 +6937,29 @@ class ApiHandler(BaseHTTPRequestHandler):
                                     else self.NOT_INDEPENDENT)
                 # One standing recommendation for a contribution from each PERSON
                 # (kittrial-5bb.154): a second one, by the same actor or by another agent of
-                # the same person, is refused and nothing is stored. Read from the brief, so
-                # it is every standing one, whether or not this service counts it.
-                standing = [entry.get('author') for entry in (current.get('review') or {}).get('recommendations') or []
+                # the same person, is refused and nothing is stored. Read from EVERY standing
+                # one, not only the newest ones a read shows (kittrial-5bb.164 item 3): past
+                # that cut a person's record was invisible here and a second one was stored.
+                review_block = current.get('review') or {}
+                keys = review_block.get('recommendation_keys')
+                if not isinstance(keys, list):
+                    # An endpoint from a kit before kittrial-5bb.164: only the capped names are
+                    # readable, and nothing here can tell an exact retry by operation id.
+                    keys = [{'author': entry.get('author')}
+                            for entry in review_block.get('recommendations') or []
+                            if isinstance(entry, dict)]
+                standing = [entry.get('author') for entry in keys
                             if isinstance(entry, dict) and isinstance(entry.get('author'), str)]
                 own = [name for name in standing if not self._independent([name], [actor, ctx.principal.user_id], pid)]
-                if own:
+                # The record this request names by operation id is an exact retry (or the same
+                # id carrying other content) when it is one of the caller's own party's; the
+                # canonical action then answers it as recorded, or refuses it as an operation id
+                # already used, exactly as it did before the person rule (kittrial-5bb.164 item 1).
+                named = payload.get('operation_id')
+                retrying = isinstance(named, str) and named and any(
+                    entry.get('operation_id') == named for entry in keys
+                    if isinstance(entry, dict) and entry.get('author') in own)
+                if own and not retrying:
                     shown = self.service.actor_names(own[:1]).get(own[0]) or own[0]
                     raise conflict(self.ALREADY_RECOMMENDED % shown, {'recommended_by': own[0]})
             if payload.get('operation') == 'respond':

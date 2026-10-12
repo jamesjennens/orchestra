@@ -504,6 +504,22 @@ person; a principal identifies a lane, not necessarily a person. The lifecycle *
 is compared exactly, never folded. The reviewer
 recommendation route keeps its own person rule.
 
+**A recommendation written on the host, under a person's id.** Only somebody running `bd` on
+the host can add a review-recommendation record directly; it is stored as an ordinary comment
+on the task whose text starts `Kind: review-recommendation-v1`. Its author is whatever the
+record carries, so a record written under a person's account id counts as that person's
+recommendation: while it stands, the web service refuses (409, `detail.recommended_by`) that
+person's own recommendation of the same contribution and every recommendation by their
+agents, and the record cannot be withdrawn. **To see it:** `brief TASK --json` (or
+`review TASK`) lists it in `review.recommendations` with its `author`, and the same read's
+`review.recommendation_keys` carries that author beside the record's `operation_id`; `work`
+marks the row's `recommended_by` with that name, and the comment itself is in `history TASK`
+and `comments list TASK`, where its text names its `summary` and `operation_id`. **What
+clears it:** the same as any recommendation — a `request-changes` or `approve` on that
+contribution written afterwards, or a new contribution (a revision), makes it lapse, and the
+person may then recommend again. There is no operation that voids a recommendation; if it
+must stop counting sooner, the reviewer asks for changes instead.
+
 **Assignment trust.** `lifecycle_authors` trusts the **current assignee** for implemented,
 tested and scope. Assignment itself is unrestricted by this rule: a worker can assign a
 task to itself, just as it can claim one. This does not permit that worker to record
