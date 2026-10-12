@@ -2,8 +2,8 @@
   "schema_version": 1,
   "operation_id": "29231d2a-1fb7-4955-8fbd-8459946bda11",
   "key": "projects.coordinator-role-and-grant",
-  "revision": 2,
-  "expected_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "revision": 3,
+  "expected_sha256": "69102739f6c55bb0dacf6ae836ec08df8014e459ce984cd3aab71580915beedc",
   "name": "A coordinator role, and a per-project grant that lets a personal agent approve",
   "aliases": [
     "coordinator role",
