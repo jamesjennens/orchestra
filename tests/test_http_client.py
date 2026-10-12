@@ -81,6 +81,24 @@ class ClientCase(unittest.TestCase):
         self.assertEqual('unauthenticated', caught.exception.code)
         self.assertTrue(caught.exception.request_id)
 
+    def test_the_servers_message_is_escaped_before_it_is_printed(self):
+        """kittrial-5bb.241: HttpApiError carries the SERVER's own message, and a kit program that
+        prints the exception (tools/demonstrate_review_targeting.py prints `{error}`) must not let a
+        server rewrite or reorder the terminal."""
+        error = HttpApiError(422, 'invalid', 'bad \x1b[31m \x07 \u202e \u2028 text', request_id='req-1')
+        said = str(error)
+        for character in ('\x1b', '\x07', '\u202e', '\u2028'):
+            self.assertNotIn(character, said)
+        self.assertIn('\\x1b[31m', said)
+        self.assertIn('\\x07', said)
+        self.assertIn('\\u202e', said)
+        self.assertIn('\\u2028', said)
+        self.assertIn('(invalid)', said)
+        self.assertIn('[req-1]', said)
+        # The data a caller works with is unchanged: only the printed form is escaped.
+        self.assertIn('\x1b', error.message)
+        self.assertEqual('bad \x1b[31m \x07 \u202e \u2028 text', error.message)
+
     def test_cookie_mode_sends_csrf(self):
         self.make_user('alex', 'alex-password-1')
         client = self.client(use_cookie=True)

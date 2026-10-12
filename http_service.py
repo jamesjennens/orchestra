@@ -1078,8 +1078,9 @@ class InProcessBackend:
         # the next-actions answer can hand it to `review_move` as the `work` row does.
         open_requests=[r for r in review['requests'] if r['status']=='open']
         contribution_id=(review['contribution'] or {}).get('id')
-        redelivered=bool(contribution_id) and bool(open_requests) and all(
-            str(r.get('contribution') or '')!=str(contribution_id) for r in open_requests)
+        # The one rule from work.py, not a copy (kittrial-5bb.264 item 4).
+        from work import is_redelivery
+        redelivered=is_redelivery(contribution_id, open_requests)
         return {'pending_change_requests':[r['id'] for r in review['requests'] if r['status']=='open'][:20],
                 'open_items':None if unreadable else (len(last.get('open_items') or []) if last else 0),
                 'blocking_items':None if unreadable else sum(item.get('kind') in ('blocker','dependency')
@@ -2791,7 +2792,10 @@ class EndpointBackend:
         open_items = row.get('open_items', 0)
         blocking_items = attention_blocking_items(row)
         redelivered = row.get('redelivered')
-        return {'pending_change_requests': [value for value in row.get('pending_change_requests') or []
+        raw_pending = row.get('pending_change_requests')
+        if isinstance(raw_pending, (str, bytes)) or not hasattr(raw_pending, '__iter__'):
+            raw_pending = []
+        return {'pending_change_requests': [value for value in raw_pending
                                             if isinstance(value, str)][:20],
                 'open_items': open_items if type(open_items) is int and open_items>=0 else None,
                 'blocking_items':blocking_items if type(blocking_items) is int and blocking_items>=0 else None,
@@ -4624,6 +4628,16 @@ class ApiHandler(BaseHTTPRequestHandler):
                 'is registered once' % (project_id, existing.get('name'),
                                         ' (archived)' if existing.get('archived') else '')))
         if not self.backend.project_exists(project_id):
+            # While a host creation RUNS for this name it is already being made (kittrial-5bb.225
+            # item 6): say that, not that an operator must create it first.
+            import project_creation
+            try:
+                running = project_creation.running_name(self.backend.root)
+            except (OSError, ValueError, AttributeError):
+                running = None
+            if running == project_id:
+                raise conflict('Project %s is being created on this server now; register it when that '
+                               'finishes.' % project_id)
             raise invalid('No canonical project %s exists on the coordination host. An operator creates it there '
                           'first (admin.py add-project %s), then you register it here.' % (project_id, project_id))
 

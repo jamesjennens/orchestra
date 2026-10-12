@@ -354,7 +354,8 @@ class BackupTests(unittest.TestCase):
         self.assertIn('Restored only into the newly created project', out.getvalue())
         self.assertEqual(json.loads((self.destination / self.request_name).read_text()), self.receipt)
 
-    def restore_with_a_failing_provisioning(self, slot_answer, empty_destination=False):
+    def restore_with_a_failing_provisioning(self, slot_answer, empty_destination=False, sidecar_restored=True,
+                                            journal_restored=False, argv_extra=(), **bundle):
         """``restore-new`` whose merge-slot provisioning step fails; returns (order, notice).
 
         The step itself is what fails (``provision_merge_slot`` is patched to raise), so the
@@ -363,11 +364,14 @@ class BackupTests(unittest.TestCase):
         fed to the read ``restore_failure_notice`` makes through ``project_merge_slot_state``).
         ``empty_destination`` makes ``restore_destination_state``'s read answer the destination's
         own merge slot alone: its "empty, working project" shape, which a clone from an empty
-        slotless source has.
+        slotless source has. ``sidecar_restored`` and ``journal_restored`` say what the two steps
+        before the failed one did; ``bundle`` is written into the sidecar as it stands
+        (``operators``/``verifiers`` make it record names this host does not list, ``status``
+        makes it unusable), and ``argv_extra`` adds restore-new flags.
         """
         (self.root / 'deployment.private.json').write_text(
             json.dumps({'password': 'x', 'operators': ['operator']}), encoding='utf-8')
-        self.save_bundle()
+        self.save_bundle(**bundle)
         (self.destination / '.beads').mkdir()
         (self.destination / '.beads' / 'metadata.json').write_text(
             json.dumps({'dolt_server_host': '127.0.0.1', 'dolt_server_port': 13317,
@@ -379,22 +383,25 @@ class BackupTests(unittest.TestCase):
             if list(args)[:2] == ['merge-slot', 'check']:
                 return slot_answer
             if list(args)[:1] == ['list']:
-                return json.dumps({'id': 'destination-merge-slot'}) if empty_destination else 'not rows'
+                # ROWS, not one JSON object: ``restore_destination_state`` reads a JSON list, so a
+                # JSON object made the destination "partial" and the empty-destination test never
+                # reached the "empty, working project" shape it names (kittrial-5bb.240 F2).
+                return json.dumps([{'id': 'destination-merge-slot'}]) if empty_destination else 'not rows'
             return 'restored'
 
         def sidecar(*args, **kwargs):
             order.append('sidecar')
-            return True
+            return sidecar_restored
 
         def journal(*args, **kwargs):
             order.append('journal')
-            return None
+            return {'operation_ids': ['op-restore-1']} if journal_restored else None
 
         def provision(*args, **kwargs):
             order.append('provision')
             raise admin.subprocess.CalledProcessError(1, 'bd', stderr='create refused')
 
-        argv = ['admin.py', '--root', str(self.root), 'restore-new', 'source', 'destination']
+        argv = ['admin.py', '--root', str(self.root), 'restore-new', 'source', 'destination', *argv_extra]
         stderr = io.StringIO()
         with patch.object(sys, 'argv', argv), patch.object(admin, 'root_path', return_value=self.root), \
                 patch.object(admin, 'add_project'), \
@@ -417,7 +424,8 @@ class BackupTests(unittest.TestCase):
         self.assertLess(order.index('sidecar'), order.index('provision'), order)
         self.assertLess(order.index('journal'), order.index('provision'), order)
         self.assertIn('the merge-slot provisioning step failed', notice)
-        self.assertIn('its data, its re-pointed backup target and its journals are in place', notice)
+        self.assertIn('its data and its re-pointed backup target are in place', notice)
+        self.assertIn('its operation journal starts empty because the backup carried no journal snapshot', notice)
         # A genuinely slotless clone: the slot is the one thing left, and merge-create is named.
         self.assertIn('Its merge slot is still missing', notice)
         self.assertIn('merge-create', notice)
@@ -433,7 +441,8 @@ class BackupTests(unittest.TestCase):
             {'available': True, 'holder': None, 'id': 'destination-merge-slot', 'waiters': None}))
         self.assertIn('Its merge slot reads healthy', notice)
         self.assertIn('nothing is left to mend', notice)
-        self.assertIn('its data, its re-pointed backup target and its journals are in place', notice)
+        self.assertIn('its data and its re-pointed backup target are in place', notice)
+        self.assertIn('its operation journal starts empty because the backup carried no journal snapshot', notice)
         self.assertNotIn('was not provisioned', notice)
         self.assertNotIn('names it missing', notice)
         self.assertNotIn('Its merge slot is still missing', notice)
@@ -448,7 +457,8 @@ class BackupTests(unittest.TestCase):
             empty_destination=True)
         self.assertIn('the merge-slot provisioning step failed', notice)
         self.assertIn('Its merge slot is still missing', notice)
-        self.assertIn('its data, its re-pointed backup target and its journals are in place', notice)
+        self.assertIn('its data and its re-pointed backup target are in place', notice)
+        self.assertIn('its operation journal starts empty because the backup carried no journal snapshot', notice)
         self.assertNotIn('nothing was restored', notice)
         self.assertNotIn('NOT restored', notice)
 
@@ -457,10 +467,69 @@ class BackupTests(unittest.TestCase):
         rather than claiming the slot is missing (F1)."""
         _, notice = self.restore_with_a_failing_provisioning('not json at all')
         self.assertIn('Whether it has a usable merge slot could not be read', notice)
-        self.assertIn('its data, its re-pointed backup target and its journals are in place', notice)
+        self.assertIn('its data and its re-pointed backup target are in place', notice)
+        self.assertIn('its operation journal starts empty because the backup carried no journal snapshot', notice)
         self.assertNotIn('Its merge slot is still missing', notice)
         self.assertNotIn('was not provisioned', notice)
         self.assertNotIn('its backup fails', notice)
+
+    def test_the_provisioning_notice_says_the_authority_step_did_not_run(self):
+        """kittrial-5bb.240 F1: ``restore_authority`` runs LAST, so a failed provisioning step
+        skipped it without a word - the "NOT restored: ..." lines a complete restore prints were
+        never printed and the two restore flags re-granted nothing. The notice says so, names what
+        the backup records, and gives the comparison and the commands. It never re-grants."""
+        _, notice = self.restore_with_a_failing_provisioning(
+            json.dumps({'available': False, 'error': 'not found', 'id': 'destination-merge-slot'}),
+            operators=['alice'], verifiers=['carol'])
+        self.assertIn('the operators and verifiers the backup records were NOT compared', notice)
+        self.assertIn('NOT re-granted', notice)
+        self.assertIn('--restore-operators/--restore-verifiers re-granted nothing', notice)
+        self.assertIn('operator allowlist entries this host does not list: alice', notice)
+        self.assertIn('capability verifiers this host does not list: carol', notice)
+        self.assertIn('backup-authority source', notice)
+        self.assertIn('operators add alice', notice)
+        self.assertIn('verifiers add carol', notice)
+        self.assertIn('--actor OPERATOR --reason TEXT', notice)      # the placeholder an add refuses
+        self.assertIn('Re-run restore-new into another unused destination name', notice)
+
+    def test_the_notice_is_silent_about_authority_when_no_recorded_name_is_missing(self):
+        """The skipped step would have printed nothing and re-granted nothing: the notice must not
+        claim it failed to compare names this host already lists (kittrial-5bb.240 F1)."""
+        _, notice = self.restore_with_a_failing_provisioning(
+            json.dumps({'available': False, 'error': 'not found', 'id': 'destination-merge-slot'}),
+            operators=['operator'])
+        self.assertIn('the merge-slot provisioning step failed', notice)
+        self.assertNotIn('NOT compared', notice)
+        self.assertNotIn('were NOT re-granted', notice)
+        self.assertNotIn('backup-authority', notice)
+
+    def test_a_backup_with_no_sidecar_says_what_that_means_for_authority(self):
+        """A legacy backup records no deployment authority, and the note that says so is printed
+        after the step that failed: the notice carries its own true sentence (kittrial-5bb.240 F1)."""
+        _, notice = self.restore_with_a_failing_provisioning(
+            json.dumps({'available': False, 'error': 'not found', 'id': 'destination-merge-slot'}),
+            sidecar_restored=False)
+        self.assertIn('This backup has no coordination sidecar, so it records no operators or verifiers: nothing '
+                      'was compared and nothing was re-granted.', notice)
+
+    def test_a_without_coordination_restore_says_nothing_was_compared(self):
+        """``--without-coordination`` restores no sidecar on purpose, and its closing notes also
+        come after the step that failed: it gets its own true sentence (kittrial-5bb.240 F1)."""
+        _, notice = self.restore_with_a_failing_provisioning(
+            json.dumps({'available': False, 'error': 'not found', 'id': 'destination-merge-slot'}),
+            argv_extra=['--without-coordination'], status='pending')
+        self.assertIn('This was a --without-coordination restore, so no coordination sidecar and no deployment '
+                      'authority were restored, and none was compared or re-granted', notice)
+        self.assertNotIn('backup-authority', notice)
+
+    def test_the_notice_claims_the_journals_only_when_one_was_restored(self):
+        """kittrial-5bb.240 F2: "its journals are in place" was said when the backup had no journal
+        snapshot to restore; with one restored the claim is true and kept."""
+        _, notice = self.restore_with_a_failing_provisioning(
+            json.dumps({'available': False, 'error': 'not found', 'id': 'destination-merge-slot'}),
+            journal_restored=True)
+        self.assertIn('its data, its re-pointed backup target and its journals are in place', notice)
+        self.assertNotIn('starts empty', notice)
 
     def restore_new_output(self):
         argv = ['admin.py', '--root', str(self.root), 'restore-new', 'source', 'destination']
