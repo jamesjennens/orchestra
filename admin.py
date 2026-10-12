@@ -5498,6 +5498,8 @@ def _restore_authority_reason(source,reason):
     if reason is None:return None
     reason=reason.strip()
     if not reason:raise ValueError('--reason must be a sentence, not blank')
+    line_refusal=authority_change_reason_line_refusal(reason)
+    if line_refusal is not None:raise ValueError(line_refusal)
     room=AUTHORITY_CHANGES_REASON_MAX-len('restore-new %s: '%source)
     if len(reason)>room:
         raise ValueError('--reason must be at most %d characters here: the recorded reason also carries '
@@ -5518,7 +5520,11 @@ def merge_authority(root,operators=(),verifiers=(),actor=None,reason=None,source
     and the source. A damaged audit refuses the re-grant because it is an ADD; nothing is changed
     and the caller reports what was not re-granted. A re-grant nobody was named for prints the same
     one stderr sentence the four list commands print (round-2 review item 3), so a bare re-grant is
-    never silently unattributed.
+    never silently unattributed. A re-grant whose ``actor`` is the literal placeholder ``OPERATOR``
+    while no listed operator carries that name is refused the same way and for the same reason as
+    an ``operators add --actor OPERATOR``: it is an ADD, and the audit must not record an operator
+    named OPERATOR (kittrial-5bb.233 finding 5). ``AuthorityPlaceholderRefused`` is raised for it,
+    and the caller reports what was not re-granted rather than failing the finished restore.
     """
     marker=root/'deployment.private.json'
     if not marker.is_file():raise ValueError('Deployment is not installed; run install first')
@@ -5531,6 +5537,11 @@ def merge_authority(root,operators=(),verifiers=(),actor=None,reason=None,source
         cfg=config(root)
         current_operators=stored_operators(cfg)
         current_verifiers=stored_verifiers(cfg)
+        # The same placeholder rule the four list commands apply to an ADD, judged against the list
+        # read UNDER this lock (kittrial-5bb.233 finding 5): a restore cannot re-grant an operator
+        # named OPERATOR with nobody of that name listed, and a removal is not involved here.
+        refusal=authority_change_placeholder_refusal(actor,reason,'add',current_operators)
+        if refusal is not None:raise AuthorityPlaceholderRefused(refusal)
         added_operators=[item for item in wanted_operators if item not in current_operators]
         added_verifiers=[item for item in wanted_verifiers if item not in current_verifiers]
         if not added_operators and not added_verifiers:return [],[]
@@ -5558,7 +5569,9 @@ def merge_verifiers(root,actors,actor=None,reason=None):
     for the lock; this single-list helper stays because it is the writer the lock matrix
     (``tests/test_deployment_config_lock.py``) and the recovery tests (``tests/test_recovery.py``)
     hold directly, and it is what an operator script that merges ONE list uses (round-2 review
-    item 4 asks why it stays: that is why).
+    item 4 asks why it stays: that is why). Its ``actor``/``reason`` are judged by the same
+    placeholder rule as a ``verifiers add``, against the operator list read under the same lock
+    (kittrial-5bb.233 finding 5).
     """
     marker=root/'deployment.private.json'
     if not marker.is_file():raise ValueError('Deployment is not installed; run install first')
@@ -5567,6 +5580,9 @@ def merge_verifiers(root,actors,actor=None,reason=None):
     with deployment_config_lock(root):
         cfg=config(root)
         current=stored_verifiers(cfg)
+        refusal=authority_change_placeholder_refusal(actor,reason,'add',
+                                                     authority_change_listed_operators(cfg))
+        if refusal is not None:raise AuthorityPlaceholderRefused(refusal)
         added=[item for item in wanted if item not in current]
         if not added:return []
         for name in added:
@@ -5597,7 +5613,9 @@ def merge_operators(root,actors,actor=None,reason=None):
     for the lock; this single-list helper stays because it is the writer the lock matrix
     (``tests/test_deployment_config_lock.py``) and the recovery tests (``tests/test_recovery.py``)
     hold directly, and it is what an operator script that merges ONE list uses (round-2 review
-    item 4 asks why it stays: that is why).
+    item 4 asks why it stays: that is why). Its ``actor``/``reason`` are judged by the same
+    placeholder rule as an ``operators add``, against the list read under the same lock
+    (kittrial-5bb.233 finding 5).
     """
     marker=root/'deployment.private.json'
     if not marker.is_file():raise ValueError('Deployment is not installed; run install first')
@@ -5607,6 +5625,8 @@ def merge_operators(root,actors,actor=None,reason=None):
     with deployment_config_lock(root):
         cfg=config(root)
         current=stored_operators(cfg)
+        refusal=authority_change_placeholder_refusal(actor,reason,'add',current)
+        if refusal is not None:raise AuthorityPlaceholderRefused(refusal)
         added=[item for item in wanted if item not in current]
         if not added:return []
         for name in added:
@@ -5776,6 +5796,11 @@ def restore_authority(root,source,restore_operators=False,restore_verifiers=Fals
         # is complete, so this is the same shape as a busy lock: report what was not re-granted
         # and exit 3 rather than fail the whole restore at its last step.
         return authority_not_regranted_damaged_audit(root,source,wanted_operators,wanted_verifiers,error,actor,reason)
+    except AuthorityPlaceholderRefused as error:
+        # The re-grant is an ADD under the literal placeholder OPERATOR, and nobody of that name is
+        # listed: refused for the same reason an `operators add --actor OPERATOR` is
+        # (kittrial-5bb.233 finding 5). The restore is complete, so report it like the two above.
+        return authority_not_regranted_placeholder(root,source,wanted_operators,wanted_verifiers,error,actor,reason)
     if added_operators:
         print('Re-granted operator allowlist entries from the backup (--restore-operators): ' + ', '.join(added_operators))
     if added_verifiers:
@@ -5803,18 +5828,49 @@ def authority_regrant_commands(root,operators,verifiers,actor=None,reason=None):
     return ['admin.py --root %s %s add %s%s'%(shlex.quote(str(root)),kind,shlex.quote(name),flags)
             for kind,actors in (('operators',operators),('verifiers',verifiers)) for name in actors]
 
-def authority_regrant_replace_note(actor=None,reason=None):
+def authority_regrant_replace_note(actor=None,reason=None,listed_operators=None):
     """The line beside printed re-grant commands whose flags are placeholders (finding 3).
 
-    Empty when the restore was given both flags. It is placed between the commands and the
-    ``backup-authority`` line, so the warning still ends with its exit-status sentence.
+    Empty when the restore was given both flags and neither is a placeholder. It is placed between
+    the commands and the ``backup-authority`` line, so the warning still ends with its exit-status
+    sentence. ``listed_operators`` is the deployment's operator list when the caller KNOWS the
+    ``--actor`` was refused as the placeholder ``OPERATOR`` (nobody of that name is listed): then a
+    value that WAS given is named for replacement too, not only an absent one
+    (kittrial-5bb.233 finding 5).
     """
     missing=[]
-    if actor is None:missing.append('%s in --actor'%AUTHORITY_CHANGE_PLACEHOLDER_ACTOR)
-    if reason is None:missing.append('%s in --reason'%AUTHORITY_CHANGE_PLACEHOLDER_REASON)
+    actor_placeholder=(actor is None or
+                       (listed_operators is not None and actor==AUTHORITY_CHANGE_PLACEHOLDER_ACTOR
+                        and actor not in set(listed_operators)))
+    if actor_placeholder:missing.append('%s in --actor'%AUTHORITY_CHANGE_PLACEHOLDER_ACTOR)
+    if reason is None or reason==AUTHORITY_CHANGE_PLACEHOLDER_REASON:
+        missing.append('%s in --reason'%AUTHORITY_CHANGE_PLACEHOLDER_REASON)
     if not missing:return ''
     return ('Replace %s in the command(s) above before running them: these are ADDs, and a literal placeholder is '
             'refused on an add, so the audit does not count an operator named OPERATOR.\n'%' and '.join(missing))
+
+def authority_not_regranted_placeholder(root,source,operators,verifiers,error,actor=None,reason=None):
+    """The warning for a restore whose re-grant named the literal placeholder ``OPERATOR``.
+
+    The re-grant is an ADD, and a literal placeholder is refused on an add (kittrial-5bb.229
+    finding 3), so nothing was re-granted and nothing was written to the audit
+    (kittrial-5bb.233 finding 5). The restore itself is complete: the same shape as a busy lock or
+    a damaged audit, so it names what was not re-granted, the commands to do it by hand - with the
+    placeholder flagged for replacement - and the exit status.
+    """
+    import shlex
+    named=[]
+    if operators:named.append('operators (--restore-operators): '+', '.join(operators))
+    if verifiers:named.append('verifiers (--restore-verifiers): '+', '.join(verifiers))
+    commands=authority_regrant_commands(root,operators,verifiers,actor,reason)
+    return ('WARNING: the restore is complete, but deployment authority the backup records was NOT re-granted: '
+            '%s. %s A re-grant is an ADD, and the literal placeholder is refused on an add, so it does not record '
+            'an operator named OPERATOR. Do not repeat the restore; re-grant them with:\n  %s\n%sCompare what the '
+            'backup records with this installation:\n  admin.py --root %s backup-authority %s\nrestore-new exits '
+            '%d: the restore is complete, but the authority above was NOT re-granted.'
+            %('; '.join(named),error,'\n  '.join(commands),
+              authority_regrant_replace_note(actor,reason,listed_operators=()),
+              shlex.quote(str(root)),shlex.quote(source),RESTORE_AUTHORITY_NOT_REGRANTED))
 
 def authority_not_regranted_damaged_audit(root,source,operators,verifiers,error,actor=None,reason=None):
     """The warning for a restore whose re-grant a DAMAGED authority-changes audit refused.
@@ -6937,9 +6993,17 @@ AUTHORITY_CHANGES_REASON_MAX=400
 #: What a damaged audit file is KEPT BESIDE the runtime as before a fresh history starts, the shape
 #: ``review-writes.audit.json`` already uses (kittrial-5bb.192 review item 1).
 AUTHORITY_CHANGES_DAMAGED='.damaged-'
+#: What a READABLE history is kept beside the runtime as when ``authority-changes-baseline`` replaces
+#: the whole history with a fresh baseline (kittrial-5bb.233 finding 1): a name of its own, never
+#: ``.damaged-``, so the reader does not list a history the kit kept on purpose as a damaged file.
+#: Nothing is deleted, and the command prints the name it used.
+AUTHORITY_CHANGES_REPLACED='.replaced-'
 #: How many free names or temporary names one set-aside tries before it gives up. A name is only
 #: taken when ``os.path.lexists`` says it is free, so this is reached only on a race.
 AUTHORITY_CHANGE_ASIDE_ATTEMPTS=64
+#: Characters reserved in the fresh-baseline reason for the ``.N`` a name collision adds to the kept
+#: name, which is chosen under the lock while the reason's room is checked before it.
+AUTHORITY_CHANGE_ASIDE_SUFFIX_MARGIN=12
 #: The name a copy of a damaged audit leaves behind when the process is killed inside the copy:
 #: ``.authority-changes.audit.json.damaged-<STAMP>[.N].tmp-<16 hex>``. It is the alternation
 #: ``remove_private_write_leftovers`` adds for this audit alone, so the leftover of a kill inside
@@ -6961,10 +7025,58 @@ AUTHORITY_CHANGE_PLACEHOLDER_REASON='TEXT'
 #: replayed within the cap (baseline plus kept would stay at 201 for ever). ``at`` is the moment
 #: it was written, ``operator`` the operator of the change that started the history (null when
 #: that change named nobody) and ``reason`` says why it was written.
-AUTHORITY_CHANGES_BASELINE_FIELDS=frozenset({'at','operator','reason','lists'})
+AUTHORITY_CHANGES_BASELINE_FIELDS=frozenset({'at','operator','reason','lists','rebased_over'})
+#: The fields EVERY baseline carries. ``rebased_over`` is OPTIONAL: a history an earlier revision
+#: wrote holds none, and a history that was never re-based over a mismatch or a damaged file needs
+#: none (kittrial-5bb.233 revision 4, review item 1: the fact is data, not a sentence).
+AUTHORITY_CHANGES_BASELINE_REQUIRED_FIELDS=frozenset({'at','operator','reason','lists'})
+#: The states of the history a re-base or a fold replaced that the field RECORDS. ``agrees``,
+#: ``incomplete`` and ``no-trail`` add nothing: no mismatch and no damage was hidden.
+AUTHORITY_CHANGES_REBASED_STATES=('mismatch','damaged')
+#: The closed field sets of one ``rebased_over`` entry and of the field itself, so a hand-edited
+#: field with an unknown key is refused as damage rather than obeyed.
+AUTHORITY_CHANGES_REBASED_ENTRY_FIELDS=frozenset({'at','operator','kept_as','state','unexplained','names'})
+AUTHORITY_CHANGES_REBASED_FIELDS=frozenset({'entries','dropped'})
+#: How many entries the field keeps WHOLE - the FIRST and the newest seven - and so how many older
+#: entries the ``dropped`` count covers. The first entry is the oldest re-base over a mismatch or a
+#: damaged file, so the fact can never be lost however many re-bases and folds follow, and the field
+#: cannot grow without limit (kittrial-5bb.233 revision 4, review item 2).
+AUTHORITY_CHANGES_REBASED_OVER_MAX=8
+#: How many whole names PER LIST one entry stores, and how long a name may be before its LENGTH is
+#: stored instead. The JSON field has no character budget; capping the NUMBER of names is what stops
+#: a hostile name from bloating the record (kittrial-5bb.233 revision 4, review item 1).
+AUTHORITY_CHANGES_REBASED_NAMES_MAX=4
+AUTHORITY_CHANGES_REBASED_NAME_MAX=200
+#: Where the name the replaced history was kept under begins in the composed reason.
+AUTHORITY_CHANGES_KEPT_CLAUSE='; kept as '
+#: Where the operator's own sentence begins in a composed reason. The verdict on the replaced
+#: history is written after it, and the reason may be squeezed freely: the fact itself lives in the
+#: field (kittrial-5bb.233 revision 4, review items 1 and 2).
+AUTHORITY_CHANGES_OPERATOR_CLAUSE='; the reason given: '
+#: The flag that says the operator has looked at a history the reader calls a mismatch or damaged
+#: and takes the baseline anyway (review item 2b). An ``incomplete`` history - the null-baseline
+#: case the command exists for - needs no flag.
+AUTHORITY_CHANGES_ACCEPT_UNEXPLAINED='--accept-unexplained'
+#: How many names of EACH list a recorded mismatch verdict names at most, and the character budget
+#: those names share (both lists together): the whole reason must stay inside
+#: ``AUTHORITY_CHANGES_REASON_MAX``, and the operator's own ``--reason`` is never truncated.
+AUTHORITY_CHANGES_VERDICT_NAMES_MAX=8
+AUTHORITY_CHANGES_VERDICT_NAMES_BUDGET=64
+#: How much of a damaged audit's own phrase the recorded verdict repeats.
+AUTHORITY_CHANGES_VERDICT_DETAIL_MAX=80
 
 class AuthorityAuditDamaged(ValueError):
     """A list change or a read was refused because the authority-changes audit is unusable."""
+
+class AuthorityPlaceholderRefused(ValueError):
+    """A re-grant named the literal placeholder ``OPERATOR``, and nobody of that name is listed.
+
+    A re-grant is an ADD, and a literal placeholder is refused on an add (kittrial-5bb.229 finding
+    3), so the restore re-grant route refuses it too rather than record OPERATOR as a real operator
+    name (kittrial-5bb.233 finding 5). The restore itself is complete: the caller reports what was
+    not re-granted and exits ``RESTORE_AUTHORITY_NOT_REGRANTED``, exactly as for a busy lock or a
+    damaged audit.
+    """
 
 def authority_change_entry(item):
     """Whether one entry has the shape ``operators``/``verifiers`` add|remove writes.
@@ -6986,7 +7098,7 @@ def authority_change_entry(item):
             and all(item[field] is None or (isinstance(item[field],str) and bool(item[field]))
                     for field in ('operator','reason')))
 
-def authority_change_baseline(lists, operator, reason, at=None):
+def authority_change_baseline(lists, operator, reason, at=None, rebased_over=None):
     """The baseline a NEW history begins with: the operator and verifier lists as they stand now.
 
     It is written (a) by the first change on an installation whose audit holds no baseline, which
@@ -7003,10 +7115,106 @@ def authority_change_baseline(lists, operator, reason, at=None):
     mentions, for good. A REMOVAL is never refused to avoid that: it starts the trail and records
     the list it could not read as ``None``, and the reader then says the trail is incomplete for
     that list. Only an ADD may be refused while a list cannot be read.
+
+    ``rebased_over`` is the field recording the histories this baseline replaced that were a
+    mismatch or were damaged (``authority_change_rebased_over_carry``). It is written only when it
+    holds an entry, so a history that was never re-based over such a history carries NO extra field
+    and an older kit's closed baseline field set still reads it (kittrial-5bb.233 revision 4).
     """
-    return {'at':at or utc_stamp(),'operator':operator,'reason':reason,
+    record={'at':at or utc_stamp(),'operator':operator,'reason':reason,
             'lists':{noun:(None if (lists or {}).get(noun) is None else sorted(lists[noun]))
                      for noun in AUTHORITY_CHANGES_LISTS}}
+    if rebased_over:record['rebased_over']=rebased_over
+    return record
+
+def authority_change_rebased_name(name):
+    """One unexplained name as ``rebased_over`` stores it: WHOLE, or its length when it is huge.
+
+    The field has no character budget, so a name is stored in full. A name longer than
+    ``AUTHORITY_CHANGES_REBASED_NAME_MAX`` is stored as the sentence saying how long it is instead,
+    so a hostile ``--actor`` cannot make one record unbounded (kittrial-5bb.233 revision 4).
+    """
+    if len(name)<=AUTHORITY_CHANGES_REBASED_NAME_MAX:return name
+    return '%d-character name not shown'%len(name)
+
+def authority_change_rebased_entry(verdict,at,operator,kept_as):
+    """The ``rebased_over`` entry for the history a re-base or a fold replaced, or ``None``.
+
+    ``None`` when the verdict is ``agrees``, ``incomplete``, ``no-trail`` (or no verdict at all):
+    those replaced histories hid nothing. A ``mismatch`` records how many names the trail did not
+    explain per list and the first few of them whole, and a ``damaged`` history records the same
+    shape with zero names. ``kept_as`` is the file the replaced history was kept under, or ``None``
+    when nothing was kept (a fold replaces the baseline in place, so it keeps nothing).
+    """
+    state=(verdict or {}).get('state')
+    if state not in AUTHORITY_CHANGES_REBASED_STATES:return None
+    unexplained={};names={}
+    for noun in AUTHORITY_CHANGES_LISTS:
+        listed=list((verdict or {}).get('unexplained',{}).get(noun) or [])
+        unexplained[noun]=len(listed)
+        names[noun]=[authority_change_rebased_name(name)
+                     for name in listed[:AUTHORITY_CHANGES_REBASED_NAMES_MAX]]
+    return {'at':at,'operator':operator,'kept_as':kept_as,'state':state,
+            'unexplained':unexplained,'names':names}
+
+def authority_change_rebased_over_bounded(entries,dropped):
+    """The field holding at most ``AUTHORITY_CHANGES_REBASED_OVER_MAX`` entries, chronological.
+
+    More entries than that keep the FIRST and the newest seven whole and count the omitted middle
+    ones in ``dropped``. The first entry is never dropped, so the fact cannot be lost, and the count
+    grows instead of the field (kittrial-5bb.233 revision 4, review item 2). ``dropped`` covers every
+    entry no longer listed, including ones an earlier bound already omitted.
+    """
+    entries=[dict(entry) for entry in entries]
+    if len(entries)<=AUTHORITY_CHANGES_REBASED_OVER_MAX:
+        return {'entries':entries,'dropped':dropped}
+    keep=[entries[0]]+entries[-(AUTHORITY_CHANGES_REBASED_OVER_MAX-1):]
+    return {'entries':keep,'dropped':dropped+len(entries)-len(keep)}
+
+def authority_change_rebased_over_carry(rebased_over,entry=None):
+    """The field to WRITE: the existing one copied forward, with ``entry`` appended when there is one.
+
+    Both a re-base and a fold copy the field forward UNCHANGED and append; nothing squeezes it. An
+    agreeing or incomplete re-base appends nothing, so the field is the previous one. ``None`` when
+    there is nothing to record at all.
+    """
+    entries=list((rebased_over or {}).get('entries') or [])
+    dropped=int((rebased_over or {}).get('dropped') or 0)
+    if entry is not None:entries.append(entry)
+    if not entries:return None
+    return authority_change_rebased_over_bounded(entries,dropped)
+
+def authority_change_rebased_over_record(field):
+    """Whether ``field`` is a ``rebased_over`` this kit writes.
+
+    Strict, in the same spirit as ``authority_change_entry`` and
+    ``authority_change_baseline_record``: the field sets are closed, the times are this kit's UTC
+    stamps, the states are the two it records, the counts are non-negative integers, the names are
+    whole non-empty strings no longer than the store limit, and the list bounds hold - at most the
+    entry cap, and at most the name cap per list with no more shown names than the count. A
+    hand-edited record that fails any of it is refused as damage rather than obeyed.
+    """
+    if not isinstance(field,dict) or set(field)!=AUTHORITY_CHANGES_REBASED_FIELDS:return False
+    if type(field['dropped']) is not int or field['dropped']<0:return False
+    entries=field['entries']
+    if not isinstance(entries,list) or not 1<=len(entries)<=AUTHORITY_CHANGES_REBASED_OVER_MAX:return False
+    for entry in entries:
+        if not isinstance(entry,dict) or set(entry)!=AUTHORITY_CHANGES_REBASED_ENTRY_FIELDS:return False
+        if not utc_timestamp(entry['at']):return False
+        if entry['operator'] is not None and not (isinstance(entry['operator'],str) and entry['operator']):return False
+        if entry['kept_as'] is not None and not (isinstance(entry['kept_as'],str) and entry['kept_as']):return False
+        if entry['state'] not in AUTHORITY_CHANGES_REBASED_STATES:return False
+        unexplained=entry['unexplained'];names=entry['names']
+        if not isinstance(unexplained,dict) or set(unexplained)!=set(AUTHORITY_CHANGES_LISTS):return False
+        if any(type(count) is not int or count<0 for count in unexplained.values()):return False
+        if not isinstance(names,dict) or set(names)!=set(AUTHORITY_CHANGES_LISTS):return False
+        for noun in AUTHORITY_CHANGES_LISTS:
+            shown=names[noun]
+            if not isinstance(shown,list) or len(shown)>AUTHORITY_CHANGES_REBASED_NAMES_MAX:return False
+            if len(shown)>unexplained[noun]:return False
+            if any(not isinstance(name,str) or not name or len(name)>AUTHORITY_CHANGES_REBASED_NAME_MAX
+                   for name in shown):return False
+    return True
 
 def authority_change_baseline_record(item):
     """Whether ``item`` is a baseline this kit writes.
@@ -7015,13 +7223,17 @@ def authority_change_baseline_record(item):
     (UNKNOWN: the list could not be read when that history began, kittrial-5bb.229 rev-2 item 1);
     the same strictness ``authority_change_entry`` applies to an entry, so a hand-written baseline
     this kit does not write is "not the history this kit writes" rather than something silently
-    obeyed.
+    obeyed. ``rebased_over`` is optional - an earlier revision wrote none - and when it is present
+    it must be a field this kit writes (``authority_change_rebased_over_record``), so a hand-edited
+    field with a bad state, a bad count or an over-long list is refused as damage.
     """
-    if not isinstance(item,dict) or set(item)!=AUTHORITY_CHANGES_BASELINE_FIELDS:return False
+    if not isinstance(item,dict) or not AUTHORITY_CHANGES_BASELINE_REQUIRED_FIELDS<=set(item):return False
+    if set(item)-AUTHORITY_CHANGES_BASELINE_FIELDS:return False
     if not utc_timestamp(item['at']):return False
     if item['operator'] is not None and not (isinstance(item['operator'],str) and item['operator']):return False
     if not (isinstance(item['reason'],str) and item['reason']) or len(item['reason'])>AUTHORITY_CHANGES_REASON_MAX:
         return False
+    if 'rebased_over' in item and not authority_change_rebased_over_record(item['rebased_over']):return False
     lists=item['lists']
     if not isinstance(lists,dict) or set(lists)!=set(AUTHORITY_CHANGES_LISTS):return False
     return all(lists[noun] is None or (isinstance(lists[noun],list)
@@ -7075,16 +7287,16 @@ def read_authority_changes(root):
         return [],None,('unreadable','cannot be read: %s'%error)
     return authority_changes_document(record)
 
-def authority_change_damaged_files(root):
-    """The ``.damaged-*`` audit files kept beside this runtime, oldest name first. Reads only.
+def authority_change_kept_files(root,marker):
+    """The ``<audit><marker>*`` files kept beside this runtime, oldest name first. Reads only.
 
-    The kit never removes one (round-2 review item 2), so the reader lists them: nothing else
-    would tell an operator that the history they are reading was restarted beside a kept file.
-    Only a REGULAR, NON-SYMLINK file is one kept here (kittrial-5bb.229 finding 1): ``is_file``
-    follows a symlink, so a ``.damaged-*`` link to any outside file used to read as bytes the
-    kit had kept inside the runtime.
+    ``marker`` is ``AUTHORITY_CHANGES_DAMAGED`` for the files a damage was set aside under and
+    ``AUTHORITY_CHANGES_REPLACED`` for the readable histories ``authority-changes-baseline``
+    replaced (kittrial-5bb.233 revision 2, review item 2c). Only a REGULAR, NON-SYMLINK file is
+    one kept here (kittrial-5bb.229 finding 1): ``is_file`` follows a symlink, so a ``.damaged-*``
+    link to any outside file used to read as bytes the kit had kept inside the runtime.
     """
-    prefix=AUTHORITY_CHANGES_AUDIT+AUTHORITY_CHANGES_DAMAGED
+    prefix=AUTHORITY_CHANGES_AUDIT+marker
     try:names=sorted(os.listdir(str(root)))
     except OSError:return []
     kept=[]
@@ -7095,19 +7307,39 @@ def authority_change_damaged_files(root):
         if stat.S_ISREG(mode):kept.append(name)
     return kept
 
-def authority_change_aside_name(root):
-    """The name a damaged audit would be kept under right now: a real stamp, free at this moment.
+def authority_change_damaged_files(root):
+    """The ``.damaged-*`` audit files kept beside this runtime, oldest name first. Reads only.
 
+    The kit never removes one (round-2 review item 2), so the reader lists them: nothing else
+    would tell an operator that the history they are reading was restarted beside a kept file.
+    """
+    return authority_change_kept_files(root,AUTHORITY_CHANGES_DAMAGED)
+
+def authority_change_replaced_files(root):
+    """The ``.replaced-*`` histories kept beside this runtime, oldest name first. Reads only.
+
+    ``authority-changes-baseline`` keeps the readable history it replaces under one of these
+    (kittrial-5bb.233 finding 1). They are NOT damaged files and the reader must not call them so;
+    it lists them under their own report key beside ``damaged_files`` (revision 2, review item 2c).
+    """
+    return authority_change_kept_files(root,AUTHORITY_CHANGES_REPLACED)
+
+
+def authority_change_aside_name(root,marker=AUTHORITY_CHANGES_DAMAGED):
+    """The name the audit would be kept under right now: a real stamp, free at this moment.
+
+    ``marker`` is ``AUTHORITY_CHANGES_DAMAGED`` for a damaged file and ``AUTHORITY_CHANGES_REPLACED``
+    for a readable history ``authority-changes-baseline`` keeps (kittrial-5bb.233 finding 1).
     "Free" is ``os.path.lexists``, not ``Path.exists`` (kittrial-5bb.229 finding 1): a DANGLING
     symlink at the name is taken, where ``exists`` read it as free and the fallback copy then
     followed the link and wrote the damaged bytes outside the runtime.
     """
     from datetime import datetime,timezone
     stamp=datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
-    aside=root/('%s%s%s'%(AUTHORITY_CHANGES_AUDIT,AUTHORITY_CHANGES_DAMAGED,stamp))
+    aside=root/('%s%s%s'%(AUTHORITY_CHANGES_AUDIT,marker,stamp))
     number=1
     while os.path.lexists(str(aside)):
-        aside=root/('%s%s%s.%d'%(AUTHORITY_CHANGES_AUDIT,AUTHORITY_CHANGES_DAMAGED,stamp,number));number+=1
+        aside=root/('%s%s%s.%d'%(AUTHORITY_CHANGES_AUDIT,marker,stamp,number));number+=1
     return aside
 
 def authority_change_aside_hint(root):
@@ -7207,6 +7439,13 @@ def authority_change_copy_bytes(source,destination):
         candidate=os.path.join(directory,'.%s.tmp-%s'%(destination.name,secrets.token_hex(8)))
         try:descriptor=os.open(candidate,flags,0o600)
         except FileExistsError:continue
+        except OSError as error:
+            # A runtime directory that cannot be written (a read-only filesystem, mode 000, a full
+            # disk) used to leave a Python traceback here (kittrial-5bb.233 revision 2, review item
+            # 3.3). A sentence names the file and nothing-changed instead.
+            raise AuthorityAuditDamaged(
+                'The kit could not write a copy of %s beside it in %s: %s. Nothing was changed.'
+                %(source,destination.parent,error)) from None
         temporary=candidate;break
     if temporary is None:
         raise AuthorityAuditDamaged(
@@ -7257,6 +7496,219 @@ def authority_change_keep_bytes(root,path):
         'The authority-changes audit %s is damaged, and the kit could not keep its bytes beside the runtime: every '
         'one of the %d names it tried was taken. Nothing was changed. Move the file aside by hand (%s) and run the '
         'command again.'%(root/AUTHORITY_CHANGES_AUDIT,AUTHORITY_CHANGE_ASIDE_ATTEMPTS,authority_change_aside_hint(root)))
+
+def authority_change_keep_previous(root):
+    """Keep the CURRENT audit beside the runtime under a dated ``.replaced-*`` name; return it, or ``None``.
+
+    ``authority-changes-baseline`` writes a FRESH history, and the entries of the history it replaces
+    describe changes made BEFORE the new baseline, so replaying them on top of it would corrupt the
+    replay (kittrial-5bb.233 finding 1). Nothing is deleted: the old file is hard-linked (or copied
+    where the filesystem has no hard links) to a free ``.replaced-<stamp>`` name FIRST, and only then
+    does the atomic write replace the audit path, so the path is never absent. The name is never
+    ``.damaged-``: the reader lists those as files a damage was set aside under, and this history was
+    readable. An absent audit file is not a history to keep, so this returns ``None`` for it.
+    """
+    path=root/AUTHORITY_CHANGES_AUDIT
+    if not os.path.lexists(str(path)):return None
+    for _ in range(AUTHORITY_CHANGE_ASIDE_ATTEMPTS):
+        aside=authority_change_aside_name(root,AUTHORITY_CHANGES_REPLACED)
+        try:
+            os.link(path,aside)
+        except FileExistsError:
+            continue
+        except OSError:
+            if authority_change_copy_bytes(path,aside):return aside
+            continue
+        else:
+            return aside
+    raise AuthorityAuditDamaged(
+        'The authority-changes audit %s could not be kept beside the runtime before a fresh baseline replaced it: '
+        'every one of the %d names it tried was taken. Nothing was changed. Move the file aside by hand (mv %s %s) '
+        'and run the command again.'
+        %(path,AUTHORITY_CHANGE_ASIDE_ATTEMPTS,AUTHORITY_CHANGES_AUDIT,
+          authority_change_aside_name(root,AUTHORITY_CHANGES_REPLACED)))
+
+def authority_change_verdict_names(names,budget=AUTHORITY_CHANGES_VERDICT_NAMES_BUDGET):
+    """The first names that fit ``budget`` characters and ``AUTHORITY_CHANGES_VERDICT_NAMES_MAX``.
+
+    The whole reason must stay inside ``AUTHORITY_CHANGES_REASON_MAX``, so the recorded name list is
+    what is bounded: whole names are taken up to the budget and the rest is counted as ``(+N more)``
+    rather than a name being cut in half (revision 2, review item 2a). At LEAST one name of a list
+    is always named: when even the first name does not fit the shared budget, the sentence says that
+    first name's length and how many there are instead - ``1 name of 70 characters not shown`` - so a
+    verdict can never read as names with none of them, which is what ``operators: (+1 more)`` did
+    (revision 3, review item 3.1). A list that reaches a budget nearly spent by an earlier list says
+    the same two facts in fewer words (``70-char name, +11``), so the shared budget still bounds the
+    total.
+    """
+    if not names:return ''
+    kept=[];used=0
+    for name in names:
+        if len(kept)>=AUTHORITY_CHANGES_VERDICT_NAMES_MAX:break
+        extra=len(name)+(2 if kept else 0)
+        if used+extra>budget:break
+        kept.append(name);used+=extra
+    if not kept:
+        note='1 name of %d characters not shown'%len(names[0])
+        if len(names)>1:note+=', (+%d more)'%(len(names)-1)
+        if budget<=0 or len(note)<=budget:return note
+        # The budget this list has left cannot hold the whole sentence: say the same two facts in
+        # the room there is, so the shared budget still bounds the total (revision 3, item 3.1).
+        short='%d-char name'%len(names[0])
+        if len(names)>1:short+=', +%d'%(len(names)-1)
+        return short
+    left=len(names)-len(kept)
+    if left:kept.append('(+%d more)'%left)
+    return ', '.join(kept)
+
+def authority_change_verdict_lists(verdict,budget=AUTHORITY_CHANGES_VERDICT_NAMES_BUDGET):
+    """The per-list names a mismatch verdict names, in ``AUTHORITY_CHANGES_LISTS`` order."""
+    parts=[];remaining=budget
+    for noun in AUTHORITY_CHANGES_LISTS:
+        names=verdict.get('unexplained',{}).get(noun) or []
+        if not names:continue
+        rendered=authority_change_verdict_names(names,remaining)
+        parts.append('%s: %s'%(noun,rendered))
+        remaining=max(0,remaining-len(rendered))
+    return '; '.join(parts)
+
+def authority_change_verdict_detail(verdict):
+    """The damage phrase a damaged verdict repeats, bounded so the reason still fits."""
+    detail='%s'%(verdict.get('detail') or '')
+    if len(detail)>AUTHORITY_CHANGES_VERDICT_DETAIL_MAX:
+        detail=detail[:AUTHORITY_CHANGES_VERDICT_DETAIL_MAX]+'...'
+    return detail
+
+def authority_change_verdict_reason(verdict,kept_name=None,budget=AUTHORITY_CHANGES_VERDICT_NAMES_BUDGET):
+    """The verdict on the history a fresh baseline replaced, as the baseline's ``reason`` records it.
+
+    It names the state, the names the trail did not explain per list when it was a mismatch, and the
+    name the replaced history was kept under. This is the operator-readable SENTENCE; the durable
+    record is the baseline's ``rebased_over`` field, which nothing squeezes and which the reader
+    reads (kittrial-5bb.233 revision 4, review items 1 and 2). The reason text is no longer parsed
+    by the kit, so no marker and no state phrase is used to find it: the ``; the history this
+    replaced`` wording is only how the sentence reads.
+    """
+    state=verdict['state']
+    if state=='mismatch':
+        note='; the history this replaced did NOT agree with the lists (mismatch)'
+        lists=authority_change_verdict_lists(verdict,budget)
+        if lists:note+=': '+lists
+    elif state=='incomplete':
+        note='; the history this replaced read as incomplete: a list could not be compared'
+    elif state=='damaged':
+        note='; the history this replaced was DAMAGED: %s'%authority_change_verdict_detail(verdict)
+    elif state=='no-trail':
+        note='; the history this replaced did not exist: there was no audit file'
+    else:
+        note='; the history this replaced agreed with the lists'
+    if kept_name is not None:note+=AUTHORITY_CHANGES_KEPT_CLAUSE+kept_name
+    return note
+
+def authority_change_verdict_phrase(verdict):
+    """The plain sentence for stderr and the JSON report: what the replaced history read as."""
+    state=verdict['state']
+    if state=='mismatch':
+        lists=authority_change_verdict_lists(verdict)
+        return ('the history this replaced does NOT agree with the current lists (mismatch)'
+                +(': '+lists if lists else ''))
+    if state=='incomplete':
+        return 'the history this replaced read as incomplete: a list could not be compared'
+    if state=='damaged':
+        return 'the history this replaced was DAMAGED: %s'%authority_change_verdict_detail(verdict)
+    if state=='no-trail':
+        return 'there was no history to replace'
+    return 'the history this replaced agreed with the lists'
+
+def authority_change_rebaseline_reason(operator,reason,kept_name=None,verdict=None):
+    """Why ``authority-changes-baseline`` wrote a fresh baseline, and what it replaced.
+
+    The baseline's own ``reason`` says why the history was restarted: it names the command, the
+    operator who ran it, the operator's own sentence and the reader's verdict on the history being
+    replaced (``authority_change_baseline_verdict``) - its state, the names a mismatch left
+    unexplained per list and the name the history was kept under. The ``operator`` field carries the
+    same operator.
+
+    This is the SENTENCE an operator reads, and it may be squeezed freely: the durable record of a
+    mismatch or a damaged history is the baseline's ``rebased_over`` field, which the kit copies
+    forward and the reader reads whatever this text says (kittrial-5bb.233 revision 4, review items 1
+    and 2). Revision 3's carrying of a previous re-base note inside this text is REMOVED, and so is
+    the ``--reason`` refusal that guarded it: nothing is parsed out of the reason any more.
+    """
+    note=('baseline: authority-changes-baseline by %s started a fresh history from the operator and verifier lists '
+          'as they stood then'%operator)
+    if reason:note+=AUTHORITY_CHANGES_OPERATOR_CLAUSE+reason
+    if verdict is not None:note+=authority_change_verdict_reason(verdict,kept_name)
+    elif kept_name is not None:note+=AUTHORITY_CHANGES_KEPT_CLAUSE+kept_name
+    return note
+
+def authority_change_rebaseline_room(operator,verdict,kept_name):
+    """How many characters the operator's ``--reason`` may take, verdict and kept name recorded.
+
+    The composed reason is what ``authority_change_baseline_record`` reads back, so this is exact:
+    the operator's own sentence is never truncated, and a longer one is refused. A margin covers the
+    ``.N`` a name collision adds to the kept name, which is only known under the lock. Nothing a
+    previous re-base left behind is in the reason any more, so this is the room the operator's own
+    sentence really has (kittrial-5bb.233 revision 4, review items 1, 2 and 3.2).
+    """
+    without=authority_change_rebaseline_reason(operator,None,kept_name,verdict)
+    return (AUTHORITY_CHANGES_REASON_MAX-len(without)-len(AUTHORITY_CHANGES_OPERATOR_CLAUSE)
+            -AUTHORITY_CHANGE_ASIDE_SUFFIX_MARGIN)
+
+def authority_change_reason_room_refusal(room):
+    """The sentence for a ``--reason`` that does not fit, NEVER a negative bound.
+
+    ``room`` can be zero or negative when the operator's own name and the verdict already take the
+    whole reason: the old wording then read ``--reason must be at most -18 characters here``, which
+    is nonsense (kittrial-5bb.233 revision 4, review item 3.2). At or below zero the refusal says so
+    in words and names the one thing that can be changed.
+    """
+    if room<=0:
+        return ("--reason cannot be recorded here: the baseline's own sentence, naming the verdict on the history it "
+                "replaces and the operator who ran the command, already needs all %d characters the reason may take, "
+                "so no operator sentence fits. The room is measured with the operator's own name, so a shorter "
+                "operator name is what makes it fit."%AUTHORITY_CHANGES_REASON_MAX)
+    return ('--reason must be at most %d characters here: the baseline reason also records the verdict on the history '
+            'it replaces, the operator and the history it keeps'%room)
+
+def authority_change_unexplained_refusal(root,verdict,accept_unexplained):
+    """The sentence refusing a fresh baseline over a mismatch or a damaged history, or ``None``.
+
+    The command is not a way to make a warning go away: it replaces the whole history, so without
+    an explicit statement that the operator has looked it refuses when the history it would replace
+    does not agree with the lists, or cannot be read at all (revision 2, review items 1, 2a and 2b).
+    An ``incomplete`` history - the null-baseline case the command exists for - is not refused.
+    """
+    state=verdict['state']
+    if state in ('agrees','incomplete','no-trail'):return None
+    if accept_unexplained:return None
+    path=root/AUTHORITY_CHANGES_AUDIT
+    prospective=authority_change_aside_name(root,AUTHORITY_CHANGES_REPLACED).name
+    if state=='damaged':
+        return ('The authority-changes audit %s is damaged: %s. Nothing was changed. Taking a fresh baseline would '
+                'keep it beside the runtime as %s and start a history that no longer says it could not be read. Move '
+                'it aside by hand (%s) and run the command again, or re-run with %s to say you have looked at the '
+                'damaged file and take the baseline anyway.'
+                %(path,authority_change_verdict_detail(verdict),prospective,
+                  authority_change_aside_hint(root),AUTHORITY_CHANGES_ACCEPT_UNEXPLAINED))
+    return ('The authority-changes audit %s does not agree with the current operator and verifier lists: %s. '
+            'Nothing was changed. Taking a fresh baseline would keep that history beside the runtime as %s and start '
+            'a history that no longer says the mismatch happened. Read it first (admin.py --root %s '
+            'authority-changes), then re-run with %s to say you have looked and take the baseline anyway.'
+            %(path,authority_change_verdict_phrase(verdict),prospective,root,
+              AUTHORITY_CHANGES_ACCEPT_UNEXPLAINED))
+
+
+def authority_change_rebaseline_problem_refusal(problem):
+    """The sentence ``authority-changes-baseline`` refuses an unreadable list with.
+
+    Recording a list nobody could read as ``null`` (UNKNOWN) is exactly the state the command exists
+    to leave behind, so it refuses instead of taking a baseline that would still be incomplete
+    (kittrial-5bb.233 finding 1).
+    """
+    return ('authority-changes-baseline needs the current operator and verifier lists, and they cannot both be '
+            'read: %s. Nothing was changed. Repair deployment.private.json (or restore the value) and run the '
+            'command again.'%problem)
 
 def set_aside_damaged_authority_changes(root,damage):
     """Keep the DAMAGED audit's bytes beside the runtime under a dated name; return the path kept.
@@ -7313,9 +7765,14 @@ def authority_change_baseline_reason(aside=None,dropped=0,late=False,unknown=())
 
     ``unknown`` names the lists this baseline holds as ``null`` because they could not be read
     (kittrial-5bb.229 rev-2 item 1). The sentence then says so and says the trail is incomplete for
-    them, so the one place the closed entry field set can record WHY - the baseline's reason -
-    carries it. With the cap also folding entries in, the wording claims only the lists it could
-    read: the fold cannot invent the names a list held when nobody could read it.
+    them. With the cap also folding entries in, the wording claims only the lists it could read: the
+    fold cannot invent the names a list held when nobody could read it. The unknown-list clause is
+    said ONCE, and the cap wording does not claim the trail leads to a list it cannot
+    (kittrial-5bb.233 finding 6).
+
+    Nothing about a previous re-base is carried in this sentence any more: the cap fold copies the
+    baseline's ``rebased_over`` field forward instead, so the fact is data and this text may be
+    squeezed freely (kittrial-5bb.233 revision 4, review items 1 and 3.1).
     """
     if dropped:
         if unknown:
@@ -7326,14 +7783,16 @@ def authority_change_baseline_reason(aside=None,dropped=0,late=False,unknown=())
             note=('baseline: the lists as the trail held them where it was cut to its %d-entry cap; the %d entr%s '
                   'dropped are folded in here, so the trail still leads to the lists'
                   %(AUTHORITY_CHANGES_MAX,dropped,'y' if dropped==1 else 'ies'))
-    elif late:
-        note=('baseline: the lists as they stand at this change; this history held entries but no baseline, so the '
-              'trail before it is incomplete for these lists and nothing recorded what they were when it began')
     else:
-        note='baseline: the lists as they stood when this history began'
-    if unknown:
-        note+=('; the %s list could not be read, so the baseline holds null (UNKNOWN) for it and the trail is '
-               'incomplete for it'%' and '.join(unknown))
+        if late:
+            note=('baseline: the lists as they stand at this change; this history held entries but no baseline, so '
+                  'the trail before it is incomplete for these lists and nothing recorded what they were when it '
+                  'began')
+        else:
+            note='baseline: the lists as they stood when this history began'
+        if unknown:
+            note+=('; the %s list could not be read, so the baseline holds null (UNKNOWN) for it and the trail is '
+                   'incomplete for it'%' and '.join(unknown))
     if aside is not None:
         note+='; the previous audit was damaged and was kept beside the runtime as %s'%aside.name
     return note
@@ -7401,6 +7860,9 @@ def record_authority_change(root,noun,action,actor,operator,reason):
         aside=set_aside_damaged_authority_changes(root,damage)
         reason=authority_change_set_aside_reason(aside,reason)
         entries=[];baseline=None
+    # The history this change and any fold REPLACE, as it stood before the change: its verdict and
+    # its own rebased_over field are what the fold copies and appends to (revision 4, items 1 and 2).
+    replaced_entries=list(entries);replaced_baseline=baseline
     entry={'at':utc_stamp(),'operator':operator,'list':noun,'actor':actor,'change':action,'reason':reason}
     if baseline is None:
         listed,problem=authority_changes_current_lists(root)
@@ -7417,17 +7879,31 @@ def record_authority_change(root,noun,action,actor,operator,reason):
     if dropped>0:
         # The oldest entries must go, and a trail cut at the head can no longer be replayed: the
         # state they recorded is carried forward in a fresh baseline, and the entries over the cap
-        # are the newest ones (round-2 review item 1).
+        # are the newest ones (round-2 review item 1). A list the baseline holds as null (UNKNOWN)
+        # stays null through the fold, so neither the baseline's reason nor this warning may claim
+        # the trail still leads to it (kittrial-5bb.233 finding 6).
+        unknown=[name for name in AUTHORITY_CHANGES_LISTS if baseline['lists'].get(name) is None]
+        # The fold computes the READER's verdict on the history it replaces and appends an entry for
+        # it when that history was a mismatch or damaged, and it copies the replaced baseline's
+        # rebased_over field forward UNCHANGED either way: an audit that was ever re-based over a
+        # mismatch says so for good, as data, however many folds follow (revision 4, review items 1
+        # and 2; the revision-3 note-carrying inside the reason is gone).
+        listed,problem=authority_changes_current_lists(root)
+        verdict=authority_change_baseline_verdict(replaced_entries,replaced_baseline,None,listed)
+        rebased=authority_change_rebased_over_carry(
+            (replaced_baseline or {}).get('rebased_over'),
+            authority_change_rebased_entry(verdict,entry['at'],operator,None))
         baseline=authority_change_baseline(authority_change_fold(baseline,history[:dropped]),operator,
-                                           authority_change_baseline_reason(
-                                               dropped=dropped,
-                                               unknown=[name for name in AUTHORITY_CHANGES_LISTS
-                                                        if baseline['lists'].get(name) is None]),
-                                           at=entry['at'])
+                                           authority_change_baseline_reason(dropped=dropped,unknown=unknown),
+                                           at=entry['at'],rebased_over=rebased)
         history=history[dropped:]
-        print('WARNING: %d older entr%s dropped from %s: it keeps the last %d entries, and what they recorded is '
-              'folded into the baseline, so the trail still leads to the lists.'
-              %(dropped,'y was' if dropped==1 else 'ies were',root/AUTHORITY_CHANGES_AUDIT,AUTHORITY_CHANGES_MAX),
+        tail=('what they recorded is folded into the baseline, so the trail still leads to the lists'
+              if not unknown else
+              'what they recorded is folded into the lists the baseline could read; the %s list stays null '
+              '(UNKNOWN), so the trail does not lead to it'%' and '.join(unknown))
+        print('WARNING: %d older entr%s dropped from %s: it keeps the last %d entries, and %s.'
+              %(dropped,'y was' if dropped==1 else 'ies were',root/AUTHORITY_CHANGES_AUDIT,
+                AUTHORITY_CHANGES_MAX,tail),
               file=sys.stderr)
     document={'schema_version':AUTHORITY_CHANGES_SCHEMA,'entries':history}
     if baseline is not None:document['baseline']=baseline
@@ -7471,14 +7947,26 @@ def authority_change_placeholder_notice(noun,action,dropped,operator):
     sentence says exactly what was recorded. Nothing is silent, and an ADD is still refused
     (finding 3), so a command copied from a warning and run unchanged does not record an operator
     named OPERATOR on a grant.
+
+    It does NOT tell the operator to run the removal again "with the real value" (kittrial-5bb.233
+    finding 4): the removal already happened, so a second one is a no-op that records nothing, and
+    the unattributed entry stays unattributed. It says what is true instead - the entry keeps the
+    gap, and the NEXT real change with ``--actor``/``--reason`` is what attributes a later state.
     """
     labels={'actor':'--actor OPERATOR','reason':'--reason TEXT'}
     given=' and '.join(labels[field] for field in dropped)
     recorded=('unattributed (operator null)' if operator is None else 'by %s'%operator)
+    if operator is None:
+        stays=('That entry is recorded WITHOUT an operator and stays unattributed. Running the removal again records '
+               'nothing: the name is already gone, so the removal is a no-op. The next real change is what carries '
+               'an operator.')
+    else:
+        stays=('That entry is recorded without a reason and stays without one. Running the removal again records '
+               'nothing: the name is already gone, so the removal is a no-op. The next real change with '
+               '--reason TEXT is what records why.')
     return ('WARNING: %s %s the placeholder the printed re-grant commands carry, not a real value. A REMOVAL is '
-            'never refused for it, and the placeholder is not recorded as a real value: this %s %s is recorded %s. '
-            'Replace it with the real value and run the command again to record it.'
-            %(given,'is' if len(dropped)==1 else 'are',noun,action,recorded))
+            'never refused for it, and the placeholder is not recorded as a real value: this %s %s is recorded %s. %s'
+            %(given,'is' if len(dropped)==1 else 'are',noun,action,recorded,stays))
 
 def authority_change_listed_operators(cfg):
     """The names the deployment lists as operators, or ``()`` when that value cannot be read.
@@ -7490,6 +7978,67 @@ def authority_change_listed_operators(cfg):
     """
     try:return list(stored_operators(cfg))
     except (ValueError,TypeError,OSError,UnicodeError):return []
+
+def authority_change_placeholder_refusal(operator,reason,action,listed_operators=()):
+    """The refusal the literal ``--actor OPERATOR``/``--reason TEXT`` earns on an ADD, or ``None``.
+
+    ``OPERATOR`` is the placeholder the printed re-grant commands carry only while no listed
+    operator carries that name, so a real listed operator named ``OPERATOR`` is not locked out of
+    attributing a change (kittrial-5bb.229 rev-2 item 3). A REMOVAL is never refused for either: it
+    drops the placeholder and records the entry without it. The one answer is used BEFORE the lock
+    (to refuse an add early and for free) and AGAIN inside it (kittrial-5bb.233 finding 5).
+    """
+    if action=='remove':return None
+    if operator==AUTHORITY_CHANGE_PLACEHOLDER_ACTOR and operator not in set(listed_operators):
+        return ('--actor %s is the placeholder the printed re-grant commands carry; replace it with the operator '
+                'who is making the change, or the audit would record OPERATOR as a real name.'
+                %AUTHORITY_CHANGE_PLACEHOLDER_ACTOR)
+    if reason==AUTHORITY_CHANGE_PLACEHOLDER_REASON:
+        return ('--reason %s is the placeholder the printed re-grant commands carry; replace it with a sentence '
+                'saying why the deployment authority is changing.'%AUTHORITY_CHANGE_PLACEHOLDER_REASON)
+    return None
+
+def authority_change_placeholder_recheck(operator,reason,action,listed_operators=()):
+    """Judge the placeholder ``--actor``/``--reason`` against the list read UNDER the lock.
+
+    ``authority_change_arguments`` reads the list before the lock, so a change that removes a real
+    operator named ``OPERATOR`` can land between that read and the write, and an add under
+    ``--actor OPERATOR`` would then record a name nobody lists: the reviewer's ``race.py`` recorded
+    an add by ``OPERATOR`` after the entry that removed ``OPERATOR`` (kittrial-5bb.233 finding 5).
+    Re-made here, inside the same lock as the write, the two cannot both be recorded. A removal is
+    still never refused for a placeholder: it drops it, exactly as before - and that is true here
+    too, where the name can have stopped being listed between the two reads (revision 2, review item
+    3.1). The REMOVAL side of the race used to stay open: ``--actor OPERATOR`` was read as a real
+    name before the lock, another change removed ``OPERATOR``, and the removal then recorded an
+    operator nobody lists. Under this lock it is judged again, and the now-unlisted placeholder is
+    dropped so the entry is recorded unattributed, exactly as a removal that carried it all along.
+    An ADD is still refused. Returns ``(operator,reason,dropped)``: ``dropped`` is the list of
+    fields (``'actor'``/``'reason'``) the caller must say were not recorded.
+    """
+    if action!='remove':
+        refusal=authority_change_placeholder_refusal(operator,reason,action,listed_operators)
+        if refusal is not None:raise ValueError(refusal)
+        return operator,reason,[]
+    dropped=[]
+    if operator==AUTHORITY_CHANGE_PLACEHOLDER_ACTOR and operator not in set(listed_operators):
+        operator=None;dropped.append('actor')
+    if reason==AUTHORITY_CHANGE_PLACEHOLDER_REASON:
+        reason=None;dropped.append('reason')
+    return operator,reason,dropped
+
+def authority_change_reason_line_refusal(reason,flag='--reason'):
+    """A sentence refusing a ``--reason`` that holds a line separator, or ``None``.
+
+    The recorded reason goes on ONE line of the JSON and the reader prints it as one sentence, so a
+    value holding a newline would read as several unexplained lines in the audit
+    (revision 2, review item 3.6). The separators are the ones ``str.splitlines`` knows, named
+    explicitly so the message says what was found.
+    """
+    for character in '\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029':
+        if character in reason:
+            return ('%s must be one line, and this value holds a line separator (%s). Give one sentence '
+                    'without a line break.'%(flag,repr(character)))
+    return None
 
 def authority_change_arguments(args,noun,listed_operators=()):
     """Validate ``--actor``/``--reason`` for one list change; returns ``(operator,reason,notice)``.
@@ -7507,6 +8056,9 @@ def authority_change_arguments(args,noun,listed_operators=()):
     without it and ``authority_change_placeholder_notice`` says so. ``OPERATOR`` is a placeholder
     only while no listed operator carries that name: ``operators add OPERATOR`` is still accepted,
     so a real operator named OPERATOR is not locked out of attributing a change (rev-2 item 3).
+    This read is the one taken BEFORE the lock; the caller re-makes it under the lock
+    (``authority_change_placeholder_recheck``), because the list can change in between
+    (kittrial-5bb.233 finding 5).
     """
     from recovery import identity
     listed=set(listed_operators)
@@ -7515,20 +8067,16 @@ def authority_change_arguments(args,noun,listed_operators=()):
     if operator is not None:
         operator=identity(operator,'Invalid operator identity')
         if operator==AUTHORITY_CHANGE_PLACEHOLDER_ACTOR and operator not in listed:
-            if args.action!='remove':
-                raise ValueError('--actor %s is the placeholder the printed re-grant commands carry; replace it with '
-                                 'the operator who is making the change, or the audit would record OPERATOR as a real '
-                                 'name'%AUTHORITY_CHANGE_PLACEHOLDER_ACTOR)
+            authority_change_placeholder_recheck(operator,None,args.action,listed)
             dropped.append('actor');operator=None
     reason=args.reason
     if reason is not None:
         reason=reason.strip()
         if not reason:raise ValueError('--reason must be a sentence, not blank')
+        line_refusal=authority_change_reason_line_refusal(reason)
+        if line_refusal is not None:raise ValueError(line_refusal)
         if reason==AUTHORITY_CHANGE_PLACEHOLDER_REASON:
-            if args.action!='remove':
-                raise ValueError('--reason %s is the placeholder the printed re-grant commands carry; replace it with '
-                                 'a sentence saying why the deployment authority is changing'
-                                 %AUTHORITY_CHANGE_PLACEHOLDER_REASON)
+            authority_change_placeholder_recheck(None,reason,args.action,listed)
             dropped.append('reason');reason=None
         elif len(reason)>AUTHORITY_CHANGES_REASON_MAX:
             raise ValueError('--reason must be at most %d characters'%AUTHORITY_CHANGES_REASON_MAX)
@@ -7694,6 +8242,13 @@ def authority_changes_replay_note(replay,entries,capped,problem,baseline=None,un
         else:
             note.append('A hand edit of deployment.private.json leaves no entry here; so does a list change made by a '
                         'kit older than the baseline this trail begins with (at %s).'%baseline['at'])
+        if incomplete:
+            # A mismatch of a list this read COULD compare is reported although another list could not be
+            # compared (kittrial-5bb.233 finding 1a): a script that reads only replay.agrees must see the
+            # false, not the null the incomplete read would otherwise answer.
+            note.append('This mismatch is reported although the trail is incomplete for %s: replay.agrees is false '
+                        'because a list this read could compare does not agree, even though the other list could '
+                        'not be compared.'%' and '.join(incomplete))
     elif readable and baseline is None:
         note.append('The trail leads to %s, but it does not begin with a baseline, so it was written '
                     'before this kit or by hand and may be older than the lists. The trail is incomplete for these '
@@ -7706,30 +8261,128 @@ def authority_changes_replay_note(replay,entries,capped,problem,baseline=None,un
         note.append('WARNING: deployment.private.json lists %s more than once; the trail compares names as a set.'
                     %'; '.join(listed_twice))
     if capped:
-        note.append('The trail is at its cap of %d entries: the newest are kept, and when the next change needs room '
-                    'the oldest entries are folded into the baseline rather than lost, so the trail still leads to '
-                    'the lists.'%AUTHORITY_CHANGES_MAX)
+        if unknown_in_baseline:
+            # The fold cannot invent the names a null (UNKNOWN) list held, so the trail cannot lead to
+            # it however many entries the cap folds in (kittrial-5bb.233 finding 6).
+            note.append('The trail is at its cap of %d entries: the newest are kept, and when the next change needs '
+                        'room the oldest entries are folded into the baseline rather than lost; the %s list stays '
+                        'null (UNKNOWN) there, so the trail does not lead to it.'
+                        %(AUTHORITY_CHANGES_MAX,' and '.join(unknown_in_baseline)))
+        else:
+            note.append('The trail is at its cap of %d entries: the newest are kept, and when the next change needs room '
+                        'the oldest entries are folded into the baseline rather than lost, so the trail still leads to '
+                        'the lists.'%AUTHORITY_CHANGES_MAX)
     return ' '.join(note)
+
+def authority_changes_replay_state(entries,baseline,listed):
+    """``(agrees,state,replay)`` exactly as the reader answers for a readable history and lists.
+
+    The ONE place the reader's verdict is computed, so ``authority-changes`` and the verdict
+    ``authority-changes-baseline`` records on the history it replaces cannot disagree
+    (kittrial-5bb.233 revision 2, review item 2a). ``listed`` is the mapping
+    ``authority_changes_current_lists`` answers; a list it holds as ``None`` has no replay and the
+    read is ``incomplete`` for it. ``no-trail`` means there is nothing to replay at all.
+    """
+    if listed is None:return None,None,None
+    replay={noun:(None if listed[noun] is None else authority_change_replay(entries,listed,noun,baseline))
+            for noun in AUTHORITY_CHANGES_LISTS}
+    no_trail=not entries and baseline is None
+    comparable=[noun for noun in AUTHORITY_CHANGES_LISTS if replay[noun] is not None]
+    mismatched=[noun for noun in comparable if not replay[noun]['agrees']]
+    if no_trail:
+        # No trail at all: there is nothing to replay, so the state is still no-trail even when
+        # the lists hold names (the note says no change was recorded here).
+        agrees=None;state='no-trail'
+    elif mismatched:
+        # A list this read COULD compare disagrees, so the answer is false even when the other
+        # list could not be compared at all (kittrial-5bb.233 finding 1a): a script that reads
+        # only replay.agrees sees the mismatch instead of a null it would have to interpret.
+        agrees=False;state='mismatch'
+    elif len(comparable)<len(AUTHORITY_CHANGES_LISTS):
+        # No comparable list mismatches, and one could not be compared: this read cannot say.
+        agrees=None;state='incomplete'
+    else:
+        agrees=True;state='agrees'
+    return agrees,state,replay
+
+def authority_change_baseline_verdict(entries,baseline,damage,listed):
+    """The reader's verdict on the history ``authority-changes-baseline`` would replace.
+
+    ``{'state', 'unexplained', 'detail'}``. ``damage`` comes from ``read_authority_changes``: a
+    damaged history has the state ``damaged`` and the damage phrase as its detail, and no replay.
+    Otherwise the state is the reader's own (``agrees``/``mismatch``/``incomplete``/``no-trail``),
+    and a mismatch holds the names the trail did not explain PER LIST
+    (``AUTHORITY_CHANGES_LISTS`` order) in ``unexplained``.
+    """
+    if damage is not None:
+        return {'state':'damaged','unexplained':{},'detail':damage[1]}
+    agrees,state,replay=authority_changes_replay_state(entries,baseline,listed)
+    unexplained={}
+    if state=='mismatch':
+        for noun in AUTHORITY_CHANGES_LISTS:
+            item=replay.get(noun)
+            if item is None or item['agrees']:continue
+            names=(item['listed_but_last_removed']+item['trail_added_but_not_listed']
+                   +item['listed_but_not_in_trail'])
+            if names:unexplained[noun]=names
+    return {'state':state,'unexplained':unexplained,'detail':None}
+
+def authority_change_rebased_over_lines(rebased_over):
+    """The reader's OWN lines for a baseline's ``rebased_over`` field: one block per entry.
+
+    The field is read as DATA, whatever the baseline's ``reason`` says. The reason text is the
+    operator's sentence and may be squeezed freely; an entry is never a sentence and is never
+    squeezed by one. Each block says the state, when the history was replaced, who replaced it, the
+    file the replaced history was kept under, the per-list counts of names the trail did not explain
+    and the first few of those names WHOLE; one more line counts the older entries the bound no
+    longer lists (kittrial-5bb.233 revision 4, review items 1, 2 and 3.1).
+    """
+    if not rebased_over:return []
+    lines=[]
+    for entry in rebased_over.get('entries') or []:
+        if entry['state']=='mismatch':
+            what='was re-based (or folded) over a history that did NOT agree with the lists (a mismatch)'
+        else:
+            what='was re-based (or folded) over a history that was DAMAGED'
+        shown=[]
+        for noun in AUTHORITY_CHANGES_LISTS:
+            count=entry['unexplained'][noun]
+            if not count:continue
+            names=', '.join(entry['names'][noun]) or 'none shown'
+            if count>len(entry['names'][noun]):names+=' (+%d more)'%(count-len(entry['names'][noun]))
+            shown.append('%s: %d not explained (%s)'%(noun,count,names))
+        lines.append('This baseline %s: at %s, by %s, the replaced history kept as %s%s.'
+                     %(what,entry['at'],entry['operator'] or 'nobody (unattributed)',
+                       entry['kept_as'] or 'nothing (no file was kept)',
+                       ('' if not shown else '; '+'; '.join(shown))))
+    dropped=rebased_over.get('dropped') or 0
+    if dropped:
+        lines.append('%d older re-base or fold entr%s no longer listed in rebased_over.'
+                     %(dropped,'y is' if dropped==1 else 'ies are'))
+    return lines
 
 def authority_changes_report(root):
     """``(report, note)`` for the ``authority-changes`` reader: the trail, the lists and the replay.
 
     The report prints the current lists beside the entries, counts and marks the entries that name
-    nobody, prints the baseline the trail begins with and any damaged audit kept beside the
-    runtime, and replays the trail against the lists (kittrial-5bb.192 review items 3a and 3b,
-    round-2 review items 1 and 2). ``replay.agrees`` is ``true`` when the trail leads to the lists,
-    ``false`` when it does not, and ``null`` when there is no trail yet or when the trail is
-    INCOMPLETE for a list (it could not be read now, or the baseline holds it as ``null``/UNKNOWN
-    because it could not be read when that history began; kittrial-5bb.229 rev-2 item 1); ``replay``
-    itself is ``null`` when the lists cannot be read at all. The exit code is 0 in all of those
-    cases, so a script must read ``replay.agrees`` rather than the exit status (round-2 review item
-    4).
+    nobody, prints the baseline the trail begins with and every audit file kept beside the runtime
+    (both the damaged ones and the readable histories ``authority-changes-baseline`` replaced,
+    under their own keys), and replays the trail against the lists (kittrial-5bb.192 review items
+    3a and 3b, round-2 review items 1 and 2). ``replay.agrees`` is ``true`` when the trail leads to
+    both lists, ``false`` when ANY list this read could compare does not agree - even when the
+    other list could not be compared (it could not be read now, or the baseline holds it as
+    ``null`` because it could not be read when that history began, kittrial-5bb.233 finding 1a) -
+    and ``null`` only when no comparable list mismatches and some list could not be compared
+    (``incomplete``) or when there is no trail at all (``no-trail``); ``replay`` itself is
+    ``null`` when the lists cannot be read at all. The exit code is 0 in all of those cases, so a
+    script must read ``replay.agrees`` rather than the exit status (round-2 review item 4).
     """
     entries,baseline,damage=read_authority_changes(root)
     if damage is not None:raise AuthorityAuditDamaged(authority_audit_refusal(root,damage,'read'))
     listed,problem=authority_changes_current_lists(root)
     capped=len(entries)>=AUTHORITY_CHANGES_MAX
     kept=authority_change_damaged_files(root)
+    replaced=authority_change_replaced_files(root)
     # A list the baseline holds as null (UNKNOWN) could not be read when that history began: it has
     # no replay either, and the note says so in those words (kittrial-5bb.229 rev-2 item 1).
     unknown_in_baseline=[noun for noun in AUTHORITY_CHANGES_LISTS
@@ -7739,38 +8392,136 @@ def authority_changes_report(root):
             'unattributed_entries':sum(1 for item in entries if item['operator'] is None),
             'baseline':None if baseline is None else
                        {'at':baseline['at'],'operator':baseline['operator'],'reason':baseline['reason'],
+                        'rebased_over':baseline.get('rebased_over'),
                         'entries':sum(len(baseline['lists'][noun]) for noun in AUTHORITY_CHANGES_LISTS
                                       if baseline['lists'][noun] is not None),
                         'unknown_lists':list(unknown_in_baseline),
                         'lists':{noun:(None if baseline['lists'][noun] is None else list(baseline['lists'][noun]))
                                  for noun in AUTHORITY_CHANGES_LISTS}},
             'damaged_files':kept,
+            'replaced_files':replaced,
             'current_lists':listed,
             'current_lists_problem':problem}
-    no_trail=not entries and baseline is None
+    # The rebased_over field is read as its own data, never out of the reason text (revision 4,
+    # review items 1 and 2): the raw field is in the JSON, a top-level boolean says whether any
+    # entry is a mismatch, and the reader's own lines are printed beside everything else.
+    rebased=baseline.get('rebased_over') if baseline is not None else None
+    report['rebased_over']=rebased
+    report['ever_rebased_over_mismatch']=any(entry['state']=='mismatch'
+                                             for entry in (rebased or {}).get('entries') or [])
     if listed is None:
         report['replay']=None
         note=authority_changes_replay_note(None,entries,capped,problem,baseline,unknown_in_baseline)
     else:
-        replay={noun:(None if listed[noun] is None else authority_change_replay(entries,listed,noun,baseline))
-                for noun in AUTHORITY_CHANGES_LISTS}
+        agrees,state,replay=authority_changes_replay_state(entries,baseline,listed)
         note=authority_changes_replay_note(replay,entries,capped,problem,baseline,unknown_in_baseline)
-        readable=all(replay[noun] is not None for noun in AUTHORITY_CHANGES_LISTS)
-        if not readable:
-            # One list could not be read (now, or when the baseline was written): the trail is
-            # incomplete for it, so this read cannot say whether it leads to the lists
-            # (kittrial-5bb.229 finding 2 and rev-2 item 1). With no trail at all the state is still
-            # no-trail; the note says which list could not be read, and says it first (rev-2 item 2).
-            agrees=None;state='no-trail' if no_trail else 'incomplete'
-        else:
-            agrees=None if no_trail else all(replay[noun]['agrees'] for noun in AUTHORITY_CHANGES_LISTS)
-            state='no-trail' if no_trail else ('agrees' if agrees else 'mismatch')
         report['replay']={'agrees':agrees,'state':state,'lists':replay,'note':note}
     if kept:
         note+=' The kit has set %d damaged audit file(s) aside beside this runtime - %s - and never removes them.'\
               %(len(kept),', '.join(kept))
+    if replaced:
+        # A readable history authority-changes-baseline replaced is NOT damaged, so it is said, and
+        # listed under its own key, in those words (kittrial-5bb.233 revision 2, review item 2c).
+        note+=' The kit has also kept %d earlier authority-changes histor%s beside this runtime under a '\
+              '".replaced-" name - %s - and never removes them: they are the readable histories a fresh baseline '\
+              'replaced, not damaged files.'%(len(replaced),'y' if len(replaced)==1 else 'ies',', '.join(replaced))
+    for line in authority_change_rebased_over_lines(rebased):
+        note+=' '+line
     if report['replay'] is not None:report['replay']['note']=note      # the JSON and stderr say the same thing
     return report,note
+
+def authority_changes_baseline_operator_check(root,operator):
+    """Refuse an operator this deployment does not list, for the fresh-baseline command.
+
+    Called BEFORE the lock (so a wrong name costs nothing) and AGAIN inside it, against the
+    operator list the write sees: an operator revoked between the two reads must not be recorded as
+    the one who took the baseline (kittrial-5bb.233 revision 2, review item 3.2).
+    """
+    from keyed_records import require_configured_operator
+    require_configured_operator(operator,operators(root,strict=True),
+                                'take a fresh authority-changes baseline')
+
+def authority_changes_baseline_command(root,operator,reason,accept_unexplained=False):
+    """Take a FRESH authority-changes history with one baseline of the lists as they stand now.
+
+    The way out when a history's baseline holds a list as ``null`` (UNKNOWN) and the value has been
+    repaired: the reader says ``incomplete`` for that list for good, because the trail has no known
+    state to replay it from (kittrial-5bb.233 finding 1). A fresh history starts from a known state
+    again.
+
+    A FRESH history, not a new baseline in place: the entries the old history holds describe changes
+    made BEFORE this snapshot, so replaying them on top of it would corrupt the replay, and the old
+    file is kept beside the runtime instead (``authority_change_keep_previous``). The lists are read
+    before the lock (so an unreadable one refuses for free) and AGAIN under it (so the baseline is
+    the lists the write sees). A list that cannot be read refuses the command: recording it as
+    ``null`` is exactly the state the command exists to leave behind.
+
+    Before it replaces anything it runs the READER's own verdict on the history being replaced; a
+    mismatch or a damaged history refuses the command unless ``accept_unexplained`` says the operator
+    has looked, because taking the baseline is not a way to make a warning go away (kittrial-5bb.233
+    revision 2, review items 1, 2a and 2b). The verdict is recorded BOTH as the reason sentence and
+    as an entry in the new baseline's ``rebased_over`` field: the field is the durable record, it is
+    copied forward by every later re-base and by the cap fold, and nothing about it is parsed out of
+    the reason any more (revision 4, review items 1 and 2). Returns ``(baseline, kept, verdict)``;
+    the caller prints what it did and the reader's verdict.
+    """
+    path=root/AUTHORITY_CHANGES_AUDIT
+    if path.is_symlink() or (os.path.lexists(str(path)) and not path.is_file()):
+        raise AuthorityAuditDamaged(authority_audit_refusal(
+            root,('not-a-regular-file','is not a regular file (a directory, a fifo or a symlink)'),'read'))
+    reason=reason.strip()
+    if not reason:raise ValueError('--reason must be a sentence, not blank')
+    line_refusal=authority_change_reason_line_refusal(reason)
+    if line_refusal is not None:raise ValueError(line_refusal)
+    if reason==AUTHORITY_CHANGE_PLACEHOLDER_REASON:
+        raise ValueError('--reason %s is the placeholder the printed re-grant commands carry; replace it with a '
+                         'sentence saying why the fresh baseline is taken'%AUTHORITY_CHANGE_PLACEHOLDER_REASON)
+    # The verdict on the history being replaced, and the free refusals: an unreadable list, and a
+    # mismatch or a damaged history without the flag that says the operator has looked (review items
+    # 2a and 2b). The composed reason must stay inside the recorded ceiling, or this kit's own file
+    # would read as "not the history this kit writes", so the room left for the operator's sentence
+    # is computed from the exact wording, the verdict and the kept name a current stamp would use.
+    lists,problem=authority_changes_current_lists(root)
+    if problem is not None:raise ValueError(authority_change_rebaseline_problem_refusal(problem))
+    entries,existing,damage=read_authority_changes(root)
+    verdict=authority_change_baseline_verdict(entries,existing,damage,lists)
+    refusal=authority_change_unexplained_refusal(root,verdict,accept_unexplained)
+    if refusal is not None:raise AuthorityAuditDamaged(refusal)
+    kept_name=authority_change_aside_name(root,AUTHORITY_CHANGES_REPLACED).name
+    room=authority_change_rebaseline_room(operator,verdict,kept_name)
+    if len(reason)>room:raise ValueError(authority_change_reason_room_refusal(room))
+    with deployment_config_lock(root):
+        # An operator revoked since the check before the lock must not be recorded as the one who
+        # took the baseline (kittrial-5bb.233 revision 2, review item 3.2).
+        authority_changes_baseline_operator_check(root,operator)
+        # The write's baseline must be the lists the deployment holds at the moment of the write,
+        # and the verdict must be the one on the history actually replaced. The operator's sentence
+        # is measured AGAIN here, because the history that verdict is about can have changed while
+        # the lock was being taken (revision 3, review item 3.2).
+        lists,problem=authority_changes_current_lists(root)
+        if problem is not None:raise ValueError(authority_change_rebaseline_problem_refusal(problem))
+        entries,existing,damage=read_authority_changes(root)
+        verdict=authority_change_baseline_verdict(entries,existing,damage,lists)
+        refusal=authority_change_unexplained_refusal(root,verdict,accept_unexplained)
+        if refusal is not None:raise AuthorityAuditDamaged(refusal)
+        prospective=authority_change_aside_name(root,AUTHORITY_CHANGES_REPLACED).name
+        room=authority_change_rebaseline_room(operator,verdict,prospective)
+        if len(reason)>room:raise ValueError(authority_change_reason_room_refusal(room))
+        kept=authority_change_keep_previous(root)
+        at=utc_stamp()
+        # The field the new baseline carries: the replaced baseline's own field copied forward
+        # UNCHANGED, plus one entry for the history this command replaced when that history was a
+        # mismatch or was damaged. Nothing is carried in the reason (revision 4, items 1 and 2).
+        rebased=authority_change_rebased_over_carry(
+            (existing or {}).get('rebased_over'),
+            authority_change_rebased_entry(verdict,at,operator,None if kept is None else kept.name))
+        baseline=authority_change_baseline(lists,operator,
+                                           authority_change_rebaseline_reason(
+                                               operator,reason,None if kept is None else kept.name,verdict),
+                                           at=at,rebased_over=rebased)
+        document={'schema_version':AUTHORITY_CHANGES_SCHEMA,'entries':[],'baseline':baseline}
+        atomic_private_write(path,json.dumps(document))
+    return baseline,kept,verdict
 
 def credential_actors(root,state_path,service_namespace=None):
     """Every worker credential of the web service with the name it writes under, and whether
@@ -8161,6 +8912,17 @@ def main():
     a.add_argument('project',nargs='?',help='only the adoptions of this project')
     a=sub.add_parser('authority-changes',help='read-only: the recorded changes of the installation operator and '
                                               'verifier lists (which list changed, who changed it, when and why)')
+    a=sub.add_parser('authority-changes-baseline',allow_abbrev=False,
+                     help='configured operator only: write a FRESH authority-changes history with one baseline of '
+                          'the operator and verifier lists as they stand now (the way out when a history begins '
+                          'with a list recorded as null/UNKNOWN)')
+    a.add_argument('--actor',required=True,metavar='OPERATOR',action=_OnceFlag,
+                   help='the configured operator taking the fresh baseline, recorded on it (given twice, refused)')
+    a.add_argument('--reason',required=True,metavar='TEXT',action=_OnceFlag,
+                   help='why the fresh baseline is taken, recorded on it (given twice, refused)')
+    a.add_argument('--accept-unexplained',action='store_true',dest='accept_unexplained',
+                   help='take the baseline although the history it replaces does not agree with the lists (or is '
+                        'damaged), which the command records on the new baseline and refuses without this flag')
     a=sub.add_parser('backup');a.add_argument('projects',nargs='*',metavar='project')
     a.add_argument('--all',action='store_true',dest='all_projects',
                    help='back up every initialized project in this runtime in one run')
@@ -8762,6 +9524,14 @@ def main():
         with deployment_config_lock(root):
             cfg=config(root)
             current=stored_operators(cfg)
+            # The placeholder check is re-made here, against the list the write sees
+            # (kittrial-5bb.233 finding 5): the read before the lock can be stale. A REMOVAL that
+            # named a real OPERATOR before the lock and finds the name gone now drops it here, so
+            # the removal is recorded unattributed rather than with an operator nobody lists
+            # (revision 2, review item 3.1).
+            operator,reason,dropped=authority_change_placeholder_recheck(operator,reason,args.action,current)
+            if dropped:
+                notice=authority_change_placeholder_notice('operators',args.action,dropped,operator)
             changed=(actor not in current) if args.action=='add' else (actor in current)
             if changed:record_authority_change(root,'operators',args.action,actor,operator,reason)
             if args.action=='add':
@@ -8807,6 +9577,13 @@ def main():
         with deployment_config_lock(root):
             cfg=config(root)
             current=stored_verifiers(cfg)
+            # Exactly as for `operators`: the placeholder is judged against the operator list the
+            # write sees (kittrial-5bb.233 finding 5), and `verifiers` itself is not that list. The
+            # removal side of the race is closed here too (revision 2, review item 3.1).
+            operator,reason,dropped=authority_change_placeholder_recheck(
+                operator,reason,args.action,authority_change_listed_operators(cfg))
+            if dropped:
+                notice=authority_change_placeholder_notice('verifiers',args.action,dropped,operator)
             changed=(actor not in current) if args.action=='add' else (actor in current)
             if changed:record_authority_change(root,'verifiers',args.action,actor,operator,reason)
             if args.action=='add':
@@ -8851,6 +9628,32 @@ def main():
         report,note=authority_changes_report(root)
         print(json.dumps(report,ensure_ascii=True,indent=2))
         if note:print(note,file=sys.stderr)
+    elif args.command=='authority-changes-baseline':
+        from keyed_records import require_configured_operator
+        require_configured_operator(args.actor,operators(root,strict=True),
+                                    'take a fresh authority-changes baseline')
+        _,kept,verdict=authority_changes_baseline_command(root,args.actor,args.reason,
+                                                          args.accept_unexplained)
+        report,note=authority_changes_report(root)
+        report['previous_audit_kept_as']=None if kept is None else kept.name
+        # The command's own record of what the history it replaced read as: the field describes the
+        # command's work, not the reader's answer for the fresh history, so it is added here (round
+        # three of kittrial-5bb.233, review items 1 and 2a). The WARNING text is the SAME in the
+        # JSON and on stderr, so the mismatch cannot be lost by a caller that reads only one.
+        verdict_note=authority_change_verdict_phrase(verdict)
+        if verdict['state'] not in ('agrees','no-trail'):
+            verdict_note=('WARNING: %s. The history it replaced was kept as %s.'
+                          %(verdict_note,'nothing (there was no history)' if kept is None else kept.name))
+        report['previous_audit_verdict']={'state':verdict['state'],
+                                          'unexplained':{noun:list(names)
+                                                         for noun,names in verdict['unexplained'].items()},
+                                          'note':verdict_note}
+        print(json.dumps(report,ensure_ascii=True,indent=2))
+        if verdict_note.startswith('WARNING'):print(verdict_note,file=sys.stderr)
+        print('Wrote a fresh authority-changes history: one baseline of the operator and verifier lists as they stand '
+              'now, with the operator and reason recorded on it%s. The reader says: %s'
+              %('' if kept is None else '; the history this replaced was kept beside the runtime as %s'%kept.name,
+                note),file=sys.stderr)
     elif args.command=='backup':backup_projects(root,args.projects,args.all_projects)
     elif args.command=='backup-schedule':
         from keyed_records import require_configured_operator
