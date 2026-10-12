@@ -969,8 +969,8 @@ lock. A fresh history rather than a new baseline in place, because the old entri
 changes made BEFORE this snapshot and replaying them on top of it would corrupt the replay. The
 command prints the baseline it wrote, the name the old history was kept under and the reader's
 verdict; `authority-changes` then answers `agrees` `true` again, and a later hand edit warns
-again. The reader's JSON is unchanged except for the extra `previous_audit_kept_as` field naming
-the kept file (`null` when there was no history yet).
+again. The command's stdout is the reader's report plus one `previous_audit_kept_as` field naming
+the kept file (`null` when there was no history yet); `authority-changes` itself is unchanged.
 
 **A damaged audit, and the two kinds of change.** An `authority-changes.audit.json` this kit
 cannot read - not JSON, empty, a list, `null`, another `schema_version` (including JSON `true`
