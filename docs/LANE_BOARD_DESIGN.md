@@ -177,6 +177,13 @@ implementation of the aging or the flags — and it takes the same threshold **a
 page**. The reference to office panel conventions is dropped: this is a project-page read, not an
 office surface.
 
+**How it scopes the read.** The web service calls the endpoint without a bound key, so
+`lanes_scope_for` answers `all` today; the panel must never rely on that default. It passes its own
+scope: owners and coordinators — the same `review_workflow.listed_operator_actor` definition the
+endpoint itself uses — read every lane, and everybody else is scoped to their own agents' lanes,
+exactly the contributor route's rule. The transport default is a property of the route, not an
+authority the page may inherit.
+
 ## 5. What an older checkpoint, an older kit and a rollback mean
 
 - **Older checkpoint** (no `lane-state-v1` record): reads as today; `state` is `unknown`, not
@@ -189,6 +196,15 @@ office surface.
   `Kind:` prefix it does not know. The record is not a checkpoint and does not touch the checkpoint
   object at all, so an older kit reads, writes and re-checkpoints the task exactly as before. This is
   proved in §6, not asserted.
+- **One reading is deliberately wrong on an older kit.** Because it cannot know the record was
+  written with the checkpoint, it counts the record as activity the checkpoint did not incorporate
+  and reports the checkpoint **stale** (`checkpoint.newer_activity: true`, and the matching wake flag)
+  until the next checkpoint supersedes it. The tip kit treats a `Kind: lane-state-v1` record that
+  names checkpoint C and was written by C's author as part of C — in the brief, in `work`/next-action
+  and in the board's checkpoint age — so only a kit at or after this change reads a declared wait
+  state as current. This is the one rollback cost of the separate record: no tracker repair, no switch
+  and no unwritable task, but a rolled-back reader sees one spurious stale/wake reading per declared
+  state. The capability record says the same.
 - **Older kit** reading the board: the read does not exist, so it falls back to
   `show-waiting-on-coordinator.py` unchanged. Nothing is written to the tracker that an older kit
   cannot read.

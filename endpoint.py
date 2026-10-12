@@ -576,18 +576,30 @@ def key_project_refusal(request,key_projects):
     if not isinstance(project,str) or project not in key_projects:
         raise ValueError('Unknown/uninitialized project')
 
-def lanes_scope_for(actor,operators,key_principal):
+def lanes_scope_for(actor,operators,key_principal,owners=None):
     """The lanes read's route isolation (kittrial-5bb.263): ``'all'`` or ``'own'``.
 
-    The host route (no bound key: ``key_principal`` is None) and a key bound to a
-    configured operator may see every lane; any other bound key is a contributor route and
-    sees only its own lane's row. A member of another project is refused earlier, by
-    ``key_project_refusal``, before any read at all. One function, so the scope cannot be
-    computed one way for one caller and another way for the next.
+    The host route (no bound key: ``key_principal`` is None) and a key bound to an operator
+    may see every lane; any other bound key is a contributor route and sees only its own
+    lane's row. What counts as an operator is the kit's ONE definition,
+    ``review_workflow.listed_operator_actor``: an actor on the installation's operator
+    allowlist, or an actor bound to a listed operator's principal (kittrial-5bb.263
+    review ``operator-definition-and-web-scope``). ``owners`` is that actor -> principal
+    map, or a callable returning it; a plain listed name is decided without reading it, and
+    ``owners=None`` is judged on the allowlist alone. A read must not fail on a damaged
+    session registry, so a loader failure falls back to the plain name. A member of another
+    project is refused earlier, by ``key_project_refusal``, before any read at all. One
+    function, so the scope cannot be computed one way for one caller and another way for
+    the next.
     """
     if key_principal is None:
         return 'all'
-    return 'all' if actor in operators else 'own'
+    from review_workflow import listed_operator_actor
+    try:
+        allowed=listed_operator_actor(actor,operators,owners)
+    except (ValueError,OSError):
+        allowed=actor in set(operators or ())
+    return 'all' if allowed else 'own'
 
 def key_principal_refusal(request,path,key_principal):
     """Refuse, for a key bound to a principal, a request whose actor that principal does not own.
@@ -842,14 +854,25 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
         owners=(owner_loader(path,registry_rule)
                 if (rules['coordinator_writes'] or rules['independent_approval']) else None)
         # The lanes read's route isolation (kittrial-5bb.263): the host route and a key
-        # bound to a configured operator may see every lane; any other bound key sees only
-        # its own row. `configured_operators` is read once here and passed on unchanged.
+        # bound to an operator may see every lane; any other bound key sees only its own
+        # row. `configured_operators` is read once here and passed on unchanged.
+        # "Operator" uses the kit's ONE definition (`review_workflow.listed_operator_actor`):
+        # a listed name, or an actor bound to a listed principal. `owners` is the map the
+        # rules already loaded; on a bound-key route that does not need a rule, it is read
+        # advisory here (key_principal_refusal already reads the same registry for a bound
+        # key), and a failure falls back to the plain name inside `lanes_scope_for`.
         #
         # Merge note (16e68c7): the web-approval fact is no longer computed inline here as
         # `web_approval`; that branch verified it with `verified_web_authority(...)` and
         # passes that boolean, so this side keeps only its own lanes isolation.
         operators=configured_operators(root)
-        lanes_scope=lanes_scope_for(actor,operators,key_principal)
+        lanes_owners=owners
+        if lanes_owners is None and key_principal is not None:
+            def load_lanes_owners():
+                import sessions
+                return sessions.owners(path)
+            lanes_owners=load_lanes_owners
+        lanes_scope=lanes_scope_for(actor,operators,key_principal,lanes_owners)
         def work_effect():
             result=work_execute(path,actor,action,args,request.get('attachments',{}),runner,
                                 operators=operators,

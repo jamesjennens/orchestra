@@ -213,6 +213,54 @@ class WriterTests(unittest.TestCase):
         self.assertEqual(lane_state.newest(data[0]['comments'], TASK)[1]['state'], 'waiting-on-coordinator')
 
 
+class CheckpointStalenessTests(unittest.TestCase):
+    """A declared wait state is part of its checkpoint, not activity written after it.
+
+    kittrial-5bb.263 review ``lane-state-must-not-stale-its-own-checkpoint``: on a real bd
+    the record made the checkpoint it was written with read stale, so every lane that
+    declared a wait state was told at once that something had changed and so was whoever
+    read its brief or its in-progress flag.
+    """
+
+    def test_the_record_does_not_make_its_own_checkpoint_stale(self):
+        data = rows()
+        save(data, lane_state=dict(WAITING))
+        read = b.brief(data, PROJECT, TASK)
+        self.assertFalse(read['checkpoint']['newer_activity'], read['checkpoint'])
+        self.assertIsNone(read['newer'])
+        # The queue read (work --mine / the in-progress flag) agrees: nothing is newer.
+        fields = b.checkpoint_queue_fields(data, data[0])
+        self.assertEqual((fields['newer_activity_by_others'], fields['newer_activity_own'],
+                          fields['newer_activity_coverage']), (0, 0, 'current'))
+
+    def test_an_ordinary_comment_still_makes_it_stale(self):
+        data = rows()
+        save(data, lane_state=dict(WAITING))
+        data[0]['comments'].append(comment('later', 'Progress after the checkpoint.', author='bob/session'))
+        self.assertTrue(b.brief(data, PROJECT, TASK)['checkpoint']['newer_activity'])
+
+    def test_a_record_naming_an_older_checkpoint_still_counts(self):
+        data = rows()
+        store = Writes(data)
+        first = b.save_checkpoint(data, PROJECT, TASK, checkpoint(data, lane_state=dict(WAITING)),
+                                  'alice/session', store.run)
+        second = b.save_checkpoint(data, PROJECT, TASK, checkpoint(data), 'alice/session', store.run)
+        self.assertEqual(b.brief(data, PROJECT, TASK)['checkpoint']['comment_id'], second['comment_id'])
+        # The FIRST checkpoint's record names an older checkpoint: it is ordinary activity.
+        data[0]['comments'].append(comment('ls-old', lane_state.PREFIX + canonical_bytes(
+            dict(schema_version=1, task=TASK, checkpoint=first['comment_id'], state='working')).decode(),
+            author='alice/session'))
+        self.assertTrue(b.brief(data, PROJECT, TASK)['checkpoint']['newer_activity'])
+
+    def test_a_record_by_another_author_still_counts(self):
+        data = rows()
+        result, _store = save(data, lane_state=dict(WAITING))
+        data[0]['comments'].append(comment('ls-foreign', lane_state.PREFIX + canonical_bytes(
+            dict(schema_version=1, task=TASK, checkpoint=result['comment_id'], state='working')).decode(),
+            author='bob/session'))
+        self.assertTrue(b.brief(data, PROJECT, TASK)['checkpoint']['newer_activity'])
+
+
 class ReaderTests(unittest.TestCase):
     def test_newest_returns_the_usable_record_and_skips_malformed_ones(self):
         data = rows()

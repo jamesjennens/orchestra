@@ -773,7 +773,7 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
         # request-changes records still unresolved.
         checkpoint_at=None;newer_activity=None
         try:
-            from briefing import checkpoint_state
+            from briefing import checkpoint_state, lane_state_record
             checkpoint_states[row['id']]=checkpoint_state(row,normalize=False)
             latest_checkpoint=checkpoint_states[row['id']]['current']
             open_items=len(latest_checkpoint[0]['open_items']) if latest_checkpoint else 0
@@ -784,7 +784,14 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
                 position=next(index for index,comment in enumerate(comments)
                               if str(comment.get('id'))==str(latest_checkpoint[1].get('id')))
                 checkpoint_at=latest_checkpoint[1].get('created_at')
+                # The lane-state record written WITH this checkpoint (same author, naming this
+                # checkpoint) is part of the checkpoint, not a later write by another actor: it
+                # must not wake the task (kittrial-5bb.263 review). A record naming an older
+                # checkpoint, or by another author, is ordinary activity and still wakes it.
+                checkpoint_id=str(latest_checkpoint[1].get('id'))
+                checkpoint_author=latest_checkpoint[1].get('author')
                 newer_activity=any(comment.get('author')!=row.get('assignee')
+                                   and not lane_state_record(comment,checkpoint_id,checkpoint_author)
                                    for comment in comments[position+1:])
         except (ValueError,TypeError,KeyError,StopIteration):
             open_items=None;blocking_items=None;checkpoint_at=None;newer_activity=None

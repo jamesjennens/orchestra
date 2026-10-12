@@ -125,6 +125,19 @@ class RowTests(unittest.TestCase):
         self.assertEqual(entry['state_age_seconds'], 9000)
         self.assertEqual(entry['held_age_seconds'], 10800)
 
+    def test_the_board_ages_a_declared_state_from_its_checkpoint_not_its_record(self):
+        # The record is written a little AFTER its checkpoint (the same act, two comments);
+        # the board ages the wait from the checkpoint, never from the record.
+        row = task('t1', A)
+        add_checkpoint(row, 'cp1', '2026-09-15T09:30:00Z')
+        add_lane_state(row, 'ls1', 'cp1', '2026-09-15T11:00:00Z', state='waiting-on-coordinator',
+                       waiting_on='coordinator')
+        _lane_row, entry = entry_of(board([row]), 't1')
+        self.assertEqual(entry['checkpoint'], 'cp1')
+        self.assertEqual(entry['state_since'], '2026-09-15T09:30:00Z')
+        self.assertEqual(entry['state_age_seconds'], 9000)
+        self.assertIn('waiting_too_long', entry['flags'])
+
     def test_whose_move_and_next_actor_come_from_the_one_decision(self):
         # A row injected with a review projection, compared against the same function the
         # work queue uses: the board never re-derives the move.
@@ -338,12 +351,27 @@ class BoundAndRouteTests(unittest.TestCase):
 
 @unittest.skipIf(endpoint is None, 'endpoint imports fcntl (POSIX-only)')
 class EndpointRouteTests(unittest.TestCase):
-    def test_the_endpoint_scope_is_own_for_a_bound_key_that_is_not_an_operator(self):
+    def test_the_endpoint_scope_uses_the_kit_one_operator_definition(self):
+        # A plain listed operator name is decided without reading the registry.
         self.assertEqual(endpoint.lanes_scope_for('contributor', frozenset(), 'lane:alex'), 'own')
         self.assertEqual(endpoint.lanes_scope_for('contributor', frozenset({'op'}), 'lane:alex'), 'own')
         self.assertEqual(endpoint.lanes_scope_for('op', frozenset({'op'}), 'lane:alex'), 'all')
+        # An actor bound to a listed operator's principal is an operator too ...
+        owners = {'bound': 'lane:op', 'op': 'lane:op'}
+        self.assertEqual(endpoint.lanes_scope_for('bound', frozenset({'op'}), 'lane:alex', owners), 'all')
+        # ... and an actor of another principal is not.
+        self.assertEqual(endpoint.lanes_scope_for('other', frozenset({'op'}), 'lane:alex',
+                                                  {'other': 'lane:someone'}), 'own')
         # The host route has no bound key at all and sees every lane.
         self.assertEqual(endpoint.lanes_scope_for('anyone', frozenset(), None), 'all')
+
+    def test_a_damaged_registry_does_not_stop_the_lanes_read(self):
+        def damaged():
+            raise OSError('registry unreadable')
+        # The plain listed name still decides 'all'; a non-listed actor narrows to 'own'
+        # rather than failing the read.
+        self.assertEqual(endpoint.lanes_scope_for('op', frozenset({'op'}), 'lane:alex', damaged), 'all')
+        self.assertEqual(endpoint.lanes_scope_for('contributor', frozenset({'op'}), 'lane:alex', damaged), 'own')
 
     def test_a_member_of_another_project_sees_nothing(self):
         with self.assertRaisesRegex(ValueError, 'Unknown/uninitialized project'):
