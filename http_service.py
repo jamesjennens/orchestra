@@ -46,6 +46,7 @@ import actor_names
 import agent_prompts
 import bd_refusals
 import project_setup
+import project_coordination
 from coordination import MERGE_SLOT_SUFFIX, is_merge_slot, merge_slot_sentence
 from reserved_comments import (ANCHOR_READ_IDS_MAX, carries_record_label, hide_records,
                                is_record_anchor)
@@ -4559,7 +4560,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         # account was disabled or the server was over its limit when the work ended.
         unregistered = [view(item, state='created-unregistered', completed_at=item.get('completed_at'),
                              what='It is complete on the server and not registered here. Register it as a superuser '
-                                  '(New project, with this name), or retire it on the server.',
+                                  '(Register a project, with this name), or retire it on the server.',
                              finish=None, remove=None) for item in waiting]
         server = found['server']
         if server is None and not found.get('server_readable', True):
@@ -4995,6 +4996,19 @@ class ApiHandler(BaseHTTPRequestHandler):
         if ctx.principal.via == 'credential':
             raise forbidden('Session authority required')
         body = project_setup.steps(self, ctx.principal, ctx.params['pid'])
+        body['generated_at'] = now_iso(self.service._now())
+        return 200, body
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/coordination')
+    def project_coordination_read(self, ctx):
+        """Who coordinates the project and the rules that bind them (kittrial-5bb.198).
+
+        For anyone who may read the project; it changes nothing. The installation's rules
+        come from the host through the read-only ``setup-status`` endpoint action, of
+        which only the rules block is returned.
+        """
+        self._project(ctx, CAP_READ)
+        body = project_coordination.view(self, ctx.principal, ctx.params['pid'])
         body['generated_at'] = now_iso(self.service._now())
         return 200, body
 

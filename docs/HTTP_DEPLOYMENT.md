@@ -583,7 +583,8 @@ Without `"create": true` the route registers an existing project, as before.
 - **If the grant is revoked or the account disabled while the project is being made**,
   the request is refused (403) and the project stays on the host, complete and not
   registered. A superuser sees it on the Projects page as "Made, not registered" and
-  either registers it (New project, with that name) or has an operator retire it. The
+  either registers it (Register a project, with that name: the entry's "Register…" button
+  fills the name in and sends nothing) or has an operator retire it. The
   same holds if the server is over its limit when the work ends.
 - **The project appears in the web interface only after the host reports it created**,
   first backup included. The creator is its only member, as owner, and is sent to the
@@ -838,6 +839,12 @@ stopped half way through is finished or removed with the same two commands
   server") and in `GET /v1/project-creations`: `items` (running, incomplete, stalled or
   damaged, each with who started it, the step it stopped at and the command for that
   reading), `unregistered` (made and not registered) and `server` (`used`, `limit`).
+  An entry whose `by` is `host` was made by an operator with `admin.py add-project`, and
+  the page says so ("Started on the server by an operator"); any other entry was started
+  from the web interface by the account it names. The list holds only projects with a
+  creation record: one made before creation records existed, restored from a backup, or
+  whose record was set aside is not listed, and is registered by its name as before.
+  (Listing those needs a read of the host's projects that the endpoint does not have yet.)
 - **To finish it**, an operator runs `admin.py finish-project NAME`. It works when the
   project was initialized (`projects/NAME/.beads/metadata.json` exists): the settings,
   the backup target, the merge slot and a backup are each done or done again. The
@@ -1894,6 +1901,31 @@ accepted as the design):
 - A grant stays when the owner who gave it is lowered or leaves.
 - Two granted agents of two accounts may approve each other's work: they are two parties.
 - A grant works in an archived project as every other write there does.
+
+**Who coordinates, for every member** (kittrial-5bb.198). `GET
+/v1/projects/{id}/coordination` answers anyone who may read the project (a member of any
+role, a superuser, an agent's credential, as the members list does) and changes nothing:
+
+- `people`: the members whose role coordinates (`coordinator` and `owner`), each with
+  `user_id`, `display_name` and `role`. A disabled account is listed as the members list
+  lists it; only a reader who administers the project gets `disabled` on each row.
+- `agents`: the agents whose grant has effect now, each with `name`, `owner_display_name`,
+  `granted_by_display_name` and `granted_at`. Not the agent's id, actor or credentials. A
+  grant on record without effect is left out, and why is said only on the owner's panel.
+- `web_rules`: this service's own rule, `approval_by_another_party` (the setting of the
+  section above), with `on` and a sentence.
+- `host_rules`: `{state, rules}`. With a host behind the service `state` is `available`
+  and `rules` lists the host's three coordinator rules with `on` and a sentence, read
+  through the read-only `setup-status` endpoint action, of which nothing else is
+  returned. Otherwise `rules` is empty and `state` says why: `unknown` (the host could
+  not read its settings or could not be asked), `unavailable` (its endpoint predates the
+  read) or `not-applicable` (no host).
+
+The settings page ("Members & settings") shows it as "Who coordinates" to every member,
+with no control on it, and reads it again after an owner changes a role or a grant there.
+A superuser of the server may also act as a coordinator in any project; the page says
+so. The host's operator list and the names of host sessions are not shown: the endpoint
+has no read for them yet.
 
 **Going back to a kit older than this one.** First, in every project, set every member
 whose role is `coordinator` to `contributor` or `owner`, and remove every coordinator grant.

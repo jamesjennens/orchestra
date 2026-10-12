@@ -152,7 +152,9 @@ export function hostCreatePanel(ctx, creation) {
 // so that none is forgotten; and how full the server is.
 const CREATION_CHIPS = { running: ['Being created', 'plain'], incomplete: ['Did not finish', 'warn'], stalled: ['Did not start', 'warn'],
   damaged: ['Record damaged', 'warn'], 'not-a-record': ['Not a creation record', 'warn'], 'created-unregistered': ['Made, not registered', 'warn'] };
-export async function incompleteCreations(ctx) {
+// `onRegister(name)`, when given, fills the register form with a finished project's name (kittrial-5bb.198); the
+// superuser still registers it there. Nothing is registered from this list.
+export async function incompleteCreations(ctx, { onRegister } = {}) {
   if (!ctx.me.superuser) return null;
   const found = await ctx.api.projectCreations().catch(() => null);
   const items = [...((found && found.items) || []), ...((found && found.unregistered) || [])];
@@ -163,15 +165,21 @@ export async function incompleteCreations(ctx) {
     h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Projects on the server ', needing ? h('span', { class: 'nav-count' }, needing) : null)),
     h('div', { class: 'panel-body stack' },
       server ? h('p', { class: 'small', id: 'server-usage' }, server.used == null ? '' : `This server holds ${server.used} of the ${server.limit} project databases its operator allows. `, h('span', { class: 'muted' }, server.note || '')) : null,
-      items.length ? h('p', { class: 'small muted' }, 'Each of these was started from the web interface. Nothing is registered here for it and its name is held. An operator acts on the server; this page does not run anything.') : null,
+      items.length ? h('p', { class: 'small muted' }, 'Nothing is registered here for any of these, and each name is held. An operator acts on the server; this page does not run anything.') : null,
       items.map((item) => {
         const [label, tone] = CREATION_CHIPS[item.state] || [item.state, 'warn'];
-        return h('div', { class: 'card', 'data-creation': item.project, 'data-state': item.state },
+        // `by` is "host" for a project an operator made with admin.py add-project (kittrial-5bb.176): no web
+        // account started it, so the card does not say one did (kittrial-5bb.198).
+        const origin = item.by === 'host' ? ['Started on the server by an operator (admin.py add-project)']
+          : ['Started from the web interface by ', item.by_name || item.by || 'unknown'];
+        return h('div', { class: 'card', 'data-creation': item.project, 'data-state': item.state, 'data-by': item.by === 'host' ? 'host' : 'web' },
           h('div', { class: 'toolbar' }, h('h2', { class: 'small mono' }, item.project), h('span', { class: 'chip ' + tone }, label)),
-          h('p', { class: 'small' }, 'Started by ', item.by_name || item.by || 'unknown', item.started_at ? [' ', time(item.started_at)] : null, item.stage && item.state !== 'running' ? `; stopped at the step “${item.stage}”.` : '.'),
+          h('p', { class: 'small' }, ...origin, item.started_at ? [' ', time(item.started_at)] : null, item.stage && item.state !== 'running' ? `; stopped at the step “${item.stage}”.` : '.'),
           item.what ? h('p', { class: 'small muted' }, item.what) : null,
           item.finish ? [h('p', { class: 'small muted' }, 'To finish it:'), h('pre', { class: 'json' }, item.finish)] : null,
-          item.remove ? [h('p', { class: 'small muted' }, item.state === 'stalled' ? 'To remove it (nothing was made, so the name is free again):' : item.state === 'damaged' ? 'To set the damaged record aside (it is kept, and nothing else is touched):' : 'To remove it (the name stays retired):'), h('pre', { class: 'json' }, item.remove)] : null);
+          item.remove ? [h('p', { class: 'small muted' }, item.state === 'stalled' ? 'To remove it (nothing was made, so the name is free again):' : item.state === 'damaged' ? 'To set the damaged record aside (it is kept, and nothing else is touched):' : 'To remove it (the name stays retired):'), h('pre', { class: 'json' }, item.remove)] : null,
+          item.state === 'created-unregistered' && onRegister ? h('div', null, h('button', { type: 'button', 'aria-label': 'Fill the register form with ' + item.project,
+            onclick: () => onRegister(item.project) }, 'Register…')) : null);
       })));
 }
 
@@ -232,6 +240,7 @@ export async function directory(ctx) {
               } }, 'Archive')))))) : '');
     };
     await drawReview();
+    let fillRegister = null;
     if (mode === 'register') {
       const register = h('form', { class: 'form', novalidate: true },
         h('p', { class: 'small muted' }, hostLine + ' Register it here with that NAME to use it in the web interface. Registering makes you its owner and gives nobody else access: add members afterwards.'),
@@ -246,6 +255,15 @@ export async function directory(ctx) {
         const created = await act(register.querySelector('button'), () => ctx.api.registerProject(projectId.trim(), name.trim()), { success: 'Project registered', onError: (e) => { if (e.status === 422 || e.status === 409) { setFieldError(register, 'project_id', e.message); return true; } return false; } });
         if (created) { await ctx.refreshProjects(); ctx.go('/p/' + created.id + '/setup'); }
       });
+      // From the list of projects made on the server and not registered (kittrial-5bb.198): the name is filled
+      // in and nothing is sent; the superuser registers it with the button of this form.
+      fillRegister = (projectId) => {
+        const input = register.querySelector('#project_id');
+        input.value = projectId;
+        setFieldError(register, 'project_id', '');
+        if (register.scrollIntoView) register.scrollIntoView({ block: 'center' });
+        if (input.focus) input.focus();
+      };
       panel = register;
     } else {
       panel = h('p', { class: 'small muted' }, hostLine + ' A superuser then registers it in the web interface and adds members. Ask an operator or a superuser.');
@@ -255,7 +273,7 @@ export async function directory(ctx) {
       h('div', { class: 'toolbar' }, archivedToggle),
       list,
       review,
-      await incompleteCreations(ctx),
+      await incompleteCreations(ctx, { onRegister: fillRegister }),
       hostCreatePanel(ctx, session && session.project_host_create),
       h('section', { class: 'panel' }, h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, mode === 'register' ? 'Register a project' : 'New project')), h('div', { class: 'panel-body' }, panel)));
   }

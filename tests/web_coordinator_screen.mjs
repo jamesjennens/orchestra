@@ -37,6 +37,18 @@ const rows = (page) => panel(page).all((e) => e.tagName === 'TR' && e.attributes
   agent: tr.attributes['data-agent'], coordinator: tr.attributes['data-coordinator'], text: tr.textContent,
   buttons: tr.all((e) => e.tagName === 'BUTTON').map((b) => b.textContent),
 }));
+// Who coordinates (kittrial-5bb.198): the read-only panel every member sees.
+const coordination = (page) => {
+  const node = page.all((e) => e.tagName === 'SECTION' && e.attributes['data-panel'] === 'coordination')[0];
+  if (!node) return null;
+  return {
+    people: node.all((e) => e.tagName === 'LI' && e.attributes['data-person']).map((li) => li.textContent),
+    agents: node.all((e) => e.tagName === 'LI' && e.attributes['data-agent-name']).map((li) => li.textContent),
+    rules: node.all((e) => e.tagName === 'LI' && e.attributes['data-rule']).map((li) => [li.attributes['data-rule'], li.attributes['data-on']]),
+    host: (node.all((e) => e.attributes && e.attributes['data-rules'] === 'host')[0] || { textContent: '' }).textContent,
+    buttons: node.all((e) => e.tagName === 'BUTTON' || e.tagName === 'SELECT' || e.tagName === 'INPUT').length,
+  };
+};
 const press = async (page, agent, label) => {
   const row = panel(page).all((e) => e.tagName === 'TR' && e.attributes['data-agent'] === agent)[0];
   await row.all((e) => e.tagName === 'BUTTON' && e.textContent === label)[0].dispatch('click');
@@ -52,8 +64,11 @@ const press = async (page, agent, label) => {
   out.before = rows(page);
   const [coordinating, working] = [out.before.find((r) => r.text.includes('Heron')).agent, out.before.find((r) => r.text.includes('Wren')).agent];
   // 2. Granted: the row says so and offers the removal.
+  out.coordinationBefore = coordination(page);
   await press(page, coordinating, 'Make coordinator');
   out.granted = rows(page).find((r) => r.agent === coordinating);
+  // The panel is read again after the grant changes.
+  out.coordinationGranted = coordination(page);
   // 3. An agent whose account is only a contributor: refused by the server, and the row is as it was.
   await press(page, working, 'Make coordinator');
   out.refused = rows(page).find((r) => r.agent === working);
@@ -66,6 +81,7 @@ const press = async (page, agent, label) => {
   const page = await view.settings(who.coordinator, { pid: project });
   await settle();
   out.coordinatorSeesPanel = Boolean(panel(page));
+  out.coordinationOfCoordinator = coordination(page);
 }
 out.can = { approveOwner: view.canApprove({ role: 'owner' }), approveCoordinator: view.canApprove({ role: 'coordinator' }),
   approveContributor: view.canApprove({ role: 'contributor' }), ownerCoordinator: view.isOwner({ role: 'coordinator' }),

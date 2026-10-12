@@ -728,6 +728,126 @@ class ProposalTests(test_http_proposals.ProposalHarness):
                 self.assertEqual(decides, decided.status != 403, decided.data)
 
 
+class CoordinationReadTests(Grants):
+    """kittrial-5bb.198: who coordinates a project, for any member, read only."""
+
+    def read(self, token):
+        return self.request('GET', '/v1/projects/%s/coordination' % self.project, token=token)
+
+    def readers(self):
+        self.ids['casey'] = self.create_account(self.admin, 'casey', 'casey-password-1')
+        self.assertEqual(200, self.member('casey', 'viewer').status)
+        self.tokens['casey'] = self.login('casey', 'casey-password-1')[0]
+        return {'an owner': self.tokens['olive'], 'a coordinator': self.tokens['cora'],
+                'a contributor': self.tokens['carl'], 'a viewer': self.tokens['casey'], 'a superuser': self.admin}
+
+    def test_every_member_reads_who_coordinates_and_the_read_changes_nothing(self):
+        readers = self.readers()
+        self.assertEqual(200, self.grant().status)
+        def held():
+            with self.service.store.lock:
+                state = self.service.state
+                return json.dumps([state['memberships'], state.get('coordinator_grants'), len(state['audit'])], sort_keys=True)
+        before = held()
+        members = self.request('GET', '/v1/projects/%s/members' % self.project, token=self.tokens['olive']).data['items']
+        people = sorted((m['user_id'], m['role']) for m in members if m['role'] in ('coordinator', 'owner'))
+        self.assertIn((self.ids['cora'], 'coordinator'), people)
+        self.assertNotIn(self.ids['carl'], [user for user, _ in people])
+        for label, token in readers.items():
+            with self.subTest(reader=label):
+                answer = self.read(token)
+                self.assertEqual(200, answer.status, answer.data)
+                self.assertEqual(sorted((p['user_id'], p['role']) for p in answer.data['people']), people)
+                self.assertEqual([(a['name'], a['owner_display_name']) for a in answer.data['agents']], [('Heron', 'cora')])
+                self.assertEqual(answer.data['agents'][0]['granted_by_display_name'], 'olive')
+                # The agent's id, its actor and its credentials are not part of this read.
+                self.assertEqual(set(answer.data['agents'][0]), {'name', 'owner_display_name', 'granted_by_display_name', 'granted_at'})
+                self.assertEqual(set(answer.data), {'project', 'people', 'agents', 'web_rules', 'host_rules', 'generated_at'})
+        # An agent's credential reads it as it reads the members list: both are CAP_READ.
+        self.assertEqual((200, 200), (self.read(self.agent).status,
+                                      self.request('GET', '/v1/projects/%s/members' % self.project, token=self.agent).status))
+        # No membership, grant or audit entry is written by reading.
+        self.assertEqual(before, held())
+
+    def test_nobody_outside_the_project_reads_it(self):
+        outsider = self.create_account(self.admin, 'otto', 'otto-password-1')
+        self.assertTrue(outsider)
+        self.assertIn(self.read(self.login('otto', 'otto-password-1')[0]).status, (403, 404))
+        self.assertEqual(401, self.read(None).status)
+        # There is no write on this path.
+        self.assertIn(self.request('POST', '/v1/projects/%s/coordination' % self.project, {}, token=self.tokens['olive'],
+                                   key='coordination-post').status, (404, 405))
+
+    def test_a_grant_without_effect_is_not_shown_as_coordinating(self):
+        self.assertEqual(200, self.grant().status)
+        self.assertEqual(1, len(self.read(self.tokens['carl']).data['agents']))
+        self.assertEqual(200, self.member('cora', 'contributor').status)
+        answer = self.read(self.tokens['carl']).data
+        self.assertEqual(answer['agents'], [])
+        self.assertNotIn(self.ids['cora'], [p['user_id'] for p in answer['people']])
+        self.assertEqual(200, self.member('cora', 'coordinator').status)
+        self.assertEqual(200, self.request('POST', '/v1/agents/%s/disable' % self.agent_id, {}, token=self.tokens['cora']).status)
+        self.assertEqual(self.read(self.tokens['carl']).data['agents'], [])
+
+    def test_a_grant_left_on_record_for_an_agent_outside_the_project_is_not_shown(self):
+        self.assertEqual(200, self.grant().status)
+        # Every route that takes the agent out of the project deletes the grant; a record left
+        # behind anyway (a hand-edited state file) still does not make it a coordinator here.
+        with self.service.store.lock:
+            self.service.state['agents'][self.agent_id]['projects'] = []
+        self.assertEqual(self.read(self.tokens['carl']).data['agents'], [])
+
+    def test_only_who_administers_the_project_is_told_an_account_is_disabled(self):
+        self.assertEqual(200, self.request('POST', '/v1/accounts/%s/disable' % self.ids['cora'], {}, token=self.admin).status)
+        owner = {p['user_id']: p for p in self.read(self.tokens['olive']).data['people']}
+        member = {p['user_id']: p for p in self.read(self.tokens['carl']).data['people']}
+        self.assertIs(owner[self.ids['cora']]['disabled'], True)
+        self.assertIs(owner[self.ids['olive']]['disabled'], False)
+        self.assertNotIn('disabled', member[self.ids['cora']])
+
+    def test_the_rules(self):
+        answer = self.read(self.tokens['carl']).data
+        self.assertEqual([(r['rule'], r['on']) for r in answer['web_rules']], [('approval_by_another_party', self.SETTING)])
+        # The in-process backend has no host behind it.
+        self.assertEqual(answer['host_rules'], {'state': 'not-applicable', 'rules': []})
+        self.service.approval_by_another_party = True
+        self.assertIs(self.read(self.tokens['carl']).data['web_rules'][0]['on'], True)
+
+    def test_the_installation_rules_come_from_the_hosts_setup_status_and_nothing_else_of_it(self):
+        import admin
+        import project_coordination
+        from http_auth import HttpError
+        self.assertEqual(tuple(project_coordination.RULES), admin.COORDINATOR_RULE_KEYS)
+        viewer = self.readers()['a viewer']
+        asked = []
+        status = {'guidance': {'state': 'set'}, 'backup': {'line': 'ExecStart=secret'}, 'admin': '/usr/bin/python3 /opt/kit/admin.py',
+                  'coordinator_rules': {'enabled': True, 'rules': {'lifecycle_authors': False, 'independent_approval': True,
+                                                                   'coordinator_writes': False}, 'detail': 'operator words'}}
+        def setup_status(project_id):
+            asked.append(project_id)
+            if isinstance(status, Exception):
+                raise status
+            return status
+        self.backend.setup_status = setup_status
+        answer = self.read(viewer)
+        self.assertEqual(200, answer.status, answer.data)
+        self.assertEqual(asked, [self.project])
+        self.assertEqual(answer.data['host_rules']['state'], 'available')
+        self.assertEqual([(r['rule'], r['on']) for r in answer.data['host_rules']['rules']],
+                         [('lifecycle_authors', False), ('independent_approval', True), ('coordinator_writes', False)])
+        for word in ('ExecStart', 'admin.py', 'operator words', 'guidance'):
+            self.assertNotIn(word, json.dumps(answer.data))
+        for given, state in (({'coordinator_rules': {'enabled': None, 'rules': None, 'detail': 'x'}}, 'unknown'),
+                             ({'coordinator_rules': {'enabled': None, 'rules': dict.fromkeys(admin.COORDINATOR_RULE_KEYS, False)}},
+                              'unknown'),
+                             ({'guidance': {'state': 'set'}}, 'unavailable'),
+                             (HttpError(502, 'bad_gateway', 'The host refused', detail='Unknown action setup-status'), 'unavailable'),
+                             (HttpError(503, 'unavailable', 'busy'), 'unknown')):
+            status = given
+            with self.subTest(state=state, given=str(given)[:40]):
+                self.assertEqual(self.read(viewer).data['host_rules'], {'state': state, 'rules': []})
+
+
 class PageTests(Grants):
     """The settings page under Node, with a small DOM, against this real service."""
 
@@ -759,6 +879,20 @@ class PageTests(Grants):
         self.assertEqual((seen['refused']['agent'], seen['refused']['coordinator']), (worker_id, 'none'))
         self.assertEqual((seen['removed']['coordinator'], seen['removed']['buttons']), ('none', ['Make coordinator']))
         self.assertIs(seen['coordinatorSeesPanel'], False)
+        # kittrial-5bb.198: who coordinates, read only, for the owner and for a coordinator who is not one.
+        before, granted, other = seen['coordinationBefore'], seen['coordinationGranted'], seen['coordinationOfCoordinator']
+        self.assertEqual(before['agents'], [])
+        self.assertTrue(any(text.startswith('cora · Coordinator') for text in before['people']), before)
+        self.assertTrue(any(text.startswith('olive · Owner') for text in before['people']), before)
+        self.assertFalse(any(text.startswith('carl') for text in before['people']), before)
+        self.assertEqual(len(granted['agents']), 1)
+        self.assertTrue(granted['agents'][0].startswith('Heron, agent of cora · granted by olive'), granted)
+        self.assertEqual(before['rules'], [['approval_by_another_party', 'false']])
+        self.assertIn('no host project behind it', before['host'])
+        self.assertEqual((before['buttons'], other['buttons']), (0, 0))
+        self.assertEqual(other['people'], before['people'])
+        # The page's last act removed the grant before the coordinator's page was read.
+        self.assertEqual(other['agents'], [])
         self.assertEqual(seen['can'], {'approveOwner': True, 'approveCoordinator': True, 'approveContributor': False,
                                        'ownerCoordinator': False, 'writeCoordinator': True})
         # What the page did is what the server holds: given and removed, so none now.
