@@ -1867,20 +1867,31 @@ def project_metadata_state(root,name):
         return 'unreadable'
     return 'server' if project_server_metadata(root,name) is not None else 'unreadable'
 
-def server_database_exists(root,name):
-    """Whether the server has the exact database name for a project missing metadata."""
-    validate_name(name)
-    rows=list(csv.reader(io.StringIO(sql(root,"SHOW DATABASES LIKE '%s';"%name,
-                                         timeout=RETIRE_PROBE_TIMEOUT))))
-    if not rows or len(rows[0])!=1 or rows[0][0].strip().lower()!='database':
-        raise ValueError('unexpected SHOW DATABASES output')
-    return any(len(row)==1 and row[0]==name for row in rows[1:])
-
-def server_database_issue_count(root,name):
-    """Count Beads issues in a same-named server database."""
+def server_database_name(root,name):
+    """Return the case-insensitively matched server database name, if any."""
     validate_name(name)
     rows=list(csv.reader(io.StringIO(sql(
-        root,"SELECT COUNT(*) FROM `%s`.issues WHERE id <> '%s-merge-slot';"%(name,name),
+        root,"SHOW DATABASES WHERE LOWER(`Database`)='%s';"%name,
+        timeout=RETIRE_PROBE_TIMEOUT))))
+    if not rows or len(rows[0])!=1 or rows[0][0].strip().lower()!='database':
+        raise csv.Error('unexpected SHOW DATABASES output')
+    databases=rows[1:]
+    if len(databases)>1 or any(len(row)!=1 for row in databases):
+        raise csv.Error('unexpected SHOW DATABASES output')
+    if not databases:
+        return None
+    database=databases[0][0]
+    if (not database.isascii() or database.casefold()!=name.casefold()):
+        raise csv.Error('unexpected SHOW DATABASES output')
+    return database
+
+def server_database_issue_count(root,database,project):
+    """Count Beads issues in the returned server database, excluding its merge slot."""
+    validate_name(project)
+    if not database.isascii() or database.casefold()!=project.casefold():
+        raise ValueError('unexpected server database name')
+    rows=list(csv.reader(io.StringIO(sql(
+        root,"SELECT COUNT(*) FROM `%s`.issues WHERE id <> '%s-merge-slot';"%(database,project),
         timeout=RETIRE_PROBE_TIMEOUT))))
     if (len(rows)!=2 or len(rows[0])!=1 or rows[0][0].strip().lower()!='count(*)'
             or len(rows[1])!=1):
@@ -2205,7 +2216,10 @@ def restore_failure_notice(destination,error,state='partial',step='native restor
                                              ' during the %s step'%step)
     else:
         cause='the %s step failed'%step if step!='native restore' else 'the native restore failed'
-    retire=('admin.py retire-project %s --actor OPERATOR --reason TEXT'%destination)
+    retire='admin.py retire-project %s --actor OPERATOR --reason TEXT'%destination
+    retry_force=(' If it is refused because the half-restored DB has issues or the server is unreachable, '
+                 'read its output and repeat it with --force.'
+                 if state in ('partial','uninitialized') else '')
     if state=='missing':
         return ('restore-new did not complete: %s. The directory of project %s is no longer there (it was moved '
                 'or retired while the restore ran), so nothing more was written: no re-point, no coordination '
@@ -2214,9 +2228,9 @@ def restore_failure_notice(destination,error,state='partial',step='native restor
     if state=='uninitialized':
         return ('restore-new did not complete: %s. The directory projects/%s exists but the project was not '
                 'initialized, so it is not a working project: nothing was restored into it, and its database '
-                'may or may not have been created. Do not use it as a tracker. Retire it (%s) and run '
+                'may or may not have been created. Do not use it as a tracker. Retire it with %s.%s Run '
                 'restore-new again into another unused destination name; the source backup was not modified.'
-                %(cause,destination,retire))
+                %(cause,destination,retire,retry_force))
     if state=='empty' and step!=MERGE_SLOT_STEP:
         return ('restore-new did not complete: %s. Project %s exists as an empty, working project: nothing '
                 'was restored into it (and its coordination sidecar, journals and operation journal were NOT '
@@ -2240,26 +2254,26 @@ def restore_failure_notice(destination,error,state='partial',step='native restor
         detail=(merge_slot or {}).get('detail')
         if where in ('missing','damaged'):
             return ('restore-new did not complete: %s. %s Its merge slot is still %s: %s Run the merge-create '
-                    'coordination operation for %s, or retire it (%s) and run restore-new again into another '
+                    'coordination operation for %s, or retire it with %s.%s Run restore-new again into another '
                     'unused destination name; the source backup was not modified.'
-                    %(cause,in_place,where,detail or 'the host read it as unusable.',destination,retire))
+                    %(cause,in_place,where,detail or 'the host read it as unusable.',destination,retire,retry_force))
         if where=='healthy':
             return ('restore-new did not complete: %s. %s Its merge slot reads healthy, so the failure was in the '
                     '%s step and not in the slot: nothing is left to mend, and merge-check and the read-only '
                     'merge-slot-report are expected to agree. Confirm with merge-check before using it, or retire '
-                    'it (%s) and run restore-new again into another unused destination name; the source backup was '
-                    'not modified.'%(cause,in_place,MERGE_SLOT_STEP,retire))
+                    'it with %s.%s Run restore-new again into another unused destination name; the source backup '
+                    'was not modified.'%(cause,in_place,MERGE_SLOT_STEP,retire,retry_force))
         return ('restore-new did not complete: %s. %s Whether it has a usable merge slot could not be read: the '
                 'same fault stopped the %s step, so this notice does not claim it is missing. Run merge-check for '
                 '%s, or the read-only merge-slot-report, and if it names the merge-create operation run that; else '
-                'retire it (%s) and run restore-new again into another unused destination name. The source backup '
-                'was not modified.'%(cause,in_place,MERGE_SLOT_STEP,destination,retire))
+                'retire it with %s.%s Run restore-new again into another unused destination name. The source backup '
+                'was not modified.'%(cause,in_place,MERGE_SLOT_STEP,destination,retire,retry_force))
     return ('restore-new did not complete: %s. Project %s exists but holds a partial restore (its '
             'coordination sidecar, journals and operation journal were NOT restored). Preserve it for '
             'inspection, do not use or back it up as a tracker, and run restore-new again into another '
             'unused destination name; the source backup was not modified. While it stays in the runtime '
-            'its backup fails and the backup gate reports the runtime incomplete: retire it with %s.'
-            %(cause,destination,retire))
+            'its backup fails and the backup gate reports the runtime incomplete: retire it with %s.%s'
+            %(cause,destination,retire,retry_force))
 
 def provision_merge_slot(root,name):
     """Create the project's merge slot once, tolerating an existing slot.
@@ -3122,13 +3136,15 @@ def retire_findings(root,name):
             server='unreachable'
     elif metadata=='absent':
         try:
-            exists=server_database_exists(root,name)
-            server='up';server_database='present' if exists else 'absent'
+            database=server_database_name(root,name)
+            server='up';server_database='present' if database is not None else 'absent'
+        except csv.Error:
+            server='up';server_database='unreadable';database=None
         except (subprocess.CalledProcessError,subprocess.TimeoutExpired,OSError,ValueError,KeyError,TypeError,
-                csv.Error,RecursionError):
-            server='unreachable';server_database='unreadable'
+                RecursionError):
+            server='unreachable';server_database='unreadable';database=None
         if server_database=='present':
-            try:server_database_issues=server_database_issue_count(root,name)
+            try:server_database_issues=server_database_issue_count(root,database,name)
             except (subprocess.CalledProcessError,subprocess.TimeoutExpired,OSError,ValueError,KeyError,TypeError,
                     csv.Error,RecursionError):
                 server_database='unreadable'
