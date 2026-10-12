@@ -246,7 +246,7 @@ class EndpointWithoutServiceTests(unittest.TestCase):
                         expected=work.APPROVAL_WAIT if enabled and actor in ('author','assignee') else row['next']
                         self.assertEqual(row['waiting_for_approval'],expected)
                         self.assertEqual(brief['review']['waiting_for_approval'],expected)
-                        self.assertEqual(brief['review']['approval_requires_other_party'],enabled)
+                        self.assertEqual(brief['review'].get('approval_requires_other_party',False),enabled)
             self.assertEqual(chain.rows,before)
 
 

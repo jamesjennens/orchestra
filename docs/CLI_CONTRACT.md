@@ -11,7 +11,8 @@ requires a new contract version.
 
 `work` rows and the canonical `brief.review` and `review` projections carry
 `waiting_for_approval` (bounded text or null) and `approval_requires_other_party`
-(boolean, the installation's `independent_approval` setting). With a current
+(boolean, the installation's `independent_approval` setting; the compact
+`brief.review` omits it when false, and absence means false). With a current
 awaiting-review contribution and that setting on, the author/assignee sees the
 independent-party waiting sentence. Other callers, and all callers with the rule
 off, see the explanation from the same decision as `whose_move`. A named reviewer

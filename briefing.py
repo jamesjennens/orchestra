@@ -807,6 +807,10 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
                       reverts=reverts[-REVERT_BRIEF_LIMIT:],reverts_total=len(reverts),
                       reverts_more='review '+task if len(reverts)>REVERT_BRIEF_LIMIT else None)
     brief_review.pop('reconciliation_needed',None)
+    # Avoid adding off-state bytes to compact long-chain briefs. The setting
+    # is carried only when ON; absence means false, including older endpoints.
+    if not brief_review.get('approval_requires_other_party'):
+        brief_review.pop('approval_requires_other_party',None)
     result={**attention,'reference_drafts_matching':reference_drafts,'task':task,'title':clip(issue.get('title'),200),'owner':clip(issue.get('assignee') or 'unassigned',96),'status':issue.get('status'),
             'activity_cursor':activity_cursor(data),'checkpoint':None if p is None else {'comment_id':str(c['id']),'author':clip(c.get('author'),96),'timestamp':c.get('created_at'),'source_commit':p['source_commit'],'branch':p['branch'],'incorporated_activity_cursor':p['activity_cursor'],
                 'newer_activity':stale,**({'taken_in_project':taken_in} if taken_in else {})},
