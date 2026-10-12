@@ -288,9 +288,10 @@ Registration writes the project record and its `registered_by` mark in one save,
 confirmation saves its confirmation and backfilled mark — putting them back if that
 save raises — before committing a success receipt. A crash after that receipt can
 replay only a durable effect. A crash after the effect but before the receipt leaves
-an in-progress request that refuses the identical `Idempotency-Key` for
-`idempotency_ttl` (24 hours by default, `IDEMPOTENCY_TTL_SECONDS`). The owner gets out
-with a new key (or none), which is answered from the true state: a registration that is
+an in-progress request that refuses the identical `Idempotency-Key` for the fixed
+`idempotency_ttl` (24 hours; it is the module constant `IDEMPOTENCY_TTL_SECONDS`, not a
+setting). The caller (a superuser on both routes) gets out with a new key (or none),
+which is answered from the true state: a registration that is
 already recorded answers 409 "already registered", and a confirmation of an
 already-confirmed record answers 409 "This project needs no confirmation", while an
 exact retry of the committed request replays its own answer.

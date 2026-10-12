@@ -1719,6 +1719,14 @@ class Service:
         save, so no window remains between the project record and its mark in which a
         failure or a kill leaves a project on disk without it (kittrial-5bb.255). The
         ordinary create route passes none, so its records carry no such mark.
+
+        A save that raises takes the record and the membership back out of memory
+        before the error is re-raised (kittrial-5bb.255, the register half of R1):
+        otherwise the next save of anything -- a GET's last-use stamp is enough --
+        would make an unaudited registration durable, leaving a usable project with no
+        committed ``projects.create`` audit entry whose key, and every new key, refuse
+        as "already registered". Both callers (the ordinary create route and the
+        register route) get the same undo, because both come through here.
         """
         if principal is None or principal.via == 'credential':
             raise forbidden('A worker credential cannot create projects')
@@ -1737,9 +1745,21 @@ class Service:
             }
             if registered_by is not None:
                 record['registered_by'] = registered_by
+            # The record is new (the id was just shown absent), so it is removed
+            # exactly; a membership under this id can only be stale state, so it is
+            # put back exactly as it was rather than assumed absent.
+            prior_members = self.state['memberships'].get(pid)
             self.state['projects'][pid] = record
             self.state['memberships'][pid] = {principal.user_id: 'owner'}
-            self.store.save()
+            try:
+                self.store.save()
+            except BaseException:
+                self.state['projects'].pop(pid, None)
+                if prior_members is None:
+                    self.state['memberships'].pop(pid, None)
+                else:
+                    self.state['memberships'][pid] = prior_members
+                raise
         return self.project_view(principal, pid)
 
     @staticmethod

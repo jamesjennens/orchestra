@@ -16,7 +16,7 @@ sys.path.insert(0, str(ROOT / 'tests'))
 import http_auth
 import http_service
 from test_http_project_register import RegisterHarness
-from test_http_review_fixes import STUB
+from test_http_review_fixes import STUB, Harness
 
 CRASH = '''
 import http.client,json,os,sys,threading
@@ -181,6 +181,72 @@ class ProjectReceiptDurabilityTests(RegisterHarness):
         self.assertEqual(200, done.status, done.data)
         self.assertEqual(self.admin_user['id'], self.service.state['projects']['alpha']['confirmed_by'])
 
+    def test_confirmation_failed_effect_save_puts_the_earlier_values_back_without_a_restart(self):
+        """kittrial-5bb.255 review item `one-test-and-words`: the undo must PUT BACK the
+        earlier values, not merely delete the fields. A record can already carry an empty
+        registered_by, an empty confirmed_by and a stale confirmed_at; a mutant whose
+        restore deletes them instead of restoring them must fail here."""
+        admin = self.fixture('confirm')
+        record = self.service.state['projects']['alpha']
+        record['registered_by'] = ''
+        record['confirmed_by'] = ''
+        record['confirmed_at'] = '2026-01-01T00:00:00Z'
+        self.store.save()
+        write = self.store._write
+
+        def fail():
+            if record.get('confirmed_by'):
+                raise OSError('synthetic confirmation save failure')
+            return write()
+        with mock.patch.object(self.store, '_write', side_effect=fail):
+            reply = self.invoke('confirm', admin)
+        self.assertEqual(500, reply.status, reply.data)
+        # No restart: the earlier values are back exactly, present and unchanged.
+        for field, earlier in (('registered_by', ''), ('confirmed_by', ''), ('confirmed_at', '2026-01-01T00:00:00Z')):
+            self.assertIn(field, record)
+            self.assertEqual(earlier, record[field])
+        # The next save of anything writes the earlier values, not a confirmation.
+        self.store.save()
+        written = json.loads(self.store.path.read_text(encoding='utf-8'))['projects']['alpha']
+        self.assertEqual((written.get('registered_by'), written.get('confirmed_by'), written.get('confirmed_at')),
+                         ('', '', '2026-01-01T00:00:00Z'))
+        self.assertEqual([], [event for event in self.service.state['audit']
+                              if event['action'] == 'projects.confirm' and event['outcome'] == 'committed'])
+        done = self.invoke('confirm', admin)
+        self.assertEqual(200, done.status, done.data)
+        self.assertEqual(self.admin_user['id'], record['confirmed_by'])
+
+    def test_registration_failed_effect_save_undoes_the_record_without_a_restart(self):
+        """kittrial-5bb.255 register half of R1: a failed create save must take the
+        project record and its membership back out of memory, so no later save can make
+        an unaudited registration durable and no false 409 survives it."""
+        admin = self.fixture('register')
+        self.assertNotIn('alpha', self.service.state['projects'])
+        write = self.store._write
+
+        def fail():
+            if 'alpha' in self.service.state['projects']:
+                raise OSError('synthetic registration save failure')
+            return write()
+        with mock.patch.object(self.store, '_write', side_effect=fail):
+            reply = self.invoke('register', admin)
+        self.assertEqual(500, reply.status, reply.data)
+        # No restart: the undo took the record and the membership back.
+        self.assertNotIn('alpha', self.service.state['projects'])
+        self.assertNotIn('alpha', self.service.state['memberships'])
+        # The next save of anything writes no project and no mark.
+        self.store.save()
+        disk = json.loads(self.store.path.read_text(encoding='utf-8'))
+        self.assertNotIn('alpha', disk['projects'])
+        self.assertNotIn('alpha', disk['memberships'])
+        self.assertEqual([], [event for event in self.service.state['audit']
+                              if event['action'] == 'projects.create' and event['outcome'] == 'committed'])
+        # The key was released, so the same key registers without a restart and no
+        # false 409 "already registered".
+        done = self.invoke('register', admin)
+        self.assertEqual(201, done.status, done.data)
+        self.assertEqual(self.admin_user['id'], self.service.state['projects']['alpha']['registered_by'])
+
     def test_confirmation_conflicting_key_and_no_key_retry_stay_refused(self):
         admin = self.fixture('confirm')
         self.assertEqual(200, self.invoke('confirm', admin).status)
@@ -188,6 +254,45 @@ class ProjectReceiptDurabilityTests(RegisterHarness):
         # A changed body cannot inherit the first receipt, even if it has no route fields.
         self.assertEqual(409, self.invoke('confirm', admin, body={'unused': True}).status)
         self.assertEqual(409, self.invoke('confirm', admin, key=None).status)
+
+
+class InProcessCreateUndoCase(Harness):
+    """kittrial-5bb.255: the ordinary creation route gets the same undo."""
+
+    def test_create_failed_effect_save_undoes_the_project_without_a_restart(self):
+        admin = self.admin_token()
+        self.create_account(admin, 'alex', 'alex-password-1')
+        alex = self.login('alex', 'alex-password-1')[0]
+        write = self.store._write
+        added = []
+
+        def fail():
+            if self.service.state['projects'] and not added:
+                added.append(next(iter(self.service.state['projects'])))
+            if self.service.state['projects']:
+                raise OSError('synthetic create save failure')
+            return write()
+        with mock.patch.object(self.store, '_write', side_effect=fail):
+            reply = self.request('POST', '/v1/projects', {'name': 'Alpha'}, token=alex, key='create-key')
+        self.assertEqual(500, reply.status, reply.data)
+        self.assertEqual(1, len(added))
+        pid = added[0]
+        # No restart: the record and the membership the failed create added are gone.
+        self.assertNotIn(pid, self.service.state['projects'])
+        self.assertNotIn(pid, self.service.state['memberships'])
+        # The release of the key saves the state again; that save must not write the
+        # project or its membership either.
+        self.assertNotIn(pid, json.loads(self.store.path.read_text(encoding='utf-8'))['projects'])
+        self.store.save()
+        disk = json.loads(self.store.path.read_text(encoding='utf-8'))
+        self.assertNotIn(pid, disk['projects'])
+        self.assertNotIn(pid, disk['memberships'])
+        self.assertEqual([], [event for event in self.service.state['audit']
+                              if event['action'] == 'projects.create' and event['outcome'] == 'committed'])
+        # The key was released, so the same key creates the project without a restart.
+        retry = self.request('POST', '/v1/projects', {'name': 'Alpha'}, token=alex, key='create-key')
+        self.assertEqual(201, retry.status, retry.data)
+        self.assertIn(retry.data['id'], self.service.state['projects'])
 
 
 if __name__ == '__main__':
