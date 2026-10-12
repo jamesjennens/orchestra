@@ -797,6 +797,9 @@ class WebScreenTests(unittest.TestCase):
 
     def test_the_forms_follow_the_no_self_rules(self):
         self.assertIn('view.can_triage && !view.mine && !escalatedByMe', self.proposals)
+        # The owner-decision form goes by the server's `can_decide` (kittrial-5bb.261).
+        self.assertIn("view.state === 'escalated-to-owner' && view.can_decide !== true", self.proposals)
+        self.assertIn('!escalatedByMe && !awaitsOwner ? triageForm(', self.proposals)
         self.assertIn('You escalated this proposal: a different owner has to decide it.', self.proposals)
         self.assertIn('This is your own proposal: another owner has to triage it.', self.proposals)
         self.assertIn("m.user_id !== ctx.me.id", self.proposals)   # the escalator is not offered as the decider
@@ -848,6 +851,11 @@ class ScreenBehaviourCase(ProposalHarness):
         self.people['erin'] = (self.login('erin', 'erin-password-1')[0], erin)
         # kittrial-5bb.97: a configured decider that is an account but not a member here.
         pr.change_settings({'add_decider': 'account:' + erin}, 'ops', settings, ['ops'])
+        # A coordinator by role (kittrial-5bb.261): triages, and is not offered the owner decision.
+        cora = self.create_account(self.admin, 'cora', 'cora-password-1')
+        self.assertEqual(200, self.request('PUT', '/v1/projects/%s/members/%s' % (self.project, cora),
+                                           {'role': 'coordinator'}, token=self.admin).status)
+        self.people['cora'] = (self.login('cora', 'cora-password-1')[0], cora)
         web = KIT / 'web' / 'js'
         people = ['%s=%s=%s' % (name, token, uid) for name, (token, uid) in self.people.items()]
         done = run_node_module(self, node, 'await import(process.argv[1])',
@@ -877,6 +885,17 @@ class ScreenBehaviourCase(ProposalHarness):
         self.assertEqual(retry['added'], 1)
         self.assertEqual(len(retry['went']), 1)                           # then it went to the one proposal
         self.assertNotEqual(retry['otherKey'], retry['keys'][0])          # other content, another key
+
+        # The owner decision is offered to an owner only (kittrial-5bb.261): the server says
+        # `can_decide`, and a coordinator sees who decides instead of a form the server refuses.
+        decide = seen['decide']
+        self.assertEqual(decide['reads'], [False, True])
+        self.assertEqual(decide['coordinator']['forms'], 0)
+        self.assertNotIn('Owner decision', decide['coordinator']['text'])
+        self.assertIn('This proposal waits for an owner’s decision. A coordinator triages and escalates a proposal; '
+                      'only an owner records the decision.', decide['coordinator']['text'])
+        self.assertEqual(decide['owner'], {'forms': 1, 'heading': True})
+        self.assertEqual(decide['triage'], {'forms': 1, 'heading': True})          # a coordinator still triages
 
         # P2 rule-refusals-show-no-reason.
         self.assertIn('Unknown decision alpha-nope', seen['refusal']['message'])

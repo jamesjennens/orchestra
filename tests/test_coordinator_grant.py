@@ -565,6 +565,38 @@ class ProposalTests(test_http_proposals.ProposalHarness):
         self.assertNotEqual(403, owned.status, owned.data)
 
 
+    def test_the_reads_say_who_may_record_the_owner_decision(self):
+        """kittrial-5bb.261: `can_decide` beside `can_triage`, on the queue and on one proposal. True for
+        who the decide route lets through (`project.admin`, signed in): an owner and a superuser. A
+        coordinator triages and does not decide; a credential does neither, granted or not."""
+        cora = self.create_account(self.admin, 'cora', 'cora-password-1')
+        self.assertEqual(200, self.request('PUT', '/v1/projects/%s/members/%s' % (self.project, cora), {'role': 'coordinator'},
+                                           token=self.admin).status)
+        made = self.request('POST', '/v1/agents', {'name': 'Heron', 'working_directory': '/home/x/heron',
+                                                   'projects': [self.project]}, token=self.token('blair'))
+        self.assertEqual(201, made.status, made.data)
+        self.assertEqual(200, self.request('PUT', '/v1/projects/%s/agents/%s/coordinator' % (self.project, made.data['agent']['id']),
+                                           {}, token=self.token('dana')).status)
+        key = self.submit().data['key']
+        callers = (('an owner', self.token('blair'), True, True), ('a coordinator', self.login('cora', 'cora-password-1')[0], True, False),
+                   ('a contributor', self.token('alex'), False, False), ('a viewer', self.token('casey'), False, False),
+                   ('a superuser', self.admin, True, True),
+                   ('a granted agent of an owner', made.data['credential']['secret'], False, False))
+        for label, token, triages, decides in callers:
+            with self.subTest(caller=label):
+                listed = self.request('GET', self.base(), token=token)
+                one = self.request('GET', self.base() + '/' + key, token=token)
+                self.assertEqual((200, 200), (listed.status, one.status), (listed.data, one.data))
+                self.assertEqual((triages, decides), (listed.data['can_triage'], listed.data['can_decide']))
+                self.assertEqual((triages, decides), (one.data['can_triage'], one.data['can_decide']))
+                self.assertIs(type(one.data['can_decide']), bool)
+                # What the read says is what the write does: a decide is refused for want of authority
+                # (403) exactly where `can_decide` is false.
+                decided = self.request('POST', self.base() + '/' + key + '/dispositions', {'operation': 'decide', 'to_state': 'approved'},
+                                       token=token, key='decide-%s' % label.replace(' ', '-'))
+                self.assertEqual(decides, decided.status != 403, decided.data)
+
+
 class PageTests(Grants):
     """The settings page under Node, with a small DOM, against this real service."""
 

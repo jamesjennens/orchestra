@@ -6285,6 +6285,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         result['next_cursor'] = (make_cursor(ctx.principal, pid, ctx.query, result['next_offset'])
                                  if result.get('next_offset') is not None else None)
         result['can_triage'] = self._triages(ctx, capabilities)
+        result['can_decide'] = self._decides(ctx, capabilities)
         result['can_propose'] = CAP_PROPOSALS in capabilities
         return 200, result
 
@@ -6294,6 +6295,13 @@ class ApiHandler(BaseHTTPRequestHandler):
         a credential, as the write below says; an agent's coordinator grant (kittrial-5bb.209)
         gives it the approval of contributions and changes nothing here."""
         return CAP_APPROVE in capabilities and ctx.principal.via != 'credential'
+
+    @staticmethod
+    def _decides(ctx, capabilities):
+        """Whether the caller records the owner decision on an escalated proposal: a signed-in
+        member with `project.admin` (an owner, or a superuser), the check the write below makes.
+        A coordinator triages and does not decide; never a credential (kittrial-5bb.261)."""
+        return CAP_PROJECT_ADMIN in capabilities and ctx.principal.via != 'credential'
 
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/proposals/(?P<key>' + PROPOSAL_KEY + r')')
     def proposals_get(self, ctx):
@@ -6309,6 +6317,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         capabilities = self.service.capabilities_for(ctx.principal, pid)
         result = self._proposal_view(ctx, capabilities, self.backend.proposal_read(pid, args, missing=True))
         result['can_triage'] = self._triages(ctx, capabilities)
+        result['can_decide'] = self._decides(ctx, capabilities)
         return 200, result
 
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/proposals/(?P<key>' + PROPOSAL_KEY + r')/dispositions')
