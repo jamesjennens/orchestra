@@ -63,10 +63,12 @@ reads `none`. An item also carries `work_state` (the review state it shows, or
 `reconciliation-needed`), `reconciliation_needed` and `reconciliation_reasons` (the
 mismatching facts), and `claimable` (the bounded claimability answer, see below).
 
-`work --state` filters by the review state the row SHOWS, so the item you see is the item
-you find. The one additive value is `work --state reconciliation-needed`: it selects the
-rows whose recorded evidence must be reconciled before it is read as current, whatever
-review state they show. Reconciliation clears nothing — it never replaces `review_state`,
+`work --state` filters by the review state the row shows BEFORE a malformed handoff journal
+turns that shown state into `error`, so the item you see is the item you find apart from
+that override. Two additive values: `work --state reconciliation-needed` selects the rows
+whose recorded evidence must be reconciled before it is read as current, whatever review
+state they show, and `work --state error` additionally finds the rows the journal override
+turned into a shown `error`. Reconciliation clears nothing — it never replaces `review_state`,
 never clears an open item or blocker, and infers neither abandonment nor deployment. The
 same read is on the brief's `review` block, in the EXISTING warning surfaces.
 

@@ -55,6 +55,8 @@ ITEM_FIELDS = {
     # Additive selection facts (kittrial-5bb.6): the next-action actor role, the
     # filterable work state, the reconciliation signal and bounded claimability.
     'next_actor', 'work_state', 'reconciliation_needed', 'reconciliation_reasons', 'claimable',
+    # Additive superseding-redelivery fact (kittrial-5bb.253 item 1).
+    'redelivered',
 }
 BRIEF_FIELDS = {
     'task', 'title', 'owner', 'status', 'activity_cursor', 'checkpoint', 'intent',
