@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "operation_id": "caprev-5bb265-bound-keys-0001",
+  "operation_id": "caprev-5bb265-bound-keys-r2-0001",
   "key": "ssh.bound-keys-only",
   "revision": 5,
   "expected_sha256": "544ea2395af20f970a581931d031af93443600711fcfe587437dc6fb3fdd164f",

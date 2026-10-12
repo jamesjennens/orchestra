@@ -363,21 +363,24 @@ groups (kittrial-5bb.265): **refused** - a line whose command is EXACTLY the sha
 BOTH, alone, in the printed order (no partial flag set - a line without `-E` obeys
 `PYTHONPATH` if sshd passes the environment - no combined `-Es`, no `-W` that takes the
 wrapper path as its own value, no `-i`), then this kit's wrapper by absolute path as the
-next word - or the wrapper path as the first word. The first word must be the absolute path
-the kit prints: a BARE interpreter name (the `--python NAME` spelling) is group two, said
-so. The interpreter's NAME is otherwise not judged: the preview trusts the first word to be
-the interpreter the kit printed - **read the first word of every listed line; if it is not
-the interpreter you installed, remove the line** - because a line whose first word is
-another program (a shell included: `/bin/sh -s WRAPPER ...` runs what stdin says, on and
-off) is listed as refused although that program still runs. The command must need no shell at all
+next word - or the wrapper path as the first word. The first word must be the absolute
+path the kit prints: a BARE interpreter name (the `--python NAME` spelling) is group two -
+the status and on warnings print `Read the first word of every listed line: if it is not
+the interpreter you installed, remove the line`, because a line whose first word is another
+program (a shell included: `/bin/sh -s WRAPPER ...` runs what stdin says, on and off) is
+listed as refused although that program still runs. The interpreter's NAME is otherwise not
+judged: the preview trusts the first word to be the interpreter the kit printed. The command must need no shell at all
 (a whitelist of plain ASCII characters: letters, digits, `-_.+/=,:` and space - a tab or a
-non-ASCII letter is shell), name the wrapper by an absolute path of at most 512 bytes, and
-carry an absolute `--root` serving this root, parsing as unbound. Group one means **not
+non-ASCII letter is shell), name the wrapper by an absolute path of at most 512 bytes, carry
+an absolute `--root` serving this root, and the whole `command=` is at most
+`AUTHORIZED_KEY_COMMAND_MAX` (8192) bytes - judged at that length before any token work,
+because Python 3.10's `shlex` is quadratic in one long word. Group one means **not
 served once on**, not served today: a wrapper file that is not executable, a relative
 `--endpoint` or an ill-formed project name serve nothing now and are still group one, said
-as refused for another reason. Read the first word of every listed line: if it is not the
-interpreter you installed, remove the line - a line whose first word is another program (a
-shell included) is listed as refused although that program still runs.
+as refused for another reason - and a BOUND line refused for one of those reasons is group
+one too (it is not served once on), while a bound line naming a WELL-FORMED project that
+does not exist is served exactly as a bound line and is in no group. Parsing as unbound is
+the ordinary group-one case; refused-before-the-setting is the other.
 **may be refused** - every OTHER line that has a `command=` at all:
 any other wrapper or root, shell syntax (`cd KIT && ...`, `2>/dev/null`, `; true`, `&`, `#`, a
 glob, an assignment, `/bin/sh -c`, quotes), a relative or `$HOME` path, and lines that run

@@ -872,6 +872,10 @@ WOULD_BE_REFUSED_NAMED_MAX=20
 #: The file is the account's, but it is read on every `status`/`on`; a huge one must not be
 #: read whole, and the report says when the tail was not inspected.
 AUTHORIZED_KEYS_MAX_BYTES=1024*1024
+#: The most command= text a key line may carry and still be judged (kittrial-5bb.265 r2):
+#: no printed line comes near it, and Python 3.10's shlex is quadratic in one long word,
+#: so an over-long command is group two at the length alone, before any token work.
+AUTHORIZED_KEY_COMMAND_MAX=8192
 #: The most of one audit field (`actor`, `at`) a warning prints (kittrial-5bb.196 review,
 #: item 6): a hand-edited entry must not put escape sequences or 200 kB on the terminal.
 AUDIT_FIELD_MAX=80
@@ -5926,6 +5930,17 @@ def key_line(line,root,kit):
     if command is None:
         entry['kind']='unrestricted'
         return entry
+    # kittrial-5bb.265 r2 item 2: a bound on the RAW COMMAND TEXT, before shlex - Python
+    # 3.10's shlex.split is quadratic in one long word (400,000 characters: 5.8 s alone),
+    # so a 1 MB line of 200,000 path components cost ~40 s before any of the kit's own
+    # code ran. No line the kit prints comes near this bound; a longer command is group
+    # two at once (it cannot be the printed shape), and no token work happens on it.
+    if len(command) > AUTHORIZED_KEY_COMMAND_MAX:
+        entry['kind']='other-command'                    # group two: not the printed shape
+        entry['needs_shell'] = False
+        entry['relative_path'] = True
+        entry['foreign_invocation'] = True
+        return entry
     try:tokens=shlex.split(command)
     except ValueError:tokens=[]
     at=next((index for index,token in enumerate(tokens) if token.rsplit('/',1)[-1]=='ssh_forced_command.py'),None)
@@ -5933,11 +5948,9 @@ def key_line(line,root,kit):
         entry['kind']='other-command'
         return entry
     wrapper=tokens[at]
-    # kittrial-5bb.265 item 5: the 512-byte bound is applied BEFORE any path work - a
-    # single 1 MB line of 200,000 path components used to cost ~40 s in status and on,
-    # because every later scan (the shell whitelist over the command, isabs, the stat)
-    # walked it first. An over-long wrapper is group two, hint None, decided here at the
-    # length alone.
+    # kittrial-5bb.265 item 5 + r2 item 2: the wrapper-path bound, applied before any
+    # path work on the tokens that remain (the raw-text bound above already refused the
+    # megabyte shapes; this one catches a short command naming one very long path).
     if len(wrapper) > 512:
         entry['needs_shell'] = False
         relative_path = True
@@ -6183,11 +6196,19 @@ def authorized_keys_listing(root,file=None):
         kittrial-5bb.265 item 6: a relative --endpoint and an ill-formed project name are
         refused the same way (lines 78/79 of the r5 review's table) - they are group one
         lines the wrapper will not serve, and the listing says so through the
-        refused-for-another-reason sentence.
+        refused-for-another-reason sentence. kittrial-5bb.265 r2 item 1: the FORM only -
+        the wrapper checks the form of a project name, not whether the project exists, so a
+        WELL-FORMED unknown project (removed, or not yet created) serves exactly as a bound
+        line and is in no group: unknown_projects holds both kinds, and only the ill-formed
+        kind refuses before the setting. The form is [a-z][a-z9]{1,23}-shaped lowercase,
+        matching the wrapper's own check.
         """
+        import re as _re
+        ill_formed_projects=[name for name in (entry.get('projects') or [])
+                             if not _re.fullmatch(r'[a-z][a-z0-9]{1,23}', name)]
         return bool(entry.get('unknown_arguments') or entry.get('principal_repeated')
                     or entry.get('principal_ill_formed') or entry.get('project_repeated')
-                    or entry.get('unknown_projects')
+                    or ill_formed_projects
                     or (isinstance(entry.get('endpoints'), list) and any(
                         not posixpath.isabs(str(e)) for e in entry['endpoints'])))
     # The three groups of kittrial-5bb.250 r2 item 3. Group one, DECIDED and refused (or
@@ -6251,10 +6272,15 @@ def authorized_keys_listing(root,file=None):
         return _may_sentence_for(numbers, more)
     more_text=' and %d more'%would_be_refused_more if would_be_refused_more else ''
     if setting:
+        cause=('that lacks a project or a principal' if refused == [n for n in refused
+                if not _refused_before_the_setting(by_line.get(n, {}))]
+               else 'that the wrapper refuses for another reason' if refused
+               else 'that lacks a project or a principal')
         notes.append('bound_keys_only: this installation accepts bound keys only, so the forced command refuses '
-                     'a line of this kit and this root that lacks a project or a principal%s. Print each such '
+                     'a line of this kit and this root %s%s. Print each such '
                      'line again with authorized-keys --project ... --principal ... and replace it. %s.'
-                     %(' (%s%s)'%(_named(refused),more_text) if refused else ' (no line here is such a line)',
+                     %(cause,
+                       ' (%s%s)'%(_named(refused),more_text) if refused else ' (no line here is such a line)',
                        _may_sentence(may_be_refused, may_be_refused_more)))
     else:
         # The preview before `on` (kittrial-5bb.196 review, item 4c): with the setting off nothing
@@ -6272,10 +6298,12 @@ def authorized_keys_listing(root,file=None):
         # kittrial-5bb.265 item 6: a relative --endpoint and an ill-formed project name are
         # refused the same way (lines 78/79 of the r5 review's table) - group one lines
         # refused before the setting - and the sentence names their causes too.
-        notes.append('%s are refused whether the setting is on or off, for another reason (a bad or unknown '
+        another=_named(refused_for_another_reason)
+        notes.append('%s %s refused whether the setting is on or off, for another reason (a bad or unknown '
                      'argument, a binding named twice, a relative or ill-formed --endpoint, or an ill-formed '
-                     '--project name); the setting is not why they are refused.'
-                     %_named(refused_for_another_reason))
+                     '--project name); the setting is not why %s refused.'
+                     %(another, 'is' if len(refused_for_another_reason)==1 else 'are',
+                       'it is' if len(refused_for_another_reason)==1 else 'they are'))
     if truncated:
         notes.append('Only the first %d bytes of this file were read; the file is larger than that, so a '
                      'line beyond it was not inspected.'%AUTHORIZED_KEYS_MAX_BYTES)

@@ -1237,7 +1237,10 @@ class SettingsCommandTests(unittest.TestCase):
                      '/usr/bin/python3 -Esi',                   # -i hidden in a cluster
                      '/usr/bin/python3 -Es',                    # a combined flag
                      'python3',                                 # a bare name, not absolute
-                     'W=1']
+                     'W=1',
+                     '/usr/bin/python3 -E -s -I',               # an extra word after the full set (r2)
+                     '/usr/bin/python3 -E -s -W',               # -W after the flags still swallows (r2)
+                     '/usr/bin/python3 -E -s -i']               # -i after the flags still runs stdin (r2)
         for prefix in group_two:
             line = key_line_text(self.root).replace(
                 '/usr/bin/python3 -E -s ', prefix + ' ' + KIT.as_posix() + '/ssh_forced_command.py ')
@@ -1262,7 +1265,7 @@ class SettingsCommandTests(unittest.TestCase):
                 self.assertEqual([1], listing['would_be_refused'])
                 self.assertEqual([], listing['may_be_refused'])
         # Every PARTIAL flag shape is group two under the exact rule.
-        for flags in ('', '-E ', '-s ', '-s -E '):
+        for flags in ('', '-E ', '-s ', '-s -E ', '-E -s -I ', '-E -s -W ', '-E -s -i '):
             line = key_line_text(self.root).replace('/usr/bin/python3 -E -s ',
                                                     '/usr/bin/python3 ' + flags)
             with self.subTest(flags=flags.strip() or 'none'):
@@ -1555,9 +1558,11 @@ class SettingsCommandTests(unittest.TestCase):
         self.assertIn('ill-formed --project name', ' '.join(listing['notes']))
 
     def test_a_megabyte_line_of_path_components_is_decided_fast(self):
-        """kittrial-5bb.265 item 5: a single 1 MB line of 200,000 path components used to
-        cost ~40 s; the 512-byte bound is applied before any path work, so the line is
-        group two in milliseconds."""
+        """kittrial-5bb.265 r2 item 2: the RAW-TEXT bound fires before shlex (Python 3.10's
+        shlex is quadratic in one long word - 400,000 characters cost 5.8 s alone, and my
+        own 1 MB line of 200,000 components took 40.9 s on the reviewer's machine with the
+        token-stage bound only). The line is group two at once, with no token work: no
+        wrapper field survives, and the answer comes in well under the shlex-alone time."""
         file = Path(self.tmp.name)/'authorized_keys'
         huge = 'kit/' * 100000 + 'ssh_forced_command.py'
         file.write_text(key_line_text(self.root).replace(
@@ -1567,7 +1572,12 @@ class SettingsCommandTests(unittest.TestCase):
         elapsed = time.monotonic() - started
         self.assertEqual([], listing['would_be_refused'])
         self.assertEqual([1], listing['may_be_refused'])
-        self.assertLess(elapsed, 5.0, 'a 1 MB component line took %.1fs' % elapsed)
+        self.assertEqual('other-command', listing['lines'][0]['kind'])
+        self.assertNotIn('wrapper', listing['lines'][0])
+        # 2.0 s is generous on a loaded host yet far under the 5.8 s shlex alone costs;
+        # a mutant that moves the bound after the token work dies on time AND on the
+        # wrapper-field absence above.
+        self.assertLess(elapsed, 2.0, 'a 1 MB component line took %.1fs' % elapsed)
 
     def test_bare_interpreter_name_is_group_two_and_said(self):
         """kittrial-5bb.265 item 2: the --python NAME spelling prints a bare name; group
@@ -1578,6 +1588,24 @@ class SettingsCommandTests(unittest.TestCase):
         listing = admin.authorized_keys_listing(self.root, str(file))
         self.assertEqual([], listing['would_be_refused'])
         self.assertEqual([1], listing['may_be_refused'])
+
+    def test_a_well_formed_unknown_project_is_in_no_group(self):
+        """kittrial-5bb.265 r2 item 1: the wrapper checks the FORM of a project name only,
+        so a bound line naming a well-formed project that does not exist (removed, or not
+        yet created) is served exactly as a bound line: in NO group, no warning, and no
+        refused-for-another-reason sentence."""
+        file = Path(self.tmp.name)/'authorized_keys'
+        file.write_text(key_line_text(self.root, bound=' --project alpha --project nosuch '
+                                                  '--principal ' + MINE) + '\n', encoding='utf-8')
+        listing = admin.authorized_keys_listing(self.root, str(file))
+        self.assertEqual([], listing['would_be_refused'])
+        self.assertEqual([], listing['may_be_refused'])
+        notes = ' '.join(listing['notes'])
+        self.assertNotIn('another reason', notes)
+        said = io.StringIO()
+        with mock.patch.object(sys, 'stderr', said):
+            admin.bound_keys_only_switch(self.root, 'status', OPERATOR, str(file))
+        self.assertNotIn('refuse', said.getvalue())
 
     def test_status_bounds_the_audit_entries_it_prints(self):
         """kittrial-5bb.250 F7: the audit list is hand-editable; the entries status prints

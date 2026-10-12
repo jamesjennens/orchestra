@@ -422,6 +422,16 @@ class ListingTests(unittest.TestCase):
             # kittrial-5bb.250 r3: the two rule fields every command line now carries.
             'needs_shell': False, 'relative_path': False, 'foreign_invocation': False})
 
+    def test_an_over_long_command_is_group_two_without_token_work(self):
+        # kittrial-5bb.265 r2: the raw-text bound fires before shlex, so a line of 200,000
+        # path components answers quickly and carries the group-two flags.
+        import time
+        entry = self.one(self.line().replace('ssh_forced_command.py', 'k/' * 100000 + 'ssh_forced_command.py'))
+        self.assertEqual('other-command', entry['kind'])
+        self.assertTrue(entry['relative_path'])
+        self.assertTrue(entry['foreign_invocation'])
+        self.assertIsNone(entry.get('wrapper'))
+
     def test_the_binding_is_the_arguments_and_never_the_comment(self):
         entry = self.one(self.line(comment='alex@laptop orchestra-projects=alpha'))
         self.assertEqual((entry['kind'], entry['projects']), ('confined', []))
