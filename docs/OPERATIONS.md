@@ -978,53 +978,70 @@ verdict; `authority-changes` then answers `agrees` `true` again, and a later han
 again.
 
 **It is not a way to make a warning go away.** Before it replaces anything, the command runs the
-READER's own verdict on the history being replaced and records it on the new baseline, because the
-closed baseline record (`{at,operator,reason,lists}`) has only its free-text `reason` to say it.
-The reason names the state the replaced history read as - `agrees`, `incomplete`, `mismatch` or
-`DAMAGED` - the names the trail did not explain PER LIST when it was a mismatch (as many whole names
-as fit a shared 64-character budget, at most the first eight of each list, and then `(+N more)`, so
-the reason stays inside the 400-character ceiling; at least one name is always named, and when even
-the first name does not fit, the reason says that first name's length and the count instead - for
-example `operators: 1 name of 70 characters not shown`, or `verifiers: 70-char name, +11` when an
-earlier list has nearly spent the shared budget - so a verdict never reads as names with none
-of them), and the
-`.replaced-` name it was kept under. The same verdict is printed as a `WARNING` on stderr and
-carried in the command's stdout under `previous_audit_verdict` (`{"state", "unexplained", "note"}`),
-beside `previous_audit_kept_as` naming the kept file (`null` when there was no history yet);
-`authority-changes` itself is unchanged. When the history being replaced is a **mismatch** or is
-**damaged**, the command **refuses**: taking a fresh baseline would leave a history that no longer
-says the mismatch happened, or that the old file could not be read. Re-run it with
-`--accept-unexplained` - an explicit statement that the operator has looked - to take the baseline
-anyway; the recorded verdict, the stderr `WARNING` and the JSON say so either way. The
+READER's own verdict on the history being replaced. The verdict is recorded as DATA on the new
+baseline, in its `rebased_over` field: when the history it replaced was a **mismatch** or was
+**damaged**, the field gains one entry saying the state, the moment, the operator who ran the
+command, the `.replaced-` name the replaced history was kept under, how many names the trail did not
+explain per list, and the first few of those names WHOLE. The JSON field has no character budget:
+only the NUMBER of names per list is capped (four per list), so a hostile name cannot bloat the
+record, and a name longer than 200 characters is stored as its length instead and says so - for
+example `250-character name not shown`. Nothing about the fact is carried in the reason text. Every
+later re-base and every cap fold copies the field forward UNCHANGED and appends its own entry when
+the history IT replaced was a mismatch or damaged; an `agrees`, `incomplete` or `no-trail` history
+appends nothing. The field is bounded: at most the FIRST entry and the newest seven are kept whole,
+and `dropped` counts the entries no longer listed, so the oldest re-base over a mismatch or a
+damaged file can never be lost and the field can never grow without limit. The reason text still
+names the verdict for an operator to read - the state (`agrees`, `incomplete`, `mismatch` or
+`DAMAGED`), the names a mismatch left unexplained within a shared 64-character budget (at most the
+first eight of each list, then `(+N more)`, and at least one name always named: when even the first
+name does not fit, the reason says that name's length and the count instead), and the `.replaced-`
+name - but it is only a sentence and may be squeezed freely: the reader reads the FIELD, never the
+reason. The same verdict is printed as a `WARNING` on stderr and carried in the command's stdout
+under `previous_audit_verdict` (`{"state", "unexplained", "note"}`), beside `previous_audit_kept_as`
+naming the kept file (`null` when there was no history yet). When the history being replaced is a
+**mismatch** or is **damaged**, the command **refuses**: taking a fresh baseline would leave a
+history that no longer says the mismatch happened, or that the old file could not be read. Re-run it
+with `--accept-unexplained` - an explicit statement that the operator has looked - to take the
+baseline anyway; the recorded field, the stderr `WARNING` and the JSON say so either way. The
 `incomplete` state (the `null` baseline the command exists for) and "no history yet" are NOT
 refused: they need no flag. A damaged history accepted with the flag is kept as
-`.replaced-<UTC date-time>` like any other, and the reason says it was `DAMAGED` and why. The
-`--reason` the operator gives is never truncated; when it cannot fit beside the verdict the command
-refuses with the number of characters it has room for. A `--reason` holding a newline (or any other
-line separator) is refused with one sentence, because the recorded reason is one line, and a
-`--reason` holding `the history this replaced` is refused too: that is the marker the kit finds its
-own verdict by, and a reason holding it could read as that verdict. The verdict is always written
-BEFORE the operator's sentence, and the operator's words are never carried into another baseline.
+`.replaced-<UTC date-time>` like any other, and both the reason and the field say it was `DAMAGED`
+and why. The `--reason` the operator gives is never truncated; when it cannot fit beside the verdict
+the command refuses with the number of characters it has room for - and when the baseline's own
+sentence already needs the whole 400 characters, it says `--reason cannot be recorded here` in words
+rather than printing a negative bound. A `--reason` holding a newline (or any other line separator)
+is refused with one sentence, because the recorded reason is one line. Nothing else in the reason is
+special any more: the kit does not parse it, so a `--reason` may hold any words, including
+`the history this replaced`.
 
 **What cannot be told, and what it needs.** Two holes need write access to the runtime's files, and
 nothing in the kit can close either. A hand edit of a list the history's baseline records as `null`
 (UNKNOWN) cannot be compared: `authority-changes-baseline` re-bases that history WITHOUT
 `--accept-unexplained` - the `incomplete` state is exactly the case the command exists for - and the
-new baseline records the verdict as `incomplete`, so the fresh history says the old one could not be
+new baseline records the verdict as `incomplete` (in the reason sentence and in no field entry,
+because nothing was hidden), so the fresh history says the old one could not be
 compared rather than that it agreed. An audit file moved aside by hand - renamed, deleted, or
-replaced - reads as no trail: `authority-changes` says the trail does not begin with a baseline, and
-`authority-changes-baseline` starts a fresh history with no file to keep. A hand edit in a list the
+replaced - reads as no trail: with no entries and no baseline `authority-changes` prints `No trail
+yet: no operator or verifier list change has been recorded here` and answers the state `no-trail`
+(a file that holds entries but no baseline instead prints `The trail leads to ... but it does not
+begin with a baseline`), and `authority-changes-baseline` starts a fresh history with no file to
+keep. A hand edit in a list the
 baseline DOES record is the one that is detected: it reads as a `mismatch`.
 
-The verdict is not lost at the cap. An audit can hold 200 entries; when the next change needs room,
-the oldest entries are folded into a fresh baseline (below), and that folded baseline CARRIES
-FORWARD the rebase note of the baseline it replaces - its state, the unexplained names it recorded
-and the `.replaced-` name - so a history that was ever re-based over a mismatch says so for good.
-A second `authority-changes-baseline` over such a history carries the FIRST re-base's note into the
-new baseline in the same way, so re-basing again cannot drop the mismatch the first one recorded.
-A squeeze keeps the marker and the state word first and cuts the names from the END of the list (the
-`(+more)` note says so) and the kept-file clause last, so what is carried is never a verdict it is
-not; the `.replaced-*` files themselves are still listed by the reader.
+The verdict is not lost at the cap, and it is not carried in a sentence: it is a FIELD. An audit
+can hold 200 entries; when the next change needs room, the oldest entries are folded into a fresh
+baseline (below), and that folded baseline COPIES FORWARD the replaced baseline's `rebased_over`
+field UNCHANGED and APPENDS an entry when the history it replaced was a mismatch or was damaged. A
+second `authority-changes-baseline` over such a history copies the field forward the same way, so
+re-basing again cannot drop the mismatch the first one recorded, however many re-bases and folds
+follow. Nothing squeezes the field: the reason text may be squeezed freely, because the reader
+reads `rebased_over` and never the reason. The reader prints the field as its own lines - one block
+per entry: the state (`mismatch` or `DAMAGED`), when, who, the kept file, the per-list counts and
+the first few names - and, when `dropped` is not zero, says how many older entries are no longer
+listed. Its JSON carries the whole field under `rebased_over` and a top-level
+`ever_rebased_over_mismatch` that is `true` when any entry is a mismatch. Both keys are always
+present, so a script can read them unconditionally; the `.replaced-*` files themselves are still
+listed by the reader.
 
 The `.replaced-*` histories are NEVER removed and the reader lists them too, in its JSON under
 `replaced_files` beside `damaged_files` and in the note when there are any. They are NOT damaged
@@ -1131,6 +1148,20 @@ and `operators remove` sets it aside itself and starts a fresh history. `schema_
 `1`, so a `caab668`-and-older kit cannot tell such a file apart from one it wrote by the version
 alone; move it aside (or keep a copy) before a rollback to `caab668` or older that has to read the
 audit, and take a fresh baseline with `authority-changes-baseline` after rolling back forward.
+
+**Downgrade: a baseline carrying `rebased_over` is not history for a kit before this revision.**
+The field is new here, and a kit before this revision does not know it. That kit's baseline field
+set is CLOSED, so it does not quietly ignore the field: a baseline carrying `rebased_over` makes the
+whole file read as "not the history this kit writes" - its `authority-changes` reader and its adds
+exit 1, and a removal sets the file aside and starts a fresh history. Such a kit therefore cannot
+tell an operator that the history was re-based over a mismatch or a damaged file. The field is
+written only when it holds an entry, so a baseline that was never re-based over a mismatch or a
+damaged file carries none and is read by an older kit normally. A fold or a re-base that carries the
+field forward is the case to watch: move the audit aside (or keep a copy) before a rollback below
+this revision that has to read it, and take a fresh baseline after rolling forward. Where an older
+kit is given a history whose baseline carries NO field - for example after the audit was moved aside
+and a fresh baseline taken - it reads a history that was re-based over a mismatch as if it were
+clean, because it does not know the field and nothing survives in the reason any more.
 
 ### Standing guidance
 

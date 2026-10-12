@@ -6875,36 +6875,34 @@ AUTHORITY_CHANGE_PLACEHOLDER_REASON='TEXT'
 #: replayed within the cap (baseline plus kept would stay at 201 for ever). ``at`` is the moment
 #: it was written, ``operator`` the operator of the change that started the history (null when
 #: that change named nobody) and ``reason`` says why it was written.
-AUTHORITY_CHANGES_BASELINE_FIELDS=frozenset({'at','operator','reason','lists'})
-#: Where the verdict ``authority-changes-baseline`` recorded on the history it replaced begins in
-#: that baseline's ``reason``. The field set is closed ({at,operator,reason,lists}), so the free-text
-#: reason is the only place the verdict can live; the marker is what the cap fold looks for when it
-#: carries the note forward for good (kittrial-5bb.233 revision 2, review items 1, 2a and 2d).
-AUTHORITY_CHANGES_REBASE_MARKER='the history this replaced'
-#: The state phrases the kit writes straight after the marker, each with the character a real phrase
-#: may be followed by (the end of the note, the ``;`` of the next clause, or the ``:`` a mismatch's
-#: names follow). ``authority_change_carry`` finds the real verdict by one of THESE, not by the
-#: marker alone: a file an earlier revision wrote may hold the marker inside the operator's
-#: ``--reason`` before the verdict, and the phrase with its clause boundary is what tells the kit's
-#: own verdict from words about it (revision 3, review items 1 and 2).
-AUTHORITY_CHANGES_VERDICT_STATES=((' did NOT agree with the lists (mismatch)',':;'),
-                                  (' read as incomplete: a list could not be compared',';'),
-                                  (' was DAMAGED:',' ;'),
-                                  (' did not exist: there was no audit file',';'),
-                                  (' agreed with the lists',';'))
-#: Where the name the replaced history was kept under begins, also inside the baseline's reason.
+AUTHORITY_CHANGES_BASELINE_FIELDS=frozenset({'at','operator','reason','lists','rebased_over'})
+#: The fields EVERY baseline carries. ``rebased_over`` is OPTIONAL: a history an earlier revision
+#: wrote holds none, and a history that was never re-based over a mismatch or a damaged file needs
+#: none (kittrial-5bb.233 revision 4, review item 1: the fact is data, not a sentence).
+AUTHORITY_CHANGES_BASELINE_REQUIRED_FIELDS=frozenset({'at','operator','reason','lists'})
+#: The states of the history a re-base or a fold replaced that the field RECORDS. ``agrees``,
+#: ``incomplete`` and ``no-trail`` add nothing: no mismatch and no damage was hidden.
+AUTHORITY_CHANGES_REBASED_STATES=('mismatch','damaged')
+#: The closed field sets of one ``rebased_over`` entry and of the field itself, so a hand-edited
+#: field with an unknown key is refused as damage rather than obeyed.
+AUTHORITY_CHANGES_REBASED_ENTRY_FIELDS=frozenset({'at','operator','kept_as','state','unexplained','names'})
+AUTHORITY_CHANGES_REBASED_FIELDS=frozenset({'entries','dropped'})
+#: How many entries the field keeps WHOLE - the FIRST and the newest seven - and so how many older
+#: entries the ``dropped`` count covers. The first entry is the oldest re-base over a mismatch or a
+#: damaged file, so the fact can never be lost however many re-bases and folds follow, and the field
+#: cannot grow without limit (kittrial-5bb.233 revision 4, review item 2).
+AUTHORITY_CHANGES_REBASED_OVER_MAX=8
+#: How many whole names PER LIST one entry stores, and how long a name may be before its LENGTH is
+#: stored instead. The JSON field has no character budget; capping the NUMBER of names is what stops
+#: a hostile name from bloating the record (kittrial-5bb.233 revision 4, review item 1).
+AUTHORITY_CHANGES_REBASED_NAMES_MAX=4
+AUTHORITY_CHANGES_REBASED_NAME_MAX=200
+#: Where the name the replaced history was kept under begins in the composed reason.
 AUTHORITY_CHANGES_KEPT_CLAUSE='; kept as '
-#: Where the operator's own sentence begins in a composed reason. It is always LAST and is never
-#: carried into another baseline, so no ``--reason`` can sit where a verdict is read
-#: (revision 3, review item 2).
+#: Where the operator's own sentence begins in a composed reason. The verdict on the replaced
+#: history is written after it, and the reason may be squeezed freely: the fact itself lives in the
+#: field (kittrial-5bb.233 revision 4, review items 1 and 2).
 AUTHORITY_CHANGES_OPERATOR_CLAUSE='; the reason given: '
-#: What introduces a carried note, and what says a squeeze dropped part of it.
-AUTHORITY_CHANGES_CARRY_PREFIX='; a previous baseline said: '
-AUTHORITY_CHANGES_CARRY_CUT=' (+more)'
-#: The least room a ``--reason`` must be offered when the record also carries a previous re-base
-#: note: enough for one character, so the command is never made unusable by the note alone
-#: (revision 3, review item 1).
-AUTHORITY_CHANGES_OPERATOR_MIN=1
 #: The flag that says the operator has looked at a history the reader calls a mismatch or damaged
 #: and takes the baseline anyway (review item 2b). An ``incomplete`` history - the null-baseline
 #: case the command exists for - needs no flag.
@@ -6950,7 +6948,7 @@ def authority_change_entry(item):
             and all(item[field] is None or (isinstance(item[field],str) and bool(item[field]))
                     for field in ('operator','reason')))
 
-def authority_change_baseline(lists, operator, reason, at=None):
+def authority_change_baseline(lists, operator, reason, at=None, rebased_over=None):
     """The baseline a NEW history begins with: the operator and verifier lists as they stand now.
 
     It is written (a) by the first change on an installation whose audit holds no baseline, which
@@ -6967,10 +6965,106 @@ def authority_change_baseline(lists, operator, reason, at=None):
     mentions, for good. A REMOVAL is never refused to avoid that: it starts the trail and records
     the list it could not read as ``None``, and the reader then says the trail is incomplete for
     that list. Only an ADD may be refused while a list cannot be read.
+
+    ``rebased_over`` is the field recording the histories this baseline replaced that were a
+    mismatch or were damaged (``authority_change_rebased_over_carry``). It is written only when it
+    holds an entry, so a history that was never re-based over such a history carries NO extra field
+    and an older kit's closed baseline field set still reads it (kittrial-5bb.233 revision 4).
     """
-    return {'at':at or utc_stamp(),'operator':operator,'reason':reason,
+    record={'at':at or utc_stamp(),'operator':operator,'reason':reason,
             'lists':{noun:(None if (lists or {}).get(noun) is None else sorted(lists[noun]))
                      for noun in AUTHORITY_CHANGES_LISTS}}
+    if rebased_over:record['rebased_over']=rebased_over
+    return record
+
+def authority_change_rebased_name(name):
+    """One unexplained name as ``rebased_over`` stores it: WHOLE, or its length when it is huge.
+
+    The field has no character budget, so a name is stored in full. A name longer than
+    ``AUTHORITY_CHANGES_REBASED_NAME_MAX`` is stored as the sentence saying how long it is instead,
+    so a hostile ``--actor`` cannot make one record unbounded (kittrial-5bb.233 revision 4).
+    """
+    if len(name)<=AUTHORITY_CHANGES_REBASED_NAME_MAX:return name
+    return '%d-character name not shown'%len(name)
+
+def authority_change_rebased_entry(verdict,at,operator,kept_as):
+    """The ``rebased_over`` entry for the history a re-base or a fold replaced, or ``None``.
+
+    ``None`` when the verdict is ``agrees``, ``incomplete``, ``no-trail`` (or no verdict at all):
+    those replaced histories hid nothing. A ``mismatch`` records how many names the trail did not
+    explain per list and the first few of them whole, and a ``damaged`` history records the same
+    shape with zero names. ``kept_as`` is the file the replaced history was kept under, or ``None``
+    when nothing was kept (a fold replaces the baseline in place, so it keeps nothing).
+    """
+    state=(verdict or {}).get('state')
+    if state not in AUTHORITY_CHANGES_REBASED_STATES:return None
+    unexplained={};names={}
+    for noun in AUTHORITY_CHANGES_LISTS:
+        listed=list((verdict or {}).get('unexplained',{}).get(noun) or [])
+        unexplained[noun]=len(listed)
+        names[noun]=[authority_change_rebased_name(name)
+                     for name in listed[:AUTHORITY_CHANGES_REBASED_NAMES_MAX]]
+    return {'at':at,'operator':operator,'kept_as':kept_as,'state':state,
+            'unexplained':unexplained,'names':names}
+
+def authority_change_rebased_over_bounded(entries,dropped):
+    """The field holding at most ``AUTHORITY_CHANGES_REBASED_OVER_MAX`` entries, chronological.
+
+    More entries than that keep the FIRST and the newest seven whole and count the omitted middle
+    ones in ``dropped``. The first entry is never dropped, so the fact cannot be lost, and the count
+    grows instead of the field (kittrial-5bb.233 revision 4, review item 2). ``dropped`` covers every
+    entry no longer listed, including ones an earlier bound already omitted.
+    """
+    entries=[dict(entry) for entry in entries]
+    if len(entries)<=AUTHORITY_CHANGES_REBASED_OVER_MAX:
+        return {'entries':entries,'dropped':dropped}
+    keep=[entries[0]]+entries[-(AUTHORITY_CHANGES_REBASED_OVER_MAX-1):]
+    return {'entries':keep,'dropped':dropped+len(entries)-len(keep)}
+
+def authority_change_rebased_over_carry(rebased_over,entry=None):
+    """The field to WRITE: the existing one copied forward, with ``entry`` appended when there is one.
+
+    Both a re-base and a fold copy the field forward UNCHANGED and append; nothing squeezes it. An
+    agreeing or incomplete re-base appends nothing, so the field is the previous one. ``None`` when
+    there is nothing to record at all.
+    """
+    entries=list((rebased_over or {}).get('entries') or [])
+    dropped=int((rebased_over or {}).get('dropped') or 0)
+    if entry is not None:entries.append(entry)
+    if not entries:return None
+    return authority_change_rebased_over_bounded(entries,dropped)
+
+def authority_change_rebased_over_record(field):
+    """Whether ``field`` is a ``rebased_over`` this kit writes.
+
+    Strict, in the same spirit as ``authority_change_entry`` and
+    ``authority_change_baseline_record``: the field sets are closed, the times are this kit's UTC
+    stamps, the states are the two it records, the counts are non-negative integers, the names are
+    whole non-empty strings no longer than the store limit, and the list bounds hold - at most the
+    entry cap, and at most the name cap per list with no more shown names than the count. A
+    hand-edited record that fails any of it is refused as damage rather than obeyed.
+    """
+    if not isinstance(field,dict) or set(field)!=AUTHORITY_CHANGES_REBASED_FIELDS:return False
+    if type(field['dropped']) is not int or field['dropped']<0:return False
+    entries=field['entries']
+    if not isinstance(entries,list) or not 1<=len(entries)<=AUTHORITY_CHANGES_REBASED_OVER_MAX:return False
+    for entry in entries:
+        if not isinstance(entry,dict) or set(entry)!=AUTHORITY_CHANGES_REBASED_ENTRY_FIELDS:return False
+        if not utc_timestamp(entry['at']):return False
+        if entry['operator'] is not None and not (isinstance(entry['operator'],str) and entry['operator']):return False
+        if entry['kept_as'] is not None and not (isinstance(entry['kept_as'],str) and entry['kept_as']):return False
+        if entry['state'] not in AUTHORITY_CHANGES_REBASED_STATES:return False
+        unexplained=entry['unexplained'];names=entry['names']
+        if not isinstance(unexplained,dict) or set(unexplained)!=set(AUTHORITY_CHANGES_LISTS):return False
+        if any(type(count) is not int or count<0 for count in unexplained.values()):return False
+        if not isinstance(names,dict) or set(names)!=set(AUTHORITY_CHANGES_LISTS):return False
+        for noun in AUTHORITY_CHANGES_LISTS:
+            shown=names[noun]
+            if not isinstance(shown,list) or len(shown)>AUTHORITY_CHANGES_REBASED_NAMES_MAX:return False
+            if len(shown)>unexplained[noun]:return False
+            if any(not isinstance(name,str) or not name or len(name)>AUTHORITY_CHANGES_REBASED_NAME_MAX
+                   for name in shown):return False
+    return True
 
 def authority_change_baseline_record(item):
     """Whether ``item`` is a baseline this kit writes.
@@ -6979,13 +7073,17 @@ def authority_change_baseline_record(item):
     (UNKNOWN: the list could not be read when that history began, kittrial-5bb.229 rev-2 item 1);
     the same strictness ``authority_change_entry`` applies to an entry, so a hand-written baseline
     this kit does not write is "not the history this kit writes" rather than something silently
-    obeyed.
+    obeyed. ``rebased_over`` is optional - an earlier revision wrote none - and when it is present
+    it must be a field this kit writes (``authority_change_rebased_over_record``), so a hand-edited
+    field with a bad state, a bad count or an over-long list is refused as damage.
     """
-    if not isinstance(item,dict) or set(item)!=AUTHORITY_CHANGES_BASELINE_FIELDS:return False
+    if not isinstance(item,dict) or not AUTHORITY_CHANGES_BASELINE_REQUIRED_FIELDS<=set(item):return False
+    if set(item)-AUTHORITY_CHANGES_BASELINE_FIELDS:return False
     if not utc_timestamp(item['at']):return False
     if item['operator'] is not None and not (isinstance(item['operator'],str) and item['operator']):return False
     if not (isinstance(item['reason'],str) and item['reason']) or len(item['reason'])>AUTHORITY_CHANGES_REASON_MAX:
         return False
+    if 'rebased_over' in item and not authority_change_rebased_over_record(item['rebased_over']):return False
     lists=item['lists']
     if not isinstance(lists,dict) or set(lists)!=set(AUTHORITY_CHANGES_LISTS):return False
     return all(lists[noun] is None or (isinstance(lists[noun],list)
@@ -7332,28 +7430,28 @@ def authority_change_verdict_detail(verdict):
     return detail
 
 def authority_change_verdict_reason(verdict,kept_name=None,budget=AUTHORITY_CHANGES_VERDICT_NAMES_BUDGET):
-    """The verdict on the history a fresh baseline replaced, as the baseline's reason records it.
+    """The verdict on the history a fresh baseline replaced, as the baseline's ``reason`` records it.
 
-    The record's field set is closed, so the reason is the only place the verdict can be kept. It
-    begins with ``AUTHORITY_CHANGES_REBASE_MARKER`` so the cap fold can find it and carry it
-    forward for good, and it names the state, the names the trail did not explain per list when it
-    was a mismatch, and the name the replaced history was kept under (revision 2, review items 2a
-    and 2d).
+    It names the state, the names the trail did not explain per list when it was a mismatch, and the
+    name the replaced history was kept under. This is the operator-readable SENTENCE; the durable
+    record is the baseline's ``rebased_over`` field, which nothing squeezes and which the reader
+    reads (kittrial-5bb.233 revision 4, review items 1 and 2). The reason text is no longer parsed
+    by the kit, so no marker and no state phrase is used to find it: the ``; the history this
+    replaced`` wording is only how the sentence reads.
     """
     state=verdict['state']
-    marker='; '+AUTHORITY_CHANGES_REBASE_MARKER
     if state=='mismatch':
-        note=marker+' did NOT agree with the lists (mismatch)'
+        note='; the history this replaced did NOT agree with the lists (mismatch)'
         lists=authority_change_verdict_lists(verdict,budget)
         if lists:note+=': '+lists
     elif state=='incomplete':
-        note=marker+' read as incomplete: a list could not be compared'
+        note='; the history this replaced read as incomplete: a list could not be compared'
     elif state=='damaged':
-        note=marker+' was DAMAGED: %s'%authority_change_verdict_detail(verdict)
+        note='; the history this replaced was DAMAGED: %s'%authority_change_verdict_detail(verdict)
     elif state=='no-trail':
-        note=marker+' did not exist: there was no audit file'
+        note='; the history this replaced did not exist: there was no audit file'
     else:
-        note=marker+' agreed with the lists'
+        note='; the history this replaced agreed with the lists'
     if kept_name is not None:note+=AUTHORITY_CHANGES_KEPT_CLAUSE+kept_name
     return note
 
@@ -7372,153 +7470,56 @@ def authority_change_verdict_phrase(verdict):
         return 'there was no history to replace'
     return 'the history this replaced agreed with the lists'
 
-def authority_change_verdict_state(head_after):
-    """The state phrase ``head_after`` begins with, or ``None``.
-
-    ``head_after`` is the text that follows ``AUTHORITY_CHANGES_REBASE_MARKER``. The phrase must also
-    end at a clause boundary this kit writes - the end, ``;``, or the ``:`` a mismatch's names follow
-    - so a sentence that merely mentions the phrase cannot pass for a verdict
-    (revision 3, review items 1 and 2).
-    """
-    if not isinstance(head_after,str):return None
-    for phrase,boundaries in AUTHORITY_CHANGES_VERDICT_STATES:
-        if head_after.startswith(phrase):
-            rest=head_after[len(phrase):]
-            if not rest or rest[0] in boundaries:return phrase
-    return None
-
-def authority_change_carry(reason):
-    """``(head,kept)`` for the rebase note inside a baseline's ``reason``, or ``None``.
-
-    Both the cap fold and a second ``authority-changes-baseline`` rewrite the baseline, and the note
-    that the audit was ever re-based over a mismatch must survive (revision 2, review item 2d;
-    revision 3, review item 1). The note is found by ``AUTHORITY_CHANGES_REBASE_MARKER`` FOLLOWED BY
-    one of the kit's own state phrases (``authority_change_verdict_state``), never by the marker
-    alone: a file an earlier revision wrote may hold the marker inside the operator's ``--reason``
-    before the real verdict, and the state phrase is what tells the verdict from words about it
-    (revision 3, review item 2). The operator's sentence is cut off, so it is never carried; the
-    kept-file clause is MOVED AFTER the rest, so a squeeze that drops it still keeps the state word
-    and the names (revision 3, review items 1 and 2).
-    """
-    if not isinstance(reason,str):return None
-    index=-1;start=0
-    while True:
-        found=reason.find(AUTHORITY_CHANGES_REBASE_MARKER,start)
-        if found<0:break
-        if authority_change_verdict_state(reason[found+len(AUTHORITY_CHANGES_REBASE_MARKER):]) is not None:
-            index=found;break
-        start=found+1
-    if index<0:return None
-    tail=reason[index:]
-    operator_index=tail.find(AUTHORITY_CHANGES_OPERATOR_CLAUSE)
-    if operator_index>=0:tail=tail[:operator_index]
-    kept_index=tail.find(AUTHORITY_CHANGES_KEPT_CLAUSE)
-    if kept_index<0:return tail,''
-    rest=tail[kept_index+len(AUTHORITY_CHANGES_KEPT_CLAUSE):]
-    boundary=rest.find('; ')
-    if boundary<0:return tail[:kept_index],tail[kept_index:]
-    return tail[:kept_index]+rest[boundary:],AUTHORITY_CHANGES_KEPT_CLAUSE+rest[:boundary]
-
-def authority_change_carry_state_names(head):
-    """``(state,names)`` for a carried note: the marker and its state word, and everything after.
-
-    The state word ends where the kit's phrase ends, and a squeeze may never touch it; the rest is
-    the names a mismatch left unexplained, the detail of a damaged file, or a nested carried note. A
-    squeeze cuts the rest from the END (revision 3, review item 2).
-    """
-    if not isinstance(head,str) or not head.startswith(AUTHORITY_CHANGES_REBASE_MARKER):return head,''
-    phrase=authority_change_verdict_state(head[len(AUTHORITY_CHANGES_REBASE_MARKER):])
-    if phrase is None:return head,''
-    end=AUTHORITY_CHANGES_REBASE_MARKER+phrase
-    return end,head[len(end):]
-
-def authority_change_names_prefix(text,allow):
-    """``text`` cut to ``allow`` characters, at a whole-name boundary when there is one to cut at."""
-    if allow<=0:return ''
-    if len(text)<=allow:return text
-    cut=text[:allow]
-    comma=cut.rfind(', ')
-    return cut if comma<=0 else cut[:comma]
-
-def authority_change_carry_note(note,carry,reserve=0):
-    """``note`` plus the carried rebase note, never longer than ``AUTHORITY_CHANGES_REASON_MAX``.
-
-    ``reserve`` is room the caller still needs after this note - the operator's own sentence - so the
-    carry is squeezed to leave it. Nothing that a squeeze drops can make the note read as a verdict
-    it is not: the marker and the state word are kept whole, the names are cut from the END of the
-    list and ``AUTHORITY_CHANGES_CARRY_CUT`` says some were dropped, and the kept-file clause is
-    dropped before any name is. The operator's words are not in a carried note at all
-    (``authority_change_carry`` cuts them off), so they are what a squeeze loses first
-    (revision 3, review items 1 and 2).
-    """
-    if not carry:return note
-    head,kept=carry
-    prefix=AUTHORITY_CHANGES_CARRY_PREFIX
-    room=AUTHORITY_CHANGES_REASON_MAX-len(note)-len(prefix)-max(0,reserve)
-    if room<=0:return note
-    if len(head)+len(kept)<=room:return note+prefix+head+kept
-    state,names=authority_change_carry_state_names(head)
-    if len(state)>room:return note
-    allow=room-len(state)
-    if len(names)<=allow:
-        if len(kept)<=allow-len(names):return note+prefix+state+names+kept
-        return note+prefix+state+names
-    cut=authority_change_names_prefix(names,allow-len(AUTHORITY_CHANGES_CARRY_CUT))
-    if cut:return note+prefix+state+cut+AUTHORITY_CHANGES_CARRY_CUT
-    if len(state)+len(AUTHORITY_CHANGES_CARRY_CUT)<=room:
-        return note+prefix+state+AUTHORITY_CHANGES_CARRY_CUT
-    return note+prefix+state
-
-def authority_change_rebaseline_reason(operator,reason,kept_name=None,verdict=None,carry=None):
+def authority_change_rebaseline_reason(operator,reason,kept_name=None,verdict=None):
     """Why ``authority-changes-baseline`` wrote a fresh baseline, and what it replaced.
 
-    The baseline's own ``reason`` is one place the closed record can say why the history was
-    restarted, so it names the command, the operator who ran it and the operator's sentence; the
-    baseline's ``operator`` field carries the same operator. ``verdict`` is the reader's verdict on
-    the history being replaced (``authority_change_baseline_verdict``): its state, the names a
-    mismatch left unexplained per list and the name the history was kept under are recorded here,
-    because the restarted history would otherwise hold no mention of them (kittrial-5bb.233 finding
-    1, revision 2 review items 2a and 2d).
+    The baseline's own ``reason`` says why the history was restarted: it names the command, the
+    operator who ran it, the operator's own sentence and the reader's verdict on the history being
+    replaced (``authority_change_baseline_verdict``) - its state, the names a mismatch left
+    unexplained per list and the name the history was kept under. The ``operator`` field carries the
+    same operator.
 
-    The VERDICT - and ``carry``, the re-base note of the baseline being replaced - come BEFORE the
-    operator's sentence, which is always LAST, so no ``--reason`` can sit where the verdict is read
-    (revision 3, review item 2; the command also refuses a ``--reason`` holding the marker). The
-    carry is squeezed to leave room for the operator's sentence, and the state word and names are
-    what it keeps (revision 3, review item 1).
+    This is the SENTENCE an operator reads, and it may be squeezed freely: the durable record of a
+    mismatch or a damaged history is the baseline's ``rebased_over`` field, which the kit copies
+    forward and the reader reads whatever this text says (kittrial-5bb.233 revision 4, review items 1
+    and 2). Revision 3's carrying of a previous re-base note inside this text is REMOVED, and so is
+    the ``--reason`` refusal that guarded it: nothing is parsed out of the reason any more.
     """
     note=('baseline: authority-changes-baseline by %s started a fresh history from the operator and verifier lists '
           'as they stood then'%operator)
+    if reason:note+=AUTHORITY_CHANGES_OPERATOR_CLAUSE+reason
     if verdict is not None:note+=authority_change_verdict_reason(verdict,kept_name)
     elif kept_name is not None:note+=AUTHORITY_CHANGES_KEPT_CLAUSE+kept_name
-    if carry is not None:
-        reserve=(len(AUTHORITY_CHANGES_OPERATOR_CLAUSE)+len(reason)) if reason else 0
-        note=authority_change_carry_note(note,carry,reserve)
-    if reason:note+=AUTHORITY_CHANGES_OPERATOR_CLAUSE+reason
     return note
 
-def authority_change_rebaseline_room(operator,verdict,kept_name,carry=None):
+def authority_change_rebaseline_room(operator,verdict,kept_name):
     """How many characters the operator's ``--reason`` may take, verdict and kept name recorded.
 
     The composed reason is what ``authority_change_baseline_record`` reads back, so this is exact:
-    the operator's own sentence is never truncated, and a longer one is refused with this number
-    (revision 2, review item 2a). A margin covers the ``.N`` a name collision adds to the kept name,
-    which is only known under the lock.
-
-    When the baseline being replaced itself carried a re-base note, the room is measured with that
-    note present, so the verdict is not silently squeezed out to make room for the operator; if the
-    full note would leave the operator no room at all, the room is measured with only the state word
-    carried, so the state always survives and the command stays usable
-    (revision 3, review items 1 and 2).
+    the operator's own sentence is never truncated, and a longer one is refused. A margin covers the
+    ``.N`` a name collision adds to the kept name, which is only known under the lock. Nothing a
+    previous re-base left behind is in the reason any more, so this is the room the operator's own
+    sentence really has (kittrial-5bb.233 revision 4, review items 1, 2 and 3.2).
     """
-    without=authority_change_rebaseline_reason(operator,None,kept_name,verdict,carry)
-    room=(AUTHORITY_CHANGES_REASON_MAX-len(without)-len(AUTHORITY_CHANGES_OPERATOR_CLAUSE)
-          -AUTHORITY_CHANGE_ASIDE_SUFFIX_MARGIN)
-    if carry is not None and room<AUTHORITY_CHANGES_OPERATOR_MIN:
-        state,_=authority_change_carry_state_names(carry[0])
-        without=authority_change_rebaseline_reason(operator,None,kept_name,verdict,(state,''))
-        room=(AUTHORITY_CHANGES_REASON_MAX-len(without)-len(AUTHORITY_CHANGES_OPERATOR_CLAUSE)
-              -AUTHORITY_CHANGE_ASIDE_SUFFIX_MARGIN)
-    return room
+    without=authority_change_rebaseline_reason(operator,None,kept_name,verdict)
+    return (AUTHORITY_CHANGES_REASON_MAX-len(without)-len(AUTHORITY_CHANGES_OPERATOR_CLAUSE)
+            -AUTHORITY_CHANGE_ASIDE_SUFFIX_MARGIN)
+
+def authority_change_reason_room_refusal(room):
+    """The sentence for a ``--reason`` that does not fit, NEVER a negative bound.
+
+    ``room`` can be zero or negative when the operator's own name and the verdict already take the
+    whole reason: the old wording then read ``--reason must be at most -18 characters here``, which
+    is nonsense (kittrial-5bb.233 revision 4, review item 3.2). At or below zero the refusal says so
+    in words and names the one thing that can be changed.
+    """
+    if room<=0:
+        return ("--reason cannot be recorded here: the baseline's own sentence, naming the verdict on the history it "
+                "replaces and the operator who ran the command, already needs all %d characters the reason may take, "
+                "so no operator sentence fits. The room is measured with the operator's own name, so a shorter "
+                "operator name is what makes it fit."%AUTHORITY_CHANGES_REASON_MAX)
+    return ('--reason must be at most %d characters here: the baseline reason also records the verdict on the history '
+            'it replaces, the operator and the history it keeps'%room)
 
 def authority_change_unexplained_refusal(root,verdict,accept_unexplained):
     """The sentence refusing a fresh baseline over a mismatch or a damaged history, or ``None``.
@@ -7604,7 +7605,7 @@ def authority_change_set_aside_reason(aside,reason):
     note='the previous audit was damaged and was kept beside the runtime as %s'%aside.name
     return '%s; %s'%(note,reason) if reason else note
 
-def authority_change_baseline_reason(aside=None,dropped=0,late=False,unknown=(),carry=None):
+def authority_change_baseline_reason(aside=None,dropped=0,late=False,unknown=()):
     """Why a baseline was written: the trail's start, a late start, a set-aside, or the cap making room.
 
     ``late`` says this history already held entries but no baseline - a file written by hand, or by
@@ -7614,15 +7615,14 @@ def authority_change_baseline_reason(aside=None,dropped=0,late=False,unknown=(),
 
     ``unknown`` names the lists this baseline holds as ``null`` because they could not be read
     (kittrial-5bb.229 rev-2 item 1). The sentence then says so and says the trail is incomplete for
-    them, so the one place the closed entry field set can record WHY - the baseline's reason -
-    carries it. With the cap also folding entries in, the wording claims only the lists it could
-    read: the fold cannot invent the names a list held when nobody could read it. The unknown-list
-    clause is said ONCE, and the cap wording does not claim the trail leads to a list it cannot
+    them. With the cap also folding entries in, the wording claims only the lists it could read: the
+    fold cannot invent the names a list held when nobody could read it. The unknown-list clause is
+    said ONCE, and the cap wording does not claim the trail leads to a list it cannot
     (kittrial-5bb.233 finding 6).
 
-    ``carry`` is the rebase note of the baseline being replaced (``authority_change_carry``). The
-    cap fold passes it so an audit that was ever re-based over a mismatch still says so, and under
-    which kept name, for good (kittrial-5bb.233 revision 2, review item 2d).
+    Nothing about a previous re-base is carried in this sentence any more: the cap fold copies the
+    baseline's ``rebased_over`` field forward instead, so the fact is data and this text may be
+    squeezed freely (kittrial-5bb.233 revision 4, review items 1 and 3.1).
     """
     if dropped:
         if unknown:
@@ -7645,8 +7645,6 @@ def authority_change_baseline_reason(aside=None,dropped=0,late=False,unknown=(),
                    'incomplete for it'%' and '.join(unknown))
     if aside is not None:
         note+='; the previous audit was damaged and was kept beside the runtime as %s'%aside.name
-    if carry is not None:
-        note=authority_change_carry_note(note,carry)
     return note
 
 def authority_change_fold(baseline,entries):
@@ -7712,6 +7710,9 @@ def record_authority_change(root,noun,action,actor,operator,reason):
         aside=set_aside_damaged_authority_changes(root,damage)
         reason=authority_change_set_aside_reason(aside,reason)
         entries=[];baseline=None
+    # The history this change and any fold REPLACE, as it stood before the change: its verdict and
+    # its own rebased_over field are what the fold copies and appends to (revision 4, items 1 and 2).
+    replaced_entries=list(entries);replaced_baseline=baseline
     entry={'at':utc_stamp(),'operator':operator,'list':noun,'actor':actor,'change':action,'reason':reason}
     if baseline is None:
         listed,problem=authority_changes_current_lists(root)
@@ -7732,15 +7733,19 @@ def record_authority_change(root,noun,action,actor,operator,reason):
         # stays null through the fold, so neither the baseline's reason nor this warning may claim
         # the trail still leads to it (kittrial-5bb.233 finding 6).
         unknown=[name for name in AUTHORITY_CHANGES_LISTS if baseline['lists'].get(name) is None]
-        # Whatever the replaced baseline said about the history authority-changes-baseline replaced
-        # - its state, the names a mismatch left unexplained and the kept name - is carried into the
-        # folded baseline, so an audit that was ever re-based over a mismatch says so for good
-        # (kittrial-5bb.233 revision 2, review item 2d).
-        carry=authority_change_carry(baseline['reason'])
+        # The fold computes the READER's verdict on the history it replaces and appends an entry for
+        # it when that history was a mismatch or damaged, and it copies the replaced baseline's
+        # rebased_over field forward UNCHANGED either way: an audit that was ever re-based over a
+        # mismatch says so for good, as data, however many folds follow (revision 4, review items 1
+        # and 2; the revision-3 note-carrying inside the reason is gone).
+        listed,problem=authority_changes_current_lists(root)
+        verdict=authority_change_baseline_verdict(replaced_entries,replaced_baseline,None,listed)
+        rebased=authority_change_rebased_over_carry(
+            (replaced_baseline or {}).get('rebased_over'),
+            authority_change_rebased_entry(verdict,entry['at'],operator,None))
         baseline=authority_change_baseline(authority_change_fold(baseline,history[:dropped]),operator,
-                                           authority_change_baseline_reason(dropped=dropped,unknown=unknown,
-                                                                            carry=carry),
-                                           at=entry['at'])
+                                           authority_change_baseline_reason(dropped=dropped,unknown=unknown),
+                                           at=entry['at'],rebased_over=rebased)
         history=history[dropped:]
         tail=('what they recorded is folded into the baseline, so the trail still leads to the lists'
               if not unknown else
@@ -8172,6 +8177,40 @@ def authority_change_baseline_verdict(entries,baseline,damage,listed):
             if names:unexplained[noun]=names
     return {'state':state,'unexplained':unexplained,'detail':None}
 
+def authority_change_rebased_over_lines(rebased_over):
+    """The reader's OWN lines for a baseline's ``rebased_over`` field: one block per entry.
+
+    The field is read as DATA, whatever the baseline's ``reason`` says. The reason text is the
+    operator's sentence and may be squeezed freely; an entry is never a sentence and is never
+    squeezed by one. Each block says the state, when the history was replaced, who replaced it, the
+    file the replaced history was kept under, the per-list counts of names the trail did not explain
+    and the first few of those names WHOLE; one more line counts the older entries the bound no
+    longer lists (kittrial-5bb.233 revision 4, review items 1, 2 and 3.1).
+    """
+    if not rebased_over:return []
+    lines=[]
+    for entry in rebased_over.get('entries') or []:
+        if entry['state']=='mismatch':
+            what='was re-based (or folded) over a history that did NOT agree with the lists (a mismatch)'
+        else:
+            what='was re-based (or folded) over a history that was DAMAGED'
+        shown=[]
+        for noun in AUTHORITY_CHANGES_LISTS:
+            count=entry['unexplained'][noun]
+            if not count:continue
+            names=', '.join(entry['names'][noun]) or 'none shown'
+            if count>len(entry['names'][noun]):names+=' (+%d more)'%(count-len(entry['names'][noun]))
+            shown.append('%s: %d not explained (%s)'%(noun,count,names))
+        lines.append('This baseline %s: at %s, by %s, the replaced history kept as %s%s.'
+                     %(what,entry['at'],entry['operator'] or 'nobody (unattributed)',
+                       entry['kept_as'] or 'nothing (no file was kept)',
+                       ('' if not shown else '; '+'; '.join(shown))))
+    dropped=rebased_over.get('dropped') or 0
+    if dropped:
+        lines.append('%d older re-base or fold entr%s no longer listed in rebased_over.'
+                     %(dropped,'y is' if dropped==1 else 'ies are'))
+    return lines
+
 def authority_changes_report(root):
     """``(report, note)`` for the ``authority-changes`` reader: the trail, the lists and the replay.
 
@@ -8203,6 +8242,7 @@ def authority_changes_report(root):
             'unattributed_entries':sum(1 for item in entries if item['operator'] is None),
             'baseline':None if baseline is None else
                        {'at':baseline['at'],'operator':baseline['operator'],'reason':baseline['reason'],
+                        'rebased_over':baseline.get('rebased_over'),
                         'entries':sum(len(baseline['lists'][noun]) for noun in AUTHORITY_CHANGES_LISTS
                                       if baseline['lists'][noun] is not None),
                         'unknown_lists':list(unknown_in_baseline),
@@ -8212,6 +8252,13 @@ def authority_changes_report(root):
             'replaced_files':replaced,
             'current_lists':listed,
             'current_lists_problem':problem}
+    # The rebased_over field is read as its own data, never out of the reason text (revision 4,
+    # review items 1 and 2): the raw field is in the JSON, a top-level boolean says whether any
+    # entry is a mismatch, and the reader's own lines are printed beside everything else.
+    rebased=baseline.get('rebased_over') if baseline is not None else None
+    report['rebased_over']=rebased
+    report['ever_rebased_over_mismatch']=any(entry['state']=='mismatch'
+                                             for entry in (rebased or {}).get('entries') or [])
     if listed is None:
         report['replay']=None
         note=authority_changes_replay_note(None,entries,capped,problem,baseline,unknown_in_baseline)
@@ -8228,6 +8275,8 @@ def authority_changes_report(root):
         note+=' The kit has also kept %d earlier authority-changes histor%s beside this runtime under a '\
               '".replaced-" name - %s - and never removes them: they are the readable histories a fresh baseline '\
               'replaced, not damaged files.'%(len(replaced),'y' if len(replaced)==1 else 'ies',', '.join(replaced))
+    for line in authority_change_rebased_over_lines(rebased):
+        note+=' '+line
     if report['replay'] is not None:report['replay']['note']=note      # the JSON and stderr say the same thing
     return report,note
 
@@ -8257,14 +8306,14 @@ def authority_changes_baseline_command(root,operator,reason,accept_unexplained=F
     the lists the write sees). A list that cannot be read refuses the command: recording it as
     ``null`` is exactly the state the command exists to leave behind.
 
-    Before it replaces anything it runs the READER's own verdict on the history being replaced and
-    records it in the new baseline's reason; a mismatch or a damaged history refuses the command
-    unless ``accept_unexplained`` says the operator has looked, because taking the baseline is not a
-    way to make a warning go away (kittrial-5bb.233 revision 2, review items 1, 2a and 2b). A baseline
-    that itself carried a re-base note has that note CARRIED into the new one, so a second re-base
-    cannot drop the first one's mismatch (revision 3, review item 1), and the operator's ``--reason``
-    is refused when it holds the marker the note is found by (revision 3, review item 2). Returns
-    ``(baseline, kept, verdict)``; the caller prints what it did and the reader's verdict.
+    Before it replaces anything it runs the READER's own verdict on the history being replaced; a
+    mismatch or a damaged history refuses the command unless ``accept_unexplained`` says the operator
+    has looked, because taking the baseline is not a way to make a warning go away (kittrial-5bb.233
+    revision 2, review items 1, 2a and 2b). The verdict is recorded BOTH as the reason sentence and
+    as an entry in the new baseline's ``rebased_over`` field: the field is the durable record, it is
+    copied forward by every later re-base and by the cap fold, and nothing about it is parsed out of
+    the reason any more (revision 4, review items 1 and 2). Returns ``(baseline, kept, verdict)``;
+    the caller prints what it did and the reader's verdict.
     """
     path=root/AUTHORITY_CHANGES_AUDIT
     if path.is_symlink() or (os.path.lexists(str(path)) and not path.is_file()):
@@ -8277,31 +8326,20 @@ def authority_changes_baseline_command(root,operator,reason,accept_unexplained=F
     if reason==AUTHORITY_CHANGE_PLACEHOLDER_REASON:
         raise ValueError('--reason %s is the placeholder the printed re-grant commands carry; replace it with a '
                          'sentence saying why the fresh baseline is taken'%AUTHORITY_CHANGE_PLACEHOLDER_REASON)
-    if AUTHORITY_CHANGES_REBASE_MARKER in reason:
-        # The marker is how the kit finds its own verdict inside the reason. A --reason holding it
-        # could sit where the verdict is read, so it is refused with one sentence (revision 3, item 2).
-        raise ValueError('--reason must not hold %r: that is the marker this kit records the verdict on the history '
-                         'a baseline replaced under, and a reason holding it could read as that verdict'
-                         %AUTHORITY_CHANGES_REBASE_MARKER)
     # The verdict on the history being replaced, and the free refusals: an unreadable list, and a
     # mismatch or a damaged history without the flag that says the operator has looked (review items
     # 2a and 2b). The composed reason must stay inside the recorded ceiling, or this kit's own file
     # would read as "not the history this kit writes", so the room left for the operator's sentence
-    # is computed from the exact wording, the verdict, the kept name a current stamp would use and the
-    # re-base note the replaced baseline itself carries (revision 3, review item 1).
+    # is computed from the exact wording, the verdict and the kept name a current stamp would use.
     lists,problem=authority_changes_current_lists(root)
     if problem is not None:raise ValueError(authority_change_rebaseline_problem_refusal(problem))
     entries,existing,damage=read_authority_changes(root)
     verdict=authority_change_baseline_verdict(entries,existing,damage,lists)
     refusal=authority_change_unexplained_refusal(root,verdict,accept_unexplained)
     if refusal is not None:raise AuthorityAuditDamaged(refusal)
-    carry=authority_change_carry(existing['reason']) if existing is not None else None
     kept_name=authority_change_aside_name(root,AUTHORITY_CHANGES_REPLACED).name
-    room=authority_change_rebaseline_room(operator,verdict,kept_name,carry)
-    if len(reason)>room:
-        raise ValueError('--reason must be at most %d characters here: the baseline reason also records the verdict '
-                         'on the history it replaces, the note an earlier re-base left, the operator and the history '
-                         'it keeps'%room)
+    room=authority_change_rebaseline_room(operator,verdict,kept_name)
+    if len(reason)>room:raise ValueError(authority_change_reason_room_refusal(room))
     with deployment_config_lock(root):
         # An operator revoked since the check before the lock must not be recorded as the one who
         # took the baseline (kittrial-5bb.233 revision 2, review item 3.2).
@@ -8316,19 +8354,21 @@ def authority_changes_baseline_command(root,operator,reason,accept_unexplained=F
         verdict=authority_change_baseline_verdict(entries,existing,damage,lists)
         refusal=authority_change_unexplained_refusal(root,verdict,accept_unexplained)
         if refusal is not None:raise AuthorityAuditDamaged(refusal)
-        carry=authority_change_carry(existing['reason']) if existing is not None else None
         prospective=authority_change_aside_name(root,AUTHORITY_CHANGES_REPLACED).name
-        room=authority_change_rebaseline_room(operator,verdict,prospective,carry)
-        if len(reason)>room:
-            raise ValueError('--reason must be at most %d characters here: the baseline reason also records the '
-                             'verdict on the history it replaces, the note an earlier re-base left, the operator and '
-                             'the history it keeps'%room)
+        room=authority_change_rebaseline_room(operator,verdict,prospective)
+        if len(reason)>room:raise ValueError(authority_change_reason_room_refusal(room))
         kept=authority_change_keep_previous(root)
         at=utc_stamp()
+        # The field the new baseline carries: the replaced baseline's own field copied forward
+        # UNCHANGED, plus one entry for the history this command replaced when that history was a
+        # mismatch or was damaged. Nothing is carried in the reason (revision 4, items 1 and 2).
+        rebased=authority_change_rebased_over_carry(
+            (existing or {}).get('rebased_over'),
+            authority_change_rebased_entry(verdict,at,operator,None if kept is None else kept.name))
         baseline=authority_change_baseline(lists,operator,
                                            authority_change_rebaseline_reason(
-                                               operator,reason,None if kept is None else kept.name,verdict,carry),
-                                           at=at)
+                                               operator,reason,None if kept is None else kept.name,verdict),
+                                           at=at,rebased_over=rebased)
         document={'schema_version':AUTHORITY_CHANGES_SCHEMA,'entries':[],'baseline':baseline}
         atomic_private_write(path,json.dumps(document))
     return baseline,kept,verdict
