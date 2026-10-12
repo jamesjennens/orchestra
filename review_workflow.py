@@ -439,9 +439,11 @@ def listed_operator_actor(actor, operators=None, owners=None):
     # Explicit identity collections already came from the installation. Preserve
     # their exact names; trimming one can turn a malformed entry into authority.
     # The environment/text form uses the configuration parser for its delimiters.
-    authority = (set(recovery.configured_operators(operators))
-                 if operators is None or isinstance(operators, str)
-                 else {name for name in operators if isinstance(name, str) and name == name.strip()})
+    if operators is None or isinstance(operators, str):
+        authority = set(recovery.configured_operators(operators))
+    else:
+        names = tuple(operators)
+        authority = {name for name in recovery.configured_operators(names) if name in names}
     if actor in authority:
         return True
     mapping = owner_map(owners)
