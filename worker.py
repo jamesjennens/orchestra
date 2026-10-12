@@ -69,7 +69,8 @@ Worker setup:
   or a loop of your own; end each turn with a one-line status for the person. Only the
   worker's own user authorizes checking again, by asking, within what the project's
   standing guidance allows. A task awaiting review or integration is not a reason to
-  stop checking before the deadline; that is exactly when checking matters. A harness
+  stop checking until your user's deadline, or the project's limit; that is exactly when
+  checking matters. A harness
   that cannot wait or schedule tells its user so in one line instead of refusing. Use
   the full client prefix and printed config, project and actor for each command.
 """
