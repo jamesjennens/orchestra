@@ -249,5 +249,164 @@ class CoordinatorWritesExemptionTests(EndpointHarness):
         self.assertEqual(['worker'], self.approvals())
 
 
+OWNER_HOLDS = sorted(http_authority.ROLE_CAPABILITIES['owner'])
+
+
+@POSIX
+class BlockMatchesRequestTests(EndpointHarness):
+    """Item 7: the block must be FOR the request it travels with: its project and its capability.
+
+    Every block here is one the live state grants (the owner holds every capability of a
+    project, in both projects), so only the comparison with the request can refuse it.
+    """
+
+    WRONG_PROJECT = 'The live-authority descriptor names another project than the one this request is for'
+    WRONG_CAPABILITY = 'The live-authority descriptor does not name the capability this request needs (%s)'
+
+    def setUp(self):
+        super().setUp()
+        import briefing
+        import proposal_records
+        import work
+        self.reached = []
+        for module, name in ((work, 'execute'), (briefing, 'execute'), (proposal_records, 'write')):
+            patcher = mock.patch.object(module, name, side_effect=self.library(module.__name__))
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def library(self, name):
+        def carried_out(*args, **options):
+            self.reached.append(name)
+            return '{}' if name == 'briefing' else {'carried_out': name}
+        return carried_out
+
+    def payload_request(self, action, args, body=None, project=PROJECT):
+        self.count += 1
+        built = {'project': project, 'actor': OWNER, 'action': action, 'args': list(args),
+                 'operation_id': 'request-%d' % self.count}
+        if body is not None:
+            built['args'].append('@attachment:0')
+            built['attachments'] = {'0': {'flag': '--file', 'text': json.dumps(body)}}
+        return built
+
+    def cases(self):
+        """(label, a request builder, the capability http_service.py asks for its route, the library reached)."""
+        review = lambda operation: (lambda: self.payload_request('review', [TASK], {
+            'schema_version': 1, 'operation': operation, 'operation_id': 'op', 'task': TASK}))
+        proposal = lambda command: (lambda: self.payload_request('proposal', [command], {'schema_version': 1}))
+        return (
+            ('review approve', review('approve'), 'reviews.approve', 'work'),
+            ('review request-changes', review('request-changes'), 'reviews.write', 'work'),
+            ('review contribute', review('contribute'), 'reviews.write', 'work'),
+            ('review recommend', review('recommend'), 'reviews.write', 'work'),
+            ('checkpoint', lambda: self.payload_request('checkpoint', [TASK], {'schema_version': 1, 'task': TASK}),
+             'checkpoints.write', 'briefing'),
+            ('claim', lambda: self.payload_request('bd', ['update', TASK, '--claim', '--json']), 'tasks.write', None),
+            ('task create', lambda: self.payload_request('bd', ['create', 'A title', '--json']), 'tasks.write', None),
+            ('proposal submit', proposal('submit'), 'proposals.write', 'proposal_records'),
+            ('proposal revise', proposal('revise'), 'proposals.write', 'proposal_records'),
+            ('proposal triage', proposal('review'), 'reviews.approve', 'proposal_records'),
+            ('proposal decide', proposal('decide'), 'project.admin', 'proposal_records'),
+        )
+
+    def test_the_table_is_what_the_service_asks_for_each_route(self):
+        for label, build, needed, _ in self.cases():
+            with self.subTest(request=label):
+                self.assertEqual(needed, http_authority.required_capability(build()))
+        # Not in the table: reads, and actions the web service sends no block for.
+        for action, args in (('review', [TASK]), ('proposal', ['get', 'k']), ('proposal', ['list']), ('work', []),
+                             ('handoff', [TASK, '@attachment:0']), ('bd', ['comments', 'add', TASK, 'text']),
+                             ('bd', ['close', TASK]), ('lifecycle', ['{}']), ('coordinate', ['{}']), ('ref', ['propose']),
+                             ('capability', ['propose']), ('feedback', ['add']), ('session', ['show']),
+                             ('guidance', ['ack']), ('owner-requirements', ['accept']), ('set-onboarding', ['set'])):
+            with self.subTest(action=action, args=args):
+                self.assertIsNone(http_authority.required_capability({'project': PROJECT, 'action': action, 'args': args}))
+
+    def test_a_block_for_another_capability_is_refused_before_anything_is_read_or_written(self):
+        for label, build, needed, _ in self.cases():
+            for claimed in OWNER_HOLDS:
+                if claimed == needed:
+                    continue
+                with self.subTest(request=label, block=claimed):
+                    refused = self.web(build(), session_block(OWNER, claimed))
+                    self.assertEqual((126, 403), (refused.get('returncode'), refused.get('authority_status')), refused)
+                    self.assertEqual(self.WRONG_CAPABILITY % needed + '; nothing was changed\n', refused['stderr'])
+        self.assertEqual(([], []), (self.reached, self.tracker.calls))
+        for name in (PROJECT, OTHER_PROJECT):                              # no lock taken, no identity reserved
+            self.assertEqual(['.beads'], sorted(p.name for p in (self.root / 'projects' / name).iterdir()))
+
+    def test_a_block_for_another_project_is_refused_before_anything_is_read_or_written(self):
+        for label, build, needed, _ in self.cases():
+            with self.subTest(request=label):
+                request = dict(build(), project=OTHER_PROJECT)
+                refused = self.web(request, session_block(OWNER, needed, project=PROJECT))
+                self.assertEqual((126, 403), (refused.get('returncode'), refused.get('authority_status')), refused)
+                self.assertEqual(self.WRONG_PROJECT + '; nothing was changed\n', refused['stderr'])
+                # A block that names no project at all is not one for this project either.
+                refused = self.web(build(), session_block(OWNER, needed, project=None))
+                self.assertEqual(126, refused.get('returncode'), refused)
+        self.assertEqual(([], []), (self.reached, self.tracker.calls))
+
+    def test_the_matching_block_is_carried_out(self):
+        for label, build, needed, library in self.cases():
+            for project in (PROJECT, OTHER_PROJECT):
+                with self.subTest(request=label, project=project):
+                    del self.reached[:], self.tracker.calls[:]
+                    done = self.web(dict(build(), project=project), session_block(OWNER, needed, project=project))
+                    self.assertEqual(0, done.get('returncode'), done)
+                    if library is None:                               # bd itself: the stub tracker was written to
+                        self.assertEqual(1, len([command for _, command in self.tracker.writes
+                                                 if command[:1] in (['update'], ['create'])]), self.tracker.calls)
+                    else:
+                        self.assertEqual([library], self.reached)
+
+    def test_the_reviewed_cases_through_the_real_review_workflow(self):
+        """As reviewed, with nothing stubbed but the tracker: an approval under a block naming
+        `reviews.write` was carried out with the host rule off, and a block naming project A was
+        carried out in project B."""
+        mock.patch.stopall()
+        for target in (endpoint.native, endpoint.subprocess):
+            patcher = mock.patch.object(target, 'run', self.tracker.run)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        refused = self.web(self.review_request(OWNER), session_block(OWNER, 'reviews.write'))
+        self.assertRefused(refused)
+        refused = self.web(self.review_request(OWNER, project=OTHER_PROJECT), session_block(OWNER, 'reviews.approve'))
+        self.assertRefused(refused)
+        # A contributor holds reviews.write and not reviews.approve: its block is a true one, and no approval.
+        refused = self.web(self.review_request(CONTRIBUTOR), session_block(CONTRIBUTOR, 'reviews.write'))
+        self.assertRefused(refused)
+        self.assertEqual(([], []), (self.approvals(), self.tracker.calls))
+        # The matching blocks: the owner's approval, and the same contributor's request for changes.
+        done = self.web(self.review_request(OWNER), session_block(OWNER, 'reviews.approve'))
+        self.assertEqual((0, [OWNER]), (done['returncode'], self.approvals()), done)
+        self.tracker.__init__()
+        asked = self.web(self.review_request(CONTRIBUTOR, operation='request-changes', items=[
+            {'id': 'item-1', 'text': 'Add the missing test.'}]), session_block(CONTRIBUTOR, 'reviews.write'))
+        self.assertEqual(0, asked['returncode'], asked)
+        self.assertEqual(1, len([command for _, command in self.tracker.writes if command[:2] == ['comments', 'add']]))
+
+    def test_the_host_route_ignores_a_block_as_before(self):
+        # No launch configuration: the block is not read at all, whatever it says.
+        request = dict(self.payload_request('review', [TASK], {'schema_version': 1, 'operation': 'approve', 'task': TASK}),
+                       actor='worker', authority=session_block(OWNER, 'read', project=OTHER_PROJECT))
+        done = endpoint.execute(self.root, request)
+        self.assertEqual((0, ['work']), (done['returncode'], self.reached))
+
+    def test_an_operation_the_table_does_not_know_keeps_todays_behaviour(self):
+        # A raw comment: the web service has no route that sends one, so no capability is
+        # required of its block; the project of the block is compared all the same.
+        comment = lambda project=PROJECT: self.payload_request('bd', ['comments', 'add', TASK, 'A plain remark'], project=project)
+        refused = self.web(comment(OTHER_PROJECT), session_block(OWNER, 'tasks.write'))
+        self.assertEqual((126, self.WRONG_PROJECT + '; nothing was changed\n'), (refused['returncode'], refused['stderr']))
+        self.assertEqual([], self.tracker.calls)
+        for claimed in ('tasks.write', 'read'):
+            with self.subTest(block=claimed):
+                del self.tracker.calls[:]
+                done = self.web(comment(), session_block(OWNER, claimed))
+                self.assertEqual(0, done['returncode'], done)
+                self.assertEqual(1, len([command for _, command in self.tracker.writes if command[:2] == ['comments', 'add']]))
+
+
 if __name__ == '__main__':
     unittest.main()
