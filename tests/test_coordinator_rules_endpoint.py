@@ -136,6 +136,71 @@ class RulesHelpers:
 
 
 class CoordinatorRulesEndpointTests(RulesHelpers, unittest.TestCase):
+    def test_legacy_self_approvals_cannot_authorize_facts_or_merge_slot(self):
+        # Approval written with the rule OFF stays readable, but cannot authorize
+        # a guarded write after it is enabled. Test author and current assignee.
+        for subject in ('author','assignee'):
+            self.deployment()
+            author='w1' if subject=='author' else 'w2'
+            task=self.seeded_task(assignee=author,actor=author)
+            made=self.contribute(task,author)
+            contribution=json.loads(made['stdout'])['comment_id']
+            if subject=='assignee':
+                reassigned=self.r.bd('update',task,'--assignee','w1','--json')
+                self.assertEqual(reassigned.returncode,0,reassigned.stderr)
+            self.approve(task,'w1',contribution)
+            self.deployment(independent_approval=True)
+            for dimension in ('reviewed','integrated'):
+                before=self.rows()
+                with self.assertRaisesRegex(ValueError,'independent_approval.*'+subject):
+                    self.lifecycle('ops',dimension,task)
+                self.assertEqual(self.rows(),before)
+            before=self.rows()
+            with self.assertRaisesRegex(ValueError,'independent_approval.*'+subject):
+                self.coordinate('ops','merge-acquire',task=task,target='main@'+'c'*40)
+            self.assertEqual(self.rows(),before)
+
+    def test_corrupt_registry_refuses_independent_writes_but_exact_assignee_can_record_scope(self):
+        self.deployment(lifecycle_authors=True,independent_approval=True)
+        task=self.task('corrupt registry '+uuid.uuid4().hex[:8],assignee='w1')
+        (self.project/'.sessions.json').write_text('{',encoding='utf-8')
+        self.lifecycle('w1','lifecycle-scope',task)
+        self.lifecycle('w1','implemented',task)
+        self.lifecycle('w1','tested',task)
+        made=self.contribute(task,'w1')
+        contribution=json.loads(made['stdout'])['comment_id']
+        before=self.rows()
+        with self.assertRaisesRegex(ValueError,'independent_approval.*registry cannot be read'):
+            self.approve(task,'ops',contribution)
+        self.assertEqual(self.rows(),before)
+        # Valid empty ownership allows a different name; strict failures are not
+        # confused with an installation that has not bound actors yet.
+        (self.project/'.sessions.json').write_text(json.dumps({'schema_version':1,'records':{}}))
+        self.approve(task,'ops',contribution)
+        (self.project/'.sessions.json').write_text('{',encoding='utf-8')
+        for dimension in ('reviewed','integrated'):
+            before=self.rows()
+            with self.assertRaisesRegex(ValueError,'independent_approval.*registry cannot be read'):
+                self.lifecycle('ops',dimension,task)
+            self.assertEqual(self.rows(),before)
+        before=self.rows()
+        with self.assertRaisesRegex(ValueError,'independent_approval.*registry cannot be read'):
+            self.coordinate('ops','merge-acquire',task=task,target='main@'+'c'*40)
+        self.assertEqual(self.rows(),before)
+
+    def test_no_contribution_cannot_authorize_facts_or_merge_slot(self):
+        self.deployment(independent_approval=True)
+        task=self.seeded_task(assignee='w1',actor='w1')
+        for dimension in ('reviewed','integrated'):
+            before=self.rows()
+            with self.assertRaisesRegex(ValueError,'independent_approval.*no contribution'):
+                self.lifecycle('ops',dimension,task)
+            self.assertEqual(self.rows(),before)
+        before=self.rows()
+        with self.assertRaisesRegex(ValueError,'independent_approval.*no contribution'):
+            self.coordinate('ops','merge-acquire',task=task,target='main@'+'c'*40)
+        self.assertEqual(self.rows(),before)
+
     # -- (a) lifecycle_authors through the endpoint ----------------------------
     def test_endpoint_honours_lifecycle_authors(self):
         self.deployment(lifecycle_authors=True)
@@ -332,6 +397,76 @@ class CoordinatorRulesWebRouteTests(RulesHelpers, unittest.TestCase):
                 'delivery': {'kind': 'bundle', 'path': 'server:/rev.bundle', 'sha256': 'f' * 64},
                 'summary': 'Delivered over the web'}
         return harness.request('POST', '/v1/projects/pp/tasks/%s/reviews' % task, body, token=token)
+
+    def test_actual_http_registry_refusal_keeps_rule_and_recovery_sentence_once(self):
+        self.deployment(independent_approval=True)
+        harness,olga,_oscar=self.web()
+        task=self.seeded_task(assignee='w1',actor='w1')
+        made=self.contribute(task,'w1'); contribution=json.loads(made['stdout'])['comment_id']
+        (self.project/'.sessions.json').write_text('{',encoding='utf-8')
+        before=self.rows()
+        response=harness.request('POST','/v1/projects/pp/tasks/%s/reviews'%task,
+            dict(operation='approve',schema_version=1,operation_id='bad-reg-'+secrets.token_hex(8),
+                 previous=contribution,contribution=contribution,summary='Review accepts'),token=olga)
+        self.assertEqual(response.status,422,response.data)
+        text=json.dumps(response.data)
+        self.assertIn('independent_approval',text)
+        self.assertIn('--rule independent_approval --actor OPERATOR',text)
+        self.assertEqual(text.lower().count('nothing was changed'),1)
+        self.assertNotIn(str(self.project),text)
+        self.assertEqual(self.rows(),before)
+
+    def test_actual_web_brief_wait_is_caller_relative_and_matches_canonical_brief(self):
+        import work
+        harness,olga,oscar=self.web(); admin=harness.admin_token()
+        extra={}
+        for name in ('third','named','coordinator'):
+            user=harness.create_account(admin,name,name+'-password-1')
+            member=harness.request('PUT','/v1/projects/pp/members/'+user,
+                {'role':'coordinator' if name=='coordinator' else 'contributor'},token=admin)
+            self.assertEqual(member.status,200,member.data)
+            extra[name]=(user,harness.login(name,name+'-password-1')[0])
+        made=harness.request('POST','/v1/projects/pp/tasks',{'title':'caller wait matrix'},token=olga)
+        self.assertEqual(made.status,201,made.data); task=made.data['id']
+        claim=harness.request('POST','/v1/projects/pp/tasks/'+task+'/claim',{},token=olga)
+        self.assertEqual(claim.status,200,claim.data)
+        delivered=self.web_contribution(harness,olga,task)
+        self.assertEqual(delivered.status,201,delivered.data)
+        first=harness.request('GET','/v1/projects/pp/tasks/'+task+'/brief',token=olga)
+        self.assertEqual(first.status,200,first.data)
+        author=first.data['review']['contribution']['author']
+        # Deliver as the assigned author, then hand off: author and current
+        # assignee are distinct callers without bypassing contribute's ownership.
+        assignee=harness.login('oscar','oscar-password-1')[2]['id']
+        changed=self.r.bd('update',task,'--assignee',assignee,'--json')
+        self.assertEqual(changed.returncode,0,changed.stderr)
+        contribution=first.data['review']['contribution']['id']
+        document=json.loads((self.root/'deployment.private.json').read_text())
+        document['review_workflow_writes']=True
+        (self.root/'deployment.private.json').write_text(json.dumps(document))
+        asked=self.post_review(task,author,dict(schema_version=1,operation='request-review',
+            operation_id='named-'+secrets.token_hex(8),task=task,previous=contribution,
+            contribution=contribution,reviewer=extra['named'][0],summary='Please review'))
+        self.assertEqual(asked['returncode'],0)
+        callers=[('author',author,olga),('assignee',assignee,oscar),
+                 ('third',extra['third'][0],extra['third'][1]),
+                 ('coordinator',extra['coordinator'][0],extra['coordinator'][1]),
+                 ('named',extra['named'][0],extra['named'][1])]
+        for enabled in (False,True):
+            self.deployment(independent_approval=enabled)
+            before=self.rows()
+            for role,actor,token in callers:
+                with self.subTest(rule=enabled,caller=role):
+                    response=harness.request('GET','/v1/projects/pp/tasks/'+task+'/brief',token=token)
+                    self.assertEqual(response.status,200,response.data)
+                    raw=self.endpoint('brief',actor,[task,'--json'])
+                    canonical=json.loads(raw['stdout'])['review']['waiting_for_approval']
+                    self.assertEqual(response.data['review']['waiting_for_approval'],canonical)
+                    expected=work.APPROVAL_WAIT if enabled and role in ('author','assignee') else work.review_move(
+                        'awaiting-review',task,role=='assignee',named_reviewer=role=='named')[1]
+                    self.assertEqual(canonical,expected)
+                    self.assertLess(len(canonical),240)
+            self.assertEqual(self.rows(),before)
 
     def test_an_owner_approves_through_the_web_route_under_coordinator_writes(self):
         self.deployment(coordinator_writes=True)

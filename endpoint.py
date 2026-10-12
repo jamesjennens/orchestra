@@ -65,10 +65,11 @@ def owner_loader(path,rule):
         import sessions
         try:
             return sessions.owners(path)
-        except (ValueError,OSError) as exc:
-            raise ValueError('%s An operator turns the rule off with `admin.py coordinator-rules off --rule %s '
+        except (ValueError,OSError):
+            raise ValueError('The installation setting %s is on, and the session registry cannot be read. '
+                             'An operator turns the rule off with `admin.py coordinator-rules off --rule %s '
                              '--actor OPERATOR`, or repairs the session registry; nothing was changed.'
-                             %(exc,rule)) from None
+                             %(rule,rule)) from None
     return load
 
 ALLOWED={'list','show','ready','search','count','create','update','close','reopen','comments','dep','state','lint'}
@@ -1302,9 +1303,13 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             return stdout
         runner=NativeRunner(run)
         def briefing_effect():
+            rules=configured_coordinator_rules(root,warnings=run_warnings)
             return {'returncode':0,'stdout':briefing_execute(root,path,name,actor,action,args,request.get('attachments',{}),runner,
                                                              operators=configured_operators(root),
-                                                             verifiers=configured_verifiers(root)),'stderr':''.join(run_warnings)}
+                                                             verifiers=configured_verifiers(root),
+                                                             independent_approval=rules['independent_approval'],
+                                                             owners=owner_loader(path,'independent_approval')
+                                                             if rules['independent_approval'] else None),'stderr':''.join(run_warnings)}
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
             return guarded_write(root,request,journal_path(path),briefing_effect,

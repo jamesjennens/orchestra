@@ -1610,7 +1610,7 @@ class EndpointBackend:
         if action == 'review' and cls.base_refusal(said) is not None:
             return cls.BASE_REFUSAL_LIMIT            # the longest form of the sentence is well below it
         if action in ('review', 'coordinate', 'lifecycle') and isinstance(said, str) \
-                and 'the installation setting' in said:
+                and 'the installation setting' in said.lower():
             return cls.RULE_REFUSAL_LIMIT
         return cls.DETAIL_LIMITS.get(action, cls.DETAIL_LIMIT)
 
@@ -2425,6 +2425,8 @@ class EndpointBackend:
         dependencies = (data.get('dependencies') or {}).get('items') or []
         return {'task': task, 'checkpoint': checkpoint, 'carry_open_items': carry,
                 'review': {'state': review.get('review_state') or 'none',
+                           'waiting_for_approval':review.get('waiting_for_approval'),
+                           'approval_requires_other_party':bool(review.get('approval_requires_other_party')),
                            'contribution': contribution, 'requests': requests,
                            'open_requests': review.get('pending_total', len(requests)),
                            'latest_id': review.get('latest_comment_id'),
@@ -6422,6 +6424,18 @@ class ApiHandler(BaseHTTPRequestHandler):
         review = brief['review']
         checkpoint = brief.get('checkpoint')
         contribution = review.get('contribution')
+        # The backend reads as the service; explain the wait to THIS caller.
+        from work import approval_wait, APPROVAL_WAIT
+        caller=ctx.principal.actor or ctx.principal.user_id
+        assignee=brief['task'].get('assignee')
+        author=(contribution or {}).get('author')
+        required=bool(review.get('approval_requires_other_party') or self.service.approval_by_another_party)
+        named=any(r.get('reviewer')==caller for r in review.get('pending_review_requests') or [])
+        text=approval_wait(review.get('state'),tid,caller,assignee,author,required,named_reviewer=named)
+        if (required and review.get('state')=='awaiting-review' and author
+                and not self._independent_all([caller],[author,assignee],pid)):
+            text=APPROVAL_WAIT
+        review['waiting_for_approval']=text
         actors = [brief['task'].get('assignee')]
         actors += [checkpoint.get('author')] if checkpoint else []
         actors += [contribution.get('author')] if contribution else []

@@ -7,6 +7,20 @@ is `cli-contract-v1`; `work --help` returns it in the `contract` field. The kit 
 renaming a documented field, changing an ID's meaning, or changing the envelope
 requires a new contract version.
 
+### Approval waiting context
+
+`work` rows and the canonical `brief.review` and `review` projections carry
+`waiting_for_approval` (bounded text or null) and `approval_requires_other_party`
+(boolean, the installation's `independent_approval` setting). With a current
+awaiting-review contribution and that setting on, the author/assignee sees the
+independent-party waiting sentence. Other callers, and all callers with the rule
+off, see the explanation from the same decision as `whose_move`. A named reviewer
+sees their review action. Outside awaiting-review, waiting text is null. The web
+brief exposes `review.waiting_for_approval` after recomputing it for its authenticated
+caller, also honoring the service's `approval_by_another_party` rule. These additive
+reader fields and corrected text mean all-off stdout is not byte-identical to older
+kits; all-off native write effects remain compatible.
+
 The endpoint is the program that runs beside the canonical Beads service
 (`endpoint.py` for SSH/local transport). Clients talk to it through one JSON envelope
 and never run the native `bd` binary directly.

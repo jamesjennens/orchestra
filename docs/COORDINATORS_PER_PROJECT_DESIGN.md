@@ -523,8 +523,9 @@ otherwise.
 4. **Should the web route also refuse an owner approving their own
    contribution?** The code's own comment says the contributor never approves;
    the route lets an owner who contributed approve. A project with one owner
-   would then need a second owner or a superuser for every approval of the
-   owner's own work. *Recommendation: yes, as a task of its own, with the
+   needs an authorized approver of another party for the owner's own work;
+   superuser authority alone does not make an approver independent. The web rule
+   also compares the person's own agents. *Recommendation: yes, as a task of its own, with the
    sentence that tells a sole owner what to do.*
 5. **Which host commands does a confined coordinator get back** (slice 3)?
    *Recommendation: guidance, accepting records, proposal reviews, the

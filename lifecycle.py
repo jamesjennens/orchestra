@@ -207,10 +207,11 @@ def dimension_authority(dimension,actor,assignee,operators=None,owners=None):
     (item 3c): ``Worker`` and ``worker/sub`` are not the assignee ``worker``.
     """
     from review_workflow import listed_operator_actor
+    if (dimension in ASSIGNEE_DIMENSIONS and isinstance(assignee,str)
+            and assignee and actor==assignee):
+        return True,None
     if listed_operator_actor(actor,operators,owners):return True,None
     if dimension in ASSIGNEE_DIMENSIONS:
-        if isinstance(assignee,str) and assignee and actor==assignee:
-            return True,None
         return False,('only the task\'s assignee or a listed operator may record %s, and %s is neither%s'
                       %(dimension,named_actor(actor),
                         ' (the task is assigned to %s)'%named_actor(assignee)
