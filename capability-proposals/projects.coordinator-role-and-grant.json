@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
-  "operation_id": "capnew-6a1f0c9d2b7e4f35a8c4d1e09b3f7a62",
+  "operation_id": "caprev-5bb210-web-merge-slot-0001",
   "key": "projects.coordinator-role-and-grant",
-  "name": "A coordinator role, and a per-project grant that lets a personal agent approve",
+  "name": "A coordinator role and personal-agent grant for approvals and the web merge slot",
   "aliases": [
     "coordinator role",
     "coordinator grant",
@@ -10,12 +10,18 @@
     "make coordinator",
     "agents.coordinator.grant",
     "web coordinator slice 1b",
-    "coordinate capability"
+    "coordinate capability",
+    "web merge slot",
+    "take and release the merge slot",
+    "owner force release",
+    "web coordinator slice 2 merge slot"
   ],
-  "summary": "A project role coordinator between contributor and owner: it approves contributions and triages proposals like an owner and holds the capability coordinate; members, worker credentials, archive and the audit stay the owner's. And a grant kept with the project: PUT or DELETE /v1/projects/{id}/agents/{agent}/coordinator, by an owner of that project or a superuser. The agent must be a personal agent that works in the project and enabled, and its own account must be a coordinator or an owner there (else 409, nothing written). The grant adds reviews.approve and coordinate to the agent's credentials in that project only, while its account holds them; nothing else a credential is denied opens, proposal triage included. A granted agent never approves work of its own party whatever the approval_by_another_party setting says. Read from the present state on every request: removing the grant, lowering the account's role, taking the agent out of the project or disabling it ends it at the next request. The project's agent list carries coordinator, and the settings page gives and removes the grant.",
+  "summary": "Coordinator roles and personal-agent grants supply reviews.approve and coordinate while the account holds them; worker credentials do not. Agents never approve their own party. Supported single-process live checks remain; inherited endpoint-binding and second-process faults are not repaired. GET merge-slot reads native holder/context. Acquire/release use coordinate and bound usr_/agent_ names. Force-release with expected_holder/reason and explicit create/repair need a signed-in owner or superuser, never an agent. One verified_web_authority helper checks exact project/capability against configured live state; ordinary host payloads/answers and independent_approval remain. No silent creation; missing/damaged/unread slots get recovery. Stable keys reconcile confirmed retries without releasing a later holder. Each confirmed write saves one deduplicated web audit with project/task/actor/before-after holder/opid before its HTTP receipt. Existing native/context/journal/service stores are reused. Page and named client ship together. No lifecycle writer, integration action, provenance mark, new store or switch.",
   "requirements": [],
   "anchors": [
-    "docs/HTTP_DEPLOYMENT.md#coordinators-a-role-and-a-grant-that-lets-an-agent-approve"
+    "docs/HTTP_DEPLOYMENT.md#coordinators-a-role-and-a-grant-that-lets-an-agent-approve",
+    "docs/HTTP_DEPLOYMENT.md#project-merge-slot-over-http",
+    "docs/HTTP_MUTATION_PERSISTENCE.md#web-merge-slot-writes"
   ],
   "code": [
     "http_authority.py::coordinator_grant",
@@ -27,11 +33,20 @@
     "http_auth.py::Service.actor_parties",
     "http_service.py::ApiHandler.project_agent_coordinator_grant",
     "http_service.py::ApiHandler.project_agent_coordinator_revoke",
-    "http_service.py::ApiHandler.reviews_add"
+    "http_service.py::ApiHandler.reviews_add",
+    "http_authority.py::verified_web_authority",
+    "web_merge_slot.py::apply",
+    "web_merge_slot.py::snapshot",
+    "http_service.py::EndpointBackend.merge_slot_read",
+    "http_service.py::ApiHandler.merge_slot_get",
+    "http_service.py::ApiHandler._merge_slot_write",
+    "http_client.py::Client.acquire_merge_slot"
   ],
   "tests": [
     "tests/test_coordinator_grant.py",
-    "tests/test_coordinator_grant_real.py"
+    "tests/test_coordinator_grant_real.py",
+    "tests/test_web_merge_slot.py",
+    "tests/web_merge_slot_screen.mjs"
   ],
   "owner": "person:orchestra-coordinator",
   "tags": [

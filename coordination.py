@@ -321,7 +321,7 @@ def repair_merge_slot(run,slot):
     return fixed,wanted
 
 def apply_native(p, actor, run, project, operators=None, coordinator_writes=False, independent_approval=False,
-                 owners=None):
+                 owners=None, verified_web_authority=False):
     """Caller holds canonical project lock. Journals belong to runtime, never Git.
 
     ``coordinator_writes`` and ``independent_approval`` are the per-installation
@@ -416,7 +416,7 @@ def apply_native(p, actor, run, project, operators=None, coordinator_writes=Fals
         # so a plain listed name does not read the registry and a damaged registry
         # never stops a listed operator (item 4c).
         from review_workflow import listed_operator_actor,named_rule_actor
-        if coordinator_writes and not listed_operator_actor(actor,operators,owners):
+        if coordinator_writes and not verified_web_authority and not listed_operator_actor(actor,operators,owners):
             raise ValueError('merge-acquire refused: the installation setting coordinator_writes is on, so only a '
                              'listed operator of this project may take the merge slot (or an actor of a listed '
                              "operator's principal), and %s is neither. An operator turns the rule off with "

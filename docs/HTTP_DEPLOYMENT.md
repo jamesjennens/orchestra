@@ -1,5 +1,26 @@
 # Office HTTP service: installation, TLS and recovery runbook
 
+## Project merge slot over HTTP
+
+`GET /v1/projects/{id}/merge-slot` reads the native slot, its holder and matching saved task/target. It also reports the caller's exact actor and current permissions. Readers may be ordinary members or credentials; taking and releasing require `coordinate`: a signed-in coordinator, owner or superuser, or a personal agent with the active per-project coordinator grant while its account holds that role. A worker credential never gets this capability. With `coordinator_writes` on, this verified web authority decides the web take/release path even if no host operator is listed; the host `coordinate` path retains its original listed-operator checks and answers. `independent_approval` still requires the current standing independent contribution approval before acquisition.
+
+The project page has take/release controls and shows the exact holder name. A person's holder is the stable `usr_...` id bound by the endpoint; a granted personal agent's is its bound `agent_...` id. These are the names the host rule and own-party checks see, not editable attribution labels or display names.
+
+| Route | Closed request body | Authority |
+| --- | --- | --- |
+| `POST .../merge-slot/acquire` | `task_id`, `target` (nonblank, at most 160 characters) | `coordinate` |
+| `POST .../merge-slot/release` | empty | `coordinate`, exact current holder |
+| `POST .../merge-slot/force-release` | `expected_holder`, `reason` (nonblank, at most 1000 characters) | signed-in owner or superuser (`project.admin`) |
+| `POST .../merge-slot/create` | empty; explicit creation or shape repair | signed-in owner or superuser (`project.admin`) |
+
+Every write requires an `Idempotency-Key`. Reuse the identical key and body after an uncertain response. The endpoint compares the expected native holder under the project lock immediately before forced release; an exact confirmed retry returns the original result and does not release a later holder. Forced release remains possible when the old credential is expired, revoked or deleted: the owner acts under their own identity. Agents, including an owner's granted agent, never force-release or create/repair. Reads and acquisitions never create a missing slot silently. Missing, damaged or unread slot/context returns a distinct 503 recovery sentence; forbidden authority is 403 (an unreachable project remains 404), invalid fields/bounds are 422, holder/context conflicts are 409, and confirmed operations are 200.
+
+Use the named Python client methods `merge_slot`, `acquire_merge_slot`, `release_merge_slot`, `force_release_merge_slot` and `create_merge_slot`; the CLI is `http_client.py merge-slot PROJECT read|acquire|release|force-release|create` with `--task/--target`, or `--expected-holder/--reason`, and `--idempotency-key` for stable retries. The browser's API keeps the key for an uncertain intent. Every confirmed slot write records project/task, authenticated actor, holder before/after and operation id in the web audit; refusals use the existing rejected/denied audit path. Effect, receipt and crash boundaries are in [HTTP_MUTATION_PERSISTENCE.md](HTTP_MUTATION_PERSISTENCE.md).
+
+For rollback, preserve the native project and existing sidecar together so the older kit continues to show the recorded web holder, and have a signed-in owner force-release that holder before rolling back or use the retained newer kit for the same recovery if the holder's identity no longer exists.
+
+This first delivery adds no lifecycle fact writer, integration action, host provenance mark, grant change, store family or rollout switch. The generic endpoint capability/project binding and second-process stale grant limitations retain their existing scope; the new slot path validates its own exact project and capability and uses the supported single service process.
+
 **Status:** runbook for the disposable `.19` implementation. It describes a
 deployment shape but does not authorize one. No office hostname, certificate,
 secret store, network policy or backup key is selected here; the office owner
@@ -1752,7 +1773,7 @@ things, and an installation that uses neither behaves as before.
 | Claim, deliver, checkpoint, review, recommend, propose | no | yes | yes | yes |
 | Approve a contribution, triage a proposal (`reviews.approve`) | no | no | yes | yes |
 | Record the owner's decision on a proposal (`decide`) | no | no | no | yes |
-| `coordinate` (no route asks for it yet; the merge slot and the lifecycle facts will) | no | no | yes | yes |
+| `coordinate` (web merge-slot acquire and release; lifecycle facts are a later delivery) | no | no | yes | yes |
 | Members, worker credentials, archive, the audit, this grant (`project.admin`) | no | no | no | yes |
 
 An owner gives and takes the role on the Members panel (`PUT

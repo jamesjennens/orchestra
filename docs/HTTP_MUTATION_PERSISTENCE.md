@@ -12,6 +12,17 @@ The registration callback saves its `registered_by` mark after `create_project` 
 
 ## Call-site inventory
 
+### Web merge-slot writes
+
+| Handler | Operation | Effect and receipt locations |
+| --- | --- | --- |
+| `merge_slot_acquire` | `merge-slot.acquire` | Native project slot plus `.merge-context.json`; existing project guarded operation journal, service canonical result and HTTP receipt. |
+| `merge_slot_release` | `merge-slot.release` | Native project slot; saved context retained; existing project guarded operation journal, service canonical result and HTTP receipt. |
+| `merge_slot_force_release` | `merge-slot.force-release` | Native holder comparison and release under the project lock; existing guarded journal, service canonical result and HTTP receipt. |
+| `merge_slot_create` | `merge-slot.create` | Native slot creation/shape repair, preserving a recorded holder; existing guarded journal, service canonical result and HTTP receipt. |
+
+Each confirmed operation saves one committed web audit entry in the existing service JSON document before its HTTP receipt, with project, task (null when no context exists), authenticated actor, operation id, and holder before/after; force release also records its bounded reason. An exact retry deduplicates that entry by project/action/operation id and uses the original canonical result. A failure before any native write releases the reservation and is rejected; an interrupted native write keeps the guarded identity uncertain and requires inspection/reconciliation. No transaction across native data, the guarded journal, service JSON and receipt SQLite is claimed. The native result may precede its web audit after a crash; the stable identity permits a confirmed canonical replay to finish the audit without repeating the effect. No new store or backup family is added.
+
 | Handler | Operation | Persistence contract |
 | --- | --- | --- |
 | `accounts_create` | `accounts.create` | Service method has an inner save; conditional paths need route-specific proof. |

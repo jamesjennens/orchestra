@@ -324,7 +324,7 @@ CAP_APPROVE = 'reviews.approve'
 #: credential ever holds.
 CAP_PROPOSALS = 'proposals.write'
 #: What a project's coordinator may do beyond approving (slice 1b of docs/WEB_COORDINATOR_DESIGN.md,
-#: kittrial-5bb.209). No route asks for it yet: the merge slot and the lifecycle facts will.
+#: kittrial-5bb.209). Web merge-slot acquire/release use it; lifecycle facts follow separately.
 CAP_COORDINATE = 'coordinate'
 CAP_PROJECT_ADMIN = 'project.admin'
 CAP_PROJECT_CREATE = 'project.create'
@@ -1995,6 +1995,24 @@ def http_shaped_names(names):
     HTTP account or agent id. Only the exact shape is reserved: `usr_` or `agent_` and 16
     lowercase hex digits. A near miss (15 digits, `USR_`) is an ordinary name."""
     return [name for name in names or [] if isinstance(name, str) and http_actor_id(name) is not None]
+
+
+def verified_web_authority(request, authority_config, capability, project):
+    """Whether the configured service grants this capability in this exact project.
+
+    A descriptor is never authority by itself. Mutations call this inside the
+    guarded effect, under the live authority lock; reads hold that lock too.
+    This helper does not infer a capability from an actor name or an SSH payload.
+    """
+    descriptor = request.get('authority')
+    if (authority_config is None or not isinstance(descriptor, dict)
+            or request.get('project') != project
+            or descriptor.get('project') != project
+            or descriptor.get('capability') != capability):
+        return False
+    descriptor = {k: v for k, v in descriptor.items() if k not in ('store', 'lock')}
+    decide(read_state(authority_config.store), descriptor)
+    return True
 
 
 def http_actor_denial(request, authority_config):
