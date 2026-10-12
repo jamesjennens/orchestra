@@ -421,7 +421,8 @@ class ListingTests(unittest.TestCase):
             'other_kit': False, 'other_root': False, 'missing': False, 'unknown_arguments': [], 'names_release': False,
             'unknown_projects': [],
             # kittrial-5bb.250 r3: the two rule fields every command line now carries.
-            'needs_shell': False, 'relative_path': False, 'foreign_invocation': False})
+            'needs_shell': False, 'relative_path': False, 'foreign_invocation': False,
+            'restrict': True, 'no_forwarding_options': True, 'confined_options': True})
 
     def test_an_over_long_command_is_group_two_without_token_work(self):
         # kittrial-5bb.265 r2: the raw-text bound fires before shlex, so a line of 200,000
@@ -441,7 +442,8 @@ class ListingTests(unittest.TestCase):
         self.assertEqual(self.one(self.line())['kind'], 'confined')
         plain = self.one('ssh-ed25519 %s james@desk' % KEY_BODY)
         self.assertEqual(plain, {'key_type': 'ssh-ed25519', 'fingerprint': fingerprint(KEY_BODY), 'comment': 'james@desk',
-                                 'kind': 'unrestricted'})
+                                 'kind': 'unrestricted',
+                                 'restrict': False, 'no_forwarding_options': False, 'confined_options': False})
         # Options that do not confine: still the account's shell.
         self.assertEqual(self.one('no-pty,from="10.0.0.0/8,192.168.1.1" ssh-rsa %s ops' % KEY_BODY)['kind'], 'unrestricted')
         self.assertEqual(self.one('environment="A=command=x" ssh-rsa %s ops' % KEY_BODY)['kind'], 'unrestricted')
@@ -471,6 +473,35 @@ class ListingTests(unittest.TestCase):
         self.assertTrue(mixed['other_kit'])                                     # the other kit's wrapper, this endpoint
         gone = self.one(self.line(kit=self.base/'removed', projects=['alpha']))
         self.assertEqual((gone['other_kit'], gone['missing']), (True, True))
+
+    def test_the_project_gate_is_first_and_execute_is_the_only_path_in(self):
+        """kittrial-5bb.218 finding 2, pinned at the source (as the actions test pins the
+        action walk): the project gate is the FIRST statement of endpoint.execute - before
+        any action is answered - and execute is the only call path from a request into an
+        action, so no action can be answered before the gate whatever is added later."""
+        source = (KIT/'endpoint.py').read_text(encoding='utf-8')
+        body = source[source.index('\ndef execute('):source.index('\ndef main(')]
+        first = next(line.strip() for line in body.split('\n')[2:] if line.strip())
+        self.assertTrue(first.startswith('key_project_refusal('),
+                        'the gate must be execute\'s first statement, found: %r' % first)
+        # No other function in endpoint.py dispatches an action, and every caller of
+        # execute (main's stdin loop is the one) goes through it: the module's own calls.
+        import ast
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name not in ('execute',):
+                for call in ast.walk(node):
+                    if isinstance(call, ast.Call) and isinstance(call.func, ast.Name):
+                        self.assertNotEqual(call.func.id, 'project_dir', 'a path read outside execute')
+        # The structural refusals come before any action is answered, and the reviewer's
+        # probe (an action answered in main() before execute) has no surface: main builds
+        # argv and calls execute once, for every request.
+        self.assertIn('answer=execute(', source)
+        calls = [line for line in source.split('\n') if 'execute(' in line and 'def execute' not in line
+                 and 'session_execute' not in line and 'work_execute' not in line
+                 and 'handoff_execute' not in line and 'briefing_execute' not in line
+                 and 'feedback_execute' not in line]
+        self.assertTrue(all('answer=execute(' in line for line in calls), calls)
 
     def test_a_line_for_another_runtime_and_unknown_things(self):
         other = self.one(self.line(root=self.base/'elsewhere', projects=['alpha']))
@@ -513,7 +544,9 @@ class ListingTests(unittest.TestCase):
         self.assertEqual([(entry['line'], entry['kind']) for entry in listing['lines']],
                          [(2, 'unrestricted'), (4, 'bound'), (5, 'confined'), (6, 'other-command'), (7, 'unreadable')])
         self.assertEqual(listing['summary'], {'unrestricted': 1, 'bound': 1, 'confined': 1, 'other-command': 1, 'unreadable': 1})
-        self.assertEqual(listing['attention'], [5, 7])                          # the other kit's line, and the one nobody can read
+        # kittrial-5bb.218 finding 1: attention also carries the lines outside every rule -
+        # line 2 (unrestricted, the operator's own key) and line 6 (another program).
+        self.assertEqual(listing['attention'], [2, 5, 6, 7])
         self.assertEqual((listing['file'], listing['root'], listing['kit']), (str(file), str(self.root), str(self.kit)))
         self.assertIn('This command reads the file and changes nothing.', listing['notes'])
         with self.assertRaises(ValueError) as missing:

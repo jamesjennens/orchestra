@@ -6232,6 +6232,17 @@ def key_line(line,root,kit):
     entry={'key_type':parts[0],
            'fingerprint':'SHA256:'+base64.b64encode(hashlib.sha256(body).digest()).decode('ascii').rstrip('='),
            'comment':parts[2] if len(parts)>2 else ''}
+    # kittrial-5bb.218 finding 1: the options a line carries are part of what it may do -
+    # the kit prints `restrict` first (and the four no-* options after it, so a stock sshd
+    # that predates restrict still gets them), and a line with this kit's command but
+    # WITHOUT them keeps port forwarding and a pty open to that key. Report both shapes:
+    # 'restrict' alone, the four no-* options, both, or neither.
+    lowered=[word.strip().lower() for word in options.split(',')]
+    entry['restrict']='restrict' in lowered
+    entry['no_forwarding_options']=all(option in lowered
+                                       for option in ('no-pty','no-port-forwarding',
+                                                      'no-agent-forwarding','no-x11-forwarding'))
+    entry['confined_options']=bool(entry['restrict'] or entry['no_forwarding_options'])
     command=_key_line_command(options)
     if command is None:
         entry['kind']='unrestricted'
@@ -6413,11 +6424,19 @@ def authorized_keys_listing(root,file=None):
         # on its own. The key appears only when such a line exists.
         if entry.get('principal') and not str(entry['principal']).startswith('-'):
             summary['principal-bound']=summary.get('principal-bound',0)+1
+        if entry.get('confined_options') is False and entry.get('kind') in ('bound','confined'):
+            summary['without-confined-options']=summary.get('without-confined-options',0)+1
     attention=[entry['line'] for entry in lines
                if entry.get('other_kit') or entry.get('missing') or entry.get('unknown_arguments')
                or entry.get('unknown_projects') or entry.get('names_release') or entry['kind']=='unreadable'
                or entry.get('principal_repeated') or entry.get('principal_ill_formed')
-               or entry.get('project_repeated')]
+               or entry.get('project_repeated')
+               # kittrial-5bb.218 finding 1: the lines OUTSIDE every rule of the kit belong
+               # beside the stale-kit lines - an operator who reads only attention must see
+               # them too, or the stale lines are all that is seen.
+               or entry['kind'] in ('unrestricted','other-command')
+               or entry.get('other_root')
+               or (entry['kind'] in ('bound','confined') and not entry['confined_options'])]
     # The installation setting that accepts bound keys only (kittrial-5bb.196, slice 4). While
     # it is on, a line that runs this kit's wrapper and names no project or no principal is
     # refused by the wrapper, so it is one more line an operator must look at: the migration
@@ -6571,6 +6590,33 @@ def authorized_keys_listing(root,file=None):
            'other_root: the line serves another runtime than --root (or names none); its projects were not looked up here.']
     def _named(numbers):
         return 'line%s %s'%('s' if len(numbers)!=1 else '',', '.join(str(number) for number in numbers))
+    # kittrial-5bb.218 finding 1: why each out-of-rule line is in attention, in words, so
+    # the list is never read without its reasons. The operator's own full-shell key is
+    # NORMAL on most installs: the reason says so rather than leaving the line out.
+    by_line={entry['line']:entry for entry in lines}
+    def _out_of_rule_reasons():
+        reasons=[]
+        unrestricted=[e['line'] for e in lines if e['kind']=='unrestricted']
+        other_command=[e['line'] for e in lines if e['kind']=='other-command']
+        no_restrict=[e['line'] for e in lines
+                     if e['kind'] in ('bound','confined') and not e['confined_options']]
+        other_root=[e['line'] for e in lines if e.get('other_root')]
+        if unrestricted:
+            reasons.append('%s: unrestricted - the account\'s full shell. The operator\'s own key is '
+                           'normally exactly this on most installs; every other such line can run '
+                           'anything the account can.'%_named(unrestricted))
+        if other_command:
+            reasons.append('%s: a command that is another program or a shell, not this kit\'s wrapper - '
+                           'outside every rule of this kit (judged by what runs, not by its '
+                           'text).'%_named(other_command))
+        if no_restrict:
+            reasons.append('%s: this kit\'s command WITHOUT restrict or the no-forwarding options - '
+                           'port forwarding and a pty stay open to that key, which is what the kit '
+                           'prints restrict for.'%_named(no_restrict))
+        if other_root:
+            reasons.append('%s: serves another runtime than --root - its projects were not looked up '
+                           'here.'%_named(other_root))
+        return reasons
     def _may_sentence(numbers, more):
         """The one group-two sentence: _may_sentence_for is the single source, so the
         listing, status and on cannot drift (kittrial-5bb.265 item 3 - this body was a
@@ -6613,6 +6659,8 @@ def authorized_keys_listing(root,file=None):
     if truncated:
         notes.append('Only the first %d bytes of this file were read; the file is larger than that, so a '
                      'line beyond it was not inspected.'%AUTHORIZED_KEYS_MAX_BYTES)
+    for reason in _out_of_rule_reasons():
+        notes.append(reason)
     notes.append('This command reads the file and changes nothing.')
     return {'schema_version':1,'file':str(path),'root':str(root),'kit':str(kit),'lines':lines,'summary':summary,
             'attention':attention,'bound_keys_only':setting,'would_be_refused':would_be_refused,
