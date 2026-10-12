@@ -1,4 +1,5 @@
 import io
+from void_test_helpers import without_void_tracker
 import json
 import sys
 import tempfile
@@ -57,6 +58,7 @@ class SessionTests(unittest.TestCase):
         a=self.register()['session'];rid=str(uuid.uuid4())
         data={'schema_version':1,'records':{a['request_id']:a,rid:dict(a,request_id=rid)}}
         with self.assertRaises(ValueError):admin.validate_coordination_files({'.sessions.json':data})
+    @without_void_tracker
     def test_registry_roundtrips_through_restore(self):
         a=self.register()['session'];data=json.loads((self.path/'.sessions.json').read_text())
         dest=self.path/'projects'/'restored';dest.mkdir(parents=True)

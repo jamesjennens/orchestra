@@ -1,5 +1,6 @@
 """Standing guidance channel (kittrial-5bb.99 slice 1): record, version, read, ack."""
 import contextlib
+from void_test_helpers import without_void_tracker
 import io
 import json
 import os
@@ -1162,6 +1163,7 @@ class GuidanceBackupTests(unittest.TestCase):
         return {'GUIDANCE.md': {'text': guidance.read_text(self.project)},
                 '.guidance.json': guidance.read_meta(self.project)}
 
+    @without_void_tracker
     def test_valid_pair_passes_validation_and_round_trips_through_restore(self):
         files = self.files()
         admin.validate_coordination_files(files)
@@ -1172,6 +1174,7 @@ class GuidanceBackupTests(unittest.TestCase):
         self.assertEqual(guidance.state(dest, 'worker-1')['version'], guidance.version_of('Be careful with X'))
         self.assertTrue(guidance.state(dest, 'worker-1')['acknowledged'])
 
+    @without_void_tracker
     def test_restore_new_with_a_backup_that_has_no_guidance_pair_reads_as_no_guidance(self):
         # kittrial-5bb.99 review `guidance-fault-skips-the-project-backup`: a degraded
         # backup carries no guidance pair. restore-new restores the tracker and the
@@ -1312,6 +1315,7 @@ class GuidanceBackupTests(unittest.TestCase):
         (self.root / 'backups' / admin.BACKUP_STATUS_NAME).write_text('not json', encoding='utf-8')
         self.assertIsNone(admin.restore_degraded_note(self.root, 'example', 'copy'))
 
+    @without_void_tracker
     def test_a_sidecar_that_carries_the_clear_record_is_validated_and_restored(self):
         # kittrial-5bb.105 item 2 (first of two releases): restore accepts the record;
         # `backup` does not write it yet, because the previous kit refuses a whole

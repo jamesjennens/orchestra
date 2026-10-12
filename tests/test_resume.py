@@ -1,4 +1,5 @@
 import copy
+from void_test_helpers import without_void_tracker
 import io
 import json
 import sys
@@ -58,6 +59,7 @@ class ResumeTests(unittest.TestCase):
             with self.assertRaises(ValueError):sessions.execute(self.path,'example',args,self.export,actor=self.record['actor'])
         self.assertEqual(before,(self.path/'.sessions.json').read_bytes())
 
+    @without_void_tracker
     def test_old_and_resumed_registries_pass_backup_validation_and_restore(self):
         old=json.loads((self.path/'.sessions.json').read_text())
         admin.validate_coordination_files({'.sessions.json':old})

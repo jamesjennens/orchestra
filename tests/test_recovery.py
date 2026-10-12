@@ -1,5 +1,6 @@
 """Audited operator recovery for malformed reserved structured history."""
 import contextlib
+from void_test_helpers import without_void_tracker
 import io
 import json
 import os
@@ -531,6 +532,7 @@ class AdminVoidRecordTests(unittest.TestCase):
         # Re-adding the operator restores the disposition: nothing was deleted.
         self.assertEqual(w.project(issue, ('ops',))['review_state'], 'awaiting-review')
 
+    @without_void_tracker
     def test_project_backup_carries_the_allowlist_and_restore_reports_it_without_regranting(self):
         marker = self.root / 'deployment.private.json'
         marker.write_text(json.dumps({'password': 'x', 'unit': 'none', 'operators': ['operator', 'ops']}),
@@ -1131,6 +1133,7 @@ class AdminRevertJournalBackupTests(unittest.TestCase):
         path.write_text(json.dumps(entry), encoding='utf-8')
         return path
 
+    @without_void_tracker
     def test_backup_and_restore_round_trip_the_host_revert_journal(self):
         self.write_entry()
         (self.root / 'backups').mkdir()
@@ -1180,6 +1183,7 @@ class AdminRevertJournalBackupTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'symlink'):
                 admin.backup_project(self.root, 'trial')
 
+    @without_void_tracker
     def test_restore_refuses_a_journal_entry_that_does_not_match_its_name(self):
         name = w.JOURNAL_DIR + '/' + '0' * 64 + '.json'
         (self.root / 'backups').mkdir()

@@ -1,5 +1,6 @@
 """Coordinator regression checks for interrupted disposition identity and backup."""
 import json
+from void_test_helpers import without_void_tracker
 import tempfile
 import types
 import unittest
@@ -43,6 +44,7 @@ class RecoveryBoundaryTests(unittest.TestCase):
     def test_unauthorized_actor_does_not_create_recovery_identity(self):
         with self.assertRaises(ValueError):self.accept(actor='mallory')
         self.assertFalse((self.path/'.handoff-recoveries').exists())
+    @without_void_tracker
     def test_backup_restore_retains_before_receipt_identity(self):
         self.interrupt_before_receipt()
         fake=types.SimpleNamespace(flock=Mock(),LOCK_EX=2)
@@ -74,6 +76,7 @@ class RecoveryBoundaryTests(unittest.TestCase):
         with self.assertRaises(ValueError):self.accept()
         self.assertFalse(target.exists())
 
+    @without_void_tracker
     def test_restore_rejects_recovery_temporary_symlink_before_any_writes(self):
         self.interrupt_before_receipt()
         files={str(file.relative_to(self.path)).replace('\\','/'):json.loads(file.read_text())

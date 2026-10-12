@@ -14,6 +14,7 @@ The lock is held by a real second process. The wait budget is patched to zero, s
 refusal comes on the first attempt and no test waits on the wall clock.
 """
 import contextlib
+from void_test_helpers import without_void_tracker
 import io
 import json
 import shlex
@@ -318,6 +319,7 @@ class RefusedAuthorityMergeTests(RuntimeCase):
                     admin.merge_authority(self.root, operators, verifiers)
         self.assertEqual(self.marker.read_bytes(), before)
 
+    @without_void_tracker
     def test_restore_coordination_called_directly_prints_the_warning(self):
         (self.root / 'projects' / 'beta').mkdir()
         holder = self.hold_lock()
