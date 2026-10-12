@@ -1794,10 +1794,60 @@ class ListingTests(unittest.TestCase):
                 'ssh-ed25519 %s james@desk' % KEY_BODY,                  # 5 unrestricted
                 'command="/usr/bin/rsync --server" ssh-ed25519 %s backup' % KEY_BODY]  # 6 other-command
 
+    def test_attention_carries_the_lines_outside_every_rule_with_reasons(self):
+        """kittrial-5bb.218 finding 1: the unrestricted, other-command, no-restrict and
+        other-root lines are in attention, each with a reason in words; the reasons note
+        that the operator's own full-shell key is normal on most installs. The listing
+        also reports the confinement options each line carries."""
+        printed = ',restrict,no-pty,no-port-forwarding,no-agent-forwarding,no-X11-forwarding'
+        no_restrict = self.line().replace(printed, '')
+        four_only = self.line().replace(printed,
+                                        ',no-pty,no-port-forwarding,no-agent-forwarding,no-X11-forwarding')
+        file = Path(self.tmp.name)/'authorized_keys'
+        file.write_text('\n'.join([
+            self.line(projects=['alpha'], principal=MINE),                # 1 bound, printed options
+            no_restrict,                                                 # 2 this kit's command, no restrict
+            four_only,                                                   # 3 the four no-* options, no restrict word
+            'command="/usr/bin/rsync --server" ssh-ed25519 %s backup' % KEY_BODY,   # 4 other-command
+            'ssh-ed25519 %s james@desk' % KEY_BODY,                      # 5 unrestricted
+            self.line(root=Path(self.tmp.name)/'elsewhere'),             # 6 another root
+        ]) + '\n', encoding='utf-8')
+        (Path(self.tmp.name)/'elsewhere').mkdir(exist_ok=True)
+        listing = admin.authorized_keys_listing(self.root, str(file))
+        # Every out-of-rule shape is in attention beside the ordinary members.
+        self.assertIn(2, listing['attention'])
+        self.assertIn(4, listing['attention'])
+        self.assertIn(5, listing['attention'])
+        self.assertIn(6, listing['attention'])
+        notes = ' '.join(listing['notes'])
+        self.assertIn("the account's full shell", notes)
+        self.assertIn('normally exactly this on most installs', notes)
+        self.assertIn('not this kit\'s wrapper', notes)
+        self.assertIn('WITHOUT restrict or the no-forwarding options', notes)
+        self.assertIn('serves another runtime', notes)
+        # The options the lines carry are reported per line.
+        by_line = {e['line']: e for e in listing['lines']}
+        self.assertEqual((True, True, True),
+                         (by_line[1]['restrict'], by_line[1]['no_forwarding_options'],
+                          by_line[1]['confined_options']))
+        self.assertEqual((False, False, False),
+                         (by_line[2]['restrict'], by_line[2]['no_forwarding_options'],
+                          by_line[2]['confined_options']))
+        # The four no-* options alone (no restrict word) confine too.
+        self.assertEqual((False, True, True),
+                         (by_line[3]['restrict'], by_line[3]['no_forwarding_options'],
+                          by_line[3]['confined_options']))
+        self.assertEqual(1, listing['summary'].get('without-confined-options'))
+        # Lines 4 and 5 carry no confinement options either (nothing to confine).
+        self.assertFalse(by_line[4]['confined_options'])
+        self.assertFalse(by_line[5]['confined_options'])
+
     def test_with_the_setting_off_nothing_is_flagged_and_the_report_says_off(self):
         listing = self.listing('\n'.join(self.lines()) + '\n')
         self.assertIs(listing['bound_keys_only'], False)
-        self.assertEqual(listing['attention'], [])
+        # kittrial-5bb.218 finding 1: the unrestricted (5) and other-command (6) lines are
+        # in attention now - the lines outside every rule, beside the stale-kit lines.
+        self.assertEqual(listing['attention'], [5, 6])
         self.assertEqual(listing['summary'], {'bound': 3, 'confined': 1, 'unrestricted': 1, 'other-command': 1,
                                               'principal-bound': 2})
         self.assertNotIn('bound_keys_only:', ' '.join(listing['notes']))
@@ -1813,7 +1863,9 @@ class ListingTests(unittest.TestCase):
         self.assertIs(listing['bound_keys_only'], True)
         # The confined line and the two bound to only one of the two; a line that does not run
         # this wrapper (unrestricted, another command) is not refused by the setting.
-        self.assertEqual(listing['attention'], [2, 3, 4])
+        # kittrial-5bb.218: lines 5 and 6 (unrestricted, other-command) join the
+        # refused lines under attention.
+        self.assertEqual(listing['attention'], [2, 3, 4, 5, 6])
         self.assertEqual(listing['would_be_refused'], [2, 3, 4])
         note = next(note for note in listing['notes'] if note.startswith('bound_keys_only:'))
         self.assertIn('lines 2, 3, 4', note)
@@ -1832,7 +1884,8 @@ class ListingTests(unittest.TestCase):
         self.assertEqual(listing['would_be_refused'], [1])
         # Line 2 is already under attention as other_kit; an other-root line of this kit is not
         # itself under attention here, and no other-kit or other-root line is named as refused.
-        self.assertEqual(listing['attention'], [1, 2])
+        # kittrial-5bb.218: line 3 (another root) is in attention too.
+        self.assertEqual(listing['attention'], [1, 2, 3])
         note = next(note for note in listing['notes'] if note.startswith('bound_keys_only:'))
         self.assertIn('Lines 2, 3 run a command this preview cannot judge', note)
 
@@ -1840,7 +1893,9 @@ class ListingTests(unittest.TestCase):
         (self.root/'deployment.private.json').write_text('{not json', encoding='utf-8')
         listing = self.listing('\n'.join(self.lines()) + '\n')
         self.assertIsNone(listing['bound_keys_only'])
-        self.assertEqual(listing['attention'], [])
+        # kittrial-5bb.218: the out-of-rule lines are in attention regardless of the
+        # setting file; the setting only adds the refused lines (none here).
+        self.assertEqual(listing['attention'], [5, 6])
         # The preview still names the lines, since it does not depend on reading the setting.
         self.assertEqual(listing['would_be_refused'], [2, 3, 4])
 

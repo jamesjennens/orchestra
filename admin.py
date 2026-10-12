@@ -1188,10 +1188,41 @@ def write_review_writes_audit(root, enabled, actor, previous, entries=None):
 
 
 #: How long a change to deployment.private.json waits for another one to finish before it
-#: refuses (kittrial-5bb.136). Every such change takes milliseconds, so a holder that keeps
-#: the lock this long is stuck; refusing says so instead of hanging the command for good.
+#: refuses (kittrial-5bb.136). The lock's own changes take milliseconds, but an
+#: ``adopt-actor`` run holds it across its checks and two writes and its own bounded wait
+#: for the project's coordination lock (kittrial-5bb.218, N1 of the .223 review), so a
+#: holder keeping it much past that ceiling is stuck; refusing says so instead of hanging
+#: the command for good.
 DEPLOYMENT_LOCK_WAIT_SECONDS = 10
 DEPLOYMENT_LOCK_POLL_SECONDS = 0.05
+
+
+def deployment_lock_is_held(root):
+    """Whether some holder - this process or another - currently holds the deployment lock.
+
+    The runtime probe behind the lock-discipline test of ``adopt-actor``
+    (kittrial-5bb.218, N2 of the .223 review): a non-blocking exclusive ``flock`` on a
+    SEPARATE open of the lock file fails exactly while a holder keeps it, and ``flock``
+    conflicts between two opens of the same process too, so the probe works while the
+    tested command runs. ``None`` where ``fcntl`` is unavailable (there is no lock to
+    see); it never waits and it never acquires for longer than the probe itself.
+    """
+    try:
+        import fcntl
+    except ImportError:
+        return None
+    if not hasattr(fcntl,'LOCK_NB'):
+        return None
+    handle=(root/REVIEW_WRITES_LOCK).open('a')
+    try:
+        try:
+            fcntl.flock(handle,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(handle,fcntl.LOCK_UN)
+        return False
+    finally:
+        handle.close()
 
 
 class DeploymentLockBusy(ValueError):
@@ -1205,7 +1236,12 @@ def deployment_config_lock(root):
     EVERY writer of that file takes it: both deployment switches (``review-writes``,
     ``checkpoint-provenance-writes``), ``operators add|remove``, ``verifiers add|remove``,
     ``project-creations --set-server-limit`` (``project_creation.set_server_limit``) and
-    the restore merges of operators and verifiers (kittrial-5bb.136). Each re-reads the
+    the restore merges of operators and verifiers (kittrial-5bb.136). ``adopt-actor``
+    takes it too (kittrial-5bb.223, finding 1) - not for that file, but so two adoptions
+    of one operator-listed name serialize - and its hold is bounded: its existence check
+    (a ``bd export`` with no timeout) runs BEFORE the lock, and its wait for the project's
+    coordination lock has the same ceiling this lock has (kittrial-5bb.218, N1 of the
+    .223 review). Each re-reads the
     file under the lock, so no change is lost to another made at the same instant. The
     file keeps the name ``.review-writes.lock`` (REVIEW_WRITES_LOCK), so a flip on an older
     kit still excludes a change here.
@@ -1234,7 +1270,8 @@ def deployment_config_lock(root):
                     break
                 except BlockingIOError:
                     if time.monotonic()>=deadline:
-                        raise DeploymentLockBusy('Nothing was changed: another change to deployment.private.json still holds '
+                        raise DeploymentLockBusy('Nothing was changed: another change to deployment.private.json '
+                                         'or an adopt-actor run still holds '
                                          'its lock (%s) after %d s. Run the command again; if this repeats, find '
                                          'the process holding it (for example `fuser %s`).'
                                          %(REVIEW_WRITES_LOCK,DEPLOYMENT_LOCK_WAIT_SECONDS,REVIEW_WRITES_LOCK)) from None
@@ -6288,6 +6325,17 @@ def key_line(line,root,kit):
     entry={'key_type':parts[0],
            'fingerprint':'SHA256:'+base64.b64encode(hashlib.sha256(body).digest()).decode('ascii').rstrip('='),
            'comment':parts[2] if len(parts)>2 else ''}
+    # kittrial-5bb.218 finding 1: the options a line carries are part of what it may do -
+    # the kit prints `restrict` first (and the four no-* options after it, so a stock sshd
+    # that predates restrict still gets them), and a line with this kit's command but
+    # WITHOUT them keeps port forwarding and a pty open to that key. Report both shapes:
+    # 'restrict' alone, the four no-* options, both, or neither.
+    lowered=[word.strip().lower() for word in options.split(',')]
+    entry['restrict']='restrict' in lowered
+    entry['no_forwarding_options']=all(option in lowered
+                                       for option in ('no-pty','no-port-forwarding',
+                                                      'no-agent-forwarding','no-x11-forwarding'))
+    entry['confined_options']=bool(entry['restrict'] or entry['no_forwarding_options'])
     command=_key_line_command(options)
     if command is None:
         entry['kind']='unrestricted'
@@ -6466,14 +6514,28 @@ def authorized_keys_listing(root,file=None):
         summary[entry['kind']]=summary.get(entry['kind'],0)+1
         # Both kinds of binding are counted and named (kittrial-5bb.194 review, finding 3):
         # `bound` counts every bound line, and `principal-bound` names the principal binding
-        # on its own. The key appears only when such a line exists.
+        # on its own. The key appears only when such a line exists. An ill-formed or repeated
+        # --principal is NOT counted there (kittrial-5bb.218, N5 of the .223 review): the
+        # wrapper refuses every request of that key, so it is not a working binding - the
+        # line stays under attention with its flag and is counted as `principal-refused`.
         if entry.get('principal') and not str(entry['principal']).startswith('-'):
-            summary['principal-bound']=summary.get('principal-bound',0)+1
+            if entry.get('principal_ill_formed') or entry.get('principal_repeated'):
+                summary['principal-refused']=summary.get('principal-refused',0)+1
+            else:
+                summary['principal-bound']=summary.get('principal-bound',0)+1
+        if entry.get('confined_options') is False and entry.get('kind') in ('bound','confined'):
+            summary['without-confined-options']=summary.get('without-confined-options',0)+1
     attention=[entry['line'] for entry in lines
                if entry.get('other_kit') or entry.get('missing') or entry.get('unknown_arguments')
                or entry.get('unknown_projects') or entry.get('names_release') or entry['kind']=='unreadable'
                or entry.get('principal_repeated') or entry.get('principal_ill_formed')
-               or entry.get('project_repeated')]
+               or entry.get('project_repeated')
+               # kittrial-5bb.218 finding 1: the lines OUTSIDE every rule of the kit belong
+               # beside the stale-kit lines - an operator who reads only attention must see
+               # them too, or the stale lines are all that is seen.
+               or entry['kind'] in ('unrestricted','other-command')
+               or entry.get('other_root')
+               or (entry['kind'] in ('bound','confined') and not entry['confined_options'])]
     # The installation setting that accepts bound keys only (kittrial-5bb.196, slice 4). While
     # it is on, a line that runs this kit's wrapper and names no project or no principal is
     # refused by the wrapper, so it is one more line an operator must look at: the migration
@@ -6611,7 +6673,9 @@ def authorized_keys_listing(root,file=None):
            'bound: the key runs only the endpoint and only for its projects and/or its principal - the '
            '`projects` and `principal` fields say which. A principal-bound line is `bound`, not `confined`.',
            'principal-bound: counted separately for the lines that name a principal, so a line bound only to '
-           'a principal is not read as merely confined.',
+           'a principal is not read as merely confined. A line whose --principal is ill-formed or repeated is '
+           'not counted here (the wrapper refuses every request of that key, so it is not a working binding); '
+           'it is counted as principal-refused and stays under attention.',
            'principal_ill_formed: the line names a principal that is not `lane:NAME` or `person:NAME`; the '
            'wrapper refuses every request of that key. principal_repeated: the line names more than one '
            'principal (the wrapper refuses it). Both are under attention and must be reprinted.',
@@ -6627,6 +6691,33 @@ def authorized_keys_listing(root,file=None):
            'other_root: the line serves another runtime than --root (or names none); its projects were not looked up here.']
     def _named(numbers):
         return 'line%s %s'%('s' if len(numbers)!=1 else '',', '.join(str(number) for number in numbers))
+    # kittrial-5bb.218 finding 1: why each out-of-rule line is in attention, in words, so
+    # the list is never read without its reasons. The operator's own full-shell key is
+    # NORMAL on most installs: the reason says so rather than leaving the line out.
+    by_line={entry['line']:entry for entry in lines}
+    def _out_of_rule_reasons():
+        reasons=[]
+        unrestricted=[e['line'] for e in lines if e['kind']=='unrestricted']
+        other_command=[e['line'] for e in lines if e['kind']=='other-command']
+        no_restrict=[e['line'] for e in lines
+                     if e['kind'] in ('bound','confined') and not e['confined_options']]
+        other_root=[e['line'] for e in lines if e.get('other_root')]
+        if unrestricted:
+            reasons.append('%s: unrestricted - the account\'s full shell. The operator\'s own key is '
+                           'normally exactly this on most installs; every other such line can run '
+                           'anything the account can.'%_named(unrestricted))
+        if other_command:
+            reasons.append('%s: a command that is another program or a shell, not this kit\'s wrapper - '
+                           'outside every rule of this kit (judged by what runs, not by its '
+                           'text).'%_named(other_command))
+        if no_restrict:
+            reasons.append('%s: this kit\'s command WITHOUT restrict or the no-forwarding options - '
+                           'port forwarding and a pty stay open to that key, which is what the kit '
+                           'prints restrict for.'%_named(no_restrict))
+        if other_root:
+            reasons.append('%s: serves another runtime than --root - its projects were not looked up '
+                           'here.'%_named(other_root))
+        return reasons
     def _may_sentence(numbers, more):
         """The one group-two sentence: _may_sentence_for is the single source, so the
         listing, status and on cannot drift (kittrial-5bb.265 item 3 - this body was a
@@ -6669,6 +6760,8 @@ def authorized_keys_listing(root,file=None):
     if truncated:
         notes.append('Only the first %d bytes of this file were read; the file is larger than that, so a '
                      'line beyond it was not inspected.'%AUTHORIZED_KEYS_MAX_BYTES)
+    for reason in _out_of_rule_reasons():
+        notes.append(reason)
     notes.append('This command reads the file and changes nothing.')
     return {'schema_version':1,'file':str(path),'root':str(root),'kit':str(kit),'lines':lines,'summary':summary,
             'attention':attention,'bound_keys_only':setting,'would_be_refused':would_be_refused,
@@ -6896,14 +6989,20 @@ def adopt_actor(root,project,actor,principal,operator,reason,from_principal=None
     command: ``from_principal`` (``--from``) must name the owner it has now, and the audit
     entry is marked ``moved``. Writing nothing when it already gives it to this one.
 
-    The same-operator-name check, the existence check and both writes run under the
-    deployment lock (kittrial-5bb.223, finding 1): two ``adopt-actor`` commands for one
-    operator-listed name in two projects serialize there, so the second reads the first's
-    owner entry and refuses instead of both exiting 0. Within that lock the registry is
-    written under the project's coordination lock. A damaged audit refuses the whole command
-    before the registry is touched. The audit is appended BEFORE the registry mutation, so a
-    host crash between the two leaves an audit entry with no adoption - the safer mistake
-    (review, item 6).
+    The existence check runs BEFORE the deployment lock (kittrial-5bb.218, note N1 of the
+    .223 review): it reads the project's tracker with a ``bd export --all`` that has no
+    timeout, and it needs no lock, so a slow or hung export in one project no longer holds
+    the deployment lock - and every deployment change with it - for good. The
+    same-operator-name check and both writes run under the deployment lock
+    (kittrial-5bb.223, finding 1): two ``adopt-actor`` commands for one operator-listed
+    name in two projects serialize there, so the second reads the first's owner entry and
+    refuses instead of both exiting 0. Within that lock the registry is written under the
+    project's coordination lock, waited for with the same ceiling the deployment lock has:
+    a holder past it is stuck, and the command refuses - releasing the deployment lock with
+    its process - instead of hanging every other deployment change. A damaged audit refuses
+    the whole command before the registry is touched. The audit is appended BEFORE the
+    registry mutation, so a host crash between the two leaves an audit entry with no
+    adoption - the safer mistake (review, item 6).
     """
     path=project_dir(root,project)
     if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
@@ -6918,6 +7017,12 @@ def adopt_actor(root,project,actor,principal,operator,reason,from_principal=None
     if not isinstance(reason,str) or not reason.strip():raise ValueError('A reason is required (--reason)')
     reason=reason.strip()
     if len(reason)>400:raise ValueError('--reason must be at most 400 characters')
+    # Outside the deployment lock (kittrial-5bb.218, N1): this is the bd export, and the
+    # export needs no lock - only the checks and writes below must serialize.
+    if actor not in project_actor_names(root,project,path):
+        raise ValueError('Refusing to adopt %s: no session registration, owner entry or tracker row in project %s '
+                         'names that actor, so this project holds nothing to give to %s. Check the name '
+                         '(session show ACTOR, or the project rows); nothing was changed.'%(actor,project,principal))
     with deployment_config_lock(root):
         if actor in operators(root):
             conflicts=principal_conflicts(root,actor,principal,project)
@@ -6927,16 +7032,30 @@ def adopt_actor(root,project,actor,principal,operator,reason,from_principal=None
                                  'installation; adopt it there first, or take it off the operator list.'
                                  %(actor,principal,conflicts[0][0],conflicts[0][1]))
         actor_adoptions(root)                   # a damaged audit refuses before anything is written
-        if actor not in project_actor_names(root,project,path):
-            raise ValueError('Refusing to adopt %s: no session registration, owner entry or tracker row in project %s '
-                             'names that actor, so this project holds nothing to give to %s. Check the name '
-                             '(session show ACTOR, or the project rows); nothing was changed.'%(actor,project,principal))
         try:
             import fcntl
         except ImportError:                     # a platform without flock: the atomic write still stands
             fcntl=None
         with (path/'.coordination.lock').open('a') as lock:
-            if fcntl is not None:fcntl.flock(lock,fcntl.LOCK_EX)
+            if fcntl is not None and not hasattr(fcntl,'LOCK_NB'):
+                fcntl.flock(lock,fcntl.LOCK_EX)  # a platform without non-blocking flock waits
+            elif fcntl is not None:
+                # kittrial-5bb.218, note N1 of the .223 review: this wait happens UNDER the
+                # deployment lock, so it is bounded like that one - a holder past the ceiling
+                # is stuck, and refusing (which releases the deployment lock with this
+                # process) is better than hanging every other deployment change for good.
+                deadline=time.monotonic()+DEPLOYMENT_LOCK_WAIT_SECONDS
+                while True:
+                    try:
+                        fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        if time.monotonic()>=deadline:
+                            raise ValueError('Nothing was changed: the coordination lock of project %s '
+                                             '(.coordination.lock) is still held after %d s. Run the command '
+                                             'again; if this repeats, find the process holding it.'
+                                             %(project,DEPLOYMENT_LOCK_WAIT_SECONDS)) from None
+                        time.sleep(DEPLOYMENT_LOCK_POLL_SECONDS)
             from coordination import atomic
             data=read_registry(path)
             current=dict(owner_map(data))
@@ -8708,28 +8827,22 @@ class _OnceFlag(argparse.Action):
     recorded ``b`` with nothing said (kittrial-5bb.192 review item 4). The second occurrence is
     refused instead: whose change it was must never depend on the order of the arguments. An
     ABBREVIATED spelling never reaches this action: the subparsers that take these flags
-    (``operators``, ``verifiers`` and, since round-2 review item 3, ``restore-new``) are built
-    with ``allow_abbrev=False``, so argparse refuses ``--act``/``--reas`` itself with exit 2.
+    (``operators``, ``verifiers``, ``restore-new`` and ``adopt-actor``) are built with
+    ``allow_abbrev=False``, so argparse refuses ``--act``/``--reas`` itself with exit 2.
+
+    The ONE mechanism for every admin.py flag that may be named at most once
+    (kittrial-5bb.218, N4 of the .223 review): ``adopt-actor``'s flags used to be
+    ``append`` arguments unwrapped and refused after the parse by a second mechanism
+    (``one_flag_value``, kittrial-5bb.223 finding 4); they take this action instead, so
+    one sentence refuses every repeated flag. ``authorized-keys --principal`` keeps
+    ``key_principal``'s value check, which mirrors the wrapper's own run-time parse of the
+    LINE's arguments - a validator, not a second CLI-flag mechanism.
     """
     def __call__(self,parser,namespace,values,option_string=None):
         if getattr(namespace,self.dest,None) is not None:
             raise ValueError('%s was given more than once; give it once. The value recorded would otherwise be the '
                              'last one, silently.'%(option_string or self.dest))
         setattr(namespace,self.dest,values)
-
-def one_flag_value(values,label):
-    """The one value of a CLI flag that may be named at most once.
-
-    ``adopt-actor``'s ``--principal``, ``--from``, ``--actor`` and ``--reason`` are ``append``
-    arguments, so a flag named twice is refused here rather than silently taking the last
-    (kittrial-5bb.223, finding 4); the parser stores one or more values in a list.
-    """
-    if isinstance(values,list):
-        if len(values)>1:
-            raise ValueError('%s given more than once; name it once (got %s)'
-                             %(label,', '.join(str(value) for value in values)))
-        return values[0] if values else None
-    return values
 
 def main():
     p=argparse.ArgumentParser();p.add_argument('--root',required=True)
@@ -8898,14 +9011,14 @@ def main():
     a.add_argument('project',help='the project whose registry records the actor')
     a.add_argument('actor',metavar='ACTOR',help='the actor name to give to the principal, as it already appears in '
                                                 'the project (a session actor, or an older name with tracker rows)')
-    a.add_argument('--principal',required=True,action='append',default=None,metavar='NAME',
+    a.add_argument('--principal',required=True,action=_OnceFlag,default=None,metavar='NAME',
                    help='the principal (a lane, lane:NAME or person:NAME) that actor is to belong to (given twice, refused)')
-    a.add_argument('--from',dest='from_principal',action='append',default=None,metavar='NAME',
+    a.add_argument('--from',dest='from_principal',action=_OnceFlag,default=None,metavar='NAME',
                    help='the principal that currently owns the actor, required to MOVE an actor another principal '
                         'already owns: without it the move is refused (given twice, refused)')
-    a.add_argument('--actor',required=True,dest='operator',action='append',default=None,metavar='OPERATOR',
+    a.add_argument('--actor',required=True,dest='operator',action=_OnceFlag,default=None,metavar='OPERATOR',
                    help='the actor performing the adoption, on the deployment operator allowlist (given twice, refused)')
-    a.add_argument('--reason',required=True,action='append',default=None,
+    a.add_argument('--reason',required=True,action=_OnceFlag,default=None,
                    help='why this actor is being adopted (recorded in the audit; given twice, refused)')
     a=sub.add_parser('actor-adoptions',help='read-only: the recorded actor adoptions (who gave which actor to which '
                                             'principal, when and why)')
@@ -9616,10 +9729,8 @@ def main():
         print(json.dumps(authorized_keys_listing(root,args.file),ensure_ascii=True,indent=2))
     elif args.command=='adopt-actor':
         print(json.dumps(adopt_actor(root,args.project,args.actor,
-                                     one_flag_value(args.principal,'--principal'),
-                                     one_flag_value(args.operator,'--actor'),
-                                     one_flag_value(args.reason,'--reason'),
-                                     from_principal=one_flag_value(args.from_principal,'--from')),
+                                     args.principal,args.operator,args.reason,
+                                     from_principal=args.from_principal),
                          ensure_ascii=True,sort_keys=True))
     elif args.command=='actor-adoptions':
         print(json.dumps({'schema_version':ACTOR_ADOPTIONS_SCHEMA,'entries':actor_adoptions(root,args.project)},

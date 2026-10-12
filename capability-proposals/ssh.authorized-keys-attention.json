@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "operation_id": "capnew-5bb218-ssh-attention-0001",
+  "key": "ssh.authorized-keys-attention",
+  "name": "authorized-keys-list carries the lines outside every rule, each with a reason",
+  "aliases": [
+    "authorized keys attention",
+    "authorized-keys-list attention",
+    "out of rule lines",
+    "unrestricted line attention",
+    "no-restrict line",
+    "other-command attention",
+    "restrict option reported",
+    "confined options"
+  ],
+  "summary": "admin.py authorized-keys-list reports, per line, whether it carries the kit's confinement options (restrict, or the four no-* options no-pty/no-port-forwarding/no-agent-forwarding/no-x11-forwarding; fields restrict, no_forwarding_options, confined_options; summary count without-confined-options) and its attention list carries the lines OUTSIDE every rule beside the stale-kit lines: unrestricted (the account's full shell - the operator's own key is normally exactly this on most installs, and the reason says so), other-command (another program or a shell, judged by what runs), this kit's command without restrict or the no-* options (port forwarding and a pty stay open), and a line serving another runtime - each with its reason in words in the notes. The project gate of endpoint.execute (key_project_refusal) is its first statement and execute is the only request-to-action path, pinned at the source.",
+  "requirements": [],
+  "anchors": [],
+  "code": [
+    "admin.py::key_line",
+    "admin.py::authorized_keys_listing"
+  ],
+  "tests": [
+    "tests/test_bound_keys_only.py",
+    "tests/test_key_projects.py"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "ssh",
+    "operations",
+    "security"
+  ]
+}

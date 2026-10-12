@@ -820,6 +820,84 @@ class AdoptionTests(unittest.TestCase):
         self.assertLess(lock, body.index("atomic(path/'.sessions.json',data)"))
         self.assertLess(body.index('atomic_private_write(root/ACTOR_ADOPTIONS_AUDIT'),
                         body.index("atomic(path/'.sessions.json',data)"))
+        # kittrial-5bb.218, N1 of the .223 review: the existence check is the bd export, and
+        # it runs BEFORE the lock (a slow or hung export must not hold the deployment lock).
+        self.assertLess(body.index('project_actor_names(root,project,path)'), lock)
+        # ... and the wait for the project's coordination lock INSIDE the deployment lock is
+        # bounded, not a plain blocking flock.
+        self.assertIn('fcntl.LOCK_EX|fcntl.LOCK_NB', body)
+        self.assertIn('coordination lock of project', body)
+
+    def test_the_locks_are_held_while_the_checks_and_writes_run(self):
+        # kittrial-5bb.218, N2 of the .223 review (mutant K2 - the lock released before the
+        # two writes - passed the source-order pins above): a RUNTIME probe beside them. At
+        # the operator-name check, at the audit write and at the registry write the
+        # DEPLOYMENT lock must be unacquirable, and at the registry write the PROJECT
+        # coordination lock must be unacquirable too. A lock released early (K2) leaves a
+        # non-blocking acquire succeeding, and this test fails.
+        if admin.deployment_lock_is_held(self.root) is None:
+            self.skipTest('fcntl or LOCK_NB unavailable on this platform')
+        import coordination
+        rows = [{'id': 't-%d' % index, 'actor': name}
+                for index, name in enumerate(('alex/s1', 'coordinator', 'ops'))]
+        moments = {}
+        real_conflicts = admin.principal_conflicts
+
+        def probed_conflicts(root, actor, principal, exclude):
+            moments['operator-name check'] = admin.deployment_lock_is_held(root)
+            return real_conflicts(root, actor, principal, exclude)
+
+        real_private_write = admin.atomic_private_write
+
+        def probed_private_write(path, text):
+            moments['audit write'] = admin.deployment_lock_is_held(self.root)
+            return real_private_write(path, text)
+
+        real_atomic = coordination.atomic
+
+        def probed_atomic(path, data):
+            import fcntl
+            moments['registry write'] = admin.deployment_lock_is_held(self.root)
+            probe = (path.parent/'.coordination.lock').open('a')
+            try:
+                try:
+                    fcntl.flock(probe, fcntl.LOCK_EX|fcntl.LOCK_NB)
+                    fcntl.flock(probe, fcntl.LOCK_UN)
+                    moments['registry write under the project lock'] = False
+                except BlockingIOError:
+                    moments['registry write under the project lock'] = True
+            finally:
+                probe.close()
+            return real_atomic(path, data)
+
+        with mock.patch.object(admin, 'run_bd', return_value='\n'.join(json.dumps(row) for row in rows)+'\n'), \
+                mock.patch.object(admin, 'principal_conflicts', probed_conflicts), \
+                mock.patch.object(admin, 'atomic_private_write', probed_private_write), \
+                mock.patch.object(coordination, 'atomic', probed_atomic):
+            # An operator-listed actor, so the operator-name check runs at all.
+            result = self.adopt(actor='ops')
+        self.assertTrue(result['changed'])
+        self.assertEqual(moments, {'operator-name check': True, 'audit write': True,
+                                   'registry write': True,
+                                   'registry write under the project lock': True})
+
+    def test_a_stuck_project_coordination_lock_refuses_within_the_ceiling(self):
+        # kittrial-5bb.218, N1 of the .223 review: the wait for the project's coordination
+        # lock happens UNDER the deployment lock, so it is bounded like that one - a stuck
+        # holder makes the command refuse (nothing changed, the deployment lock released
+        # with the process) instead of hanging every deployment change for good.
+        import fcntl
+        if not hasattr(fcntl, 'LOCK_NB'):
+            self.skipTest('non-blocking flock unavailable on this platform')
+        held = (self.root/'projects'/'alpha'/'.coordination.lock').open('a')
+        fcntl.flock(held, fcntl.LOCK_EX)
+        self.addCleanup(held.close)
+        with mock.patch.object(admin, 'DEPLOYMENT_LOCK_WAIT_SECONDS', 0):
+            with self.assertRaises(ValueError) as refusal:
+                self.adopt()
+        self.assertIn('coordination lock of project alpha', str(refusal.exception))
+        self.assertIn('still held after 0 s', str(refusal.exception))
+        self.assertFalse((self.root/'projects'/'alpha'/'.sessions.json').exists())
 
     def test_a_non_project_is_refused(self):
         with self.assertRaises(ValueError) as refusal:
@@ -953,8 +1031,12 @@ class PrintAndAdoptCommandTests(unittest.TestCase):
         file.write_text('\n'.join([good, repeated_line, ill_line])+'\n', encoding='utf-8')
         listing = admin.authorized_keys_listing(self.root, str(file))
         # Both kinds of binding are counted: `bound` for all three, `principal-bound` named.
+        # kittrial-5bb.218, N5 of the .223 review: the repeated and the ill-formed principal
+        # are NOT counted as principal-bound (the wrapper refuses every request of those
+        # keys, so they are not working bindings); they are counted as principal-refused.
         self.assertEqual(listing['summary'].get('bound'), 3)
-        self.assertEqual(listing['summary'].get('principal-bound'), 3)
+        self.assertEqual(listing['summary'].get('principal-bound'), 1)
+        self.assertEqual(listing['summary'].get('principal-refused'), 2)
         self.assertIn(2, listing['attention'])                        # the repeated principal
         self.assertIn(3, listing['attention'])                        # the ill-formed one
 
@@ -982,8 +1064,12 @@ class PrintAndAdoptCommandTests(unittest.TestCase):
         self.assertFalse(listing['lines'][1]['principal_ill_formed'])
         self.assertTrue(listing['lines'][2]['principal_ill_formed'])
         self.assertTrue(listing['lines'][3]['project_repeated'])
-        # Every named principal is counted; a token that is a flag is not a principal at all.
-        self.assertEqual(listing['summary']['principal-bound'], 3)
+        # A named principal is counted only when it works: kittrial-5bb.218, N5 of the .223
+        # review - the repeated and the ill-formed one are refused by the wrapper, so they
+        # count as principal-refused, not principal-bound; a token that is a flag is not a
+        # principal at all.
+        self.assertEqual(listing['summary']['principal-bound'], 1)
+        self.assertEqual(listing['summary']['principal-refused'], 2)
 
     def test_a_repeated_adopt_flag_is_refused_and_an_abbreviation_is_not_a_flag(self):
         # Finding 4: argparse used to keep the last of a repeated --from/--principal/--actor/

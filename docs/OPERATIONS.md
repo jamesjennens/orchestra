@@ -275,6 +275,19 @@ project: the one operator list must mean the same lane everywhere. It records in
 actor this project already gave to a different principal. It writes nothing when the project
 already gives the actor to this principal.
 
+**The command takes the deployment lock, but never for long** (kittrial-5bb.223 finding 1;
+bounded by kittrial-5bb.218, note N1 of the .223 review). The existence check - the
+`bd export` that reads the tracker for the name - runs BEFORE the lock, and the registry
+write takes the project's coordination lock (`.coordination.lock`) with a 10-second wait
+inside it: a holder past that is stuck, and the command refuses with `Nothing was changed:
+the coordination lock of project ... is still held` instead of hanging. So while the
+command runs, other deployment changes (`operators add`, a deployment switch,
+`--set-server-limit`) may wait up to 10 seconds and then refuse with a sentence that names
+an adopt-actor run as a possible holder; nothing else is affected. **Each of
+`--principal`, `--from`, `--actor` and `--reason` may be named at most once**: a flag given
+twice is refused (the value recorded would otherwise be the last one, silently), and an
+abbreviated spelling (`--princ`) is refused by the parser itself.
+
 **Moving an actor that another principal already owns is not the same plain command.** Once
 a project's registry gives an actor to a principal, `adopt-actor` refuses to give it to
 another unless the command names the owner it has now with `--from PRINCIPAL`; the audit
@@ -1450,10 +1463,19 @@ and the `--restore-operators` /
 `--restore-verifiers` merges of `restore-new` take the deployment lock
 (`.review-writes.lock`) across their whole read-modify-write and re-read the file under
 it, so two changes made at the same instant, from any two of these commands, never lose
-one another (kittrial-5bb.131, kittrial-5bb.136). A change that finds the lock held
-waits up to 10 seconds; these changes take milliseconds, so a holder that keeps it longer
+one another (kittrial-5bb.131, kittrial-5bb.136). `adopt-actor` takes the same lock too
+(kittrial-5bb.223, finding 1) - not for that file, but so two adoptions of one
+operator-listed name in two projects serialize - and its hold is bounded
+(kittrial-5bb.218, note N1 of the .223 review): its existence check (a `bd export` that
+has no timeout) runs before the lock, and its wait for the project's coordination lock
+gives up after the same 10 seconds, so a hung export or a stuck project lock no longer
+holds the deployment lock - and with it every deployment change of the installation -
+for good. A change that finds the lock held
+waits up to 10 seconds; the lock's own changes take milliseconds and an `adopt-actor`
+run is bounded by its own waits, so a holder that keeps it longer
 is stuck, and the command then refuses with `Nothing was changed: another change to
-deployment.private.json still holds its lock ...` instead of waiting for good. Run it
+deployment.private.json or an adopt-actor run still holds its lock ...` instead of
+waiting for good. Run it
 again; if it repeats, find the holder (`fuser RUNTIME/.review-writes.lock`). A killed
 holder releases the lock with its process. Reads (`status`, `operators list`, every
 endpoint read) never take the lock.
