@@ -565,6 +565,80 @@ class ProposalTests(test_http_proposals.ProposalHarness):
         self.assertNotEqual(403, owned.status, owned.data)
 
 
+    def test_the_endpoint_is_handed_and_requires_the_capability_the_route_checked(self):
+        """kittrial-5bb.261: the route checked `project.admin` for a decide and handed the endpoint
+        `reviews.approve`, which the endpoint side re-checked. Both now mean the same thing: `project.admin`
+        for the owner decision, `reviews.approve` for triage. An owner's triage and decision are carried out
+        as before; a coordinator triages, and its decide is refused by the route AND by the endpoint."""
+        import proposal_records as pr
+        from http_auth import HttpError
+        handed = []
+        real = self.backend._endpoint
+
+        def watched(action, project, actor, args, *rest, **options):
+            if action == 'proposal' and args[0] in ('review', 'decide') and options.get('authority'):
+                handed.append((args[0], options['authority']['capability']))
+            return real(action, project, actor, args, *rest, **options)
+        self.backend._endpoint = watched
+        self.addCleanup(setattr, self.backend, '_endpoint', real)
+        dana = {'question': 'Replace the baseline?', 'owner_identity': 'account:' + self.uid('dana'), 'due_by': None}
+        decision = self.decision_issue()
+        # Owners, as before: blair triages and escalates, dana decides.
+        key = self.submit().data['key']
+        claimed = self.dispose(key, 'under-review')
+        self.assertEqual((201, 'under-review', 'coordinator'), (claimed.status, claimed.data['state'], claimed.data['role']))
+        self.assertEqual(201, self.dispose(key, 'escalated-to-owner', escalation=dana).status)
+        decided = self.dispose(key, 'approved', who='dana', operation='decide', decision={'decision_id': decision})
+        self.assertEqual((201, 'approved', 'owner'), (decided.status, decided.data['state'], decided.data['role']), decided.data)
+        self.assertEqual(handed, [('review', 'reviews.approve'), ('review', 'reviews.approve'), ('decide', 'project.admin')])
+        # A coordinator by role triages and escalates.
+        cora = self.create_account(self.admin, 'cora', 'cora-password-1')
+        self.assertEqual(200, self.request('PUT', '/v1/projects/%s/members/%s' % (self.project, cora), {'role': 'coordinator'},
+                                           token=self.admin).status)
+        self.people['cora'] = (self.login('cora', 'cora-password-1')[0], cora)
+        second = self.submit().data['key']
+        del handed[:]
+        for to_state, fields in (('under-review', {}), ('escalated-to-owner', {'escalation': dana})):
+            view = self.get(second)
+            made = self.request('POST', '%s/%s/dispositions' % (self.base(), second), dict(
+                {'previous': view['disposition_comment_id'], 'proposal_sha256': view['sha256'], 'to_state': to_state}, **fields),
+                token=self.token('cora'), key='cora-%s-0001' % to_state)
+            self.assertEqual((201, 'coordinator'), (made.status, made.data.get('role')), made.data)
+        self.assertEqual(handed, [('review', 'reviews.approve'), ('review', 'reviews.approve')])
+        # Its decide: refused by the route, and nothing is sent to the endpoint.
+        view = self.get(second)
+        body = {'previous': view['disposition_comment_id'], 'proposal_sha256': view['sha256'], 'to_state': 'approved',
+                'decision': {'decision_id': decision}}
+        refused = self.request('POST', '%s/%s/dispositions' % (self.base(), second), dict(body, operation='decide'),
+                               token=self.token('cora'), key='cora-decide-0001')
+        self.assertEqual(403, refused.status, refused.data)
+        self.assertIn("The decision on a proposal is an owner's", refused.data['error']['message'])
+        self.assertEqual(2, len(handed))
+        # And by the endpoint, asked without the route's check: with the capability a decide needs it reads
+        # the live state and the coordinator does not hold it; with the one it does hold, a decide is not
+        # recorded under it.
+        principal = self.service.authenticate(self.token('cora'))
+        for number, capability in enumerate(('project.admin', 'reviews.approve')):
+            with self.subTest(handed=capability), self.assertRaises(HttpError) as denied:
+                self.backend.invoke('proposals.dispose', principal, self.project, {'command': 'decide', 'body': dict(
+                    body, schema_version=1, operation='decide', key=second, operation_id='forged-decide-%d' % number)}, None,
+                    target='%s/%s/dispositions' % (self.base(), second), authorize=None, capability=capability)
+            self.assertIn(denied.exception.status, (403, 422), denied.exception)
+            self.assertEqual(self.get(second)['state'], 'escalated-to-owner')
+        # The library's own rule, whatever reaches it: the capability must be the one of the operation.
+        def reached(argv):
+            raise AssertionError('the tracker was asked: %r' % (argv,))
+        for route, capability, said in (('decide', pr.CAP_APPROVE, 'needs a signed-in owner with project.admin'),
+                                        ('review', pr.CAP_PROJECT_ADMIN, 'needs a signed-in member with reviews.approve'),
+                                        ('decide', pr.CAP_PROPOSALS, 'needs a signed-in owner with project.admin')):
+            with self.subTest(route=route, capability=capability), self.assertRaises(ValueError) as said_no:
+                pr.dispose({}, cora, reached, self.canonical_root / self.project, route=route,
+                           http=pr.HttpContext(cora, 'session', capability))
+            self.assertIn(said, str(said_no.exception))
+        # The owner decides it.
+        owned = self.dispose(second, 'approved', who='dana', operation='decide', decision={'decision_id': decision})
+        self.assertEqual((201, 'approved', 'owner'), (owned.status, owned.data['state'], owned.data['role']), owned.data)
+
     def test_the_reads_say_who_may_record_the_owner_decision(self):
         """kittrial-5bb.261: `can_decide` beside `can_triage`, on the queue and on one proposal. True for
         who the decide route lets through (`project.admin`, signed in): an owner and a superuser. A

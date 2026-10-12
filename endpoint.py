@@ -1094,8 +1094,8 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
         # everything that rests on the operator allowlist is a host command (admin.py
         # proposal-review, proposal-decide, proposal-settings). The HTTP service is the
         # other authority: launched by it, with live authority required, review and
-        # decide run for a signed-in member whose reviews.approve the guard has just
-        # re-validated, and a submission's submitter is bound to the verified account.
+        # decide run for a signed-in member whose capability the guard has just re-validated
+        # (reviews.approve for a review, project.admin for a decide: kittrial-5bb.261), and a submission's submitter is bound to the verified account.
         import proposal_records
         args=request.get('args',[])
         if not isinstance(args,list) or any(not isinstance(x,str) or '\0' in x for x in args):raise ValueError('Expected argument list')

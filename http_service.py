@@ -6348,13 +6348,19 @@ class ApiHandler(BaseHTTPRequestHandler):
         fields, operation_id = self._proposal_body(ctx, self.PROPOSAL_DISPOSE_FIELDS, 'A proposal disposition')
         body = dict(fields, schema_version=1, operation=command, key=ctx.params['key'], operation_id=operation_id)
         pid = ctx.params['pid']
+        # The endpoint is handed the capability this route checked for THIS operation, and
+        # authorizes that one again from the live state (kittrial-5bb.261): `project.admin` for
+        # the owner decision, `reviews.approve` for triage. It used to be handed
+        # `reviews.approve` for both, so its second authorization of a decide asked less than
+        # the first.
+        needed = CAP_PROJECT_ADMIN if command == 'decide' else CAP_APPROVE
 
         def dispose():
             result = self.backend.invoke('proposals.dispose', principal, pid, {'command': command, 'body': body},
                                          ctx.idempotency_key, target=ctx.route_target,
-                                         authorize=ctx.authorize, capability=CAP_APPROVE)
+                                         authorize=ctx.authorize, capability=needed)
             return result, result
-        return self._mutate(ctx, 'proposals.dispose', pid, dispose, status=201, capability=CAP_APPROVE,
+        return self._mutate(ctx, 'proposals.dispose', pid, dispose, status=201, capability=needed,
                             serialize=False, canonical=True, reason='%s %s' % (command, ctx.params['key']))
 
     @route('GET', r'/v1/me/contributions')
