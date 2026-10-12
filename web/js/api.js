@@ -131,6 +131,8 @@ export function createApi(transport) {
     projectAgents: (pid) => call('GET', `/v1/projects/${pid}/agents`),
     grantCoordinator: (pid, aid) => mutate('PUT', `/v1/projects/${pid}/agents/${aid}/coordinator`, {}),
     revokeCoordinator: (pid, aid) => mutate('DELETE', `/v1/projects/${pid}/agents/${aid}/coordinator`),
+    // Who coordinates the project and the rules that bind them, for any member; read only (kittrial-5bb.198).
+    coordination: (pid) => call('GET', `/v1/projects/${pid}/coordination`),
     removeMember: (pid, uid) => mutate('DELETE', `/v1/projects/${pid}/members/${uid}`),
     credentials: (pid) => call('GET', `/v1/projects/${pid}/worker-credentials`, { params: { limit: 100 } }),
     issueCredential: (pid, scopes, label) => mutate('POST', `/v1/projects/${pid}/worker-credentials`, { scopes, label }),

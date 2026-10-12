@@ -436,6 +436,8 @@ open(path, 'w', encoding='utf-8').write(json.dumps(state))
         self.assertEqual([(i['project'], i['state'], i['by'], i['finish'], i['remove']) for i in listed['unregistered']],
                          [('alpha', 'created-unregistered', self.ids['olive'], None, None)])
         self.assertIn('Register it as a superuser', listed['unregistered'][0]['what'])
+        # The panel of this server's Projects page is "Register a project" (kittrial-5bb.198).
+        self.assertIn('(Register a project, with this name)', listed['unregistered'][0]['what'])
 
     def test_the_plain_register_route_refuses_a_creation_that_has_not_finished(self):
         self.grant()
@@ -973,7 +975,7 @@ class ScreenTests(Case):
         self.assertEqual(seen['list']['cards'], ['beta'])
         self.assertEqual(seen['list']['commands'], ['admin.py finish-project beta',
                                                     'admin.py remove-creation beta --actor OPERATOR --reason REASON'])
-        self.assertIn('Started by olive', seen['list']['text'])
+        self.assertIn('Started from the web interface by olive', seen['list']['text'])
         self.assertIn('this page does not run anything', seen['list']['text'])
         # How full the server is, for the superuser, with what the number counts.
         self.assertIn('This server holds 2 of the 20 project databases its operator allows', seen['list']['text'])
@@ -1005,6 +1007,41 @@ class ScreenTests(Case):
         self.assertNotIn('not-a-record', chips['UPPER'][1])
         self.assertIn('Did not finish', chips['beta'][1])
         self.assertFalse(self.on_host('gamma'))
+
+
+class UnregisteredScreenTests(unittest.TestCase):
+    """kittrial-5bb.198: the superuser's list says who made each project, and fills the register form in."""
+
+    def test_host_made_projects_are_said_to_be_and_the_button_fills_the_form(self):
+        import shutil
+        from test_http_web import run_node_module
+        node = shutil.which('node')
+        if not node:
+            print('NOTE: UnregisteredScreenTests was SKIPPED: node is not installed, so the Projects page of '
+                  'web/js/views/work.js was not run on this platform.', file=sys.stderr)
+            self.skipTest('node is not installed; the Projects page is not run here')
+        done = run_node_module(self, node, 'await import(process.argv[1])',
+                               (KIT / 'tests' / 'web_unregistered_screen.mjs').as_uri(),
+                               (KIT / 'tests' / 'web_dom_shim.mjs').as_uri(), (KIT / 'web' / 'js' / 'views' / 'work.js').as_uri())
+        self.assertEqual(0, done.returncode, done.stderr[-3000:])
+        seen = json.loads(done.stdout.strip().splitlines()[-1])
+        cards = seen['cards']
+        self.assertNotIn('was started from the web interface', seen['intro'])
+        self.assertIn('Nothing is registered here for any of these', seen['intro'])
+        self.assertEqual(cards['gamma']['by'], 'host')
+        self.assertIn('Started on the server by an operator (admin.py add-project)', cards['gamma']['text'])
+        self.assertNotIn('web interface', cards['gamma']['text'])
+        self.assertNotIn('by host', cards['gamma']['text'])
+        for project in ('beta', 'delta'):
+            self.assertIn('Started from the web interface by olive', cards[project]['text'])
+        # Only a finished project not registered here is offered the button.
+        self.assertEqual({name: card['buttons'] for name, card in cards.items()},
+                         {'beta': [], 'gamma': ['Register\u2026'], 'delta': ['Register\u2026']})
+        # The button fills the form and sends nothing; the form's own button registers.
+        self.assertEqual((seen['before'], seen['filled'], seen['callsAfterFill'], seen['refilled']), ('', 'gamma', [], 'delta'))
+        self.assertEqual(seen['calls'], [['registerProject', 'delta', '']])
+        self.assertEqual(seen['went'], ['/p/delta/setup'])
+        self.assertEqual(seen['bareButtons'], 0)
 
 
 class GrantShapeTests(unittest.TestCase):

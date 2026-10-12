@@ -2768,6 +2768,44 @@ class Service:
         return {'granted_by': grant['granted_by'], 'granted_by_display_name': self._owner_name(grant['granted_by']),
                 'granted_at': grant.get('granted_at'), 'effective': effective, 'no_effect_because': why}
 
+    def coordinators_of(self, principal, project_id):
+        """Who coordinates the project, for any reader of it (kittrial-5bb.198). Changes nothing.
+
+        ``people``: the members whose role coordinates (``coordinator`` and ``owner``), with the
+        fields :meth:`list_members` gives the same reader. A disabled account is listed as the
+        members list lists it; only a reader who administers the project is told so, because
+        account state is administrative detail there too. ``agents``: the agents whose grant
+        has effect now, by name and account name. A grant on record without effect is left out
+        for every reader, and why is said only on the owner's agent panel.
+        """
+        with self.store.lock:
+            self.check_authority(principal, project_id, CAP_READ)
+            try:
+                self.check_authority(principal, project_id, CAP_PROJECT_ADMIN)
+                admin = True
+            except HttpError:
+                admin = False
+            people = []
+            for user_id, role in sorted(self.state['memberships'].get(project_id, {}).items()):
+                if CAP_COORDINATE not in ROLE_CAPABILITIES.get(role, frozenset()):
+                    continue
+                user = self.state['users'].get(user_id) or {}
+                item = {'user_id': user_id, 'display_name': user.get('display_name') or user_id, 'role': role}
+                if admin:
+                    item['disabled'] = bool(user.get('disabled'))
+                people.append(item)
+            agents = []
+            for agent in sorted(self.state['agents'].values(), key=lambda a: a['id']):
+                if project_id not in (agent.get('projects') or []):
+                    continue
+                grant = coordinator_grant(self.state, project_id, agent['id'])
+                if grant is None or not self._may_coordinate(project_id, agent):
+                    continue
+                agents.append({'name': agent['name'], 'owner_display_name': self._owner_name(agent['owner']),
+                               'granted_by_display_name': self._owner_name(grant['granted_by']),
+                               'granted_at': grant.get('granted_at')})
+            return {'people': people, 'agents': agents}
+
     def _may_coordinate(self, project_id, agent):
         """Whether the agent's account holds the coordinator's capabilities in the project now."""
         owner = self.state['users'].get(agent.get('owner')) or {}

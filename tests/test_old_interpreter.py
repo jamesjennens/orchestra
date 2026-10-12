@@ -45,7 +45,7 @@ MODULES = ('actor_names.py', 'agent_prompts.py', 'artifacts.py', 'bd_refusals.py
            'capability_misses.py', 'capability_records.py', 'capability_verification.py', 'credential_store.py',
            'endpoint_process.py', 'feedback.py', 'field_limits.py', 'guidance.py', 'handoff.py', 'http_auth.py', 'http_authority.py',
            'keyed_entries.py', 'keyed_records.py', 'lane_state.py', 'lanes.py', 'native.py', 'onboarding.py', 'open_items.py',
-           'project_creation.py', 'project_setup.py', 'proposal_records.py', 'raw_lifecycle.py', 'record_json.py', 'recovery.py',
+           'project_coordination.py', 'project_creation.py', 'project_setup.py', 'proposal_records.py', 'raw_lifecycle.py', 'record_json.py', 'recovery.py',
            'reference_records.py', 'render.py', 'requirement_governance.py', 'requirement_http.py',
            'requirement_owner_records.py', 'requirement_terminal.py', 'reserved_comments.py', 'review_recommendations.py',
            'review_state.py', 'review_workflow.py', 'sessions.py', 'version.py', 'web_merge_slot.py', 'work.py')

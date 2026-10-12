@@ -3,6 +3,7 @@ import { pageHead, reviewChip, statusChip, priority, empty, field, setFieldError
 import { queuePanel, detailPanel, proposeForm, myStrip } from './proposals.js';
 import { setupHint } from './setup.js';
 import { mergeSlotPanel } from './merge_slot.js';
+import { coordinationPanel } from './coordination.js';
 
 const PAGE = 10;
 export const canWrite = (p) => ['owner', 'coordinator', 'contributor', 'superuser'].includes(p.role);
@@ -224,6 +225,8 @@ export async function settings(ctx, { pid }) {
   const agentsHost = h('div');
   const credsHost = h('div');
   const auditHost = h('div');
+  // Who coordinates (kittrial-5bb.198), read again after an owner changes a role or a grant here.
+  const coordination = coordinationPanel(ctx, project);
 
   async function drawMembers() {
     let data;
@@ -239,7 +242,7 @@ export async function settings(ctx, { pid }) {
           select.addEventListener('change', async () => {
             try { await act(select, () => ctx.api.setMember(pid, m.user_id, select.value), { success: `${m.display_name} is now ${select.value}` }); }
             catch { select.value = m.role; }
-            drawMembers();
+            drawMembers(); coordination.draw();
           });
           return h('tr', null,
             h('td', null, h('div', { class: 'title' }, m.display_name), h('div', { class: 'sub' }, '@' + m.username, m.agent_of_name ? ' · agent of ' + m.agent_of_name : '', m.disabled ? ' · account disabled' : '')),
@@ -248,7 +251,7 @@ export async function settings(ctx, { pid }) {
               const ok = await confirmDialog({ title: `Remove ${m.display_name}?`, body: 'They lose access to this project immediately, including any worker credentials they issued. Their past contributions stay in the record.', confirmLabel: 'Remove', danger: true });
               if (!ok) return;
               try { await act(e.currentTarget, () => ctx.api.removeMember(pid, m.user_id), { success: 'Removed' }); } catch { /* shown */ }
-              drawMembers();
+              drawMembers(); coordination.draw();
             } }, 'Remove')) : null);
         })))),
       // Not `null`: replaceChildren writes a null argument out as the word "null", which is what a member
@@ -273,7 +276,7 @@ export async function settings(ctx, { pid }) {
       }
       setFieldError(form, 'm-username', '');
       try { await act(form.querySelector('button[type=submit]'), () => ctx.api.setMember(pid, account.id, v['m-role']), { success: `${account.display_name} added as ${v['m-role']}` }); } catch { return; }
-      drawMembers();
+      drawMembers(); coordination.draw();
     });
     return form;
   }
@@ -294,7 +297,7 @@ export async function settings(ctx, { pid }) {
           const grant = a.coordinator;
           const change = async (e, call, done) => {
             try { await act(e.currentTarget, call, { success: done }); } catch { /* the refusal is shown */ }
-            drawAgents();
+            drawAgents(); coordination.draw();
           };
           return h('tr', { 'data-agent': a.id, 'data-coordinator': grant ? String(grant.effective) : 'none' },
             h('td', null, a.name, a.enabled ? null : h('div', { class: 'sub' }, 'Disabled')),
@@ -366,5 +369,5 @@ export async function settings(ctx, { pid }) {
     pageHead({ crumbs: crumbs(ctx, project, 'Members & settings'), title: 'Members & settings', lede: owner ? 'Manage who can see and change this project.' : 'Only project owners can change membership.' }),
     archivedBanner(project),
     unusableBanner(project),
-    membersHost, agentsHost, credsHost, auditHost, danger);
+    membersHost, coordination.node, agentsHost, credsHost, auditHost, danger);
 }
