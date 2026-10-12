@@ -52,8 +52,8 @@ move it is in words, both derived only from the validated review state the item 
 shows. A task with changes requested is the caller's work until a revision is delivered;
 one waiting for review or integration is the reviewer's or the coordinator's move. Where
 the caller's own current checkpoint records a blocker or dependency, `next` quotes that
-checkpoint's own next action, escaped; no person is inferred, and the move and the count
-stay the caller's. Items where the move is the caller's sort first, and top-level
+blocker or dependency entry itself, escaped; no person is inferred, and the move and the
+count stay the caller's. Items where the move is the caller's sort first, and top-level
 `your_move` carries their count in the answer.
 
 ### The selection facts: `next_actor`, `work_state`, reconciliation and `claimable`

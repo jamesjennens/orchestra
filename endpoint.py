@@ -42,7 +42,7 @@ from reserved_comments import (carries_record_label, check_raw_request, comment_
                                is_merge_slot_id, shown_token, write_targets, MERGE_SLOT_LABEL, MERGE_SLOT_SUFFIX,
                                reserved_label_in_args, refuse_http_actor, status_change_targets, title_change_targets,
                                unresolved_bd_flags)
-from http_authority import AuthorityConfig, NativeRunner, CAP_APPROVE, CAP_PROJECT_ADMIN, descriptor_actor_denial, http_actor_denial, journal_path, run_guarded, stamp_write
+from http_authority import AuthorityConfig, NativeRunner, CAP_APPROVE, CAP_PROJECT_ADMIN, verified_web_authority, block_mismatch_denial, required_capability, descriptor_actor_denial, http_actor_denial, journal_path, run_guarded, stamp_write
 
 #: One warning per line on stderr (kittrial-5bb.197 review request 01a12894, item 6):
 #: the configuration warnings and the native warnings are collected in one list, and
@@ -55,20 +55,22 @@ def warning_text(warnings):
 def owner_loader(path,rule):
     """A zero-argument reader of the project's actor -> principal map.
 
-    The map (``sessions.owners``) is read ONLY when a rule needs it, and only for the
-    writes that need it, so a damaged registry never stops ``work``, ``review``,
-    ``contribute`` or a listed operator's operation (kittrial-5bb.197 review request
-    01a12894, item 4c). A registry that cannot be read raises with the way to turn
-    ``rule`` off; the caller adds nothing.
+    The map (``sessions.owners``) is read only when a rule needs it. Advisory
+    readers catch failures and retain name comparison. Independent-approval
+    writers fail closed, including listed operators. The other naming rules can
+    decide an exact assignee or directly listed name without a registry read.
+    A failure names the setting and recovery once, without registry contents.
     """
     def load():
         import sessions
         try:
             return sessions.owners(path)
-        except (ValueError,OSError) as exc:
-            raise ValueError('%s An operator turns the rule off with `admin.py coordinator-rules off --rule %s '
+        except (ValueError,OSError):
+            from review_workflow import CoordinatorRuleRefusal
+            raise CoordinatorRuleRefusal('The installation setting %s is on, and the session registry cannot be read. '
+                             'An operator turns the rule off with `admin.py coordinator-rules off --rule %s '
                              '--actor OPERATOR`, or repairs the session registry; nothing was changed.'
-                             %(exc,rule)) from None
+                             %(rule,rule)) from None
     return load
 
 ALLOWED={'list','show','ready','search','count','create','update','close','reopen','comments','dep','state','lint'}
@@ -554,7 +556,7 @@ def reserved_actors(root,path,rows=False,own=()):
     return names
 
 #: The actions that exist only for the web service: they name no existing project.
-SERVICE_ONLY_ACTIONS=('create-project','project-creations','creation-standing')
+SERVICE_ONLY_ACTIONS=('create-project','project-creations','creation-standing','web-merge-slot')
 
 def key_project_refusal(request,key_projects):
     """Refuse, for a key bound to projects, a request that is not for one of them.
@@ -735,6 +737,11 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
         answered=request.get('action') if isinstance(request,dict) else None
         if answered in SERVICE_ONLY_ACTIONS:
             raise ValueError('%s is available only to the web service'%answered)
+    # Slot requests bind the block before project, tracker, or authority reads.
+    # The shared table is the sole endpoint action/operation capability mapping.
+    if request.get('action') in ('coordinate','web-merge-slot'):
+        denied=block_mismatch_denial(request,authority_config)
+        if denied is not None:return denied
     # Two actions exist only for the web service and name no existing project
     # (kittrial-5bb.118 part 2); project_creation holds them, with what stops other callers.
     if request.get('action')=='create-project':
@@ -767,6 +774,10 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
     # And a name WITHOUT that shape, sent by the web service with a descriptor, is written only
     # by a worker credential inside a namespace that is nobody else's (kittrial-5bb.184).
     denied=descriptor_actor_denial(request,authority_config,lambda rows=False,own=():reserved_actors(root,path,rows,own))
+    if denied is not None:return denied
+    # The block must be FOR this request (kittrial-5bb.261): the project it names is this
+    # project, and the capability it names is the one this action needs. Before any action.
+    denied=block_mismatch_denial(request,authority_config)
     if denied is not None:return denied
     if request.get('action')=='session':
         from sessions import execute as session_execute
@@ -811,18 +822,12 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
         run_warnings.extend(switch_warnings)
         # The principal rule of slice 7 and the party comparison of rule 3 both need the
         # project's actor -> principal map, and only when a rule that consults it is on:
-        # an installation that configures nothing reads no registry here, and a damaged
-        # registry does not stop work, review, contribute or a listed operator's own
-        # operation (kittrial-5bb.197 review request 01a12894, items 1 and 4c).
+        # an installation that configures nothing reads no registry here. Advisory
+        # reads retain name comparison on failure; independent-approval writers
+        # must load ownership strictly, even for a directly listed operator.
         registry_rule='coordinator_writes' if rules['coordinator_writes'] else 'independent_approval'
         owners=(owner_loader(path,registry_rule)
                 if (rules['coordinator_writes'] or rules['independent_approval']) else None)
-        # A verified web-owner approval capability: the web service already established
-        # who the caller is, so `coordinator_writes` does not refuse an owner approving
-        # through the web route (kittrial-5bb.199). The merge slot is not on that route.
-        web_owner=(authority_config is not None and action=='review'
-                   and isinstance(request.get('authority'),dict)
-                   and request['authority'].get('capability')==CAP_APPROVE)
         def work_effect():
             result=work_execute(path,actor,action,args,request.get('attachments',{}),runner,
                                 operators=configured_operators(root),
@@ -830,7 +835,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                                 review_writes=review_writes,
                                 independent_approval=rules['independent_approval'],
                                 coordinator_writes=rules['coordinator_writes'],
-                                owners=owners,web_owner=web_owner)
+                                owners=owners,verified_web_authority=verified_web_authority(request,authority_config,CAP_APPROVE,name))
             # A handoff request and a decline are recorded in the kit's handoff journal and move
             # nothing in bd, so the runner saw no write; they are writes all the same (review
             # of kittrial-5bb.97). One that was already recorded (`reconciled`) wrote nothing.
@@ -1091,8 +1096,8 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
         # everything that rests on the operator allowlist is a host command (admin.py
         # proposal-review, proposal-decide, proposal-settings). The HTTP service is the
         # other authority: launched by it, with live authority required, review and
-        # decide run for a signed-in member whose reviews.approve the guard has just
-        # re-validated, and a submission's submitter is bound to the verified account.
+        # decide run for a signed-in member whose capability the guard has just re-validated
+        # (reviews.approve for a review, project.admin for a decide: kittrial-5bb.261), and a submission's submitter is bound to the verified account.
         import proposal_records
         args=request.get('args',[])
         if not isinstance(args,list) or any(not isinstance(x,str) or '\0' in x for x in args):raise ValueError('Expected argument list')
@@ -1299,14 +1304,70 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             return stdout
         runner=NativeRunner(run)
         def briefing_effect():
+            rules=configured_coordinator_rules(root,warnings=run_warnings)
             return {'returncode':0,'stdout':briefing_execute(root,path,name,actor,action,args,request.get('attachments',{}),runner,
                                                              operators=configured_operators(root),
-                                                             verifiers=configured_verifiers(root)),'stderr':''.join(run_warnings)}
+                                                             verifiers=configured_verifiers(root),
+                                                             independent_approval=rules['independent_approval'],
+                                                             owners=owner_loader(path,'independent_approval')
+                                                             if rules['independent_approval'] else None),'stderr':''.join(run_warnings)}
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
             return guarded_write(root,request,journal_path(path),briefing_effect,
                                authority_config=authority_config,
                                require_authority=require_authority,runner=runner)
+    if action=='web-merge-slot':
+        from http_authority import CAP_READ, CAP_COORDINATE, file_lock
+        from web_merge_slot import SlotError, validate as slot_validate, apply as slot_apply
+        from review_workflow import CoordinatorRuleRefusal
+        args=request.get('args',[])
+        run_warnings=[]
+        def slot_run(argv):
+            stdout,warnings=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
+            if warnings:run_warnings.append(warnings)
+            return stdout
+        runner=NativeRunner(slot_run)
+        try:
+            if not isinstance(args,list) or len(args)!=1 or not isinstance(args[0],str):
+                raise SlotError(422,'Expected one merge-slot JSON payload')
+            payload=record_json.loads(args[0]);operation=slot_validate(payload)
+            capability=required_capability(request)
+            if capability is None:raise SlotError(403,'This merge-slot operation has no endpoint capability binding')
+            denied_status=[]
+            def slot_authority():
+                descriptor=request.get('authority') or {}
+                if (not verified_web_authority(request,authority_config,capability,name)
+                        or (operation in ('create','force-release') and descriptor.get('via')!='session')):
+                    denied_status.append(403)
+                    raise SlotError(403,'Verified web authority required for this merge-slot operation in this project')
+            rules=configured_coordinator_rules(root,warnings=run_warnings)
+            def slot_effect():
+                result=slot_apply(payload,actor,runner,path,request.get('operation_id'),
+                                  operators=(configured_operators(root) if rules['independent_approval'] else None),
+                                  coordinator_writes=rules['coordinator_writes'],
+                                  independent_approval=rules['independent_approval'],
+                                  owners=owner_loader(path,'independent_approval'))
+                return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':warning_text(run_warnings)}
+            with (path/'.coordination.lock').open('a') as lock:
+                fcntl.flock(lock,fcntl.LOCK_EX)
+                if operation=='check':
+                    if authority_config is None:raise SlotError(403,'Verified web authority required for the merge-slot read')
+                    with file_lock(authority_config.lock):
+                        slot_authority()
+                        return slot_effect()
+                if not request.get('operation_id'):
+                    raise SlotError(422,'A stable operation identity is required for a merge-slot write')
+                answer=guarded_write(root,request,journal_path(path),slot_effect,
+                                     authority_config=authority_config,require_authority=True,
+                                     runner=runner,identity_check=slot_authority)
+                if denied_status and answer.get('returncode')==2:answer['merge_slot_status']=403
+                return answer
+        except CoordinatorRuleRefusal as error:
+            # Preserve the slot's conflict status and identify the native rule refusal.
+            return {'returncode':2,'stdout':'','stderr':str(error)+'\n',
+                    'merge_slot_status':409,'refused':'coordinator-rule'}
+        except SlotError as error:
+            return {'returncode':2,'stdout':'','stderr':str(error)+'\n','merge_slot_status':error.status}
     if action in ('lifecycle','coordinate','requirement'):
         args=request.get('args',[])
         if not isinstance(args,list) or len(args)!=1 or not isinstance(args[0],str):raise ValueError('Expected one JSON payload')
@@ -1534,6 +1595,12 @@ def main():
         answer={'returncode':75,'stdout':'','stderr':'Busy: %s. Nothing was done; try again shortly.\n'%waited}
     except Exception as e:
         answer={'returncode':2,'stdout':'','stderr':f'{type(e).__name__}: {e}\n'}
+        from review_workflow import CoordinatorRuleRefusal
+        if isinstance(e,CoordinatorRuleRefusal):
+            # Preserve the host's ValueError sentence while identifying a kit rule
+            # refusal explicitly. HTTP never decides this from words in stderr.
+            answer['stderr']=f'ValueError: {e}\n'
+            answer['refused']='coordinator-rule'
         import actor_names
         if isinstance(e,actor_names.TrackerUnreadable):
             # The export could not be read (bd failed, or answered something that is not

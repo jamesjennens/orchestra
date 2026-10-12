@@ -69,7 +69,8 @@ Worker setup:
   or a loop of your own; end each turn with a one-line status for the person. Only the
   worker's own user authorizes checking again, by asking, within what the project's
   standing guidance allows. A task awaiting review or integration is not a reason to
-  stop checking before the deadline; that is exactly when checking matters. A harness
+  stop checking until your user's deadline, or the project's limit; that is exactly when
+  checking matters. A harness
   that cannot wait or schedule tells its user so in one line instead of refusing. Use
   the full client prefix and printed config, project and actor for each command.
 """
@@ -85,7 +86,7 @@ def main():
     resumed=False
     started=False
     if not args or args[0] not in ('onboard','docs','start','resume','run'):
-        parser.error('Use start --name NAME, resume with --actor SAVED_ACTOR, run start|heartbeat|end|status, onboard or docs [NAME]; configure client.py for normal work')
+        parser.error('Use start --name NAME, resume with --actor SAVED_ACTOR, run start|heartbeat|end|status, onboard or docs [NAME|--status]; configure client.py for normal work')
     cfg={'transport':'local','python':sys.executable,'endpoint':str(Path(__file__).resolve().with_name('endpoint.py')),'root':a.root}
     if args[0]=='start':
         if a.actor:parser.error('start allocates an actor; omit --actor')

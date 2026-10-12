@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "operation_id": "caprev-5bb210-web-merge-slot-0003",
+  "key": "projects.coordinator-role-and-grant",
+  "name": "A coordinator role and personal-agent grant for approvals and the web merge slot",
+  "aliases": [
+    "coordinator role",
+    "coordinator grant",
+    "agent approves",
+    "make coordinator",
+    "agents.coordinator.grant",
+    "web coordinator slice 1b",
+    "coordinate capability",
+    "web merge slot",
+    "take and release the merge slot",
+    "owner force release",
+    "web coordinator slice 2 merge slot"
+  ],
+  "summary": "Coordinator roles and personal-agent grants supply reviews.approve and coordinate while the account holds them; worker credentials do not. Agents never approve their own party. The endpoint table binds action/operation to required capability and project; slot mismatches are refused before tracker or authority reads. One verified_web_authority helper checks configured live authority. GET slot reads native holder/context. Take/release use coordinate and bound usr_/agent_ names; force-release with expected holder/reason and explicit repair need a signed-in owner or superuser, never an agent. Native context/guarded receipts/web audit are reused. No silent creation; missing/damaged slots have recovery. Stable retries cannot release a later holder; each write saves deduplicated project/task/actor/opid/before-after audit before its HTTP receipt. Page and named client ship together; repeated uncertain repairs keep their retry. Host answers and independent_approval remain. Approved .261 is integrated in the accepted base; unknown table actions and second-process authority remain separate. No facts/integration action/provenance/new store/switch.",
+  "requirements": [],
+  "anchors": [
+    "docs/HTTP_DEPLOYMENT.md#coordinators-a-role-and-a-grant-that-lets-an-agent-approve",
+    "docs/HTTP_DEPLOYMENT.md#project-merge-slot-over-http",
+    "docs/HTTP_MUTATION_PERSISTENCE.md#web-merge-slot-writes"
+  ],
+  "code": [
+    "http_authority.py::coordinator_grant",
+    "http_authority.py::coordinator_grant_capabilities",
+    "http_authority.py::credential_capabilities",
+    "http_auth.py::Service.grant_coordinator",
+    "http_auth.py::Service.revoke_coordinator",
+    "http_auth.py::Service.agent_approves",
+    "http_auth.py::Service.actor_parties",
+    "http_service.py::ApiHandler.project_agent_coordinator_grant",
+    "http_service.py::ApiHandler.project_agent_coordinator_revoke",
+    "http_service.py::ApiHandler.reviews_add",
+    "http_authority.py::verified_web_authority",
+    "web_merge_slot.py::apply",
+    "web_merge_slot.py::snapshot",
+    "http_service.py::EndpointBackend.merge_slot_read",
+    "http_service.py::ApiHandler.merge_slot_get",
+    "http_service.py::ApiHandler._merge_slot_write",
+    "http_client.py::Client.acquire_merge_slot",
+    "http_auth.py::Service._end_coordinator_grants",
+    "http_auth.py::Service.remove_member",
+    "http_authority.py::block_mismatch_denial",
+    "http_service.py::ApiHandler._decides",
+    "http_service.py::ApiHandler.proposals_dispose",
+    "http_authority.py::required_capability"
+  ],
+  "tests": [
+    "tests/test_coordinator_grant.py",
+    "tests/test_coordinator_grant_real.py",
+    "tests/test_web_merge_slot.py",
+    "tests/web_merge_slot_screen.mjs",
+    "tests/web_merge_slot_repair_screen.mjs",
+    "tests/test_endpoint_authority_block.py",
+    "tests/test_http_proposals.py"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "reviews",
+    "http",
+    "identity"
+  ],
+  "revision": 5,
+  "expected_sha256": "1d4ac45fb9069be14eea9a6a3ded640a6f7f9761c5d6328bb03a6638127b3e3e"
+}

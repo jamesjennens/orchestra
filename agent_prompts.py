@@ -241,7 +241,7 @@ CLASSES = [
          _deliverer(i), _recommended(i)),
      'waiting_since'),
     ('recommend', 'Contributions you could review: read the work, then record a recommendation or request '
-                  'changes (you cannot approve; an owner decides)',
+                  'changes (you cannot approve; an owner or a coordinator decides)',
      lambda i: 'state %s; %s; delivered by%s%s' % (
          token(i.get('review_state')), _revision(i), _deliverer(i), _recommended(i)),
      'waiting_since'),

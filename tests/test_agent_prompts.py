@@ -107,7 +107,7 @@ class ClassificationCase(unittest.TestCase):
         text = prompt([classify(reviewer, [row('t1', 'awaiting-review', OTHER)], project=project,
                                 reviewable={'t1'})])['text']
         self.assertIn('Contributions you could review: read the work, then record a recommendation or request '
-                      'changes (you cannot approve; an owner decides):', text)
+                      'changes (you cannot approve; an owner or a coordinator decides):', text)
         # This row does not say who delivered (an endpoint older than the service): nobody is named
         # as the deliverer, and the assignee is given as the assignee (kittrial-5bb.154).
         self.assertRegex(text, r'- task t1 .*state awaiting-review; .*; delivered by: not stated by this server '

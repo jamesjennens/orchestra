@@ -362,10 +362,11 @@ def owner_map(owners):
 
     ``owners`` is a mapping, or a zero-argument callable returning one. The endpoint
     passes a callable so that a request that does not need the registry never reads
-    it: with ``coordinator_writes`` ON a damaged registry must not stop ``work``,
-    ``review``, ``contribute`` or a listed operator's own operation (kittrial-5bb.197
-    review request 01a12894, item 4c). A callable that cannot read the registry
-    raises its own sentence; the caller adds the way to turn the rule off.
+    it. Listed names need no registry for the coordinator/lifecycle naming rules,
+    and exact assignees need none for their allowed facts. Independent-approval
+    writers load it strictly even for a listed operator. Readers can fall back to
+    names; contributing does not need ownership. A failing loader names its rule
+    and recovery; ``approval_owners`` supplies the independent-approval refusal.
     """
     return owners() if callable(owners) else owners
 
@@ -376,9 +377,8 @@ def party_key(actor, owners=None):
     The principal the project's session registry gives the actor when it has one
     (``sessions.owners``, as slice 2 does), otherwise the actor's own name under the
     same normalisation the follows gate uses (case-folded, a ``/``-namespace suffix
-    dropped). A party with a principal and a party without one are never the same:
-    a name-only actor and a principal-bound actor cannot be told apart, which is the
-    documented limit of this comparison, so they are treated as distinct parties.
+    dropped). This key describes available attribution; :func:`same_party` also
+    compares folded names, so binding just one name cannot evade that comparison.
     A registry that cannot be read falls back to the name-only comparison rather
     than stopping a read: the same-name refusal survives, only the principal
     refinement is unavailable.
@@ -395,8 +395,30 @@ def party_key(actor, owners=None):
 
 
 def same_party(first, second, owners=None):
-    """Whether two actors are the same party under ``party_key``."""
+    """Equal folded names OR equal known principals identify the same party.
+
+    Readers retain name comparison when ownership is unavailable. Writers that
+    require independent approval first load the registry with :func:`approval_owners`.
+    This helper is not used by the older follows or recommendation gates.
+    """
+    if author_key(first) == author_key(second):
+        return True
     return party_key(first, owners) == party_key(second, owners)
+
+
+class CoordinatorRuleRefusal(ValueError):
+    """A rule refused before any effect; the endpoint marks this for HTTP callers."""
+
+
+def approval_owners(owners):
+    """Load ownership before an independent-approval write; never guess on failure."""
+    try:
+        return owner_map(owners)
+    except (ValueError, OSError):
+        raise CoordinatorRuleRefusal('The installation setting independent_approval is on, and the session registry '
+                         'cannot be read. An operator turns the rule off with '
+                         '`admin.py coordinator-rules off --rule independent_approval --actor OPERATOR`, '
+                         'or repairs the session registry; nothing was changed.') from None
 
 
 def listed_operator_actor(actor, operators=None, owners=None):
@@ -1684,8 +1706,9 @@ def independent_approval_state(issue, operators=None, owners=None, journal=None)
     approval when a new contribution supersedes or follows the old one, so an
     approval of an OLDER contribution cannot satisfy a newer one; a void applied
     after the approval clears it the same way. The approving party is compared with
-    ``party_key``: a principal where the registry gives one, otherwise the normalised
-    name. Returns ``(False, reason)`` when the contribution does not qualify, so the
+    ``same_party``: equal known principals OR equal normalised names. This reader
+    remains available when the registry cannot be read; writers load ownership
+    strictly before using it. Returns ``(False, reason)`` when the contribution does not qualify, so the
     caller can refuse with the setting named.
     """
     ordered, voids, invalid, refused, positions, reverts, invalid_reverts = history(
@@ -1721,10 +1744,11 @@ APPROVAL_REFUSAL = ('%s refused: the installation setting independent_approval i
 
 def require_independent_approval(issue, what, task, operators=None, owners=None, journal=None):
     """Raise the one refusal for part (b), or return when the contribution qualifies."""
+    owners = approval_owners(owners)
     allowed, reason = independent_approval_state(issue, operators, owners, journal)
     if allowed:
         return
-    raise ValueError(APPROVAL_REFUSAL % (what, task, what, reason))
+    raise CoordinatorRuleRefusal(APPROVAL_REFUSAL % (what, task, what, reason))
 
 
 def require_integrated_follow_on(payload, state, ordered, rows, task, assignee=None, operators=None,
@@ -2007,7 +2031,7 @@ def open_review_requests_by(rows, actor, operators=None, journal=None):
 
 
 def execute(rows, task, actor, payload, run, operators=None, journal=None, review_writes=None,
-            independent_approval=False, coordinator_writes=False, owners=None, web_owner=False):
+            independent_approval=False, coordinator_writes=False, owners=None, verified_web_authority=False):
     """Validate, CAS and append once; return receipt and projected review state.
 
     ``journal`` is the project directory holding the host-issued
@@ -2025,10 +2049,11 @@ def execute(rows, task, actor, payload, run, operators=None, journal=None, revie
     both default OFF, so an installation that configures nothing behaves as before).
     ``owners`` is the project's actor -> principal map (``sessions.owners``), or a
     callable returning it so the registry is read only when a rule needs it, used by
-    the principal half of both rules. ``web_owner`` says the request came through the
-    web route with a verified owner approval capability: the web service has already
-    established who the caller is (kittrial-5bb.199), so ``coordinator_writes`` does
-    not refuse it; the merge slot is not on that route and stays with listed actors.
+    the principal half of both rules. ``verified_web_authority`` says the request came through the
+    web route with a verified approval capability for an owner, coordinator, or granted
+    agent. The configured live authority establishes the caller (kittrial-5bb.199,
+    kittrial-5bb.209), so ``coordinator_writes`` does not refuse it. Web slot operations
+    use the same helper for their capability; host operations retain listed actors.
     """
     for row in rows or []:
         if isinstance(row, dict) and row.get('id') == task and is_merge_slot(row):
@@ -2121,21 +2146,23 @@ def execute(rows, task, actor, payload, run, operators=None, journal=None, revie
         # may not be the contribution's author or the task's assignee by PARTY - the
         # principal the registry gives the actor where it has one, its normalised name
         # otherwise (the task's rule 3). (c) coordinator writes: only a listed actor of
-        # this project may approve, unless the verified web owner route already
-        # established the caller (kittrial-5bb.199). Judged before the snapshot is
-        # stamped and before the sole native write, so a refusal writes nothing.
+        # this project may approve, unless a verified web approval (owner, coordinator, or
+        # agent with the grant) already established the caller (kittrial-5bb.199, .209).
+        # Judged before the snapshot is stamped and before the sole native write, so a
+        # refusal writes nothing.
         if independent_approval or coordinator_writes:
             contribution=state.get('contribution') or {}
-            if coordinator_writes and not web_owner and not listed_operator_actor(actor,operators,owners):
-                raise ValueError('approve refused: the installation setting coordinator_writes is on, so only a '
+            if coordinator_writes and not verified_web_authority and not listed_operator_actor(actor,operators,owners):
+                raise CoordinatorRuleRefusal('approve refused: the installation setting coordinator_writes is on, so only a '
                                  'listed operator of this project may approve a contribution (or an actor of a '
                                  'listed operator\'s principal), and %s is neither. A worker still contributes, '
                                  'responds, recommends and requests changes; an operator turns the rule off with '
                                  '`admin.py coordinator-rules off --rule coordinator_writes --actor OPERATOR`.'
                                  %named_rule_actor(actor))
             if independent_approval:
+                owners = approval_owners(owners)
                 if same_party(actor,contribution.get('author'),owners):
-                    raise ValueError('approve refused: the installation setting independent_approval is on, and '
+                    raise CoordinatorRuleRefusal('approve refused: the installation setting independent_approval is on, and '
                                      'nobody passes their own work; %s is the contribution\'s author\'s party, so '
                                      'it may not approve its own contribution. Another party must approve it, or an '
                                      'operator turns the rule off with `admin.py coordinator-rules off --rule '
@@ -2143,7 +2170,7 @@ def execute(rows, task, actor, payload, run, operators=None, journal=None, revie
                                      %named_rule_actor(actor))
                 assignee=issue.get('assignee')
                 if isinstance(assignee,str) and assignee and same_party(actor,assignee,owners):
-                    raise ValueError('approve refused: the installation setting independent_approval is on, and '
+                    raise CoordinatorRuleRefusal('approve refused: the installation setting independent_approval is on, and '
                                      'nobody passes their own work; %s is the task\'s assignee\'s party, so it may '
                                      'not approve the contribution on its own task. Another party must approve it, '
                                      'or an operator turns the rule off with `admin.py coordinator-rules off --rule '

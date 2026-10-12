@@ -289,12 +289,16 @@ class NoUnguardedParseTests(unittest.TestCase):
             # acceptance command, which the caller transports as a file attachment. It is
             # the caller's text, so it is parsed through the guard.
             # kittrial-5bb.221 revision 2 moved tracker_actors' export rows to
-            # record_json.loads_rows (the row bound), so four remain.
-            'briefing.py': 3, 'coordination.py': 3, 'endpoint.py': 4, 'export_requirements.py': 1, 'feedback.py': 3, 'guidance.py': 3,
+            # record_json.loads_rows (the row bound); the web merge-slot payload adds a fifth guarded parse.
+            'briefing.py': 3, 'coordination.py': 3, 'endpoint.py': 5, 'export_requirements.py': 1, 'feedback.py': 3, 'guidance.py': 3,
             # Requirements request bodies use the guard and reject duplicate fields.
+            # http_authority reads the operation of an attached review record through the guard,
+            # exactly as work.py does, to know which capability the request needs (kittrial-5bb.261).
+            'http_authority.py': 1,
             'handoff.py': 1, 'http_service.py': 3, 'lifecycle.py': 1, 'recovery.py': 1, 'requirements.py': 1, 'requirement_records.py': 1, 'reserved_comments.py': 1,
             # The simple owner adapter guards bd's decision-create receipt too.
             'requirement_http.py': 2,
+            'web_merge_slot.py': 4,
             'review_recommendations.py': 2, 'review_workflow.py': 4, 'work.py': 1, 'worker_gate.py': 1})
 
     def test_the_parsers_that_do_not_call_it_directly_reach_it(self):

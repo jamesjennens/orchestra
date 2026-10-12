@@ -139,7 +139,7 @@ def steps(handler, principal, project_id):
         ('%d members.' % len(members)) if len(members) > 1 else
         'You are the only member. That is fine if you work alone; otherwise add the others.',
         'owner', link=base + '/members',
-        note='An owner adds contributors and viewers. Only a superuser can make someone an owner.'))
+        note='An owner adds contributors, coordinators and viewers. Only a superuser can make someone an owner.'))
 
     repository = project.get('repository')
     # A value stored under an earlier rule that no longer passes is withheld by the

@@ -207,19 +207,7 @@ class RealStackTests(Members, fixes.Harness, rb.RealBdLabelAliasTests):
             rb.signal.signal(signum, previous)
         cls._signals = {}
         rb.RealBdLabelAliasTests.__dict__['_stop_server'].__func__(cls)
-        # The scratch server has ended, but a bd the endpoint started for the last request may
-        # still be writing under .dolt for a moment: the folder was then "not empty" while it
-        # was being removed (seen three times on a loaded machine, kittrial-5bb.208 and .226,
-        # every test of the class having passed). Tried again for a few seconds, then for real.
-        import time
-        for attempt in range(40):
-            try:
-                cls._tmp.cleanup()
-                break
-            except OSError:
-                if attempt == 39:
-                    raise
-                time.sleep(0.25)
+        rb.remove_scratch(cls._tmp)
 
     def bd_row(self, task):
         found = json.loads(self.bd('show', task, '--json').stdout)
@@ -339,6 +327,41 @@ class StubCase(Members, fixes.EndpointCase):
         refused = self.claim('casey', task)
         self.assertEqual((409, 'Task is already claimed by worker-a', {'held_by': 'worker-a'}),
                          (refused.status, message(refused), refused.data['error']['detail']))
+
+    def test_a_held_task_bd_leaves_in_progress_carries_candidates(self):
+        """F1: bd's own claim leaves a held task `in_progress`, not open, and a refusal of it
+        must still fall through to the bounded candidates while naming the holder. The stub
+        answers a claim as bd 1.2.2 was measured to, so this is the real status."""
+        project = self.owned_project()
+        self.members(project)
+        held = self.new('held')
+        self.assertEqual(200, self.claim('casey', held).status)
+        spare = self.new('spare')
+        refused = self.claim('drew', held)
+        self.assertEqual(409, refused.status, refused.data)
+        detail = refused.data['error']['detail']
+        self.assertEqual(self.ids['casey'], detail.get('held_by'))
+        self.assertEqual([{'task': spare, 'title': 'spare'}], detail.get('candidates'))
+
+    def test_a_closed_task_that_still_has_an_assignee_carries_no_candidates(self):
+        """F2: bd refuses a CLOSED task that still has an assignee as already claimed, so the
+        refusal carries `held_by`; because the task is closed there is no fall-through read and
+        no candidate list, even with a claimable row beside it. This is the case the mutant
+        `held_by is not None or status == 'open'` must fail."""
+        project = self.owned_project()
+        self.members(project)
+        closed = self.new('held then closed')
+        self.assertEqual(200, self.claim('casey', closed).status)
+        # The web change closes the row and leaves the assignee on it, as bd does.
+        done = self.request('PATCH', '%s/%s' % (self.tasks, closed), {'status': 'closed'},
+                            token=self.tokens['alex'])
+        self.assertEqual(200, done.status, done.data)
+        self.new('spare')                     # a claimable row this refusal must not offer
+        refused = self.claim('drew', closed)
+        self.assertEqual(409, refused.status, refused.data)
+        detail = refused.data['error']['detail']
+        self.assertEqual(self.ids['casey'], detail.get('held_by'))
+        self.assertNotIn('candidates', detail)
 
 
 class InProcessCase(Members, fixes.Harness):
