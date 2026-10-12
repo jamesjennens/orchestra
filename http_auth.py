@@ -3175,7 +3175,7 @@ class Service:
             agent = self._agent(principal.agent_id)
             return self.agent_view(agent, principal)
 
-    def update_agent(self, principal, agent_id, payload):
+    def update_agent(self, principal, agent_id, payload, request_id=None):
         if principal is None or principal.via == 'credential':
             raise forbidden('Session authority required to change an agent')
         with self.store.lock:
@@ -3205,7 +3205,7 @@ class Service:
             # An agent that leaves a project by THIS route leaves its coordinators too (review of
             # kittrial-5bb.209): the grant stayed in the state, unseen by the project's owner, and
             # took effect again when the project was put back, with no owner's decision.
-            self._end_coordinator_grants(agent, left, principal, None,
+            self._end_coordinator_grants(agent, left, principal, request_id,
                                          'the agent\'s projects were changed (PATCH /v1/agents)')
             if changes.get('enabled') is False:
                 self._revoke_agent_credentials(agent)

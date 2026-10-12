@@ -5127,7 +5127,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             refuse_unknown_fields(payload, self.AGENT_UPDATE_FIELDS, 'An agent change')
             if 'enabled' in payload and payload['enabled'] is not None and not bool(payload['enabled']):
                 metadata.update(self._revocation_metadata(agent_id=ctx.params['aid']))
-            result = self.service.update_agent(ctx.principal, ctx.params['aid'], payload)
+            result = self.service.update_agent(ctx.principal, ctx.params['aid'], payload,
+                                               request_id=ctx.request_id)
             return result, result
         return self._mutate(ctx, 'agents.update', None, update, capability=CAP_AGENTS,
                             audit_metadata=metadata)

@@ -234,6 +234,30 @@ class GrantTests(Grants):
         self.assertIn(('agents.coordinator.revoke', 'committed',
                        'agent %s: a project owner took the agent out of the project' % self.agent_id), self.audited())
 
+    def test_a_grant_ended_by_patch_is_audited_with_the_id_of_that_request(self):
+        """kittrial-5bb.261: the revoke written when PATCH /v1/agents/{id} takes the agent out of the project
+        carried `request_id: null`; it carries the id of the PATCH, as the owner's DELETE route does."""
+        def events(action):
+            with self.service.store.lock:
+                return [event for event in self.service.state['audit'] if event['action'] == action]
+        self.assertEqual(200, self.grant().status)
+        self.assertEqual(200, self.request('PATCH', '/v1/agents/%s' % self.agent_id, {'projects': []},
+                                           token=self.tokens['cora']).status)
+        revoked, updated = events('agents.coordinator.revoke'), events('agents.update')
+        self.assertEqual([self.project], [event['project_id'] for event in revoked])
+        self.assertIsInstance(revoked[0]['request_id'], str)
+        self.assertTrue(revoked[0]['request_id'])
+        self.assertEqual(updated[-1]['request_id'], revoked[0]['request_id'])
+        # The owner's route, for comparison: its revoke carries its request's id too.
+        self.assertEqual(200, self.request('PATCH', '/v1/agents/%s' % self.agent_id, {'projects': [self.project]},
+                                           token=self.tokens['cora']).status)
+        self.assertEqual(200, self.grant().status)
+        self.assertEqual(200, self.request('DELETE', '/v1/projects/%s/agents/%s' % (self.project, self.agent_id),
+                                           token=self.tokens['olive']).status)
+        self.assertTrue(all(isinstance(event['request_id'], str) and event['request_id']
+                            for event in events('agents.coordinator.revoke')))
+        self.assertEqual(2, len({event['request_id'] for event in events('agents.coordinator.revoke')}))
+
     def test_a_task_held_by_the_agents_own_account_is_its_own_partys(self):
         """The assignee half of the rule, for an agent: carl delivered, the task was then given to cora."""
         self.assertEqual(200, self.grant().status)
