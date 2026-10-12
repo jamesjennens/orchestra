@@ -287,6 +287,83 @@ class GuidanceAndOnboardingTests(unittest.TestCase):
         self.assertNotIn('outcome unknown', str(refusal.exception))
         self.assertEqual(file_tree(self.project), before)
 
+    def test_the_directory_refusal_reserves_no_operation_identity(self):
+        # kittrial-5bb.259 item G1: the check sat inside coordinator_effect, so with an operation_id
+        # the identity was reserved and then released, and the operation journal was created if it
+        # was absent. It runs before the guarded write now: nothing is reserved.
+        (self.project/'ONBOARDING.md').mkdir()
+        built = request('set-onboarding', text='Fresh onboarding for alpha.\n')
+        built['operation_id'] = 'op-259-directory'
+        with self.assertRaises(ValueError) as refusal:
+            endpoint.execute(self.root, built, key_principal=PRINCIPAL, key_projects=['alpha'])
+        self.assertIn('is a directory', str(refusal.exception))
+        self.assertFalse((self.project/'.http-operations.sqlite3').exists(),
+                         'a refusal must not create the operation journal')
+
+    def test_a_symlink_to_a_directory_gets_the_symlink_sentence(self):
+        # kittrial-5bb.259 item G2: is_dir() follows a symlink, so a symlink to a directory was
+        # answered with the directory sentence ("Remove the directory") where the base said the
+        # document must not be a symlink at all. The symlink is tested first now.
+        directory = self.project/'elsewhere'
+        directory.mkdir()
+        link = self.project/'ONBOARDING.md'
+        try:
+            link.symlink_to(directory, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest('symlink creation is not available')
+        with self.assertRaises(ValueError) as refusal:
+            self.ask('set-onboarding', text='Fresh onboarding for alpha.\n')
+        self.assertIn('must not be a symlink', str(refusal.exception))
+        self.assertNotIn('is a directory', str(refusal.exception))
+        self.assertTrue(link.is_symlink())
+
+    def test_the_symlink_refusal_reserves_no_operation_identity(self):
+        # kittrial-5bb.259 item 2: the directory refusal is held to G1 above, the symlink one was
+        # not - the test at :303 sends no operation_id - so a mutant that put the symlink refusal
+        # back inside the effect survived. With an operation_id the identity would be reserved and
+        # the journal created; the refusal must answer before the guarded write instead.
+        directory = self.project/'elsewhere'
+        directory.mkdir()
+        link = self.project/'ONBOARDING.md'
+        try:
+            link.symlink_to(directory, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest('symlink creation is not available')
+        built = request('set-onboarding', text='Fresh onboarding for alpha.\n')
+        built['operation_id'] = 'op-259-symlink'
+        with self.assertRaises(ValueError) as refusal:
+            endpoint.execute(self.root, built, key_principal=PRINCIPAL, key_projects=['alpha'])
+        self.assertIn('must not be a symlink', str(refusal.exception))
+        self.assertNotIn('is a directory', str(refusal.exception))
+        self.assertFalse((self.project/'.http-operations.sqlite3').exists(),
+                         'a refusal must not create the operation journal')
+        self.assertTrue(link.is_symlink())
+
+    def test_the_in_effect_backstop_answers_when_the_path_changes_after_the_pre_check(self):
+        # kittrial-5bb.259 item 1: the pre-check runs before the project lock is taken, so the path
+        # can become a directory while the call waits for it, and then the OLD code reached
+        # os.replace with it. guarded_write is the seam between the two checks: this wrapper makes
+        # the swap there, so only the in-effect backstop can answer. It must be a refusal (rc 2)
+        # with the pre-check's sentence, not rc 124 "outcome unknown", and the identity must be
+        # released so the same request works once the directory is gone.
+        real_guarded = endpoint.guarded_write
+        def swap(*args, **kwargs):
+            (self.project/'ONBOARDING.md').mkdir(exist_ok=True)
+            return real_guarded(*args, **kwargs)
+        built = request('set-onboarding', text='Fresh onboarding for alpha.\n')
+        built['operation_id'] = 'op-259-swap'
+        with mock.patch.object(endpoint, 'guarded_write', side_effect=swap):
+            with self.assertRaises(ValueError) as refusal:
+                endpoint.execute(self.root, built, key_principal=PRINCIPAL, key_projects=['alpha'])
+        self.assertIn('is a directory', str(refusal.exception))
+        self.assertNotIn('outcome unknown', str(refusal.exception))
+        self.assertTrue((self.project/'ONBOARDING.md').is_dir())
+        (self.project/'ONBOARDING.md').rmdir()
+        answer = endpoint.execute(self.root, built, key_principal=PRINCIPAL, key_projects=['alpha'])
+        self.assertEqual(answer['returncode'], 0, answer['stderr'])
+        self.assertEqual((self.project/'ONBOARDING.md').read_text(encoding='utf-8'),
+                         'Fresh onboarding for alpha.\n')
+
     def test_guidance_clear_with_nothing_set_answers_changed_false_and_writes_nothing(self):
         # Review of 958e883, item 3a: this used to answer rc 124 "outcome unknown" through an
         # AttributeError (version_of(None)), and a caller with no shell cannot reconcile that.
