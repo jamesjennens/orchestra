@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "operation_id": "caprev-5bb210-web-merge-slot-0001",
+  "operation_id": "caprev-5bb210-web-merge-slot-0002",
   "key": "projects.coordinator-role-and-grant",
   "name": "A coordinator role and personal-agent grant for approvals and the web merge slot",
   "aliases": [
@@ -62,5 +62,7 @@
     "reviews",
     "http",
     "identity"
-  ]
+  ],
+  "revision": 3,
+  "expected_sha256": "69102739f6c55bb0dacf6ae836ec08df8014e459ce984cd3aab71580915beedc"
 }
