@@ -234,8 +234,11 @@ class Client:
     def release_merge_slot(self, project, key=None):
         return self._write_merge_slot(project, 'release', {}, key)
 
-    def force_release_merge_slot(self, project, expected_holder, reason, key=None):
-        return self._write_merge_slot(project, 'force-release', {'expected_holder': expected_holder, 'reason': reason}, key)
+    def force_release_merge_slot(self, project, expected_holder, reason, key=None, expected_task=None):
+        body = {'expected_holder': expected_holder, 'reason': reason}
+        if expected_task is not None:
+            body['expected_task'] = expected_task   # the task the caller saw held (kittrial-5bb.268)
+        return self._write_merge_slot(project, 'force-release', body, key)
 
     def create_merge_slot(self, project, key=None):
         return self._write_merge_slot(project, 'create', {}, key)

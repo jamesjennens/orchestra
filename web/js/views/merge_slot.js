@@ -8,6 +8,10 @@ export function mergeSlotPanel(ctx, project) {
   function showError(message, error) {
     message.textContent = describe(error);
     if (!error.retry) return;
+    // kittrial-5bb.268 item 5: the audit entry is written after the slot changes. If the
+    // server stopped between the two, only the same request, retried, records it.
+    message.append(' This page does not retry by itself: if the change was made, the web audit records it only '
+      + 'when the same request is retried, so retry it here before you leave the page. ');
     const retry = h('button', { type: 'button', onclick: async () => {
       if (writing) return;
       writing = true; retry.disabled = true;
@@ -26,7 +30,8 @@ export function mergeSlotPanel(ctx, project) {
       if (version !== revision) return;
       // Older services have no slot route. Keep the existing project page usable.
       if ([404, 501].includes(error.status)) { panel.replaceChildren(); return; }
-      panel.replaceChildren(h('div', { class: 'stack' }, h('h2', null, 'Merge slot'), h('p', { role: 'alert' }, describe(error)),
+      panel.replaceChildren(h('div', { class: 'stack' }, h('h2', null, 'Merge slot'),
+        h('p', { role: 'alert' }, error.status === 503 ? unusable(error) : describe(error)),
         h('button', { type: 'button', onclick: draw }, 'Read again'),
         ['owner', 'superuser'].includes(project.role) && error.status === 503
           ? repairButton('Create or repair slot', () => ctx.api.createMergeSlot(project.id), true) : null));
@@ -59,8 +64,22 @@ export function mergeSlotPanel(ctx, project) {
         button('Take slot', () => ctx.api.acquireMergeSlot(project.id, task.value, target.value))) : null,
       slot.can_coordinate && own && !slot.available ? button('Release slot', () => ctx.api.releaseMergeSlot(project.id)) : null,
       slot.can_force_release && !slot.available ? h('div', { class: 'stack' }, h('label', null, 'Reason for forced release', reason),
-        button('Force release', () => ctx.api.forceReleaseMergeSlot(project.id, slot.holder, reason.value), true)) : null,
+        // The task the page shows travels with the holder (kittrial-5bb.268 item 4): a holder
+        // who released and took the slot again for another task is not released by this page.
+        button('Force release', () => ctx.api.forceReleaseMergeSlot(project.id, slot.holder, reason.value,
+          slot.context ? slot.context.task : undefined), true)) : null,
       message));
+  }
+  // kittrial-5bb.268 item 2: a 503 on the slot read is not a lost save. Say what the server
+  // found and who can put it right, instead of the generic uncertain-outcome sentence.
+  function unusable(error) {
+    const found = error.message && error.message !== 'Request failed' ? error.message : 'The merge slot cannot be read.';
+    const owner = ['owner', 'superuser'].includes(project.role);
+    const who = /installation operator/i.test(found)
+      ? ' An installation operator repairs this on the host.'
+      : owner ? ' You can repair it with Create or repair slot below.'
+        : ' A project owner or superuser can repair it from this page.';
+    return 'The merge slot cannot be used: ' + found + who;
   }
   // The unavailable-state controls use the same explicit confirmation and retry flow.
   function repairButton(label, work, confirm) {

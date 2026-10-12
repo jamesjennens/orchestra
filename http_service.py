@@ -2001,7 +2001,9 @@ class EndpointBackend:
             operation = route.split('.', 1)[1]
             fields = {'operation': operation}
             if operation == 'acquire':fields.update(task=payload['task_id'], target=payload['target'])
-            if operation == 'force-release':fields.update(expected_holder=payload['expected_holder'], reason=payload['reason'])
+            if operation == 'force-release':
+                fields.update(expected_holder=payload['expected_holder'], reason=payload['reason'])
+                if 'expected_task' in payload:fields['expected_task'] = payload['expected_task']
             return 'web-merge-slot', project_id, [json.dumps(fields)], {}
         task_id = payload.get('task_id')
         if route == 'tasks.create':
@@ -4823,14 +4825,17 @@ class ApiHandler(BaseHTTPRequestHandler):
         metadata = {}
         fields = {'acquire': ('task_id', 'target'), 'release': (),
                   'force-release': ('expected_holder', 'reason'), 'create': ()}[operation]
+        # expected_task: the task the page saw held (kittrial-5bb.268 item 4); optional.
+        optional = ('expected_task',) if operation == 'force-release' else ()
         def write():
             self._merge_slot_backend()
             if ctx.idempotency_key is None:
                 raise invalid('Send an Idempotency-Key and reuse it with the identical request after an uncertain outcome')
             payload = dict(ctx.payload or {})
-            refuse_unknown_fields(payload, fields, 'Merge-slot ' + operation)
-            if set(payload) != set(fields):
-                raise invalid('Supply exactly ' + (', '.join(fields) or 'an empty body'))
+            refuse_unknown_fields(payload, fields + optional, 'Merge-slot ' + operation)
+            if set(payload) - set(optional) != set(fields):
+                raise invalid('Supply exactly ' + (', '.join(fields) or 'an empty body')
+                              + (' (and optionally ' + ', '.join(optional) + ')' if optional else ''))
             from web_merge_slot import validate, SlotError
             checked = dict(payload, operation=operation)
             if operation == 'acquire':checked['task'] = checked.pop('task_id')
