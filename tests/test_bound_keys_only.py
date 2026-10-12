@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -109,14 +110,20 @@ def ssh_line_of_key():
 
 
 def printed_lines(printed):
-    """The command= lines admin.authorized_keys prints, as authorized_keys rows (r5 item 1:
-    every line the kit prints must be decided by the preview)."""
-    document = printed if isinstance(printed, dict) else json.loads(printed['stdout'])
+    """The command= lines admin.authorized_keys prints, as authorized_keys rows
+    (kittrial-5bb.265 item 1: the dict-shape trap made this return [] and the round-trip
+    loop ran 0 times; parse the captured stdout JSON, or take a parsed document)."""
+    document = json.loads(printed['stdout']) if isinstance(printed, dict) else printed
+    if not isinstance(document, dict):
+        return []
     lines = []
     for value in (document.get('contributor'), document.get('operator')):
         if isinstance(value, str) and value.startswith('command="'):
             lines.append(value)
-    return [line for line in lines if line.strip()]
+    if not lines:
+        raise AssertionError('authorized_keys printed no command= line to feed back; the '
+                             'round-trip must not silently run 0 times')
+    return lines
 
 
 class ScratchHomeGuardTests(unittest.TestCase):
@@ -557,7 +564,11 @@ class FlushTests(unittest.TestCase):
         self.assertGreaterEqual(said.flushes, 1, 'the refusal was not flushed')
 
 
-@unittest.skipIf(os.name == 'nt', 'the bound-keys preview and its fixtures assume POSIX paths (r5 item 4: the CI-red Windows run); the Linux suite holds them')
+@unittest.skipIf(os.name == 'nt', 'the bound-keys preview and its fixtures assume POSIX paths '
+             '(r5 item 4: the CI-red Windows run); the Linux suite holds them. kittrial-5bb.265 '
+             'item 4: the isabs calls on key-line text are posixpath now, judged identically on '
+             'every host - C:/ and //?/C:/ spellings read as absolute for both - but the fixtures '
+             'still build POSIX paths, so the skip stays until they are ported')
 class SettingsCommandTests(unittest.TestCase):
     """``admin.py bound-keys-only``: operator-gated, audited, and off by default."""
 
@@ -846,9 +857,13 @@ class SettingsCommandTests(unittest.TestCase):
         for label, path, wording in shapes:
             with self.subTest(shape=label):
                 # Open first, judge the open file (r3 item 2): a fifo is refused by the
-                # descriptor's own kind, a dangling link answers the truthful ENOENT.
+                # descriptor's own kind, a dangling link answers the truthful ENOENT. The
+                # call runs under the timeout so a dropped O_NONBLOCK dies HERE by
+                # assertion (kittrial-5bb.265 item 1), not by hanging the module.
                 with self.assertRaises(ValueError) as refused:
-                    admin.authorized_keys_listing(self.root, str(path))
+                    self.run_with_timeout(
+                        lambda p=path: admin.authorized_keys_listing(self.root, str(p)),
+                        label='the listing with a non-regular keys file')
                 self.assertIn(wording, str(refused.exception))
                 said = io.StringIO()
                 with mock.patch.object(sys, 'stderr', said):
@@ -1232,19 +1247,37 @@ class SettingsCommandTests(unittest.TestCase):
                 listing = admin.authorized_keys_listing(self.root, str(file))
                 self.assertEqual([], listing['would_be_refused'], prefix)
                 self.assertEqual([1], listing['may_be_refused'], prefix)
-        # The printed shape stays decided whatever the interpreter is NAMED, with each
-        # flag alone and in any number - the operator's own doing if it is not python.
+        # The printed shape stays decided whatever the interpreter is NAMED - with the
+        # EXACT flags the kit prints, both -E and -s, alone, in the printed order
+        # (kittrial-5bb.265 item 2: a line without -E obeys PYTHONPATH if sshd passes the
+        # environment; a partial or reordered flag set is group two).
         for interpreter in ('/usr/bin/python3', '/bin/sh', '/usr/bin/exec'):
-            for flags in ('', '-E ', '-s ', '-E -s '):
-                line = key_line_text(self.root).replace(
-                    '/usr/bin/python3 -E -s ',
-                    interpreter + ' ' + flags + KIT.as_posix() + '/ssh_forced_command.py ')
-                with self.subTest(interpreter=interpreter, flags=flags.strip()):
-                    file = Path(self.tmp.name)/'authorized_keys'
-                    file.write_text(line + '\n', encoding='utf-8')
-                    listing = admin.authorized_keys_listing(self.root, str(file))
-                    self.assertEqual([1], listing['would_be_refused'])
-                    self.assertEqual([], listing['may_be_refused'])
+            line = key_line_text(self.root).replace(
+                '/usr/bin/python3 -E -s ',
+                interpreter + ' -E -s ' + KIT.as_posix() + '/ssh_forced_command.py ')
+            with self.subTest(interpreter=interpreter):
+                file = Path(self.tmp.name)/'authorized_keys'
+                file.write_text(line + '\n', encoding='utf-8')
+                listing = admin.authorized_keys_listing(self.root, str(file))
+                self.assertEqual([1], listing['would_be_refused'])
+                self.assertEqual([], listing['may_be_refused'])
+        # Every PARTIAL flag shape is group two under the exact rule.
+        for flags in ('', '-E ', '-s ', '-s -E '):
+            line = key_line_text(self.root).replace('/usr/bin/python3 -E -s ',
+                                                    '/usr/bin/python3 ' + flags)
+            with self.subTest(flags=flags.strip() or 'none'):
+                file = Path(self.tmp.name)/'authorized_keys'
+                file.write_text(line + '\n', encoding='utf-8')
+                listing = admin.authorized_keys_listing(self.root, str(file))
+                self.assertEqual([], listing['would_be_refused'])
+                self.assertEqual([1], listing['may_be_refused'])
+        # A bare interpreter name (the authorized-keys --python NAME spelling) is group two.
+        bare = key_line_text(self.root).replace('/usr/bin/python3 -E -s ', 'python3 -E -s ')
+        file = Path(self.tmp.name)/'authorized_keys'
+        file.write_text(bare + '\n', encoding='utf-8')
+        listing = admin.authorized_keys_listing(self.root, str(file))
+        self.assertEqual([], listing['would_be_refused'])
+        self.assertEqual([1], listing['may_be_refused'])
         # And every line authorized-keys PRINTS is decided: drive the printer itself.
         pub = Path(self.tmp.name)/'pub'
         pub.write_text(ssh_line_of_key(), encoding='utf-8')
@@ -1385,45 +1418,82 @@ class SettingsCommandTests(unittest.TestCase):
         self.assertIsNone(listing['wrapper_names_setting'].get(1))
 
     def test_flag_value_shapes_and_survivors(self):
-        """kittrial-5bb.250 r5 item 3, the named survivors, each pinned once: on's
-        may_be_refused_more always present (0 when the group is empty); a non-ASCII letter
-        (str.isalnum mutants); a wrapper READ failure hint None (a WRITE-failure 513-byte
-        path hint None too - the bound applies at the hint open); a relative --root group
-        two; a no-op on printing no preview."""
-        # on's JSON carries may_be_refused_more even when the group is empty.
+        """kittrial-5bb.265 item 1, each pin made to hold: may_be_refused_more on a
+        NON-empty group in on's JSON; a non-ASCII letter in the PATH (the whitelist test
+        that mattered - in the flag word the rule rejects it anyway); a wrapper READ
+        failure (the open succeeds, the read fails) hint None; the 512-byte bound built
+        from several components so the directory actually exists; a relative --root whose
+        name exists from one directory; a no-op on printing no preview."""
+        # may_be_refused_more counted on a NON-empty group: two shim lines of another
+        # wrapper put two lines in group two, and on's JSON says 2 (0 was the only value
+        # the old assertion could see).
+        shim = Path(self.tmp.name)/'shim-survivor'
+        shim.mkdir()
+        (shim/'ssh_forced_command.py').write_text('#!/bin/sh\nexec true\n', encoding='utf-8')
         file = Path(self.tmp.name)/'authorized_keys'
-        file.write_text(key_line_text(self.root) + '\n', encoding='utf-8')
+        file.write_text(key_line_text(self.root, kit=shim) + '\n'
+                        + key_line_text(self.root, kit=shim) + '\n', encoding='utf-8')
         result = admin.bound_keys_only_switch(self.root, 'on', OPERATOR, str(file))
+        self.assertEqual([1, 2], result['may_be_refused'])
         self.assertEqual(0, result['may_be_refused_more'])
+        self.assertEqual(2, result['may_be_refused'][0] and len(result['may_be_refused']))
         admin.bound_keys_only_switch(self.root, 'off', OPERATOR)
-        # A non-ASCII letter anywhere in the command: group two (str.isalnum is not the
-        # whitelist - the plain set is ASCII-only).
-        nonascii = key_line_text(self.root).replace('/usr/bin/python3 -E -s ',
-                                                    '/usr/bin/python3 -E -s\u00e9 ')
-        file.write_text(nonascii + '\n', encoding='utf-8')
-        listing = admin.authorized_keys_listing(self.root, str(file))
-        self.assertEqual([1], listing['may_be_refused'])
-        self.assertEqual([], listing['would_be_refused'])
-        # A wrapper path over the bound: hint None at the hint open (a 513-byte path under
-        # a real directory gave True before the bound was applied there).
-        long_kit = Path(self.tmp.name)/('x' * 480)
+        # A non-ASCII letter in the PATH (not the flag word): group two by the whitelist.
+        accented = Path(self.tmp.name)/'accenté-kit'
         try:
-            long_kit.mkdir()
+            accented.mkdir()
         except OSError:
-            long_kit = None
-        if long_kit is not None:
-            shutil.copy(KIT/'ssh_forced_command.py', long_kit/'ssh_forced_command.py')
-            wrapper = long_kit/'ssh_forced_command.py'
-            if len(str(wrapper)) > 512:
-                file.write_text(key_line_text(self.root, kit=long_kit) + '\n', encoding='utf-8')
-                listing = admin.authorized_keys_listing(self.root, str(file))
-                self.assertEqual([1], listing['may_be_refused'])
-                self.assertIsNone(listing['wrapper_names_setting'].get(1))
-        # A relative --root is group two.
+            accented = None
+        if accented is not None:
+            shutil.copy(KIT/'ssh_forced_command.py', accented/'ssh_forced_command.py')
+            file.write_text(key_line_text(self.root, kit=accented) + '\n', encoding='utf-8')
+            listing = admin.authorized_keys_listing(self.root, str(file))
+            self.assertEqual([1], listing['may_be_refused'])
+            self.assertEqual([], listing['would_be_refused'])
+        # A wrapper READ failure (the open succeeds on a regular file; the READ fails):
+        # patch os.read over the descriptor and assert hint None, never True.
+        other = Path(self.tmp.name)/'read-fails'
+        other.mkdir()
+        shutil.copy(KIT/'ssh_forced_command.py', other/'ssh_forced_command.py')
+        file.write_text(key_line_text(self.root, kit=other) + '\n', encoding='utf-8')
+        real_read = os.read
+        def failing_read(fd, n):
+            for entry in ('read-fails',):
+                path = os.readlink('/proc/self/fd/%d' % fd) if os.path.isdir('/proc/self/fd') else ''
+                if entry in path:
+                    raise OSError('the read failed')
+            return real_read(fd, n)
+        with mock.patch.object(os, 'read', failing_read):
+            listing = admin.authorized_keys_listing(self.root, str(file))
+        self.assertEqual([1], listing['may_be_refused'])
+        self.assertIsNone(listing['wrapper_names_setting'].get(1))
+        # The 512-byte bound, built from components that exist: nested directories of
+        # ordinary names, none long enough to fail mkdir, totalling over 512 bytes.
+        deep = self.tmp.name
+        for number in range(6):
+            deep = str(Path(deep)/('component-%02d-of-the-bound' % number))
+        try:
+            Path(deep).mkdir(parents=True, exist_ok=True)
+        except OSError:
+            deep = None
+        if deep is not None and len(str(Path(deep)/'ssh_forced_command.py')) > 512:
+            shutil.copy(KIT/'ssh_forced_command.py', Path(deep)/'ssh_forced_command.py')
+            file.write_text(key_line_text(self.root, kit=Path(deep)) + '\n', encoding='utf-8')
+            listing = admin.authorized_keys_listing(self.root, str(file))
+            self.assertEqual([1], listing['may_be_refused'])
+            self.assertIsNone(listing['wrapper_names_setting'].get(1))
+        # A relative --root whose name EXISTS from the working directory (the old shape
+        # tested a name that resolved nowhere): run from the tmp folder, where the name
+        # resolves to the real root, and the line is STILL group two.
         relative_root = key_line_text(self.root).replace(
-            '--root ' + self.root.as_posix(), '--root ' + 'rel-root')
+            '--root ' + self.root.as_posix(), '--root ' + os.path.basename(self.root.as_posix()))
         file.write_text(relative_root + '\n', encoding='utf-8')
-        listing = admin.authorized_keys_listing(self.root, str(file))
+        saved = os.getcwd()
+        os.chdir(self.tmp.name)
+        try:
+            listing = admin.authorized_keys_listing(self.root, str(file))
+        finally:
+            os.chdir(saved)
         self.assertEqual([], listing['would_be_refused'])
         self.assertEqual([1], listing['may_be_refused'])
         # A no-op on prints no preview (not even the refused group's warning).
@@ -1435,6 +1505,79 @@ class SettingsCommandTests(unittest.TestCase):
         self.assertFalse(noop['changed'])
         self.assertNotIn('refuse', said.getvalue())
         admin.bound_keys_only_switch(self.root, 'off', OPERATOR)
+
+    def test_status_and_on_each_open_the_keys_file_once(self):
+        """kittrial-5bb.265 item 1: no test counted the opens of status and of on - one
+        listing per command means ONE keys-file open each, and the wrapper hint opens at
+        most once per distinct wrapper path across the whole command."""
+        other = Path(self.tmp.name)/'counted-release'
+        other.mkdir()
+        shutil.copy(KIT/'ssh_forced_command.py', other/'ssh_forced_command.py')
+        file = Path(self.tmp.name)/'authorized_keys'
+        file.write_text(key_line_text(self.root) + '\n' + key_line_text(self.root, kit=other) + '\n',
+                        encoding='utf-8')
+        real_open = os.open
+        opens = []
+        def counting(path, flags, *args, **kwargs):
+            opens.append(str(path))
+            return real_open(path, flags, *args, **kwargs)
+        for action in ('status', 'on'):
+            # `off` reads no keys file at all - its own assertion below.
+            with mock.patch.object(os, 'open', counting):
+                admin.bound_keys_only_switch(self.root, action, OPERATOR, str(file))
+            with self.subTest(action=action):
+                self.assertEqual(1, len([p for p in opens if p.endswith('authorized_keys')]),
+                                 (action, opens))
+                self.assertLessEqual(len([p for p in opens if 'counted-release' in p]), 1,
+                                     (action, opens))
+            opens.clear()
+        with mock.patch.object(os, 'open', counting):
+            admin.bound_keys_only_switch(self.root, 'off', OPERATOR)
+        self.assertEqual([], [p for p in opens if p.endswith('authorized_keys')], opens)
+
+    def test_relative_endpoint_and_ill_formed_project_are_said(self):
+        """kittrial-5bb.265 item 6 (lines 78/79): a group-one line with a relative
+        --endpoint or an ill-formed project name is refused for another reason, and the
+        listing says so - not silently."""
+        # A relative --endpoint: group one shape, refused before the setting.
+        relative_endpoint = key_line_text(self.root).replace(
+            (KIT/'endpoint.py').as_posix(), 'rel-endpoint/endpoint.py')
+        file = Path(self.tmp.name)/'authorized_keys'
+        file.write_text(relative_endpoint + '\n', encoding='utf-8')
+        listing = admin.authorized_keys_listing(self.root, str(file))
+        self.assertEqual([1], listing['would_be_refused'])
+        self.assertIn('relative or ill-formed --endpoint', ' '.join(listing['notes']))
+        # An ill-formed project name: group one shape, refused before the setting.
+        ill_formed = key_line_text(self.root, bound=' --project UPPER --principal ' + MINE)
+        file.write_text(ill_formed + '\n', encoding='utf-8')
+        listing = admin.authorized_keys_listing(self.root, str(file))
+        self.assertEqual([1], listing['would_be_refused'])
+        self.assertIn('ill-formed --project name', ' '.join(listing['notes']))
+
+    def test_a_megabyte_line_of_path_components_is_decided_fast(self):
+        """kittrial-5bb.265 item 5: a single 1 MB line of 200,000 path components used to
+        cost ~40 s; the 512-byte bound is applied before any path work, so the line is
+        group two in milliseconds."""
+        file = Path(self.tmp.name)/'authorized_keys'
+        huge = 'kit/' * 100000 + 'ssh_forced_command.py'
+        file.write_text(key_line_text(self.root).replace(
+            (KIT/'ssh_forced_command.py').as_posix(), huge) + '\n', encoding='utf-8')
+        started = time.monotonic()
+        listing = admin.authorized_keys_listing(self.root, str(file))
+        elapsed = time.monotonic() - started
+        self.assertEqual([], listing['would_be_refused'])
+        self.assertEqual([1], listing['may_be_refused'])
+        self.assertLess(elapsed, 5.0, 'a 1 MB component line took %.1fs' % elapsed)
+
+    def test_bare_interpreter_name_is_group_two_and_said(self):
+        """kittrial-5bb.265 item 2: the --python NAME spelling prints a bare name; group
+        two, and the docs say so (pinned here by the rule's own behaviour)."""
+        bare = key_line_text(self.root).replace('/usr/bin/python3 -E -s ', 'python3 -E -s ')
+        file = Path(self.tmp.name)/'authorized_keys'
+        file.write_text(bare + '\n', encoding='utf-8')
+        listing = admin.authorized_keys_listing(self.root, str(file))
+        self.assertEqual([], listing['would_be_refused'])
+        self.assertEqual([1], listing['may_be_refused'])
 
     def test_status_bounds_the_audit_entries_it_prints(self):
         """kittrial-5bb.250 F7: the audit list is hand-editable; the entries status prints

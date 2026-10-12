@@ -1,9 +1,9 @@
 {
   "schema_version": 1,
-  "operation_id": "caprev-5bb250-bound-keys-r5-0006",
+  "operation_id": "caprev-5bb265-bound-keys-0001",
   "key": "ssh.bound-keys-only",
-  "revision": 3,
-  "expected_sha256": "abb850aca4b448b28a8bc2be52a6080371280dde639ea01f6f195a05f5343bd0",
+  "revision": 5,
+  "expected_sha256": "544ea2395af20f970a581931d031af93443600711fcfe587437dc6fb3fdd164f",
   "name": "Bound keys only: the setting, its audited switch, and a preview that says what it did not decide",
   "aliases": [
     "bound keys only",
