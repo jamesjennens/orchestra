@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "operation_id": "caprev-5bb210-web-merge-slot-0003",
+  "operation_id": "caprev-5bb267-block-followups-0001",
   "key": "projects.coordinator-role-and-grant",
   "name": "A coordinator role and personal-agent grant for approvals and the web merge slot",
   "aliases": [
@@ -14,9 +14,12 @@
     "web merge slot",
     "take and release the merge slot",
     "owner force release",
-    "web coordinator slice 2 merge slot"
+    "web coordinator slice 2 merge slot",
+    "web authority endpoint",
+    "endpoint authority table",
+    "unknown authority action"
   ],
-  "summary": "Coordinator roles and personal-agent grants supply reviews.approve and coordinate while the account holds them; worker credentials do not. Agents never approve their own party. The endpoint table binds action/operation to required capability and project; slot mismatches are refused before tracker or authority reads. One verified_web_authority helper checks configured live authority. GET slot reads native holder/context. Take/release use coordinate and bound usr_/agent_ names; force-release with expected holder/reason and explicit repair need a signed-in owner or superuser, never an agent. Native context/guarded receipts/web audit are reused. No silent creation; missing/damaged slots have recovery. Stable retries cannot release a later holder; each write saves deduplicated project/task/actor/opid/before-after audit before its HTTP receipt. Page and named client ship together; repeated uncertain repairs keep their retry. Host answers and independent_approval remain. Approved .261 is integrated in the accepted base; unknown table actions and second-process authority remain separate. No facts/integration action/provenance/new store/switch.",
+  "summary": "Coordinator roles and personal-agent grants supply reviews.approve and coordinate while the account holds them; worker credentials do not. Agents never approve their own party. The endpoint table binds action/operation to capability and project; a carried block for an absent action/operation is refused before action locks, reservation or effects. The preceding worker namespace check may read registry/native rows. Nontext capabilities refuse403, and forged review help/list attachments reserve nothing. No-block host calls retain their behavior. One verified_web_authority helper checks configured live authority. Web merge-slot read/take/release use native holder/context; force-release and explicit repair need an owner/superuser, never an agent. Stale/repeated recovery preserves holder and audit; page and named client ship together. Host rules and independent approval remain. Older service without can_decide leaves newer page without an owner decision form. No web facts/integration writer or new store/switch.",
   "requirements": [],
   "anchors": [
     "docs/HTTP_DEPLOYMENT.md#coordinators-a-role-and-a-grant-that-lets-an-agent-approve",
@@ -46,7 +49,8 @@
     "http_authority.py::block_mismatch_denial",
     "http_service.py::ApiHandler._decides",
     "http_service.py::ApiHandler.proposals_dispose",
-    "http_authority.py::required_capability"
+    "http_authority.py::required_capability",
+    "http_authority.py::decide"
   ],
   "tests": [
     "tests/test_coordinator_grant.py",
@@ -55,7 +59,8 @@
     "tests/web_merge_slot_screen.mjs",
     "tests/web_merge_slot_repair_screen.mjs",
     "tests/test_endpoint_authority_block.py",
-    "tests/test_http_proposals.py"
+    "tests/test_http_proposals.py",
+    "tests/test_authority_block_followups.py"
   ],
   "owner": "person:orchestra-coordinator",
   "tags": [
@@ -63,6 +68,6 @@
     "http",
     "identity"
   ],
-  "revision": 5,
-  "expected_sha256": "1d4ac45fb9069be14eea9a6a3ded640a6f7f9761c5d6328bb03a6638127b3e3e"
+  "revision": 7,
+  "expected_sha256": "dde125463ed9f23f68572b9354adfdf3b4181bab2b906fbf46c2c80b972407cd"
 }

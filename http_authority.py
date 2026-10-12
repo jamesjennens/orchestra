@@ -502,6 +502,8 @@ def decide(state, request, *, now=None, allow_self_user=None):
     capability = request.get('capability')
     if via not in ('session', 'credential') or not user_id:
         raise deny(401, 'unauthenticated', 'Authentication required')
+    if not isinstance(capability, str):
+        raise deny(403, 'forbidden', 'The live-authority descriptor must name a capability as text')
 
     if via == 'credential':
         credential = state.get('credentials', {}).get(request.get('credential_id'))
@@ -2163,8 +2165,8 @@ def descriptor_actor_denial(request, authority_config, reserved):
 #: (kittrial-5bb.261): endpoint action -> the capability ``http_service.py`` asks for the
 #: route that sends it. A mapping value is keyed by the action's operation (the first
 #: argument; for ``review`` the ``operation`` of the attached record), with ``None`` for
-#: every other operation of that action. An action or operation that is not here is not
-#: judged for its capability by ``block_mismatch_denial``. The five service-only actions
+#: every other operation of that action. A request carrying a block is refused if its
+#: action or operation is absent from this table. The five service-only actions
 #: are not judged there at all: they carry their own exact check
 #: (``project_creation.SERVICE_ACTIONS``).
 BLOCK_CAPABILITIES = {
@@ -2192,13 +2194,15 @@ def required_capability(request):
     record is found and parsed exactly as ``work.execute`` does it, so the operation judged
     here is the operation carried out.
     """
-    needed = BLOCK_CAPABILITIES.get(request.get('action', 'bd'))
+    action = request.get('action', 'bd')
+    if not isinstance(action, str):
+        return None
+    needed = BLOCK_CAPABILITIES.get(action)
     if needed is None or not isinstance(needed, dict):
         return needed
     args = request.get('args')
     if not isinstance(args, list) or not args or any(not isinstance(token, str) for token in args):
         return None
-    action = request.get('action')
     if action in ('coordinate', 'web-merge-slot'):
         if len(args) != 1:
             return None
@@ -2232,10 +2236,13 @@ def block_mismatch_denial(request, authority_config):
     with the request it travels with (kittrial-5bb.261, an older gap): an approval sent with
     a block naming ``reviews.write`` was carried out where ``coordinator_writes`` is off, and
     a block naming project A on a request for project B was carried out in B. Launched by
-    the service, a request with a block is refused here, before any lock, tracker read or
-    write, when the block's project is not the request's project, or when the block's
-    capability is not the one ``BLOCK_CAPABILITIES`` gives for the action. Over SSH there is
-    no launch configuration and a block a caller sends is ignored, as before.
+    the service, a request with a block is refused here when its project or capability
+    does not fit the request, or its action/operation is absent from the table. This
+    comparison itself reads nothing. Except for the slot's earlier structural check,
+    the endpoint calls it after descriptor_actor_denial, which can read the session
+    registry and export a worker credential's native rows before their first check;
+    the comparison precedes action locks, operation reservations and effects. Over
+    SSH there is no launch configuration and a caller's block is ignored, as before.
     """
     if authority_config is None:
         return None
@@ -2243,7 +2250,8 @@ def block_mismatch_denial(request, authority_config):
     if not isinstance(authority, dict):
         return None
     from project_creation import SERVICE_ACTIONS
-    if request.get('action') in SERVICE_ACTIONS:
+    action = request.get('action', 'bd')
+    if isinstance(action, str) and action in SERVICE_ACTIONS:
         # The service-only actions hold this rule themselves, with their own sentences
         # (``project_creation.service_descriptor``: exactly the capability of the action; and
         # the project, where the action has one). They are answered as before.
@@ -2252,7 +2260,10 @@ def block_mismatch_denial(request, authority_config):
         return _envelope(126, stderr='The live-authority descriptor names another project than the one this request '
                                      'is for; nothing was changed\n', authority_status=403)
     needed = required_capability(request)
-    if needed is not None and authority.get('capability') != needed:
+    if needed is None:
+        return _envelope(126, stderr='The web authority table does not allow this action or operation; '
+                                     'nothing was changed\n', authority_status=403)
+    if authority.get('capability') != needed:
         return _envelope(126, stderr='The live-authority descriptor does not name the capability this request needs '
                                      '(%s); nothing was changed\n' % needed, authority_status=403)
     return None

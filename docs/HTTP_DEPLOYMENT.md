@@ -1035,6 +1035,14 @@ The rules:
     descriptor for every action under such an actor, whether or not the process was
     started with `--require-authority`, and the descriptor must name that actor (the
     account, or the agent whose credential it carries).
+  - A carried block must also name the request's project and the capability its
+    action/operation needs in the shared endpoint table. An action or operation
+    absent from that table is refused with 403 before reserving an operation or
+    writing native state. A malformed capability is a refusal sentence, not an
+    uncertain outcome. The preceding worker namespace check can read the registry
+    and native rows; the table comparison itself reads nothing. Service reads send
+    no block, and the host route without service launch configuration still ignores
+    a caller-supplied block.
   - A worker credential's actor namespace cannot have the shape of an account or agent
     id other than the issuer's own account id.
 - **The reservation does not reach back in time.** A kit from before this slice has no
@@ -1058,6 +1066,8 @@ The rules:
 - **Rollback.** A kit from before this slice reads a web-written disposition as inert:
   the proposal shows its earlier state there, with a warning. Nothing is lost, backups
   and restores are unaffected, and the newer kit reads it as counted again.
+  - A newer page talking to an older service that omits `can_decide` shows no owner
+    decision form; it fails closed until the service supplies that permission.
   - Do **not** follow the older kit's advice for such a disposition. Its refusal says
     "re-adding them (`admin.py operators add ACTOR`) makes those records count again".
     For a web disposition the author is an account id: adding `usr_...` to the operator
