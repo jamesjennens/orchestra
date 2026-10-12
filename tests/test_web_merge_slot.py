@@ -151,8 +151,17 @@ class NativeWebSlotTests(RulesHelpers, unittest.TestCase):
     def test_independent_approval_is_still_required_before_acquisition(self):
         self.deployment(operators=[], coordinator_writes=True, independent_approval=True)
         harness, token = self.web();task = self.task();before = self.rows()
-        reply = self.request(harness, token, 'acquire', {'task_id': task, 'target': 'main'}, key='no-approval-slot-1')
+        original_endpoint = harness.backend._endpoint;answers = []
+        def record_endpoint(*args, **kwargs):
+            answer = original_endpoint(*args, **kwargs);answers.append(answer);return answer
+        from unittest.mock import patch
+        with patch.object(harness.backend, '_endpoint', side_effect=record_endpoint):
+            reply = self.request(harness, token, 'acquire', {'task_id': task, 'target': 'main'}, key='no-approval-slot-1')
         self.assertEqual(reply.status, 409, reply.data);self.assertEqual(self.rows(), before)
+        self.assertEqual(answers[-1]['refused'], 'coordinator-rule')
+        self.assertEqual(reply.data['error']['message'], answers[-1]['stderr'].strip())
+        self.assertIn('installation setting independent_approval is on', reply.data['error']['message'])
+        self.assertIn('--rule independent_approval --actor OPERATOR', reply.data['error']['message'])
 
     def test_roles_grant_removal_demotion_and_owner_only_recovery(self):
         self.deployment(operators=[], coordinator_writes=True)

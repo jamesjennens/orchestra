@@ -116,11 +116,15 @@ def apply(payload, actor, run, project, operation_id, *, operators=None,
             from reserved_comments import is_record_anchor
             if not isinstance(row, dict) or coordination.is_merge_slot(row) or is_record_anchor(row):
                 raise SlotError(422, 'The merge-slot task must be one ordinary native task')
+        from review_workflow import CoordinatorRuleRefusal
         try:
             native = coordination.apply_native(command, actor, run, project, operators=operators,
                                                coordinator_writes=coordinator_writes,
                                                independent_approval=independent_approval,
                                                owners=owners, verified_web_authority=True)
+        except CoordinatorRuleRefusal:
+            # Keep the rule type for the endpoint marker and full HTTP sentence.
+            raise
         except ValueError as error:
             raise SlotError(409, str(error)) from None
         if operation == 'acquire' and native.get('acquired') is not True:

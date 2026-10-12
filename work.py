@@ -71,11 +71,7 @@ VALUE_OPTIONS = {'--owner', '--state', '--limit', '--offset', '--handoff-limit',
 #: At most this many request ids are named per work item (a review record holds at most 20 items).
 PENDING_REQUEST_IDS_MAX = 20
 
-#: One sentence for a contribution that waits for somebody else's approval (kittrial-5bb.197
-#: review request 01a12894, item 3b). It is carried by `work` and `brief` whether the
-#: installation's approval rules are on or off, so a reader of either learns what the
-#: contribution is waiting for without reading the setting. It is deliberately short: the
-#: brief is bounded, and this field must not push a long prior chain past the bound.
+#: Bounded author/assignee explanation when independent approval is required.
 APPROVAL_WAIT = 'Waiting for somebody else\'s approval of the current contribution.'
 
 # Compact owned-work context, not a recipient or authorization inference.
@@ -495,7 +491,22 @@ class Parser(argparse.ArgumentParser):
         hint=next((text for flag,text in MISTAKEN_FLAGS.items() if flag in message),None)
         raise ValueError(message+('; hint: '+hint if hint else ''))
 
-def workflow(issue,scopes=None,operators=None,reverts=None,journal=None,invalid_reverts=None):
+def approval_wait(state, task, actor, assignee, author, independent_approval=False,
+                  owners=None, named_reviewer=False, move_text=None):
+    """Caller-relative waiting text, using the same next move as the work queue."""
+    if state != 'awaiting-review' or not author:
+        return None
+    from review_workflow import same_party
+    if independent_approval and actor and (
+            same_party(actor,author,owners) or (assignee and same_party(actor,assignee,owners))):
+        return APPROVAL_WAIT
+    if move_text is not None:
+        return move_text
+    return review_move(state,task,bool(actor) and actor==assignee,named_reviewer)[1]
+
+
+def workflow(issue,scopes=None,operators=None,reverts=None,journal=None,invalid_reverts=None,
+             actor=None,independent_approval=False,owners=None):
     from review_state import project as reviewed
     result=reviewed(issue,scopes,operators,reverts,journal,invalid_reverts)
     # Additive (kittrial-5bb.115): the standing reviewer recommendations for the current
@@ -503,15 +514,17 @@ def workflow(issue,scopes=None,operators=None,reverts=None,journal=None,invalid_
     # reader (review, brief, work) gets them from this one place.
     from review_recommendations import block as recommendations
     result.update(recommendations(issue,result))
-    # One sentence for a contribution that waits for somebody else's approval
-    # (kittrial-5bb.197 review request 01a12894, item 3b): `work` and `brief` both read
-    # this projection, and it is present whether the rules are on or off.
-    result['waiting_for_approval']=(APPROVAL_WAIT if result.get('review_state')=='awaiting-review'
-                                    and result.get('contribution') else None)
+    from review_workflow import author_key
+    named=bool(actor) and any(author_key(r.get('reviewer'))==author_key(actor)
+                             for r in result.get('pending_review_requests') or [])
+    result['approval_requires_other_party']=bool(independent_approval)
+    result['waiting_for_approval']=approval_wait(result.get('review_state'),issue.get('id'),actor,
+        issue.get('assignee'),(result.get('contribution') or {}).get('author'),
+        independent_approval,owners,named)
     return result
 
 def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes=None, journal=None,
-          reference_attention=False, verifiers=None):
+          reference_attention=False, verifiers=None,independent_approval=False,owners=None):
     """One page of the work queue.
 
     ``reverts`` and ``scopes`` are PER TASK: each is a mapping of task id to that
@@ -614,6 +627,7 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
                           'newer_activity_by_others':None,'newer_activity_own':None,
                           'newer_activity_coverage':None,'unresolved_directions':None,
                           'waiting_for_approval':None,
+                          'approval_requires_other_party':bool(independent_approval),
                           # A malformed row shows no validated review state, so whose move it
                           # is stays unknown rather than guessed (kittrial-5bb.249).
                           'whose_move':'unknown','next':UNKNOWN_MOVE_TEXT,
@@ -824,9 +838,9 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
                       # Additive (kittrial-5bb.52): the integration disagreement entries
                       # naming both facts and both scopes, and their rendered warnings.
                       'integration_disagreements':disagreements,'integration_warnings':integration_warnings,
-                      # Additive (kittrial-5bb.197 item 3b): one sentence when the current
-                      # contribution waits for another party's approval, rules on or off.
-                      'waiting_for_approval':(APPROVAL_WAIT if state=='awaiting-review' and contribution else None)})
+                      'approval_requires_other_party':bool(independent_approval),
+                      'waiting_for_approval':approval_wait(state,row['id'],actor,row.get('assignee'),
+                          contribution.get('author'),independent_approval,owners,review_request,move_text)})
     from briefing import checkpoint_queue_fields
     task_rows={row['id']:row for row in rows if isinstance(row,dict) and row.get('id')}
     # The bounded claimable-work view (kittrial-5bb.6 deliverable b): filter to the rows
@@ -937,7 +951,8 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
         from reserved_comments import RECORD_ANCHOR_LABELS
         rows=record_json.classify(rows,run,sorted(RECORD_ANCHOR_LABELS)+['gt:slot'], ['event','gate'])
         return queue(rows,actor,args,path/'.handoff-requests', operators=operators, journal=path,
-                     reference_attention=True, verifiers=verifiers)
+                     reference_attention=True, verifiers=verifiers,
+                     independent_approval=independent_approval,owners=owners)
     if len(args) not in (1,2):raise ValueError('Use review TASK [--file payload.json] or handoff TASK --file payload.json')
     task=args[0]
     if action=='review' and len(args)==1:
@@ -946,7 +961,8 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
         rows=read_event_rows(run)
         issue=task_row(rows,task)
         from review_state import scopes_for
-        return workflow(issue,scopes_for(rows,task),operators=operators,journal=path)
+        return workflow(issue,scopes_for(rows,task),operators=operators,journal=path,
+                        actor=actor,independent_approval=independent_approval,owners=owners)
     if len(args)!=2 or not args[1].startswith('@attachment:'):raise ValueError('A JSON file attachment is required')
     item=attachments.get(args[1].partition(':')[2],{})
     if not isinstance(item,dict) or item.get('flag') not in ('--file','-f') or not isinstance(item.get('text'),str):raise ValueError('Invalid attachment')

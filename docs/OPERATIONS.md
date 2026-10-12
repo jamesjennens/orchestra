@@ -470,8 +470,11 @@ three are deliberate, and all three are covered by the recovery:
 
 Slices 6 and 7 of [COORDINATORS_PER_PROJECT_DESIGN.md](COORDINATORS_PER_PROJECT_DESIGN.md)
 (kittrial-5bb.197), from the decisions recorded on kittrial-5bb.106. Three
-**per-installation** rules live in `deployment.private.json`, each absent or false = OFF, so
-**an installation that configures nothing behaves exactly as it did before**:
+**per-installation** rules live in `deployment.private.json`, each absent or false = OFF.
+All-off native writes remain compatible. Reader output is additive even with all rules
+off: `work` items and `review` include `approval_requires_other_party: false`, and the web
+brief's `review` includes `waiting_for_approval` and `approval_requires_other_party`.
+The existing waiting text is caller-relative; stdout is not byte-identical to older kits.
 
 | Key | With it ON |
 |---|---|
@@ -489,11 +492,24 @@ actor of a listed operator's principal may approve, take the slot and record an
 operator-only lifecycle fact alike. Names match by whole name and case.
 
 **What this cannot tell apart.** The comparison above is attribution, not authentication. Two
-actors of the same principal are one party; two actors with **no** principal are compared by
-their normalised names (case-folded, a `/`-namespace suffix dropped); and a name-only actor
-and a principal-bound actor can never be shown to be the same party, so they are treated as
-distinct. The lifecycle **assignee** is compared exactly, never folded. The reviewer
+actors are one party when their known principals are equal **or** their normalised names
+are equal (case-folded, a `/`-namespace suffix dropped). A spelling variant of the author
+or assignee is refused even if only that author or assignee is bound. Ownership lookup
+uses exact actor keys: a differently cased spelling of **another** actor of the same
+principal can evade that lookup and read as a distinct name. Bound keys and principals
+are the answer; a caller must not be able to invent another spelling. Conversely,
+different principals whose names fold together are refused as one party: `Dana`/`dana`,
+`erin/laptop`/`erin`, and `team/alice`/`team/bob`. Different unowned names still cannot be linked to a
+person; a principal identifies a lane, not necessarily a person. The lifecycle **assignee**
+is compared exactly, never folded. The reviewer
 recommendation route keeps its own person rule.
+
+**Assignment trust.** `lifecycle_authors` trusts the **current assignee** for implemented,
+tested and scope. Assignment itself is unrestricted by this rule: a worker can assign a
+task to itself, just as it can claim one. This does not permit that worker to record
+reviewed or integrated. Assignment provenance and historical reader trust require a
+separate design; the raw lifecycle-write guard protects new writes, without authenticating
+all historical facts or repairing them.
 
 **How to turn the rules on, in order.** They bind only where the caller's identity is the
 server's fact, not the caller's word. **Over an UNBOUND key the rules attribute but do not
@@ -516,25 +532,43 @@ export with the reader every other lifecycle read uses, and prints, for every re
 trusted fact, the actor who recorded it and whether the rule would allow it
 (`counts.would_be_refused` and `counts.tasks_with_would_be_refused`; at most
 `task_limit` tasks are listed and `truncated` says when there are more). **While a rule is
-OFF nothing is refused and nothing is written to stderr**: all-off is byte-identical to an
-installation that never had the rules, and the read-only report is the only preview. A fact
+OFF no authority refusal or rule warning is added to a valid write**. Native effects remain
+compatible with an installation that never configured the rules. Additive reader fields
+are present even all-off: `work` items and `review` have `approval_requires_other_party: false`;
+the web brief's `review` has `waiting_for_approval` and `approval_requires_other_party`.
+Caller-relative waiting text can also change JSON/stdout. The read-only report is a preview. A fact
 that an unlisted actor recorded while the rule was off is not rewritten and still reads as
 recorded: nothing is migrated, and the rule applies to the next write.
 
 **The approval rules refuse before any native write** and name the rule and the setting in
 the sentence, so nothing is recorded and the retry is the same operation. An already-written
 record keeps reading as it did: nothing is migrated. The project's session registry is read
-**only when a `coordinator_writes` write actually needs it** (an actor that is not a plain
-listed name) and only for `review approve` and `coordination merge-acquire`: with the rules
-off no registry is read at all, and a damaged registry does not stop `work`, `review`,
-`contribute`, or a listed operator's own approve or merge. When the registry is needed and
-cannot be read, only those two writes are refused, with a sentence saying how to turn the
-rule off.
+for these authority decisions:
+
+* `coordinator_writes`: approve or merge-acquire by an actor not named directly on the
+  operator list needs the registry's listed-principal comparison.
+* `lifecycle_authors`: the exact assignee's implemented/tested/scope and a directly listed
+  operator need no registry. Other actors need it to establish listed-principal authority.
+* `independent_approval`: every new approve and every reviewed/integrated/merge-acquire
+  checks ownership before trusting independent approval, even for a listed operator.
+
+When needed, an unreadable registry refuses the write before any effect, naming the
+setting and its recovery command. The endpoint marks these and ordinary rule refusals
+as `refused: coordinator-rule`; the web response puts the sentence in `error.message`,
+as well as the diagnostic detail. An older endpoint without the marker can still give
+the web service a generic message with its refusal in the detail. A missing registry or a valid registry without owners
+uses names; damaged JSON and permission errors do not. With the rules off these writes do
+not consult the registry. Reads remain available with name comparison when ownership is
+unavailable; `work`, `brief` and `review` may consult it for advisory caller-relative text.
+Contributing does not need this registry comparison.
 
 **`work` and `brief` say what a contribution is waiting for.** While a contribution is
 `awaiting-review`, both carry one sentence (`waiting_for_approval`) saying it waits for an
-approval from a party other than its author and the task's assignee. The sentence is present
-whether the rules are on or off.
+approval from another party **only to the author or assignee, when independent_approval is
+on**. Other callers, including named reviewers, see the next-move explanation from the
+same decision as `whose_move`. With the rule off, that explanation is used for everyone.
+The web brief recomputes this bounded field for its authenticated caller, rather than
+showing the service reader's explanation.
 
 **Where the rules are enforced.** `independent_approval` and `coordinator_writes` are host
 (endpoint/SSH) settings for the review write path, and between them they cover `reviewed`,
@@ -546,6 +580,10 @@ because the endpoint reads that authority again from the web service's live stat
 every such request and never goes by a name the caller sends. An agent without the grant
 is refused there. `independent_approval` applies to the web route as well: an
 owner approving their **own** web contribution is refused, and the refusal names the setting.
+The web service's separate `approval_by_another_party` rule also treats a person's agents
+and worker credentials in that project as that person's party, including own-agent work.
+A superuser's authority does not make their own party independent. Neither authority
+allows an ordinary caller to forge a web approval descriptor on the endpoint.
 The merge slot is not on the web route and stays with listed actors.
 
 **Recovery.** A rule is turned off by the same command (`... off --rule NAME`), effective
@@ -563,6 +601,13 @@ audit field it prints.
 by party) and the second refusal (`reviewed` and `integrated`, and the merge slot, need
 another party's approval of the **current** contribution). What remains outside the code is
 the limit above: over an unbound key this is attribution, not authentication.
+
+A task with **no contribution** cannot satisfy independent approval for reviewed,
+integrated or taking the slot. A sole coordinator cannot pass their own commit: another
+listed operator or an authorized web approver from another party must approve it. An
+operator may instead explicitly decide to turn the rule off for that release, using the
+audited recovery command above. Private review evidence is evidence, not authority to
+bypass this decision.
 
 
 ### sshd settings the boundary needs
@@ -686,7 +731,7 @@ history](#malformed-structured-history) (`void-record`).
 | `review-writes status\|on\|off --actor OPERATOR` | read or set the per-installation switch that allows **writing** the new review-workflow record shapes (`withdraw`, `request-review`, `resolve-item`, `decline-review`, an item `severity`, a request-changes `summary`). Readers in this kit understand those shapes either way; with the switch off (the default) a write of one is refused before any native write. See [Review-workflow write switch](#review-workflow-write-switch) | the deployment operator allowlist, checked before any write; `deployment.private.json` is the only source (there is no environment fallback) |
 | `checkpoint-provenance-writes status\|on\|off --actor OPERATOR` | read or set the per-installation switch that allows **writing** checkpoint provenance and direction dispositions (acknowledge, resolve, supersede). Readers in this kit understand them either way; with the switch off (the default) a checkpoint that asks for them is refused before any native write. See [Checkpoint provenance write switch](#checkpoint-provenance-write-switch) | the deployment operator allowlist, checked before any write; `deployment.private.json` is the only source |
 | `bound-keys-only status\|on\|off --actor OPERATOR [--file AUTHORIZED_KEYS]` | read or set the per-installation setting that **accepts bound keys only**: with it on, the forced command of an `authorized_keys` line refuses a line that names no project or no principal, and `setup-status` reports it. `status` and `on` report `would_be_refused` (the lines of this kit and this root the setting refuses, or would refuse while it is off) and `may_be_refused` with `may_be_refused_more` (the `command=` lines this preview does not decide, at most twenty named), read from `--file` or `~/.ssh/authorized_keys`; `on --without-preview` turns the setting on past the refusal an unreadable or partly-inspected keys file raises. Off is the default and the absent key, so an installation that configures nothing behaves as before. See [Accept bound keys only](#accept-bound-keys-only) | the deployment operator allowlist, checked before any write; `deployment.private.json` is the only source |
-| `coordinator-rules status\|on\|off [--rule lifecycle_authors\|independent_approval\|coordinator_writes] --actor OPERATOR` | read or set the three per-installation rules of the coordinators design, slices 6 and 7 (kittrial-5bb.197): who may record which lifecycle fact, that nobody passes their own work, and that approval and the merge slot belong to a listed actor of the project. `status` reports **all three**; `--rule` names the one `on`/`off` flips and is required for `on`/`off` (given at most once). Off is the default and the absent key, so an installation that configures nothing behaves as before. See [The coordinator rules](#the-coordinator-rules-who-may-write-which-fact-and-who-may-approve) | the deployment operator allowlist, checked before any write; `deployment.private.json` is the only source (there is no environment fallback) |
+| `coordinator-rules status\|on\|off [--rule lifecycle_authors\|independent_approval\|coordinator_writes] --actor OPERATOR` | read or set the three per-installation rules of the coordinators design, slices 6 and 7 (kittrial-5bb.197): who may record which lifecycle fact, that nobody passes their own work, and that approval and the merge slot belong to a listed actor of the project. `status` reports **all three**; `--rule` names the one `on`/`off` flips and is required for `on`/`off` (given at most once). Off is the default and the absent key; native writes stay compatible. All-off reader output adds `approval_requires_other_party: false` to `work` items and `review`, and `waiting_for_approval` and `approval_requires_other_party` to the web brief's `review`; waiting text is caller-relative. See [The coordinator rules](#the-coordinator-rules-who-may-write-which-fact-and-who-may-approve) | the deployment operator allowlist, checked before any write; `deployment.private.json` is the only source (there is no environment fallback) |
 | `lifecycle-authors PROJECT [--limit N]` | read-only: for every recorded trusted lifecycle fact of the project, the actor who recorded it, whether the `lifecycle_authors` rule would allow it (`allowed`, `would_be_refused`, `reason`) and the totals (`counts.would_be_refused`), plus whether the setting is currently on. Run it **before** turning `lifecycle_authors` on. It writes nothing and takes no `--actor`: shell access to the service account is already authority over the installation. At most `--limit` tasks (default 200) are listed and `truncated` says when there are more | none: read-only |
 | `proposal-review PROJECT --actor OPERATOR --file review.json` | record a coordinator disposition on a requirement proposal. The payload is `{schema_version, operation_id, key, previous, proposal_sha256, to_state, ...}`: `previous` is the `disposition_comment_id` and `proposal_sha256` the `sha256` that `proposal get` returned, so a stale read is refused before any write. `to_state` is `under-review` (the claim), `rejected` (with `reason`), `duplicate-of` (with `duplicate_of`), `needs-info` (with `question`), `escalated-to-owner` (with `escalation: {question, owner_identity, due_by}`) or `incorporated` (with `incorporation`, checked against the requirement record) | the deployment operator allowlist, checked before any read; the actor must be mapped to a person and must not be the submitter |
 | `proposal-decide PROJECT --actor OPERATOR --file decision.json` | record the owner decision on an escalated proposal: `to_state` `approved` or `rejected` (with `reason`), and `decision: {decision_id}` naming an existing native decision issue. Never a requirement id | the allowlist; the decider must be a different person than the escalator and must not be the submitter |
