@@ -5,6 +5,18 @@ export function mergeSlotPanel(ctx, project) {
   const panel = h('section', { class: 'panel', 'aria-label': 'Merge slot' });
   let revision = 0;
   let writing = false;
+  function showError(message, error) {
+    message.textContent = describe(error);
+    if (!error.retry) return;
+    const retry = h('button', { type: 'button', onclick: async () => {
+      if (writing) return;
+      writing = true; retry.disabled = true;
+      try { await error.retry(); writing = false; await draw(); }
+      catch (again) { showError(message, again); }
+      finally { writing = false; retry.disabled = false; }
+    } }, 'Retry the same request');
+    message.append(retry);
+  }
   async function draw() {
     const version = ++revision;
     let slot;
@@ -31,9 +43,7 @@ export function mergeSlotPanel(ctx, project) {
         if (confirm && !await confirmDialog({ title: label, body: 'Confirm this merge-slot change.', confirmLabel: label, danger: true })) return;
         writing = true; node.disabled = true;
         try { await work(); message.textContent = 'Saved.'; writing = false; await draw(); }
-        catch (error) { message.textContent = describe(error); if (error.retry) message.append(h('button', { type: 'button', onclick: async () => {
-          try { await error.retry(); await draw(); } catch (again) { message.textContent = describe(again); }
-        } }, 'Retry the same request')); }
+        catch (error) { showError(message, error); }
         finally { writing = false; node.disabled = false; }
       } }, label);
       return node;
@@ -58,7 +68,10 @@ export function mergeSlotPanel(ctx, project) {
       if (writing || (confirm && !await confirmDialog({ title: label, body: 'Create the missing slot or repair its native shape?', confirmLabel: label }))) return;
       writing = true; node.disabled = true;
       try { await work(); writing = false; await draw(); }
-      catch (error) { panel.append(h('p', { role: 'alert' }, describe(error))); }
+      catch (error) {
+        const message = h('p', { role: 'alert' });
+        panel.append(message); showError(message, error);
+      }
       finally { writing = false; node.disabled = false; }
     } }, label);
     return node;

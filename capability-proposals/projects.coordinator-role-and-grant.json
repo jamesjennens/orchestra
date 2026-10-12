@@ -46,7 +46,8 @@
     "tests/test_coordinator_grant.py",
     "tests/test_coordinator_grant_real.py",
     "tests/test_web_merge_slot.py",
-    "tests/web_merge_slot_screen.mjs"
+    "tests/web_merge_slot_screen.mjs",
+    "tests/web_merge_slot_repair_screen.mjs"
   ],
   "owner": "person:orchestra-coordinator",
   "tags": [

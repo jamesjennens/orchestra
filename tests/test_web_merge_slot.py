@@ -213,5 +213,28 @@ class NativeWebSlotTests(RulesHelpers, unittest.TestCase):
         self.assertEqual(control.status, 200, control.data)
         self.assertEqual(self.request(harness, token, 'release', {}, key='right-descriptor-release-1').status, 200)
 
+    def test_real_page_repair_keeps_its_retry_after_repeated_lost_responses(self):
+        import shutil
+        from test_http_web import run_node_module
+        node = shutil.which('node')
+        if not node:self.skipTest('Node is unavailable; the real repair page is not exercised')
+        harness, token = self.web();task = self.task()
+        self.coordinate('ops', 'merge-acquire', task, 'main')
+        damaged = self.r.bd('update', 'pp-merge-slot', '--status', 'closed', '--json')
+        self.assertEqual(damaged.returncode, 0, damaged.stderr)
+        done = run_node_module(self, node, 'await import(process.argv[1])',
+                               (KIT / 'tests/web_merge_slot_repair_screen.mjs').as_uri(),
+                               (KIT / 'tests/web_dom_shim.mjs').as_uri(),
+                               (KIT / 'web/js/api.js').as_uri(),
+                               (KIT / 'web/js/views/merge_slot.js').as_uri(),
+                               'http://127.0.0.1:' + str(harness.port), 'pp', token)
+        self.assertEqual(done.returncode, 0, done.stderr[-3000:])
+        proof = json.loads(done.stdout.strip().splitlines()[-1])
+        self.assertTrue(proof['stableKey']);self.assertTrue(proof['repeatedRetry']);self.assertTrue(proof['refreshRace'])
+        self.assertEqual(proof['repairRequests'], 3)
+        committed = [e for e in harness.service.state['audit'] if e['action'] == 'merge-slot.create' and e['outcome'] == 'committed']
+        self.assertEqual(len(committed), 1);self.assertEqual(committed[0]['holder_after'], 'ops')
+        self.coordinate('ops', 'merge-release')
+
 
 if __name__ == '__main__':unittest.main()
