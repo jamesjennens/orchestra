@@ -574,6 +574,19 @@ def key_project_refusal(request,key_projects):
     if not isinstance(project,str) or project not in key_projects:
         raise ValueError('Unknown/uninitialized project')
 
+def lanes_scope_for(actor,operators,key_principal):
+    """The lanes read's route isolation (kittrial-5bb.263): ``'all'`` or ``'own'``.
+
+    The host route (no bound key: ``key_principal`` is None) and a key bound to a
+    configured operator may see every lane; any other bound key is a contributor route and
+    sees only its own lane's row. A member of another project is refused earlier, by
+    ``key_project_refusal``, before any read at all. One function, so the scope cannot be
+    computed one way for one caller and another way for the next.
+    """
+    if key_principal is None:
+        return 'all'
+    return 'all' if actor in operators else 'own'
+
 def key_principal_refusal(request,path,key_principal):
     """Refuse, for a key bound to a principal, a request whose actor that principal does not own.
 
@@ -826,14 +839,20 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
         web_approval=(authority_config is not None and action=='review'
                    and isinstance(request.get('authority'),dict)
                    and request['authority'].get('capability')==CAP_APPROVE)
+        # The lanes read's route isolation (kittrial-5bb.263): the host route and a key
+        # bound to a configured operator may see every lane; any other bound key sees only
+        # its own row. `configured_operators` is read once here and passed on unchanged.
+        operators=configured_operators(root)
+        lanes_scope=lanes_scope_for(actor,operators,key_principal)
         def work_effect():
             result=work_execute(path,actor,action,args,request.get('attachments',{}),runner,
-                                operators=configured_operators(root),
+                                operators=operators,
                                 verifiers=configured_verifiers(root),
                                 review_writes=review_writes,
                                 independent_approval=rules['independent_approval'],
                                 coordinator_writes=rules['coordinator_writes'],
-                                owners=owners,web_approval=web_approval)
+                                owners=owners,web_approval=web_approval,
+                                lanes_scope=lanes_scope)
             # A handoff request and a decline are recorded in the kit's handoff journal and move
             # nothing in bd, so the runner saw no write; they are writes all the same (review
             # of kittrial-5bb.97). One that was already recorded (`reconciled`) wrote nothing.

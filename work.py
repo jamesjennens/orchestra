@@ -277,7 +277,8 @@ def help_payload(action='work'):
     """Machine-readable help returned through the normal JSON envelope on exit 0."""
     usage = {
         'work': 'work [--mine | --owner ACTOR] [--state STATE] [--claimable] [--limit N] [--offset N] '
-                '[--handoff-limit N] [--handoff-offset N] [--ref-limit N] [--ref-offset N] [--json]',
+                '[--handoff-limit N] [--handoff-offset N] [--ref-limit N] [--ref-offset N] [--json]'
+                ' | work lanes [--idle-minutes N] [--limit N] [--offset N] [--json]',
         'review': 'review TASK [--file payload.json]',
         'handoff': 'handoff TASK --file payload.json',
         'brief': 'brief TASK [--items-offset N] [--items-limit N] [--full] [--json]',
@@ -292,6 +293,7 @@ def help_payload(action='work'):
                'exit_codes': {'0': 'result or help JSON on stdout',
                               '2': 'validation/transport error on stderr; stdout is not written'}}
     if action == 'work':
+        import lanes
         payload['limits'] = {
             'limit': '%d..%d' % (WORK_LIMIT_MIN, WORK_LIMIT_MAX),
             'offset': '>= %d' % WORK_OFFSET_MIN,
@@ -303,6 +305,9 @@ def help_payload(action='work'):
             'proposal-offset': '>= %d' % WORK_OFFSET_MIN,
             'capability-limit': '%d..%d' % (WORK_LIMIT_MIN, WORK_LIMIT_MAX),
             'capability-offset': '>= %d' % WORK_OFFSET_MIN,
+            'lanes-idle-minutes': '%d..%d (work lanes; the threshold is an argument of the read, not a '
+                                  'setting)' % (lanes.IDLE_MINUTES_MIN, lanes.IDLE_MINUTES_MAX),
+            'lanes-limit': '%d..%d (work lanes)' % (lanes.LANES_LIMIT_MIN, lanes.LANES_LIMIT_MAX),
         }
         payload['output'] = {
             'top_level': ['owner', 'total', 'your_move', 'items', 'next_offset', 'coverage', 'attention', 'guidance'],
@@ -371,6 +376,20 @@ def help_payload(action='work'):
                             'newer_activity_by_others', 'newer_activity_own',
                             'newer_activity_coverage', 'unresolved_directions',
                             'recommended', 'recommended_by', 'contribution_author'],
+            'lanes': 'work lanes is the lanes board (kittrial-5bb.263, docs/LANE_BOARD_DESIGN.md): ONE '
+                     'export plus the session registry, one row per lane keyed by the session\'s '
+                     'registered name (a task with no lane reads as its assignee actor), bounded with '
+                     'total/items/next_offset like this queue. Each holding row carries its held tasks '
+                     '(id, title, review_state, whose_move, next_actor, work_state) and the declared '
+                     'state/waiting_on/expect_by of the newest usable Kind: lane-state-v1 record with the '
+                     'age of the checkpoint it names and the age of the lane\'s newest write anywhere; '
+                     'inferred true marks a row whose state is not declared. Three flags are carried: '
+                     'waiting_too_long (a waiting state older than --idle-minutes), expect_by_passed (a '
+                     'declared expect_by in the past) and your_move_idle (the holder\'s own move with no '
+                     'write for longer than the threshold). Lanes that hold nothing and wrote within 24 '
+                     'hours are listed idle with the age of that write. --idle-minutes is an argument of '
+                     'the read (default 15), not an installation setting. The contributor route shows a '
+                     'caller only its own lane\'s row.',
         }
     elif action == 'review':
         payload['operations'] = ['read (review TASK)', 'contribute', 'request-changes',
@@ -917,13 +936,19 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
     return result
 
 def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None,review_writes=None,
-            independent_approval=False,coordinator_writes=False,owners=None,web_approval=False):
+            independent_approval=False,coordinator_writes=False,owners=None,web_approval=False,
+            lanes_scope='all'):
     """``independent_approval``, ``coordinator_writes`` and ``owners`` are the slices
     6 and 7 settings and the project's actor -> principal map (kittrial-5bb.197),
     supplied by the endpoint; all default OFF/absent, so nothing changes for an
     installation that configures nothing. ``owners`` may be a callable, so the
     registry is read only when a rule needs it. ``web_approval`` says a verified web
-    owner approved through the web route (kittrial-5bb.199)."""
+    owner approved through the web route (kittrial-5bb.199).
+
+    ``lanes_scope`` is the route's lanes isolation (kittrial-5bb.263): ``'all'`` on the
+    host route and the bound-key coordinator route, ``'own'`` for a bound key whose actor
+    is not a configured operator, so a lane sees only its own board row. It defaults to
+    ``'all'``, so every existing caller is unchanged."""
     # Help is recognised anywhere as a standalone token and never touches the
     # native export, the coordination lock or an attachment.
     if help_requested(args):
@@ -935,6 +960,14 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
         rows=record_json.loads_rows(run(['export','--all']))
         from reserved_comments import RECORD_ANCHOR_LABELS
         rows=record_json.classify(rows,run,sorted(RECORD_ANCHOR_LABELS)+['gt:slot'], ['event','gate'])
+        if args[:1]==['lanes']:
+            # The lanes board (kittrial-5bb.263) reads the SAME export this action already
+            # loaded, plus the project's session registry: one pass, no per-task comment
+            # read. Its flags and aging live in lanes.py only.
+            from lanes import read as lanes_read
+            from sessions import read_registry
+            return lanes_read(rows,actor,read_registry(path),args[1:],operators=operators,
+                              journal=path,scope=lanes_scope)
         return queue(rows,actor,args,path/'.handoff-requests', operators=operators, journal=path,
                      reference_attention=True, verifiers=verifiers)
     if len(args) not in (1,2):raise ValueError('Use review TASK [--file payload.json] or handoff TASK --file payload.json')
