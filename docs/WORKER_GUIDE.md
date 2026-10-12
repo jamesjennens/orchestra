@@ -4,7 +4,7 @@ Use your existing client prefix for the Beads commands below. This guide is avai
 
 ## Which document for what
 
-`docs` lists the documents this installation serves; `docs NAME` returns one, always whole. Read the short ones first and keep the long ones for looking things up:
+`docs` lists the documents this installation serves; `docs NAME` returns one, always whole. `docs --status` reports every catalogued name as served with its size or refused with its sentence (release live verification; whoever may call `docs` may call it; the web route does not offer it). Read the short ones first and keep the long ones for looking things up:
 
 | Read | When | Size |
 |---|---|---|

@@ -212,7 +212,16 @@ class RealBdCoordinatorAcceptanceTests(unittest.TestCase):
             signal.signal(signum, previous)
         cls._signals = {}
         cls._stop_server()
-        cls._tmp.cleanup()
+        # Tried again while a late bd still writes (see test_bd_label_aliases.remove_scratch).
+        import time
+        for attempt in range(40):
+            try:
+                cls._tmp.cleanup()
+                break
+            except OSError:
+                if attempt == 39:
+                    raise
+                time.sleep(0.25)
 
     def ask(self, subcommand, body, actor=ACTOR):
         attachment = self.root / ('%s.json' % subcommand)
