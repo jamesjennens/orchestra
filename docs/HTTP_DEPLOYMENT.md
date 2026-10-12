@@ -2837,7 +2837,9 @@ line separately and unconfined.
   no longer read are excluded. Nothing is cached across requests
   by the attention calculation, and live authority is checked before every project.
   - **One action per own task, in this order:** `changes-requested` (priority 1, with
-    `requests`, the request-changes record ids), `blocked` (2: the latest checkpoint
+    `requests`, the request-changes record ids, and whose_move/next from the brief
+    route; `links.reviews` points at `GET /v1/projects/{id}/tasks/{task}/brief`
+    where a web agent reads the item text), `blocked` (2: the latest checkpoint
     lists an open `blocker` or `dependency` on undelivered work; with `open_items`,
     `blocking_items`, `blocked_since` and `newer_activity`),
     `in-progress` (3: claimed, not closed, nothing delivered yet, with `newer_activity`), then
