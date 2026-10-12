@@ -33,15 +33,33 @@ def validate(payload):
         except ValueError:
             raise SlotError(422, 'Supply a short native task id') from None
         text(payload['target'], 'target', 160)
+        plain(payload['target'], 'target')
     if operation == 'force-release':
         text(payload['expected_holder'], 'expected_holder', 96)
         text(payload['reason'], 'reason', 1000)
+        plain(payload['reason'], 'reason')
     return operation
 
 
 def text(value, field, bound):
     if not isinstance(value, str) or not value.strip() or len(value) > bound or '\0' in value:
         raise SlotError(422, field + ' must be nonblank text of at most ' + str(bound) + ' characters')
+
+
+def plain(value, field):
+    """The kit's plain-text rule for text other people read (kittrial-5bb.268 item 7).
+
+    The target is shown on the page and in the context file; the reason goes into the web
+    audit. Like the service's other reason fields (allow_actor_reason), they refuse control,
+    bidi, zero-width, C1, tag and variation-selector characters; tab, newline and carriage
+    return stay allowed. The expected holder is not checked here: it must equal the holder
+    bd reports, whatever that holds.
+    """
+    from review_workflow import plain_text
+    try:
+        plain_text(value, field)
+    except ValueError as error:
+        raise SlotError(422, str(error)) from None
 
 
 def snapshot(run, project, *, repair=False):
