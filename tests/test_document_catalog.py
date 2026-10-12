@@ -186,7 +186,90 @@ class BoundTests(unittest.TestCase):
         shown = json.loads(onboarding.execute(self.kit, self.project, 'example', 'worker', 'docs', ['--status']))
         by_name = {row['name']: row for row in shown['documents']}
         self.assertFalse(by_name['start']['served'])
-        self.assertIn('larger than the start document may be', by_name['start']['refused'])
+        # The bound is named for what it is (kittrial-5bb.262 C5): this row refused the file for
+        # the START bound the status read applies, which is tighter than the kit-document bound.
+        self.assertIn('larger than the start bound', by_name['start']['refused'])
+        self.assertIn('tighter than the kit-document bound', by_name['start']['refused'])
+
+    def test_docs_start_over_the_kit_bound_says_the_kit_document_bound(self):
+        """kittrial-5bb.262 C5: "The start document is larger than the start document may be"
+        never said WHICH of the two start bounds refused it; `docs start` applies the kit one."""
+        start = self.kit / onboarding.DOCUMENTS['start']
+        start.write_bytes(b'x' * (onboarding.KIT_DOCUMENT_LIMIT + 1))
+        with self.assertRaises(ValueError) as refused:
+            self.docs('start')
+        said = str(refused.exception)
+        self.assertIn('larger than the kit-document bound (over %d bytes)' % onboarding.KIT_DOCUMENT_LIMIT, said)
+        self.assertNotIn('start document may be', said)
+        self.assertNotIn('shorten', said)
+        self.assertIn('ask the operator to reinstall the kit', said)
+
+    def test_the_listing_says_size_only_for_served_names(self):
+        """kittrial-5bb.262 C6: the listing said "with its size" for refused names too."""
+        listed = onboarding.execute(self.kit, self.project, 'example', 'worker', 'docs', [])
+        self.assertIn('as served, with its size, or as refused', listed)
+        self.assertNotIn('every name as served or refused, with its size', listed)
+
+    def test_an_unreadable_document_is_refused_without_a_host_path_for_docs_and_onboard(self):
+        """kittrial-5bb.262 C4 (and C5): only the `--status` row was held to the path-free
+        sentence, so a mutant that prints the absolute path from `docs NAME` or `onboard`
+        survived. The sentence also NAMES the document now."""
+        import os
+        if os.name == 'nt' or (hasattr(os, 'geteuid') and os.geteuid() == 0):
+            self.skipTest('a mode cannot make a file unreadable here')
+        path = self.kit / onboarding.DOCUMENTS['workflow']
+        path.chmod(0)
+        self.addCleanup(path.chmod, 0o644)
+        with self.assertRaises(ValueError) as refused:
+            self.docs('workflow')
+        said = str(refused.exception)
+        self.assertNotIn(str(path), said)
+        self.assertNotIn(str(self.kit), said)
+        self.assertIn('ask the operator', said)
+        self.assertIn('The document "%s"' % onboarding.DOCUMENTS['workflow'], said)
+        # onboard reads the START document from the same directory: one unreadable document
+        # refuses the whole answer, with the same path-free sentence.
+        start = self.kit / onboarding.DOCUMENTS['start']
+        start.chmod(0)
+        self.addCleanup(start.chmod, 0o644)
+        with self.assertRaises(ValueError) as refused:
+            onboarding.execute(self.kit, self.project, 'example', 'worker', 'onboard', [])
+        said = str(refused.exception)
+        self.assertNotIn(str(start), said)
+        self.assertNotIn(str(self.kit), said)
+        self.assertIn('The document "%s"' % onboarding.DOCUMENTS['start'], said)
+        self.assertIn('ask the operator', said)
+
+    def test_an_unsearchable_documents_directory_is_refused_without_a_host_path(self):
+        """kittrial-5bb.262 C2: with kit/docs mode 000, `docs NAME` and `onboard` answered
+        `PermissionError: [Errno 13] Permission denied: /home/.../docs/WORKFLOW.md` - raised by
+        the symlink walk BEFORE the read - and `docs --status` named the path too."""
+        import json
+        import os
+        if os.name == 'nt' or (hasattr(os, 'geteuid') and os.geteuid() == 0):
+            self.skipTest('a mode cannot make a directory unsearchable here')
+        directory = self.kit / 'docs'
+        directory.chmod(0)
+        self.addCleanup(directory.chmod, 0o755)
+        with self.assertRaises(ValueError) as refused:
+            self.docs('workflow')
+        said = str(refused.exception)
+        self.assertNotIn(str(self.kit), said)
+        self.assertNotIn('Permission denied: /', said)
+        self.assertIn('The document "%s"' % onboarding.DOCUMENTS['workflow'], said)
+        self.assertIn('ask the operator', said)
+        with self.assertRaises(ValueError) as refused:
+            onboarding.execute(self.kit, self.project, 'example', 'worker', 'onboard', [])
+        said = str(refused.exception)
+        self.assertNotIn(str(self.kit), said)
+        self.assertIn('ask the operator', said)
+        # A refusal is a row, not a raise, and the row names the document without a host path.
+        shown = json.loads(onboarding.execute(self.kit, self.project, 'example', 'worker', 'docs', ['--status']))
+        by_name = {row['name']: row for row in shown['documents']}
+        self.assertFalse(by_name['workflow']['served'])
+        self.assertNotIn(str(self.kit), by_name['workflow']['refused'])
+        self.assertIn('The document "%s"' % onboarding.DOCUMENTS['workflow'], by_name['workflow']['refused'])
+        self.assertTrue(by_name['project']['served'])
 
     def test_docs_status_refuses_a_symlink_directory_or_fifo_without_hanging(self):
         import json

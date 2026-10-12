@@ -1836,6 +1836,42 @@ class HeldLockTests(Case):
                                                          key='account-zoe-2'))
         self.assertEqual(self.said(answer), (503, 'busy', self.BUSY))
 
+    def test_a_committed_write_that_lost_its_response_says_committed_and_reload(self):
+        """F1: two endpoint texts say the write WAS committed; the reader must reload."""
+        from http_service import HttpError
+        cases = [
+            'Operation is committed but its response exceeded the retention bound; reconcile canonical state before retrying.\n',
+            'Operation committed but the journal could not retain the response; reconcile canonical state before retrying.\n',
+        ]
+        for stderr in cases:
+            with self.subTest(stderr=stderr[:40]):
+                with self.assertRaises(HttpError) as caught:
+                    self.backend._checked({'returncode': 124, 'stdout': '', 'stderr': stderr}, 'bd')
+                self.assertEqual(str(caught.exception),
+                                 'Canonical command was committed; reload to see its result')
+
+    def test_a_repeat_of_a_reserved_key_and_an_empty_stderr_get_their_own_sentences(self):
+        from http_service import HttpError
+        cases = [
+            ('Operation identity reserved; outcome unknown. Reconcile canonical state before retrying.\n',
+             'Canonical command was already reserved; reconcile state before retrying'),
+            ('\n', 'Canonical command returned no explanation; outcome may be unknown'),
+        ]
+        for stderr, sentence in cases:
+            with self.subTest(stderr=stderr[:40]):
+                with self.assertRaises(HttpError) as caught:
+                    self.backend._checked({'returncode': 124, 'stdout': '', 'stderr': stderr}, 'bd')
+                self.assertEqual(str(caught.exception), sentence)
+
+    def test_a_connection_timeout_after_the_reservation_is_a_timeout(self):
+        """F2: OSError Connection timed out is the same class as a timed-out command."""
+        from http_service import HttpError
+        stderr = ('Effect raised after the reservation (OSError: [Errno 110] Connection timed out); '
+                  'outcome unknown. Reconcile canonical state before retrying.\n')
+        with self.assertRaises(HttpError) as caught:
+            self.backend._checked({'returncode': 124, 'stdout': '', 'stderr': stderr}, 'bd')
+        self.assertEqual(str(caught.exception), 'Canonical command timed out; outcome may be unknown')
+
     def test_a_non_timeout_reservation_failure_does_not_say_timed_out(self):
         """kittrial-5bb.173 item 3: 124 after a reservation is not only a timeout.
 

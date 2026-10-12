@@ -294,6 +294,85 @@ class InProcessCreateUndoCase(Harness):
         self.assertEqual(201, retry.status, retry.data)
         self.assertIn(retry.data['id'], self.service.state['projects'])
 
+    def test_a_failed_create_save_leaves_pre_existing_projects_alone(self):
+        """kittrial-5bb.266 F2: the undo takes back only what the failed create added.
+
+        A mutant whose undo removes by NAME takes an ARCHIVED project of the same name with it,
+        and one that always pops the membership loses a stale earlier membership: both damage a
+        project this create never touched. The code is right as probed; this holds it.
+        """
+        admin = self.admin_token()
+        self.create_account(admin, 'alex', 'alex-password-1')
+        alex = self.login('alex', 'alex-password-1')[0]
+        creator = self.admin_user['id']
+        archived = {'id': 'alpha', 'name': 'Alpha', 'created_by': creator,
+                    'created_at': '2026-01-01T00:00:00Z', 'archived': True}
+        other = {'id': 'beta', 'name': 'Beta', 'created_by': creator,
+                 'created_at': '2026-01-01T00:00:00Z', 'archived': False}
+        stale = {'someone-else': 'viewer'}
+        self.service.state['projects']['alpha'] = dict(archived)
+        self.service.state['memberships']['alpha'] = {creator: 'owner'}
+        self.service.state['projects']['beta'] = dict(other)
+        self.service.state['memberships']['beta'] = {creator: 'owner'}
+        # A membership under the id the new create uses, with no record of that id: the undo
+        # must put THIS back, not assume the id had none.
+        self.service.state['memberships']['gamma'] = dict(stale)
+        self.store.save()
+        write = self.store._write
+
+        def fail():
+            if 'gamma' in self.service.state['projects']:
+                raise OSError('synthetic create save failure')
+            return write()
+        with mock.patch.object(self.store, '_write', side_effect=fail):
+            # The archived project shares this NAME, so the name check allows the create: only
+            # the undo can touch it, which is the point here.
+            reply = self.request('POST', '/v1/projects', {'project_id': 'gamma', 'name': 'Alpha'},
+                                 token=alex, key='pre-existing-key')
+        self.assertEqual(500, reply.status, reply.data)
+        # Only the record the failed create added goes back out.
+        self.assertNotIn('gamma', self.service.state['projects'])
+        # The archived project of the SAME NAME and the second project are untouched...
+        self.assertEqual(archived, self.service.state['projects'].get('alpha'))
+        self.assertEqual({creator: 'owner'}, self.service.state['memberships'].get('alpha'))
+        self.assertEqual(other, self.service.state['projects'].get('beta'))
+        self.assertEqual({creator: 'owner'}, self.service.state['memberships'].get('beta'))
+        # ...and the stale membership under the new id is put back exactly, not dropped.
+        self.assertEqual(stale, self.service.state['memberships'].get('gamma'))
+        # Nothing the failed save did reached the file: it still holds the records above.
+        disk = json.loads(self.store.path.read_text(encoding='utf-8'))
+        self.assertNotIn('gamma', disk['projects'])
+        self.assertEqual(stale, disk['memberships'].get('gamma'))
+        self.assertEqual(archived, disk['projects'].get('alpha'))
+        self.assertEqual(other, disk['projects'].get('beta'))
+
+    def test_an_ordinary_create_with_an_existing_identifier_changes_nothing(self):
+        """kittrial-5bb.266 F2: the identifier conflict is refused before anything is added or
+        removed. A mutant that clears the existing record and membership before refusing
+        survives without this test."""
+        admin = self.admin_token()
+        self.create_account(admin, 'alex', 'alex-password-1')
+        alex = self.login('alex', 'alex-password-1')[0]
+        creator = self.admin_user['id']
+        existing = {'id': 'alpha', 'name': 'Alpha', 'created_by': creator,
+                    'created_at': '2026-01-01T00:00:00Z', 'archived': True}
+        self.service.state['projects']['alpha'] = dict(existing)
+        self.service.state['memberships']['alpha'] = {creator: 'owner'}
+        self.store.save()
+        before = json.loads(self.store.path.read_text(encoding='utf-8'))
+        reply = self.request('POST', '/v1/projects', {'project_id': 'alpha', 'name': 'Alpha Two'},
+                             token=alex, key='existing-identifier-key')
+        self.assertEqual(409, reply.status, reply.data)
+        self.assertIn('identifier already exists', reply.data['error']['message'])
+        # The existing record and its membership are exactly what they were, in memory and on
+        # disk, and no second record was added.
+        self.assertEqual(existing, self.service.state['projects'].get('alpha'))
+        self.assertEqual({creator: 'owner'}, self.service.state['memberships'].get('alpha'))
+        self.assertEqual({'alpha': existing}, self.service.state['projects'])
+        after = json.loads(self.store.path.read_text(encoding='utf-8'))
+        self.assertEqual(before['projects'], after['projects'])
+        self.assertEqual(before['memberships'], after['memberships'])
+
 
 if __name__ == '__main__':
     unittest.main()

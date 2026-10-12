@@ -110,6 +110,36 @@ class EndpointTests(unittest.TestCase):
         self.assertIn('Nothing was created', str(refused.exception))
         self.assertFalse((root / 'projects' / 'alpha').exists())
 
+    def test_odd_port_strings_are_refused_without_python_errors(self):
+        """F3: ASCII digits only, at most five characters."""
+        import json
+        import admin
+        for port in ('5000-digit string'[:0] + '9'*5000, '\u00b2', '٢', '5433 ', ' 5433', '+5433', '5.433'):
+            with self.subTest(port=port[:20] if len(port) > 20 else port):
+                root = self.real_root()
+                (root / 'deployment.private.json').write_text(json.dumps({'port': port, 'password': 'x'}),
+                                                              encoding='utf-8')
+                with self.assertRaises(ValueError) as refused:
+                    admin.require_creatable_project(root, 'alpha')
+                self.assertIn('no usable port', str(refused.exception))
+                self.assertNotIn('Exceeds the limit', str(refused.exception))
+                self.assertNotIn('invalid literal', str(refused.exception))
+                self.assertFalse((root / 'projects' / 'alpha').exists())
+
+    def test_add_project_command_with_a_missing_configuration_says_install_first(self):
+        """F4: through the add-project command itself, not only require_creatable_project."""
+        import admin
+        import sys
+        root = self.real_root()
+        argv = ['admin.py', '--root', str(root), 'add-project', 'alpha']
+        with mock.patch.object(sys, 'argv', argv):
+            with self.assertRaises(SystemExit) as stopped:
+                admin.run_main()
+        # run_main shortens the kit's own refusal to one line; nothing is made.
+        self.assertIn('ValueError: Deployment is not installed; run install first', str(stopped.exception))
+        self.assertIn('Nothing was created', str(stopped.exception))
+        self.assertFalse((root / 'projects' / 'alpha').exists())
+
     def test_add_project_with_no_usable_port_is_refused_and_leaves_nothing(self):
         """isinstance(True, int) is true: a bool or a non-numeric port is not usable (01a1288a)."""
         import json
