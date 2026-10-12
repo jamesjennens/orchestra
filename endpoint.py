@@ -42,7 +42,7 @@ from reserved_comments import (carries_record_label, check_raw_request, comment_
                                is_merge_slot_id, shown_token, write_targets, MERGE_SLOT_LABEL, MERGE_SLOT_SUFFIX,
                                reserved_label_in_args, refuse_http_actor, status_change_targets, title_change_targets,
                                unresolved_bd_flags)
-from http_authority import AuthorityConfig, NativeRunner, CAP_APPROVE, CAP_PROJECT_ADMIN, block_mismatch_denial, descriptor_actor_denial, http_actor_denial, journal_path, run_guarded, stamp_write
+from http_authority import AuthorityConfig, NativeRunner, CAP_APPROVE, CAP_PROJECT_ADMIN, verified_web_authority, block_mismatch_denial, required_capability, descriptor_actor_denial, http_actor_denial, journal_path, run_guarded, stamp_write
 
 #: One warning per line on stderr (kittrial-5bb.197 review request 01a12894, item 6):
 #: the configuration warnings and the native warnings are collected in one list, and
@@ -556,7 +556,7 @@ def reserved_actors(root,path,rows=False,own=()):
     return names
 
 #: The actions that exist only for the web service: they name no existing project.
-SERVICE_ONLY_ACTIONS=('create-project','project-creations','creation-standing')
+SERVICE_ONLY_ACTIONS=('create-project','project-creations','creation-standing','web-merge-slot')
 
 def key_project_refusal(request,key_projects):
     """Refuse, for a key bound to projects, a request that is not for one of them.
@@ -750,6 +750,11 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
         answered=request.get('action') if isinstance(request,dict) else None
         if answered in SERVICE_ONLY_ACTIONS:
             raise ValueError('%s is available only to the web service'%answered)
+    # Slot requests bind the block before project, tracker, or authority reads.
+    # The shared table is the sole endpoint action/operation capability mapping.
+    if request.get('action') in ('coordinate','web-merge-slot'):
+        denied=block_mismatch_denial(request,authority_config)
+        if denied is not None:return denied
     # Two actions exist only for the web service and name no existing project
     # (kittrial-5bb.118 part 2); project_creation holds them, with what stops other callers.
     if request.get('action')=='create-project':
@@ -836,18 +841,13 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
         registry_rule='coordinator_writes' if rules['coordinator_writes'] else 'independent_approval'
         owners=(owner_loader(path,registry_rule)
                 if (rules['coordinator_writes'] or rules['independent_approval']) else None)
-        # A verified approval capability of the web route: the web service established who the
-        # caller is and that it may approve there (an owner, a coordinator by role, or an agent
-        # with the project's coordinator grant; `decide` above re-read that from the live
-        # authority store), so `coordinator_writes`, which is about names on the HOST route,
-        # does not refuse it (kittrial-5bb.199, kittrial-5bb.209). The merge slot is not on
-        # that route.
-        web_approval=(authority_config is not None and action=='review'
-                   and isinstance(request.get('authority'),dict)
-                   and request['authority'].get('capability')==CAP_APPROVE)
         # The lanes read's route isolation (kittrial-5bb.263): the host route and a key
         # bound to a configured operator may see every lane; any other bound key sees only
         # its own row. `configured_operators` is read once here and passed on unchanged.
+        #
+        # Merge note (16e68c7): the web-approval fact is no longer computed inline here as
+        # `web_approval`; that branch verified it with `verified_web_authority(...)` and
+        # passes that boolean, so this side keeps only its own lanes isolation.
         operators=configured_operators(root)
         lanes_scope=lanes_scope_for(actor,operators,key_principal)
         def work_effect():
@@ -857,7 +857,8 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                                 review_writes=review_writes,
                                 independent_approval=rules['independent_approval'],
                                 coordinator_writes=rules['coordinator_writes'],
-                                owners=owners,web_approval=web_approval,
+                                owners=owners,
+                                verified_web_authority=verified_web_authority(request,authority_config,CAP_APPROVE,name),
                                 lanes_scope=lanes_scope)
             # A handoff request and a decline are recorded in the kit's handoff journal and move
             # nothing in bd, so the runner saw no write; they are writes all the same (review
@@ -1339,6 +1340,58 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             return guarded_write(root,request,journal_path(path),briefing_effect,
                                authority_config=authority_config,
                                require_authority=require_authority,runner=runner)
+    if action=='web-merge-slot':
+        from http_authority import CAP_READ, CAP_COORDINATE, file_lock
+        from web_merge_slot import SlotError, validate as slot_validate, apply as slot_apply
+        from review_workflow import CoordinatorRuleRefusal
+        args=request.get('args',[])
+        run_warnings=[]
+        def slot_run(argv):
+            stdout,warnings=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
+            if warnings:run_warnings.append(warnings)
+            return stdout
+        runner=NativeRunner(slot_run)
+        try:
+            if not isinstance(args,list) or len(args)!=1 or not isinstance(args[0],str):
+                raise SlotError(422,'Expected one merge-slot JSON payload')
+            payload=record_json.loads(args[0]);operation=slot_validate(payload)
+            capability=required_capability(request)
+            if capability is None:raise SlotError(403,'This merge-slot operation has no endpoint capability binding')
+            denied_status=[]
+            def slot_authority():
+                descriptor=request.get('authority') or {}
+                if (not verified_web_authority(request,authority_config,capability,name)
+                        or (operation in ('create','force-release') and descriptor.get('via')!='session')):
+                    denied_status.append(403)
+                    raise SlotError(403,'Verified web authority required for this merge-slot operation in this project')
+            rules=configured_coordinator_rules(root,warnings=run_warnings)
+            def slot_effect():
+                result=slot_apply(payload,actor,runner,path,request.get('operation_id'),
+                                  operators=(configured_operators(root) if rules['independent_approval'] else None),
+                                  coordinator_writes=rules['coordinator_writes'],
+                                  independent_approval=rules['independent_approval'],
+                                  owners=owner_loader(path,'independent_approval'))
+                return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':warning_text(run_warnings)}
+            with (path/'.coordination.lock').open('a') as lock:
+                fcntl.flock(lock,fcntl.LOCK_EX)
+                if operation=='check':
+                    if authority_config is None:raise SlotError(403,'Verified web authority required for the merge-slot read')
+                    with file_lock(authority_config.lock):
+                        slot_authority()
+                        return slot_effect()
+                if not request.get('operation_id'):
+                    raise SlotError(422,'A stable operation identity is required for a merge-slot write')
+                answer=guarded_write(root,request,journal_path(path),slot_effect,
+                                     authority_config=authority_config,require_authority=True,
+                                     runner=runner,identity_check=slot_authority)
+                if denied_status and answer.get('returncode')==2:answer['merge_slot_status']=403
+                return answer
+        except CoordinatorRuleRefusal as error:
+            # Preserve the slot's conflict status and identify the native rule refusal.
+            return {'returncode':2,'stdout':'','stderr':str(error)+'\n',
+                    'merge_slot_status':409,'refused':'coordinator-rule'}
+        except SlotError as error:
+            return {'returncode':2,'stdout':'','stderr':str(error)+'\n','merge_slot_status':error.status}
     if action in ('lifecycle','coordinate','requirement'):
         args=request.get('args',[])
         if not isinstance(args,list) or len(args)!=1 or not isinstance(args[0],str):raise ValueError('Expected one JSON payload')

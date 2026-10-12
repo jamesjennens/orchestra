@@ -324,7 +324,7 @@ CAP_APPROVE = 'reviews.approve'
 #: credential ever holds.
 CAP_PROPOSALS = 'proposals.write'
 #: What a project's coordinator may do beyond approving (slice 1b of docs/WEB_COORDINATOR_DESIGN.md,
-#: kittrial-5bb.209). No route asks for it yet: the merge slot and the lifecycle facts will.
+#: kittrial-5bb.209). Web merge-slot acquire/release use it; lifecycle facts follow separately.
 CAP_COORDINATE = 'coordinate'
 CAP_PROJECT_ADMIN = 'project.admin'
 CAP_PROJECT_CREATE = 'project.create'
@@ -1997,6 +1997,24 @@ def http_shaped_names(names):
     return [name for name in names or [] if isinstance(name, str) and http_actor_id(name) is not None]
 
 
+def verified_web_authority(request, authority_config, capability, project):
+    """Whether the configured service grants this capability in this exact project.
+
+    A descriptor is never authority by itself. Mutations call this inside the
+    guarded effect, under the live authority lock; reads hold that lock too.
+    This helper does not infer a capability from an actor name or an SSH payload.
+    """
+    descriptor = request.get('authority')
+    if (authority_config is None or not isinstance(descriptor, dict)
+            or request.get('project') != project
+            or descriptor.get('project') != project
+            or descriptor.get('capability') != capability):
+        return False
+    descriptor = {k: v for k, v in descriptor.items() if k not in ('store', 'lock')}
+    decide(read_state(authority_config.store), descriptor)
+    return True
+
+
 def http_actor_denial(request, authority_config):
     """Why a request under an HTTP-shaped actor is refused, as the envelope, or None.
 
@@ -2153,6 +2171,11 @@ BLOCK_CAPABILITIES = {
     'bd': {'create': CAP_TASKS,            # tasks.create
            'update': CAP_TASKS},           # tasks.update, tasks.claim
     'checkpoint': CAP_CHECKPOINTS,         # checkpoints.add
+    'coordinate': {'merge-check': CAP_READ, 'merge-acquire': CAP_COORDINATE,
+                   'merge-release': CAP_COORDINATE, 'merge-create': CAP_PROJECT_ADMIN},
+    'web-merge-slot': {'check': CAP_READ, 'acquire': CAP_COORDINATE,
+                       'release': CAP_COORDINATE, 'force-release': CAP_PROJECT_ADMIN,
+                       'create': CAP_PROJECT_ADMIN},
     'review': {'approve': CAP_APPROVE,     # reviews.add, operation approve
                None: CAP_REVIEWS},         # reviews.add, every other operation
     'proposal': {'submit': CAP_PROPOSALS, 'revise': CAP_PROPOSALS,     # proposals.submit
@@ -2175,13 +2198,19 @@ def required_capability(request):
     args = request.get('args')
     if not isinstance(args, list) or not args or any(not isinstance(token, str) for token in args):
         return None
-    if request.get('action') != 'review':
+    action = request.get('action')
+    if action in ('coordinate', 'web-merge-slot'):
+        if len(args) != 1:
+            return None
+        item = {'text': args[0]}
+    elif action != 'review':
         return needed.get(args[0])
-    args = [token for token in args if token != '--json']
-    attachments = request.get('attachments', {})
-    if len(args) != 2 or not args[1].startswith('@attachment:') or not isinstance(attachments, dict):
-        return None                                  # `review TASK` reads; anything else is refused there
-    item = attachments.get(args[1].partition(':')[2], {})
+    else:
+        args = [token for token in args if token != '--json']
+        attachments = request.get('attachments', {})
+        if len(args) != 2 or not args[1].startswith('@attachment:') or not isinstance(attachments, dict):
+            return None                              # `review TASK` reads; anything else is refused there
+        item = attachments.get(args[1].partition(':')[2], {})
     if not isinstance(item, dict) or not isinstance(item.get('text'), str):
         return None
     import record_json
@@ -2192,7 +2221,7 @@ def required_capability(request):
     if not isinstance(payload, dict):
         return None
     operation = payload.get('operation')
-    return needed.get(operation if isinstance(operation, str) else None, needed[None])
+    return needed.get(operation if isinstance(operation, str) else None, needed.get(None))
 
 
 def block_mismatch_denial(request, authority_config):

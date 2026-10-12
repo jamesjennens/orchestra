@@ -2,6 +2,7 @@ import { h, time, confirmDialog, secretDialog, toast, shortSha } from '../dom.js
 import { pageHead, reviewChip, statusChip, priority, empty, field, setFieldError, formValues, act, errorState, describe } from '../ui.js';
 import { queuePanel, detailPanel, proposeForm, myStrip } from './proposals.js';
 import { setupHint } from './setup.js';
+import { mergeSlotPanel } from './merge_slot.js';
 
 const PAGE = 10;
 export const canWrite = (p) => ['owner', 'coordinator', 'contributor', 'superuser'].includes(p.role);
@@ -120,6 +121,7 @@ export async function overview(ctx, { pid }) {
     archivedBanner(project),
     unusableBanner(project),
     setupLine,
+    mergeSlotPanel(ctx, project),
     strip,
     h('div', { class: 'toolbar' }, search, statusSeg, reviewSel),
     tableHost);

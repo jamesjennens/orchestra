@@ -50,7 +50,7 @@ from coordination import MERGE_SLOT_SUFFIX, is_merge_slot, merge_slot_sentence
 from reserved_comments import (ANCHOR_READ_IDS_MAX, carries_record_label, hide_records,
                                is_record_anchor)
 from http_auth import (AGENT_SECRET_ENV, agent_secret_file, CAP_ACCOUNTS_ADMIN, CAP_AGENTS, CAP_APPROVE,
-                       CAP_CHECKPOINTS, CAP_FEEDBACK, CAP_PROPOSALS,
+                       CAP_CHECKPOINTS, CAP_FEEDBACK, CAP_PROPOSALS, CAP_COORDINATE,
                        CAP_PROJECT_ADMIN, CAP_PROJECT_CREATE, CAP_PROJECT_HOST_CREATE, CAP_READ, CAP_REVIEWS,
                        CAP_TASKS, RESULT_RETENTION_SECONDS, HttpError, Service, Store,
                        address_group, authority_request, busy, conflict, forbidden, invalid, not_found,
@@ -1361,7 +1361,8 @@ class EndpointBackend:
     flight is surfaced as an uncertain outcome, never as success.
     """
 
-    ROUTES = InProcessBackend.ROUTES
+    ROUTES = InProcessBackend.ROUTES + ('merge-slot.acquire', 'merge-slot.release',
+                                      'merge-slot.force-release', 'merge-slot.create')
     #: Routes with no canonical command yet, and why. Fails closed rather than
     #: pretending the service store is canonical.
     UNRESOLVED = {
@@ -1417,6 +1418,13 @@ class EndpointBackend:
         the canonical workflow's assignee check holds.
         """
         return principal.actor or principal.user_id
+
+    def merge_slot_read(self, principal, project_id):
+        return self._run('web-merge-slot', project_id, self._actor(principal),
+                         [json.dumps({'operation': 'check'})],
+                         authority=authority_request(principal, project_id, CAP_READ,
+                                                     now=self.service._expiry_now()),
+                         require_authority=True)
 
     # -- transport -------------------------------------------------------------
     # A project's tasks live in a canonical Beads project that only an operator creates on
@@ -1592,6 +1600,13 @@ class EndpointBackend:
         reply = self._endpoint(action, project, actor, args, attachments,
                                operation_id=operation_id, authority=authority,
                                require_authority=require_authority, route=route, extra=extra)
+        if action == 'web-merge-slot' and isinstance(reply, dict) and reply.get('merge_slot_status'):
+            status = reply['merge_slot_status']
+            error = HttpError(status, 'conflict' if status == 409 else 'invalid' if status == 422 else
+                              'forbidden' if status == 403 else 'unavailable',
+                              (reply.get('stderr') or 'Merge slot cannot be read').strip())
+            error.nothing_done = True
+            raise error
         # Without a descriptor the service only reads (every write it sends carries one).
         return self._checked(reply, action, reading=authority is None)
 
@@ -1966,6 +1981,12 @@ class EndpointBackend:
         require — including ``schema_version`` and ``operation_id`` — and no
         operation-inappropriate nulls.
         """
+        if route.startswith('merge-slot.'):
+            operation = route.split('.', 1)[1]
+            fields = {'operation': operation}
+            if operation == 'acquire':fields.update(task=payload['task_id'], target=payload['target'])
+            if operation == 'force-release':fields.update(expected_holder=payload['expected_holder'], reason=payload['reason'])
+            return 'web-merge-slot', project_id, [json.dumps(fields)], {}
         task_id = payload.get('task_id')
         if route == 'tasks.create':
             title = str(payload.get('title') or '')
@@ -4760,6 +4781,93 @@ class ApiHandler(BaseHTTPRequestHandler):
             return result, result
         return self._mutate(ctx, 'projects.confirm', None, confirm, capability=CAP_ACCOUNTS_ADMIN,
                             reason='confirm ' + project_id)
+
+    def _merge_slot_backend(self):
+        if not hasattr(self.backend, 'merge_slot_read'):
+            raise not_implemented('Merge-slot coordination is unavailable on this server')
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/merge-slot')
+    def merge_slot_get(self, ctx):
+        self._project(ctx, CAP_READ)
+        self._merge_slot_backend()
+        result = self.backend.merge_slot_read(ctx.principal, ctx.params['pid'])
+        result['current_actor'] = self.service.bind_actor(ctx.principal, None)
+        def allowed(capability):
+            try:
+                self.service.check_authority(ctx.principal, ctx.params['pid'], capability)
+                return True
+            except HttpError:
+                return False
+        result['can_coordinate'] = allowed(CAP_COORDINATE)
+        result['can_force_release'] = allowed(CAP_PROJECT_ADMIN) and ctx.principal.via == 'session'
+        return 200, result
+
+    def _merge_slot_write(self, ctx, operation):
+        capability = CAP_PROJECT_ADMIN if operation in ('create', 'force-release') else CAP_COORDINATE
+        metadata = {}
+        fields = {'acquire': ('task_id', 'target'), 'release': (),
+                  'force-release': ('expected_holder', 'reason'), 'create': ()}[operation]
+        def write():
+            self._merge_slot_backend()
+            if ctx.idempotency_key is None:
+                raise invalid('Send an Idempotency-Key and reuse it with the identical request after an uncertain outcome')
+            payload = dict(ctx.payload or {})
+            refuse_unknown_fields(payload, fields, 'Merge-slot ' + operation)
+            if set(payload) != set(fields):
+                raise invalid('Supply exactly ' + (', '.join(fields) or 'an empty body'))
+            from web_merge_slot import validate, SlotError
+            checked = dict(payload, operation=operation)
+            if operation == 'acquire':checked['task'] = checked.pop('task_id')
+            try:
+                validate(checked)
+            except SlotError as error:
+                raise invalid(str(error)) from None
+            payload['actor'] = self.service.bind_actor(ctx.principal, None)
+            result = self.backend.invoke('merge-slot.' + operation, ctx.principal, ctx.params['pid'],
+                                         payload, ctx.idempotency_key, target=ctx.route_target,
+                                         authorize=ctx.authorize, capability=capability)
+            metadata.update({key: result.get(key) for key in
+                             ('operation_id', 'actor', 'task_id', 'holder_before', 'holder_after', 'reason')})
+            with self.service.store.lock:
+                # A crash after the audit save but before the HTTP receipt leaves
+                # the canonical identity reconcilable. Do not append another
+                # committed event when that exact operation is retried.
+                existing = any(event.get('action') == 'merge-slot.' + operation
+                               and event.get('project_id') == ctx.params['pid']
+                               and event.get('operation_id') == result['operation_id']
+                               and event.get('outcome') == 'committed'
+                               for event in self.service.state['audit'])
+                if not existing:
+                    event = self.service.audit(ctx.request_id, ctx.principal, 'merge-slot.' + operation,
+                                               'committed', project_id=ctx.params['pid'])
+                    event.update(metadata)
+                try:
+                    self.service.store.save()
+                except (OSError, TimeoutError):
+                    raise UncertainOutcome() from None
+            return result, result
+        # Persist the audit before the HTTP receipt. A lost canonical response
+        # reconciles through the existing guarded receipt, with its original
+        # before/after holder metadata, without releasing a later holder.
+        return self._mutate(ctx, 'merge-slot.' + operation, ctx.params['pid'], write,
+                            capability=capability, serialize=False, canonical=True,
+                            audit_success=False)
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/merge-slot/acquire')
+    def merge_slot_acquire(self, ctx):
+        return self._merge_slot_write(ctx, 'acquire')
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/merge-slot/release')
+    def merge_slot_release(self, ctx):
+        return self._merge_slot_write(ctx, 'release')
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/merge-slot/force-release')
+    def merge_slot_force_release(self, ctx):
+        return self._merge_slot_write(ctx, 'force-release')
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/merge-slot/create')
+    def merge_slot_create(self, ctx):
+        return self._merge_slot_write(ctx, 'create')
 
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')')
     def project_get(self, ctx):
