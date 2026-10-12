@@ -412,9 +412,9 @@ class BlockMatchesRequestTests(EndpointHarness):
         done = endpoint.execute(self.root, request)
         self.assertEqual((0, ['work']), (done['returncode'], self.reached))
 
-    def test_an_operation_the_table_does_not_know_keeps_todays_behaviour(self):
-        # A raw comment: the web service has no route that sends one, so no capability is
-        # required of its block; the project of the block is compared all the same.
+    def test_an_operation_the_table_does_not_know_is_refused_when_a_block_is_present(self):
+        # A raw comment has no web route. A block must never let a service mistake
+        # cross into the host-only write, even if its capability is otherwise valid.
         comment = lambda project=PROJECT: self.payload_request('bd', ['comments', 'add', TASK, 'A plain remark'], project=project)
         refused = self.web(comment(OTHER_PROJECT), session_block(OWNER, 'tasks.write'))
         self.assertEqual((126, self.WRONG_PROJECT + '; nothing was changed\n'), (refused['returncode'], refused['stderr']))
@@ -422,9 +422,10 @@ class BlockMatchesRequestTests(EndpointHarness):
         for claimed in ('tasks.write', 'read'):
             with self.subTest(block=claimed):
                 del self.tracker.calls[:]
-                done = self.web(comment(), session_block(OWNER, claimed))
-                self.assertEqual(0, done['returncode'], done)
-                self.assertEqual(1, len([command for _, command in self.tracker.writes if command[:2] == ['comments', 'add']]))
+                refused = self.web(comment(), session_block(OWNER, claimed))
+                self.assertRefused(refused)
+                self.assertEqual([], self.tracker.calls)
+                self.assertIn('table does not allow this action or operation', refused['stderr'])
 
 
 if __name__ == '__main__':
