@@ -382,6 +382,7 @@ def fingerprint(body):
     return 'SHA256:' + base64.b64encode(hashlib.sha256(base64.b64decode(body)).digest()).decode().rstrip('=')
 
 
+@unittest.skipIf(os.name == 'nt', 'these fixtures write the temporary folder (a Windows path) as the key line\'s --root and wrapper paths; key-line text is POSIX sshd syntax and is judged with posixpath, which correctly does not read C:/ or D:\\ paths as absolute - kittrial-5bb.265 r2 item 5. Build the fixtures as POSIX text to run here.')
 class ListingTests(unittest.TestCase):
 
     def setUp(self):
@@ -423,6 +424,16 @@ class ListingTests(unittest.TestCase):
             'unknown_projects': [],
             # kittrial-5bb.250 r3: the two rule fields every command line now carries.
             'needs_shell': False, 'relative_path': False, 'foreign_invocation': False})
+
+    def test_an_over_long_command_is_group_two_without_token_work(self):
+        # kittrial-5bb.265 r2: the raw-text bound fires before shlex, so a line of 200,000
+        # path components answers quickly and carries the group-two flags.
+        import time
+        entry = self.one(self.line().replace('ssh_forced_command.py', 'k/' * 100000 + 'ssh_forced_command.py'))
+        self.assertEqual('other-command', entry['kind'])
+        self.assertTrue(entry['relative_path'])
+        self.assertTrue(entry['foreign_invocation'])
+        self.assertIsNone(entry.get('wrapper'))
 
     def test_the_binding_is_the_arguments_and_never_the_comment(self):
         entry = self.one(self.line(comment='alex@laptop orchestra-projects=alpha'))
@@ -466,7 +477,7 @@ class ListingTests(unittest.TestCase):
     def test_a_line_for_another_runtime_and_unknown_things(self):
         other = self.one(self.line(root=self.base/'elsewhere', projects=['alpha']))
         self.assertTrue(other['other_root'])
-        self.assertNotIn('unknown_projects', other)                             # not looked up in a runtime it does not serve
+        self.assertEqual([], other['unknown_projects'])                         # not looked up in a runtime it does not serve (always a list now)
         entry = self.one(self.line(projects=['alpha', 'gamma', 'Not-A-Name']))
         self.assertEqual(entry['unknown_projects'], ['gamma', 'Not-A-Name'])
         entry = self.one(self.line(more=' --authority-store /x --principal person:alex'))
