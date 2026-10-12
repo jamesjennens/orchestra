@@ -228,6 +228,9 @@ def backup_files(project, rows=None):
     if journal['invalid']:
         raise ValueError('Cannot back up an unreadable/incomplete lifecycle VOID family')
     if not journal['present']:
+        if rows is not None and native_correction_comments(rows):
+            raise ValueError('Native lifecycle correction comments exist but their VOID family is missing; '
+                             'an operator preserves the native data and recovers a complete VOID-capable backup')
         return {}
     if rows is None:
         raise ValueError('A lifecycle VOID backup requires its native snapshot')
@@ -241,6 +244,30 @@ def backup_files(project, rows=None):
     return files
 
 
+def native_correction_comments(rows):
+    """Bounded native correction inventory, including unissued/cut comments."""
+    comments = []
+    total = 0
+    for row in rows:
+        if not isinstance(row,dict):
+            raise ValueError('Native correction comments cannot be checked on an unreadable row')
+        values=row.get('comments') or []
+        if not isinstance(values,list):
+            raise ValueError('Native correction comments cannot be checked on an unreadable comment list')
+        for comment in values:
+            if not isinstance(comment,dict):
+                raise ValueError('Native correction comments cannot be checked on an unreadable comment')
+            text=comment.get('text')
+            if not isinstance(text,str) or not text.startswith(PREFIX):continue
+            item=dict(task=row.get('id'),id=str(comment.get('id')),
+                      author=comment.get('author'),created_at=comment.get('created_at'),text=text)
+            size=len(canonical_bytes(item));total+=size
+            if size>MAX_RECORD_BYTES+1000 or total>MAX_FAMILY_BYTES or len(comments)>=MAX_RECORDS:
+                raise ValueError('Native lifecycle correction generation exceeds its bounds')
+            comments.append(item)
+    return sorted(comments,key=canonical_bytes)
+
+
 def native_generation(rows):
     """Bound all correction comments, including inert/pending ones, to this backup.
 
@@ -248,21 +275,7 @@ def native_generation(rows):
     authority. It prevents an older sidecar erasing a newer local correction when
     a changed native backup happens to retain the older named event/comment pair.
     """
-    comments = []
-    total = 0
-    for row in rows:
-        for comment in row.get('comments', []):
-            text = comment.get('text')
-            if not isinstance(text, str) or not text.startswith(PREFIX):
-                continue
-            item = dict(task=row.get('id'), id=str(comment.get('id')),
-                        author=comment.get('author'), created_at=comment.get('created_at'), text=text)
-            size = len(canonical_bytes(item))
-            total += size
-            if size > MAX_RECORD_BYTES + 1000 or total > MAX_FAMILY_BYTES or len(comments) >= MAX_RECORDS:
-                raise ValueError('Native lifecycle correction generation exceeds its bounds')
-            comments.append(item)
-    return content_hash({'comments': sorted(comments, key=canonical_bytes)})
+    return content_hash({'comments':native_correction_comments(rows)})
 
 
 def validate_backup(files, rows=None):
@@ -315,6 +328,8 @@ def validate_backup(files, rows=None):
         state = context(rows, journal)
         if any(reason != 'voided' for reason in state['reasons'].values()):
             raise ValueError('Lifecycle VOID backup does not bind the native target/comment generation')
+        if state['incomplete']:
+            raise ValueError('Lifecycle VOID backup has native correction comments without their host entries')
     return journal
 
 
@@ -334,6 +349,15 @@ def restore_files(project, files, rows):
         if os.path.lexists(str(directory)) or os.path.lexists(str(marker)):
             raise ValueError('Legacy backup has no VOID manifest; preserve the current family and reconcile '
                              'with a complete VOID-capable backup before restoring')
+        if native_correction_comments(rows):
+            # The native restore already happened. Do not allow that published
+            # destination to silently expose the original values again.
+            atomic(marker,dict(schema_version=1,missing_void_manifest=True,
+                               native_corrections_sha256=native_generation(rows)))
+            raise ValueError('Native lifecycle correction comments exist but the backup carries no VOID '
+                             'manifest or family. Restore refused; the incomplete restore marker is retained. '
+                             'Preserve this destination and restore a complete VOID-capable backup into '
+                             'an unused destination; do not use or back up this incomplete tracker.')
         return False
     if directory.is_symlink() or marker.is_symlink() or marker.with_suffix('.tmp').is_symlink():
         raise ValueError('Lifecycle VOID restore paths must not be symlinks')
@@ -384,6 +408,8 @@ def context(rows, journal):
         if isinstance(row, dict) and row.get('id'):
             issues.setdefault(row['id'], []).append(row)
     valid = {}
+    entry_reasons = {}
+    task_reasons = {}
     for key, entry in entries.items():
         payload = entry['payload']; binding = payload['binding']; event_id = binding['event_id']
         targets = issues.get(event_id, [])
@@ -406,6 +432,12 @@ def context(rows, journal):
             valid[key] = entry
         except (ValueError, TypeError, KeyError):
             reasons[event_id] = reason
+            entry_reasons[key] = reason
+            if len(targets)==1:
+                from lifecycle import native_event
+                actual=native_event(targets[0])
+                if actual is not None and actual['task']!=binding['task']:
+                    task_reasons[binding['task']]=reason
     retracted = set()
     from review_workflow import _recorded_at
     for key, entry in valid.items():
@@ -417,14 +449,23 @@ def context(rows, journal):
                 or payload['target_void'] in retracted
                 or _recorded_at(entry['created_at']) < _recorded_at(target['created_at'])):
             reasons[payload['binding']['event_id']] = 'lifecycle-void-journal-mismatch'
+            entry_reasons[key] = 'lifecycle-void-journal-mismatch'
         else:
             retracted.add(payload['target_void'])
     for key, entry in valid.items():
         payload = entry['payload']
         if payload['operation'] == 'void' and key not in retracted:
             reasons.setdefault(payload['binding']['event_id'], 'voided')
-    return dict(reasons=reasons, global_reason=UNKNOWN_JOURNAL if journal.get('invalid') else None,
-                entries=entries, invalid=journal.get('invalid', []), retracted=retracted)
+    invalid=list(journal.get('invalid',[]))
+    try:native_comments=native_correction_comments(rows)
+    except ValueError as error:
+        native_comments=[];invalid.append(str(error))
+    bound_comments={(e['payload']['binding']['task'],e['comment_id']) for e in entries.values()}
+    incomplete=[c for c in native_comments if (c['task'],c['id']) not in bound_comments]
+    return dict(reasons=reasons, global_reason=UNKNOWN_JOURNAL if invalid else None,
+                entries=entries, invalid=invalid, retracted=retracted,
+                entry_reasons=entry_reasons,task_reasons=task_reasons,
+                native_comments=native_comments,incomplete=incomplete)
 
 
 class Snapshot(list):
@@ -437,8 +478,54 @@ class Snapshot(list):
 def snapshot(rows, project=None, journal=None):
     journal = read_journal(project) if journal is None else journal
     if not journal['entries'] and not journal['invalid']:
-        return rows
+        try:
+            if not native_correction_comments(rows):return rows
+        except ValueError:pass
     return Snapshot(rows, context(rows, journal))
+
+
+def correction_audit(correction):
+    """Every host record and unpaired native correction, without conferring authority."""
+    entries=correction.get('entries',{})
+    retracted=correction.get('retracted',set())
+    native={(c['task'],c['id']):c for c in correction.get('native_comments',[])}
+    result=[]
+    for key,entry in entries.items():
+        payload=entry['payload'];binding=payload['binding']
+        comment=native.get((binding['task'],entry['comment_id']))
+        problem=correction.get('entry_reasons',{}).get(key)
+        status=('damaged' if problem else 'retraction' if payload['operation']=='retract'
+                else 'retracted' if key in retracted else 'in-effect')
+        item=dict(operation_id=key,operation=payload['operation'],task=binding['task'],
+                  event_id=binding['event_id'],operator=payload['actor'],
+                  created_at=entry['created_at'],reason=payload['reason'],evidence=payload['evidence'],
+                  target_void=payload['target_void'],comment_id=entry['comment_id'],status=status,
+                  journaled=True,native_author=comment['author'] if comment else None,
+                  native_time=comment['created_at'] if comment else None)
+        if problem:item['classification_reason']=problem
+        if key in retracted:
+            item['retracted_by']=[k for k,e in entries.items() if e['payload']['operation']=='retract'
+                                  and e['payload']['target_void']==key
+                                  and k not in correction.get('entry_reasons',{})]
+        result.append(item)
+    for comment in correction.get('incomplete',[]):
+        try:
+            payload=validate_payload(record_json.loads(comment['text'][len(PREFIX):]))
+        except (ValueError,TypeError):
+            payload=None
+        binding=payload['binding'] if payload else {}
+        result.append(dict(operation_id=payload['operation_id'] if payload else None,
+                           operation=payload['operation'] if payload else None,task=comment['task'],
+                           event_id=binding.get('event_id'),operator=payload['actor'] if payload else None,
+                           created_at=comment['created_at'],reason=payload['reason'] if payload else None,
+                           evidence=payload['evidence'] if payload else [],
+                           target_void=payload['target_void'] if payload else None,
+                           comment_id=comment['id'],status='incomplete',journaled=False,
+                           native_author=comment['author'],native_time=comment['created_at'],
+                           classification_reason='native-correction-without-host-entry' if payload else
+                                                 'native-correction-payload-unclassifiable'))
+    return sorted(result,key=lambda x:(str(x['created_at'] or ''),str(x['task'] or ''),
+                                       str(x['operation_id'] or ''),str(x['comment_id'])))
 
 
 def audit(rows, operators=None, owners=None, limit=50, offset=0):
@@ -452,7 +539,9 @@ def audit(rows, operators=None, owners=None, limit=50, offset=0):
     import review_workflow as reviews
     if type(limit) is not int or not 1 <= limit <= 100 or type(offset) is not int or offset < 0:
         raise ValueError('Lifecycle audit needs limit 1..100 and nonnegative offset')
-    events = lifecycle.classified_events(rows)
+    correction=(rows.lifecycle_corrections if isinstance(rows,Snapshot) else
+                context(rows,dict(entries={},invalid=[],present=False)))
+    events = lifecycle.classified_events(rows if isinstance(rows,Snapshot) else Snapshot(rows,correction))
     issues = {r['id']: r for r in rows if isinstance(r, dict) and r.get('id')
               and r.get('issue_type') != 'event' and not r.get('malformed')}
     native_events = [r for r in rows if isinstance(r, dict)
@@ -461,15 +550,19 @@ def audit(rows, operators=None, owners=None, limit=50, offset=0):
     unclassifiable = sum(1 for row in native_events if row.get('id') not in classified)
     ordered = sorted(events, key=lambda e: (e['task'], e['dimension'],
                      e['order'] if e['order'] is not None else -1, e['id']))
-    if offset > len(ordered):
+    corrections=correction_audit(correction)
+    page_total=max(len(ordered),len(corrections))
+    if offset > page_total:
         raise ValueError('Lifecycle audit offset exceeds its total')
     items = []
+    questionable_total=0
+    unclassifiable_total=0
     loaded_owners = []
     def once_owners():
         if not loaded_owners:
             loaded_owners.append(reviews.owner_map(owners))
         return loaded_owners[0]
-    for event in ordered[offset:offset + limit]:
+    for index,event in enumerate(ordered):
         issue = issues.get(event['task'], {})
         payload = event['payload']
         recorder = payload['actor'] if payload else next(
@@ -532,10 +625,27 @@ def audit(rows, operators=None, owners=None, limit=50, offset=0):
         item['questionable'] = bool(reason or event.get('void_reason') or
             (not item['recorder_is_current_assignee'] and operator is not True) or
             (event['dimension'] in ('reviewed', 'integrated') and approval is not True))
-        items.append(item)
+        questionable_total+=item['questionable']
+        unclassifiable_total+=bool(item.get('classification_reason'))
+        if offset<=index<offset+limit:items.append(item)
     return dict(items=items, total=len(ordered), offset=offset, limit=limit,
-                omitted_before=offset, omitted_after=max(0, len(ordered) - offset - len(items)),
-                next_offset=offset + len(items) if offset + len(items) < len(ordered) else None,
+                omitted_before=min(offset,len(ordered)), omitted_after=max(0, len(ordered) - offset - len(items)),
+                next_offset=offset+limit if offset+limit<page_total else None,
+                page_total=page_total,corrections=corrections[offset:offset+limit],
+                correction_count=len(corrections),
+                corrections_omitted_before=min(offset,len(corrections)),
+                corrections_omitted_after=max(0,len(corrections)-offset-limit),
+                in_effect_void_count=sum(c['status']=='in-effect' for c in corrections),
+                retracted_void_count=sum(c['status']=='retracted' for c in corrections),
+                incomplete_correction_count=sum(c['status']=='incomplete' for c in corrections),
+                damaged_correction_count=sum(c['status']=='damaged' for c in corrections),
+                family_reason=correction.get('global_reason'),
+                family_problems=correction.get('invalid',[]),
+                correction_status=('damaged' if correction.get('global_reason') or correction.get('entry_reasons')
+                                   else 'incomplete' if correction.get('incomplete') else 'complete'),
+                questionable_fact_count=questionable_total,
+                questionable_native_record_count=questionable_total+unclassifiable,
+                unclassifiable_classification_count=unclassifiable_total,
                 unclassifiable_native_event_count=unclassifiable,
                 unclassifiable_fact_count=sum(e['payload'] is None or reviews._recorded_at(e['created_at']) is None
                                               for e in ordered),
@@ -616,6 +726,14 @@ def apply(rows, actor, payload, run, project, operators=None, owners=None, enabl
             found.append(comment)
     if len(found) > 1:
         raise ValueError('Lifecycle correction operation identity has ambiguous native comments')
+    if payload['operation']=='void':
+        other_voids=[key for key,entry in journal['entries'].items()
+                     if key!=payload['operation_id'] and entry['payload']['operation']=='void'
+                     and entry['payload']['binding']['event_id']==binding['event_id']
+                     and key not in state['retracted']]
+        if other_voids:
+            raise ValueError('This lifecycle event is already voided under operation '+sorted(other_voids)[0]
+                             +'; this operation cannot publish a second void. Reconcile or retract the existing operation.')
     if not found:
         if payload['operation'] == 'void' and binding['event_id'] in state['reasons']:
             raise ValueError('This lifecycle event is already voided or its correction is damaged')

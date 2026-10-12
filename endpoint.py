@@ -407,7 +407,8 @@ def _guard_named_rows(root,path,name,args,attachments,actor,strict=False):
     rows,problem=_resolve_rows(root,path,actor,request['targets'],strict=strict)
     if problem:
         advice=(' '+raw_lifecycle.ADVICE) if strict else ''
-        raise ValueError('Refusing %s: %s, so the rows this would write are not known. Name each task by its id. Nothing was written.%s'%(command,problem,advice))
+        refusal=raw_lifecycle.Refusal if strict else ValueError
+        raise refusal('Refusing %s: %s, so the rows this would write are not known. Name each task by its id. Nothing was written.%s'%(command,problem,advice))
     slot=name+MERGE_SLOT_SUFFIX
     for row in rows:
         if row['id']==slot or is_merge_slot(row):
@@ -1592,9 +1593,20 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             # First the rows the write names (an existing id given to create, a write that names
             # none, the merge slot); then the guards that read what those rows carry.
             from review_workflow import listed_operator_actor, operator_owners
+            lifecycle_operators=configured_operators(root)
             lifecycle_guard=args[0] in ('create','update','dep','close','reopen') and not listed_operator_actor(
-                actor, configured_operators(root), operator_owners(path))
-            named=_guard_named_rows(root,path,name,args,request.get('attachments',{}),actor,strict=lifecycle_guard)
+                actor, lifecycle_operators)
+            def bound_raw_exemption():
+                try:
+                    return listed_operator_actor(actor,lifecycle_operators,operator_owners(path))
+                except (ValueError,OSError):
+                    return False
+            try:
+                named=_guard_named_rows(root,path,name,args,request.get('attachments',{}),actor,strict=lifecycle_guard)
+            except raw_lifecycle.Refusal:
+                if not bound_raw_exemption():raise
+                lifecycle_guard=False
+                named=_guard_named_rows(root,path,name,args,request.get('attachments',{}),actor,strict=False)
             if lifecycle_guard:
                 resolved_request=write_targets(args,request.get('attachments',{}))
                 resolved_tokens=resolved_request['targets'] if resolved_request is not None else None
@@ -1609,7 +1621,14 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                     rows,problem=_resolve_rows(root,path,actor,tokens,strict=True)
                     if problem:raw_lifecycle.refuse('the affected tasks could not be read completely')
                     return rows
-                raw_lifecycle.guard(args,request.get('attachments',{}),lifecycle_rows)
+                try:
+                    raw_lifecycle.guard(args,request.get('attachments',{}),lifecycle_rows)
+                except raw_lifecycle.Refusal:
+                    # Ordinary raw work does not depend on a registry. Only an
+                    # otherwise refused lifecycle write needs principal evidence.
+                    # An unreadable registry proves no exemption; preserve the
+                    # lifecycle refusal rather than blocking unrelated writes.
+                    if not bound_raw_exemption():raise
             _guard_record_anchor_status(root,path,args,actor)
             _guard_record_anchor_title(root,path,args,actor,named)
             _guard_reserved_labels(root,path,args,actor)

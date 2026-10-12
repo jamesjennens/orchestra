@@ -24,6 +24,11 @@ def render(rows,dest,operators=None,verifiers=None):
     # issue pages, the journals or views/issues.jsonl.
     from reserved_comments import hide_records
     rows=hide_records(rows)
+    # Hiding record anchors is a projection of this same native read. Keep its
+    # separately attached host correction evidence through that projection.
+    from lifecycle_voids import Snapshot
+    if isinstance(all_rows, Snapshot):
+        rows=Snapshot(rows, all_rows.lifecycle_corrections)
     stamp=datetime.now(timezone.utc).isoformat(timespec='seconds')
     banner=f'Exported {stamp}. Query Beads for current state. Do not hand-edit generated files.\n\n'
     valid=re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,160}')
@@ -85,7 +90,9 @@ def render(rows,dest,operators=None,verifiers=None):
             values=[]
             for dim in DIMENSIONS:
                 entry=fact['facts'][dim];value=entry['value']
-                values.append(f'[{value}](jobs/{entry["event_id"]}.md)' if entry['event_id'] else value)
+                shown=f'[{value}](jobs/{entry["event_id"]}.md)' if entry['event_id'] else value
+                if entry.get('reason'):shown+=' ('+cell(entry['reason'])+')'
+                values.append(shown)
             current.append('| ['+fact['id']+'](jobs/'+fact['id']+'.md) | '+' | '.join(values+[cell(scope.get(k)) for k in ('source_commit','integration_commit','release_id','environment')])+' |\n')
         current.append('\n')
     for r in sorted(rows_with_id,key=lambda x:x['id']):

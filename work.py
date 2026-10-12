@@ -595,6 +595,9 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
     parser.add_argument('--capability-limit',type=int,default=20);parser.add_argument('--capability-offset',type=int,default=0)
     parser.add_argument('--json',action='store_true')  # output is always JSON; accepted for consistency
     a=parser.parse_args(args)
+    from lifecycle_voids import Snapshot, snapshot
+    if journal is not None and not isinstance(rows,Snapshot):
+        rows=snapshot(rows,journal)
     if not WORK_LIMIT_MIN<=a.limit<=WORK_LIMIT_MAX or a.offset<WORK_OFFSET_MIN or not WORK_LIMIT_MIN<=a.handoff_limit<=WORK_LIMIT_MAX or a.handoff_offset<WORK_OFFSET_MIN:
         raise ValueError('Invalid work page: --limit and --handoff-limit must be %d..%d; '
                          '--offset and --handoff-offset must be >= %d' % (WORK_LIMIT_MIN,WORK_LIMIT_MAX,WORK_OFFSET_MIN))

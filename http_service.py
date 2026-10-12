@@ -2475,6 +2475,10 @@ class EndpointBackend:
         lifecycle = {dimension: {'value': fact.get('value'), 'note': None}
                      for dimension, fact in (data.get('lifecycle') or {}).items()
                      if isinstance(fact, dict)}
+        for dimension, fact in (data.get('lifecycle') or {}).items():
+            if isinstance(fact,dict) and fact.get('reason'):
+                lifecycle[dimension]['reason']=fact['reason']
+                lifecycle[dimension]['note']=fact['reason']
         dependencies = (data.get('dependencies') or {}).get('items') or []
         return {'task': task, 'checkpoint': checkpoint, 'carry_open_items': carry,
                 'review': {'state': review.get('review_state') or 'none',

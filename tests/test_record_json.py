@@ -306,7 +306,7 @@ class NoUnguardedParseTests(unittest.TestCase):
             'web_merge_slot.py': 4,
             # F0: bounded host entries/restore marker and native correction/comment
             # bodies use the guard; none is trusted merely because it parses.
-            'lifecycle_voids.py': 4,
+            'lifecycle_voids.py': 5,
             'review_recommendations.py': 2, 'review_workflow.py': 4, 'work.py': 1, 'worker_gate.py': 1})
 
     def test_the_parsers_that_do_not_call_it_directly_reach_it(self):

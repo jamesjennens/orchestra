@@ -56,6 +56,16 @@ class VoidAdministrationTests(unittest.TestCase):
                 self.switch('on', actor)
         self.assertEqual(before, (self.project / 'deployment.private.json').read_bytes())
 
+    def test_healthy_audit_switch_requires_plain_listed_name_before_effect(self):
+        self.config()
+        before=(self.project/'deployment.private.json').read_bytes()
+        for actor in ('worker','bound-session'):
+            with self.subTest(actor=actor),self.assertRaisesRegex(ValueError,'operator'):
+                self.switch('on',actor)
+            self.assertEqual((self.project/'deployment.private.json').read_bytes(),before)
+        self.assertFalse(admin.lifecycle_void_writes(self.project))
+        self.assertTrue(self.switch('on','op')['changed'])
+
     def test_damaged_flag_is_unknown_then_explicit_off_repairs_and_retains_it(self):
         self.config(lifecycle_void_writes='not a boolean')
         with self.assertRaises(ValueError):

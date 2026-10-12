@@ -427,19 +427,23 @@ def classified_events(rows):
     reasons = correction.get('reasons', {})
     found = []
     positions = set()
+    native_positions = set()
     for row in rows:
         event = native_event(row)
         if event and event['dimension'] in (*DIMENSIONS, 'lifecycle-scope', ENABLED, LIVE):
-            reason = correction.get('global_reason') or reasons.get(event['id'])
+            reason = (correction.get('global_reason')
+                      or correction.get('task_reasons',{}).get(event['task'])
+                      or reasons.get(event['id']))
             if reason:
                 event['void_reason'] = reason
             found.append(event)
             positions.add((event['task'], event['dimension'], event['id']))
+            native_positions.add(event['id'])
     for entry in correction.get('entries', {}).values():
         binding = entry['payload']['binding']
         key = (binding['task'], binding['dimension'], binding['event_id'])
         reason = correction.get('global_reason') or reasons.get(binding['event_id'])
-        if reason and key not in positions:
+        if reason and key not in positions and binding['event_id'] not in native_positions:
             suffix = binding['event_id'].removeprefix(binding['task'] + '.')
             found.append(dict(task=binding['task'], dimension=binding['dimension'],
                               value=binding['value'], payload=binding['payload'],
@@ -484,7 +488,9 @@ def trusted_payloads(rows,events=None):
         task=row['id'];labels=row.get('labels') or []
         scope_event=latest_event(events,task,'lifecycle-scope')
         scope=scope_event['payload']['scope'] if label_agrees(labels,scope_event,'lifecycle-scope') and scope_event['payload'] else None
-        scope_reason = scope_event.get('void_reason') if scope_event else None
+        scope_reason = ((scope_event.get('void_reason') if scope_event else None)
+                        or (rows.lifecycle_corrections.get('task_reasons',{}).get(task)
+                            if isinstance(rows,Snapshot) else None))
         if scope_reason:
             scope = None
         dimensions={}
@@ -1326,6 +1332,11 @@ def _apply_fact(payload,actor,rows,run,current_scope,op_index,issues,recorded=No
     scope, so evidence for an older release can be recorded without moving what is
     live (rev2 item 3). A scope that was never recorded is still refused.
     """
+    from lifecycle_voids import Snapshot
+    correction=rows.lifecycle_corrections if isinstance(rows,Snapshot) else {}
+    if correction.get('global_reason'):
+        raise ValueError('Lifecycle correction family is damaged or its restore is incomplete ('
+                         +correction['global_reason']+'); an operator repairs the family before recording facts')
     prior=op_index.get(payload['operation_id'])
     if payload['operation_id'] in getattr(op_index, 'blocked', {}):
         raise ValueError('Lifecycle operation names an event that reads unknown ('
@@ -1955,6 +1966,19 @@ def release_group_estimate(writes):
     return round(DRY_RUN_FIXED_SECONDS+DRY_RUN_SECONDS_PER_WRITE*writes,1)
 
 
+def offline_snapshot(rows, project=None):
+    """An export cannot prove that the host has no correction family.
+
+    A named local project supplies the same bounded family reader as the host.
+    Without one, preserve native evidence but report its derived truth unknown.
+    """
+    from lifecycle_voids import Snapshot, snapshot
+    if project is not None:
+        return snapshot(rows, project)
+    return Snapshot(rows, dict(entries={},reasons={},invalid=[],retracted=set(),
+                              global_reason='lifecycle-corrections-not-consulted'))
+
+
 def main():
     parser=argparse.ArgumentParser(description=__doc__);sub=parser.add_subparsers(dest='command',required=True)
     record=sub.add_parser('record')
@@ -1982,8 +2006,8 @@ def main():
     # without it (a remote worker usually cannot read the host journal) no revert
     # is trusted locally and the endpoint, which always has both, is authoritative.
     release.add_argument('--journal')
-    view=sub.add_parser('list');view.add_argument('--export',required=True);view.add_argument('--implemented-not-deployed',action='store_true')
-    owed=sub.add_parser('evidence-owed');owed.add_argument('--export',required=True)
+    view=sub.add_parser('list');view.add_argument('--export',required=True);view.add_argument('--implemented-not-deployed',action='store_true');view.add_argument('--journal')
+    owed=sub.add_parser('evidence-owed');owed.add_argument('--export',required=True);owed.add_argument('--journal')
     a=parser.parse_args()
     try:
         if a.command=='record':
@@ -2010,6 +2034,11 @@ def main():
                 raise ValueError('--target/--rollback cannot be combined: a rollback resolves its own targets')
             rows=read_export(a.export)
             journal=a.journal or None
+            # Offline selection must consult the same family as host readers.
+            # A writing release still has its authoritative endpoint check; its
+            # local candidate report below discloses an unconsulted family.
+            if a.dry_run or journal is not None:
+                rows=offline_snapshot(rows,journal)
             is_ancestor=git_ancestry(a.repo)
             config=load_json(a.config)
             warnings=[]
@@ -2173,6 +2202,12 @@ def main():
                 report['reverts_source']='local'
                 report['dry_run_revert_note']=DRY_RUN_REVERT_NOTE
                 warnings=warnings+[DRY_RUN_REVERT_NOTE]
+            report['corrections_consulted']=journal is not None
+            if journal is None:
+                report['correction_note']=('Lifecycle corrections were not consulted locally: pass --journal '
+                    'PROJECT_DIRECTORY for the host family. Offline facts are unknown; a writing release '
+                    'is checked by the endpoint before effects.')
+                warnings.append(report['correction_note'])
             if warnings:report['warnings']=warnings
             # Check every target and every derived operation ID for the WHOLE release
             # before the first group request, so a conflict or a stale target in group
@@ -2228,10 +2263,20 @@ def main():
                 print(json.dumps(report,ensure_ascii=False,indent=2))
         elif a.command=='evidence-owed':
             from export_requirements import read_export
-            print(json.dumps(evidence_owed(read_export(a.export)),ensure_ascii=False,indent=2))
+            report=evidence_owed(offline_snapshot(read_export(a.export),a.journal or None))
+            if not a.journal:
+                print('Lifecycle corrections were not consulted; pass --journal PROJECT_DIRECTORY. '
+                      'Derived facts and the evidence owed are unknown.',file=sys.stderr)
+            print(json.dumps(report,ensure_ascii=False,indent=2))
         else:
             from export_requirements import read_export
-            facts=project_facts(read_export(a.export))
+            facts=project_facts(offline_snapshot(read_export(a.export),a.journal or None))
+            if not a.journal:
+                print('Lifecycle corrections were not consulted; pass --journal PROJECT_DIRECTORY. '
+                      'Derived facts are unknown.',file=sys.stderr)
+            for fact in facts:
+                fact['corrections_consulted']=bool(a.journal)
+                if not a.journal:fact['correction_note']='Lifecycle corrections were not consulted; pass --journal PROJECT_DIRECTORY. Derived facts are unknown.'
             if a.implemented_not_deployed:facts=[r for r in facts if r['facts']['implemented']['value']=='passed' and r['facts']['deployed']['value'] not in ('passed','not-applicable')]
             print(json.dumps(facts,ensure_ascii=False,indent=2))
     except (ValueError,OSError,RuntimeError) as exc:raise SystemExit(str(exc))

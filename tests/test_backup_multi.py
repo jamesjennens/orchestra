@@ -870,6 +870,8 @@ class InterruptedRunAndCopyLockCase(unittest.TestCase):
     """P3: the stale staged snapshot, and the coordination-lock scope of backup-copy."""
 
     def setUp(self):
+        patcher=patch.object(admin,'backup_lifecycle_void_family',return_value={})
+        patcher.start();self.addCleanup(patcher.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name) / 'runtime'

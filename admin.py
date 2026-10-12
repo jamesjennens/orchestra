@@ -4382,6 +4382,13 @@ def guidance_backup_pair(path):
                     'set with clean text, which replaces it.'%(error,))
     return {'GUIDANCE.md': {'text': guidance_text}, GUIDANCE_META: guidance_meta}, None
 
+def backup_lifecycle_void_family(root,name):
+    """Check the native/host pair even when an older kit omitted the whole family."""
+    from lifecycle_voids import backup_files
+    rows=record_json.loads_rows(run_bd(root,name,['export','--all']))
+    return backup_files(project_dir(root,name),rows)
+
+
 def backup_project(root,name):
     import fcntl
     from coordination import atomic
@@ -4396,19 +4403,10 @@ def backup_project(root,name):
         fcntl.flock(lock,fcntl.LOCK_EX)
         atomic(bundle,{'schema_version':1,'status':'pending'})
         files={}
-        from lifecycle_voids import backup_files as void_backup_files
         from lifecycle_voids import read_journal as read_void_journal
         void_journal = read_void_journal(path)
         if void_journal['invalid']:
             raise ValueError('Cannot back up an unreadable/incomplete lifecycle VOID family')
-        if void_journal['present']:
-            # Verify the complete host/native pair under the same project lock
-            # as the subsequent native sync, not just the JSON file shapes.
-            native_rows = record_json.loads_rows(run_bd(root,name,['export','--all']))
-            void_files = void_backup_files(path,native_rows)
-            from lifecycle_voids import validate_backup as validate_void_backup
-            validate_void_backup(void_files,native_rows)
-            files.update(void_files)
         from requirement_governance import snapshot as governance_snapshot
         files.update(governance_snapshot(path,name))
         if (path/'.coordination-requests').is_symlink() or (path/'.merge-context.json').is_symlink():raise ValueError('Coordination paths must not be symlinks')
@@ -4504,6 +4502,9 @@ def backup_project(root,name):
                 validate_quarantine_record(quarantine_name,backup)
                 files[quarantine_name]=backup
         validate_coordination_files(files)
+        # Check under the held project lock, after local validation and before
+        # any native sync. An absent family can be an omitted or cut family.
+        files.update(backup_lifecycle_void_family(root,name))
         # The idempotency journal is a second local store inside the project directory;
         # take its consistent snapshot in the same critical section as the coordination
         # sidecar so a backup never pairs one store's state with the other's. It is
@@ -5792,12 +5793,26 @@ def using_last_complete_sidecar(root,source):
     fallback=last_complete_sidecar_path(root,source)
     return complete_sidecar(bundle) is None and complete_sidecar(fallback) is not None
 
+def restore_lifecycle_void_family(root,destination,files):
+    """Check the restored native data even when every VOID member was omitted."""
+    import fcntl
+    import lifecycle_voids as voids
+    path=project_dir(root,destination)
+    if (path/'.coordination.lock').is_symlink():
+        raise ValueError('Coordination restore lock must not be a symlink')
+    with (path/'.coordination.lock').open('a') as lock:
+        fcntl.flock(lock,fcntl.LOCK_EX)
+        native_rows=record_json.loads_rows(run_bd(root,destination,['export','--all']))
+        return voids.restore_files(path,files,native_rows)
+
+
 def restore_coordination(root,source,destination,restore_operators=False,restore_verifiers=False,authority=True,
                          actor=None,reason=None):
     from coordination import atomic
     path=project_dir(root,destination)
     files=coordination_backup(root,source)
     if files is None:
+        restore_lifecycle_void_family(root,destination,{})
         print('Legacy backup has no coordination journal. Reconcile outstanding child requests and merge ownership before accepting writes.')
         return False
     from requirement_governance import restored_files as restored_governance_files
@@ -5857,14 +5872,7 @@ def restore_coordination(root,source,destination,restore_operators=False,restore
     # sidecar writes. A hard cut retains the marker until the exact restore is
     # retried; it cannot expose an older passing event between member writes.
     import lifecycle_voids as voids
-    if voids.MANIFEST in files or os.path.lexists(str(path/voids.DIRECTORY)) or os.path.lexists(str(path/voids.RESTORE_MARKER)):
-        import fcntl
-        if (path/'.coordination.lock').is_symlink():
-            raise ValueError('Coordination restore lock must not be a symlink')
-        with (path/'.coordination.lock').open('a') as lock:
-            fcntl.flock(lock,fcntl.LOCK_EX)
-            native_rows=record_json.loads_rows(run_bd(root,destination,['export','--all']))
-            voids.restore_files(path,files,native_rows)
+    restore_lifecycle_void_family(root,destination,files)
     for name,record in files.items():
         if name==voids.MANIFEST or name.startswith(voids.DIRECTORY+'/'):
             continue
@@ -9306,7 +9314,13 @@ def finish_restore(root,args,snapshot,step=None):
     # that waits on the deployment lock, and a refusal there must leave a complete restore.
     # --without-coordination (kittrial-5bb.152): no coordination files, no authority; the
     # operation journal is restored as before when the backup has a snapshot.
-    sidecar=False if getattr(args,'native_only',None) is not None else restore_coordination(root,args.project,args.destination,authority=False)
+    if getattr(args,'native_only',None) is not None:
+        # An explicit omission of coordination still cannot silently revive
+        # native facts whose correction evidence the command can see.
+        restore_lifecycle_void_family(root,args.destination,{})
+        sidecar=False
+    else:
+        sidecar=restore_coordination(root,args.project,args.destination,authority=False)
     # What the deployment-authority step at the END of this function needed: it does not run when
     # the merge-slot step below fails, so the notice must say what was not compared and not
     # re-granted, and it can only say that knowing this (kittrial-5bb.240 F1).

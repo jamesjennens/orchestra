@@ -4,7 +4,14 @@
 
 `admin.py --root ROOT lifecycle-audit PROJECT --limit 50 --offset 0` is a read-only,
 bounded page of recorded lifecycle attribution and standing approval evidence.
-It reports omitted and unclassifiable counts. A recorder's current assignee or
+It reports omitted and unclassifiable counts, project-wide questionable fact
+counts, and every correction's operation key, operator, native time, reason and
+evidence. Active VOID, retracted VOID, retraction and incomplete native comments
+remain visible. `correction_status` says incomplete or damaged; an unpaired
+native comment never establishes issuance authority or silently reads as a
+clean audit. Event and correction pages share `--limit` and `--offset`;
+`page_total` and `next_offset` cover both streams, and their omitted counts are
+reported separately. A recorder's current assignee or
 operator relationship is shown separately from approval at recording time;
 historical principal ownership cannot be proved by today's registry. Questionable
 evidence is for operator review, not a finding of fraud. Reads create no store.
@@ -12,7 +19,9 @@ evidence is for operator review, not a finding of fraud. Reads create no store.
 The host-only writer is OFF on a new installation and stays OFF on upgrade unless
 an operator explicitly changes it. First install this reader, backup and restore
 support on **every installation that may hold or restore the project**. Then a
-listed deployment operator may use:
+listed deployment operator may use. The switch takes a **plain listed name
+only**; a project principal's bound actor may issue VOID/retraction, but cannot
+flip this installation setting merely by its principal binding:
 
 ```sh
 python3 admin.py --root ROOT lifecycle_void_writes status --actor OPERATOR
@@ -28,6 +37,8 @@ the native comment write says the effect is uncertain and names that key. The
 exact retry binds the already stored native comment and publishes its missing
 host record; it does not create another native comment. A reused key naming
 different content or actor refuses. Retraction names the VOID operation key.
+If another key already voids the event, a pending/cut key cannot publish a second
+VOID on retry: the refusal names the operation already in effect.
 
 Authority is checked under the project and deployment configuration locks. A
 currently listed operator's registered actor may act through the same bound
@@ -35,6 +46,9 @@ principal; another principal or an unreadable registry grants no exemption.
 This intentionally extends the raw native-write operator exemption to a listed
 operator's bound actor as well. Unbound actor names remain attribution on a
 trusted host, not authentication. Contributor routes cannot issue corrections.
+Registry damage proves no exemption for a lifecycle-shaped raw write. Ordinary
+create, update, dependency, close and reopen requests do not need that exemption
+and do not read the registry merely for this guard.
 
 A correction binds the exact native event, original payload, parent task, native
 author/time, and matching correction comment to `.lifecycle-voids/`. The comment
@@ -53,8 +67,24 @@ native correction comments is refused. Both target and native
 comment bindings and the retraction graph must validate. An absent family leaves
 legacy backup bytes unchanged. A trusted host restore restores issuance evidence;
 it never re-grants the recorded operator. A copied native comment without the host
-family remains inert. A native generation that differs from the sidecar requires
+family remains unissued and is listed as incomplete by the audit. A native generation that differs from the sidecar requires
 operator reconciliation and stays UNKNOWN.
+
+The family has a lifetime limit of **1,000 records and 4 MiB per project**;
+retracted VOID/retraction pairs still count. The writer reserves room to retract
+outstanding VOID records. At the limit, retain the family and native evidence,
+turn the writer OFF if necessary, and upgrade every reader/restorer to a kit with
+larger validated bounds before adding corrections. Do not delete/prune old
+entries or native comments to make space: doing so loses binding/history and
+requires operator reconciliation.
+
+Offline `lifecycle.py list --export FILE --journal PROJECT_DIRECTORY`,
+`evidence-owed --export FILE --journal PROJECT_DIRECTORY`, and release selection
+read the same family. A list or dry-run release without a local `--journal`
+reports that corrections were not consulted and derives UNKNOWN, not PASSED.
+An evidence-owed command without it warns that its result is unknown. The
+writing release's local candidate report discloses an unconsulted family; the
+endpoint validates each actual target before any effects.
 
 Restore installs `.lifecycle-void-restore.json` before any member replacement and
 clears it only after the complete family/native pair matches. A cut retains this
@@ -63,6 +93,12 @@ Repeat the exact restore with its original manifest to complete it. A different
 manifest, damaged existing family, or a legacy backup that would discard an
 existing VOID family refuses; preserve the files and reconcile using a complete
 VOID-capable backup. Do not delete the marker to make a partial restore look done.
+This also refuses a backup whose manifest **and all family members** were
+omitted while native correction comments remain, including an older-kit backup
+and `--without-coordination`. The refusal retains an incomplete restore marker;
+reads stay UNKNOWN, audit reports the incomplete corrections and backup refuses
+the destination. Preserve it and restore a complete VOID-capable backup into an
+unused destination.
 
 **Rollback:** an older kit ignores this family and can report the original fact.
 It also refuses a sidecar containing these new paths. Before rolling the kit back,
