@@ -380,6 +380,7 @@ def fingerprint(body):
     return 'SHA256:' + base64.b64encode(hashlib.sha256(base64.b64decode(body)).digest()).decode().rstrip('=')
 
 
+@unittest.skipIf(os.name == 'nt', 'these fixtures write the temporary folder (a Windows path) as the key line\'s --root and wrapper paths; key-line text is POSIX sshd syntax and is judged with posixpath, which correctly does not read C:/ or D:\\ paths as absolute - kittrial-5bb.265 r2 item 5. Build the fixtures as POSIX text to run here.')
 class ListingTests(unittest.TestCase):
 
     def setUp(self):
@@ -474,7 +475,7 @@ class ListingTests(unittest.TestCase):
     def test_a_line_for_another_runtime_and_unknown_things(self):
         other = self.one(self.line(root=self.base/'elsewhere', projects=['alpha']))
         self.assertTrue(other['other_root'])
-        self.assertNotIn('unknown_projects', other)                             # not looked up in a runtime it does not serve
+        self.assertEqual([], other['unknown_projects'])                         # not looked up in a runtime it does not serve (always a list now)
         entry = self.one(self.line(projects=['alpha', 'gamma', 'Not-A-Name']))
         self.assertEqual(entry['unknown_projects'], ['gamma', 'Not-A-Name'])
         entry = self.one(self.line(more=' --authority-store /x --principal person:alex'))

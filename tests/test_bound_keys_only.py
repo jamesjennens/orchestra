@@ -1747,6 +1747,7 @@ class SettingsCommandTests(unittest.TestCase):
                 admin.bound_keys_only_switch(self.root, 'on', OPERATOR)
 
 
+@unittest.skipIf(os.name == 'nt', 'these fixtures write the temporary folder (a Windows path) as the key line\'s --root and wrapper paths; key-line text is POSIX sshd syntax and is judged with posixpath, which correctly does not read C:/ or D:\\ paths as absolute - kittrial-5bb.265 r2 item 5. Build the fixtures as POSIX text to run here.')
 class ListingTests(unittest.TestCase):
     """``authorized-keys-list`` names the lines the setting refuses."""
 

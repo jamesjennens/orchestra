@@ -6037,10 +6037,10 @@ def key_line(line,root,kit):
     link=install_current_link(here)
     entry['names_release']=bool(link is not None and not entry['other_kit'] and not relative_path
                                 and not all(str(path).startswith(str(link)+'/') for path in [wrapper,*endpoints]))
-    if not entry['other_root']:
-        entry['unknown_projects']=[name for name in values['--project']
-                                   if not re.fullmatch(r'[a-z][a-z0-9]{1,23}',name)
-                                   or not (Path(root)/'projects'/name/'.beads/metadata.json').is_file()]
+    entry['unknown_projects']=([name for name in values['--project']
+                               if not re.fullmatch(r'[a-z][a-z0-9]{1,23}',name)
+                               or not (Path(root)/'projects'/name/'.beads/metadata.json').is_file()]
+                              if not entry['other_root'] else [])
     if principals:
         # A repeated principal would be served as the last one while the listing showed the
         # first; an ill-formed one refuses every request of that key. Both go under attention.
