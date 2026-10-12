@@ -82,7 +82,7 @@ python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime ins
 python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime add-project example
 ```
 
-`add-project` initializes the project, records the standard native configuration, provisions the project's merge slot (idempotently) and performs the initial backup. A project whose slot is missing refuses `merge-check`, `merge-acquire` and `merge-release` with an error naming the `merge-create` coordination operation, which is also the manual repair for a project created before this behavior.
+`add-project` initializes the project, records the standard native configuration, provisions the project's merge slot (idempotently) and performs the initial backup. A project whose slot is missing refuses `merge-check`, `merge-acquire` and `merge-release` with an error naming the `merge-create` coordination operation, which is also the manual repair for a project created before this behavior. **One creation at a time per HOST** (not per project): while any creation runs (`add-project` or the web interface), an `add-project` or `restore-new` of another name is refused at once with `Another project is being created on this server right now (NAME); wait for it to finish, then run this command again`, and `retire-project` of any project is refused. An operator's script that creates several projects should wait and retry when that sentence appears.
 
 Project names use 2–24 lowercase letters/digits, starting with a letter. To use a project in the web interface (`http_service.py --backend endpoint`), a superuser then registers it there under the same name; the web service never creates canonical projects ([HTTP deployment](HTTP_DEPLOYMENT.md#projects-on-the-endpoint-backend)). After upgrading a web service, run its upgrade check once: `http_service.py --state <STATE> --list-unconfirmed-projects` lists project records made by an older kit that the service now refuses until a superuser confirms or archives them. Run these commands as the service account. An administrator should enable its user manager at boot and after logout:
 
@@ -431,18 +431,29 @@ is missing, a directory, a fifo (which this command refuses to wait on), or larg
 bound: an operator who cannot see what will be cut off must say so deliberately, with
 `--without-preview`, and the refusal names that option; nothing is changed by the refusal
 (kittrial-5bb.250 F2, the coordinator's decision). The preview decides by ONE rule, in three
-groups (kittrial-5bb.250 r5): **refused** - a line whose command is EXACTLY the shape
-`authorized-keys` prints: one ABSOLUTE interpreter path, then zero or more of the two words
-`-E` and `-s` each alone (no other flag, no combined `-Es`, no `-W` that takes the wrapper
-path as its own value, no `-i`), then this kit's wrapper by absolute path as the next word -
-or the wrapper path as the first word. The interpreter's NAME is not judged: the preview
-trusts the first word to be the interpreter the kit printed, and a line of that shape whose
-interpreter is not Python is the operator's own doing. The command must need no shell at all
+groups (kittrial-5bb.265): **refused** - a line whose command is EXACTLY the shape
+`authorized-keys` prints: one ABSOLUTE interpreter path, then the two words `-E` and `-s`
+BOTH, alone, in the printed order (no partial flag set - a line without `-E` obeys
+`PYTHONPATH` if sshd passes the environment - no combined `-Es`, no `-W` that takes the
+wrapper path as its own value, no `-i`), then this kit's wrapper by absolute path as the
+next word - or the wrapper path as the first word. The first word must be the absolute
+path the kit prints: a BARE interpreter name (the `--python NAME` spelling) is group two -
+the status and on warnings print `Read the first word of every listed line: if it is not
+the interpreter you installed, remove the line`, because a line whose first word is another
+program (a shell included: `/bin/sh -s WRAPPER ...` runs what stdin says, on and off) is
+listed as refused although that program still runs. The interpreter's NAME is otherwise not
+judged: the preview trusts the first word to be the interpreter the kit printed. The command must need no shell at all
 (a whitelist of plain ASCII characters: letters, digits, `-_.+/=,:` and space - a tab or a
-non-ASCII letter is shell), name the wrapper by an absolute path of at most 512 bytes, and
-carry an absolute `--root` serving this root, parsing as unbound. Group one means **not
+non-ASCII letter is shell), name the wrapper by an absolute path of at most 512 bytes, carry
+an absolute `--root` serving this root, and the whole `command=` is at most
+`AUTHORIZED_KEY_COMMAND_MAX` (8192) bytes - judged at that length before any token work,
+because Python 3.10's `shlex` is quadratic in one long word. Group one means **not
 served once on**, not served today: a wrapper file that is not executable, a relative
-`--endpoint` or an ill-formed project name serve nothing now and are still group one.
+`--endpoint` or an ill-formed project name serve nothing now and are still group one, said
+as refused for another reason - and a BOUND line refused for one of those reasons is group
+one too (it is not served once on), while a bound line naming a WELL-FORMED project that
+does not exist is served exactly as a bound line and is in no group. Parsing as unbound is
+the ordinary group-one case; refused-before-the-setting is the other.
 **may be refused** - every OTHER line that has a `command=` at all:
 any other wrapper or root, shell syntax (`cd KIT && ...`, `2>/dev/null`, `; true`, `&`, `#`, a
 glob, an assignment, `/bin/sh -c`, quotes), a relative or `$HOME` path, and lines that run

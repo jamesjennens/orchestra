@@ -1014,6 +1014,10 @@ WOULD_BE_REFUSED_NAMED_MAX=20
 #: The file is the account's, but it is read on every `status`/`on`; a huge one must not be
 #: read whole, and the report says when the tail was not inspected.
 AUTHORIZED_KEYS_MAX_BYTES=1024*1024
+#: The most command= text a key line may carry and still be judged (kittrial-5bb.265 r2):
+#: no printed line comes near it, and Python 3.10's shlex is quadratic in one long word,
+#: so an over-long command is group two at the length alone, before any token work.
+AUTHORIZED_KEY_COMMAND_MAX=8192
 #: The most of one audit field (`actor`, `at`) a warning prints (kittrial-5bb.196 review,
 #: item 6): a hand-edited entry must not put escape sequences or 200 kB on the terminal.
 AUDIT_FIELD_MAX=80
@@ -1673,8 +1677,12 @@ def bound_keys_only_switch(root,action,actor,file=None,without_preview=False):
         may_refuse=[] if preview_info is None else preview_info[3]
         may_refuse_more=0 if preview_info is None else preview_info[4]
         if preview:
-            print('WARNING: %s %d authorized_keys line(s) of this kit and this root: %s%s. Print each such '
-                  'line again with `admin.py authorized-keys --project ... --principal ...` and replace it%s.'
+            # kittrial-5bb.265 item 2: the consequence of the trusted first word is said
+            # with the group-one list itself, in status and in on alike.
+            print('WARNING: %s %d authorized_keys line(s) of this kit and this root: %s%s. Read the first '
+                  'word of every listed line: if it is not the interpreter you installed, remove the line. '
+                  'Print each such line again with `admin.py authorized-keys --project ... --principal ...` '
+                  'and replace it%s.'
                   %('this installation refuses' if current else 'turning this setting on would refuse',
                     len(preview)+preview_more,', '.join(str(number) for number in preview),
                     ' and %d more'%preview_more if preview_more else '',
@@ -1750,8 +1758,9 @@ def bound_keys_only_switch(root,action,actor,file=None,without_preview=False):
         # business.
         if preview:
             print('WARNING: turning this setting on refuses %d authorized_keys line(s) of this kit and this '
-                  'root: %s%s. Print each such line again with `admin.py authorized-keys --project ... '
-                  '--principal ...` and replace it.'
+                  'root: %s%s. Read the first word of every listed line: if it is not the interpreter you '
+                  'installed, remove the line. Print each such line again with `admin.py authorized-keys '
+                  '--project ... --principal ...` and replace it.'
                   %(len(preview)+preview_more,', '.join(str(number) for number in preview),
                     ' and %d more'%preview_more if preview_more else ''),file=sys.stderr)
         if may_refuse or may_refuse_more:
@@ -2353,7 +2362,8 @@ def restore_destination_state(root,destination):
 #: ``restore_failure_notice`` can say what is true after it fails (kittrial-5bb.202 rev-2).
 MERGE_SLOT_STEP='merge-slot provisioning'
 
-def restore_failure_notice(destination,error,state='partial',step='native restore',merge_slot=None):
+def restore_failure_notice(destination,error,state='partial',step='native restore',merge_slot=None,
+                           journals_restored=None,authority_note=None):
     """What an operator must do after the native step of ``restore-new`` did not complete.
 
     ``state`` is ``restore_destination_state``'s answer: the notice says "partial" only
@@ -2364,6 +2374,13 @@ def restore_failure_notice(destination,error,state='partial',step='native restor
     coordination sidecar and the journals, so the notice may say those are in place, and it
     must not call the slot unprovisioned or "named missing by the report" unless this fresh
     read of the clone actually says so (kittrial-5bb.202 review of revision 2, F1).
+
+    ``journals_restored`` is ``args.journal_restored`` (True when the backup carried an
+    operation-journal snapshot and it was restored, False when it carried none, None when the
+    caller does not know): the notice may claim "its journals are in place" only when it is True
+    (kittrial-5bb.240 F2). ``authority_note`` is the sentence about the deployment-authority step
+    the failure skipped, appended to the provisioning notices (kittrial-5bb.240 F1); None adds
+    nothing.
     """
     if isinstance(error,subprocess.TimeoutExpired):
         cause='the native restore reached its %d s ceiling and its client was stopped'%RESTORE_TIMEOUT
@@ -2404,32 +2421,117 @@ def restore_failure_notice(destination,error,state='partial',step='native restor
         # empty slotless source reads as that shape (bd lists no rows at all), and the generic
         # sentence there would then claim the sidecar and journals were NOT restored, which is
         # exactly what the reordering made false.
-        in_place=('Project %s exists and holds the restored tracker: its data, its re-pointed backup target and '
-                  'its journals are in place, and a backup of it taken now is expected to succeed.'%destination)
+        in_place=merge_slot_step_in_place(destination,journals_restored)
+        # The deployment-authority step runs after this one, so the failure skipped it: the
+        # notice says what was not compared and not re-granted, and how to do it
+        # (kittrial-5bb.240 F1).
+        authority=(' '+authority_note) if authority_note else ''
         where=(merge_slot or {}).get('state')
         detail=(merge_slot or {}).get('detail')
         if where in ('missing','damaged'):
             return ('restore-new did not complete: %s. %s Its merge slot is still %s: %s Run the merge-create '
                     'coordination operation for %s, or retire it with %s.%s Run restore-new again into another '
-                    'unused destination name; the source backup was not modified.'
-                    %(cause,in_place,where,detail or 'the host read it as unusable.',destination,retire,retry_force))
+                    'unused destination name; the source backup was not modified.%s'
+                    %(cause,in_place,where,detail or 'the host read it as unusable.',destination,retire,retry_force,
+                      authority))
         if where=='healthy':
             return ('restore-new did not complete: %s. %s Its merge slot reads healthy, so the failure was in the '
                     '%s step and not in the slot: nothing is left to mend, and merge-check and the read-only '
                     'merge-slot-report are expected to agree. Confirm with merge-check before using it, or retire '
                     'it with %s.%s Run restore-new again into another unused destination name; the source backup '
-                    'was not modified.'%(cause,in_place,MERGE_SLOT_STEP,retire,retry_force))
+                    'was not modified.%s'%(cause,in_place,MERGE_SLOT_STEP,retire,retry_force,authority))
         return ('restore-new did not complete: %s. %s Whether it has a usable merge slot could not be read: the '
                 'same fault stopped the %s step, so this notice does not claim it is missing. Run merge-check for '
                 '%s, or the read-only merge-slot-report, and if it names the merge-create operation run that; else '
                 'retire it with %s.%s Run restore-new again into another unused destination name. The source backup '
-                'was not modified.'%(cause,in_place,MERGE_SLOT_STEP,destination,retire,retry_force))
+                'was not modified.%s'%(cause,in_place,MERGE_SLOT_STEP,destination,retire,retry_force,authority))
     return ('restore-new did not complete: %s. Project %s exists but holds a partial restore (its '
             'coordination sidecar, journals and operation journal were NOT restored). Preserve it for '
             'inspection, do not use or back it up as a tracker, and run restore-new again into another '
             'unused destination name; the source backup was not modified. While it stays in the runtime '
             'its backup fails and the backup gate reports the runtime incomplete: retire it with %s.%s'
             %(cause,destination,retire,retry_force))
+
+def merge_slot_step_in_place(destination,journals_restored=None):
+    """What the clone holds when the merge-slot provisioning step failed, as one sentence.
+
+    That step runs LAST, after the re-point, the coordination sidecar and the journals
+    (kittrial-5bb.202 rev-3 item 1), so the clone really does hold the restored tracker and its
+    own backup target here. It must NOT claim the journals are in place when ``restore_journal``
+    found no snapshot to restore (kittrial-5bb.240 F2): ``journals_restored`` is
+    ``args.journal_restored`` - True when a snapshot was restored, False when the backup carried
+    none, None when the caller does not know - and None only says that the steps before this one
+    ran to completion.
+    """
+    if journals_restored is True:
+        holds='its data, its re-pointed backup target and its journals are in place'
+    elif journals_restored is False:
+        holds=('its data and its re-pointed backup target are in place, and its operation journal starts empty '
+               'because the backup carried no journal snapshot')
+    else:
+        holds=('its data and its re-pointed backup target are in place, and the steps before this one (the '
+               're-point, the coordination sidecar and the journals) ran to completion')
+    return ('Project %s exists and holds the restored tracker: %s, and a backup of it taken now is expected to '
+            'succeed.'%(destination,holds))
+
+
+def restore_authority_not_run(root,source,args):
+    """The sentence the provisioning notice adds: the deployment-authority step did not run.
+
+    ``restore_authority`` is the LAST thing ``finish_restore`` does, so when the merge-slot
+    provisioning step fails it is skipped without a word: the "NOT restored: the backup records
+    ..." lines a complete restore prints are never printed, and ``--restore-operators``/
+    ``--restore-verifiers`` re-grant nothing while the command exits 1 (kittrial-5bb.240 F1).
+    This returns what to say instead, and NEVER re-grants: the re-grant stays an explicit operator
+    decision. It is called only for a failure of that step, where ``args.sidecar_restored`` is
+    already set, and it never raises (it runs on a failure path).
+    """
+    asked=bool(getattr(args,'restore_operators',False) or getattr(args,'restore_verifiers',False))
+    if getattr(args,'native_only',None) is not None:
+        return ('This was a --without-coordination restore, so no coordination sidecar and no deployment authority '
+                'were restored, and none was compared or re-granted'
+                +(' (--restore-operators/--restore-verifiers re-granted nothing).' if asked
+                  else ' (as the restore asked).'))
+    if not getattr(args,'sidecar_restored',False):
+        return ('This backup has no coordination sidecar, so it records no operators or verifiers: nothing was '
+                'compared and nothing was re-granted'
+                +(' (--restore-operators/--restore-verifiers re-granted nothing).' if asked else '.'))
+    return recorded_authority_not_compared(root,source,args)
+
+
+def recorded_authority_not_compared(root,source,args=None):
+    """The read-only half of ``restore_authority``, for the notice of a later failed step.
+
+    It makes the SAME comparison ``restore_authority`` makes and returns one sentence naming what
+    the backup records and this host does not list, with the exact commands that re-grant one name
+    and the read-only comparison line, or None when there is nothing to report. It follows the
+    same rule as the rest of the restore: the comparison is read-only, and the re-grant is an
+    explicit operator decision (kittrial-5bb.240 F1). It never raises: a sidecar or a deployment
+    configuration that cannot be read is SAID, not raised, because this runs on a failure path.
+    """
+    import shlex
+    try:
+        missing=missing_operators(root,source)
+        unlisted=missing_verifiers(root,source)
+    except (OSError,ValueError,TypeError,KeyError,UnicodeError):
+        return ('The deployment-authority step also did not run, so the operators and verifiers the backup records '
+                'were NOT compared and NOT re-granted; they could not even be listed here, because the backup '
+                'sidecar or the deployment configuration could not be read.')
+    named=[]
+    if missing:named.append('operator allowlist entries this host does not list: '+', '.join(missing))
+    if unlisted:named.append('capability verifiers this host does not list: '+', '.join(unlisted))
+    if not named:return None
+    actor=getattr(args,'actor',None)
+    reason=getattr(args,'reason',None)
+    commands=authority_regrant_commands(root,missing,unlisted,actor,reason)
+    return ('The deployment-authority step runs AFTER this one, so it did not run either: the operators and '
+            'verifiers the backup records were NOT compared (the "NOT restored: ..." line a complete restore prints '
+            'was not printed) and NOT re-granted (--restore-operators/--restore-verifiers re-granted nothing). The '
+            'backup records %s. Compare this installation with the backup:\n  admin.py --root %s backup-authority '
+            '%s\nRe-grant what you decide to with:\n  %s\n%sRe-run restore-new into another unused destination name '
+            'with --restore-operators/--restore-verifiers to re-establish the whole recorded list in one step.'
+            %('; '.join(named),shlex.quote(str(root)),shlex.quote(source),'\n  '.join(commands),
+              authority_regrant_replace_note(actor,reason)))
 
 def provision_merge_slot(root,name):
     """Create the project's merge slot once, tolerating an existing slot.
@@ -3610,7 +3712,7 @@ def require_bd_init_tools(root):
     if missing:
         names=' and '.join(missing)
         raise ValueError('This host has no %s on PATH, which bd init needs to create a project. '
-                         'Install %s and run this command again; nothing was created.'%(names,names))
+                         'Install %s and run this command again; no project was created.'%(names,names))
 
 def require_creatable_project(root,name):
     """The checks a creation needs before anything is made; returns the project directory.
@@ -3634,16 +3736,16 @@ def require_creatable_project(root,name):
     try:
         document = config(root)
     except FileNotFoundError:
-        raise ValueError('Deployment is not installed; run install first. Nothing was created.') from None
+        raise ValueError('Deployment is not installed; run install first. No project was created.') from None
     except OSError as error:
         raise ValueError('This host cannot read the deployment configuration %s (%s). '
-                         'Fix that file and run this command again; nothing was created.'
+                         'Fix that file and run this command again; no project was created.'
                          % (root/'deployment.private.json', error.strerror or error)) from None
     except ValueError:
         raise
     if not isinstance(document, dict):
         raise ValueError('Deployment configuration %s is not a JSON object. Fix that file and run '
-                         'this command again; nothing was created.' % (root/'deployment.private.json'))
+                         'this command again; no project was created.' % (root/'deployment.private.json'))
     port = document.get('port')
     # isinstance(True, int) is true: a bool is not a port (review 01a1288a).
     # ASCII digits only, at most five characters (F3): str.isdigit() accepts superscripts
@@ -3653,7 +3755,7 @@ def require_creatable_project(root,name):
                   and port.isascii() and port.isdigit() and 1 <= int(port) <= 65535))
     if not usable:
         raise ValueError('Deployment configuration %s has no usable port. Fix that file and run '
-                         'this command again; nothing was created.' % (root/'deployment.private.json'))
+                         'this command again; no project was created.' % (root/'deployment.private.json'))
     return path
 
 def initialize_requirements_governance(root,name):
@@ -6267,9 +6369,13 @@ def _wrapper_exists(wrapper):
     """Whether the wrapper path names anything, without raising on a NUL or an over-long name.
 
     A RELATIVE wrapper path is not asked at all (r4 item 2): stat would answer by the
-    caller's directory, so the listing's missing flag would differ by directory.
+    caller's directory, so the listing's missing flag would differ by directory. The path
+    is a key line's POSIX text, judged with posixpath on every host (kittrial-5bb.265
+    item 4 - the Windows fixtures write C:/ spellings that ntpath and posixpath both
+    read as absolute, and the //?/C:/ spelling likewise; the isabs calls here stay
+    POSIX because sshd syntax is POSIX, not because the host is).
     """
-    if not os.path.isabs(str(wrapper)) or str(wrapper).startswith('~') or len(str(wrapper)) > 512:
+    if not posixpath.isabs(str(wrapper)) or str(wrapper).startswith('~') or len(str(wrapper)) > 512:
         return False
     try:
         return Path(wrapper).is_file()
@@ -6302,6 +6408,17 @@ def key_line(line,root,kit):
     if command is None:
         entry['kind']='unrestricted'
         return entry
+    # kittrial-5bb.265 r2 item 2: a bound on the RAW COMMAND TEXT, before shlex - Python
+    # 3.10's shlex.split is quadratic in one long word (400,000 characters: 5.8 s alone),
+    # so a 1 MB line of 200,000 path components cost ~40 s before any of the kit's own
+    # code ran. No line the kit prints comes near this bound; a longer command is group
+    # two at once (it cannot be the printed shape), and no token work happens on it.
+    if len(command) > AUTHORIZED_KEY_COMMAND_MAX:
+        entry['kind']='other-command'                    # group two: not the printed shape
+        entry['needs_shell'] = False
+        entry['relative_path'] = True
+        entry['foreign_invocation'] = True
+        return entry
     try:tokens=shlex.split(command)
     except ValueError:tokens=[]
     at=next((index for index,token in enumerate(tokens) if token.rsplit('/',1)[-1]=='ssh_forced_command.py'),None)
@@ -6309,18 +6426,25 @@ def key_line(line,root,kit):
         entry['kind']='other-command'
         return entry
     wrapper=tokens[at]
-    # kittrial-5bb.250 r3 item 4, THE RULE: a command is decided only when it needs no
-    # shell at all. A whitelist of plain characters decides that - letters, digits and the
-    # few punctuation marks an authorized_keys command never needs beyond them - because a
-    # blacklist always misses one more thing the shell treats specially (&, #, a glob, an
-    # assignment, quotes). Relative means NOT ABSOLUTE (r3 item 3): './x' and 'dir/x' were
-    # resolved against the caller's directory and wrongly decided; a leading ~ or $ is
-    # relative here too. Both put the line in group two, hint None.
-    plain=set('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.+/=,: ')
-    entry['needs_shell']=any(character not in plain for character in command)
-    relative_path=(not os.path.isabs(wrapper) or wrapper.startswith('~')
-                   or len(wrapper) > 512)              # r4: a 60,000-component path is not judged
-    entry['relative_path']=relative_path
+    # kittrial-5bb.265 item 5 + r2 item 2: the wrapper-path bound, applied before any
+    # path work on the tokens that remain (the raw-text bound above already refused the
+    # megabyte shapes; this one catches a short command naming one very long path).
+    if len(wrapper) > 512:
+        entry['needs_shell'] = False
+        relative_path = True
+        entry['relative_path'] = relative_path
+    else:
+        # kittrial-5bb.250 r3 item 4, THE RULE: a command is decided only when it needs no
+        # shell at all. A whitelist of plain characters decides that - letters, digits and the
+        # few punctuation marks an authorized_keys command never needs beyond them - because a
+        # blacklist always misses one more thing the shell treats specially (&, #, a glob, an
+        # assignment, quotes). Relative means NOT ABSOLUTE (r3 item 3): './x' and 'dir/x' were
+        # resolved against the caller's directory and wrongly decided; a leading ~ or $ is
+        # relative here too. Both put the line in group two, hint None.
+        plain=set('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.+/=,: ')
+        entry['needs_shell']=any(character not in plain for character in command)
+        relative_path=(not posixpath.isabs(wrapper) or wrapper.startswith('~'))
+        entry['relative_path']=relative_path
     # kittrial-5bb.250 r5 item 1, THE RULE final: group one only when the command is
     # EXACTLY the shape authorized_key_lines prints - taken from that function's own
     # constants, so the preview and the printer cannot drift. One ABSOLUTE interpreter
@@ -6334,15 +6458,16 @@ def key_line(line,root,kit):
     def _printed_invocation(prefix):
         if not prefix:
             return True                                   # the wrapper invoked directly
-        if len(prefix) > 1 + len(AUTHORIZED_KEY_PYTHON_FLAGS):
+        # kittrial-5bb.265 item 2, the coordinator's preference: EXACTLY the printed
+        # flags - both -E and -s, alone, in the printed order - so a line without -E (which
+        # obeys PYTHONPATH if sshd passes the environment) and any other flag shape is
+        # group two. A bare interpreter name (authorized-keys --python NAME) is group two
+        # too: the first word must be the absolute path the kit prints, and the docs say so.
+        if prefix[1:] != list(AUTHORIZED_KEY_PYTHON_FLAGS):
             return False
         # A key line's command is POSIX text whatever the host: posixpath, not os.path, so that
         # /usr/bin/python3 is absolute on every platform (ntpath.isabs changed in Python 3.13).
-        if not posixpath.isabs(prefix[0]) or prefix[0].startswith('~'):
-            return False                                  # the printed interpreter is absolute
-        flags = prefix[1:]
-        allowed = list(AUTHORIZED_KEY_PYTHON_FLAGS)       # (-E, -s): each alone, in any number
-        return all(word in allowed for word in flags)
+        return posixpath.isabs(prefix[0]) and not prefix[0].startswith('~')
     prefix=tokens[:at]
     entry['foreign_invocation']=not _printed_invocation(prefix)
     values={'--root':[],'--endpoint':[],'--python':[],'--project':[],'--principal':[]};unknown=[]
@@ -6361,7 +6486,7 @@ def key_line(line,root,kit):
     # must decide by the same one. A RELATIVE --root is resolved by the wrapper against its
     # own directory at run time, so this preview does not decide it (r4 small-things).
     line_root=values['--root'][-1] if values['--root'] else None
-    relative_root=line_root is not None and (not os.path.isabs(line_root) or line_root.startswith('~'))
+    relative_root=line_root is not None and (not posixpath.isabs(line_root) or line_root.startswith('~'))
     principals=values['--principal']
     entry.update({
         # A line bound to a principal is bound, not merely confined (kittrial-5bb.194 review,
@@ -6390,10 +6515,10 @@ def key_line(line,root,kit):
     link=install_current_link(here)
     entry['names_release']=bool(link is not None and not entry['other_kit'] and not relative_path
                                 and not all(str(path).startswith(str(link)+'/') for path in [wrapper,*endpoints]))
-    if not entry['other_root']:
-        entry['unknown_projects']=[name for name in values['--project']
-                                   if not re.fullmatch(r'[a-z][a-z0-9]{1,23}',name)
-                                   or not (Path(root)/'projects'/name/'.beads/metadata.json').is_file()]
+    entry['unknown_projects']=([name for name in values['--project']
+                               if not re.fullmatch(r'[a-z][a-z0-9]{1,23}',name)
+                               or not (Path(root)/'projects'/name/'.beads/metadata.json').is_file()]
+                              if not entry['other_root'] else [])
     if principals:
         # A repeated principal would be served as the last one while the listing showed the
         # first; an ill-formed one refuses every request of that key. Both go under attention.
@@ -6493,14 +6618,15 @@ def authorized_keys_listing(root,file=None):
         (kittrial-5bb.250 r2 item 3: a word in a comment made a served line read refused).
 
         Read once per distinct real path per run (item 2: 3,000 lines naming one wrapper
-        opened it 2,505 times), only through lstat-confirmed regular files - a fifo or a
-        symlink to one named by a key line must not hang this read (item 1) - and never a
-        relative path, which would be resolved against the caller's directory (item 2).
+        opened it 2,505 times); the file is OPENED first and the descriptor judged - a
+        fifo is opened non-blocking and never read, a symlink not followed (item 1) - and
+        a relative path is never asked, which would be resolved against the caller's
+        directory (item 2).
         """
         if str(wrapper) in _wrapper_hint_cache:
             return _wrapper_hint_cache[str(wrapper)]
         hint=None
-        if (os.path.isabs(str(wrapper)) and not str(wrapper).startswith('~')
+        if (posixpath.isabs(str(wrapper)) and not str(wrapper).startswith('~')
                 and len(str(wrapper)) <= 512):
             # Open FIRST, judge the OPEN FILE (r3 item 2): between an lstat and an open the
             # path can become a fifo, and the review's race hung status in 2 of 5 runs.
@@ -6543,17 +6669,38 @@ def authorized_keys_listing(root,file=None):
                 and not entry.get('relative_path') and not entry.get('foreign_invocation')
                 and Path(os.path.realpath(wrapper))==here/'ssh_forced_command.py')
     def _refused_before_the_setting(entry):
-        """Whether the wrapper refuses this line before it ever reads the setting."""
+        """Whether the wrapper refuses this line before it ever reads the setting.
+
+        kittrial-5bb.265 item 6: a relative --endpoint and an ill-formed project name are
+        refused the same way (lines 78/79 of the r5 review's table) - they are group one
+        lines the wrapper will not serve, and the listing says so through the
+        refused-for-another-reason sentence. kittrial-5bb.265 r2 item 1: the FORM only -
+        the wrapper checks the form of a project name, not whether the project exists, so a
+        WELL-FORMED unknown project (removed, or not yet created) serves exactly as a bound
+        line and is in no group: unknown_projects holds both kinds, and only the ill-formed
+        kind refuses before the setting. The form is [a-z][a-z9]{1,23}-shaped lowercase,
+        matching the wrapper's own check.
+        """
+        import re as _re
+        ill_formed_projects=[name for name in (entry.get('projects') or [])
+                             if not _re.fullmatch(r'[a-z][a-z0-9]{1,23}', name)]
         return bool(entry.get('unknown_arguments') or entry.get('principal_repeated')
-                    or entry.get('principal_ill_formed') or entry.get('project_repeated'))
+                    or entry.get('principal_ill_formed') or entry.get('project_repeated')
+                    or ill_formed_projects
+                    or (isinstance(entry.get('endpoints'), list) and any(
+                        not posixpath.isabs(str(e)) for e in entry['endpoints'])))
     # The three groups of kittrial-5bb.250 r2 item 3. Group one, DECIDED and refused (or
     # to-be-refused while off): this kit's own wrapper file, this root, a command needing no
     # shell on no relative path. Group two, NOT DECIDED and MAY be refused: every other
     # wrapper or root, a command that needs the shell, a relative or $HOME path - each with
     # the word in the wrapper file said as a hint, never as a decision. Lines refused before
     # the setting are refused either way and stay named in group one's list.
+    # kittrial-5bb.265 item 6: a decided line the wrapper refuses for another reason (a
+    # relative --endpoint, an ill-formed project name) is group one too - refused once on -
+    # even when it parses as bound, and the sentence says why.
     would_be_refused=sorted({entry['line'] for entry in lines
-                             if _setting_decided(entry) and _unbound(entry)})
+                             if _setting_decided(entry)
+                             and (_unbound(entry) or _refused_before_the_setting(entry))})
     # Group two is every OTHER line that has a command= at all (r3 item 5): bound lines the
     # shell decides, lines of another wrapper or root, shell syntax, relative paths, and
     # lines that run another program - none of them is decided here, and no such line is
@@ -6597,24 +6744,21 @@ def authorized_keys_listing(root,file=None):
     def _named(numbers):
         return 'line%s %s'%('s' if len(numbers)!=1 else '',', '.join(str(number) for number in numbers))
     def _may_sentence(numbers, more):
-        """The one group-two sentence (kittrial-5bb.250 r3 item 5): what was not decided and
-        why, bounded like group one, said the same way by the listing, status and on."""
-        if not numbers and not more:
-            return 'No line runs a command this preview cannot judge'
-        named=', '.join(str(number) for number in numbers)
-        one=len(numbers)==1 and not more
-        return ('Line%s %s%s run%s a command this preview cannot judge (another wrapper or root, '
-                'shell syntax, a relative path, or another program) and %s not decided: if %s '
-                'reach%s a kit that has bound keys only on, %s refused unless bound'
-                %('s' if not one else '', named, '' if not more else ' and %d more'%more,
-                  's' if one else '', 'was' if one else 'were', 'it' if one else 'they',
-                  'es' if one else '', 'it is' if one else 'they are'))
+        """The one group-two sentence: _may_sentence_for is the single source, so the
+        listing, status and on cannot drift (kittrial-5bb.265 item 3 - this body was a
+        second copy of it)."""
+        return _may_sentence_for(numbers, more)
     more_text=' and %d more'%would_be_refused_more if would_be_refused_more else ''
     if setting:
+        cause=('that lacks a project or a principal' if refused == [n for n in refused
+                if not _refused_before_the_setting(by_line.get(n, {}))]
+               else 'that the wrapper refuses for another reason' if refused
+               else 'that lacks a project or a principal')
         notes.append('bound_keys_only: this installation accepts bound keys only, so the forced command refuses '
-                     'a line of this kit and this root that lacks a project or a principal%s. Print each such '
+                     'a line of this kit and this root %s%s. Print each such '
                      'line again with authorized-keys --project ... --principal ... and replace it. %s.'
-                     %(' (%s%s)'%(_named(refused),more_text) if refused else ' (no line here is such a line)',
+                     %(cause,
+                       ' (%s%s)'%(_named(refused),more_text) if refused else ' (no line here is such a line)',
                        _may_sentence(may_be_refused, may_be_refused_more)))
     else:
         # The preview before `on` (kittrial-5bb.196 review, item 4c): with the setting off nothing
@@ -6629,9 +6773,15 @@ def authorized_keys_listing(root,file=None):
     if refused_for_another_reason:
         # Named because `on` would still not serve them, but the SETTING is not the reason: the
         # reviewer asked for that to be said rather than implied (kittrial-5bb.196 review, item 2).
-        notes.append('%s are refused whether the setting is on or off, for another reason (a bad or unknown '
-                     'argument, or a binding named twice); the setting is not why they are refused.'
-                     %_named(refused_for_another_reason))
+        # kittrial-5bb.265 item 6: a relative --endpoint and an ill-formed project name are
+        # refused the same way (lines 78/79 of the r5 review's table) - group one lines
+        # refused before the setting - and the sentence names their causes too.
+        another=_named(refused_for_another_reason)
+        notes.append('%s %s refused whether the setting is on or off, for another reason (a bad or unknown '
+                     'argument, a binding named twice, a relative or ill-formed --endpoint, or an ill-formed '
+                     '--project name); the setting is not why %s refused.'
+                     %(another, 'is' if len(refused_for_another_reason)==1 else 'are',
+                       'it is' if len(refused_for_another_reason)==1 else 'they are'))
     if truncated:
         notes.append('Only the first %d bytes of this file were read; the file is larger than that, so a '
                      'line beyond it was not inspected.'%AUTHORIZED_KEYS_MAX_BYTES)
@@ -9086,8 +9236,15 @@ def main():
                     # source reads that way, and it still needs the provisioning notice.
                     slot=(project_merge_slot_state(root,args.destination)
                           if step[0]==MERGE_SLOT_STEP and destination_state in ('partial','empty') else None)
+                    # The deployment-authority step did not run when this one failed, and the
+                    # provisioning notice must not leave that unsaid (kittrial-5bb.240 F1). The
+                    # comparison it makes is read-only; the re-grant is never run from here.
+                    authority=(restore_authority_not_run(root,args.project,args)
+                               if step[0]==MERGE_SLOT_STEP else None)
                     print(restore_failure_notice(args.destination,error,destination_state,step=step[0],
-                                                 merge_slot=slot),
+                                                 merge_slot=slot,
+                                                 journals_restored=getattr(args,'journal_restored',None),
+                                                 authority_note=authority),
                           file=sys.stderr)
                 raise
             finally:
@@ -9150,6 +9307,10 @@ def finish_restore(root,args,snapshot,step=None):
     # --without-coordination (kittrial-5bb.152): no coordination files, no authority; the
     # operation journal is restored as before when the backup has a snapshot.
     sidecar=False if getattr(args,'native_only',None) is not None else restore_coordination(root,args.project,args.destination,authority=False)
+    # What the deployment-authority step at the END of this function needed: it does not run when
+    # the merge-slot step below fails, so the notice must say what was not compared and not
+    # re-granted, and it can only say that knowing this (kittrial-5bb.240 F1).
+    args.sidecar_restored=sidecar
     restored=restore_journal(snapshot,
                              project_dir(root,args.destination)/JOURNAL_STORE_NAME)
     args.journal_restored=restored is not None
