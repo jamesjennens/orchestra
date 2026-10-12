@@ -498,6 +498,25 @@ class HostStatusTests(unittest.TestCase):
         self.assertEqual(calls[1], str(Path(admin.__file__).resolve()))
         self.assertIn('/current/', run_now)
 
+    def test_the_kit_path_is_escaped_in_the_run_now_and_check_commands(self):
+        """kittrial-5bb.251 review item 1: a kit installed under a path holding ESC printed it raw.
+
+        The kit path is the interpreter and this module - not the runtime root, which root_path
+        already refuses for such characters - and both commands are shown on the set-up page and
+        by add-project, so the escape is at the one place that builds them.
+        """
+        hostile = Path('/srv/a\x1bcb')
+        with patch.object(admin, 'install_current_path',
+                          side_effect=lambda path: hostile / Path(str(path)).name):
+            run_now = admin.backup_now_command(self.root)
+            check = admin.host_command(self.root, 'backup-status', '--require-complete')
+        for command in (run_now, check):
+            self.assertNotIn('\x1b', command)
+            self.assertIn('\\x1b', command)
+            self.assertIn('a\\x1bcb', command)
+        # A plain path is unchanged: the escape must not reprint every command differently.
+        self.assertNotIn('\\x1b', admin.backup_now_command(self.root))
+
     def _systemd_analyze_verifies(self):
         import shutil
         if shutil.which('systemd-analyze') is None:
@@ -657,6 +676,109 @@ class HostStatusTests(unittest.TestCase):
                 self.assertEqual(backup['scheduled'], 'not-covered')
                 self.assertIsNone(backup['elsewhere'])
 
+    def test_a_hand_made_note_that_could_rewrite_a_terminal_is_no_note(self):
+        """kittrial-5bb.251 review item 1: the reader refuses what the writer refuses.
+
+        A hand-made file skipped every check the writer makes, so ESC, a bidi override, a carriage
+        return, a line feed and a line separator in the note or the actor read as a note and were
+        printed on the set-up page and by add-project.
+        """
+        path = self.root / 'backups' / admin.BACKUP_SCHEDULE_NOTE_NAME
+        stamp = '2026-10-08T09:00:00Z'
+        # Arabic-Indic 2026: '\\d' in the shape check and '%Y' in strptime both accept it, so the
+        # time must be ASCII digits only (review item 1).
+        other_digits = '\u0662\u0660\u0662\u0666-10-08T09:00:00Z'
+        self.assertTrue(admin.utc_timestamp(other_digits))          # the shape check passes...
+        self.assertFalse(admin.real_utc_timestamp(other_digits))    # ...and this is what refuses it
+        for wrong in ({'schema_version': 1, 'note': 'esc\u001b[31m', 'recorded_by': 'operator-1', 'recorded_at': stamp},
+                      {'schema_version': 1, 'note': 'bidi \u202esdraw', 'recorded_by': 'operator-1', 'recorded_at': stamp},
+                      {'schema_version': 1, 'note': 'line\u2028sep', 'recorded_by': 'operator-1', 'recorded_at': stamp},
+                      {'schema_version': 1, 'note': 'one\rtwo\nthree', 'recorded_by': 'operator-1', 'recorded_at': stamp},
+                      {'schema_version': 1, 'note': 'x', 'recorded_by': 'esc\u001b[31m', 'recorded_at': stamp},
+                      {'schema_version': 1, 'note': 'x', 'recorded_by': 'bidi\u202e', 'recorded_at': stamp},
+                      {'schema_version': 1, 'note': 'x', 'recorded_by': 'two words', 'recorded_at': stamp},
+                      {'schema_version': 1, 'note': 'x', 'recorded_by': 'operator-1', 'recorded_at': other_digits}):
+            with self.subTest(wrong=wrong):
+                path.write_text(json.dumps(wrong), encoding='utf-8')
+                self.assertIsNone(admin.read_backup_schedule_note(self.root))
+        # A plain note still reads, and the actor's surrounding whitespace is stripped before the
+        # shape is judged: the rule must refuse the dangerous names, not every name.
+        path.write_text(json.dumps({'schema_version': 1, 'note': 'plain note', 'recorded_by': ' operator-1 ',
+                                    'recorded_at': stamp}), encoding='utf-8')
+        self.assertEqual(admin.read_backup_schedule_note(self.root),
+                         {'note': 'plain note', 'recorded_by': 'operator-1', 'recorded_at': stamp})
+
+    def test_a_schema_version_that_is_the_string_one_is_no_note(self):
+        """kittrial-5bb.251 review item 4 (m5d): reading the STRING '1' as the version survived."""
+        path = self.root / 'backups' / admin.BACKUP_SCHEDULE_NOTE_NAME
+        for version in ('1', 1.0, True, 2):
+            with self.subTest(version=version):
+                path.write_text(json.dumps({'schema_version': version, 'note': 'x', 'recorded_by': 'operator-1',
+                                            'recorded_at': '2026-10-08T09:00:00Z'}), encoding='utf-8')
+                self.assertIsNone(admin.read_backup_schedule_note(self.root))
+        path.write_text(json.dumps({'schema_version': 1, 'note': 'x', 'recorded_by': 'operator-1',
+                                    'recorded_at': '2026-10-08T09:00:00Z'}), encoding='utf-8')
+        self.assertIsNotNone(admin.read_backup_schedule_note(self.root))
+
+    def test_the_actor_bound_is_pinned_at_both_ends(self):
+        """kittrial-5bb.251 review item 4 (m5g): raising the bound from 200 to 1,200 survived.
+
+        The bound is pinned as a NUMBER as well as at the boundary: a test that derives both the
+        accepted and the refused name from the constant passes whatever the constant is.
+        """
+        self.assertEqual(admin.BACKUP_SCHEDULE_ACTOR_MAX, 200)
+        path = self.root / 'backups' / admin.BACKUP_SCHEDULE_NOTE_NAME
+        stamp = '2026-10-08T09:00:00Z'
+        at_bound = 'o' * 200
+        path.write_text(json.dumps({'schema_version': 1, 'note': 'x', 'recorded_by': at_bound,
+                                    'recorded_at': stamp}), encoding='utf-8')
+        self.assertEqual(admin.read_backup_schedule_note(self.root)['recorded_by'], at_bound)
+        path.write_text(json.dumps({'schema_version': 1, 'note': 'x', 'recorded_by': at_bound + 'o',
+                                    'recorded_at': stamp}), encoding='utf-8')
+        self.assertIsNone(admin.read_backup_schedule_note(self.root))
+
+    def test_the_log_keeps_only_the_newest_hundred_lines(self):
+        """kittrial-5bb.251 review item 4 (m6e): removing the 100-line bound survived."""
+        self.assertEqual(admin.BACKUP_SCHEDULE_LOG_MAX, 100)
+        log = self.root / 'backups' / admin.BACKUP_SCHEDULE_LOG_NAME
+        for index in range(admin.BACKUP_SCHEDULE_LOG_MAX + 50):
+            admin._append_backup_schedule_log(self.root, {'at': '2026-10-08T09:00:00Z', 'by': 'operator-1',
+                                                          'action': 'set', 'n': index})
+        lines = [line for line in log.read_text(encoding='utf-8').splitlines() if line.strip()]
+        self.assertEqual(len(lines), 100)
+        self.assertIn('"n": 149', lines[-1])
+
+    def test_a_clear_says_when_the_log_was_kept_aside(self):
+        """kittrial-5bb.251 review item 4 (m6d): a clear that set a damaged log aside said nothing."""
+        admin.write_backup_schedule_note(self.root, 'first', 'operator-1')
+        log = self.root / 'backups' / admin.BACKUP_SCHEDULE_LOG_NAME
+        log.write_bytes(b'\xff\xfe\x80')
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertTrue(admin.clear_backup_schedule_note(self.root, 'operator-2'))
+        self.assertIn('kept aside', output.getvalue())
+        self.assertIn('.damaged', output.getvalue())
+
+    def test_an_earlier_set_aside_is_not_overwritten_and_a_failed_one_is_said(self):
+        """kittrial-5bb.251 review item 4 (small): the earlier .damaged file was overwritten
+        silently, and when keeping the unreadable log aside failed, only 'a new log was started'
+        was said while the unreadable one was in fact replaced."""
+        log = self.root / 'backups' / admin.BACKUP_SCHEDULE_LOG_NAME
+        backups = self.root / 'backups'
+        entry = {'at': '2026-10-08T09:00:00Z', 'by': 'operator-1', 'action': 'set'}
+        log.write_bytes(b'\xff\xfe\x80')
+        first = admin._append_backup_schedule_log(self.root, entry)
+        self.assertIn('.damaged', first)
+        log.write_bytes(b'\xff\xfe\x80')
+        second = admin._append_backup_schedule_log(self.root, entry)
+        self.assertIn('.damaged.2', second)
+        self.assertTrue((backups / (admin.BACKUP_SCHEDULE_LOG_NAME + '.damaged')).exists())
+        self.assertTrue((backups / (admin.BACKUP_SCHEDULE_LOG_NAME + '.damaged.2')).exists())
+        log.write_bytes(b'\xff\xfe\x80')
+        with patch.object(Path, 'replace', side_effect=OSError('read-only file system')):
+            failed = admin._append_backup_schedule_log(self.root, entry)
+        self.assertIn('could not be kept aside', failed)
+
     def test_a_symlinked_or_oversized_note_is_ignored(self):
         """kittrial-5bb.220 review 3 item 4(b): a symlinked note, and one past the file-size limit, are no note."""
         real = self.root / 'real-note.json'
@@ -747,17 +869,25 @@ class HostStatusTests(unittest.TestCase):
         self.assertEqual(self.status()['backup']['scheduled'], 'unknown')
 
     def test_a_unit_or_timer_file_that_is_not_utf8_is_read_as_unreadable(self):
-        """kittrial-5bb.251 item 2: a file that is not UTF-8 is unreadable, not a traceback."""
+        """kittrial-5bb.251 item 2: a file that is not UTF-8 is unreadable, not a traceback.
+
+        ``scheduled_backup_coverage`` takes the account's unit directory from
+        ``scheduled_backup_unit_dir``, which is ``Path.home()`` and IGNORES HOME on Windows, so
+        the directory is patched here rather than written under HOME (kittrial-5bb.251 review
+        item 2); the status route reads the same files through ``account_unit_dir``, which the
+        class's ACCOUNT_HOME_ENV already points at ``self.units``.
+        """
         (self.units / 'beads-backup.service').write_bytes(b'\xff\xfe\x00not text')
         # An unreadable unit is "could not check", not an exception.
         self.assertIsNone(admin.scheduled_backup_covers(self.root, 'alpha'))
-        self.assertIn(self.status()['backup']['scheduled'], ('unknown', 'not-covered'))
+        # ...and it is 'unknown' with a reason, NOT 'not-covered': nothing that was read says
+        # this project is uncovered (review item 2: this accepted either answer).
+        backup = self.status()['backup']
+        self.assertEqual((backup['scheduled'], backup['reason']), ('unknown', 'unreadable'))
         # The coverage report reads the account's own unit directory: a file there that is not
         # UTF-8 is named as unreadable rather than raising UnicodeDecodeError.
-        plain = Path(os.environ['HOME']) / '.config' / 'systemd' / 'user'
-        plain.mkdir(parents=True, exist_ok=True)
-        (plain / 'beads-backup.service').write_bytes(b'\xff\xfe\x00not text')
-        covered, message = admin.scheduled_backup_coverage(self.root, 'alpha')
+        with patch.object(admin, 'scheduled_backup_unit_dir', return_value=self.units):
+            covered, message = admin.scheduled_backup_coverage(self.root, 'alpha')
         self.assertFalse(covered)
         self.assertIn('beads-backup.service', message)      # named as unreadable, not raised
         # A timer file that is not UTF-8 is skipped the same way.
@@ -1128,6 +1258,14 @@ class EndpointSetupTests(fixes.EndpointCase):
         self.assertIn('To check, reload this page', step['commands'][1]['note'])
         self.assertIn('It does not schedule anything', step['commands'][0]['note'])
         self.assertNotIn('with the command shown', step['note'])
+        # The NOTE hint is true and carries no task id (kittrial-5bb.251 review item 3a): unquoted,
+        # the command answers "unrecognized arguments" and records NOTHING - it does not record the
+        # first word, which is what the page said.
+        hint = step['commands'][-1]['note']
+        self.assertIn('unrecognized arguments', hint)
+        self.assertIn('records nothing', hint)
+        self.assertNotIn('records only the first word', hint)
+        self.assertNotIn('kittrial-5bb', hint)
         # The state says WHICH of the two is missing: a backup that was run (as recorded), a schedule that
         # will run the next. "No backup run has recorded this project yet" is what is true straight after
         # add-project, whose run has not reached backup-status.json (kittrial-5bb.220 F2).
