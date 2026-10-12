@@ -4628,6 +4628,16 @@ class ApiHandler(BaseHTTPRequestHandler):
                 'is registered once' % (project_id, existing.get('name'),
                                         ' (archived)' if existing.get('archived') else '')))
         if not self.backend.project_exists(project_id):
+            # While a host creation RUNS for this name it is already being made (kittrial-5bb.225
+            # item 6): say that, not that an operator must create it first.
+            import project_creation
+            try:
+                running = project_creation.running_name(self.backend.root)
+            except (OSError, ValueError, AttributeError):
+                running = None
+            if running == project_id:
+                raise conflict('Project %s is being created on this server now; register it when that '
+                               'finishes.' % project_id)
             raise invalid('No canonical project %s exists on the coordination host. An operator creates it there '
                           'first (admin.py add-project %s), then you register it here.' % (project_id, project_id))
 
