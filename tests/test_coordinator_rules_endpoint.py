@@ -246,6 +246,8 @@ class CoordinatorRulesEndpointTests(RulesHelpers, unittest.TestCase):
         before = self.rows()
         with self.assertRaises(ValueError) as caught:
             self.coordinate('w2', 'merge-acquire', task=task, target='main@' + 'c' * 40)
+        from review_workflow import CoordinatorRuleRefusal
+        self.assertIsInstance(caught.exception, CoordinatorRuleRefusal)
         self.assertIn('coordinator_writes', str(caught.exception))
         self.assertEqual(self.rows(), before)
         acquired = self.coordinate('ops', 'merge-acquire', task=task, target='main@' + 'c' * 40)
@@ -322,6 +324,8 @@ class CoordinatorRulesEndpointTests(RulesHelpers, unittest.TestCase):
         before = self.rows()
         with self.assertRaises(ValueError) as caught:
             self.coordinate('w1', 'merge-acquire', task=task, target='main@' + 'c' * 40)
+        from review_workflow import CoordinatorRuleRefusal
+        self.assertIsInstance(caught.exception, CoordinatorRuleRefusal)
         self.assertIn('independent_approval', str(caught.exception))
         self.assertEqual(self.rows(), before)
         self.approve(task, 'w2', contribution)

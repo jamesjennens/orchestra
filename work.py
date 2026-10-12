@@ -931,13 +931,13 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
     return result
 
 def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None,review_writes=None,
-            independent_approval=False,coordinator_writes=False,owners=None,web_approval=False):
+            independent_approval=False,coordinator_writes=False,owners=None,verified_web_authority=False):
     """``independent_approval``, ``coordinator_writes`` and ``owners`` are the slices
     6 and 7 settings and the project's actor -> principal map (kittrial-5bb.197),
     supplied by the endpoint; all default OFF/absent, so nothing changes for an
     installation that configures nothing. ``owners`` may be a callable, so the
-    registry is read only when a rule needs it. ``web_approval`` says the request carries a
-    verified web approval (owner, coordinator, or agent with the grant) from the web route
+    registry is read only when a rule needs it. ``verified_web_authority`` says the configured
+    web authority verified an owner, coordinator, or agent with the project grant
     (kittrial-5bb.199, kittrial-5bb.209)."""
     # Help is recognised anywhere as a standalone token and never touches the
     # native export, the coordination lock or an attachment.
@@ -987,7 +987,7 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
     from review_workflow import execute as review
     result=review(rows,task,actor,payload,run, operators=operators, journal=path,
                   review_writes=review_writes, independent_approval=independent_approval,
-                  coordinator_writes=coordinator_writes, owners=owners, web_approval=web_approval)
+                  coordinator_writes=coordinator_writes, owners=owners, verified_web_authority=verified_web_authority)
     if payload.get('operation')=='request-changes':
         # Retry repairs a label update interrupted after the durable review comment.
         run(['update',task,'--remove-label','review-ready','--json'])
