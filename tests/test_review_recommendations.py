@@ -314,6 +314,14 @@ class ReaderRuleTests(Harness):
         self.assertEqual([entry['author'] for entry in view['recommendations']][:6],
                          ['reviewer-%02d' % index for index in range(24, 18, -1)])
         self.assertEqual(view['recommendations'][1]['summary'], view['recommendation']['summary'])
+        # The writer's list is NOT cut (kittrial-5bb.164 item 3): every standing one, newest
+        # first, each with the operation id of its own record, so a writer can see a person
+        # whose record the twenty above leave out and can recognise an exact retry.
+        self.assertEqual([entry['author'] for entry in view['recommendation_keys']],
+                         ['reviewer-%02d' % index for index in range(24, -1, -1)])
+        self.assertEqual(sorted(view['recommendation_keys'][0]), ['author', 'operation_id'])
+        self.assertEqual(view['recommendation_keys'][0]['operation_id'],
+                         json.loads(self.issue['comments'][-1]['text'].split('\n', 1)[1])['operation_id'])
 
     def test_a_record_with_a_hidden_character_is_never_displayed_whoever_wrote_it(self):
         """The reader holds a record to the plain-text rule, as the writer does (review of the first delivery)."""
@@ -419,6 +427,8 @@ class ReaderRuleTests(Harness):
     def test_a_closed_task_and_a_task_without_a_contribution_show_none(self):
         self.assertEqual(rec.block(self.issue, w.project(self.issue)),
                          {'recommendation': None, 'recommendations': [], 'recommended': False})
+        # The uncapped writer's list is absent too when nothing stands (kittrial-5bb.164).
+        self.assertNotIn('recommendation_keys', rec.block(self.issue, w.project(self.issue)))
         contribution = self.contribute()
         self.recommend(contribution)
         self.issue['status'] = 'closed'
