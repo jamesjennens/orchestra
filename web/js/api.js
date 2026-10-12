@@ -118,7 +118,8 @@ export function createApi(transport) {
     mergeSlot: (pid) => call('GET', `/v1/projects/${pid}/merge-slot`),
     acquireMergeSlot: (pid, task_id, target) => mutate('POST', `/v1/projects/${pid}/merge-slot/acquire`, { task_id, target }),
     releaseMergeSlot: (pid) => mutate('POST', `/v1/projects/${pid}/merge-slot/release`, {}),
-    forceReleaseMergeSlot: (pid, expected_holder, reason) => mutate('POST', `/v1/projects/${pid}/merge-slot/force-release`, { expected_holder, reason }),
+    forceReleaseMergeSlot: (pid, expected_holder, reason, expected_task) => mutate('POST', `/v1/projects/${pid}/merge-slot/force-release`,
+      expected_task ? { expected_holder, reason, expected_task } : { expected_holder, reason }),
     createMergeSlot: (pid) => mutate('POST', `/v1/projects/${pid}/merge-slot/create`, {}),
     setRepository: (pid, repository) => mutate('PATCH', `/v1/projects/${pid}`, { repository }),
     // Superuser only: the records this server will not serve, to confirm or archive.
