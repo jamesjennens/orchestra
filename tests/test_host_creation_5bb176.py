@@ -426,6 +426,68 @@ class TwoProcessTests(unittest.TestCase):
         self.assertNotIn('error', record)
 
 
+class HostWideLockTests(CreationRecordCase):
+    """kittrial-5bb.225 items 1, 2, 4: one creation per HOST, the right name, nothing left."""
+
+    def test_the_busy_sentence_names_the_running_creation(self):
+        # Item 1 / mutant M12: the sentence names the project that is being created.
+        # running_name reads the marker only while another holder has the lock, so a
+        # thread holds it here (flock is per process: the same process can take it twice).
+        import threading
+        directory = pc.records_dir(self.root)
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / pc.RUN_NAME).write_text('alpha\n', encoding='utf-8')
+        from http_authority import file_lock
+        held = threading.Event()
+        release = threading.Event()
+        def hold():
+            with file_lock(directory / pc.LOCK_NAME, timeout=5):
+                held.set()
+                release.wait(5)
+        thread = threading.Thread(target=hold, daemon=True)
+        thread.start()
+        self.assertTrue(held.wait(5))
+        try:
+            sentence = pc.host_busy_message(self.root, 'beta')
+            self.assertIn('Another project is being created on this server right now (alpha)', sentence)
+            self.assertIn('wait for it to finish', sentence)
+            self.assertIn('Project already exists', pc.host_busy_message(self.root, 'alpha'))
+        finally:
+            release.set()
+            thread.join(5)
+        # No holder: a stale marker means nothing runs, and the generic sentence is used.
+        self.assertIsNone(pc.running_name(self.root))
+        self.assertEqual(pc.BUSY, pc.host_busy_message(self.root, 'beta'))
+
+    def test_creation_lock_writes_what_it_is_doing_and_clears_the_marker(self):
+        # Item 2: every command that takes the lock writes its own name.
+        with pc.creation_lock(self.root, wait=0, name='alpha'):
+            marker = pc.records_dir(self.root) / pc.RUN_NAME
+            self.assertEqual('alpha', marker.read_text(encoding='utf-8').strip())
+            pc._clear_running(self.root, 'alpha')
+            self.assertFalse(marker.exists())
+        # A stale marker with no holder means nothing runs.
+        (pc.records_dir(self.root) / pc.RUN_NAME).write_text('alpha\n', encoding='utf-8')
+        self.assertIsNone(pc.running_name(self.root))
+
+    def test_a_refusal_that_made_nothing_leaves_no_records_directory(self):
+        # Item 4: admin.py says a refusal leaves no directory.
+        def refuse(root, name, stage):
+            raise ValueError('nope')
+        with self.assertRaises(ValueError):
+            pc.host_create(self.root, 'gamma', refuse, lambda root, name: None)
+        directory = pc.records_dir(self.root)
+        self.assertFalse(directory.exists(), 'project-creations/ was left behind by a refusal')
+
+    def test_the_record_carries_a_token_so_two_runs_cannot_hold_equal_dicts(self):
+        # Item 3.
+        record = {'project': 'delta', 'by': 'host', 'state': 'started', 'stage': None,
+                  'started_at': '2026-01-01T00:00:00Z', 'token': 'run-1-delta'}
+        pc.write_record(self.root, 'delta', record)
+        self.assertTrue(pc._record_is_ours(self.root, 'delta', record))
+        self.assertFalse(pc._record_is_ours(self.root, 'delta', dict(record, token='run-2-delta')))
+
+
 class GitCheckReadsTheRuntimeBinTests(unittest.TestCase):
     """Item 5: the check reads the runtime's ``bin``, not only the caller's PATH."""
 

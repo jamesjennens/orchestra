@@ -180,6 +180,31 @@ def running_name(root):
     return name or None
 
 
+def _drop_empty_records_dir(root):
+    """Remove ``project-creations/`` when a refusal left only its lock file behind."""
+    directory = records_dir(root)
+    try:
+        if directory.is_dir() and not directory.is_symlink():
+            leftovers = [p for p in directory.iterdir() if p.name != LOCK_NAME]
+            if not leftovers:
+                for p in directory.iterdir():
+                    p.unlink()
+                directory.rmdir()
+    except OSError:
+        pass
+
+
+def _clear_running(root, name):
+    """Drop the ``.running`` marker when it names ``name`` (kittrial-5bb.225 item 2)."""
+    directory = records_dir(root)
+    marker = directory / RUN_NAME
+    try:
+        if marker.is_file() and not marker.is_symlink() and marker.read_text(encoding='utf-8').strip() == name:
+            marker.unlink()
+    except OSError:
+        pass
+
+
 def effective_state(root, record, running=None):
     """A record's state as an operator should read it.
 
@@ -309,12 +334,14 @@ def server_usage(root):
 
 
 @contextlib.contextmanager
-def creation_lock(root, wait=600.0, name=None):
-    """One creation at a time on a host: the count and the name check are then exact.
+def creation_lock(root, wait=600.0, name=None, doing=None):
+    """One creation at a time on a HOST: the count and the name check are then exact.
 
     ``wait=0`` is for a creation: it does not queue behind another one, it raises
     :class:`Busy`. An operator command waits. ``name`` is written beside the lock for the
-    time it is held, so a reader can tell which record is the one being made.
+    time it is held, so a reader can tell which record is the one being made (kittrial-5bb.225
+    item 2: every command that takes the lock writes what it is doing, so a stale marker is
+    never named as the running creation while another command holds the lock).
     """
     from http_authority import file_lock
     directory = records_dir(root)
@@ -485,12 +512,19 @@ def _record_is_ours(root, name, record):
 
     A run that failed or was interrupted must not overwrite or delete a record another run
     wrote in the meantime (kittrial-5bb.176 item 2). The creation lock makes that all but
-    impossible now; this check makes it impossible.
+    impossible now; this check makes it impossible. Each run stamps a ``token`` in the
+    record it writes (kittrial-5bb.225 item 3): two runs can hold equal dicts when
+    ``started_at`` has one-second resolution, so the token is what says which run owns it.
     """
     try:
         current = read_record(root, name)
     except (ValueError, OSError):
         return False
+    if not isinstance(current, dict) or not isinstance(record, dict):
+        return current == record
+    token = record.get('token')
+    if token is not None:
+        return current.get('token') == token
     return current == record
 
 
@@ -541,13 +575,19 @@ def host_create(root, name, initialize, guards, requirements_default=True):
             return _host_create_locked(root, name, initialize, guards, requirements_default)
     except Busy:
         raise ValueError(host_busy_message(root, name)) from None
+    except BaseException:
+        # A refusal that wrote no record must leave no project-creations directory
+        # either (kittrial-5bb.225 item 4; admin.py says a refusal leaves nothing).
+        _drop_empty_records_dir(root)
+        raise
 
 
 def _host_create_locked(root, name, initialize, guards, requirements_default=True):
     guards(root, name)
     record = read_record(root, name)
     if record is None or record['state'] != 'started':
-        record = {'project': name, 'by': HOST, 'state': 'started', 'stage': None, 'started_at': _stamp()}
+        record = {'project': name, 'by': HOST, 'state': 'started', 'stage': None, 'started_at': _stamp(),
+                  'token': _stamp() + '-' + name}
         if requirements_default:
             record['requirements_governance'] = 'simple'
 
@@ -647,6 +687,7 @@ def finish(root, name, finish_steps=None):
         record.update(state='created', stage=None, completed_at=_stamp(), finished_by='operator')
         record.pop('error', None)
         write_record(root, name, record)
+        _clear_running(root, name)
         return dict(record, effective='created')
 
 
@@ -710,12 +751,14 @@ def remove(root, name, actor, reason, retire=None):
                 with contextlib.suppress(OSError):
                     path.rmdir()
             delete_record(root, name)
+            _clear_running(root, name)
             return {'project': name, 'removed': 'record', 'name': 'free', 'by': record.get('by')}
         (retire or admin.retire_project)(root, name, actor, reason, force=True, creation_locked=True)
         record = read_record(root, name) or record
         if record['state'] != 'removed':
             record.update(state='removed', removed_at=_stamp(), removed_by=actor)
             write_record(root, name, record)
+        _clear_running(root, name)
         return {'project': name, 'removed': 'directory', 'name': 'retired', 'by': record.get('by')}
     finally:
         context.__exit__(None, None, None)

@@ -611,6 +611,12 @@ creation lock.
   already run `admin.py add-project`. The action gives such a caller nothing new, and
   nothing here stops them.
 
+**One creation at a time on the host.** The creation lock is per HOST, not per project:
+while any creation runs (`add-project` or this interface), another `add-project` or
+`restore-new` of a different name is refused at once and told which project is being
+made (kittrial-5bb.225 item 1). An operator's multi-create script should wait and retry
+when it reads that sentence.
+
 **When a creation stops half way.** The host keeps one record per creation in
 `<root>/project-creations/NAME.json`: the intent is written before the first write and
 the result after the last. `admin.py add-project` keeps the same record, so a creation it
