@@ -125,8 +125,8 @@ class BoundEndpointTests(unittest.TestCase):
                 self.refused(request)
 
     def test_the_web_only_actions_are_refused_before_their_name_is_looked_at(self):
-        self.assertEqual(sorted(endpoint.SERVICE_ONLY_ACTIONS), ['create-project', 'creation-standing', 'project-creations'])
-        for action in ('create-project', 'project-creations', 'creation-standing'):
+        self.assertEqual(sorted(endpoint.SERVICE_ONLY_ACTIONS), ['create-project', 'creation-standing', 'project-creations', 'web-merge-slot'])
+        for action in ('create-project', 'project-creations', 'creation-standing', 'web-merge-slot'):
             for project in ('alpha', 'beta', 'Not A Name', None):
                 with self.subTest(action=action, project=project):
                     self.refused({'project': project, 'actor': 'a', 'action': action},
