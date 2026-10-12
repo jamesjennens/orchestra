@@ -1990,6 +1990,14 @@ class Service:
                     raise forbidden('Only a superuser may remove a project owner')
                 self._assert_not_final_owner(user_id)
             del members[user_id]
+            # An account that leaves a project takes its agents' coordinator grants there with
+            # it (kittrial-5bb.261): a grant left on record was effective again, with no new
+            # decision, once an owner added the account back as a coordinator. Lowering a role
+            # keeps the grant on record without effect, as before.
+            for agent in list((self.state.get('agents') or {}).values()):
+                if isinstance(agent, dict) and agent.get('owner') == user_id and isinstance(agent.get('id'), str):
+                    self._end_coordinator_grants(agent, [project_id], principal, request_id,
+                                                 'the account was removed from the project')
             self.store.save()
         return {'project': project_id, 'user': user_id, 'removed': True}
 

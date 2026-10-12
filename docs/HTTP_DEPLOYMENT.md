@@ -1798,13 +1798,17 @@ credential approved anything; this is the one place where that is lifted.
   before.
 - It is read from the present state on every request, by the web service and again when
   the endpoint authorizes the write. Each of these ends it at the agent's next request:
-  the grant is removed; the account is made a contributor or a viewer, or leaves the
-  project; the agent is taken out of the project, **by any route** (the project owner's
+  the grant is removed; the account is made a contributor or a viewer; the account is
+  removed from the project (`DELETE /v1/projects/{id}/members/{user}`), or the agent is
+  taken out of the project **by any route** (the project owner's
   `DELETE /v1/projects/{id}/agents/{agent}`, or `PATCH /v1/agents/{id}` by its account or a
-  superuser): the grant is deleted with it and audited as a revoke with the reason, so it
-  does not wait in the state for the project to be put back; the agent or its account
-  is disabled. A grant whose account was lowered stays on record and shows as "Granted,
-  no effect" until the account is raised again or the grant is removed.
+  superuser): in both of these the grant is deleted and audited as a revoke with the
+  reason ("the account was removed from the project" for the first), so it does not wait
+  in the state for the account or the project to be put back, and an account that is added
+  again as a coordinator has agents that approve only after an owner grants them again;
+  the agent or its account is disabled. A grant whose account was lowered (to contributor
+  or viewer) stays on record and shows as "Granted, no effect" until the account is raised
+  again or the grant is removed.
 
 `GET /v1/projects/{id}/agents` and `.../agents/{agent}` carry `coordinator` for each
 agent: `null`, or `{granted_by, granted_by_display_name, granted_at, effective,
@@ -1838,8 +1842,9 @@ facts are not on the web route. `independent_approval` applies to the web route 
 accepted as the design):
 
 - A grant on record takes effect again **without a new decision by an owner** when the
-  agent's account is made a coordinator or owner again, or the agent is enabled again.
-  To end it for good, remove the grant.
+  agent's account, after it was lowered, is made a coordinator or owner again, or the
+  agent is enabled again. (An account that was removed from the project has no grant
+  left: see above.) To end it for good, remove the grant.
 - A grant stays when the owner who gave it is lowered or leaves.
 - Two granted agents of two accounts may approve each other's work: they are two parties.
 - A grant works in an archived project as every other write there does.

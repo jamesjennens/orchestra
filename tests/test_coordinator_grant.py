@@ -151,9 +151,11 @@ class GrantTests(Grants):
     def test_what_ends_the_grant_at_the_next_request(self):
         self.assertEqual(200, self.grant().status)
         ways = (('the account is made a contributor', lambda: self.member('cora', 'contributor'), lambda: self.member('cora', 'coordinator')),
+                # Removed from the project, the grant is ended with it (kittrial-5bb.261): added back as a
+                # coordinator, the agent approves only after an owner grants it again.
                 ('the account leaves the project',
                  lambda: self.request('DELETE', '/v1/projects/%s/members/%s' % (self.project, self.ids['cora']), token=self.tokens['olive']),
-                 lambda: self.member('cora', 'coordinator')),
+                 lambda: self.regranted_after_the_account_returns()),
                 ('the agent is taken out of the project',
                  lambda: self.request('DELETE', '/v1/projects/%s/agents/%s' % (self.project, self.agent_id), token=self.tokens['olive']),
                  None))
@@ -174,6 +176,61 @@ class GrantTests(Grants):
         self.assertIsNone(self.listed()[self.agent_id]['coordinator'])
         task, contribution = self.deliver(self.tokens['carl'])
         self.assertEqual(403, self.approve(self.agent, task, contribution).status)
+
+    def regranted_after_the_account_returns(self):
+        self.assertEqual(200, self.member('cora', 'coordinator').status)
+        self.assertIsNone(self.listed()[self.agent_id]['coordinator'])
+        return self.grant()
+
+    def test_removing_the_account_from_the_project_ends_its_agents_grants(self):
+        """kittrial-5bb.261: remove_member left the grant on record, and an owner who later added the account
+        back as a coordinator made it effective again without a new PUT. The grant is ended and audited as a
+        revoke; lowering the role keeps it on record without effect, as before."""
+        beta = self.create_project(self.admin, 'Beta')
+        self.assertEqual(200, self.request('PUT', '/v1/projects/%s/members/%s' % (beta, self.ids['cora']), {'role': 'owner'},
+                                           token=self.admin).status)
+        second, second_id = self.agent_with_id('cora', 'Egret', projects=[self.project, beta])
+        other, other_id = self.agent_with_id('olive', 'Swift')
+        for agent_id in (self.agent_id, second_id, other_id):
+            self.assertEqual(200, self.grant(agent_id).status)
+        self.assertEqual(200, self.grant(second_id, token=self.tokens['cora'], project=beta).status)
+        task, contribution = self.deliver(self.tokens['carl'])
+        # Lowered: kept on record, not effective, and effective again when raised. No revoke is audited.
+        self.assertEqual(200, self.member('cora', 'contributor').status)
+        self.assertEqual((False, 'account-role'), (self.listed()[self.agent_id]['coordinator']['effective'],
+                                                   self.listed()[self.agent_id]['coordinator']['no_effect_because']))
+        self.assertEqual(200, self.member('cora', 'coordinator').status)
+        self.assertTrue(self.listed()[self.agent_id]['coordinator']['effective'])
+        self.assertEqual([], [event for event in self.audited() if event[0] == 'agents.coordinator.revoke'])
+        # Removed: both of the account's grants in THIS project end; its grant in Beta and another account's stay.
+        removed = self.request('DELETE', '/v1/projects/%s/members/%s' % (self.project, self.ids['cora']), token=self.tokens['olive'])
+        self.assertEqual(200, removed.status, removed.data)
+        with self.service.store.lock:
+            grants = self.service.state['coordinator_grants']
+            self.assertEqual({other_id}, set(grants[self.project]))
+            self.assertEqual({second_id}, set(grants[beta]))
+            revoked = [event for event in self.service.state['audit']
+                       if event['action'] == 'agents.coordinator.revoke' and event['project_id'] == self.project]
+            removal = [event for event in self.service.state['audit'] if event['action'] == 'members.remove'][-1]
+        self.assertEqual(sorted('agent %s: the account was removed from the project' % agent_id
+                                for agent_id in (self.agent_id, second_id)), sorted(event['reason'] for event in revoked))
+        self.assertEqual({('committed', self.ids['olive'], removal['request_id'])},
+                         {(event['outcome'], event['user_id'], event['request_id']) for event in revoked})
+        self.assertTrue(removal['request_id'])
+        # Added back as a coordinator by an owner: no grant, no approval, until an owner decides again.
+        self.assertEqual(200, self.member('cora', 'coordinator').status)
+        self.assertIsNone(self.listed()[self.agent_id]['coordinator'])
+        self.assertIsNone(self.listed()[second_id]['coordinator'])
+        for agent in (self.agent, second):
+            self.assertEqual(403, self.approve(agent, task, contribution).status)
+        self.assertEqual(self.state_of(task), 'awaiting-review')
+        self.assertEqual(200, self.grant().status)
+        self.assertEqual(201, self.approve(self.agent, task, contribution).status)
+        # A removal of an account that holds no grant writes no revoke.
+        before = len(self.audited())
+        self.assertEqual(200, self.request('DELETE', '/v1/projects/%s/members/%s' % (self.project, self.ids['carl']),
+                                           token=self.tokens['olive']).status)
+        self.assertEqual(before, len(self.audited()))
 
     def test_a_disabled_agent_or_account_approves_nothing(self):
         for label, path in (('the agent', '/v1/agents/%s/disable' % self.agent_id), ('its account', '/v1/accounts/%s/disable' % self.ids['cora'])):
