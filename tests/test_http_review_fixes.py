@@ -4748,6 +4748,46 @@ class RecordStoreMissingPathCase(unittest.TestCase):
         self.assertTrue(after['suspect'])
 
 
+class RecordStoreClosesItsConnectionsCase(unittest.TestCase):
+    """P3 kittrial-5bb.174: every use of the store commits and CLOSES the connection.
+
+    SQLite's own ``with`` commits or rolls back but never closed, so -wal and -shm
+    could linger until a later collection and the database file's time could move at
+    an arbitrary moment. A backup that copies the state folder while the service runs
+    is the reader this matters to: after these calls the sidecar files are settled.
+    """
+
+    def test_a_use_leaves_no_wal_or_shm_behind(self):
+        tmp = unique_dir('recclose174-')
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        path = tmp / 'http-state.json.records.sqlite3'
+        store = RecordStore(path)
+        store.put('idempotency', 'k', {'a': 1}, ttl=60)
+        self.assertEqual({'a': 1}, store.get('idempotency', 'k'))
+        store.delete('idempotency', 'k')
+        self.assertIsNone(store.get('idempotency', 'k'))
+        # WAL checkpointing on close removes the -wal and -shm companions.
+        self.assertFalse(path.with_name(path.name + '-wal').exists(),
+                         'a -wal file lingered after the store closed its connection')
+        self.assertFalse(path.with_name(path.name + '-shm').exists(),
+                         'a -shm file lingered after the store closed its connection')
+
+    def test_each_with_is_its_own_connection_and_nothing_keeps_one(self):
+        tmp = unique_dir('recclose174b-')
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        path = tmp / 'http-state.json.records.sqlite3'
+        store = RecordStore(path)
+        opened = []
+        original = store._connection
+        def watch():
+            opened.append(1)
+            return original()
+        store._connection = watch
+        store.put('idempotency', 'k1', {'a': 1}, ttl=60)
+        store.get('idempotency', 'k1')
+        self.assertEqual(2, len(opened), 'each call must open and close its own connection')
+
+
 class FollowOnBaseRefusalOverHttpCase(EndpointCase):
     """kittrial-5bb.158: the follow-on base refusal reaches an HTTP caller whole.
 
