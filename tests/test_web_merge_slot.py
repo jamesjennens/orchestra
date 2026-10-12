@@ -308,7 +308,9 @@ class NativeWebSlotTests(RulesHelpers, unittest.TestCase):
                                (KIT / 'web/js/views/merge_slot.js').as_uri(),
                                'http://127.0.0.1:' + str(harness.port), 'pp', token, task)
         self.assertEqual(done.returncode, 0, done.stderr[-3000:]);view = json.loads(done.stdout.strip().splitlines()[-1])
-        self.assertIn('Available', view['before']);self.assertIn('Held by usr_', view['held'])
+        self.assertIn('Available', view['before'])
+        # The holder by name and by the exact id a forced release compares (kittrial-5bb.198).
+        self.assertRegex(view['held'], r'Held by root-admin \(usr_[0-9a-f]{16}\)')
         self.assertTrue(view['escaped']);self.assertTrue(view['releaseEnabled']);self.assertTrue(view['slot']['available'])
         client = Client('http://127.0.0.1:' + str(harness.port));client.token = token
         take = client.acquire_merge_slot('pp', task, 'main')

@@ -8,9 +8,13 @@ installation's three coordinator rules, which the host reports in the read-only
 ``setup-status`` endpoint action the setup page already uses. Of that answer only the rules
 block is passed on: a member who does not administer the project is not told the rest.
 
-Nothing here writes anywhere. The host's operator list and session names are not shown:
-the endpoint has no read for them yet.
+The installation's operator list comes from the read-only ``host-coordination`` endpoint
+action (host_reads.py), sent without an authority block: only the operators are passed on
+here; the project's session names serve the names the web interface shows elsewhere.
+
+Nothing here writes anywhere.
 """
+from http_auth import HttpError
 from project_setup import host_status
 
 #: The installation's coordinator rules, said for a member (``admin.COORDINATOR_RULE_KEYS``;
@@ -47,6 +51,25 @@ def host_rules(backend, project_id):
             'rules': [{'rule': key, 'on': values.get(key) is True, 'text': text} for key, text in RULES.items()]}
 
 
+def host_operators(backend, project_id):
+    """The installation's operator list from the host, or a state saying why there is none.
+
+    The states are those of :func:`host_rules`. The read is fresh: the panel is opened rarely, and
+    an operator added just now should be seen.
+    """
+    read = getattr(backend, 'host_coordination', None)
+    if read is None:
+        return {'state': 'not-applicable', 'operators': []}
+    try:
+        answer = read(project_id, fresh=True)
+    except HttpError as error:
+        return {'state': 'unavailable' if 'Unknown action' in str(error.detail or '') else 'unknown', 'operators': []}
+    operators = answer.get('operators')
+    if not isinstance(operators, list):
+        return {'state': 'unknown', 'operators': []}
+    return {'state': 'available', 'operators': [name for name in operators if isinstance(name, str)]}
+
+
 def view(handler, principal, project_id):
     """The panel's data. The caller has checked that the principal may read the project."""
     service = handler.service
@@ -56,5 +79,6 @@ def view(handler, principal, project_id):
                               'on': bool(getattr(service, 'approval_by_another_party', False)),
                               'text': OTHER_PARTY}],
                   host_rules=host_rules(handler.backend, project_id),
+                  host_operators=host_operators(handler.backend, project_id),
                   generated_at=None)
     return result

@@ -19,7 +19,9 @@ const api = {
         what: 'It is complete on the server and not registered here.' },
       { project: 'delta', state: 'created-unregistered', by: 'usr_0123456789abcdef', by_name: 'olive',
         started_at: '2026-10-12T10:00:00Z', what: 'It is complete on the server and not registered here.' }],
-    server: null, host: 'available' }),
+    unrecorded: [{ project: 'omega', state: 'unrecorded-unregistered', by: null, by_name: null, started_at: null,
+      what: 'It is a project on the server with no creation record.' }],
+    host_projects: 'available', server: null, host: 'available' }),
   registerProject: async (id, name) => { calls.push(['registerProject', id, name]); return { id }; },
 };
 const ctx = { api, me: { superuser: true }, projects: [], refreshProjects: async () => {}, href: (p) => '#' + p,
@@ -48,4 +50,12 @@ out.went = ctx.went.slice();
 // Without a register form (no callback), the list offers no button.
 const bare = await work.incompleteCreations(ctx);
 out.bareButtons = bare.all((e) => e.tagName === 'BUTTON').length;
+// A host that could not list its projects without a record: said, and the rest still listed.
+for (const state of ['unknown', 'unavailable']) {
+  const saved = api.projectCreations;
+  api.projectCreations = async () => ({ ...(await saved()), unrecorded: [], host_projects: state });
+  const shown = await work.incompleteCreations(ctx);
+  out['unlisted_' + state] = (shown.all((e) => e.attributes && e.attributes.id === 'unrecorded-unlisted')[0] || { textContent: null }).textContent;
+  api.projectCreations = saved;
+}
 console.log(JSON.stringify(out));

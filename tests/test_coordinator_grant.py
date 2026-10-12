@@ -762,7 +762,7 @@ class CoordinationReadTests(Grants):
                 self.assertEqual(answer.data['agents'][0]['granted_by_display_name'], 'olive')
                 # The agent's id, its actor and its credentials are not part of this read.
                 self.assertEqual(set(answer.data['agents'][0]), {'name', 'owner_display_name', 'granted_by_display_name', 'granted_at'})
-                self.assertEqual(set(answer.data), {'project', 'people', 'agents', 'web_rules', 'host_rules', 'generated_at'})
+                self.assertEqual(set(answer.data), {'project', 'people', 'agents', 'web_rules', 'host_rules', 'host_operators', 'generated_at'})
         # An agent's credential reads it as it reads the members list: both are CAP_READ.
         self.assertEqual((200, 200), (self.read(self.agent).status,
                                       self.request('GET', '/v1/projects/%s/members' % self.project, token=self.agent).status))
@@ -861,6 +861,8 @@ class PageTests(Grants):
                   'so the settings page of web/js/views/project.js was not run on this platform.', file=sys.stderr)
             self.skipTest('node is not installed; the coordinator panel is not run here')
         _, worker_id = self.agent_with_id('carl', 'Wren')
+        self.backend.host_coordination = lambda project_id, fresh=False: {
+            'schema_version': 1, 'operators': ['james'], 'sessions': [], 'sessions_note': None}
         web = KIT / 'web' / 'js'
         done = run_node_module(self, node, 'await import(process.argv[1])',
                                (KIT / 'tests' / 'web_coordinator_screen.mjs').as_uri(),
@@ -889,6 +891,8 @@ class PageTests(Grants):
         self.assertTrue(granted['agents'][0].startswith('Heron, agent of cora · granted by olive'), granted)
         self.assertEqual(before['rules'], [['approval_by_another_party', 'false']])
         self.assertIn('no host project behind it', before['host'])
+        # The host's operator list (kittrial-5bb.198), from the host-coordination read given below.
+        self.assertEqual(before['operators'], 'available: james')
         self.assertEqual((before['buttons'], other['buttons']), (0, 0))
         self.assertEqual(other['people'], before['people'])
         # The page's last act removed the grant before the coordinator's page was read.

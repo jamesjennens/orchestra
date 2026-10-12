@@ -556,7 +556,11 @@ def reserved_actors(root,path,rows=False,own=()):
     return names
 
 #: The actions that exist only for the web service: they name no existing project.
-SERVICE_ONLY_ACTIONS=('create-project','project-creations','creation-standing','web-merge-slot')
+#: ``host-coordination`` and ``host-projects`` are reads for the web interface (kittrial-5bb.198,
+#: host_reads.py): the operator list, the project's session names and the runtime's projects,
+#: which a bound key is not told.
+SERVICE_ONLY_ACTIONS=('create-project','project-creations','creation-standing','web-merge-slot',
+                      'host-coordination','host-projects')
 
 def key_project_refusal(request,key_projects):
     """Refuse, for a key bound to projects, a request that is not for one of them.
@@ -788,6 +792,9 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
     if request.get('action')=='project-creations':
         import project_creation
         return project_creation.list_action(root,request,authority_config)
+    if request.get('action')=='host-projects':
+        import host_reads
+        return host_reads.projects(request,root)
     if request.get('action')=='creation-standing':
         import project_creation
         return project_creation.standing_action(root,request,authority_config)
@@ -959,6 +966,11 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
         rows=tracker if isinstance(tracker,str) else bool(tracker)
         reserved=reserved_actors(root,path,rows,own)
         return {'returncode':0,'stdout':json.dumps({'schema_version':1,'names':{n:actor_names.collision(n,**reserved) for n in names}})+'\n','stderr':''}
+    if action=='host-coordination':
+        # Read-only (kittrial-5bb.198): the operator list and the project's sessions with their
+        # names and principals, for the web interface. No lock, no write; a web-service-only action.
+        import host_reads
+        return host_reads.coordination(request,path,configured_operators(root))
     if action=='setup-status':
         # Read-only (kittrial-5bb.118): what the host knows about this project's setup,
         # for the web setup page. States, versions and times only; never guidance or

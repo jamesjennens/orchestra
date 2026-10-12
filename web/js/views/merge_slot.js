@@ -55,7 +55,9 @@ export function mergeSlotPanel(ctx, project) {
     }
     const own = slot.holder === slot.current_actor;
     panel.replaceChildren(h('div', { class: 'stack' }, h('h2', null, 'Merge slot'),
-      h('p', null, slot.available ? 'Available' : 'Held by ' + slot.holder),
+      // The holder as people know it, and the exact name a forced release compares (kittrial-5bb.198).
+      h('p', null, slot.available ? 'Available' : 'Held by ' + (slot.holder_name && slot.holder_name !== slot.holder
+        ? slot.holder_name + ' (' + slot.holder + ')' : slot.holder)),
       slot.context ? h('p', null, 'Task: ' + slot.context.task + ' · Target: ' + slot.context.target
         + (slot.context.target_omitted_chars ? '…' : '')) : null,
       h('button', { type: 'button', onclick: draw }, 'Refresh'),
