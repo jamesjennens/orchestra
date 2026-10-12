@@ -42,7 +42,7 @@ from reserved_comments import (carries_record_label, check_raw_request, comment_
                                is_merge_slot_id, shown_token, write_targets, MERGE_SLOT_LABEL, MERGE_SLOT_SUFFIX,
                                reserved_label_in_args, refuse_http_actor, status_change_targets, title_change_targets,
                                unresolved_bd_flags)
-from http_authority import AuthorityConfig, NativeRunner, CAP_APPROVE, CAP_PROJECT_ADMIN, descriptor_actor_denial, http_actor_denial, journal_path, run_guarded, stamp_write
+from http_authority import AuthorityConfig, NativeRunner, CAP_APPROVE, CAP_PROJECT_ADMIN, block_mismatch_denial, descriptor_actor_denial, http_actor_denial, journal_path, run_guarded, stamp_write
 
 #: One warning per line on stderr (kittrial-5bb.197 review request 01a12894, item 6):
 #: the configuration warnings and the native warnings are collected in one list, and
@@ -768,6 +768,10 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
     # by a worker credential inside a namespace that is nobody else's (kittrial-5bb.184).
     denied=descriptor_actor_denial(request,authority_config,lambda rows=False,own=():reserved_actors(root,path,rows,own))
     if denied is not None:return denied
+    # The block must be FOR this request (kittrial-5bb.261): the project it names is this
+    # project, and the capability it names is the one this action needs. Before any action.
+    denied=block_mismatch_denial(request,authority_config)
+    if denied is not None:return denied
     if request.get('action')=='session':
         from sessions import execute as session_execute
         args=request.get('args',[])
@@ -1094,8 +1098,8 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
         # everything that rests on the operator allowlist is a host command (admin.py
         # proposal-review, proposal-decide, proposal-settings). The HTTP service is the
         # other authority: launched by it, with live authority required, review and
-        # decide run for a signed-in member whose reviews.approve the guard has just
-        # re-validated, and a submission's submitter is bound to the verified account.
+        # decide run for a signed-in member whose capability the guard has just re-validated
+        # (reviews.approve for a review, project.admin for a decide: kittrial-5bb.261), and a submission's submitter is bound to the verified account.
         import proposal_records
         args=request.get('args',[])
         if not isinstance(args,list) or any(not isinstance(x,str) or '\0' in x for x in args):raise ValueError('Expected argument list')

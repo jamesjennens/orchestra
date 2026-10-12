@@ -2141,6 +2141,94 @@ def descriptor_actor_denial(request, authority_config, reserved):
     return None
 
 
+#: The ONE table of what a request the web service sends must be authorized for
+#: (kittrial-5bb.261): endpoint action -> the capability ``http_service.py`` asks for the
+#: route that sends it. A mapping value is keyed by the action's operation (the first
+#: argument; for ``review`` the ``operation`` of the attached record), with ``None`` for
+#: every other operation of that action. An action or operation that is not here is not
+#: judged for its capability by ``block_mismatch_denial``. The five service-only actions
+#: are not judged there at all: they carry their own exact check
+#: (``project_creation.SERVICE_ACTIONS``).
+BLOCK_CAPABILITIES = {
+    'bd': {'create': CAP_TASKS,            # tasks.create
+           'update': CAP_TASKS},           # tasks.update, tasks.claim
+    'checkpoint': CAP_CHECKPOINTS,         # checkpoints.add
+    'review': {'approve': CAP_APPROVE,     # reviews.add, operation approve
+               None: CAP_REVIEWS},         # reviews.add, every other operation
+    'proposal': {'submit': CAP_PROPOSALS, 'revise': CAP_PROPOSALS,     # proposals.submit
+                 'review': CAP_APPROVE,                               # proposals.dispose, triage
+                 'decide': CAP_PROJECT_ADMIN},                        # proposals.dispose, the owner decision
+}
+
+
+def required_capability(request):
+    """The capability the action of ``request`` needs by ``BLOCK_CAPABILITIES``, or None.
+
+    None means "not in the table": an action the table does not know, a read, or a request
+    so malformed that the action's own validation refuses it before it writes. The review
+    record is found and parsed exactly as ``work.execute`` does it, so the operation judged
+    here is the operation carried out.
+    """
+    needed = BLOCK_CAPABILITIES.get(request.get('action', 'bd'))
+    if needed is None or not isinstance(needed, dict):
+        return needed
+    args = request.get('args')
+    if not isinstance(args, list) or not args or any(not isinstance(token, str) for token in args):
+        return None
+    if request.get('action') != 'review':
+        return needed.get(args[0])
+    args = [token for token in args if token != '--json']
+    attachments = request.get('attachments', {})
+    if len(args) != 2 or not args[1].startswith('@attachment:') or not isinstance(attachments, dict):
+        return None                                  # `review TASK` reads; anything else is refused there
+    item = attachments.get(args[1].partition(':')[2], {})
+    if not isinstance(item, dict) or not isinstance(item.get('text'), str):
+        return None
+    import record_json
+    try:
+        payload = record_json.loads(item['text'])
+    except ValueError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    operation = payload.get('operation')
+    return needed.get(operation if isinstance(operation, str) else None, needed[None])
+
+
+def block_mismatch_denial(request, authority_config):
+    """Why a request whose authority block does not fit what it asks for is refused, or None.
+
+    The block says for which project and which capability the web service authorized the
+    caller, and ``decide`` re-reads exactly that from the live state. Nothing compared it
+    with the request it travels with (kittrial-5bb.261, an older gap): an approval sent with
+    a block naming ``reviews.write`` was carried out where ``coordinator_writes`` is off, and
+    a block naming project A on a request for project B was carried out in B. Launched by
+    the service, a request with a block is refused here, before any lock, tracker read or
+    write, when the block's project is not the request's project, or when the block's
+    capability is not the one ``BLOCK_CAPABILITIES`` gives for the action. Over SSH there is
+    no launch configuration and a block a caller sends is ignored, as before.
+    """
+    if authority_config is None:
+        return None
+    authority = request.get('authority')
+    if not isinstance(authority, dict):
+        return None
+    from project_creation import SERVICE_ACTIONS
+    if request.get('action') in SERVICE_ACTIONS:
+        # The service-only actions hold this rule themselves, with their own sentences
+        # (``project_creation.service_descriptor``: exactly the capability of the action; and
+        # the project, where the action has one). They are answered as before.
+        return None
+    if authority.get('project') != request.get('project'):
+        return _envelope(126, stderr='The live-authority descriptor names another project than the one this request '
+                                     'is for; nothing was changed\n', authority_status=403)
+    needed = required_capability(request)
+    if needed is not None and authority.get('capability') != needed:
+        return _envelope(126, stderr='The live-authority descriptor does not name the capability this request needs '
+                                     '(%s); nothing was changed\n' % needed, authority_status=403)
+    return None
+
+
 def run_guarded(request, journal_path, effect, authority_config=None,
                 require_authority=False, runner=None, journal_options=None, account_identity=False,
                 identity_check=None):

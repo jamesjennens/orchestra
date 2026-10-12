@@ -5155,7 +5155,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             refuse_unknown_fields(payload, self.AGENT_UPDATE_FIELDS, 'An agent change')
             if 'enabled' in payload and payload['enabled'] is not None and not bool(payload['enabled']):
                 metadata.update(self._revocation_metadata(agent_id=ctx.params['aid']))
-            result = self.service.update_agent(ctx.principal, ctx.params['aid'], payload)
+            result = self.service.update_agent(ctx.principal, ctx.params['aid'], payload,
+                                               request_id=ctx.request_id)
             return result, result
         return self._mutate(ctx, 'agents.update', None, update, capability=CAP_AGENTS,
                             audit_metadata=metadata)
@@ -6319,6 +6320,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         result['next_cursor'] = (make_cursor(ctx.principal, pid, ctx.query, result['next_offset'])
                                  if result.get('next_offset') is not None else None)
         result['can_triage'] = self._triages(ctx, capabilities)
+        result['can_decide'] = self._decides(ctx, capabilities)
         result['can_propose'] = CAP_PROPOSALS in capabilities
         return 200, result
 
@@ -6328,6 +6330,13 @@ class ApiHandler(BaseHTTPRequestHandler):
         a credential, as the write below says; an agent's coordinator grant (kittrial-5bb.209)
         gives it the approval of contributions and changes nothing here."""
         return CAP_APPROVE in capabilities and ctx.principal.via != 'credential'
+
+    @staticmethod
+    def _decides(ctx, capabilities):
+        """Whether the caller records the owner decision on an escalated proposal: a signed-in
+        member with `project.admin` (an owner, or a superuser), the check the write below makes.
+        A coordinator triages and does not decide; never a credential (kittrial-5bb.261)."""
+        return CAP_PROJECT_ADMIN in capabilities and ctx.principal.via != 'credential'
 
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/proposals/(?P<key>' + PROPOSAL_KEY + r')')
     def proposals_get(self, ctx):
@@ -6343,6 +6352,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         capabilities = self.service.capabilities_for(ctx.principal, pid)
         result = self._proposal_view(ctx, capabilities, self.backend.proposal_read(pid, args, missing=True))
         result['can_triage'] = self._triages(ctx, capabilities)
+        result['can_decide'] = self._decides(ctx, capabilities)
         return 200, result
 
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/proposals/(?P<key>' + PROPOSAL_KEY + r')/dispositions')
@@ -6373,13 +6383,19 @@ class ApiHandler(BaseHTTPRequestHandler):
         fields, operation_id = self._proposal_body(ctx, self.PROPOSAL_DISPOSE_FIELDS, 'A proposal disposition')
         body = dict(fields, schema_version=1, operation=command, key=ctx.params['key'], operation_id=operation_id)
         pid = ctx.params['pid']
+        # The endpoint is handed the capability this route checked for THIS operation, and
+        # authorizes that one again from the live state (kittrial-5bb.261): `project.admin` for
+        # the owner decision, `reviews.approve` for triage. It used to be handed
+        # `reviews.approve` for both, so its second authorization of a decide asked less than
+        # the first.
+        needed = CAP_PROJECT_ADMIN if command == 'decide' else CAP_APPROVE
 
         def dispose():
             result = self.backend.invoke('proposals.dispose', principal, pid, {'command': command, 'body': body},
                                          ctx.idempotency_key, target=ctx.route_target,
-                                         authorize=ctx.authorize, capability=CAP_APPROVE)
+                                         authorize=ctx.authorize, capability=needed)
             return result, result
-        return self._mutate(ctx, 'proposals.dispose', pid, dispose, status=201, capability=CAP_APPROVE,
+        return self._mutate(ctx, 'proposals.dispose', pid, dispose, status=201, capability=needed,
                             serialize=False, canonical=True, reason='%s %s' % (command, ctx.params['key']))
 
     @route('GET', r'/v1/me/contributions')
