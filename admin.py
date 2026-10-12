@@ -3469,7 +3469,7 @@ def require_bd_init_tools(root):
     if missing:
         names=' and '.join(missing)
         raise ValueError('This host has no %s on PATH, which bd init needs to create a project. '
-                         'Install %s and run this command again; nothing was created.'%(names,names))
+                         'Install %s and run this command again; no project was created.'%(names,names))
 
 def require_creatable_project(root,name):
     """The checks a creation needs before anything is made; returns the project directory.
@@ -3493,16 +3493,16 @@ def require_creatable_project(root,name):
     try:
         document = config(root)
     except FileNotFoundError:
-        raise ValueError('Deployment is not installed; run install first. Nothing was created.') from None
+        raise ValueError('Deployment is not installed; run install first. No project was created.') from None
     except OSError as error:
         raise ValueError('This host cannot read the deployment configuration %s (%s). '
-                         'Fix that file and run this command again; nothing was created.'
+                         'Fix that file and run this command again; no project was created.'
                          % (root/'deployment.private.json', error.strerror or error)) from None
     except ValueError:
         raise
     if not isinstance(document, dict):
         raise ValueError('Deployment configuration %s is not a JSON object. Fix that file and run '
-                         'this command again; nothing was created.' % (root/'deployment.private.json'))
+                         'this command again; no project was created.' % (root/'deployment.private.json'))
     port = document.get('port')
     # isinstance(True, int) is true: a bool is not a port (review 01a1288a).
     # ASCII digits only, at most five characters (F3): str.isdigit() accepts superscripts
@@ -3512,7 +3512,7 @@ def require_creatable_project(root,name):
                   and port.isascii() and port.isdigit() and 1 <= int(port) <= 65535))
     if not usable:
         raise ValueError('Deployment configuration %s has no usable port. Fix that file and run '
-                         'this command again; nothing was created.' % (root/'deployment.private.json'))
+                         'this command again; no project was created.' % (root/'deployment.private.json'))
     return path
 
 def initialize_requirements_governance(root,name):

@@ -180,20 +180,6 @@ def running_name(root):
     return name or None
 
 
-def _drop_empty_records_dir(root):
-    """Remove ``project-creations/`` when a refusal left only its lock file behind."""
-    directory = records_dir(root)
-    try:
-        if directory.is_dir() and not directory.is_symlink():
-            leftovers = [p for p in directory.iterdir() if p.name != LOCK_NAME]
-            if not leftovers:
-                for p in directory.iterdir():
-                    p.unlink()
-                directory.rmdir()
-    except OSError:
-        pass
-
-
 def _clear_running(root, name):
     """Drop the ``.running`` marker when it names ``name`` (kittrial-5bb.225 item 2)."""
     directory = records_dir(root)
@@ -575,19 +561,17 @@ def host_create(root, name, initialize, guards, requirements_default=True):
             return _host_create_locked(root, name, initialize, guards, requirements_default)
     except Busy:
         raise ValueError(host_busy_message(root, name)) from None
-    except BaseException:
-        # A refusal that wrote no record must leave no project-creations directory
-        # either (kittrial-5bb.225 item 4; admin.py says a refusal leaves nothing).
-        _drop_empty_records_dir(root)
-        raise
 
 
 def _host_create_locked(root, name, initialize, guards, requirements_default=True):
     guards(root, name)
     record = read_record(root, name)
     if record is None or record['state'] != 'started':
+        import secrets
+        # A value that differs per run (kittrial-5bb.225 item 3): two runs of the same name
+        # in the same second must not share a token.
         record = {'project': name, 'by': HOST, 'state': 'started', 'stage': None, 'started_at': _stamp(),
-                  'token': _stamp() + '-' + name}
+                  'token': secrets.token_hex(8)}
         if requirements_default:
             record['requirements_governance'] = 'simple'
 

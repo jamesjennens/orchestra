@@ -470,14 +470,33 @@ class HostWideLockTests(CreationRecordCase):
         (pc.records_dir(self.root) / pc.RUN_NAME).write_text('alpha\n', encoding='utf-8')
         self.assertIsNone(pc.running_name(self.root))
 
-    def test_a_refusal_that_made_nothing_leaves_no_records_directory(self):
-        # Item 4: admin.py says a refusal leaves no directory.
+    def test_a_refusal_never_deletes_a_lock_file_others_may_hold(self):
+        # kittrial-5bb.225 review: the lock file is never unlinked after the lock is
+        # released -- a waiter may already hold that inode.
         def refuse(root, name, stage):
             raise ValueError('nope')
         with self.assertRaises(ValueError):
             pc.host_create(self.root, 'gamma', refuse, lambda root, name: None)
         directory = pc.records_dir(self.root)
-        self.assertFalse(directory.exists(), 'project-creations/ was left behind by a refusal')
+        self.assertTrue((directory / pc.LOCK_NAME).exists() or not directory.exists(),
+                        'a refusal must not unlink a lock file another creation may hold')
+
+    def test_two_runs_of_one_name_in_the_same_second_get_different_tokens(self):
+        # kittrial-5bb.225 review: secrets.token_hex(8) differs per run.
+        first = {'project': 'delta', 'by': 'host', 'state': 'started', 'stage': None,
+                 'started_at': '2026-01-01T00:00:00Z', 'token': pc._stamp() and 'run-a'}
+        # Build the way host_create does: the token is not derived from the timestamp.
+        import secrets
+        a = {'project': 'delta', 'by': 'host', 'state': 'started', 'stage': None,
+             'started_at': '2026-01-01T00:00:00Z', 'token': secrets.token_hex(8)}
+        b = dict(a, token=secrets.token_hex(8))
+        self.assertNotEqual(a['token'], b['token'])
+        pc.write_record(self.root, 'delta', a)
+        self.assertTrue(pc._record_is_ours(self.root, 'delta', a))
+        self.assertFalse(pc._record_is_ours(self.root, 'delta', b))
+        pc.write_record(self.root, 'delta', b)
+        self.assertFalse(pc._record_is_ours(self.root, 'delta', a))
+        self.assertTrue(pc._record_is_ours(self.root, 'delta', b))
 
     def test_the_record_carries_a_token_so_two_runs_cannot_hold_equal_dicts(self):
         # Item 3.
