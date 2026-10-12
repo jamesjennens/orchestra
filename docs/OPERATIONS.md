@@ -1648,6 +1648,11 @@ What it does:
 
 A project a stopped restore left behind needs no flag: the server answers and bd rejects the project. An empty project that bd reads (what a restore that failed before writing leaves) needs no flag either. A directory that was never initialized (no `.beads/metadata.json`: what a stop during the `add-project` step leaves) needs no flag only when the Dolt server can answer and no same-named server database exists or that database contains no issues. If the server cannot be reached, the check fails closed and retirement needs `--force` (or retry after starting the server).
 
+For a partial or uninitialized destination, `restore-new` prints the plain
+`admin.py retire-project PROJECT --actor OPERATOR --reason TEXT` command first.
+If it is refused because the half-restored DB has issues or the server is
+unreachable, read its output and repeat it with `--force`.
+
 "bd rejects the project" is any refusal by bd while the server answers. By design that also covers a project whose recorded `project_id` or `dolt_database` was changed by hand so that it no longer matches its database: bd refuses it exactly as it refuses a partial restore, the kit cannot tell the two apart, and it retires with no flag. Nothing is deleted, and moving the directory back undoes it.
 
 `retire-project` is refused, with or without `--force`, while a `restore-new` into that name is running: the restore holds `backups/PROJECT.restore.lock` for its whole run. Wait for it to finish or stop it first.
