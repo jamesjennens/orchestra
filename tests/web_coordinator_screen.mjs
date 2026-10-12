@@ -46,6 +46,8 @@ const coordination = (page) => {
     agents: node.all((e) => e.tagName === 'LI' && e.attributes['data-agent-name']).map((li) => li.textContent),
     rules: node.all((e) => e.tagName === 'LI' && e.attributes['data-rule']).map((li) => [li.attributes['data-rule'], li.attributes['data-on']]),
     host: (node.all((e) => e.attributes && e.attributes['data-rules'] === 'host')[0] || { textContent: '' }).textContent,
+    operators: (node.all((e) => e.attributes && e.attributes['data-operators'])[0] || { attributes: {}, textContent: '' }).attributes['data-operators']
+      + ': ' + (node.all((e) => e.attributes && e.attributes['data-operators'])[0] || { textContent: '' }).textContent,
     buttons: node.all((e) => e.tagName === 'BUTTON' || e.tagName === 'SELECT' || e.tagName === 'INPUT').length,
   };
 };

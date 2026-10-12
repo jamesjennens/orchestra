@@ -1036,7 +1036,14 @@ class UnregisteredScreenTests(unittest.TestCase):
             self.assertIn('Started from the web interface by olive', cards[project]['text'])
         # Only a finished project not registered here is offered the button.
         self.assertEqual({name: card['buttons'] for name, card in cards.items()},
-                         {'beta': [], 'gamma': ['Register\u2026'], 'delta': ['Register\u2026']})
+                         {'beta': [], 'gamma': ['Register\u2026'], 'delta': ['Register\u2026'], 'omega': ['Register\u2026']})
+        # A project on the server with no creation record: nobody is named as its maker.
+        self.assertEqual(cards['omega']['by'], 'unknown')
+        self.assertIn('On the server, not registered', cards['omega']['text'])
+        self.assertIn('no creation record says by whom or when', cards['omega']['text'])
+        self.assertNotIn('Started', cards['omega']['text'])
+        self.assertIn('could not be listed just now', seen['unlisted_unknown'])
+        self.assertIn('cannot list its projects that have no creation record', seen['unlisted_unavailable'])
         # The button fills the form and sends nothing; the form's own button registers.
         self.assertEqual((seen['before'], seen['filled'], seen['callsAfterFill'], seen['refilled']), ('', 'gamma', [], 'delta'))
         self.assertEqual(seen['calls'], [['registerProject', 'delta', '']])

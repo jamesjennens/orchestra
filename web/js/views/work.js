@@ -151,34 +151,45 @@ export function hostCreatePanel(ctx, creation) {
 // Superuser only: project creations that run, stopped or finished without being registered,
 // so that none is forgotten; and how full the server is.
 const CREATION_CHIPS = { running: ['Being created', 'plain'], incomplete: ['Did not finish', 'warn'], stalled: ['Did not start', 'warn'],
-  damaged: ['Record damaged', 'warn'], 'not-a-record': ['Not a creation record', 'warn'], 'created-unregistered': ['Made, not registered', 'warn'] };
+  damaged: ['Record damaged', 'warn'], 'not-a-record': ['Not a creation record', 'warn'], 'created-unregistered': ['Made, not registered', 'warn'],
+  'unrecorded-unregistered': ['On the server, not registered', 'warn'] };
+// Registrable from the list: finished, and nothing is registered here under the name.
+const REGISTRABLE = ['created-unregistered', 'unrecorded-unregistered'];
+// Why projects without a creation record are not listed (kittrial-5bb.198), as the server says it.
+const UNLISTED = {
+  unknown: 'Projects on the server without a creation record could not be listed just now. Reload the page to try again.',
+  unavailable: 'This server cannot list its projects that have no creation record; such a project is still registered by its name below.',
+};
 // `onRegister(name)`, when given, fills the register form with a finished project's name (kittrial-5bb.198); the
 // superuser still registers it there. Nothing is registered from this list.
 export async function incompleteCreations(ctx, { onRegister } = {}) {
   if (!ctx.me.superuser) return null;
   const found = await ctx.api.projectCreations().catch(() => null);
-  const items = [...((found && found.items) || []), ...((found && found.unregistered) || [])];
+  const items = [...((found && found.items) || []), ...((found && found.unregistered) || []), ...((found && found.unrecorded) || [])];
   const server = found && found.server;
-  if (!items.length && !server) return null;
+  const unlisted = found && UNLISTED[found.host_projects];
+  if (!items.length && !server && !unlisted) return null;
   const needing = items.filter((item) => item.state !== 'running').length;
   return h('section', { class: 'panel', id: 'incomplete-creations' },
     h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Projects on the server ', needing ? h('span', { class: 'nav-count' }, needing) : null)),
     h('div', { class: 'panel-body stack' },
+      unlisted ? h('p', { class: 'small', id: 'unrecorded-unlisted' }, unlisted) : null,
       server ? h('p', { class: 'small', id: 'server-usage' }, server.used == null ? '' : `This server holds ${server.used} of the ${server.limit} project databases its operator allows. `, h('span', { class: 'muted' }, server.note || '')) : null,
       items.length ? h('p', { class: 'small muted' }, 'Nothing is registered here for any of these, and each name is held. An operator acts on the server; this page does not run anything.') : null,
       items.map((item) => {
         const [label, tone] = CREATION_CHIPS[item.state] || [item.state, 'warn'];
         // `by` is "host" for a project an operator made with admin.py add-project (kittrial-5bb.176): no web
         // account started it, so the card does not say one did (kittrial-5bb.198).
-        const origin = item.by === 'host' ? ['Started on the server by an operator (admin.py add-project)']
-          : ['Started from the web interface by ', item.by_name || item.by || 'unknown'];
-        return h('div', { class: 'card', 'data-creation': item.project, 'data-state': item.state, 'data-by': item.by === 'host' ? 'host' : 'web' },
+        const origin = item.state === 'unrecorded-unregistered' ? ['Made on the server; no creation record says by whom or when']
+          : item.by === 'host' ? ['Started on the server by an operator (admin.py add-project)']
+            : ['Started from the web interface by ', item.by_name || item.by || 'unknown'];
+        return h('div', { class: 'card', 'data-creation': item.project, 'data-state': item.state, 'data-by': item.state === 'unrecorded-unregistered' ? 'unknown' : item.by === 'host' ? 'host' : 'web' },
           h('div', { class: 'toolbar' }, h('h2', { class: 'small mono' }, item.project), h('span', { class: 'chip ' + tone }, label)),
           h('p', { class: 'small' }, ...origin, item.started_at ? [' ', time(item.started_at)] : null, item.stage && item.state !== 'running' ? `; stopped at the step “${item.stage}”.` : '.'),
           item.what ? h('p', { class: 'small muted' }, item.what) : null,
           item.finish ? [h('p', { class: 'small muted' }, 'To finish it:'), h('pre', { class: 'json' }, item.finish)] : null,
           item.remove ? [h('p', { class: 'small muted' }, item.state === 'stalled' ? 'To remove it (nothing was made, so the name is free again):' : item.state === 'damaged' ? 'To set the damaged record aside (it is kept, and nothing else is touched):' : 'To remove it (the name stays retired):'), h('pre', { class: 'json' }, item.remove)] : null,
-          item.state === 'created-unregistered' && onRegister ? h('div', null, h('button', { type: 'button', 'aria-label': 'Fill the register form with ' + item.project,
+          REGISTRABLE.includes(item.state) && onRegister ? h('div', null, h('button', { type: 'button', 'aria-label': 'Fill the register form with ' + item.project,
             onclick: () => onRegister(item.project) }, 'Register…')) : null);
       })));
 }
