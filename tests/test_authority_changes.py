@@ -969,6 +969,10 @@ class RestoreRegrantTests(AuthorityChangesCase):
                 contextlib.redirect_stdout(io.StringIO()):
             warning = admin.restore_authority(self.root, 'lm', restore_operators=True,
                                               actor='james', reason='after a rollback')
+        # kittrial-5bb.233 revision 2, review item 3.7: a restore-route mutant that stopped returning
+        # this warning used to make the assertions below die by a TypeError (assertIn on None), not
+        # by an assertion. The warning text is asserted only after this says it is there.
+        self.assertIsNotNone(warning)
         self.assertIn('was NOT re-granted', warning)
         self.assertIn('authority-changes audit', warning)
         self.assertIn('restore-new exits %d' % admin.RESTORE_AUTHORITY_NOT_REGRANTED, warning)
@@ -988,6 +992,7 @@ class RestoreRegrantTests(AuthorityChangesCase):
                 contextlib.redirect_stdout(io.StringIO()):
             warning = admin.restore_authority(self.root, 'lm', restore_operators=True,
                                               actor='OPERATOR', reason='after a rollback')
+        self.assertIsNotNone(warning)                          # an assertion, not a TypeError (item 3.7)
         self.assertIn('was NOT re-granted', warning)
         self.assertIn('placeholder', warning)
         self.assertIn('operators add op1 --actor OPERATOR', warning)
@@ -1637,6 +1642,174 @@ class RebaselineTests(AuthorityChangesCase):
         self.assertEqual(self.kept_histories(), [])
 
 
+class RebaselineVerdictTests(AuthorityChangesCase):
+    """kittrial-5bb.233 revision 2, review items 1 and 2a-2d: the baseline records its own verdict.
+
+    The command replaced the whole history and the reader then agreed, so the mismatch it hid was
+    lost. It now runs the READER's own verdict on the history being replaced, records the state,
+    the names the trail did not explain per list and the kept name in the new baseline's reason,
+    prints a WARNING and carries it in the JSON, refuses a mismatch or a damaged history without
+    `--accept-unexplained`, lists the `.replaced-*` files beside the `.damaged-*` ones, and carries
+    the note through the cap fold for good.
+    """
+
+    def hand_add(self, noun, name):
+        config = self.stored()
+        config[noun] = config[noun] + [name]
+        self.marker.write_text(json.dumps(config), encoding='utf-8')
+
+    def kept_histories(self):
+        return sorted(self.root.glob(AUDIT + admin.AUTHORITY_CHANGES_REPLACED + '*'))
+
+    def test_a_mismatch_is_recorded_in_the_new_baseline_on_stderr_and_in_the_json(self):
+        # (a): state, the names the trail does not explain per list, and the kept name.
+        self.cli('operators', 'add', 'bob', '--actor', OPERATOR, '--reason', 'pilot')
+        self.hand_add('operators', 'sneaked')
+        self.assertEqual(json.loads(self.cli('authority-changes')[0])['replay']['state'], 'mismatch')
+        before = (self.root / AUDIT).read_bytes()
+        out, err = self.cli('authority-changes-baseline', '--actor', OPERATOR, '--reason', 'tidying',
+                            '--accept-unexplained')
+        report = json.loads(out)
+        reason = self.baseline()['reason']
+        self.assertIn(admin.AUTHORITY_CHANGES_REBASE_MARKER, reason)
+        self.assertIn('mismatch', reason)
+        self.assertIn('sneaked', reason)
+        kept = self.kept_histories()
+        self.assertEqual(len(kept), 1)
+        self.assertIn(kept[0].name, reason)
+        self.assertEqual(kept[0].read_bytes(), before)          # byte for byte, as before
+        self.assertEqual([item['actor'] for item in self.entries()], [])   # a fresh history
+        # stderr AND the JSON carry the warning the reader alone would lose.
+        self.assertIn('WARNING', err)
+        self.assertIn('does NOT agree', err)
+        self.assertIn('sneaked', err)
+        verdict = report['previous_audit_verdict']
+        self.assertEqual(verdict['state'], 'mismatch')
+        self.assertEqual(verdict['unexplained'], {'operators': ['sneaked']})
+        self.assertIn('sneaked', verdict['note'])
+        self.assertIn('WARNING', verdict['note'])          # the JSON carries the same WARNING
+        self.assertEqual(report['previous_audit_kept_as'], kept[0].name)
+        # The fresh history itself agrees - and the history still says the mismatch happened.
+        self.assertTrue(report['replay']['agrees'])
+        self.assertIn('mismatch', json.loads(self.cli('authority-changes')[0])['baseline']['reason'])
+
+    def test_a_mismatch_refuses_without_the_explicit_flag(self):
+        # (b): the null-baseline case needs no flag; a mismatch does, and the refusal says so.
+        self.cli('operators', 'add', 'bob', '--actor', OPERATOR, '--reason', 'pilot')
+        self.hand_add('verifiers', 'sneaked-v')
+        before = (self.root / AUDIT).read_bytes()
+        message, err = self.cli_refusal('authority-changes-baseline', '--actor', OPERATOR,
+                                        '--reason', 'tidying')
+        self.assertIn('does not agree', message)
+        self.assertIn(admin.AUTHORITY_CHANGES_ACCEPT_UNEXPLAINED, message)
+        self.assertIn('verifiers', message)
+        self.assertIn('sneaked-v', message)
+        self.assertEqual((self.root / AUDIT).read_bytes(), before)   # nothing replaced
+        self.assertEqual(self.kept_histories(), [])
+        self.assertNotIn('WARNING', err)                             # it never said it wrote one
+
+    def test_the_incomplete_null_baseline_case_needs_no_flag_and_is_recorded(self):
+        # (a) again for the case the command exists for: incomplete, no flag, state recorded.
+        (self.root / AUDIT).write_text(
+            json.dumps({'schema_version': 1, 'entries': [self.good_entry(actor=OPERATOR)],
+                        'baseline': self.good_baseline(lists={'operators': [OPERATOR], 'verifiers': None})}),
+            encoding='utf-8')
+        out, err = self.cli('authority-changes-baseline', '--actor', OPERATOR,
+                            '--reason', 'the verifiers value was repaired')
+        report = json.loads(out)
+        self.assertTrue(report['replay']['agrees'])
+        self.assertIn('incomplete', self.baseline()['reason'])
+        self.assertEqual(report['previous_audit_verdict']['state'], 'incomplete')
+        self.assertIn('incomplete', err)
+
+    def test_a_damaged_audit_refuses_without_the_flag_and_is_kept_and_recorded_with_it(self):
+        # (b) for a damaged file, and (a) saying DAMAGED and why.
+        (self.root / AUDIT).write_text('{nope', encoding='utf-8')
+        before = (self.root / AUDIT).read_bytes()
+        message, err = self.cli_refusal('authority-changes-baseline', '--actor', OPERATOR,
+                                        '--reason', 'repair')
+        self.assertIn('damaged', message)
+        self.assertIn(admin.AUTHORITY_CHANGES_ACCEPT_UNEXPLAINED, message)
+        self.assertEqual((self.root / AUDIT).read_bytes(), before)
+        self.assertEqual(self.kept_histories(), [])
+        out, err = self.cli('authority-changes-baseline', '--actor', OPERATOR, '--reason', 'repair',
+                            '--accept-unexplained')
+        report = json.loads(out)
+        reason = self.baseline()['reason']
+        self.assertIn('DAMAGED', reason)
+        kept = self.kept_histories()
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0].read_text(encoding='utf-8'), '{nope')    # byte for byte
+        self.assertIn(kept[0].name, reason)
+        self.assertEqual(report['previous_audit_verdict']['state'], 'damaged')
+        self.assertIn('DAMAGED', err)
+        self.assertTrue(report['replay']['agrees'])                       # the fresh history is clean
+
+    def test_the_reader_lists_the_replaced_history_beside_the_damaged_ones(self):
+        # (c): a readable history kept on purpose is NOT a damaged file, and is listed.
+        self.cli('operators', 'add', 'bob', '--actor', OPERATOR, '--reason', 'pilot')
+        self.cli('authority-changes-baseline', '--actor', OPERATOR, '--reason', 'start clean')
+        damaged = self.root / (AUDIT + admin.AUTHORITY_CHANGES_DAMAGED + '20260101T000000Z')
+        damaged.write_text('{nope', encoding='utf-8')
+        report = json.loads(self.cli('authority-changes')[0])
+        replaced = [name for name in report['replaced_files']
+                    if admin.AUTHORITY_CHANGES_REPLACED in name]
+        self.assertEqual(len(replaced), 1)
+        self.assertEqual(report['damaged_files'], [damaged.name])
+        self.assertNotIn(replaced[0], report['damaged_files'])
+        self.assertIn(replaced[0], report['replay']['note'])
+        self.assertIn('not damaged files', report['replay']['note'])
+
+    def test_the_cap_fold_carries_the_rebase_note_forward(self):
+        # (d): after the cap folds entries into a fresh baseline, the audit still says the mismatch
+        # happened, which names were unexplained and what the replaced history was kept as.
+        limit = admin.AUTHORITY_CHANGES_MAX
+        rebase = ('baseline: authority-changes-baseline by alice started a fresh history from the operator and '
+                  'verifier lists as they stood then; the reason given: tidying; '
+                  'the history this replaced did NOT agree with the lists (mismatch): operators: sneaked; '
+                  'kept as ' + AUDIT + '.replaced-20260101T000000Z')
+        (self.root / AUDIT).write_text(
+            json.dumps({'schema_version': 1,
+                        'entries': [dict(self.good_entry(actor='n%03d' % index),
+                                         at='2026-10-01T00:00:%02dZ' % (index % 60))
+                                    for index in range(limit)],
+                        'baseline': self.good_baseline(reason=rebase)}),
+            encoding='utf-8')
+        self.cli('operators', 'add', 'final', '--actor', 'alice', '--reason', 'rebase')
+        folded = self.baseline()['reason']
+        self.assertIn('cap', folded)
+        self.assertIn(admin.AUTHORITY_CHANGES_REBASE_MARKER, folded)
+        self.assertIn('sneaked', folded)
+        self.assertIn('.replaced-20260101T000000Z', folded)
+        self.assertTrue(admin.authority_change_baseline_record(self.baseline()))
+        # Another fold keeps saying so, for good.
+        self.cli('operators', 'add', 'later', '--actor', 'alice', '--reason', 'on')
+        self.assertIn('sneaked', self.baseline()['reason'])
+        self.assertIn('.replaced-20260101T000000Z', self.baseline()['reason'])
+
+    def test_the_hand_added_operator_runs_the_baseline_and_the_mismatch_is_still_said(self):
+        # The reviewer's own in/a.py hide: a name added to `operators` by hand, and then THAT name -
+        # a listed operator now - runs authority-changes-baseline itself.
+        self.cli('operators', 'add', 'bob', '--actor', OPERATOR, '--reason', 'pilot')
+        self.hand_add('operators', 'o1')
+        self.assertIn('o1', self.stored()['operators'])
+        out, err = self.cli('authority-changes-baseline', '--actor', 'o1', '--reason', 'tidying',
+                            '--accept-unexplained')
+        report = json.loads(out)
+        # The reader agrees for the fresh history - and the history still says the mismatch
+        # happened, and which name was unexplained.
+        self.assertTrue(report['replay']['agrees'])
+        self.assertEqual(report['replay']['state'], 'agrees')
+        reason = self.baseline()['reason']
+        self.assertIn('did NOT agree', reason)
+        self.assertIn('mismatch', reason)
+        self.assertIn('o1', reason)
+        self.assertIn('tidying', reason)
+        self.assertEqual(self.baseline()['operator'], 'o1')
+        self.assertIn('WARNING', err)
+        self.assertIn('o1', err)
+
+
 class PlaceholderOnRemovalTests(AuthorityChangesCase):
     """kittrial-5bb.229 rev-2 item 3: a removal is never harder WITH the flags than without."""
 
@@ -1767,6 +1940,112 @@ class PlaceholderOnRemovalTests(AuthorityChangesCase):
         self.cli('operators', 'add', 'bob', '--actor', 'OPERATOR', '--reason', 'pilot')
         self.assertEqual(self.entries()[-1]['operator'], 'OPERATOR')
         self.assertEqual(self.stored()['operators'], [OPERATOR, 'OPERATOR', 'bob'])
+
+    def test_the_removal_placeholder_check_is_remade_under_the_deployment_lock(self):
+        # kittrial-5bb.233 revision 2, review item 3.1: the REMOVAL side of the race used to stay
+        # open. OPERATOR is a real listed operator when the arguments are read, and a concurrent
+        # change removes it before the lock; the removal must drop it there, not record an operator
+        # nobody lists.
+        self.marker.write_text(json.dumps({'password': 'x', 'unit': 'none',
+                                           'operators': [OPERATOR, 'OPERATOR', 'bob'],
+                                           'verifiers': [VERIFIER]}), encoding='utf-8')
+        with patch.object(admin, 'deployment_config_lock', self.racing('OPERATOR')):
+            out, err = self.cli('operators', 'remove', 'bob', '--confirm-revoke',
+                                '--actor', 'OPERATOR', '--reason', 'key leaked')
+        self.assertEqual(json.loads(out), {'operators': [OPERATOR]})   # the removal happened
+        entry = self.entries()[0]
+        self.assertIsNone(entry['operator'])           # dropped under the lock, not recorded
+        self.assertEqual(entry['actor'], 'bob')
+        self.assertEqual(entry['reason'], 'key leaked')  # the real reason IS recorded
+        self.assertIn('placeholder', err)
+        self.assertIn('unattributed', err)
+
+    def test_the_removal_placeholder_check_is_remade_for_verifiers_too(self):
+        # The same race on the verifiers command, whose placeholder is judged against the OPERATOR
+        # list (review item 3.1).
+        self.marker.write_text(json.dumps({'password': 'x', 'unit': 'none',
+                                           'operators': [OPERATOR, 'OPERATOR'],
+                                           'verifiers': [VERIFIER, 'v2']}), encoding='utf-8')
+        with patch.object(admin, 'deployment_config_lock', self.racing('OPERATOR')):
+            out, err = self.cli('verifiers', 'remove', 'v2', '--confirm-revoke',
+                                '--actor', 'OPERATOR', '--reason', 'host retired')
+        self.assertEqual(json.loads(out), {'verifiers': [VERIFIER]})
+        self.assertIsNone(self.entries()[0]['operator'])
+        self.assertEqual(self.entries()[0]['actor'], 'v2')
+        self.assertIn('placeholder', err)
+
+
+class SmallerRevisionTests(AuthorityChangesCase):
+    """kittrial-5bb.233 revision 2, review items 3.2 to 3.7."""
+
+    def test_the_baseline_operator_is_checked_again_under_the_lock(self):
+        # Item 3.2: an operator revoked between the check before the lock and the write must not be
+        # recorded as the one who took the baseline.
+        real = admin.deployment_config_lock
+
+        def wrapper(root):
+            config = json.loads(self.marker.read_text(encoding='utf-8'))
+            config['operators'] = [name for name in config['operators'] if name != OPERATOR]
+            self.marker.write_text(json.dumps(config), encoding='utf-8')
+            return real(root)
+
+        self.cli('operators', 'add', 'bob', '--actor', OPERATOR, '--reason', 'pilot')
+        before = (self.root / AUDIT).read_bytes()
+        with patch.object(admin, 'deployment_config_lock', wrapper):
+            message, err = self.cli_refusal('authority-changes-baseline', '--actor', OPERATOR,
+                                            '--reason', 'tidying')
+        self.assertIn('not a server-side configured operator', message)
+        self.assertEqual((self.root / AUDIT).read_bytes(), before)
+        self.assertEqual(sorted(self.root.glob(AUDIT + admin.AUTHORITY_CHANGES_REPLACED + '*')), [])
+
+    def test_a_runtime_that_cannot_be_written_is_a_sentence_not_a_traceback(self):
+        # Item 3.3: a PermissionError from the copy of the history to keep (the old admin.py:7129)
+        # used to escape as a traceback.
+        path = self.root / AUDIT
+        path.write_text('{nope', encoding='utf-8')
+        before = self.marker.read_bytes()
+        real_open = admin.os.open
+
+        def deny_open(target, *args, **kwargs):
+            # Only the copy's own create call is denied: reading the deployment file uses os.open
+            # too, and the point is a runtime directory that cannot be WRITTEN.
+            if '.tmp-' in str(target):
+                raise PermissionError(13, 'Permission denied (injected)')
+            return real_open(target, *args, **kwargs)
+
+        with patch.object(admin.os, 'link',
+                          side_effect=PermissionError(13, 'Permission denied (injected)')), \
+                patch.object(admin.os, 'open', side_effect=deny_open):
+            message, err = self.cli_refusal('operators', 'remove', OPERATOR, '--confirm-revoke')
+            message, err = self.cli_refusal('operators', 'remove', OPERATOR, '--confirm-revoke')
+        self.assertIn('could not write a copy', message)
+        self.assertIn('Nothing was changed', message)
+        self.assertNotIn('Traceback', message)
+        self.assertEqual(self.marker.read_bytes(), before)              # the operator was NOT removed
+        self.assertEqual(path.read_text(encoding='utf-8'), '{nope')
+        self.assertEqual(self.asides(), [])
+
+    def test_the_placeholder_refusal_composes_with_a_full_stop(self):
+        # Item 3.4: '...as a real name A re-grant...' was missing its stop.
+        refusal = admin.authority_change_placeholder_refusal('OPERATOR', 'pilot', 'add', ())
+        self.assertTrue(refusal.endswith('as a real name.'))
+        warning = admin.authority_not_regranted_placeholder(self.root, 'lm', ['op1'], [], refusal,
+                                                           actor='OPERATOR')
+        self.assertIn('as a real name. A re-grant is an ADD', warning)
+
+    def test_a_reason_holding_a_line_separator_is_refused(self):
+        # Item 3.6: the recorded reason is one line, so a newline (and any other separator) is
+        # refused with one sentence, before anything is written.
+        for argv in (('operators', 'add', 'bob', '--actor', 'alice', '--reason', 'one\ntwo'),
+                     ('verifiers', 'add', 'v2', '--actor', 'alice', '--reason', 'one\rtwo'),
+                     ('operators', 'add', 'bob', '--actor', 'alice', '--reason', 'one\u2028two'),
+                     ('authority-changes-baseline', '--actor', OPERATOR, '--reason', 'one\ntwo'),
+                     ('restore-new', 'lm', 'lmr', '--restore-operators', '--actor', 'james',
+                      '--reason', 'one\ntwo')):
+            with self.subTest(argv=argv):
+                with self.assertRaisesRegex(ValueError, 'one line'):
+                    self.cli(*argv)
+        self.assertIsNone(self.audit())
 
 
 class SmallerFindingTests(AuthorityChangesCase):
@@ -1971,6 +2250,31 @@ class DocumentationTests(unittest.TestCase):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, text)
 
+    def test_operations_documents_the_baseline_verdict_and_the_flag(self):
+        # kittrial-5bb.233 revision 2, review item 2e: the document says all of it, including that
+        # the command is not a way to make a warning go away.
+        text = (KIT / 'docs' / 'OPERATIONS.md').read_text(encoding='utf-8')
+        for phrase in ('It is not a way to make a warning go away',
+                       '--accept-unexplained',
+                       'previous_audit_verdict',
+                       '`replaced_files`',
+                       'CARRIES',
+                       'FORWARD',
+                       'A `--reason` holding a newline',
+                       'the first eight of',
+                       '(+N more)',
+                       'are NOT damaged'):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, text)
+
+    def test_operations_names_the_kits_the_null_baseline_downgrade_affects(self):
+        # kittrial-5bb.233 revision 2, review item 3.5: main 46ebcad reads a null baseline; the
+        # older-kit sentence is true of caab668 and older.
+        text = (KIT / 'docs' / 'OPERATIONS.md').read_text(encoding='utf-8')
+        for phrase in ('46ebcad', 'caab668', 'reads a `null` baseline'):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, text)
+
     def test_the_capability_payload_summary_matches_the_behaviour(self):
         # Item 2: the payload is a REVISION of the behaviour, not a propose. It carries `revision`
         # and `expected_sha256` (the accepted revision it revises), so the field set must ALLOW both
@@ -1993,6 +2297,10 @@ class DocumentationTests(unittest.TestCase):
         self.assertIn('recorded unattributed', payload['summary'])
         self.assertIn('a REMOVAL never is, for the audit or the OTHER list', payload['summary'])
         self.assertIn('authority-changes-baseline', payload['summary'])
+        # kittrial-5bb.233 revision 2: the capability's summary says what the command now records
+        # and what it refuses.
+        self.assertIn('--accept-unexplained', payload['summary'])
+        self.assertIn('replaced_files', payload['summary'])
 
 
 if __name__ == '__main__':

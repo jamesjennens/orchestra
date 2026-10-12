@@ -946,7 +946,12 @@ is not refused - the placeholder is dropped, the entry is recorded without it, a
 sentence says so - while an add carrying them is refused (rev-2 item 3), and that check is made
 again under the deployment lock, so a change that removes a real operator named `OPERATOR` at the
 same instant can no longer be followed by an add under `--actor OPERATOR` that records a name
-nobody lists (kittrial-5bb.233 finding 5).
+nobody lists (kittrial-5bb.233 finding 5). The same re-check closes the REMOVAL side of that race
+(revision 2, review item 3.1): a removal that named a real `OPERATOR` when the arguments were read
+and finds the name gone when the lock is taken drops it there, so the entry is recorded
+unattributed rather than with an operator nobody lists. A removal is never refused for the
+placeholder, on either read; the `OPERATOR` list itself is what the check is judged against, for
+`verifiers` too, and a listed operator of that name is unaffected.
 
 **What the audit cannot see.** An entry holds no before/after of the list itself, so
 `authority-changes` can only replay the trail from its baseline: a name the list holds whose
@@ -959,7 +964,8 @@ not lead to the lists, never silently. Nothing else in the kit detects a hand ed
 records a list as `null` is incomplete for that list for good, even after the value is repaired
 (above). The documented way out is `admin.py --root RUNTIME authority-changes-baseline --actor
 OPERATOR --reason TEXT`, run by a configured operator (the deployment operator allowlist, checked
-before the lock). It reads the current operator and verifier lists and **refuses**, with a
+before the lock AND again under it, so an operator revoked in between is not recorded as the one who
+took the baseline). It reads the current operator and verifier lists and **refuses**, with a
 sentence naming the list, if either cannot be read: recording one as `null` is exactly the state
 the command exists to leave behind. It keeps the history it replaces beside the runtime first,
 under a dated `authority-changes.audit.json.replaced-<UTC date-time>` name (`.N` if that name is
@@ -969,8 +975,37 @@ lock. A fresh history rather than a new baseline in place, because the old entri
 changes made BEFORE this snapshot and replaying them on top of it would corrupt the replay. The
 command prints the baseline it wrote, the name the old history was kept under and the reader's
 verdict; `authority-changes` then answers `agrees` `true` again, and a later hand edit warns
-again. The command's stdout is the reader's report plus one `previous_audit_kept_as` field naming
-the kept file (`null` when there was no history yet); `authority-changes` itself is unchanged.
+again.
+
+**It is not a way to make a warning go away.** Before it replaces anything, the command runs the
+READER's own verdict on the history being replaced and records it on the new baseline, because the
+closed baseline record (`{at,operator,reason,lists}`) has only its free-text `reason` to say it.
+The reason names the state the replaced history read as - `agrees`, `incomplete`, `mismatch` or
+`DAMAGED` - the names the trail did not explain PER LIST when it was a mismatch (the first eight of
+each list and `(+N more)`, so the reason stays inside the 400-character ceiling), and the
+`.replaced-` name it was kept under. The same verdict is printed as a `WARNING` on stderr and
+carried in the command's stdout under `previous_audit_verdict` (`{"state", "unexplained", "note"}`),
+beside `previous_audit_kept_as` naming the kept file (`null` when there was no history yet);
+`authority-changes` itself is unchanged. When the history being replaced is a **mismatch** or is
+**damaged**, the command **refuses**: taking a fresh baseline would leave a history that no longer
+says the mismatch happened, or that the old file could not be read. Re-run it with
+`--accept-unexplained` - an explicit statement that the operator has looked - to take the baseline
+anyway; the recorded verdict, the stderr `WARNING` and the JSON say so either way. The
+`incomplete` state (the `null` baseline the command exists for) and "no history yet" are NOT
+refused: they need no flag. A damaged history accepted with the flag is kept as
+`.replaced-<UTC date-time>` like any other, and the reason says it was `DAMAGED` and why. The
+`--reason` the operator gives is never truncated; when it cannot fit beside the verdict the command
+refuses with the number of characters it has room for. A `--reason` holding a newline (or any other
+line separator) is refused with one sentence, because the recorded reason is one line.
+
+The verdict is not lost at the cap. An audit can hold 200 entries; when the next change needs room,
+the oldest entries are folded into a fresh baseline (below), and that folded baseline CARRIES
+FORWARD the rebase note of the baseline it replaces - its state, the unexplained names it recorded
+and the `.replaced-` name - so a history that was ever re-based over a mismatch says so for good.
+
+The `.replaced-*` histories are NEVER removed and the reader lists them too, in its JSON under
+`replaced_files` beside `damaged_files` and in the note when there are any. They are NOT damaged
+files and the reader does not call them so: they are readable histories a fresh baseline replaced.
 
 **A damaged audit, and the two kinds of change.** An `authority-changes.audit.json` this kit
 cannot read - not JSON, empty, a list, `null`, another `schema_version` (including JSON `true`
@@ -1063,14 +1098,16 @@ by an older kit running on the same runtime - both change the lists with no entr
 reader's replay reports the gap.
 
 **Downgrade: an audit with a `null` (UNKNOWN) baseline is not history for an older kit.** The
-`baseline` record was added by this kit, and a list it holds as `null` is not a shape an older
-kit's reader accepts. On a kit older than this one such a file is **not readable history**: its
-`authority-changes` reader and `operators add` exit 1 (the file reads as not this kit's history)
-until it is moved aside by hand, and `operators remove` sets it aside itself and starts a fresh
-history. `schema_version` is still `1`, so an older kit cannot tell such a file apart from
-one it wrote by the version alone; move it aside (or keep a copy) before a rollback that has to
-read the audit, and take a fresh baseline with `authority-changes-baseline` after rolling back
-forward.
+`baseline` record itself was added before this kit, and a list it holds as `null` is not a shape
+those older readers accept. Which kit is which matters here, so it is said: main `46ebcad` reads a `null` baseline (its `authority_change_baseline_record` accepts `null` for a list), and so does
+everything after it, this kit included. The sentence about older kits is true of `caab668` and
+older: their reader requires BOTH lists in a baseline to be arrays of names, so on such a kit a
+file holding a `null` baseline is **not readable history**: its `authority-changes` reader and
+`operators add` exit 1 (the file reads as not this kit's history) until it is moved aside by hand,
+and `operators remove` sets it aside itself and starts a fresh history. `schema_version` is still
+`1`, so a `caab668`-and-older kit cannot tell such a file apart from one it wrote by the version
+alone; move it aside (or keep a copy) before a rollback to `caab668` or older that has to read the
+audit, and take a fresh baseline with `authority-changes-baseline` after rolling back forward.
 
 ### Standing guidance
 
