@@ -267,6 +267,35 @@ class GrantTests(Grants):
             del self.service.state['coordinator_grants']
         self.assertEqual(200, self.grant().status)
 
+    def test_a_null_record_of_grants_is_damage_and_an_absent_one_is_not(self):
+        """kittrial-5bb.261: `coordinator_grants: null` passed the damaged-record check and answered 500. It is
+        answered like every other damaged shape; a state file with NO such key is every installation before
+        its first grant and must keep working."""
+        with self.service.store.lock:
+            self.assertNotIn('coordinator_grants', self.service.state)
+        self.assertEqual(200, self.grant().status)                      # absent: the first grant creates it
+        self.assertEqual(200, self.grant(method='DELETE').status)
+        for damaged in (None, 7, {self.project: None}, {self.project: 7}):
+            with self.subTest(stored=damaged):
+                with self.service.store.lock:
+                    self.service.state['coordinator_grants'] = damaged
+                before = self.audited()
+                refused = self.grant()
+                self.assertEqual(503, refused.status, refused.data)
+                self.assertEqual('The record of coordinator grants in the service state is damaged (it is not an object), '
+                                 'so no grant was written. An operator must repair the state file',
+                                 refused.data['error']['message'])
+                with self.service.store.lock:
+                    self.assertIn('coordinator_grants', self.service.state)
+                    self.assertEqual(self.service.state['coordinator_grants'], damaged)
+                added = self.audited()[len(before):]
+                self.assertEqual([('agents.coordinator.grant', 'rejected')], [event[:2] for event in added], added)
+                self.assertIsNone(self.listed()[self.agent_id]['coordinator'])
+        with self.service.store.lock:
+            del self.service.state['coordinator_grants']
+        self.assertEqual(200, self.grant().status)
+        self.assertTrue(self.listed()[self.agent_id]['coordinator']['effective'])
+
     def test_why_a_grant_on_record_has_no_effect(self):
         self.assertEqual(200, self.grant().status)
         view = lambda: self.listed()[self.agent_id]['coordinator']

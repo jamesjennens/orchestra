@@ -2750,7 +2750,10 @@ class Service:
             if not self._may_coordinate(project_id, agent):
                 raise conflict(self.NOT_A_COORDINATOR)
             stored = self.state.get('coordinator_grants')
-            if stored is not None and (not isinstance(stored, dict) or not isinstance(stored.get(project_id, {}), dict)):
+            # An ABSENT key is every installation before its first grant, and the grant below
+            # creates it. A key that is there with anything but an object, an explicit null
+            # included, is damage (kittrial-5bb.261): null used to pass this check and answer 500.
+            if 'coordinator_grants' in self.state and (not isinstance(stored, dict) or not isinstance(stored.get(project_id, {}), dict)):
                 raise HttpError(503, 'unavailable',
                                 'The record of coordinator grants in the service state is damaged (it is not an object), '
                                 'so no grant was written. An operator must repair the state file')
