@@ -16,6 +16,7 @@ import hashlib
 import io
 import json
 import os
+import posixpath
 import re
 import secrets
 import signal
@@ -5950,7 +5951,9 @@ def key_line(line,root,kit):
             return True                                   # the wrapper invoked directly
         if len(prefix) > 1 + len(AUTHORIZED_KEY_PYTHON_FLAGS):
             return False
-        if not os.path.isabs(prefix[0]) or prefix[0].startswith('~'):
+        # A key line's command is POSIX text whatever the host: posixpath, not os.path, so that
+        # /usr/bin/python3 is absolute on every platform (ntpath.isabs changed in Python 3.13).
+        if not posixpath.isabs(prefix[0]) or prefix[0].startswith('~'):
             return False                                  # the printed interpreter is absolute
         flags = prefix[1:]
         allowed = list(AUTHORIZED_KEY_PYTHON_FLAGS)       # (-E, -s): each alone, in any number
