@@ -646,6 +646,12 @@ def main():
         if denied is not None:
             print(json.dumps(denied))
             return
+        # endpoint.py's comparison of the block with the request it travels with (kittrial-5bb.261).
+        denied = http_authority.block_mismatch_denial(request, config) \
+            if http_authority is not None and hasattr(http_authority, 'block_mismatch_denial') else None
+        if denied is not None:
+            print(json.dumps(denied))
+            return
         if request.get('action') == 'actor-standing':
             import actor_names
             if request.get('tracker') and config is None:

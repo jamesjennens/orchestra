@@ -933,9 +933,9 @@ The routes exist on the endpoint backend; the in-process backend answers 501.
 | Route | Who | What |
 | --- | --- | --- |
 | `POST /v1/projects/{id}/proposals` | `proposals.write`: contributors, owners, and an agent credential with the `proposals` scope | submit; with `key` in the body, revise your own proposal. Send an `Idempotency-Key` (or an `operation_id`): the proposal key derives from it |
-| `GET /v1/projects/{id}/proposals` | any member | the queue: `state`, `target`, `order` (`oldest`, the default, or `newest`), `mine=1` (only the caller's own **verified** proposals, the rule of `/v1/me/contributions`: one that merely names the account is not counted; the answer then carries `unverified_omitted`, the number of proposals that name the caller's account as submitter but are not verified, such as one submitted over SSH under that name, so the caller can see that some exist without being shown them), `limit`, `cursor`. `total` is the count for the filter, not for the page. A cursor this route issued stays valid when the list shrinks under it: a cursor that now points past the end, including one issued before the total shrank, returns 200 with `items: []` and `next_cursor: null`, not a refusal (a cursor the route did not issue, or one used with a different query or account, is still a 409). Also `can_propose` and `can_triage` for the caller |
-| `GET /v1/projects/{id}/proposals/{key}` | any member | the newest revision, the disposition timeline (`history` 1..50), the derived links, and `deciders` (the configured owner deciders) |
-| `POST /v1/projects/{id}/proposals/{key}/dispositions` | `reviews.approve`: owners, in a signed-in session | triage (`operation: "review"`, the default) or the owner decision (`"decide"`), with `previous` and `proposal_sha256` from the detail read |
+| `GET /v1/projects/{id}/proposals` | any member | the queue: `state`, `target`, `order` (`oldest`, the default, or `newest`), `mine=1` (only the caller's own **verified** proposals, the rule of `/v1/me/contributions`: one that merely names the account is not counted; the answer then carries `unverified_omitted`, the number of proposals that name the caller's account as submitter but are not verified, such as one submitted over SSH under that name, so the caller can see that some exist without being shown them), `limit`, `cursor`. `total` is the count for the filter, not for the page. A cursor this route issued stays valid when the list shrinks under it: a cursor that now points past the end, including one issued before the total shrank, returns 200 with `items: []` and `next_cursor: null`, not a refusal (a cursor the route did not issue, or one used with a different query or account, is still a 409). Also `can_propose`, `can_triage` and `can_decide` (who may record the owner decision: `project.admin`, signed in; never a credential) for the caller |
+| `GET /v1/projects/{id}/proposals/{key}` | any member | the newest revision, the disposition timeline (`history` 1..50), the derived links, `deciders` (the configured owner deciders), and `can_triage` and `can_decide` for the caller |
+| `POST /v1/projects/{id}/proposals/{key}/dispositions` | `reviews.approve`: owners and coordinators by role, in a signed-in session; the owner decision also needs `project.admin` (an owner or a superuser), and no credential records either | triage (`operation: "review"`, the default) or the owner decision (`"decide"`; a coordinator who sends it is answered `403`), with `previous` and `proposal_sha256` from the detail read |
 | `GET /v1/me/contributions` | a signed-in session | your own **verified** proposals across your projects, newest first, `limit` per page with a `cursor` (`next_cursor`); it pages through the newest 100 and stops there: the last page has `truncated: true` and no `next_cursor`, and older proposals are read per project from the queue. A cursor the route did not issue is refused with 409. A proposal that only names your account, or whose later revision someone else wrote, is not listed |
 
 The rules:
@@ -983,8 +983,9 @@ The rules:
   The mapping feeds the no-self rules and nothing else: it does not let that actor (or
   any SSH caller who declares a name in that namespace) revise the account's proposals
   or submit proposals that read as the account's.
-- **No credential triages.** `reviews.approve` is never granted to a worker or agent
-  credential.
+- **No credential triages.** A worker credential never holds `reviews.approve`; an agent's
+  credential holds it only through the coordinator grant, for approving a contribution, and
+  the triage and decision routes refuse every credential whatever it holds.
 - **Refusals** from the canonical rules (a stale read, an illegal transition, a no-self
   rule) answer 422 with the rule's message. Proposal text is never in an error body or
   the audit log; the audit records the action and the proposal key.
@@ -1047,9 +1048,11 @@ The rules:
   triage, Incorporated but not yet the accepted requirement. A row opens the proposal on
   the same page (`#/p/{id}/reviews?proposal={key}`): the text, why, evidence, what has
   happened, and the form for whoever acts next.
-  - A member with `reviews.approve` gets the triage form, or the owner-decision form on
-    an escalated proposal. It is not offered on their own proposal, nor the decision to
-    the member who escalated.
+  - A member with `reviews.approve` (an owner, or a coordinator by role) gets the triage
+    form. On an escalated proposal the owner-decision form is for a member with
+    `project.admin` (an owner): a coordinator triages and may escalate, and does not
+    record the owner's decision. Neither form is offered on their own proposal, nor the
+    decision to the member who escalated.
   - The submitter gets a revise form while the proposal is submitted or a coordinator
     has asked a question.
 - **Propose a requirement** is a button on Reviews (`?propose=1`). The form never sends
@@ -1803,13 +1806,17 @@ credential approved anything; this is the one place where that is lifted.
   before.
 - It is read from the present state on every request, by the web service and again when
   the endpoint authorizes the write. Each of these ends it at the agent's next request:
-  the grant is removed; the account is made a contributor or a viewer, or leaves the
-  project; the agent is taken out of the project, **by any route** (the project owner's
+  the grant is removed; the account is made a contributor or a viewer; the account is
+  removed from the project (`DELETE /v1/projects/{id}/members/{user}`), or the agent is
+  taken out of the project **by any route** (the project owner's
   `DELETE /v1/projects/{id}/agents/{agent}`, or `PATCH /v1/agents/{id}` by its account or a
-  superuser): the grant is deleted with it and audited as a revoke with the reason, so it
-  does not wait in the state for the project to be put back; the agent or its account
-  is disabled. A grant whose account was lowered stays on record and shows as "Granted,
-  no effect" until the account is raised again or the grant is removed.
+  superuser): in both of these the grant is deleted and audited as a revoke with the
+  reason ("the account was removed from the project" for the first), so it does not wait
+  in the state for the account or the project to be put back, and an account that is added
+  again as a coordinator has agents that approve only after an owner grants them again;
+  the agent or its account is disabled. A grant whose account was lowered (to contributor
+  or viewer) stays on record and shows as "Granted, no effect" until the account is raised
+  again or the grant is removed.
 
 `GET /v1/projects/{id}/agents` and `.../agents/{agent}` carry `coordinator` for each
 agent: `null`, or `{granted_by, granted_by_display_name, granted_at, effective,
@@ -1843,8 +1850,9 @@ facts are not on the web route. `independent_approval` applies to the web route 
 accepted as the design):
 
 - A grant on record takes effect again **without a new decision by an owner** when the
-  agent's account is made a coordinator or owner again, or the agent or its account is
-  enabled again. To end it for good, remove the grant.
+  agent's account, after it was lowered, is made a coordinator or owner again, or the
+  agent is enabled again. (An account that was removed from the project has no grant
+  left: see above.) To end it for good, remove the grant.
 - A grant stays when the owner who gave it is lowered or leaves.
 - Two granted agents of two accounts may approve each other's work: they are two parties.
 - A grant works in an archived project as every other write there does.

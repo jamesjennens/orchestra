@@ -676,7 +676,8 @@ def newer_activity_summary(data,prov,checkpoint_timestamp,owner,direction_idx=No
             'omitted':max(0,len(outstanding)-NEWER_MAX)}
     return result
 
-def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifiers=None,actor=None,full=False):
+def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifiers=None,actor=None,full=False,
+          independent_approval=False,owners=None):
     if type(offset) is not int or offset<BRIEF_ITEM_OFFSET_MIN or type(limit) is not int or not BRIEF_ITEM_LIMIT_MIN<=limit<=BRIEF_ITEM_LIMIT_MAX:
         raise ValueError('Invalid unresolved-item page: --items-offset must be >= %d and --items-limit must be %d..%d' % (BRIEF_ITEM_OFFSET_MIN,BRIEF_ITEM_LIMIT_MIN,BRIEF_ITEM_LIMIT_MAX))
     issue=task_row(rows,task);state=checkpoint_state(issue);current=state['current'];invalid=state['invalid']
@@ -689,7 +690,8 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
     from work import workflow
     from review_state import RECONCILIATION_WARNING_PREFIX, is_integration_warning, scopes_for
     from guidance import brief_block
-    review=workflow(issue,scopes_for(rows,task),operators=operators,journal=journal)
+    review=workflow(issue,scopes_for(rows,task),operators=operators,journal=journal,
+                    actor=actor,independent_approval=independent_approval,owners=owners)
     # ORIGINAL meaning: does the scope currently shown in `lifecycle`/`lifecycle_scope`
     # (the newest recorded scope) belong to the current contribution? The ANY-scope
     # answer is additive as `review.integration.matches_contribution`.
@@ -805,6 +807,10 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
                       reverts=reverts[-REVERT_BRIEF_LIMIT:],reverts_total=len(reverts),
                       reverts_more='review '+task if len(reverts)>REVERT_BRIEF_LIMIT else None)
     brief_review.pop('reconciliation_needed',None)
+    # Avoid adding off-state bytes to compact long-chain briefs. The setting
+    # is carried only when ON; absence means false, including older endpoints.
+    if not brief_review.get('approval_requires_other_party'):
+        brief_review.pop('approval_requires_other_party',None)
     result={**attention,'reference_drafts_matching':reference_drafts,'task':task,'title':clip(issue.get('title'),200),'owner':clip(issue.get('assignee') or 'unassigned',96),'status':issue.get('status'),
             'activity_cursor':activity_cursor(data),'checkpoint':None if p is None else {'comment_id':str(c['id']),'author':clip(c.get('author'),96),'timestamp':c.get('created_at'),'source_commit':p['source_commit'],'branch':p['branch'],'incorporated_activity_cursor':p['activity_cursor'],
                 'newer_activity':stale,**({'taken_in_project':taken_in} if taken_in else {})},
@@ -1639,7 +1645,8 @@ def latest_checkpoint_read(rows,project,task,include_provenance=False):
             'invalid_checkpoint_comments':state['invalid'][:5],
             'evidence':{'history':'history '+task,'checkpoint_entry':task+'-c'+str(c['id'])}}
 
-def execute(root,path,project,actor,action,args,attachments,run,operators=None,verifiers=None):
+def execute(root,path,project,actor,action,args,attachments,run,operators=None,verifiers=None,
+            independent_approval=False,owners=None):
     """Endpoint holds project coordination lock. History caches are disposable."""
     from work import help_payload,help_requested
     if help_requested(args):
@@ -1694,7 +1701,8 @@ def execute(root,path,project,actor,action,args,attachments,run,operators=None,v
         rows=exported_rows(run)
         if action=='brief':
             result=brief(rows,project,a.task,a.items_offset,a.items_limit,operators=operators,journal=path,
-                         verifiers=verifiers,actor=actor,full=a.full)
+                         verifiers=verifiers,actor=actor,full=a.full,
+                         independent_approval=independent_approval,owners=owners)
             return json.dumps(result,ensure_ascii=False,indent=2)+'\n' if a.json else format_brief(result)
         data=snapshot(rows,project,a.task);digest=content_hash(data);cache.mkdir(exist_ok=True)
         file=cache/(digest+'.json')

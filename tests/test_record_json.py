@@ -297,7 +297,9 @@ class NoUnguardedParseTests(unittest.TestCase):
             # lane_state.py reads the body of a reserved Kind: lane-state-v1 record comment
             # (kittrial-5bb.263): any actor's comments can carry one, so it is parsed through
             # the guard and a nested body is dropped as an unusable record.
-            'handoff.py': 1, 'http_service.py': 3, 'lane_state.py': 1, 'lifecycle.py': 1, 'recovery.py': 1, 'requirements.py': 1, 'requirement_records.py': 1, 'reserved_comments.py': 1,
+            # http_authority reads the operation of an attached review record through the guard,
+            # exactly as work.py does, to know which capability the request needs (kittrial-5bb.261).
+            'handoff.py': 1, 'http_authority.py': 1, 'http_service.py': 3, 'lane_state.py': 1, 'lifecycle.py': 1, 'recovery.py': 1, 'requirements.py': 1, 'requirement_records.py': 1, 'reserved_comments.py': 1,
             # The simple owner adapter guards bd's decision-create receipt too.
             'requirement_http.py': 2,
             'review_recommendations.py': 2, 'review_workflow.py': 4, 'work.py': 1, 'worker_gate.py': 1})
