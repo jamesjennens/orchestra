@@ -30,6 +30,27 @@ class BoundaryTests(unittest.TestCase):
             with self.subTest(body=body), self.assertRaises(web_merge_slot.SlotError):web_merge_slot.validate(body)
         self.assertEqual(web_merge_slot.validate({'operation': 'acquire', 'task': 'pp-1', 'target': 'main'}), 'acquire')
 
+    def test_target_and_reason_refuse_control_characters_other_than_nul(self):
+        # kittrial-5bb.268 item 7: the plain-text rule of the service's other reason fields.
+        for bad in ('main\x1b[2J', 'main\x07', 'main\x7f', 'main\x85', 'main\u202e', 'main\u200b'):
+            with self.subTest(text=bad):
+                for body in ({'operation': 'acquire', 'task': 'pp-1', 'target': bad},
+                             {'operation': 'force-release', 'expected_holder': 'ops', 'reason': bad}):
+                    with self.assertRaises(web_merge_slot.SlotError) as raised:
+                        web_merge_slot.validate(body)
+                    self.assertEqual(raised.exception.status, 422)
+                    self.assertIn('plain text', str(raised.exception))
+        # Tab, newline and carriage return stay allowed, as the rule allows them; so do letters
+        # outside ASCII and a joiner between letters.
+        for good in ('release/2026\tmain', 'Stuck holder.\r\nSee the log.', 'versión-ü', '\u0645\u06cc\u200c\u062e\u0648\u0627\u0647\u0645'):
+            with self.subTest(text=good):
+                self.assertEqual(web_merge_slot.validate({'operation': 'acquire', 'task': 'pp-1', 'target': good}), 'acquire')
+                self.assertEqual(web_merge_slot.validate(
+                    {'operation': 'force-release', 'expected_holder': 'ops', 'reason': good}), 'force-release')
+        # The expected holder is compared with bd's holder, not checked for plain text.
+        self.assertEqual(web_merge_slot.validate(
+            {'operation': 'force-release', 'expected_holder': 'ops\u200b', 'reason': 'Stuck'}), 'force-release')
+
     def test_force_release_may_name_the_task_it_saw(self):
         # kittrial-5bb.268 item 4: optional, bounded, a native id, and nothing else is added.
         base = {'operation': 'force-release', 'expected_holder': 'ops', 'reason': 'Gone'}
@@ -158,10 +179,15 @@ class NativeWebSlotTests(RulesHelpers, unittest.TestCase):
         for body, status in [({'expected_holder': 'old', 'reason': 'Stale page'}, 409),
                              ({'expected_holder': 'ops', 'reason': ''}, 422),
                              ({'expected_holder': 'ops', 'reason': 'x' * 1001}, 422),
-                             ({'expected_holder': 'ops', 'reason': 'Okay', 'actor': 'ops'}, 422)]:
+                             ({'expected_holder': 'ops', 'reason': 'Okay', 'actor': 'ops'}, 422),
+                             ({'expected_holder': 'ops', 'reason': 'Stop\x1b[2J'}, 422)]:
             reply = self.request(harness, token, 'force-release', body, key='invalid-slot-' + str(status) + '-' + str(len(body.get('reason',''))))
             self.assertEqual(reply.status, status, reply.data);self.assertEqual(self.rows(), before)
-        self.coordinate('ops', 'merge-release')
+        self.coordinate('ops', 'merge-release');before = self.rows()
+        # kittrial-5bb.268 item 7: a target with a control character takes nothing.
+        reply = self.request(harness, token, 'acquire', {'task_id': task, 'target': 'main\x1b[2J'}, key='invalid-slot-target')
+        self.assertEqual(reply.status, 422, reply.data);self.assertIn('plain text', reply.data['error']['message'])
+        self.assertEqual(self.rows(), before)
 
     def test_independent_approval_is_still_required_before_acquisition(self):
         self.deployment(operators=[], coordinator_writes=True, independent_approval=True)
