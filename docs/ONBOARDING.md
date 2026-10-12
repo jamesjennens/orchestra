@@ -101,8 +101,9 @@ client-prefixed command examples above; do not run bare `work --mine` or
 office/person-started mode, do not start a poll or a loop of your own; end each turn
 with a one-line status for the person. Only the worker's own user authorizes checking
 again, by asking, within what the project's standing guidance allows. A task awaiting
-review or integration is not a reason to stop checking before the deadline; that is
-exactly when checking matters. A harness that cannot wait or schedule tells its user so
+review or integration is not a reason to stop checking until your user's deadline, or the
+project's limit; that is exactly when checking matters. A harness that cannot wait or
+schedule tells its user so
 in one line instead of refusing. Do not depend on another worker's checkout or start
 another coordination database.
 ```

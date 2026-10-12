@@ -125,6 +125,14 @@ out.unchecked = [setup.summary({ remaining: 0, unchecked: 1 }), setup.summary({ 
   out.fill = { kinds: fill.kinds, buttons: fill.buttons, text: fill.text };
   const nullEntry = await shown({ command: null, commands: [null, { kind: 'shell', label: 'Run', text: 'run-me', note: null, replace: [] }] });
   out.nullEntry = { kinds: nullEntry.kinds, texts: nullEntry.texts, buttons: nullEntry.buttons };
+  // kittrial-5bb.251 item 9 (mutant n23): the "Replace first:" hint is shown ONLY when there is
+  // something to replace. An empty list must not leave a bare "Replace first: " on the page.
+  const words = ['NOTE', 'OPERATOR'];
+  const fillCommand = { kind: 'shell-fill', label: 'Record it', text: 'admin.py backup-schedule --note "NOTE" --actor OPERATOR', note: null };
+  const withWords = await shown({ command: fillCommand.text, commands: [{ ...fillCommand, replace: words }] });
+  const without = await shown({ command: fillCommand.text, commands: [{ ...fillCommand, replace: [] }] });
+  out.replaceHint = { withWords: withWords.text.includes('Replace first: ' + words.join(', ')),
+    without: without.text.includes('Replace first:') };
   // kittrial-5bb.199: the installation's review rule under the steps. A service older than the rule
   // sends none: then nothing is added (a null handed to replaceChildren would be the word "null").
   out.rule = [];

@@ -139,7 +139,7 @@ def steps(handler, principal, project_id):
         ('%d members.' % len(members)) if len(members) > 1 else
         'You are the only member. That is fine if you work alone; otherwise add the others.',
         'owner', link=base + '/members',
-        note='An owner adds contributors and viewers. Only a superuser can make someone an owner.'))
+        note='An owner adds contributors, coordinators and viewers. Only a superuser can make someone an owner.'))
 
     repository = project.get('repository')
     # A value stored under an earlier rule that no longer passes is withheld by the
@@ -329,10 +329,13 @@ def steps(handler, principal, project_id):
     # An operator can record that backups are scheduled elsewhere: show the command, as the other
     # steps show theirs (kittrial-5bb.220 review 2 item 4c).
     commands.append(fill(status, 'Record that backups are scheduled elsewhere (a shell command, on the server)',
-                         'backup-schedule --note NOTE --actor OPERATOR',
+                         'backup-schedule --note "NOTE" --actor OPERATOR',
                          'Replace NOTE with one line of at most 300 characters and OPERATOR with your name on the '
-                         'server\'s operator list. The statement is about the whole runtime and never expires; the '
-                         'server does not check it. Every set and clear is kept in a log on the server.',
+                         'server\'s operator list. NOTE is quoted because a note is free text: unquoted, a shell '
+                         'splits it at its spaces, and the command answers "unrecognized arguments" and records '
+                         'nothing - it does not record the first word. The statement is about the whole runtime and '
+                         'never expires; the server does not check it. Every set and clear is kept in a log on the '
+                         'server.',
                          ('NOTE', 'OPERATOR')))
     result.append(host_step('backup', 'Make sure a scheduled backup covers this project', status, reason, backup,
                             None, commands, None))

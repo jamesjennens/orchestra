@@ -71,11 +71,7 @@ VALUE_OPTIONS = {'--owner', '--state', '--limit', '--offset', '--handoff-limit',
 #: At most this many request ids are named per work item (a review record holds at most 20 items).
 PENDING_REQUEST_IDS_MAX = 20
 
-#: One sentence for a contribution that waits for somebody else's approval (kittrial-5bb.197
-#: review request 01a12894, item 3b). It is carried by `work` and `brief` whether the
-#: installation's approval rules are on or off, so a reader of either learns what the
-#: contribution is waiting for without reading the setting. It is deliberately short: the
-#: brief is bounded, and this field must not push a long prior chain past the bound.
+#: Bounded author/assignee explanation when independent approval is required.
 APPROVAL_WAIT = 'Waiting for somebody else\'s approval of the current contribution.'
 
 # Compact owned-work context, not a recipient or authorization inference.
@@ -88,7 +84,8 @@ WHOSE_MOVE = ('you', 'reviewer', 'coordinator', 'unknown')
 UNKNOWN_MOVE_TEXT = 'Whose move this is cannot be told from the review state shown here.'
 
 
-def _caller_move(state, task, owned, named_reviewer=False, pending_items=0, redelivered=False):
+def _caller_move(state, task, owned, named_reviewer=False, pending_items=0, redelivered=False,
+                 way_back=None):
     """`(whose_move, next)`: the caller-relative half of the one whose-move decision.
 
     Byte-identical to main (kittrial-5bb.249): derived only from the review state the
@@ -98,12 +95,22 @@ def _caller_move(state, task, owned, named_reviewer=False, pending_items=0, rede
     for it here: a reconciliation row's move stays its review state's move and
     ``next_actor`` comes from the same decision (review item 2/6 removed the branch
     that could never be taken).
+
+    ``way_back`` is how the sentence tells the caller to read the review state. It
+    defaults to the client command ``review TASK``; the HTTP next-actions answer passes
+    this task's brief route instead, because a web agent cannot run the client command
+    (kittrial-5bb.253 review, item 4). Every other word is the same in both answers.
     """
     name = str(task or 'the task')
-    items = max(0, int(pending_items or 0))
+    try:
+        items = int(pending_items or 0)
+    except (TypeError, ValueError):
+        raise ValueError('pending_items must be a number')
+    items = max(0, items)
     plural = 'item' if items == 1 else 'items'
+    back = '`review %s`' % name if way_back is None else way_back
     if named_reviewer and state in ('awaiting-review', 'legacy-review-ready'):
-        return 'you', 'This is your review: read `review %s` and record your decision.' % name
+        return 'you', 'This is your review: read %s and record your decision.' % back
     if not owned:
         return 'unknown', UNKNOWN_MOVE_TEXT
     if state == 'changes-requested':
@@ -111,12 +118,12 @@ def _caller_move(state, task, owned, named_reviewer=False, pending_items=0, rede
             # A revision that supersedes the one the items were filed on is already
             # delivered: only the responses are owed, so the worker does not redeliver
             # again (kittrial-5bb.249 review, item 3b).
-            return 'you', ('This is your work now: %d outstanding review %s. Read `review %s` and '
+            return 'you', ('This is your work now: %d outstanding review %s. Read %s and '
                            'respond to each item: the revision that supersedes this contribution '
-                           'has already been delivered.' % (items, plural, name))
-        return 'you', ('This is your work now: %d outstanding review %s. Read `review %s`, deliver '
+                           'has already been delivered.' % (items, plural, back))
+        return 'you', ('This is your work now: %d outstanding review %s. Read %s, deliver '
                        'a revision that supersedes this contribution and respond to each item.'
-                       % (items, plural, name))
+                       % (items, plural, back))
     if state in ('awaiting-review', 'legacy-review-ready'):
         return 'reviewer', "Nothing is for you to do: the next move is the reviewer's."
     if state in ('awaiting-integration', 'approved'):
@@ -124,16 +131,16 @@ def _caller_move(state, task, owned, named_reviewer=False, pending_items=0, rede
         return 'coordinator', "Nothing is for you to do: the next move is the coordinator's."
     if state in ('withdrawn', 'superseded') and items:
         return 'you', ('This is your work now: %d outstanding review %s on a final contribution. '
-                       'Read `review %s` and deliver a new contribution that answers each item.'
-                       % (items, plural, name))
+                       'Read %s and deliver a new contribution that answers each item.'
+                       % (items, plural, back))
     if state in (None, 'none'):
-        return 'you', ('This is your work: no contribution has been delivered yet. Read `review %s` '
-                       'for its current state and deliver one.' % name)
+        return 'you', ('This is your work: no contribution has been delivered yet. Read %s '
+                       'for its current state and deliver one.' % back)
     return 'unknown', UNKNOWN_MOVE_TEXT
 
 
 def move_decision(state, task, owned, named_reviewer=False, pending_items=0, redelivered=False,
-                  assignee=None, closed=False, claimable=None):
+                  assignee=None, closed=False, claimable=None, way_back=None):
     """THE one whose-move decision (kittrial-5bb.6 review item 2): `(move, next, next_actor)`.
 
     One function gives all three answers, so no reader can be told one mover by
@@ -149,19 +156,26 @@ def move_decision(state, task, owned, named_reviewer=False, pending_items=0, red
     ``assignee``, ``closed``, ``pending_items`` and ``claimable`` are the row facts
     that role needs; they are the same facts the shared projection passes, so a
     ``work`` row and the ``review`` read of the same task cannot disagree.
+
+    ``way_back`` is the reference the sentence tells the caller to follow, passed through
+    to :func:`_caller_move`; it changes no word of the decision (kittrial-5bb.253 review,
+    item 4).
     """
-    move, text = _caller_move(state, task, owned, named_reviewer, pending_items, redelivered)
+    move, text = _caller_move(state, task, owned, named_reviewer, pending_items, redelivered,
+                             way_back=way_back)
     return move, text, next_actor(state, assignee, closed, pending_items=pending_items,
                                   claimable=claimable)
 
 
-def review_move(state, task, owned, named_reviewer=False, pending_items=0, redelivered=False):
+def review_move(state, task, owned, named_reviewer=False, pending_items=0, redelivered=False,
+                way_back=None):
     """`(whose_move, next)`: one plain sentence from the validated review state alone.
 
     The public two-answer shape (kittrial-5bb.249), unchanged. The decision it comes
     from is :func:`move_decision`, which yields ``next_actor`` as well.
     """
-    move, text, _ = move_decision(state, task, owned, named_reviewer, pending_items, redelivered)
+    move, text, _ = move_decision(state, task, owned, named_reviewer, pending_items, redelivered,
+                                  way_back=way_back)
     return move, text
 
 
@@ -179,16 +193,34 @@ def quoted_checkpoint_text(value):
     return text.replace('"', '\\"').replace('\n', '\\n')
 
 
-def waiting_move(next_action):
+def checkpoint_wait_move_text(state):
+    """The RAW text of the first blocker/dependency entry the caller recorded.
+
+    ``None`` when there is no current checkpoint or it lists no blocker/dependency. The
+    sentence escapes this raw text exactly once (kittrial-5bb.253 review, item 2);
+    ``checkpoint_wait``'s own projection is already escaped for display, so quoting THAT
+    would escape a control twice.
+    """
+    if not isinstance(state, dict) or state.get('invalid') or state.get('current') is None:
+        return None
+    payload = state['current'][0] if state['current'] else None
+    for entry in (payload or {}).get('open_items') or []:
+        if isinstance(entry, dict) and entry.get('kind') in ('blocker', 'dependency'):
+            return entry.get('text')
+    return None
+
+
+def waiting_move(blocker_text):
     """`next` for a caller whose own current checkpoint records a blocker or dependency.
 
     What is known is the caller's own record, never an inferred person (kittrial-5bb.219):
-    the sentence says the caller recorded a blocker or dependency and quotes that
-    checkpoint's own wording, escaped so it cannot read as a move. The move is still the
-    caller's own: the row keeps ``whose_move`` 'you' and stays in ``your_move``
-    (kittrial-5bb.249 review, item 1).
+    the sentence says the caller recorded a blocker or dependency and quotes that blocker
+    or dependency entry itself, escaped so it cannot read as a move. It does NOT quote the
+    checkpoint's next action, which read as if that were the blocker (kittrial-5bb.253
+    review, item 2). The move is still the caller's own: the row keeps ``whose_move``
+    'you' and stays in ``your_move`` (kittrial-5bb.249 review, item 1).
     """
-    text = next_action.get('text') if isinstance(next_action, dict) else next_action
+    text = blocker_text.get('text') if isinstance(blocker_text, dict) else blocker_text
     if not text:
         return None
     return ('You recorded a blocker or dependency in your own checkpoint: "%s".'
@@ -300,8 +332,8 @@ def help_payload(action='work'):
             'item_move': 'items[].whose_move is you, reviewer, coordinator or unknown, relative to the '
                          'calling actor, derived only from the validated review state the row already '
                          'shows; items[].next is one plain sentence saying the same in words, and '
-                         'quotes the next action of the caller\'s own checkpoint when that checkpoint records '
-                         'a blocker or dependency (no person is inferred; the move stays the caller\'s). '
+                         'quotes the blocker or dependency entry of the caller\'s own checkpoint when that '
+                         'checkpoint records one (no person is inferred; the move stays the caller\'s). '
                          'Items where the move is the caller\'s sort first; top-level your_move '
                          'carries their count for the filtered queue. Nothing is inferred from a title, a '
                          'comment or an actor name.',
@@ -322,7 +354,8 @@ def help_payload(action='work'):
                            'Advisory: claimability is not a reservation.',
             'item_fields': ['task', 'title', 'owner', 'status', 'review_state', 'whose_move', 'next',
                             'next_actor', 'work_state', 'reconciliation_needed', 'reconciliation_reasons',
-                            'claimable', 'contribution_id',
+                            'claimable', 'redelivered',
+                            'contribution_id',
                             'commit', 'pending_review_items', 'pending_change_requests', 'open_items',
                             'blocking_items', 'checkpoint_at', 'newer_activity', 'checkpoint_wait',
                             'pending_handoff_requests',
@@ -458,7 +491,22 @@ class Parser(argparse.ArgumentParser):
         hint=next((text for flag,text in MISTAKEN_FLAGS.items() if flag in message),None)
         raise ValueError(message+('; hint: '+hint if hint else ''))
 
-def workflow(issue,scopes=None,operators=None,reverts=None,journal=None,invalid_reverts=None):
+def approval_wait(state, task, actor, assignee, author, independent_approval=False,
+                  owners=None, named_reviewer=False, move_text=None):
+    """Caller-relative waiting text, using the same next move as the work queue."""
+    if state != 'awaiting-review' or not author:
+        return None
+    from review_workflow import same_party
+    if independent_approval and actor and (
+            same_party(actor,author,owners) or (assignee and same_party(actor,assignee,owners))):
+        return APPROVAL_WAIT
+    if move_text is not None:
+        return move_text
+    return review_move(state,task,bool(actor) and actor==assignee,named_reviewer)[1]
+
+
+def workflow(issue,scopes=None,operators=None,reverts=None,journal=None,invalid_reverts=None,
+             actor=None,independent_approval=False,owners=None):
     from review_state import project as reviewed
     result=reviewed(issue,scopes,operators,reverts,journal,invalid_reverts)
     # Additive (kittrial-5bb.115): the standing reviewer recommendations for the current
@@ -466,15 +514,17 @@ def workflow(issue,scopes=None,operators=None,reverts=None,journal=None,invalid_
     # reader (review, brief, work) gets them from this one place.
     from review_recommendations import block as recommendations
     result.update(recommendations(issue,result))
-    # One sentence for a contribution that waits for somebody else's approval
-    # (kittrial-5bb.197 review request 01a12894, item 3b): `work` and `brief` both read
-    # this projection, and it is present whether the rules are on or off.
-    result['waiting_for_approval']=(APPROVAL_WAIT if result.get('review_state')=='awaiting-review'
-                                    and result.get('contribution') else None)
+    from review_workflow import author_key
+    named=bool(actor) and any(author_key(r.get('reviewer'))==author_key(actor)
+                             for r in result.get('pending_review_requests') or [])
+    result['approval_requires_other_party']=bool(independent_approval)
+    result['waiting_for_approval']=approval_wait(result.get('review_state'),issue.get('id'),actor,
+        issue.get('assignee'),(result.get('contribution') or {}).get('author'),
+        independent_approval,owners,named)
     return result
 
 def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes=None, journal=None,
-          reference_attention=False, verifiers=None):
+          reference_attention=False, verifiers=None,independent_approval=False,owners=None):
     """One page of the work queue.
 
     ``reverts`` and ``scopes`` are PER TASK: each is a mapping of task id to that
@@ -577,6 +627,7 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
                           'newer_activity_by_others':None,'newer_activity_own':None,
                           'newer_activity_coverage':None,'unresolved_directions':None,
                           'waiting_for_approval':None,
+                          'approval_requires_other_party':bool(independent_approval),
                           # A malformed row shows no validated review state, so whose move it
                           # is stays unknown rather than guessed (kittrial-5bb.249).
                           'whose_move':'unknown','next':UNKNOWN_MOVE_TEXT,
@@ -756,6 +807,10 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
                       'reconciliation_needed':bool(review.get('reconciliation_needed')),
                       'reconciliation_reasons':review.get('reconciliation_reasons') or [],
                       'claimable':row_claimable,
+                      # Additive (kittrial-5bb.253 item 1): the same fact the sentence above
+                      # used, carried on the row so the HTTP agent builders can hand it to
+                      # the one helper instead of re-deriving it without it.
+                      'redelivered':redelivered,
                       'contribution_id':contribution.get('comment_id'),'commit':contribution.get('commit'),'pending_review_items':pending_items,
                       'pending_handoff_requests':handoff_requests,
                       'pending_handoff_total':handoff_total,
@@ -783,9 +838,9 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
                       # Additive (kittrial-5bb.52): the integration disagreement entries
                       # naming both facts and both scopes, and their rendered warnings.
                       'integration_disagreements':disagreements,'integration_warnings':integration_warnings,
-                      # Additive (kittrial-5bb.197 item 3b): one sentence when the current
-                      # contribution waits for another party's approval, rules on or off.
-                      'waiting_for_approval':(APPROVAL_WAIT if state=='awaiting-review' and contribution else None)})
+                      'approval_requires_other_party':bool(independent_approval),
+                      'waiting_for_approval':approval_wait(state,row['id'],actor,row.get('assignee'),
+                          contribution.get('author'),independent_approval,owners,review_request,move_text)})
     from briefing import checkpoint_queue_fields
     task_rows={row['id']:row for row in rows if isinstance(row,dict) and row.get('id')}
     # The bounded claimable-work view (kittrial-5bb.6 deliverable b): filter to the rows
@@ -800,12 +855,13 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
         item['checkpoint_wait']=checkpoint_wait(task_rows.get(item['task'],{}),actor,
             checkpoint_states.get(item['task']),
             delivered=bool(item['contribution_id']) or item['review_state'] not in (None,'none'))
-        # (kittrial-5bb.219 addition c, revised for kittrial-5bb.249 item 1) Where the caller's
-        # own current checkpoint records a blocker or dependency, `next` quotes that
-        # checkpoint's own words and says no person was inferred. The move stays the caller's:
-        # `whose_move` is not rewritten and the row stays in `your_move`.
+        # (kittrial-5bb.219 addition c, revised for kittrial-5bb.249 item 1 and kittrial-5bb.253
+        # item 2) Where the caller's own current checkpoint records a blocker or dependency,
+        # `next` quotes that blocker or dependency ENTRY itself (its raw text, escaped once) and
+        # says no person was inferred. The move stays the caller's: `whose_move` is not rewritten
+        # and the row stays in `your_move`.
         if item['checkpoint_wait'].get('active'):
-            wait_text=waiting_move(item['checkpoint_wait'].get('next_action'))
+            wait_text=waiting_move(checkpoint_wait_move_text(checkpoint_states.get(item['task'])))
             if wait_text:
                 item['next']=wait_text
     priority={'changes-requested':0,'error':1,'awaiting-review':2,'legacy-review-ready':2,'awaiting-integration':3}
@@ -875,13 +931,14 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
     return result
 
 def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None,review_writes=None,
-            independent_approval=False,coordinator_writes=False,owners=None,web_owner=False):
+            independent_approval=False,coordinator_writes=False,owners=None,verified_web_authority=False):
     """``independent_approval``, ``coordinator_writes`` and ``owners`` are the slices
     6 and 7 settings and the project's actor -> principal map (kittrial-5bb.197),
     supplied by the endpoint; all default OFF/absent, so nothing changes for an
     installation that configures nothing. ``owners`` may be a callable, so the
-    registry is read only when a rule needs it. ``web_owner`` says a verified web
-    owner approved through the web route (kittrial-5bb.199)."""
+    registry is read only when a rule needs it. ``verified_web_authority`` says the configured
+    web authority verified an owner, coordinator, or agent with the project grant
+    (kittrial-5bb.199, kittrial-5bb.209)."""
     # Help is recognised anywhere as a standalone token and never touches the
     # native export, the coordination lock or an attachment.
     if help_requested(args):
@@ -894,7 +951,8 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
         from reserved_comments import RECORD_ANCHOR_LABELS
         rows=record_json.classify(rows,run,sorted(RECORD_ANCHOR_LABELS)+['gt:slot'], ['event','gate'])
         return queue(rows,actor,args,path/'.handoff-requests', operators=operators, journal=path,
-                     reference_attention=True, verifiers=verifiers)
+                     reference_attention=True, verifiers=verifiers,
+                     independent_approval=independent_approval,owners=owners)
     if len(args) not in (1,2):raise ValueError('Use review TASK [--file payload.json] or handoff TASK --file payload.json')
     task=args[0]
     if action=='review' and len(args)==1:
@@ -903,7 +961,8 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
         rows=read_event_rows(run)
         issue=task_row(rows,task)
         from review_state import scopes_for
-        return workflow(issue,scopes_for(rows,task),operators=operators,journal=path)
+        return workflow(issue,scopes_for(rows,task),operators=operators,journal=path,
+                        actor=actor,independent_approval=independent_approval,owners=owners)
     if len(args)!=2 or not args[1].startswith('@attachment:'):raise ValueError('A JSON file attachment is required')
     item=attachments.get(args[1].partition(':')[2],{})
     if not isinstance(item,dict) or item.get('flag') not in ('--file','-f') or not isinstance(item.get('text'),str):raise ValueError('Invalid attachment')
@@ -928,7 +987,7 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
     from review_workflow import execute as review
     result=review(rows,task,actor,payload,run, operators=operators, journal=path,
                   review_writes=review_writes, independent_approval=independent_approval,
-                  coordinator_writes=coordinator_writes, owners=owners, web_owner=web_owner)
+                  coordinator_writes=coordinator_writes, owners=owners, verified_web_authority=verified_web_authority)
     if payload.get('operation')=='request-changes':
         # Retry repairs a label update interrupted after the durable review comment.
         run(['update',task,'--remove-label','review-ready','--json'])

@@ -405,6 +405,9 @@ export async function detailPanel(ctx, pid, key) {
   const canRevise = view.mine && ['submitted', 'needs-info'].includes(view.state);
   // The owner decision comes from a different person than the one who escalated.
   const escalatedByMe = view.state === 'escalated-to-owner' && view.disposition && view.disposition.actor === ctx.me.id;
+  // The decision an escalated proposal waits for is an owner's: the server says who may record
+  // it (`can_decide`). A coordinator triages (`can_triage`) and is not offered that form.
+  const awaitsOwner = view.state === 'escalated-to-owner' && view.can_decide !== true;
   // A later revision written by someone other than the submitter (the server names it).
   const broken = (view.warnings || []).find((w) => w.code === 'identity-broken');
   return h('section', { class: 'stack', 'aria-labelledby': 'h-proposal' },
@@ -433,7 +436,8 @@ export async function detailPanel(ctx, pid, key) {
       h('div', { class: 'panel-head' }, h('h3', { class: 'small' }, 'What has happened ', h('span', { class: 'nav-count' }, view.timeline_total))),
       view.timeline.length ? h('div', { class: 'panel-body' }, h('ul', { class: 'timeline' }, view.timeline.map(timelineItem))) : empty('Nothing yet', 'No coordinator has picked this up.')),
     canRevise ? reviseForm(ctx, pid, view) : null,
-    view.can_triage && !view.mine && !escalatedByMe ? triageForm(ctx, pid, view, owners) : null,
+    view.can_triage && !view.mine && !escalatedByMe && !awaitsOwner ? triageForm(ctx, pid, view, owners) : null,
+    view.can_triage && !view.mine && !escalatedByMe && awaitsOwner ? h('div', { class: 'banner' }, 'This proposal waits for an owner’s decision. A coordinator triages and escalates a proposal; only an owner records the decision.') : null,
     view.can_triage && escalatedByMe ? h('div', { class: 'banner' }, 'You escalated this proposal: a different owner has to decide it.') : null,
     view.can_triage && view.mine && TRANSITIONS[view.state] ? h('div', { class: 'banner' }, 'This is your own proposal: another owner has to triage it.') : null);
 }

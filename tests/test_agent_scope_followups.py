@@ -142,9 +142,30 @@ class AgentScopeFollowupTests(AgentHarness):
             credential = self.service.state['credentials'][cid]
             credential['expires_at'] = expiry
             credential.pop('issued_raw', None)
+        # The inference reading is 0 while a second reading taken during the inference
+        # is 100: the mutant "time zero treated as false" (a liveness helper re-reading
+        # a falsy moment) then treats the live credential as expired and is caught. A
+        # mock answering 0 to every call cannot see that mutant (kittrial-5bb.255 U3).
+        inside = []
+        real_scopes = self.service.agent_scopes
+
+        def scopes(agent):
+            inside.append(0)
+            try:
+                return real_scopes(agent)
+            finally:
+                inside.pop()
+
+        def expiry_now():
+            if not inside:
+                return 0
+            inside[-1] += 1
+            return 0 if inside[-1] == 1 else 100
+
         # Exercise the ordinary agent read, including metadata projection. Raw
         # time is deliberately different from the captured expiry instant.
-        with mock.patch.object(self.service, '_expiry_now', return_value=0), \
+        with mock.patch.object(self.service, '_expiry_now', side_effect=expiry_now), \
+                mock.patch.object(self.service, 'agent_scopes', side_effect=scopes), \
                 mock.patch.object(self.service, '_now', return_value=100):
             reply = self.request('GET', '/v1/agents/%s' % aid, token=self.owner)
         self.assertEqual(200, reply.status, reply.data)

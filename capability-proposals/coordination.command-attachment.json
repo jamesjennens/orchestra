@@ -1,6 +1,5 @@
 {
   "schema_version": 1,
-  "operation_id": "capnew-5bb242-command-attachment-0001",
   "key": "coordination.command-attachment",
   "name": "A confined coordinator command carries one attachment, and the token must name it",
   "aliases": [
@@ -14,7 +13,8 @@
   "anchors": [],
   "code": [
     "endpoint.py::coordinator_payload",
-    "endpoint.py::coordinator_apply_refusal"
+    "endpoint.py::coordinator_apply_refusal",
+    "endpoint.py::execute"
   ],
   "tests": [
     "tests/test_coordinator_endpoint.py"
@@ -24,5 +24,8 @@
     "coordination",
     "endpoint",
     "attachments"
-  ]
+  ],
+  "revision": 3,
+  "expected_sha256": "afd67d2c96cd1ad434ba377646b032c0b25fba3c70ece36213fbed5b43b037d7",
+  "operation_id": "caprev-5bb259-command-attachment-0001"
 }

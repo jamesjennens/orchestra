@@ -1,17 +1,19 @@
 {
   "schema_version": 1,
-  "operation_id": "77fa5a6a-c886-48eb-8cef-3d79d076dba8",
+  "operation_id": "c5ee07b8-5727-453f-80a1-f35b20174238",
   "key": "admin.retire-project-server-issues",
+  "revision": 3,
+  "expected_sha256": "4a36636dd94e59d66ef6d9b46d70ed45a3215fec338a4bcd28b3e8b806657728",
   "name": "Protect same-named server issues during project retirement",
   "aliases": [
     "retire-project with missing metadata",
     "retirement of projects with server issues"
   ],
-  "summary": "When project metadata is absent, retire-project checks the exact same-named Dolt database and requires --force if it contains issues or the issue count cannot be read. An absent or issue-free database adds no blocker.",
+  "summary": "When project metadata is absent, retire-project queries Dolt database names case-insensitively and counts issues in the returned database. Issues, an unreadable count, an unreachable server, or a malformed or ambiguous database-list response require --force; no match or an issue-free database adds no blocker.",
   "requirements": [],
   "anchors": [],
   "code": [
-    "admin.py::server_database_exists",
+    "admin.py::server_database_name",
     "admin.py::server_database_issue_count",
     "admin.py::retire_findings",
     "admin.py::retire_blockers"

@@ -1,5 +1,33 @@
 # Office HTTP service: installation, TLS and recovery runbook
 
+## Project merge slot over HTTP
+
+The endpoint's shared `BLOCK_CAPABILITIES` table binds the slot action and its JSON
+operation to the capability of the route: read for a check, coordinate for take/release,
+and project.admin for force-release or explicit creation/repair. A slot block naming
+another project or capability is refused before project, authority, or tracker reads.
+The same table covers the host coordinate slot operations when the service supplies a
+block; ordinary SSH operations without configured web authority keep their answers.
+
+`GET /v1/projects/{id}/merge-slot` reads the native slot, its holder and matching saved task/target. It also reports the caller's exact actor and current permissions. Readers may be ordinary members or credentials; taking and releasing require `coordinate`: a signed-in coordinator, owner or superuser, or a personal agent with the active per-project coordinator grant while its account holds that role. A worker credential never gets this capability. With `coordinator_writes` on, this verified web authority decides the web take/release path even if no host operator is listed; the host `coordinate` path retains its original listed-operator checks and answers. `independent_approval` still requires the current standing independent contribution approval before acquisition.
+
+The project page has take/release controls and shows the exact holder name. A person's holder is the stable `usr_...` id bound by the endpoint; a granted personal agent's is its bound `agent_...` id. These are the names the host rule and own-party checks see, not editable attribution labels or display names.
+
+| Route | Closed request body | Authority |
+| --- | --- | --- |
+| `POST .../merge-slot/acquire` | `task_id`, `target` (nonblank, at most 160 characters) | `coordinate` |
+| `POST .../merge-slot/release` | empty | `coordinate`, exact current holder |
+| `POST .../merge-slot/force-release` | `expected_holder`, `reason` (nonblank, at most 1000 characters) | signed-in owner or superuser (`project.admin`) |
+| `POST .../merge-slot/create` | empty; explicit creation or shape repair | signed-in owner or superuser (`project.admin`) |
+
+Every write requires an `Idempotency-Key`. Reuse the identical key and body after an uncertain response. The endpoint compares the expected native holder under the project lock immediately before forced release; an exact confirmed retry returns the original result and does not release a later holder. Forced release remains possible when the old credential is expired, revoked or deleted: the owner acts under their own identity. Agents, including an owner's granted agent, never force-release or create/repair. Reads and acquisitions never create a missing slot silently. Missing, damaged or unread slot/context returns a distinct 503 recovery sentence; forbidden authority is 403 (an unreachable project remains 404), invalid fields/bounds are 422, holder/context conflicts are 409, and confirmed operations are 200.
+
+Use the named Python client methods `merge_slot`, `acquire_merge_slot`, `release_merge_slot`, `force_release_merge_slot` and `create_merge_slot`; the CLI is `http_client.py merge-slot PROJECT read|acquire|release|force-release|create` with `--task/--target`, or `--expected-holder/--reason`, and `--idempotency-key` for stable retries. The browser's API keeps the key for an uncertain intent. Every confirmed slot write records project/task, authenticated actor, holder before/after and operation id in the web audit; refusals use the existing rejected/denied audit path. Effect, receipt and crash boundaries are in [HTTP_MUTATION_PERSISTENCE.md](HTTP_MUTATION_PERSISTENCE.md).
+
+For rollback, preserve the native project and existing sidecar together so the older kit continues to show the recorded web holder, and have a signed-in owner force-release that holder before rolling back or use the retained newer kit for the same recovery if the holder's identity no longer exists.
+
+This first delivery adds no lifecycle fact writer, integration action, host provenance mark, grant change, store family or rollout switch. The generic endpoint capability/project binding and second-process stale grant limitations retain their existing scope; the new slot path validates its own exact project and capability and uses the supported single service process.
+
 **Status:** runbook for the disposable `.19` implementation. It describes a
 deployment shape but does not authorize one. No office hostname, certificate,
 secret store, network policy or backup key is selected here; the office owner
@@ -27,7 +55,7 @@ capture, owner authority, bearer/CSRF behavior and uncertain-write recovery.
 
 It is an authenticated adapter to canonical coordination data: browser sessions
 and project-scoped worker credentials gate every route, and organization is by
-project membership (`owner`, `contributor`, `viewer`) with a global superuser.
+project membership (`owner`, `coordinator`, `contributor`, `viewer`) with a global superuser.
 
 It is **not** a replacement for repository permissions, TLS termination, host
 isolation, or the canonical database's own access controls. It never grants Git
@@ -284,10 +312,17 @@ a `proj_...` record until a superuser decides. After every upgrade to this kit o
    - **archives** it (`POST /v1/projects/{id}/archive`).
 3. Archive each `no-canonical` entry (a `proj_...` id).
 
-Registration saves its complete registration mark, and confirmation saves its
-confirmation and backfilled mark, before committing a success receipt. A crash
-after that receipt can replay only a durable effect. A crash after the effect
-but before the receipt can leave an in-progress request that refuses retry.
+Registration writes the project record and its `registered_by` mark in one save, and
+confirmation saves its confirmation and backfilled mark — putting them back if that
+save raises — before committing a success receipt. A crash after that receipt can
+replay only a durable effect. A crash after the effect but before the receipt leaves
+an in-progress request that refuses the identical `Idempotency-Key` for the fixed
+`idempotency_ttl` (24 hours; it is the module constant `IDEMPOTENCY_TTL_SECONDS`, not a
+setting). The caller (a superuser on both routes) gets out with a new key (or none),
+which is answered from the true state: a registration that is
+already recorded answers 409 "already registered", and a confirmation of an
+already-confirmed record answers 409 "This project needs no confirmation", while an
+exact retry of the committed request replays its own answer.
 See [HTTP mutation persistence](HTTP_MUTATION_PERSISTENCE.md) for the caller
 inventory, crash probes and remaining audit persistence limit.
 
@@ -926,9 +961,9 @@ The routes exist on the endpoint backend; the in-process backend answers 501.
 | Route | Who | What |
 | --- | --- | --- |
 | `POST /v1/projects/{id}/proposals` | `proposals.write`: contributors, owners, and an agent credential with the `proposals` scope | submit; with `key` in the body, revise your own proposal. Send an `Idempotency-Key` (or an `operation_id`): the proposal key derives from it |
-| `GET /v1/projects/{id}/proposals` | any member | the queue: `state`, `target`, `order` (`oldest`, the default, or `newest`), `mine=1` (only the caller's own **verified** proposals, the rule of `/v1/me/contributions`: one that merely names the account is not counted; the answer then carries `unverified_omitted`, the number of proposals that name the caller's account as submitter but are not verified, such as one submitted over SSH under that name, so the caller can see that some exist without being shown them), `limit`, `cursor`. `total` is the count for the filter, not for the page. A cursor this route issued stays valid when the list shrinks under it: a cursor that now points past the end, including one issued before the total shrank, returns 200 with `items: []` and `next_cursor: null`, not a refusal (a cursor the route did not issue, or one used with a different query or account, is still a 409). Also `can_propose` and `can_triage` for the caller |
-| `GET /v1/projects/{id}/proposals/{key}` | any member | the newest revision, the disposition timeline (`history` 1..50), the derived links, and `deciders` (the configured owner deciders) |
-| `POST /v1/projects/{id}/proposals/{key}/dispositions` | `reviews.approve`: owners, in a signed-in session | triage (`operation: "review"`, the default) or the owner decision (`"decide"`), with `previous` and `proposal_sha256` from the detail read |
+| `GET /v1/projects/{id}/proposals` | any member | the queue: `state`, `target`, `order` (`oldest`, the default, or `newest`), `mine=1` (only the caller's own **verified** proposals, the rule of `/v1/me/contributions`: one that merely names the account is not counted; the answer then carries `unverified_omitted`, the number of proposals that name the caller's account as submitter but are not verified, such as one submitted over SSH under that name, so the caller can see that some exist without being shown them), `limit`, `cursor`. `total` is the count for the filter, not for the page. A cursor this route issued stays valid when the list shrinks under it: a cursor that now points past the end, including one issued before the total shrank, returns 200 with `items: []` and `next_cursor: null`, not a refusal (a cursor the route did not issue, or one used with a different query or account, is still a 409). Also `can_propose`, `can_triage` and `can_decide` (who may record the owner decision: `project.admin`, signed in; never a credential) for the caller |
+| `GET /v1/projects/{id}/proposals/{key}` | any member | the newest revision, the disposition timeline (`history` 1..50), the derived links, `deciders` (the configured owner deciders), and `can_triage` and `can_decide` for the caller |
+| `POST /v1/projects/{id}/proposals/{key}/dispositions` | `reviews.approve`: owners and coordinators by role, in a signed-in session; the owner decision also needs `project.admin` (an owner or a superuser), and no credential records either | triage (`operation: "review"`, the default) or the owner decision (`"decide"`; a coordinator who sends it is answered `403`), with `previous` and `proposal_sha256` from the detail read |
 | `GET /v1/me/contributions` | a signed-in session | your own **verified** proposals across your projects, newest first, `limit` per page with a `cursor` (`next_cursor`); it pages through the newest 100 and stops there: the last page has `truncated: true` and no `next_cursor`, and older proposals are read per project from the queue. A cursor the route did not issue is refused with 409. A proposal that only names your account, or whose later revision someone else wrote, is not listed |
 
 The rules:
@@ -976,8 +1011,9 @@ The rules:
   The mapping feeds the no-self rules and nothing else: it does not let that actor (or
   any SSH caller who declares a name in that namespace) revise the account's proposals
   or submit proposals that read as the account's.
-- **No credential triages.** `reviews.approve` is never granted to a worker or agent
-  credential.
+- **No credential triages.** A worker credential never holds `reviews.approve`; an agent's
+  credential holds it only through the coordinator grant, for approving a contribution, and
+  the triage and decision routes refuse every credential whatever it holds.
 - **Refusals** from the canonical rules (a stale read, an illegal transition, a no-self
   rule) answer 422 with the rule's message. Proposal text is never in an error body or
   the audit log; the audit records the action and the proposal key.
@@ -1040,9 +1076,11 @@ The rules:
   triage, Incorporated but not yet the accepted requirement. A row opens the proposal on
   the same page (`#/p/{id}/reviews?proposal={key}`): the text, why, evidence, what has
   happened, and the form for whoever acts next.
-  - A member with `reviews.approve` gets the triage form, or the owner-decision form on
-    an escalated proposal. It is not offered on their own proposal, nor the decision to
-    the member who escalated.
+  - A member with `reviews.approve` (an owner, or a coordinator by role) gets the triage
+    form. On an escalated proposal the owner-decision form is for a member with
+    `project.admin` (an owner): a coordinator triages and may escalate, and does not
+    record the owner's decision. Neither form is offered on their own proposal, nor the
+    decision to the member who escalated.
   - The submitter gets a revise form while the proposal is submitted or a coordinator
     has asked a question.
 - **Propose a requirement** is a button on Reviews (`?propose=1`). The form never sends
@@ -1739,6 +1777,122 @@ service configuration first: an office service older than this setting refuses t
 with a key it does not know. The older web service ignores the state's record of the
 setting, and every rule is what it was.
 
+### Coordinators: a role, and a grant that lets an agent approve
+
+Slice 1b of [WEB_COORDINATOR_DESIGN.md](WEB_COORDINATOR_DESIGN.md) (kittrial-5bb.209). Two
+things, and an installation that uses neither behaves as before.
+
+**The role `coordinator`** sits between `contributor` and `owner`:
+
+| | viewer | contributor | coordinator | owner |
+|---|---|---|---|---|
+| Read | yes | yes | yes | yes |
+| Claim, deliver, checkpoint, review, recommend, propose | no | yes | yes | yes |
+| Approve a contribution, triage a proposal (`reviews.approve`) | no | no | yes | yes |
+| Record the owner's decision on a proposal (`decide`) | no | no | no | yes |
+| `coordinate` (web merge-slot acquire and release; lifecycle facts are a later delivery) | no | no | yes | yes |
+| Members, worker credentials, archive, the audit, this grant (`project.admin`) | no | no | no | yes |
+
+An owner gives and takes the role on the Members panel (`PUT
+/v1/projects/{id}/members/{user}` with `"role": "coordinator"`); making an owner stays a
+superuser's. A coordinator who is signed in approves as an owner does, and the setting of
+the section above binds them alike.
+
+**The coordinator grant** lets one personal agent approve in one project. Until now no
+credential approved anything; this is the one place where that is lifted.
+
+- `PUT /v1/projects/{id}/agents/{agent}/coordinator` (empty body) gives it, `DELETE` on
+  the same path takes it away. An owner of that project or a superuser, signed in; never
+  a credential, a granted agent included (`403`). Both answer the project's view of the
+  agent, and both write an audit record (`agents.coordinator.grant`,
+  `agents.coordinator.revoke`) that names the project, the agent and who did it.
+- The agent must be a personal agent that works in the project (anything else answers
+  `404 Agent not found`, as the other routes of this list do; a worker credential is not
+  an agent and cannot be named), enabled (`409`), and **its own account must be a
+  coordinator or an owner of the project, or a superuser**: otherwise `409` "This agent's
+  account is not a coordinator or an owner of this project, so the grant would have no
+  effect. Make the account a coordinator first (Members), then grant the agent." Nothing
+  is written.
+- The grant is kept with the project, not on a credential: a new or renewed credential of
+  the agent has it, and the agent's scopes (one list for all its projects, set by its own
+  account) do not carry it. In another project of the same agent it gives nothing.
+- What it adds to the agent's credentials there is `reviews.approve` and `coordinate`,
+  each only while the agent's account holds it. Nothing else a credential is denied
+  opens: members, worker credentials, the audit, archiving, creating a project and the
+  grant itself stay refused, and so does the triage of requirement proposals (no
+  credential records a disposition; the proposal reads keep answering `can_triage:
+  false` to a granted agent).
+- **A granted agent never approves work of its own party, whatever the setting of the
+  section above says.** The party is the full one of that section: its account, that
+  account's other agents, and every name a worker credential of that account holds or has
+  held. `403`, with the sentences of that section said of the agent: "This contribution
+  was delivered by this agent's own party: its account, one of that account's agents, or
+  a name that a worker credential of that account holds or has held. An agent never
+  approves work of its own party, whatever this server's setting for people says:
+  somebody of another party who may approve here must approve it (another coordinator or
+  owner of this project, or a superuser)." A person's approval follows the setting as
+  before.
+- It is read from the present state on every request, by the web service and again when
+  the endpoint authorizes the write. Each of these ends it at the agent's next request:
+  the grant is removed; the account is made a contributor or a viewer; the account is
+  removed from the project (`DELETE /v1/projects/{id}/members/{user}`), or the agent is
+  taken out of the project **by any route** (the project owner's
+  `DELETE /v1/projects/{id}/agents/{agent}`, or `PATCH /v1/agents/{id}` by its account or a
+  superuser): in both of these the grant is deleted and audited as a revoke with the
+  reason ("the account was removed from the project" for the first), so it does not wait
+  in the state for the account or the project to be put back, and an account that is added
+  again as a coordinator has agents that approve only after an owner grants them again;
+  the agent or its account is disabled. A grant whose account was lowered (to contributor
+  or viewer) stays on record and shows as "Granted, no effect" until the account is raised
+  again or the grant is removed.
+
+`GET /v1/projects/{id}/agents` and `.../agents/{agent}` carry `coordinator` for each
+agent: `null`, or `{granted_by, granted_by_display_name, granted_at, effective,
+no_effect_because}`; the last is `null` while the grant has effect, else `agent-disabled`,
+`account-disabled` or `account-role`, and the page says which. A record of grants in the
+state file that is not an object answers `503` to a new grant, with a sentence and no
+write. The
+project's settings page lists "Agents in this project" for an owner with a "Make
+coordinator" or "Remove grant" button on each row, and shows the server's sentence when a
+grant is refused. `GET /v1/agents/me/next` tells a granted agent of a contribution by
+another account "You hold the coordinator grant in this project: review it, then approve
+it or request changes", and never lists its own party's work for approval.
+
+Like the setting above, this is the web route's: an approval on the host route
+(`endpoint.py` over SSH, or run on the server) knows no accounts and no grants.
+
+**The host's coordinator rules and the web route.** The host has three rules of its own
+(`lifecycle_authors`, `independent_approval`, `coordinator_writes` in
+`deployment.private.json`; OPERATIONS.md, "The coordinator rules"), all off by default.
+`coordinator_writes` is about **names on the host route**: with it on, the endpoint refuses
+an approval from a name that is not listed there. **On the web route the service's own
+authority decides instead**: an owner, a coordinator by role, or an agent with the
+project's coordinator grant approves with `coordinator_writes` on and nobody listed, because
+the endpoint reads that authority again from the live state for every such request and
+does not go by a name the caller sends. An agent WITHOUT the grant is refused there even
+when the request claims the approval (tested through the real endpoint). A web
+coordinator is not thereby a listed operator of the host: the merge slot and the lifecycle
+facts are not on the web route. `independent_approval` applies to the web route as well.
+
+**What the owner of a project should know about a grant** (each as the review ran it, and
+accepted as the design):
+
+- A grant on record takes effect again **without a new decision by an owner** when the
+  agent's account, after it was lowered, is made a coordinator or owner again, or the
+  agent is enabled again. (An account that was removed from the project has no grant
+  left: see above.) To end it for good, remove the grant.
+- A grant stays when the owner who gave it is lowered or leaves.
+- Two granted agents of two accounts may approve each other's work: they are two parties.
+- A grant works in an archived project as every other write there does.
+
+**Going back to a kit older than this one.** First, in every project, set every member
+whose role is `coordinator` to `contributor` or `owner`, and remove every coordinator grant.
+The older kit opens the state file unchanged, but it does not know the role: such a member
+and their agents are **locked out of the project, reads included**, and the grants stay in
+the file, where they take effect again at the next upgrade. A page cached from the older
+kit shows a coordinator as a viewer and offers no Approve; this kit's page against the
+older service offers "Make coordinator" and gets `404`.
+
 ### The merge slot is not a task
 
 Each project has one merge slot, `PROJECT-merge-slot`, an internal record. On the host it
@@ -2035,7 +2189,9 @@ private. `GET /v1/projects/{id}/agents` lists the agents whose grant names the p
 (id, name, owner, `last_seen_at`, `enabled` only, never `working_directory` or
 `working_directory_hidden`), `GET /v1/projects/{id}/agents/{agent}` returns one of
 them, and `DELETE /v1/projects/{id}/agents/{agent}` removes the project from that
-agent's grant with an audit record naming the project and the acting user. An agent that
+agent's grant with an audit record naming the project and the acting user. Which of
+them coordinates the project, and the routes that give and take that, are in
+"Coordinators: a role, and a grant that lets an agent approve" above. An agent that
 is not granted the project is reported exactly like a nonexistent id: both routes answer
 `404` with the same `Agent not found` message, so a project owner cannot probe the wider
 registry. Removal

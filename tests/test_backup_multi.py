@@ -541,6 +541,15 @@ class ScheduledCoverageGuidanceCase(unittest.TestCase):
         self.assertIn('backup --all', message)
         self.assertIn('ExecStart=', message)
 
+    def test_the_report_names_the_note_the_operator_recorded(self):
+        """kittrial-5bb.251 item 7c: add-project prints this report, so it reads the note too."""
+        admin.write_backup_schedule_note(self.root, 'Site cron runs it nightly.', 'operator-1')
+        covered, message = admin.scheduled_backup_coverage(self.root, 'second')
+        self.assertFalse(covered)
+        self.assertIn('scheduled elsewhere', message)
+        self.assertIn('Site cron runs it nightly.', message)
+        self.assertIn('operator-1', message)
+
     def test_unit_listing_only_other_projects_reports_this_project_missing(self):
         self.write_unit(self.line('first'))
         covered, message = admin.scheduled_backup_coverage(self.root, 'second')
@@ -753,6 +762,108 @@ class ScheduledCoverageGuidanceCase(unittest.TestCase):
         self.assertIn('do not include newproject', text)
         self.assertNotIn('no change is needed', text)
         self.assertNotIn('backup --all', text)
+
+
+    def test_add_project_prints_no_control_character_from_a_hand_made_note(self):
+        """kittrial-5bb.251 review item 1: a hand-made note must not reach the terminal raw.
+
+        The reader refuses the characters the writer refuses, and the sentence add-project builds
+        escapes what it prints, so neither the note nor the actor can rewrite the line, inject a
+        line of the report, or reorder it with a bidi override.
+        """
+        note = self.root / 'backups' / admin.BACKUP_SCHEDULE_NOTE_NAME
+        note.write_text(json.dumps({'schema_version': 1,
+                                    'note': 'esc\u001b[31m\r\nExecStart=/bin/false',
+                                    'recorded_by': 'op\u001b[31m\u202e',
+                                    'recorded_at': '2026-10-08T09:00:00Z'}), encoding='utf-8')
+        self.assertIsNone(admin.read_backup_schedule_note(self.root))
+        output = io.StringIO()
+        with patch.object(admin, 'config', return_value={'port': 13317}), \
+                patch.object(admin, 'run_bd', return_value=''), \
+                patch.object(admin, 'backup_project'), contextlib.redirect_stdout(output):
+            admin.add_project(self.root, 'newproject')
+        text = output.getvalue()
+        self.assertIn('Created project newproject', text)
+        self.assertNotIn('\x1b', text)
+        self.assertNotIn('\r', text)
+        self.assertNotIn('\u202e', text)
+        self.assertNotIn('ExecStart=/bin/false', text)
+        # Even a value the reader hands over unjudged (an older kit's record, or a category the
+        # rule does not know) is escaped where the report prints it.
+        hostile = {'note': 'esc\u001b[31m\rinjected', 'recorded_by': 'op\u202e',
+                   'recorded_at': '2026-10-08T09:00:00Z'}
+        with patch.object(admin, 'read_backup_schedule_note', return_value=hostile):
+            covered, message = admin.scheduled_backup_coverage(self.root, 'newproject')
+        self.assertFalse(covered)
+        self.assertNotIn('\x1b', message)
+        self.assertNotIn('\r', message)
+        self.assertNotIn('\u202e', message)
+        self.assertIn('\\x1b', message)
+
+    def test_a_covering_unit_with_an_unreadable_timer_says_could_not_be_checked(self):
+        """kittrial-5bb.251 review item 3b: the report claimed 'no enabled timer runs them' for a
+        unit whose timer could not be read, while the status for the same files said could-not-check."""
+        self.write_unit(self.line('--all'))
+        wants = self.units / 'timers.target.wants'
+        wants.mkdir(parents=True, exist_ok=True)
+        (wants / 'beads-backup.timer').write_bytes(b'\xff\xfe\x00not text')
+        covered, message = admin.scheduled_backup_coverage(self.root, 'second')
+        self.assertFalse(covered)
+        self.assertIn('could not be checked', message)
+        self.assertIn('beads-backup.timer', message)
+        self.assertNotIn('no enabled beads-*backup*.timer runs them', message)
+
+    def test_the_named_project_branch_with_an_unreadable_timer_says_could_not_be_checked(self):
+        """kittrial-5bb.251 review item 3b, the other sentence that counts timers."""
+        self.write_unit(self.line('second'))
+        wants = self.units / 'timers.target.wants'
+        wants.mkdir(parents=True, exist_ok=True)
+        (wants / 'beads-backup.timer').write_bytes(b'\xff\xfe\x00not text')
+        covered, message = admin.scheduled_backup_coverage(self.root, 'second')
+        self.assertFalse(covered)
+        self.assertIn('could not be checked', message)
+        self.assertNotIn('No enabled beads-*backup*.timer runs them', message)
+
+    def test_a_non_covering_unit_still_gets_the_run_now_and_check_commands(self):
+        """kittrial-5bb.251 review item 3c: item 4's commands were kept only when NO unit was
+        installed. With a unit installed that does not cover this project they vanished and the
+        report pointed at a line it could not print."""
+        self.write_unit(self.admin_line('/srv/other', '--all'))
+        with patch.object(admin, 'install_current_path',
+                          side_effect=lambda path: Path('/srv/a$b/' + Path(str(path)).name)):
+            covered, message = admin.scheduled_backup_coverage(self.root, 'second')
+        self.assertFalse(covered)
+        self.assertIn('No line for a schedule can be printed for this installation', message)
+        self.assertIn('To run a backup of every project now', message)
+        self.assertIn('backup-status --require-complete', message)
+        self.assertNotIn('needs the line below', message)
+
+    def test_the_named_project_branch_states_why_it_cannot_print_the_line(self):
+        """kittrial-5bb.251 review item 3c: this branch ended 'not a shell command:' with nothing
+        after it and then 'Read: ...' - a colon pointing at no line and no reason."""
+        self.write_unit(self.line('second'))
+        with patch.object(admin, 'install_current_path',
+                          side_effect=lambda path: Path('/srv/a$b/' + Path(str(path)).name)):
+            covered, message = admin.scheduled_backup_coverage(self.root, 'second')
+        self.assertFalse(covered)
+        self.assertIn('no line for a schedule can be printed for this installation', message)
+        self.assertIn('To run a backup of every project now', message)
+        self.assertNotIn('not a shell command:', message)
+
+    def test_a_percent_in_the_root_is_doubled_and_read_back(self):
+        """kittrial-5bb.251 review item 4 (m7a2): a '%' root is doubled for systemd, and the kit's
+        own reader then read its own line as ANOTHER runtime's, so the schedule it had printed was
+        reported as not installed. Nothing tested a '%' root, so dropping the doubling survived."""
+        rooted = (Path(self.temp.name) / 'rt%root').resolve()
+        (rooted / 'backups').mkdir(parents=True)
+        (rooted / 'projects').mkdir()
+        line = admin.scheduled_backup_execstart(rooted)
+        self.assertIn('%%', line)                      # systemd expands a specifier: doubled
+        self.write_unit(line)
+        covered, message = admin.scheduled_backup_coverage(rooted, 'second')
+        self.assertFalse(covered)                      # no enabled timer yet
+        self.assertIn('cover every project', message)  # READ BACK as this runtime, not another
+        self.assertNotIn('do not back up this runtime', message)
 
 
 class InterruptedRunAndCopyLockCase(unittest.TestCase):

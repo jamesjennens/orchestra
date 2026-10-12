@@ -49,12 +49,14 @@ ITEM_FIELDS = {
     'newer_activity_coverage', 'unresolved_directions',
     # Additive: one sentence for a contribution that waits for somebody else's approval
     # (kittrial-5bb.197 review request 01a12894, item 3b).
-    'waiting_for_approval',
+    'waiting_for_approval', 'approval_requires_other_party',
     # Additive move sentence (kittrial-5bb.249): whose move it is, in words.
     'whose_move', 'next',
     # Additive selection facts (kittrial-5bb.6): the next-action actor role, the
     # filterable work state, the reconciliation signal and bounded claimability.
     'next_actor', 'work_state', 'reconciliation_needed', 'reconciliation_reasons', 'claimable',
+    # Additive superseding-redelivery fact (kittrial-5bb.253 item 1).
+    'redelivered',
 }
 BRIEF_FIELDS = {
     'task', 'title', 'owner', 'status', 'activity_cursor', 'checkpoint', 'intent',

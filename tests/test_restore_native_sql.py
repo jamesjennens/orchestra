@@ -423,6 +423,10 @@ class RestoreNewCommandCase(RuntimeCase):
                 notice = stderr.getvalue()
                 self.assertIn('restore-new did not complete', notice)
                 self.assertIn('partial restore', notice)
+                self.assertIn('retire-project beta --actor OPERATOR --reason TEXT', notice)
+                self.assertNotIn('retire-project beta --actor OPERATOR --reason TEXT --force', notice)
+                self.assertIn('If it is refused because the half-restored DB has issues or the server is unreachable, '
+                              'read its output and repeat it with --force.', notice)
                 self.assertIn('another unused destination', notice)
                 # No re-point, no sidecar, no identity adoption after a failed native step:
                 # only the read that tells an empty destination from a partial one.

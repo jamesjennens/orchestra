@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "operation_id": "capnew-5bb197-coordinator-rules-0001",
+  "operation_id": "caprev-5bb254-coordinator-rules-0002",
   "key": "coordination.coordinator-rules",
   "name": "An installation can say who may write a lifecycle fact, who may approve and who may take the merge slot",
   "aliases": [
@@ -10,7 +10,7 @@
     "who may record reviewed and integrated",
     "coordinators per project slices 6 and 7"
   ],
-  "summary": "Three per-installation booleans in deployment.private.json, absent or false meaning off. admin.py coordinator-rules status|on|off [--rule NAME] --actor OPERATOR is operator-gated, holds the config lock, writes nothing when nothing changes, refuses --rule twice, and audits the last 20 flips. lifecycle_authors: implemented, tested and the task scope only from the task's assignee (compared exactly) or a listed operator, and reviewed, integrated, deployed, live-verified, enabled, live and a release deploy only from a listed operator; 'listed' is ONE rule shared with review_workflow (the operator allowlist, or an actor of a listed operator's principal). While off the write succeeds silently; admin.py lifecycle-authors PROJECT is the read-only preview. independent_approval is rule 3, both halves: approve is refused from the author's or assignee's party (principal if the registry gives one, else the normalised name), and reviewed, integrated and merge-acquire need the CURRENT contribution approved by another party. coordinator_writes refuses approve and merge-acquire unless the actor is a listed actor of the project. The session registry is read lazily, only when a rule needs it.",
+  "summary": "Three per-installation rules, off by default: lifecycle_authors permits exact-current-assignee implemented/tested/scope before reading ownership, or a listed operator; other facts require a listed operator. Assignment itself is unrestricted. independent_approval refuses equal known principals OR folded actor names and requires a standing independent approval of the current contribution for reviewed/integrated/merge-acquire. Its writers fail closed on an unreadable registry; missing or valid empty ownership uses names, readers remain available. coordinator_writes permits listed actors for host approve/merge-acquire; verified web approval retains its own owner/coordinator/granted-agent authority. Forged ordinary endpoint descriptors confer none. work/brief approval waiting is caller-relative and conditional, and the web brief recomputes it for the caller. The endpoint marks rule refusals; HTTP error.message carries ordinary and registry setting/recovery sentences without paths or duplicate clauses. Native all-off writes stay compatible; additive reader fields/text are declared. No historical migration or rollout switch change.",
   "requirements": [],
   "anchors": [
     "docs/OPERATIONS.md#the-coordinator-rules-who-may-write-which-fact-and-who-may-approve"
@@ -33,17 +33,27 @@
     "review_workflow.py::require_independent_approval",
     "review_workflow.py::execute",
     "coordination.py::apply_native",
-    "work.py::workflow"
+    "work.py::workflow",
+    "review_workflow.py::approval_owners",
+    "work.py::approval_wait",
+    "endpoint.py::owner_loader",
+    "http_service.py::EndpointBackend._detail_limit",
+    "http_service.py::EndpointBackend.task_brief",
+    "review_workflow.py::CoordinatorRuleRefusal",
+    "http_service.py::EndpointBackend._checked"
   ],
   "tests": [
     "tests/test_lifecycle_authors.py",
     "tests/test_coordinator_rules.py",
-    "tests/test_coordinator_rules_endpoint.py"
+    "tests/test_coordinator_rules_endpoint.py",
+    "tests/test_coordinator_rule_followups.py"
   ],
   "owner": "person:orchestra-coordinator",
   "tags": [
     "coordination",
     "operations",
     "security"
-  ]
+  ],
+  "revision": 3,
+  "expected_sha256": "be8b751c20ccc32d927f689d206604e760ac1629cef4b6c593236f038e03ddc5"
 }
