@@ -2212,7 +2212,8 @@ def restore_destination_state(root,destination):
 #: ``restore_failure_notice`` can say what is true after it fails (kittrial-5bb.202 rev-2).
 MERGE_SLOT_STEP='merge-slot provisioning'
 
-def restore_failure_notice(destination,error,state='partial',step='native restore',merge_slot=None):
+def restore_failure_notice(destination,error,state='partial',step='native restore',merge_slot=None,
+                           journals_restored=None,authority_note=None):
     """What an operator must do after the native step of ``restore-new`` did not complete.
 
     ``state`` is ``restore_destination_state``'s answer: the notice says "partial" only
@@ -2223,6 +2224,13 @@ def restore_failure_notice(destination,error,state='partial',step='native restor
     coordination sidecar and the journals, so the notice may say those are in place, and it
     must not call the slot unprovisioned or "named missing by the report" unless this fresh
     read of the clone actually says so (kittrial-5bb.202 review of revision 2, F1).
+
+    ``journals_restored`` is ``args.journal_restored`` (True when the backup carried an
+    operation-journal snapshot and it was restored, False when it carried none, None when the
+    caller does not know): the notice may claim "its journals are in place" only when it is True
+    (kittrial-5bb.240 F2). ``authority_note`` is the sentence about the deployment-authority step
+    the failure skipped, appended to the provisioning notices (kittrial-5bb.240 F1); None adds
+    nothing.
     """
     if isinstance(error,subprocess.TimeoutExpired):
         cause='the native restore reached its %d s ceiling and its client was stopped'%RESTORE_TIMEOUT
@@ -2263,32 +2271,117 @@ def restore_failure_notice(destination,error,state='partial',step='native restor
         # empty slotless source reads as that shape (bd lists no rows at all), and the generic
         # sentence there would then claim the sidecar and journals were NOT restored, which is
         # exactly what the reordering made false.
-        in_place=('Project %s exists and holds the restored tracker: its data, its re-pointed backup target and '
-                  'its journals are in place, and a backup of it taken now is expected to succeed.'%destination)
+        in_place=merge_slot_step_in_place(destination,journals_restored)
+        # The deployment-authority step runs after this one, so the failure skipped it: the
+        # notice says what was not compared and not re-granted, and how to do it
+        # (kittrial-5bb.240 F1).
+        authority=(' '+authority_note) if authority_note else ''
         where=(merge_slot or {}).get('state')
         detail=(merge_slot or {}).get('detail')
         if where in ('missing','damaged'):
             return ('restore-new did not complete: %s. %s Its merge slot is still %s: %s Run the merge-create '
                     'coordination operation for %s, or retire it with %s.%s Run restore-new again into another '
-                    'unused destination name; the source backup was not modified.'
-                    %(cause,in_place,where,detail or 'the host read it as unusable.',destination,retire,retry_force))
+                    'unused destination name; the source backup was not modified.%s'
+                    %(cause,in_place,where,detail or 'the host read it as unusable.',destination,retire,retry_force,
+                      authority))
         if where=='healthy':
             return ('restore-new did not complete: %s. %s Its merge slot reads healthy, so the failure was in the '
                     '%s step and not in the slot: nothing is left to mend, and merge-check and the read-only '
                     'merge-slot-report are expected to agree. Confirm with merge-check before using it, or retire '
                     'it with %s.%s Run restore-new again into another unused destination name; the source backup '
-                    'was not modified.'%(cause,in_place,MERGE_SLOT_STEP,retire,retry_force))
+                    'was not modified.%s'%(cause,in_place,MERGE_SLOT_STEP,retire,retry_force,authority))
         return ('restore-new did not complete: %s. %s Whether it has a usable merge slot could not be read: the '
                 'same fault stopped the %s step, so this notice does not claim it is missing. Run merge-check for '
                 '%s, or the read-only merge-slot-report, and if it names the merge-create operation run that; else '
                 'retire it with %s.%s Run restore-new again into another unused destination name. The source backup '
-                'was not modified.'%(cause,in_place,MERGE_SLOT_STEP,destination,retire,retry_force))
+                'was not modified.%s'%(cause,in_place,MERGE_SLOT_STEP,destination,retire,retry_force,authority))
     return ('restore-new did not complete: %s. Project %s exists but holds a partial restore (its '
             'coordination sidecar, journals and operation journal were NOT restored). Preserve it for '
             'inspection, do not use or back it up as a tracker, and run restore-new again into another '
             'unused destination name; the source backup was not modified. While it stays in the runtime '
             'its backup fails and the backup gate reports the runtime incomplete: retire it with %s.%s'
             %(cause,destination,retire,retry_force))
+
+def merge_slot_step_in_place(destination,journals_restored=None):
+    """What the clone holds when the merge-slot provisioning step failed, as one sentence.
+
+    That step runs LAST, after the re-point, the coordination sidecar and the journals
+    (kittrial-5bb.202 rev-3 item 1), so the clone really does hold the restored tracker and its
+    own backup target here. It must NOT claim the journals are in place when ``restore_journal``
+    found no snapshot to restore (kittrial-5bb.240 F2): ``journals_restored`` is
+    ``args.journal_restored`` - True when a snapshot was restored, False when the backup carried
+    none, None when the caller does not know - and None only says that the steps before this one
+    ran to completion.
+    """
+    if journals_restored is True:
+        holds='its data, its re-pointed backup target and its journals are in place'
+    elif journals_restored is False:
+        holds=('its data and its re-pointed backup target are in place, and its operation journal starts empty '
+               'because the backup carried no journal snapshot')
+    else:
+        holds=('its data and its re-pointed backup target are in place, and the steps before this one (the '
+               're-point, the coordination sidecar and the journals) ran to completion')
+    return ('Project %s exists and holds the restored tracker: %s, and a backup of it taken now is expected to '
+            'succeed.'%(destination,holds))
+
+
+def restore_authority_not_run(root,source,args):
+    """The sentence the provisioning notice adds: the deployment-authority step did not run.
+
+    ``restore_authority`` is the LAST thing ``finish_restore`` does, so when the merge-slot
+    provisioning step fails it is skipped without a word: the "NOT restored: the backup records
+    ..." lines a complete restore prints are never printed, and ``--restore-operators``/
+    ``--restore-verifiers`` re-grant nothing while the command exits 1 (kittrial-5bb.240 F1).
+    This returns what to say instead, and NEVER re-grants: the re-grant stays an explicit operator
+    decision. It is called only for a failure of that step, where ``args.sidecar_restored`` is
+    already set, and it never raises (it runs on a failure path).
+    """
+    asked=bool(getattr(args,'restore_operators',False) or getattr(args,'restore_verifiers',False))
+    if getattr(args,'native_only',None) is not None:
+        return ('This was a --without-coordination restore, so no coordination sidecar and no deployment authority '
+                'were restored, and none was compared or re-granted'
+                +(' (--restore-operators/--restore-verifiers re-granted nothing).' if asked
+                  else ' (as the restore asked).'))
+    if not getattr(args,'sidecar_restored',False):
+        return ('This backup has no coordination sidecar, so it records no operators or verifiers: nothing was '
+                'compared and nothing was re-granted'
+                +(' (--restore-operators/--restore-verifiers re-granted nothing).' if asked else '.'))
+    return recorded_authority_not_compared(root,source,args)
+
+
+def recorded_authority_not_compared(root,source,args=None):
+    """The read-only half of ``restore_authority``, for the notice of a later failed step.
+
+    It makes the SAME comparison ``restore_authority`` makes and returns one sentence naming what
+    the backup records and this host does not list, with the exact commands that re-grant one name
+    and the read-only comparison line, or None when there is nothing to report. It follows the
+    same rule as the rest of the restore: the comparison is read-only, and the re-grant is an
+    explicit operator decision (kittrial-5bb.240 F1). It never raises: a sidecar or a deployment
+    configuration that cannot be read is SAID, not raised, because this runs on a failure path.
+    """
+    import shlex
+    try:
+        missing=missing_operators(root,source)
+        unlisted=missing_verifiers(root,source)
+    except (OSError,ValueError,TypeError,KeyError,UnicodeError):
+        return ('The deployment-authority step also did not run, so the operators and verifiers the backup records '
+                'were NOT compared and NOT re-granted; they could not even be listed here, because the backup '
+                'sidecar or the deployment configuration could not be read.')
+    named=[]
+    if missing:named.append('operator allowlist entries this host does not list: '+', '.join(missing))
+    if unlisted:named.append('capability verifiers this host does not list: '+', '.join(unlisted))
+    if not named:return None
+    actor=getattr(args,'actor',None)
+    reason=getattr(args,'reason',None)
+    commands=authority_regrant_commands(root,missing,unlisted,actor,reason)
+    return ('The deployment-authority step runs AFTER this one, so it did not run either: the operators and '
+            'verifiers the backup records were NOT compared (the "NOT restored: ..." line a complete restore prints '
+            'was not printed) and NOT re-granted (--restore-operators/--restore-verifiers re-granted nothing). The '
+            'backup records %s. Compare this installation with the backup:\n  admin.py --root %s backup-authority '
+            '%s\nRe-grant what you decide to with:\n  %s\n%sRe-run restore-new into another unused destination name '
+            'with --restore-operators/--restore-verifiers to re-establish the whole recorded list in one step.'
+            %('; '.join(named),shlex.quote(str(root)),shlex.quote(source),'\n  '.join(commands),
+              authority_regrant_replace_note(actor,reason)))
 
 def provision_merge_slot(root,name):
     """Create the project's merge slot once, tolerating an existing slot.
@@ -8891,8 +8984,15 @@ def main():
                     # source reads that way, and it still needs the provisioning notice.
                     slot=(project_merge_slot_state(root,args.destination)
                           if step[0]==MERGE_SLOT_STEP and destination_state in ('partial','empty') else None)
+                    # The deployment-authority step did not run when this one failed, and the
+                    # provisioning notice must not leave that unsaid (kittrial-5bb.240 F1). The
+                    # comparison it makes is read-only; the re-grant is never run from here.
+                    authority=(restore_authority_not_run(root,args.project,args)
+                               if step[0]==MERGE_SLOT_STEP else None)
                     print(restore_failure_notice(args.destination,error,destination_state,step=step[0],
-                                                 merge_slot=slot),
+                                                 merge_slot=slot,
+                                                 journals_restored=getattr(args,'journal_restored',None),
+                                                 authority_note=authority),
                           file=sys.stderr)
                 raise
             finally:
@@ -8955,6 +9055,10 @@ def finish_restore(root,args,snapshot,step=None):
     # --without-coordination (kittrial-5bb.152): no coordination files, no authority; the
     # operation journal is restored as before when the backup has a snapshot.
     sidecar=False if getattr(args,'native_only',None) is not None else restore_coordination(root,args.project,args.destination,authority=False)
+    # What the deployment-authority step at the END of this function needed: it does not run when
+    # the merge-slot step below fails, so the notice must say what was not compared and not
+    # re-granted, and it can only say that knowing this (kittrial-5bb.240 F1).
+    args.sidecar_restored=sidecar
     restored=restore_journal(snapshot,
                              project_dir(root,args.destination)/JOURNAL_STORE_NAME)
     args.journal_restored=restored is not None
