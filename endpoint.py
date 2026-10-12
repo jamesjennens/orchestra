@@ -626,6 +626,18 @@ COORDINATOR_TEXTS=('guidance-set','set-onboarding')
 #: ``proposal-review``/``proposal-decide``, so it is neither allowed nor needed here.
 COORDINATOR_APPLY_OPERATIONS=('accept',)
 
+def onboarding_directory_refusal(target):
+    """The one sentence both ``ONBOARDING.md`` directory checks answer with.
+
+    The pre-check and the refusal inside ``coordinator_effect`` have to say the same thing, and
+    say it the same way, because either can answer the same request depending on nothing the
+    caller can see: whether a directory was put there before or after the project lock was
+    waited for (kittrial-5bb.259 item 1).
+    """
+    return ValueError('Project onboarding cannot be written: %s is a directory, not a file. '
+                      'Remove the directory, or write the document by hand on the host. '
+                      'Nothing was written.'%target.name)
+
 def coordinator_refusal(request,root,key_principal):
     """Refuse the coordinator acceptance commands unless the caller is a key bound to a principal
     whose actor is on this installation's operator list (or, for ``capability-verify``, verifiers).
@@ -1162,13 +1174,20 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             # (kittrial-5bb.259 item G1: this check used to sit inside the effect). The SYMLINK is
             # tested FIRST (item G2): a symlink to a directory matched is_dir() and was answered with
             # the directory sentence, where the base said the document must not be a symlink at all.
+            #
+            # Known and accepted order change (kittrial-5bb.259 item 2): this check answers before
+            # the operation journal is consulted, so a COMMITTED operation_id retried after the host
+            # turned the path into a directory or a symlink is answered with this refusal instead of
+            # its recorded answer, and an identity reused with different text is answered with this
+            # path sentence instead of 'Operation identity reused with a different request'. Both
+            # need the host to change the path between two calls. The DIRECTORY refusal is made a
+            # second time inside the effect as a backstop (coordinator_effect below), because this
+            # check runs before the project lock and the effect can be reached long afterwards.
             target=path/'ONBOARDING.md'
             if target.is_symlink():
                 raise ValueError('Project onboarding must not be a symlink')
             if target.is_dir():
-                raise ValueError('Project onboarding cannot be written: %s is a directory, not a file. '
-                                 'Remove the directory, or write the document by hand on the host. '
-                                 'Nothing was written.'%target.name)
+                raise onboarding_directory_refusal(target)
         operators=configured_operators(root)
         verifiers=configured_verifiers(root)
         run_warnings=[]
@@ -1211,8 +1230,19 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                 from http_authority import server_time as now_stamp
                 target=path/'ONBOARDING.md'
                 previous=None
-                # The directory and symlink refusals are made BEFORE the guarded write now
-                # (kittrial-5bb.259 items G1 and G2): see the check above coordinator_effect.
+                # The second of the two directory checks, and why there are two: the pre-check
+                # above answers the ordinary case and, for kittrial-5bb.259 item G1, answers before
+                # any identity is reserved. It runs before the project lock, though, so this effect
+                # can be reached long after it, with a directory put there while the call waited.
+                # os.replace over a directory raises IsADirectoryError, which is NOT in
+                # REFUSAL_EXCEPTIONS: the identity would stay reserved and the answer would be
+                # rc 124 "outcome unknown" for a call that wrote nothing - the case kittrial-5bb.242
+                # item 5 fixed. The sentence is the pre-check's, so the caller cannot tell the two
+                # apart. The symlink is deliberately not repeated here: os.replace does not follow
+                # a symlink at the destination, it replaces the link itself, so a link swapped in
+                # after the pre-check cannot raise this way.
+                if target.is_dir():
+                    raise onboarding_directory_refusal(target)
                 if target.is_file() and not target.is_symlink():
                     try:
                         previous=target.read_text(encoding='utf-8-sig')
