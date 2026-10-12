@@ -877,6 +877,43 @@ class HistoryTests(AuthorityChangesCase):
         self.cli('operators', 'add', 'bob', '--actor', 'alice', '--reason', 'pilot')
         self.assertEqual(stat.S_IMODE((self.root / AUDIT).stat().st_mode), 0o600)
 
+    def test_a_null_list_surviving_the_cap_is_not_turned_into_an_empty_list(self):
+        # Mutant R05 (kittrial-5bb.233 finding 6): the fold must keep a null (UNKNOWN) list null, and
+        # the baseline's reason and the drop warning must not claim the trail leads to it.
+        limit = admin.AUTHORITY_CHANGES_MAX
+        names = ['n%03d' % index for index in range(limit)]
+        entries = [dict(self.entry(actor=name), at='2026-10-01T00:00:%02dZ' % (index % 60))
+                   for index, name in enumerate(names)]
+        (self.root / AUDIT).write_text(
+            json.dumps({'schema_version': admin.AUTHORITY_CHANGES_SCHEMA, 'entries': entries,
+                        'baseline': self.good_baseline(lists={'operators': [names[0]], 'verifiers': None})}),
+            encoding='utf-8')
+        _, err = self.cli('operators', 'add', 'bob', '--actor', 'alice', '--reason', 'pilot')
+        self.assertIsNone(self.baseline()['lists']['verifiers'])       # NOT an empty list
+        self.assertEqual(self.baseline()['lists']['operators'], [names[0]])
+        reason = self.baseline()['reason']
+        self.assertEqual(reason.count('UNKNOWN'), 1)                   # the clause is said once
+        self.assertNotIn('still leads to the lists', reason)
+        self.assertIn('stays null (UNKNOWN)', reason)
+        self.assertNotIn('still leads to the lists', err)
+        self.assertIn('does not lead to it', err)
+
+    def test_the_capped_reader_note_does_not_promise_the_null_list_either(self):
+        # The same wording rule in the reader's own cap sentence.
+        limit = admin.AUTHORITY_CHANGES_MAX
+        names = ['n%03d' % index for index in range(limit)]
+        (self.root / AUDIT).write_text(
+            json.dumps({'schema_version': admin.AUTHORITY_CHANGES_SCHEMA,
+                        'entries': [dict(self.entry(actor=name), at='2026-10-01T00:00:%02dZ' % (index % 60))
+                                    for index, name in enumerate(names)],
+                        'baseline': self.good_baseline(lists={'operators': [names[0]], 'verifiers': None})}),
+            encoding='utf-8')
+        report = json.loads(self.cli('authority-changes')[0])
+        note = report['replay']['note']
+        self.assertIn('cap of %d entries' % limit, note)
+        self.assertNotIn('still leads to the lists', note)
+        self.assertIn('the verifiers list stays null (UNKNOWN) there, so the trail does not lead to it', note)
+
 
 class RestoreRegrantTests(AuthorityChangesCase):
     """Review item 2: the one route that undoes a revocation is recorded in the same audit."""
@@ -940,6 +977,38 @@ class RestoreRegrantTests(AuthorityChangesCase):
         self.assertIn('operators add op1 --actor james --reason ', warning)
         self.assertEqual(self.marker.read_bytes(), before)          # nothing was re-granted
         self.assertEqual((self.root / AUDIT).read_text(encoding='utf-8'), '{nope')
+
+    def test_a_regrant_naming_the_placeholder_is_refused_and_records_nothing(self):
+        # kittrial-5bb.233 finding 5: the restore re-grant route used to record OPERATOR as a real
+        # operator even though nobody of that name is listed. A re-grant is an ADD, so it is refused,
+        # and the restore reports what was not re-granted and exits 3, as for a damaged audit.
+        before = self.marker.read_bytes()
+        with patch.object(admin, 'missing_operators', return_value=['op1']), \
+                patch.object(admin, 'missing_verifiers', return_value=[]), \
+                contextlib.redirect_stdout(io.StringIO()):
+            warning = admin.restore_authority(self.root, 'lm', restore_operators=True,
+                                              actor='OPERATOR', reason='after a rollback')
+        self.assertIn('was NOT re-granted', warning)
+        self.assertIn('placeholder', warning)
+        self.assertIn('operators add op1 --actor OPERATOR', warning)
+        self.assertIn('Replace OPERATOR in --actor', warning)
+        self.assertIn('restore-new exits %d' % admin.RESTORE_AUTHORITY_NOT_REGRANTED, warning)
+        self.assertEqual(self.marker.read_bytes(), before)          # nothing was re-granted
+        self.assertIsNone(self.audit())                             # and nothing was recorded
+
+    def test_a_regrant_naming_a_real_operator_named_OPERATOR_is_recorded(self):
+        # The placeholder is not a real name only while nobody lists it: a listed OPERATOR re-grants.
+        self.marker.write_text(json.dumps({'password': 'x', 'unit': 'none',
+                                           'operators': [OPERATOR, 'OPERATOR'],
+                                           'verifiers': [VERIFIER]}), encoding='utf-8')
+        with patch.object(admin, 'missing_operators', return_value=['op1']), \
+                patch.object(admin, 'missing_verifiers', return_value=[]), \
+                contextlib.redirect_stdout(io.StringIO()):
+            warning = admin.restore_authority(self.root, 'lm', restore_operators=True,
+                                              actor='OPERATOR', reason='after a rollback')
+        self.assertIsNone(warning)
+        self.assertEqual(self.entries()[-1]['operator'], 'OPERATOR')
+        self.assertIn('op1', self.stored()['operators'])
 
     def test_the_regrant_commands_a_refused_restore_prints_are_never_bare(self):
         # Round-2 review item 3: the bare form records a null operator and prints the warning, so
@@ -1343,8 +1412,14 @@ class RemovalWithUnreadableListTests(AuthorityChangesCase):
         self.assertEqual(json.loads(out), {'operators': [OPERATOR, 'compromised', 'new-op']})
         self.assertEqual(self.entries()[-1]['actor'], 'new-op')
         report = json.loads(self.cli('authority-changes')[0])
-        self.assertEqual(report['replay']['state'], 'incomplete')
-        self.assertIsNone(report['replay']['agrees'])
+        # The trail's operators list has no entry for `compromised`, so the list this read COULD
+        # compare does not agree: the answer is the false, not the null an incomplete read would
+        # give (kittrial-5bb.233 finding 1a). The verifiers list is unreadable, and the note says
+        # the mismatch is reported although it could not be compared.
+        self.assertEqual(report['replay']['state'], 'mismatch')
+        self.assertFalse(report['replay']['agrees'])
+        self.assertIsNone(report['replay']['lists']['verifiers'])
+        self.assertIn('although the trail is incomplete for verifiers', report['replay']['note'])
 
     def test_a_baseline_holding_a_list_as_null_reads_incomplete_after_a_repair(self):
         self.unusable()
@@ -1416,6 +1491,152 @@ class RemovalWithUnreadableListTests(AuthorityChangesCase):
         self.assertNotIn('  ', note)
 
 
+class MismatchBesideUnknownListTests(AuthorityChangesCase):
+    """kittrial-5bb.233 finding 1a: a comparable mismatch is reported beside an unknown list."""
+
+    def null_verifiers_baseline(self):
+        (self.root / AUDIT).write_text(
+            json.dumps({'schema_version': 1, 'entries': [self.good_entry(actor=OPERATOR)],
+                        'baseline': self.good_baseline(lists={'operators': [OPERATOR], 'verifiers': None})}),
+            encoding='utf-8')
+
+    def test_a_hand_added_operator_is_a_mismatch_beside_a_null_verifiers_baseline(self):
+        # The reviewer's `in/exp8.py N2` shape: the baseline holds verifiers as null (UNKNOWN) and a
+        # name was added to operators by hand. replay.agrees used to stay null, so a script told to
+        # read that field saw no mismatch at all.
+        self.null_verifiers_baseline()
+        config = self.stored()
+        config['operators'] = config['operators'] + ['sneaked']
+        self.marker.write_text(json.dumps(config), encoding='utf-8')
+        report = json.loads(self.cli('authority-changes')[0])
+        self.assertEqual(report['replay']['lists']['operators']['listed_but_not_in_trail'], ['sneaked'])
+        self.assertFalse(report['replay']['agrees'])
+        self.assertEqual(report['replay']['state'], 'mismatch')
+        self.assertIsNone(report['replay']['lists']['verifiers'])
+        note = report['replay']['note']
+        self.assertTrue(note.startswith('The trail is incomplete for verifiers'), note)
+        self.assertIn('sneaked', note)
+        self.assertIn('although the trail is incomplete for verifiers', note)
+
+    def test_a_hand_added_verifier_is_a_mismatch_beside_a_null_operators_baseline(self):
+        # The mirror case: the OTHER list is the unknown one.
+        (self.root / AUDIT).write_text(
+            json.dumps({'schema_version': 1,
+                        'entries': [self.good_entry(list='verifiers', actor=VERIFIER)],
+                        'baseline': self.good_baseline(lists={'operators': None, 'verifiers': [VERIFIER]})}),
+            encoding='utf-8')
+        config = self.stored()
+        config['verifiers'] = config['verifiers'] + ['sneaked']
+        self.marker.write_text(json.dumps(config), encoding='utf-8')
+        report = json.loads(self.cli('authority-changes')[0])
+        self.assertEqual(report['replay']['lists']['verifiers']['listed_but_not_in_trail'], ['sneaked'])
+        self.assertFalse(report['replay']['agrees'])
+        self.assertEqual(report['replay']['state'], 'mismatch')
+        self.assertIsNone(report['replay']['lists']['operators'])
+        self.assertIn('although the trail is incomplete for operators', report['replay']['note'])
+
+    def test_a_mismatch_beside_a_list_unreadable_now_is_reported_too(self):
+        # The same rule when the list is unreadable NOW rather than null in the baseline.
+        (self.root / AUDIT).write_text(
+            json.dumps({'schema_version': 1, 'entries': [self.good_entry(actor=OPERATOR)],
+                        'baseline': self.good_baseline()}), encoding='utf-8')
+        self.marker.write_text(json.dumps({'password': 'x', 'unit': 'none',
+                                           'operators': [OPERATOR, 'sneaked'], 'verifiers': 5}),
+                               encoding='utf-8')
+        report = json.loads(self.cli('authority-changes')[0])
+        self.assertFalse(report['replay']['agrees'])
+        self.assertEqual(report['replay']['state'], 'mismatch')
+        self.assertIn('although the trail is incomplete for verifiers', report['replay']['note'])
+
+    def test_no_comparable_mismatch_stays_incomplete(self):
+        # The other half of the rule: null/incomplete only while no comparable list mismatches.
+        self.null_verifiers_baseline()
+        report = json.loads(self.cli('authority-changes')[0])
+        self.assertTrue(report['replay']['lists']['operators']['agrees'])
+        self.assertIsNone(report['replay']['agrees'])
+        self.assertEqual(report['replay']['state'], 'incomplete')
+        self.assertNotIn('does not lead to', report['replay']['note'])
+
+
+class RebaselineTests(AuthorityChangesCase):
+    """kittrial-5bb.233 finding 1b: authority-changes-baseline takes a FRESH history."""
+
+    def null_baseline_history(self):
+        (self.root / AUDIT).write_text(
+            json.dumps({'schema_version': 1, 'entries': [self.good_entry(actor=OPERATOR)],
+                        'baseline': self.good_baseline(lists={'operators': [OPERATOR], 'verifiers': None})}),
+            encoding='utf-8')
+
+    def kept_histories(self):
+        return sorted(self.root.glob(AUDIT + admin.AUTHORITY_CHANGES_REPLACED + '*'))
+
+    def test_a_null_baseline_is_left_behind_and_a_later_hand_edit_warns_again(self):
+        self.null_baseline_history()
+        before = (self.root / AUDIT).read_bytes()
+        # Before the command the reader says incomplete for good: the baseline holds verifiers null.
+        self.assertEqual(json.loads(self.cli('authority-changes')[0])['replay']['state'], 'incomplete')
+        out, err = self.cli('authority-changes-baseline', '--actor', OPERATOR,
+                            '--reason', 'the verifiers value was repaired')
+        report = json.loads(out)
+        self.assertTrue(report['replay']['agrees'])
+        self.assertEqual(report['replay']['state'], 'agrees')
+        self.assertEqual(self.entries(), [])                       # a fresh history, no old entries
+        self.assertEqual(self.baseline()['lists'],
+                         {'operators': [OPERATOR], 'verifiers': [VERIFIER]})
+        self.assertEqual(self.baseline()['operator'], OPERATOR)
+        self.assertIn('authority-changes-baseline', self.baseline()['reason'])
+        self.assertIn('the verifiers value was repaired', self.baseline()['reason'])
+        # The old history is kept beside the runtime, byte for byte, under a .replaced- name - and it
+        # is NOT a .damaged- name, because the reader lists those as damage.
+        kept = self.kept_histories()
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0].read_bytes(), before)
+        self.assertEqual(report['previous_audit_kept_as'], kept[0].name)
+        self.assertIn(kept[0].name, err)
+        self.assertIn('fresh authority-changes history', err)
+        self.assertEqual([name for name in report['damaged_files'] if 'replaced' in name], [])
+        # A later hand edit of a list warns again: the fresh baseline made the trail usable.
+        config = self.stored()
+        config['verifiers'] = config['verifiers'] + ['sneaked']
+        self.marker.write_text(json.dumps(config), encoding='utf-8')
+        report = json.loads(self.cli('authority-changes')[0])
+        self.assertFalse(report['replay']['agrees'])
+        self.assertEqual(report['replay']['state'], 'mismatch')
+        self.assertEqual(report['replay']['lists']['verifiers']['listed_but_not_in_trail'], ['sneaked'])
+
+    def test_a_history_with_no_audit_file_is_started_without_a_kept_file(self):
+        self.assertEqual(self.audit(), None)
+        out, err = self.cli('authority-changes-baseline', '--actor', OPERATOR, '--reason', 'start clean')
+        report = json.loads(out)
+        self.assertTrue(report['replay']['agrees'])
+        self.assertIsNone(report['previous_audit_kept_as'])
+        self.assertEqual(self.kept_histories(), [])
+        self.assertEqual(self.entries(), [])
+
+    def test_a_list_that_cannot_be_read_refuses_the_command(self):
+        self.marker.write_text(json.dumps({'password': 'x', 'unit': 'none',
+                                           'operators': [OPERATOR], 'verifiers': 5}), encoding='utf-8')
+        before = self.marker.read_bytes()
+        message, err = self.cli_refusal('authority-changes-baseline', '--actor', OPERATOR, '--reason', 'repair')
+        self.assertIn('cannot both be read', message)
+        self.assertIn('verifiers', message)
+        self.assertEqual(self.audit(), None)
+        self.assertEqual(self.marker.read_bytes(), before)
+        self.assertEqual(self.kept_histories(), [])
+
+    def test_only_a_configured_operator_may_take_the_baseline(self):
+        message, err = self.cli_refusal('authority-changes-baseline', '--actor', 'nobody', '--reason', 'repair')
+        self.assertIn('nobody', message)
+        self.assertEqual(self.audit(), None)
+
+    def test_the_reason_is_bounded_by_what_the_baseline_reason_can_hold(self):
+        message, err = self.cli_refusal('authority-changes-baseline', '--actor', OPERATOR,
+                                        '--reason', 'x' * 400)
+        self.assertIn('at most', message)
+        self.assertEqual(self.audit(), None)
+        self.assertEqual(self.kept_histories(), [])
+
+
 class PlaceholderOnRemovalTests(AuthorityChangesCase):
     """kittrial-5bb.229 rev-2 item 3: a removal is never harder WITH the flags than without."""
 
@@ -1480,6 +1701,72 @@ class PlaceholderOnRemovalTests(AuthorityChangesCase):
                 with self.assertRaisesRegex(ValueError, 'placeholder'):
                     self.cli(*argv)
         self.assertIsNone(self.audit())
+
+    def test_the_removal_placeholder_sentence_says_the_entry_stays_unattributed(self):
+        # kittrial-5bb.233 finding 4: the sentence used to say to run the removal again "with the real
+        # value", but the name is already gone, so running it again is a no-op that records nothing.
+        out, err = self.cli('operators', 'remove', OPERATOR, '--confirm-revoke',
+                            '--actor', 'OPERATOR', '--reason', 'TEXT')
+        self.assertIn('recorded WITHOUT an operator', err)
+        self.assertIn('stays unattributed', err)
+        self.assertIn('the name is already gone', err)
+        self.assertIn('no-op', err)
+        self.assertIn('next real change', err)
+        self.assertNotIn('Replace it with the real value', err)
+        # What it says is true: the removal happened, and running it again records nothing.
+        entries = self.entries()
+        self.cli('operators', 'remove', OPERATOR, '--confirm-revoke', '--actor', 'alice', '--reason', 'again')
+        self.assertEqual(self.entries(), entries)
+
+    def racing(self, remove):
+        """``deployment_config_lock`` that removes ``remove`` from the operators list on entry."""
+        real = admin.deployment_config_lock
+
+        def wrapper(root):
+            config = json.loads(self.marker.read_text(encoding='utf-8'))
+            config['operators'] = [name for name in config['operators'] if name != remove]
+            self.marker.write_text(json.dumps(config), encoding='utf-8')
+            return real(root)
+
+        return wrapper
+
+    def test_the_placeholder_check_is_remade_under_the_deployment_lock(self):
+        # kittrial-5bb.233 finding 5, the reviewer's `in/race.py`: OPERATOR is listed when the
+        # arguments are checked, and another change removes OPERATOR before the lock is taken. The add
+        # must not be recorded with an operator nobody lists.
+        self.marker.write_text(json.dumps({'password': 'x', 'unit': 'none',
+                                           'operators': [OPERATOR, 'OPERATOR'],
+                                           'verifiers': [VERIFIER]}), encoding='utf-8')
+        with patch.object(admin, 'deployment_config_lock', self.racing('OPERATOR')):
+            message, err = self.cli_refusal('operators', 'add', 'bob',
+                                            '--actor', 'OPERATOR', '--reason', 'pilot')
+        self.assertIn('placeholder', message)
+        self.assertIsNone(self.audit())                        # nothing was recorded
+        self.assertEqual(self.stored()['operators'], [OPERATOR])   # the concurrent removal stands
+        self.assertNotIn('bob', self.stored()['operators'])
+
+    def test_the_placeholder_check_is_remade_for_verifiers_too(self):
+        # The same race on the verifiers command, whose placeholder is judged against the OPERATOR
+        # list: it must be re-read under the lock too.
+        self.marker.write_text(json.dumps({'password': 'x', 'unit': 'none',
+                                           'operators': [OPERATOR, 'OPERATOR'],
+                                           'verifiers': [VERIFIER]}), encoding='utf-8')
+        with patch.object(admin, 'deployment_config_lock', self.racing('OPERATOR')):
+            message, err = self.cli_refusal('verifiers', 'add', 'v2',
+                                            '--actor', 'OPERATOR', '--reason', 'pilot')
+        self.assertIn('placeholder', message)
+        self.assertIsNone(self.audit())
+        self.assertEqual(self.stored()['verifiers'], [VERIFIER])
+
+    def test_a_real_listed_operator_named_OPERATOR_survives_the_recheck(self):
+        # The recheck must not lock out a real operator named OPERATOR: with the name still listed
+        # under the lock, the add is recorded and attributed to it.
+        self.marker.write_text(json.dumps({'password': 'x', 'unit': 'none',
+                                           'operators': [OPERATOR, 'OPERATOR'],
+                                           'verifiers': [VERIFIER]}), encoding='utf-8')
+        self.cli('operators', 'add', 'bob', '--actor', 'OPERATOR', '--reason', 'pilot')
+        self.assertEqual(self.entries()[-1]['operator'], 'OPERATOR')
+        self.assertEqual(self.stored()['operators'], [OPERATOR, 'OPERATOR', 'bob'])
 
 
 class SmallerFindingTests(AuthorityChangesCase):
@@ -1576,6 +1863,50 @@ class SmallerFindingTests(AuthorityChangesCase):
         self.assertEqual(report['replay']['lists']['operators']['current'], sorted([OPERATOR, 'bob']))
         self.assertIn('more than once', report['replay']['note'])
 
+    def test_the_fresh_history_sentence_comes_after_the_write(self):
+        # Mutant R06 (kittrial-5bb.233 finding 6): the sentence saying a fresh history starts must be
+        # printed only once that history is on disk. A write that fails must not have said it, while
+        # the damaged bytes are still kept aside first.
+        path = self.root / AUDIT
+        path.write_text('{nope', encoding='utf-8')
+        real = admin.atomic_private_write
+
+        def fail_audit(target, text):
+            if Path(target).name == AUDIT:
+                raise OSError(28, 'No space left on device (injected)')
+            return real(target, text)
+
+        err = io.StringIO()
+        with patch.object(admin, 'atomic_private_write', side_effect=fail_audit), \
+                patch.object(admin, 'root_path', return_value=self.root), \
+                patch.object(sys, 'argv', ['admin.py', '--root', str(self.root), 'operators', 'remove',
+                                           OPERATOR, '--confirm-revoke', '--actor', 'alice', '--reason', 'gone']), \
+                contextlib.redirect_stderr(err):
+            with self.assertRaises(OSError):
+                admin.main()
+        self.assertNotIn('a fresh history starts', err.getvalue())
+        self.assertEqual(path.read_text(encoding='utf-8'), '{nope')     # the path is never absent
+        self.assertEqual(len(self.asides()), 1)                         # the bytes were kept first
+
+    def test_the_temporary_copy_giving_up_is_a_sentence_not_a_traceback(self):
+        # Mutant R13b (kittrial-5bb.233 finding 6): when every one of the 64 temporary copy names is
+        # taken, the refusal is a sentence naming the count, not a traceback.
+        path = self.root / AUDIT
+        path.write_text('{nope', encoding='utf-8')
+        destination = self.root / (AUDIT + admin.AUTHORITY_CHANGES_DAMAGED + '20260101T000000Z')
+        taken = self.root / ('.%s.tmp-%s' % (destination.name, 'a' * 16))
+        taken.write_text('taken', encoding='utf-8')
+        with patch.object(admin, 'remove_private_write_leftovers', lambda root: []), \
+                patch.object(admin, 'authority_change_aside_name', return_value=destination), \
+                patch.object(admin.os, 'link', side_effect=OSError(1, 'Operation not permitted (injected)')), \
+                patch.object(admin.secrets, 'token_hex', return_value='a' * 16):
+            message, err = self.cli_refusal('operators', 'remove', OPERATOR, '--confirm-revoke')
+        self.assertIn('could not write a temporary copy', message)
+        self.assertIn(str(admin.AUTHORITY_CHANGE_ASIDE_ATTEMPTS), message)
+        self.assertNotIn('Traceback', message)
+        self.assertEqual(taken.read_text(encoding='utf-8'), 'taken')     # never opened or truncated
+        self.assertEqual(path.read_text(encoding='utf-8'), '{nope')
+
 
 class DocumentationTests(unittest.TestCase):
     def test_operations_documents_the_audit_the_reader_and_the_keep_working_rule(self):
@@ -1626,19 +1957,42 @@ class DocumentationTests(unittest.TestCase):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, text)
 
+    def test_operations_documents_the_fresh_baseline_and_the_downgrade(self):
+        # kittrial-5bb.233 findings 1b, 3, 4 and 6.
+        text = (KIT / 'docs' / 'OPERATIONS.md').read_text(encoding='utf-8')
+        for phrase in ('authority-changes-baseline',
+                       'authority-changes.audit.json.replaced-<UTC date-time>',
+                       'A removal FROM the list whose own value cannot be read is',
+                       'is not history for an older kit',
+                       'cannot tell such a file apart from',
+                       'a second removal is a no-op',
+                       'the mismatch is',
+                       'although the other list could not be compared'):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, text)
+
     def test_the_capability_payload_summary_matches_the_behaviour(self):
-        # Item 2: the payload is a revision of the behaviour, inside the closed field set.
+        # Item 2: the payload is a REVISION of the behaviour, not a propose. It carries `revision`
+        # and `expected_sha256` (the accepted revision it revises), so the field set must ALLOW both
+        # and the payload must REQUIRE them; the old form pinned the propose shape, and a corrected
+        # file failed it (kittrial-5bb.233 finding 2).
         payload = json.loads((KIT / 'capability-proposals' /
                               'deployment.list-changes-audited.json').read_text(encoding='utf-8'))
         self.assertEqual(set(payload) - {'schema_version', 'operation_id', 'key', 'name', 'aliases',
                                         'summary', 'requirements', 'anchors', 'code', 'tests',
-                                        'owner', 'tags'}, set())
+                                        'owner', 'tags', 'revision', 'expected_sha256'}, set())
+        self.assertIn('revision', payload)
+        self.assertIn('expected_sha256', payload)
+        self.assertIsInstance(payload['revision'], int)
+        self.assertGreaterEqual(payload['revision'], 2)
+        self.assertRegex(payload['expected_sha256'], r'^[0-9a-f]{64}$')
         self.assertLessEqual(len(payload['summary']), 1200)
         self.assertIn('A damaged audit never refuses a REMOVAL', payload['summary'])
         self.assertIn('null (UNKNOWN)', payload['summary'])
         self.assertIn('incomplete', payload['summary'])
         self.assertIn('recorded unattributed', payload['summary'])
-        self.assertIn('a REMOVAL is never refused for the audit or an unreadable list', payload['summary'])
+        self.assertIn('a REMOVAL never is, for the audit or the OTHER list', payload['summary'])
+        self.assertIn('authority-changes-baseline', payload['summary'])
 
 
 if __name__ == '__main__':
