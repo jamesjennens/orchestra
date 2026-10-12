@@ -1011,8 +1011,9 @@ The rules:
   The mapping feeds the no-self rules and nothing else: it does not let that actor (or
   any SSH caller who declares a name in that namespace) revise the account's proposals
   or submit proposals that read as the account's.
-- **No credential triages.** `reviews.approve` is never granted to a worker or agent
-  credential.
+- **No credential triages.** A worker credential never holds `reviews.approve`; an agent's
+  credential holds it only through the coordinator grant, for approving a contribution, and
+  the triage and decision routes refuse every credential whatever it holds.
 - **Refusals** from the canonical rules (a stale read, an illegal transition, a no-self
   rule) answer 422 with the rule's message. Proposal text is never in an error body or
   the audit log; the audit records the action and the proposal key.
