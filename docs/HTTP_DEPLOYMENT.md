@@ -11,7 +11,7 @@ block; ordinary SSH operations without configured web authority keep their answe
 
 `GET /v1/projects/{id}/merge-slot` reads the native slot, its holder and matching saved task/target. It also reports the caller's exact actor and current permissions. Readers may be ordinary members or credentials; taking and releasing require `coordinate`: a signed-in coordinator, owner or superuser, or a personal agent with the active per-project coordinator grant while its account holds that role. A worker credential never gets this capability. With `coordinator_writes` on, this verified web authority decides the web take/release path even if no host operator is listed; the host `coordinate` path retains its original listed-operator checks and answers. `independent_approval` still requires the current standing independent contribution approval before acquisition.
 
-The project page has take/release controls and shows the exact holder name. A person's holder is the stable `usr_...` id bound by the endpoint; a granted personal agent's is its bound `agent_...` id. These are the names the host rule and own-party checks see, not editable attribution labels or display names.
+The project page has take/release controls and shows the holder by name with the exact holder id beside it (`holder_name` and `holder` in the read; kittrial-5bb.198): an account's or agent's display name, or a host session's registered name and principal. A person's holder is the stable `usr_...` id bound by the endpoint; a granted personal agent's is its bound `agent_...` id. These are the names the host rule and own-party checks see, not editable attribution labels or display names.
 
 | Route | Closed request body | Authority |
 | --- | --- | --- |
@@ -851,10 +851,14 @@ stopped half way through is finished or removed with the same two commands
   reading), `unregistered` (made and not registered) and `server` (`used`, `limit`).
   An entry whose `by` is `host` was made by an operator with `admin.py add-project`, and
   the page says so ("Started on the server by an operator"); any other entry was started
-  from the web interface by the account it names. The list holds only projects with a
-  creation record: one made before creation records existed, restored from a backup, or
-  whose record was set aside is not listed, and is registered by its name as before.
-  (Listing those needs a read of the host's projects that the endpoint does not have yet.)
+  from the web interface by the account it names. `unrecorded` lists the initialized
+  projects of the runtime that are not registered here and have no creation record (made
+  before creation records existed, restored from a backup, or whose record was set
+  aside), read through the web-service-only `host-projects` action (below); the page
+  shows them as "On the server, not registered", names nobody as their maker and gives
+  them the same "Register…" button. `host_projects` is `available`, or `unavailable`
+  (the endpoint predates the read) or `unknown` (it could not be asked), and the page
+  says so when the list could not be read.
 - **To finish it**, an operator runs `admin.py finish-project NAME`. It works when the
   project was initialized (`projects/NAME/.beads/metadata.json` exists): the settings,
   the backup target, the merge slot and a backup are each done or done again. The
@@ -1930,12 +1934,33 @@ role, a superuser, an agent's credential, as the members list does) and changes 
   returned. Otherwise `rules` is empty and `state` says why: `unknown` (the host could
   not read its settings or could not be asked), `unavailable` (its endpoint predates the
   read) or `not-applicable` (no host).
+- `host_operators`: `{state, operators}`: the installation's operator list, read fresh
+  through the web-service-only `host-coordination` action (below), with the states of
+  `host_rules`.
 
 The settings page ("Members & settings") shows it as "Who coordinates" to every member,
 with no control on it, and reads it again after an owner changes a role or a grant there.
 A superuser of the server may also act as a coordinator in any project; the page says
-so. The host's operator list and the names of host sessions are not shown: the endpoint
-has no read for them yet.
+so.
+
+**Host session names** (kittrial-5bb.198). Where a project is known (the task list, a
+task, its brief and history, a claim refused because another holds the task, the merge
+slot), an actor `session-<uuid>` that is no account or agent is shown by the name it was
+registered with and the principal it is mapped to, "Cloud lane (person james)"; the id
+stays in the answer beside the name. The names come from the `host-coordination` action
+and are reused for 30 seconds per project, so a session registered just now may show by
+its id that long. With no host, an older host or a registry that cannot be read, the id
+is shown as before.
+
+**The two host reads.** `host-coordination` (one project: `operators`, and `sessions` as
+`{actor, name, principal}`, or `null` with `sessions_note` when the registry cannot be
+read) and `host-projects` (no project: the initialized projects whose creation, if any,
+finished) are read-only endpoint actions: no lock, no write, no arguments. The web service
+sends them without an authority block; they are not in the endpoint's capability table.
+Both are in the endpoint's `SERVICE_ONLY_ACTIONS`, so a key bound to a project or a
+principal is refused them before anything is read: a worker's key is not told the
+operator list, other sessions' names or the runtime's other projects. Run on the server
+without a bound key, they answer as they answer the web service.
 
 **Going back to a kit older than this one.** First, in every project, set every member
 whose role is `coordinator` to `contributor` or `owner`, and remove every coordinator grant.

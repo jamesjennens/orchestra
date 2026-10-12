@@ -2805,6 +2805,41 @@ class EndpointBackend:
         """
         return self._run('setup-status', project_id, self.actor_namespace + '/read', [])
 
+    #: How long the host's session names of one project are reused (kittrial-5bb.198). A task
+    #: list names its assignees on every read, and a session registered just now may show by
+    #: its id for this long.
+    HOST_NAMES_SECONDS = 30
+
+    def host_coordination(self, project_id, fresh=False):
+        """The installation's operators and the project's sessions (kittrial-5bb.198).
+
+        One read-only ``host-coordination`` endpoint action, sent without an authority block:
+        ``{'operators': [...], 'sessions': [{'actor', 'name', 'principal'}] or None,
+        'sessions_note'}``. Kept for :data:`HOST_NAMES_SECONDS` per project unless ``fresh``.
+        An endpoint that predates the action refuses it as an unknown action (``HttpError``).
+        """
+        cache = self.__dict__.setdefault('_host_coordination', {})
+        now = time.monotonic()
+        held = cache.get(project_id)
+        if not fresh and held is not None and now - held[0] < self.HOST_NAMES_SECONDS:
+            return held[1]
+        result = self._run('host-coordination', project_id, self.actor_namespace + '/read', [])
+        if not isinstance(result, dict):
+            raise HttpError(502, 'bad_gateway', 'The server answered the host-coordination read with no document')
+        cache[project_id] = (now, result)
+        return result
+
+    def host_projects(self):
+        """The runtime's initialized projects whose creation finished (kittrial-5bb.198; superusers).
+
+        One read-only ``host-projects`` endpoint action, sent without an authority block.
+        """
+        result = self._run('host-projects', None, self.actor_namespace + '/read', [])
+        names = result.get('projects') if isinstance(result, dict) else None
+        if not isinstance(names, list):
+            raise HttpError(502, 'bad_gateway', 'The server answered the host-projects read with no list')
+        return [name for name in names if isinstance(name, str)]
+
     def review_states(self, project_id, queue=None):
         """Review state per task from the canonical ``work`` projection.
 
@@ -2996,6 +3031,25 @@ def unreadable_row(task_id):
                      'Task %s exists, but its row cannot be read (it is malformed or nested too deeply). '
                      'Ask an operator of the server to repair it.' % task_id,
                      {'task': task_id, 'state': 'unreadable'})
+
+
+def session_label(item):
+    """How a host session is shown (kittrial-5bb.198): its registered name and the principal it is
+    mapped to, ``'Cloud lane (lane cloud)'`` or ``'Review (person james)'``; None when the host
+    knows neither, so the caller keeps the id."""
+    if not isinstance(item, dict):
+        return None
+    name = item.get('name') if isinstance(item.get('name'), str) and item.get('name').strip() else None
+    principal = item.get('principal') if isinstance(item.get('principal'), str) else None
+    mapped = None
+    if principal and ':' in principal:
+        kind, _, who = principal.partition(':')
+        mapped = '%s %s' % (kind, who)
+    if name and mapped:
+        return '%s (%s)' % (name, mapped)
+    if mapped:
+        return 'a session of %s' % mapped
+    return name
 
 
 def _row_id(text):
@@ -3966,9 +4020,35 @@ class ApiHandler(BaseHTTPRequestHandler):
         view['next_action'] = next_action(view)
         return view
 
-    def _task_views(self, tasks):
-        names = self.service.actor_names([t.get('assignee') for t in tasks])
+    def _task_views(self, tasks, project_id=None):
+        names = self._actor_names([t.get('assignee') for t in tasks], project_id)
         return [self._task_view(t, names) for t in tasks]
+
+    def _actor_names(self, actors, project_id=None):
+        """Display names, as :meth:`Service.actor_names` gives them, and a host session's too.
+
+        A session actor of the project (``session-<uuid>``) that is no account or agent is
+        shown by its registered session name and the principal it is mapped to, as the host
+        reports them in the read-only ``host-coordination`` action (kittrial-5bb.198), instead
+        of by its id. The id stays in the answer beside the name. With no project, no host, an
+        older host or a registry that cannot be read, the id is shown as before.
+        """
+        names = self.service.actor_names(actors)
+        waiting = [actor for actor in actors if isinstance(actor, str) and names.get(actor) == actor
+                   and actor_names.SESSION_ACTOR.fullmatch(actor)]
+        read = getattr(self.backend, 'host_coordination', None)
+        if project_id is None or not waiting or read is None:
+            return names
+        try:
+            sessions = read(project_id).get('sessions') or []
+        except HttpError:
+            return names
+        known = {item.get('actor'): item for item in sessions if isinstance(item, dict)}
+        for actor in waiting:
+            shown = session_label(known.get(actor))
+            if shown:
+                names[actor] = shown
+        return names
 
     #: Said when a recommendation is refused because it is not independent of the author.
     NOT_INDEPENDENT = ('A recommendation must be independent of the author: the contribution\'s author, the '
@@ -4607,6 +4687,22 @@ class ApiHandler(BaseHTTPRequestHandler):
                              what='It is complete on the server and not registered here. Register it as a superuser '
                                   '(Register a project, with this name), or retire it on the server.',
                              finish=None, remove=None) for item in waiting]
+        # Initialized on the host, not registered here and with no creation record (kittrial-5bb.198):
+        # made before creation records existed, restored from a backup, or its record set aside.
+        # From the read-only ``host-projects`` action; what cannot be read is said, not hidden.
+        recorded = {item.get('project') for item in found['items'] + found['created']}
+        unrecorded, listed = [], 'available'
+        read = getattr(self.backend, 'host_projects', None)
+        try:
+            for project in read() if read else ():
+                if project not in registered and project not in recorded:
+                    unrecorded.append({'project': project, 'state': 'unrecorded-unregistered', 'by': None,
+                                       'by_name': None, 'stage': None, 'started_at': None, 'stopped_at': None,
+                                       'what': self.UNRECORDED, 'finish': None, 'remove': None})
+        except HttpError as error:
+            listed = 'unavailable' if 'Unknown action' in str(error.detail or '') else 'unknown'
+        if read is None:
+            listed = 'unavailable'
         server = found['server']
         if server is None and not found.get('server_readable', True):
             server = {'used': None, 'limit': None,
@@ -4617,7 +4713,13 @@ class ApiHandler(BaseHTTPRequestHandler):
                       'note': 'Counts every project database on the server: archived and retired projects and '
                               'unfinished creations too, because their databases stay on it. An operator changes '
                               'the limit (admin.py project-creations --set-server-limit N --actor OPERATOR).'}
-        return 200, {'items': items, 'unregistered': unregistered, 'server': server, 'host': 'available'}
+        return 200, {'items': items, 'unregistered': unregistered, 'unrecorded': unrecorded,
+                     'host_projects': listed, 'server': server, 'host': 'available'}
+
+    #: An initialized project on the host with no creation record and no registration here.
+    UNRECORDED = ('It is a project on the server with no creation record (made before records existed, restored '
+                  'from a backup, or its record was set aside), and it is not registered here. Register it as a '
+                  'superuser (Register a project, with this name), or retire it on the server.')
 
     @route('PUT', r'/v1/accounts/(?P<uid>' + ID + r')/project-grant')
     def account_project_grant(self, ctx):
@@ -4871,6 +4973,10 @@ class ApiHandler(BaseHTTPRequestHandler):
                 return False
         result['can_coordinate'] = allowed(CAP_COORDINATE)
         result['can_force_release'] = allowed(CAP_PROJECT_ADMIN) and ctx.principal.via == 'session'
+        # The holder as people know it (kittrial-5bb.198): an account's or agent's name, or a host
+        # session's name and principal. `holder` stays the exact name a forced release compares.
+        holder = result.get('holder')
+        result['holder_name'] = self._actor_names([holder], ctx.params['pid']).get(holder) if isinstance(holder, str) else None
         return 200, result
 
     def _merge_slot_write(self, ctx, operation):
@@ -6087,7 +6193,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         else:
             result = {'items': rows[state['o']:state['o'] + limit], 'total': snapshot.get('total', len(rows))}
             complete = review_states(result['items'])
-        result['items'] = self._task_views(result['items'])
+        result['items'] = self._task_views(result['items'], ctx.params['pid'])
         # False when some rows' review state is unknown (``review_state: null``): the
         # bounded canonical projection did not cover them, or they are closed tasks
         # whose finished review the queue no longer lists.
@@ -6123,7 +6229,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         self._project(ctx, CAP_READ)
         row = self.backend.get_task(ctx.params['pid'], ctx.params['tid'])
         self._refuse_record_anchor(row)
-        return 200, self._task_views([row])[0]
+        return 200, self._task_views([row], ctx.params['pid'])[0]
 
     def _row_or_none(self, project_id, task_id):
         """The task's row for deciding why another read of it failed; None when this read fails too."""
@@ -6710,7 +6816,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         advice = [review.get('recommendation')] if review.get('recommendation') else []
         advice += review.get('recommendations') or []
         actors += [entry.get('author') for entry in advice]
-        names = self.service.actor_names(actors)
+        names = self._actor_names(actors, pid)
         task = dict(brief['task'], review_state=review.get('state') or 'none')
         brief['task'] = self._task_view(task, names)
         if checkpoint:
@@ -6847,7 +6953,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                     raise conflict(refusal.message, detail) from None
                 # Somebody else has it. Nobody takes a task over through a claim, an owner
                 # included (kittrial-5bb.187); said with the holder's name as people know it.
-                shown = self.service.actor_names([held_by]).get(held_by) or held_by
+                shown = self._actor_names([held_by], ctx.params['pid']).get(held_by) or held_by
                 raise conflict('Task is already claimed by %s' % shown, detail) from None
             return result, result
         return self._mutate(ctx, 'tasks.claim', ctx.params['pid'], claim,
@@ -7044,7 +7150,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                                            state['o'], canonical=state['x'])
         who = lambda e: (e.get('user_id') or e.get('author')) if isinstance(e, dict) else None
         # (A canonical entry's author may be structured; ActorNames.get ignores it.)
-        names = self.service.actor_names([who(e) for e in result['items']])
+        names = self._actor_names([who(e) for e in result['items']], ctx.params['pid'])
         body = {'items': [dict(e, user_name=names.get(who(e))) if isinstance(e, dict) else e
                           for e in result['items']], 'total': result['total']}
         if result.get('activity_cursor'):
@@ -7076,7 +7182,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                      item['review_state'] in ACTIVE_REVIEW_STATES)]
         body = self._paged(ctx, items, limit, state, complete=bool(read.get('complete')),
                            generated_at=now_iso(self.service._now()))
-        body['items'] = self._task_views(body['items'])
+        body['items'] = self._task_views(body['items'], ctx.params['pid'])
         return 200, body
 
     @route('GET', r'/v1/me/work')
