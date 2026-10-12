@@ -22,6 +22,7 @@ from handoff import (
     parse_identity as parse_handoff_identity,
 )
 from lifecycle import PREFIX as LIFECYCLE_PREFIX
+from lifecycle_voids import PREFIX as LIFECYCLE_CORRECTION_PREFIX
 from requirements import ACCEPTANCE_FIELDS, SHA256_TEXT
 from recovery import PREFIX as VOID_PREFIX
 from requirement_owner_records import (ACCEPTANCE_PREFIX as OWNER_REQUIREMENT_ACCEPTANCE_PREFIX,
@@ -208,6 +209,8 @@ RESERVED = (
     (REVIEW_PREFIX, 'contribution/review record', 'review TASK --file payload.json'),
     (CHECKPOINT_PREFIX, 'task checkpoint', 'checkpoint TASK --file checkpoint.json'),
     (LIFECYCLE_PREFIX, 'lifecycle evidence record', 'lifecycle.py record --file event.json'),
+    (LIFECYCLE_CORRECTION_PREFIX, 'host lifecycle correction record',
+     'admin.py lifecycle-event-void|lifecycle-event-retract on the coordination host'),
     (REQUIREMENT_PREFIX, 'requirement revision', 'requirement_records.py draft|revise'),
     (ACCEPTANCE_PREFIX, 'requirement acceptance evidence', 'admin.py requirement-apply'),
     (OWNER_REQUIREMENT_ACCEPTANCE_PREFIX, 'owner requirement acceptance evidence', 'the owner requirements page'),
@@ -241,6 +244,8 @@ PREFIXES = tuple(prefix for prefix, _, _ in RESERVED)
 # review item `smaller` b): otherwise a raw `Kind: capability-entry-v7` would be
 # writable and then hidden. A later writer of vN ships its own tolerant-reader step.
 _RECORD_KIND_RESERVATIONS = {
+    'lifecycle-event-correction': ('host lifecycle correction record',
+                                  'admin.py lifecycle-event-void|lifecycle-event-retract on the coordination host'),
     'reference-entry': ('reference catalog entry', 'ref propose|revise'),
     'reference-acceptance': ('reference acceptance evidence', 'admin.py reference-apply'),
     'requirement-proposal': ('requirement proposal', 'proposal submit|revise'),

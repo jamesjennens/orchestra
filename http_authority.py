@@ -918,9 +918,10 @@ class NativeRunner:
     it returns whatever the dispatch returns and raises whatever it raises.
     """
 
-    __slots__ = ('_dispatch', 'attempted_write', 'calls', 'wrote')
+    __slots__ = ('_dispatch', 'attempted_write', 'calls', 'wrote',
+                 'lifecycle_project', '_lifecycle_void_journal')
 
-    def __init__(self, dispatch):
+    def __init__(self, dispatch, project=None):
         self._dispatch = dispatch
         self.attempted_write = False
         self.calls = 0
@@ -928,6 +929,8 @@ class NativeRunner:
         #: journal): the answer is then the answer of a write, with the server's time
         #: (kittrial-5bb.97). It says nothing about refusals, which `attempted_write` decides.
         self.wrote = False
+        self.lifecycle_project = project
+        self._lifecycle_void_journal = None
 
     def __call__(self, argv):
         self.calls += 1

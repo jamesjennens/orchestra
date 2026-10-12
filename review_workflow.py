@@ -448,6 +448,19 @@ def listed_operator_actor(actor, operators=None, owners=None):
     return any(mapping.get(name) == principal for name in authority)
 
 
+def operator_owners(project):
+    """Lazy registry input for operator eligibility, independent of writer-rule flags."""
+    def load():
+        import sessions
+        try:
+            return sessions.owners(project)
+        except (ValueError, OSError):
+            raise ValueError('The project session registry cannot be read; bound-principal operator '
+                             'eligibility cannot be proved. A listed operator repairs the registry; '
+                             'no native write was attempted.') from None
+    return load
+
+
 def fields(value, expected):
     if not isinstance(value, dict) or set(value) != expected:
         raise ValueError('Invalid review workflow fields')
@@ -1752,7 +1765,7 @@ def require_independent_approval(issue, what, task, operators=None, owners=None,
 
 
 def require_integrated_follow_on(payload, state, ordered, rows, task, assignee=None, operators=None,
-                                 journal=None):
+                                 journal=None, owners=None):
     """Refuse an additive follow-on whose prior revision is not genuinely approved.
 
     ``follows`` asserts that the reviewer's base is already integrated, so the gate
@@ -1836,7 +1849,7 @@ def require_integrated_follow_on(payload, state, ordered, rows, task, assignee=N
     # Main usually moves before a follow-on is ready (kittrial-5bb.148). The base may also
     # be an integration commit this project recorded AFTER the prior one. See
     # recorded_integrations for what that can and cannot know.
-    recorded, newest = recorded_integrations(rows, task, evidence, operators, journal)
+    recorded, newest = recorded_integrations(rows, task, evidence, operators, journal, owners)
     found = recorded.get(base)
     if found == 'later':
         return
@@ -1912,7 +1925,7 @@ def _recorded_at(value):
     return stamp if stamp.tzinfo is not None else stamp.replace(tzinfo=datetime.timezone.utc)
 
 
-def recorded_integrations(rows, task, prior, operators=None, journal=None):
+def recorded_integrations(rows, task, prior, operators=None, journal=None, owners=None):
     """``({commit: 'later' | 'earlier' | 'reverted'}, newest later commit or None)`` for a follow-on's base.
 
     ``prior`` is the integration evidence of ``task``'s prior revision (``review_state.integration``).
@@ -1949,7 +1962,13 @@ def recorded_integrations(rows, task, prior, operators=None, journal=None):
     # kittrial-5bb.155), so a position in it says nothing about which came first.
     created = {row.get('id'): _recorded_at(row.get('created_at')) for row in rows
                if isinstance(row, dict) and row.get('issue_type') == 'event'}
-    listed = {name for name in (operators or []) if isinstance(name, str) and name}
+    if owners is None and journal is not None:
+        owners = operator_owners(journal)
+    loaded = []
+    def once_owners():
+        if not loaded:
+            loaded.append(owner_map(owners))
+        return loaded[0]
     reverted = set()
     for found in reverts_by_task(rows, operators, journal)[0].values():
         reverted |= {str(record.get('integration_commit') or '').lower() for record in found}
@@ -1971,7 +1990,7 @@ def recorded_integrations(rows, task, prior, operators=None, journal=None):
                 reading = 'reverted'
             elif prior_time is None or stamp is None or not stamp > prior_time:
                 reading = 'earlier'
-            elif fact.get('actor') in listed:
+            elif _recorded_operator(fact.get('actor'), operators, once_owners):
                 reading = 'later'
             else:
                 # Later, and recorded by somebody who is not a listed operator: not a base. The
@@ -1989,6 +2008,14 @@ def recorded_integrations(rows, task, prior, operators=None, journal=None):
             if reading == 'later' and (newest is None or stamp > newest[0]):
                 newest = (stamp, commit)
     return recorded, (newest[1] if newest else None)
+
+
+def _recorded_operator(actor, operators, owners):
+    """Unreadable ownership never confers the common bound-operator eligibility."""
+    try:
+        return listed_operator_actor(actor, operators, owners)
+    except (ValueError, OSError):
+        return False
 
 
 def _retry_matches(stored, incoming):
@@ -2189,7 +2216,7 @@ def execute(rows, task, actor, payload, run, operators=None, journal=None, revie
     # here, still before the sole native mutation, so the refusal writes nothing.
     if payload['operation'] == 'contribute' and payload.get('follows') is not None:
         require_integrated_follow_on(payload, state, ordered, rows, task, issue.get('assignee'),
-                                     operators, journal)
+                                     operators, journal, owners)
     result = json.loads(run(['comments', 'add', task, PREFIX + canonical_bytes(payload).decode(), '--json']))
     return dict(comment_id=str(result['id']), reconciled=False, **receipt(preview, rows, task))
 

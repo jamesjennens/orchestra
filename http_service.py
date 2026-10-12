@@ -1333,6 +1333,8 @@ def own_queue_tasks(queue, actor=None):
                       'redelivered':fields.get('redelivered'),
                       'checkpoint_at':fields.get('checkpoint_at'),
                       'newer_activity':fields.get('newer_activity')})
+        if row.get('lifecycle_reasons'):
+            tasks[-1]['lifecycle_reasons'] = dict(row['lifecycle_reasons'])
     return {'tasks':tasks,'complete':bool(queue.get('complete'))}
 
 
@@ -2825,6 +2827,8 @@ class EndpointBackend:
                              'redelivered': attention.get('redelivered'),
                              'checkpoint_at': attention.get('checkpoint_at'),
                              'newer_activity': attention.get('newer_activity')})
+                if item.get('lifecycle_reasons'):
+                    rows[-1]['lifecycle_reasons'] = dict(item['lifecycle_reasons'])
             return {'tasks': rows, 'complete': bool(queue.get('complete'))}
         if not isinstance(actor, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.@/-]{0,95}', actor):
             return {'tasks': [], 'complete': True}

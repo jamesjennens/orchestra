@@ -841,6 +841,9 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
                       'approval_requires_other_party':bool(independent_approval),
                       'waiting_for_approval':approval_wait(state,row['id'],actor,row.get('assignee'),
                           contribution.get('author'),independent_approval,owners,review_request,move_text)})
+        reasons = {dim: state['reason'] for dim, state in fact.items() if state.get('reason')}
+        if reasons:
+            items[-1]['lifecycle_reasons'] = reasons
     from briefing import checkpoint_queue_fields
     task_rows={row['id']:row for row in rows if isinstance(row,dict) and row.get('id')}
     # The bounded claimable-work view (kittrial-5bb.6 deliverable b): filter to the rows
@@ -950,6 +953,8 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
         rows=record_json.loads_rows(run(['export','--all']))
         from reserved_comments import RECORD_ANCHOR_LABELS
         rows=record_json.classify(rows,run,sorted(RECORD_ANCHOR_LABELS)+['gt:slot'], ['event','gate'])
+        from lifecycle import host_snapshot
+        rows=host_snapshot(rows, run=run, project=path)
         return queue(rows,actor,args,path/'.handoff-requests', operators=operators, journal=path,
                      reference_attention=True, verifiers=verifiers,
                      independent_approval=independent_approval,owners=owners)
@@ -959,6 +964,8 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
         from briefing import task_row
         from lifecycle import read_event_rows
         rows=read_event_rows(run)
+        from lifecycle import host_snapshot
+        rows=host_snapshot(rows, run=run, project=path)
         issue=task_row(rows,task)
         from review_state import scopes_for
         return workflow(issue,scopes_for(rows,task),operators=operators,journal=path,
@@ -979,6 +986,8 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
         return handoff(path,actor,payload,run)
     from lifecycle import read_event_rows
     rows=read_event_rows(run)
+    from lifecycle import host_snapshot
+    rows=host_snapshot(rows, run=run, project=path)
     if payload.get('operation')=='recommend':
         # A reviewer's recommendation (kittrial-5bb.115) is a record beside the review
         # chain: it has its own writer and never passes through the chain's.

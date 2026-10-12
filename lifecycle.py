@@ -415,16 +415,48 @@ def scoped_event(events,task,dim,scope):
     return max(matching,key=lambda e:e['order'])
 
 
+def classified_events(rows):
+    """Every historical lifecycle event, with optional trusted host correction context.
+
+    Keep a voided event in its ordering position. Dropping it could revive an older
+    passed event. A changed/deleted target gets the same bound position from the
+    host record; native JSON fields cannot supply this host context.
+    """
+    from lifecycle_voids import Snapshot
+    correction = rows.lifecycle_corrections if isinstance(rows, Snapshot) else {}
+    reasons = correction.get('reasons', {})
+    found = []
+    positions = set()
+    for row in rows:
+        event = native_event(row)
+        if event and event['dimension'] in (*DIMENSIONS, 'lifecycle-scope', ENABLED, LIVE):
+            reason = correction.get('global_reason') or reasons.get(event['id'])
+            if reason:
+                event['void_reason'] = reason
+            found.append(event)
+            positions.add((event['task'], event['dimension'], event['id']))
+    for entry in correction.get('entries', {}).values():
+        binding = entry['payload']['binding']
+        key = (binding['task'], binding['dimension'], binding['event_id'])
+        reason = correction.get('global_reason') or reasons.get(binding['event_id'])
+        if reason and key not in positions:
+            suffix = binding['event_id'].removeprefix(binding['task'] + '.')
+            found.append(dict(task=binding['task'], dimension=binding['dimension'],
+                              value=binding['value'], payload=binding['payload'],
+                              id=binding['event_id'], order=int(suffix) if suffix.isdigit() else None,
+                              created_at=binding['created_at'], void_reason=reason))
+            positions.add(key)
+    return found
+
+
 def events_by_dimension(rows):
-    """Every exported lifecycle-shaped state event, grouped by (task, dimension)."""
+    """All classified current/historical state events, grouped by task/dimension."""
     # An unreadable event has no trustworthy parent or dimension. An older
     # readable fact cannot establish current truth for any task in this snapshot.
     if unreadable_events(rows):return {}
     events={}
-    for row in rows:
-        event=native_event(row)
-        if event and event['dimension'] in (*DIMENSIONS,'lifecycle-scope',ENABLED,LIVE):
-            events.setdefault((event['task'],event['dimension']),[]).append(event)
+    for event in classified_events(rows):
+        events.setdefault((event['task'],event['dimension']),[]).append(event)
     return events
 
 
@@ -444,12 +476,17 @@ def trusted_payloads(rows,events=None):
     already-recorded scope therefore never hides the current scope's fact.
     """
     if events is None:events=events_by_dimension(rows)
+    from lifecycle_voids import Snapshot
+    global_reason = rows.lifecycle_corrections.get('global_reason') if isinstance(rows, Snapshot) else None
     trusted={}
     for row in rows:
         if not isinstance(row, dict) or row.get('issue_type')=='event' or row.get('malformed') or not row.get('id'):continue
         task=row['id'];labels=row.get('labels') or []
         scope_event=latest_event(events,task,'lifecycle-scope')
         scope=scope_event['payload']['scope'] if label_agrees(labels,scope_event,'lifecycle-scope') and scope_event['payload'] else None
+        scope_reason = scope_event.get('void_reason') if scope_event else None
+        if scope_reason:
+            scope = None
         dimensions={}
         for dim in (*DIMENSIONS,ENABLED,LIVE):
             newest=latest_event(events,task,dim)
@@ -457,12 +494,18 @@ def trusted_payloads(rows,events=None):
                       and label_agrees(labels,newest,dim))
             e=scoped_event(events,task,dim,scope) if scope is not None else None
             valid=labelled and e is not None
+            reason = (global_reason or scope_reason or (e.get('void_reason') if e else None)
+                      or (newest.get('void_reason') if newest and (not labelled or e is None) else None))
+            if reason:
+                valid = False
             # The event id names the event the value came from when the value is
             # trusted; when it is not, it still names the newest event of the
             # dimension, so a caller can see WHICH event made it unknown.
             dimensions[dim]={'scope':scope,'value':e['value'] if valid else 'unknown',
                              'event_id':e['id'] if valid else (newest['id'] if newest is not None else None),
                              'payload':e['payload'] if valid else None}
+            if reason:
+                dimensions[dim]['reason'] = reason
         trusted[task]=dimensions
     return trusted
 
@@ -493,6 +536,8 @@ def project_facts(rows):
                 value='unknown';evidence=[]
             facts[dim]={'value':value,'event_id':state['event_id'],
                         'evidence':evidence,'provenance':payload['provenance'] if payload else None}
+            if state.get('reason'):
+                facts[dim]['reason'] = state['reason']
         result.append({'id':row['id'],'title':row.get('title',''),'status':row.get('status'),
                        'scope':dimensions[DIMENSIONS[0]]['scope'],'facts':facts,'live':live,
                        'has_lifecycle':any((row['id'],dim) in events for dim in (*DIMENSIONS,'lifecycle-scope'))})
@@ -516,6 +561,8 @@ def enabled_states(rows):
                        'evidence':payload['evidence'] if payload else [],
                        'defect_task':payload.get('defect_task') if payload else None,
                        'actor':payload['actor'] if payload else None,'scope':state['scope']})
+        if state.get('reason'):
+            result[-1]['reason'] = state['reason']
     return result
 
 
@@ -537,6 +584,8 @@ def untrusted_reason(dim,labels,found,scope_trusted,orders):
     if len([v for v in labels if v.startswith(dim+':')])>1:
         return 'the task has more than one native %s: label'%dim
     newest=max(found,key=lambda e:e['order'])
+    if newest.get('void_reason') and newest['payload'] is None:
+        return newest['void_reason']
     if newest['payload'] is None:
         return 'the newest %s event has no structured lifecycle payload (raw native set-state)'%dim
     if not label_agrees(labels,newest,dim):
@@ -597,10 +646,15 @@ def scoped_evidence(rows,dimensions=('integrated',)):
                 slot=per_token.setdefault(token,{})
                 prior=slot.get(dim)
                 if prior is None or key>prior[0]:
-                    slot[dim]=(key,{'value':event['value'],'event_id':event['id'],
-                                    'evidence':payload['evidence'],'provenance':payload['provenance'],
+                    reason = event.get('void_reason')
+                    state = {'value':'unknown' if reason else event['value'],'event_id':event['id'],
+                                    'evidence':[] if reason else payload['evidence'],
+                                    'provenance':None if reason else payload['provenance'],
                                     'actor':payload['actor'],'trigger':payload.get('trigger'),
-                                    'defect_task':payload.get('defect_task')})
+                                    'defect_task':payload.get('defect_task')}
+                    if reason:
+                        state['reason'] = reason
+                    slot[dim] = (key, state)
         # One pass over the recorded scopes: the newest recording of a token wins.
         scopes={}
         for event in events.get((task,'lifecycle-scope'),[]):
@@ -612,9 +666,16 @@ def scoped_evidence(rows,dimensions=('integrated',)):
         entries=[]
         for token,(key,event,scope_value) in sorted(scopes.items(),key=lambda kv:(kv[1][0],kv[0]),reverse=True):
             entry={'scope_token':token,'scope':scope_value,'order':event['order']}
+            scope_reason = event.get('void_reason')
+            if scope_reason:
+                entry['scope_reason'] = scope_reason
             for dim in dims:
                 got=per_token.get(token,{}).get(dim)
                 entry[dim]=dict(got[1]) if got else None
+                if scope_reason:
+                    entry[dim] = dict(value='unknown', event_id=got[1]['event_id'] if got else None,
+                                      evidence=[], provenance=None, actor=None, trigger=None,
+                                      defect_task=None, reason=scope_reason)
                 # The recording order of that scope's fact, so a per-environment
                 # liveness reader can order two scopes by the newest LIVE event
                 # rather than by when each scope token first appeared (rev3 item 1).
@@ -993,7 +1054,11 @@ def release_selection(rows,scope,is_ancestor,previous_commit=None,subset=None,re
         chosen=None;reason=entry['untrusted'].get('integrated')
         for candidate in sorted(scopes,key=lambda c:((c.get('integrated') or {}).get('order') or -1,
                                                       (c.get('integrated') or {}).get('event_id') or ''),reverse=True):
-            if (candidate.get('integrated') or {}).get('value')!='passed':continue
+            integration = candidate.get('integrated') or {}
+            if integration.get('value')!='passed':
+                if integration.get('reason'):
+                    reason = 'integrated evidence is unknown: ' + integration['reason']
+                continue
             commit=candidate['scope']['integration_commit']
             if not COMMIT.fullmatch(commit):
                 reason='integration commit is not a full lowercase commit: '+str(commit);continue
@@ -1209,14 +1274,23 @@ def _native_event_row(event_id,task,dimension,value,reason,actor):
             'dependencies':[{'issue_id':event_id,'depends_on_id':task,'type':'parent-child'}]}
 
 
+class OperationIndex(dict):
+    def __init__(self):
+        super().__init__()
+        self.blocked = {}
+
+
 def _operation_index(rows):
     """``{operation_id: (payload, event_id)}`` from one pass over the export."""
-    index={}
+    index=OperationIndex()
     for row in rows:
         if record_json.selected(row, types=['event']) and row.get('malformed'):
             raise ValueError('Event row %s cannot be parsed: %s; operator must reconcile or repair the event'
                              % (row.get('id') or 'unknown', row.get('error') or 'malformed'))
-        event=native_event(row)
+    for event in classified_events(rows):
+        if event['payload'] and event.get('void_reason'):
+            index.blocked[event['payload']['operation_id']] = event['void_reason']
+            continue
         if event and event['payload'] and event['payload']['operation_id'] not in index:
             index[event['payload']['operation_id']]=(event['payload'],event['id'])
     return index
@@ -1231,7 +1305,7 @@ def read_event_rows(run):
     """One export; only an unreadable row needs a complete native event-ID read."""
     rows=record_json.loads_rows(run(['export','--all']))
     try:
-        return record_json.classify(rows,run,types=['event'])
+        return host_snapshot(record_json.classify(rows,run,types=['event']), run=run)
     except (ValueError,OSError,subprocess.SubprocessError) as error:
         raise ValueError('Lifecycle event membership cannot be read: %s; operator must reconcile or repair the event index'
                          % error) from None
@@ -1253,6 +1327,9 @@ def _apply_fact(payload,actor,rows,run,current_scope,op_index,issues,recorded=No
     live (rev2 item 3). A scope that was never recorded is still refused.
     """
     prior=op_index.get(payload['operation_id'])
+    if payload['operation_id'] in getattr(op_index, 'blocked', {}):
+        raise ValueError('Lifecycle operation names an event that reads unknown ('
+                         + op_index.blocked[payload['operation_id']] + '); operator reconciliation required')
     if prior is not None:
         if prior[0]!=payload:raise ValueError('operation ID already used for different content')
         return {'event_id':prior[1],'reconciled':True}
@@ -1512,6 +1589,9 @@ def _check_release_operations(plans,negative,op_index,evidence,operation_id):
     """
     identities={}
     for planned in [p for plan in plans.values() for _,p in plan]+[p for _,p in negative]:
+        if planned['operation_id'] in getattr(op_index, 'blocked', {}):
+            raise ValueError('Release operation names a voided or mismatched lifecycle event; '
+                             'operator reconciliation required for operation ' + operation_id)
         earlier=identities.setdefault(planned['operation_id'],planned)
         if earlier!=planned:raise ValueError('operation ID already used for different content in the same plan; a new operation ID is needed: '+operation_id)
         prior=op_index.get(planned['operation_id'])
@@ -1740,8 +1820,27 @@ def recorded_scope_tokens(rows):
     One pass over the export, shared by the single-fact and release paths so a fact
     may be recorded against any scope a task already has, not only its newest.
     """
-    return {entry['id']:{content_hash(c['scope']) for c in entry['scopes']}
+    return {entry['id']:{content_hash(c['scope']) for c in entry['scopes'] if not c.get('scope_reason')}
             for entry in scoped_evidence(rows,())}
+
+
+def host_snapshot(rows, run=None, project=None):
+    """Attach a host family's context once to this request's native snapshot."""
+    from lifecycle_voids import Snapshot, read_journal, snapshot
+    if isinstance(rows, Snapshot):
+        return rows
+    project = project if project is not None else getattr(run, 'lifecycle_project', None)
+    if project is None:
+        return rows
+    cached = getattr(run, '_lifecycle_void_journal', None) if run is not None else None
+    if cached is None or cached[0] != str(project):
+        cached = (str(project), read_journal(project))
+        if run is not None:
+            try:
+                run._lifecycle_void_journal = cached
+            except (AttributeError, TypeError):
+                pass
+    return snapshot(rows, journal=cached[1])
 
 
 def _declared_targets(raw):

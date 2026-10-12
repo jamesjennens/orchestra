@@ -841,6 +841,7 @@ def lifecycle_authors_command(root,project,limit=None):
     if limit is None:limit=lifecycle.AUTHORS_REPORT_TASK_LIMIT
     if not isinstance(limit,int) or isinstance(limit,bool) or limit<0:raise ValueError('Invalid --limit')
     def run(argv):return run_bd(root,project,argv)
+    run.lifecycle_project = project_dir(root, project)
     rows=lifecycle.read_event_rows(run)
     import sessions
     try:owners=sessions.owners(project_dir(root,project))
@@ -849,6 +850,146 @@ def lifecycle_authors_command(root,project,limit=None):
     report['project']=project
     report['setting']={'lifecycle_authors':coordinator_rule(root,'lifecycle_authors')}
     return report
+
+
+def lifecycle_audit_command(root, project, limit=50, offset=0):
+    """Host read-only audit of native attribution and standing approval evidence."""
+    import lifecycle
+    from lifecycle_voids import audit
+    from review_workflow import operator_owners
+    path = project_dir(root, project)
+    def run(argv):
+        return run_bd(root, project, argv)
+    run.lifecycle_project = path
+    report = audit(lifecycle.read_event_rows(run), operators(root), operator_owners(path),
+                   limit=limit, offset=offset)
+    report['project'] = project
+    return report
+
+
+LIFECYCLE_VOID_WRITES_KEY = 'lifecycle_void_writes'
+LIFECYCLE_VOID_AUDIT_KEY = 'lifecycle_void_writes_audit'
+LIFECYCLE_VOID_AUDIT_MAX = 20
+
+
+def lifecycle_void_writes(root):
+    """Installation-only writer gate: absence is OFF; damaged values refuse writes."""
+    value = config(root).get(LIFECYCLE_VOID_WRITES_KEY, False)
+    if type(value) is not bool:
+        raise ValueError('lifecycle_void_writes must be true or false; operator repairs the setting')
+    return value
+
+
+def lifecycle_void_audit(cfg):
+    entries = cfg.get(LIFECYCLE_VOID_AUDIT_KEY, [])
+    if not isinstance(entries, list) or len(entries) > LIFECYCLE_VOID_AUDIT_MAX:
+        raise ValueError('Lifecycle VOID switch audit is damaged; operator reconciliation required')
+    from recovery import identity
+    from review_workflow import _recorded_at
+    for entry in entries:
+        if (not isinstance(entry, dict) or set(entry) != {'at', 'actor', 'previous', 'enabled'}
+                or type(entry['previous']) is not bool or type(entry['enabled']) is not bool
+                or _recorded_at(entry['at']) is None):
+            raise ValueError('Lifecycle VOID switch audit is damaged; operator reconciliation required')
+        identity(entry['actor'], 'Invalid lifecycle VOID audit actor')
+    return entries
+
+
+def lifecycle_void_switch(root, action, actor):
+    """Same atomic deployment-config lock as other flags; no implicit upgrade enable."""
+    from recovery import identity
+    identity(actor, 'Invalid actor identity')
+    if action not in ('status', 'on', 'off'):
+        raise ValueError('Invalid lifecycle_void_writes action')
+    if not (root / 'deployment.private.json').is_file():
+        raise ValueError('Deployment is not installed; run install first')
+    with deployment_config_lock(root):
+        # Authority is read AFTER acquiring the lock, so a concurrent revocation
+        # cannot be lost between the allowlist check and the setting write.
+        if actor not in operators(root, strict=True):
+            raise ValueError('lifecycle_void_writes requires a listed deployment operator')
+        cfg = config(root)
+        audit = lifecycle_void_audit(cfg)
+        raw = cfg.get(LIFECYCLE_VOID_WRITES_KEY, False)
+        damaged = type(raw) is not bool
+        current = raw if not damaged else None
+        changed = action != 'status' and (damaged or current != (action == 'on'))
+        if action == 'on' and damaged:
+            raise ValueError('Repair lifecycle_void_writes with off before enabling it')
+        if changed:
+            # Preserve the damaged setting in the same atomic document. An
+            # operator can repair it with OFF without manufacturing a prior bool.
+            if damaged:
+                cfg[LIFECYCLE_VOID_WRITES_KEY + '_damaged_' + utc_stamp()] = raw
+            audit = (audit + [dict(at=utc_stamp(), actor=actor,
+                                  previous=raw if not damaged else False,
+                                  enabled=action == 'on')])[-LIFECYCLE_VOID_AUDIT_MAX:]
+            cfg[LIFECYCLE_VOID_WRITES_KEY] = action == 'on'
+            cfg[LIFECYCLE_VOID_AUDIT_KEY] = audit
+            atomic_private_write(root / 'deployment.private.json', json.dumps(cfg))
+            current = action == 'on'
+        last = audit[-1] if audit else None
+        return dict(lifecycle_void_writes=current, changed=changed,
+                    audit_history=audit, audit_records=len(audit),
+                    audit_agrees=(last['enabled'] == current) if last and current is not None else None,
+                    audit_note='damaged setting' if damaged and not changed else
+                               ('no entry' if last is None else 'agrees' if last['enabled'] == current else 'stale'),
+                    enable_requirement='Install VOID reader, backup and restore support on every installation '
+                                       'before enabling writes. Older kits ignore these corrections.')
+
+
+def lifecycle_correction_command(root, project, operation, target, actor, reason, evidence,
+                                 operation_id=None):
+    """Host-only VOID/retraction of one exact event, without changing native facts."""
+    import fcntl
+    import lifecycle_voids as voids
+    from recovery import identity
+    from review_workflow import operator_owners, listed_operator_actor
+    identity(actor, 'Invalid actor identity')
+    key = operation_id or ('lifecycle-' + secrets.token_hex(16))
+    voids._identity(key, 'operation identity')
+    voids._text(reason, 'reason', 1000)
+    if operation not in ('void', 'retract'):
+        raise ValueError('Invalid lifecycle correction operation')
+    if not isinstance(evidence, list) or not 1 <= len(evidence) <= 20:
+        raise ValueError('Evidence needs one to twenty nonblank pointers')
+    for pointer in evidence:
+        voids._text(pointer, 'evidence')
+    path = project_dir(root, project)
+    if not (path / '.beads/metadata.json').is_file():
+        raise ValueError('Unknown/uninitialized project')
+    if (path / '.coordination.lock').is_symlink():
+        raise ValueError('Coordination lock must not be a symlink')
+    with (path / '.coordination.lock').open('a') as lock, deployment_config_lock(root):
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        authority = operators(root, strict=True)
+        owners = operator_owners(path)
+        if not listed_operator_actor(actor, authority, owners):
+            raise ValueError('Lifecycle correction requires a currently listed operator or its bound actor')
+        enabled = lifecycle_void_writes(root)
+        if not enabled:
+            raise ValueError('lifecycle_void_writes is off; nothing was changed')
+        def run(argv):
+            return run_bd(root, project, ['--actor', actor, *argv])
+        rows = record_json.loads_rows(run(['export', '--all']))
+        target_void = None
+        if operation == 'retract':
+            journal = voids.read_journal(path)
+            if journal['invalid']:
+                raise ValueError('Lifecycle VOID journal is damaged; operator reconciliation required')
+            entry = journal['entries'].get(target)
+            if entry is None or entry['payload']['operation'] != 'void':
+                raise ValueError('Retraction names an existing host VOID operation identity')
+            binding = entry['payload']['binding']
+            target_void = target
+        else:
+            candidates = [row for row in rows if row.get('id') == target]
+            if len(candidates) != 1:
+                raise ValueError('Lifecycle correction event is missing or ambiguous')
+            binding = voids.event_binding(candidates[0])
+        payload = dict(schema_version=1, operation=operation, operation_id=key, actor=actor,
+                       reason=reason, evidence=evidence, binding=binding, target_void=target_void)
+        return voids.apply(rows, actor, payload, run, path, authority, owners, enabled)
 
 
 #: The key of the installation setting that accepts bound keys only, and the key of its short
@@ -3534,8 +3675,8 @@ def validate_coordination_files(files):
     if not isinstance(files,dict):raise ValueError('Invalid coordination files map')
     for name,record in files.items():
         quarantine = isinstance(name,str) and re.fullmatch(r'\.feedback\.jsonl\.(?:[a-f0-9]{16}|[a-f0-9]{64})\.incomplete',name)
-        journal = isinstance(name,str) and re.fullmatch(r'(?:\.coordination-requests|\.handoffs|\.handoff-requests|\.handoff-recoveries|\.requirement-requests|\.requirement-owner-requests|\.requirement-backfills|\.integration-reverts|\.reference-requests|\.proposal-requests|\.capability-requests|\.open-item-requests|\.owner-answers)/[a-f0-9]{64}\.json',name)
-        if name not in ('.merge-context.json','ONBOARDING.md','GUIDANCE.md','.guidance.json','.guidance-clear.json','.sessions.json','.feedback.jsonl','.requirements-governance.json','.requirements-governance-source.json') and not quarantine and not journal:raise ValueError('Invalid coordination backup path')
+        journal = isinstance(name,str) and re.fullmatch(r'(?:\.coordination-requests|\.handoffs|\.handoff-requests|\.handoff-recoveries|\.requirement-requests|\.requirement-owner-requests|\.requirement-backfills|\.integration-reverts|\.lifecycle-voids|\.reference-requests|\.proposal-requests|\.capability-requests|\.open-item-requests|\.owner-answers)/[a-f0-9]{64}\.json',name)
+        if name not in ('.merge-context.json','ONBOARDING.md','GUIDANCE.md','.guidance.json','.guidance-clear.json','.sessions.json','.feedback.jsonl','.requirements-governance.json','.requirements-governance-source.json','.lifecycle-voids-manifest.json') and not quarantine and not journal:raise ValueError('Invalid coordination backup path')
         if not isinstance(record,dict):raise ValueError('Invalid coordination record')
         if name=='.sessions.json':
             from sessions import validate
@@ -3596,6 +3737,8 @@ def validate_coordination_files(files):
             validate_quarantine_record(name,record)
     from requirement_governance import validate_files as validate_governance_files
     validate_governance_files(files)
+    from lifecycle_voids import validate_backup as validate_void_backup
+    validate_void_backup(files)
     # The guidance text and its audit record are one generation: a backup that
     # carries the text but not the matching record (or a record whose version is not
     # the hash of the text) is refused rather than restored as a mismatched pair
@@ -4006,6 +4149,19 @@ def backup_project(root,name):
         fcntl.flock(lock,fcntl.LOCK_EX)
         atomic(bundle,{'schema_version':1,'status':'pending'})
         files={}
+        from lifecycle_voids import backup_files as void_backup_files
+        from lifecycle_voids import read_journal as read_void_journal
+        void_journal = read_void_journal(path)
+        if void_journal['invalid']:
+            raise ValueError('Cannot back up an unreadable/incomplete lifecycle VOID family')
+        if void_journal['present']:
+            # Verify the complete host/native pair under the same project lock
+            # as the subsequent native sync, not just the JSON file shapes.
+            native_rows = record_json.loads_rows(run_bd(root,name,['export','--all']))
+            void_files = void_backup_files(path,native_rows)
+            from lifecycle_voids import validate_backup as validate_void_backup
+            validate_void_backup(void_files,native_rows)
+            files.update(void_files)
         from requirement_governance import snapshot as governance_snapshot
         files.update(governance_snapshot(path,name))
         if (path/'.coordination-requests').is_symlink() or (path/'.merge-context.json').is_symlink():raise ValueError('Coordination paths must not be symlinks')
@@ -5340,6 +5496,8 @@ def restore_coordination(root,source,destination,restore_operators=False,restore
     # directory is not. Report it before any coordination or journal write, so the operator
     # learns here whether the restored Dolt really is the generation the journal describes.
     report_native_backup_change(root,source)
+    from lifecycle_voids import validate_backup as validate_void_backup
+    validate_void_backup(files)
     for name in files:
         target=path/name
         if target.is_symlink() or target.parent.is_symlink() or target.with_suffix('.tmp').is_symlink():raise ValueError('Coordination restore paths must not be symlinks')
@@ -5380,7 +5538,21 @@ def restore_coordination(root,source,destination,restore_operators=False,restore
         from guidance import version_of as guidance_version
         if files['.guidance.json'].get('version')!=guidance_version(files['GUIDANCE.md']['text']):
             raise ValueError('Invalid guidance backup: the audit record does not match the guidance text')
+    # Install this family as one explicitly uncertain generation, before other
+    # sidecar writes. A hard cut retains the marker until the exact restore is
+    # retried; it cannot expose an older passing event between member writes.
+    import lifecycle_voids as voids
+    if voids.MANIFEST in files or os.path.lexists(str(path/voids.DIRECTORY)) or os.path.lexists(str(path/voids.RESTORE_MARKER)):
+        import fcntl
+        if (path/'.coordination.lock').is_symlink():
+            raise ValueError('Coordination restore lock must not be a symlink')
+        with (path/'.coordination.lock').open('a') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            native_rows=record_json.loads_rows(run_bd(root,destination,['export','--all']))
+            voids.restore_files(path,files,native_rows)
     for name,record in files.items():
+        if name==voids.MANIFEST or name.startswith(voids.DIRECTORY+'/'):
+            continue
         target=project_dir(root,destination)/name
         target.parent.mkdir(exist_ok=True)
         if name.startswith('.handoff-recoveries/'):
@@ -7760,6 +7932,20 @@ def main():
     a.add_argument('--limit',type=int,default=None,
                    help='list at most this many tasks, in the order the export gives them; the counts cover '
                         'every task either way (default 200)')
+    a=sub.add_parser('lifecycle-audit',help='read-only, paged lifecycle event attribution/approval audit; '
+                                         'questionable evidence for operator review, not a finding of fraud')
+    a.add_argument('project')
+    a.add_argument('--limit',type=int,default=50)
+    a.add_argument('--offset',type=int,default=0)
+    a=sub.add_parser('lifecycle_void_writes',help='read or flip the audited installation VOID writer gate (OFF by default)')
+    a.add_argument('action',choices=['status','on','off'])
+    a.add_argument('--actor',required=True)
+    for command, target in (('lifecycle-event-void','event'), ('lifecycle-event-retract','void_operation')):
+        a=sub.add_parser(command,help='host-only lifecycle correction; native facts remain unchanged',allow_abbrev=False)
+        a.add_argument('project');a.add_argument(target)
+        a.add_argument('--actor',required=True);a.add_argument('--reason',required=True)
+        a.add_argument('--evidence',required=True,action='append')
+        a.add_argument('--operation-id',default=None,help='retain the returned identity for an exact retry after uncertainty')
     a=sub.add_parser('capability-verify',help='record verified capability checks (operator allowlist or verifiers list)')
     a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('authorized-keys',help='print the confined contributor and unrestricted operator authorized_keys lines for one public key')
@@ -8470,6 +8656,15 @@ def main():
         print(json.dumps(coordinator_rules_switch(root,args.action,rules[0] if rules else None,args.actor)))
     elif args.command=='lifecycle-authors':
         print(json.dumps(lifecycle_authors_command(root,args.project,args.limit)))
+    elif args.command=='lifecycle-audit':
+        print(json.dumps(lifecycle_audit_command(root,args.project,args.limit,args.offset)))
+    elif args.command=='lifecycle_void_writes':
+        print(json.dumps(lifecycle_void_switch(root,args.action,args.actor)))
+    elif args.command in ('lifecycle-event-void','lifecycle-event-retract'):
+        operation='void' if args.command=='lifecycle-event-void' else 'retract'
+        target=args.event if operation=='void' else args.void_operation
+        print(json.dumps(lifecycle_correction_command(root,args.project,operation,target,args.actor,
+                         args.reason,args.evidence,args.operation_id)))
     elif args.command=='authorized-keys':
         authorized_keys(root,args.key_file,args.role,args.python,args.comment,args.project,args.principal)
     elif args.command=='authorized-keys-list':

@@ -1,0 +1,685 @@
+"""Host-issued corrections of named lifecycle events, with native-first retries.
+
+The journal is the host boundary, as for integration reverts. A native comment
+alone is never a correction. Authorization is checked at write time; an issued
+correction stays effective after operator replacement until an authorized linked
+retraction. Actor names on an unbound host remain attribution, not authentication.
+Nothing in this module creates a directory on a read.
+"""
+import json
+import hashlib
+import os
+import re
+import stat
+from pathlib import Path
+
+import record_json
+from requirements import canonical_bytes, content_hash
+
+DIRECTORY = '.lifecycle-voids'
+MANIFEST = '.lifecycle-voids-manifest.json'
+RESTORE_MARKER = '.lifecycle-void-restore.json'
+PREFIX = 'Kind: lifecycle-event-correction-v1\n'
+MAX_RECORD_BYTES = 24000
+MAX_RECORDS = 1000
+MAX_FAMILY_BYTES = 4 * 1024 * 1024
+BINDING_FIELDS = {'event_id', 'task', 'dimension', 'value', 'created_by', 'payload',
+                  'created_at', 'payload_sha256', 'native_sha256'}
+PAYLOAD_FIELDS = {'schema_version', 'operation', 'operation_id', 'actor', 'reason',
+                  'evidence', 'binding', 'target_void'}
+ENTRY_FIELDS = {'schema_version', 'payload', 'sha256', 'comment_id', 'created_at'}
+UNKNOWN_JOURNAL = 'lifecycle-void-journal-unreadable'
+
+
+def entry_bytes(entry):
+    # Exactly the serialization coordination.atomic publishes (including its
+    # separator spaces), so admission cannot emit a file its reader rejects.
+    return json.dumps(entry, ensure_ascii=False, sort_keys=True).encode('utf-8')
+
+
+def _text(value, name, limit=500):
+    if not isinstance(value, str) or not value.strip() or '\0' in value or len(value) > limit:
+        raise ValueError(name + ': require bounded nonblank text')
+    return value
+
+
+def _identity(value, name):
+    _text(value, name, 300)
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.@/-]*', value):
+        raise ValueError('Invalid ' + name)
+    return value
+
+
+def event_binding(row):
+    """Bind an exact lifecycle-shaped native row, including raw/untrusted facts."""
+    from lifecycle import native_event, DIMENSIONS, ENABLED, LIVE
+    event = native_event(row)
+    if event is None or event['dimension'] not in (*DIMENSIONS, 'lifecycle-scope', ENABLED, LIVE):
+        raise ValueError('Target is not a readable lifecycle state event')
+    for key in ('id', 'created_by', 'created_at'):
+        _text(row.get(key), 'native ' + key, 300)
+    parents = [{'depends_on_id': d.get('depends_on_id'), 'type': d.get('type')}
+               for d in row.get('dependencies', []) if d.get('type') == 'parent-child']
+    bound = {key: row.get(key) for key in
+             ('id', 'issue_type', 'title', 'description', 'created_by', 'created_at')}
+    bound['parents'] = parents
+    return dict(event_id=row['id'], task=event['task'], dimension=event['dimension'],
+                value=event['value'], created_by=row['created_by'], created_at=row['created_at'],
+                payload=event['payload'],
+                payload_sha256=content_hash(event['payload']) if event['payload'] else None,
+                native_sha256=content_hash(bound))
+
+
+def validate_payload(payload):
+    if not isinstance(payload, dict) or set(payload) != PAYLOAD_FIELDS:
+        raise ValueError('Invalid lifecycle correction fields')
+    if type(payload['schema_version']) is not int or payload['schema_version'] != 1:
+        raise ValueError('Invalid lifecycle correction version')
+    if payload['operation'] not in ('void', 'retract'):
+        raise ValueError('Invalid lifecycle correction operation')
+    _identity(payload['operation_id'], 'operation identity')
+    _identity(payload['actor'], 'actor')
+    _text(payload['reason'], 'reason', 1000)
+    evidence = payload['evidence']
+    if not isinstance(evidence, list) or not 1 <= len(evidence) <= 20:
+        raise ValueError('Evidence needs one to twenty nonblank pointers')
+    for pointer in evidence:
+        _text(pointer, 'evidence')
+    binding = payload['binding']
+    if not isinstance(binding, dict) or set(binding) != BINDING_FIELDS:
+        raise ValueError('Invalid lifecycle correction target binding')
+    for key in ('event_id', 'task'):
+        _identity(binding[key], key)
+    for key in ('dimension', 'value', 'created_by', 'created_at'):
+        _text(binding[key], key, 300)
+    from lifecycle import DIMENSIONS, ENABLED, LIVE
+    if binding['dimension'] not in (*DIMENSIONS, 'lifecycle-scope', ENABLED, LIVE):
+        raise ValueError('Invalid lifecycle correction dimension')
+    for key in ('native_sha256', 'payload_sha256'):
+        if key == 'payload_sha256' and binding[key] is None:
+            continue
+        if not isinstance(binding[key], str) or not re.fullmatch('[a-f0-9]{64}', binding[key]):
+            raise ValueError('Invalid lifecycle correction hash')
+    original = binding['payload']
+    if original is None:
+        if binding['payload_sha256'] is not None:
+            raise ValueError('Raw lifecycle correction target has a payload hash')
+    else:
+        from lifecycle import validate_payload as validate_fact
+        validate_fact(original)
+        if (content_hash(original) != binding['payload_sha256']
+                or any(original[key] != binding[key] for key in ('task', 'dimension', 'value'))
+                or original['actor'] != binding['created_by']):
+            raise ValueError('Lifecycle correction target payload binding mismatch')
+    if payload['operation'] == 'void':
+        if payload['target_void'] is not None:
+            raise ValueError('A void has no retraction target')
+    else:
+        _identity(payload['target_void'], 'void operation identity')
+        if payload['target_void'] == payload['operation_id']:
+            raise ValueError('A retraction cannot name itself')
+    if len(canonical_bytes(payload)) > MAX_RECORD_BYTES:
+        raise ValueError('Lifecycle correction exceeds its byte bound')
+    return payload
+
+
+def validate_entry(entry, name=None):
+    if not isinstance(entry, dict) or set(entry) != ENTRY_FIELDS:
+        raise ValueError('Invalid lifecycle void journal entry')
+    if type(entry['schema_version']) is not int or entry['schema_version'] != 1:
+        raise ValueError('Invalid lifecycle void journal version')
+    validate_payload(entry['payload'])
+    _identity(entry['comment_id'], 'native correction comment identity')
+    _text(entry['created_at'], 'native correction timestamp', 100)
+    from review_workflow import _recorded_at
+    if _recorded_at(entry['created_at']) is None:
+        raise ValueError('Invalid native lifecycle correction timestamp')
+    digest = content_hash(entry['payload'])
+    if entry['sha256'] != digest or (name is not None and name != digest + '.json'):
+        raise ValueError('Lifecycle void journal hash/path does not match its payload')
+    if len(entry_bytes(entry)) > MAX_RECORD_BYTES:
+        raise ValueError('Lifecycle void journal entry exceeds its byte bound')
+    return entry
+
+
+def _read_regular(path):
+    if path.is_symlink():
+        raise ValueError('Lifecycle void journal entry is a symlink')
+    flags = os.O_RDONLY | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_NOFOLLOW', 0)
+    fd = os.open(path, flags)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_RECORD_BYTES:
+            raise ValueError('Lifecycle void journal entry is not a bounded regular file')
+        with os.fdopen(fd, 'rb', closefd=False) as stream:
+            blob = stream.read(MAX_RECORD_BYTES + 1)
+        if len(blob) > MAX_RECORD_BYTES:
+            raise ValueError('Lifecycle void journal entry exceeds its byte bound')
+        return blob
+    finally:
+        os.close(fd)
+
+
+def read_journal(project):
+    """Bounded host-family read; damage never silently restores a voided fact."""
+    result = dict(entries={}, invalid=[], present=False, bytes=0)
+    if project is None:
+        return result
+    # Written before replacing any restore member and cleared only after the
+    # complete family/native pair is checked. Any shape means uncertainty.
+    if os.path.lexists(str(Path(project) / RESTORE_MARKER)):
+        result['invalid'].append('lifecycle-void-restore-incomplete')
+    directory = Path(project) / DIRECTORY
+    if not directory.exists() and not directory.is_symlink():
+        return result
+    result['present'] = True
+    if directory.is_symlink() or not directory.is_dir():
+        result['invalid'].append(UNKNOWN_JOURNAL)
+        return result
+    total = 0
+    before = None
+    try:
+        before = directory.stat()
+        # Stop enumeration at the bound rather than allocating an arbitrary directory.
+        with os.scandir(directory) as scan:
+            names = []
+            for entry in scan:
+                names.append(entry.name)
+                if len(names) > MAX_RECORDS:
+                    raise ValueError('Lifecycle void journal exceeds its record bound')
+        for name in sorted(names):
+            # Atomic/probe temporaries confer no authority and are not records.
+            if re.fullmatch(r'(?:[a-f0-9]{64}|\.writable-[a-f0-9]{32})\.tmp', name):
+                continue
+            try:
+                if not re.fullmatch('[a-f0-9]{64}\\.json', name):
+                    raise ValueError('Invalid lifecycle void journal file name')
+                blob = _read_regular(directory / name)
+                total += len(blob)
+                if total > MAX_FAMILY_BYTES:
+                    raise ValueError('Lifecycle void journal exceeds its byte bound')
+                record = validate_entry(record_json.loads(blob.decode('utf-8')), name)
+                key = record['payload']['operation_id']
+                if key in result['entries']:
+                    raise ValueError('Conflicting lifecycle correction operation identity')
+                result['entries'][key] = record
+            except (ValueError, OSError, UnicodeError) as error:
+                result['invalid'].append(str(error)[:300])
+                if total > MAX_FAMILY_BYTES:
+                    break
+    except (ValueError, OSError) as error:
+        result['invalid'].append(str(error)[:300])
+    try:
+        after = directory.stat()
+        if (before is None or (before.st_ino, before.st_mtime_ns, before.st_ctime_ns)
+                != (after.st_ino, after.st_mtime_ns, after.st_ctime_ns)):
+            result['invalid'].append('lifecycle-void-family-changed-during-read')
+        if os.path.lexists(str(Path(project) / RESTORE_MARKER)) and 'lifecycle-void-restore-incomplete' not in result['invalid']:
+            result['invalid'].append('lifecycle-void-restore-incomplete')
+    except OSError:
+        result['invalid'].append(UNKNOWN_JOURNAL)
+    result['bytes'] = total
+    return result
+
+
+def backup_files(project, rows=None):
+    """Allowlisted bounded family plus its exact generation manifest; no read writes."""
+    journal = read_journal(project)
+    if journal['invalid']:
+        raise ValueError('Cannot back up an unreadable/incomplete lifecycle VOID family')
+    if not journal['present']:
+        return {}
+    if rows is None:
+        raise ValueError('A lifecycle VOID backup requires its native snapshot')
+    files = {DIRECTORY + '/' + entry['sha256'] + '.json': entry
+             for entry in journal['entries'].values()}
+    members = {name: hashlib.sha256(entry_bytes(record)).hexdigest() for name, record in files.items()}
+    files[MANIFEST] = dict(schema_version=1, family=DIRECTORY, count=len(members),
+                           bytes=sum(len(entry_bytes(record)) for record in files.values()),
+                           files=members, native_corrections_sha256=native_generation(rows))
+    validate_backup(files, rows)
+    return files
+
+
+def native_generation(rows):
+    """Bound all correction comments, including inert/pending ones, to this backup.
+
+    This is generation evidence only: a native comment still confers no issuance
+    authority. It prevents an older sidecar erasing a newer local correction when
+    a changed native backup happens to retain the older named event/comment pair.
+    """
+    comments = []
+    total = 0
+    for row in rows:
+        for comment in row.get('comments', []):
+            text = comment.get('text')
+            if not isinstance(text, str) or not text.startswith(PREFIX):
+                continue
+            item = dict(task=row.get('id'), id=str(comment.get('id')),
+                        author=comment.get('author'), created_at=comment.get('created_at'), text=text)
+            size = len(canonical_bytes(item))
+            total += size
+            if size > MAX_RECORD_BYTES + 1000 or total > MAX_FAMILY_BYTES or len(comments) >= MAX_RECORDS:
+                raise ValueError('Native lifecycle correction generation exceeds its bounds')
+            comments.append(item)
+    return content_hash({'comments': sorted(comments, key=canonical_bytes)})
+
+
+def validate_backup(files, rows=None):
+    """Closed manifest, every member/hash/bound, and linked retraction graph."""
+    if not isinstance(files, dict) or any(not isinstance(name, str) for name in files):
+        raise ValueError('Invalid lifecycle VOID backup files')
+    members = {name: value for name, value in files.items() if name.startswith(DIRECTORY + '/')}
+    manifest = files.get(MANIFEST)
+    if not members and manifest is None:
+        return None
+    if (not isinstance(manifest, dict)
+            or set(manifest) != {'schema_version', 'family', 'count', 'bytes', 'files', 'native_corrections_sha256'}
+            or type(manifest['schema_version']) is not int or manifest['schema_version'] != 1
+            or manifest['family'] != DIRECTORY or type(manifest['count']) is not int
+            or type(manifest['bytes']) is not int or manifest['count'] != len(members)
+            or not 0 <= len(members) <= MAX_RECORDS):
+        raise ValueError('Invalid lifecycle VOID backup manifest')
+    if not isinstance(manifest['native_corrections_sha256'], str) or not re.fullmatch('[a-f0-9]{64}', manifest['native_corrections_sha256']):
+        raise ValueError('Invalid lifecycle VOID native generation hash')
+    entries = {}
+    for name, entry in members.items():
+        if not re.fullmatch(re.escape(DIRECTORY) + r'/[a-f0-9]{64}\.json', name):
+            raise ValueError('Invalid lifecycle VOID backup path')
+        validate_entry(entry, name.partition('/')[2])
+        key = entry['payload']['operation_id']
+        if key in entries:
+            raise ValueError('Conflicting lifecycle VOID backup operation identity')
+        entries[key] = entry
+    total = sum(len(entry_bytes(record)) for record in members.values())
+    if (total > MAX_FAMILY_BYTES or manifest['bytes'] != total
+            or manifest['files'] != {name: hashlib.sha256(entry_bytes(record)).hexdigest() for name, record in members.items()}):
+        raise ValueError('Lifecycle VOID backup manifest member/hash/byte mismatch')
+    retracted = set()
+    from review_workflow import _recorded_at
+    for entry in entries.values():
+        payload = entry['payload']
+        if payload['operation'] != 'retract':
+            continue
+        target = entries.get(payload['target_void'])
+        if (target is None or target['payload']['operation'] != 'void'
+                or target['payload']['binding'] != payload['binding']
+                or _recorded_at(entry['created_at']) < _recorded_at(target['created_at'])
+                or payload['target_void'] in retracted):
+            raise ValueError('Invalid lifecycle VOID backup retraction graph')
+        retracted.add(payload['target_void'])
+    journal = dict(entries=entries, invalid=[], present=True)
+    if rows is not None:
+        if native_generation(rows) != manifest['native_corrections_sha256']:
+            raise ValueError('Lifecycle VOID backup does not bind the native correction comment generation')
+        state = context(rows, journal)
+        if any(reason != 'voided' for reason in state['reasons'].values()):
+            raise ValueError('Lifecycle VOID backup does not bind the native target/comment generation')
+    return journal
+
+
+def restore_files(project, files, rows):
+    """Install a validated generation; interrupted reads remain UNKNOWN until exact repair.
+
+    The caller owns the project coordination lock (or an unpublished restore-new
+    destination). Restore is trusted host action: this restores issuance evidence,
+    never re-grants the recorded actor or changes a native lifecycle/release row.
+    """
+    from coordination import atomic
+    project = Path(project)
+    journal = validate_backup(files)
+    directory = project / DIRECTORY
+    marker = project / RESTORE_MARKER
+    if journal is None:
+        if os.path.lexists(str(directory)) or os.path.lexists(str(marker)):
+            raise ValueError('Legacy backup has no VOID manifest; preserve the current family and reconcile '
+                             'with a complete VOID-capable backup before restoring')
+        return False
+    if directory.is_symlink() or marker.is_symlink() or marker.with_suffix('.tmp').is_symlink():
+        raise ValueError('Lifecycle VOID restore paths must not be symlinks')
+    if directory.exists() and not directory.is_dir():
+        raise ValueError('Lifecycle VOID restore directory is not a directory')
+    # Refuse an unrelated incomplete restore rather than changing its meaning.
+    identity = dict(schema_version=1, manifest_sha256=content_hash(files[MANIFEST]))
+    if marker.exists() and record_json.loads(_read_regular(marker).decode('utf-8')) != identity:
+        raise ValueError('Another lifecycle VOID restore is incomplete; reconcile its exact manifest first')
+    # A native restore may already have taken place. Bind failure must therefore
+    # leave uncertainty visible, even before the first family member is written.
+    atomic(marker, identity)
+    validate_backup(files, rows)
+    directory.mkdir(exist_ok=True)
+    _writable(directory)
+    old = read_journal(project)
+    # The marker's own uncertainty is expected; other family damage is not safe
+    # to overwrite automatically. Exact manifest members may repair a cut.
+    if any(problem != 'lifecycle-void-restore-incomplete' for problem in old['invalid']):
+        raise ValueError('Existing lifecycle VOID family is damaged; operator reconciliation required')
+    expected = set(files[MANIFEST]['files'])
+    for name in sorted(expected):
+        target = project / name
+        if target.is_symlink() or target.with_suffix('.tmp').is_symlink():
+            raise ValueError('Lifecycle VOID restore member must not be a symlink')
+    for name in sorted(expected):
+        atomic(project / name, files[name])
+    for entry in old['entries'].values():
+        name = DIRECTORY + '/' + entry['sha256'] + '.json'
+        if name not in expected:
+            (project / name).unlink()
+    # Read and compare every installed member before clearing uncertainty.
+    actual = read_journal(project)
+    if (actual['entries'] != journal['entries']
+            or actual['invalid'] != ['lifecycle-void-restore-incomplete']):
+        raise ValueError('Lifecycle VOID restore verification failed; marker retained')
+    validate_backup(files, rows)
+    marker.unlink()
+    return True
+
+
+def context(rows, journal):
+    """One native snapshot's effective corrections; never recheck today's operator list."""
+    reasons = {}
+    entries = journal.get('entries', {})
+    issues = {}
+    for row in rows:
+        if isinstance(row, dict) and row.get('id'):
+            issues.setdefault(row['id'], []).append(row)
+    valid = {}
+    for key, entry in entries.items():
+        payload = entry['payload']; binding = payload['binding']; event_id = binding['event_id']
+        targets = issues.get(event_id, [])
+        reason = 'lifecycle-void-target-changed'
+        try:
+            if len(targets) != 1 or event_binding(targets[0]) != binding:
+                raise ValueError('lifecycle-void-target-changed')
+            reason = 'lifecycle-void-journal-mismatch'
+            tasks = issues.get(binding['task'], [])
+            if len(tasks) != 1:
+                raise ValueError('lifecycle-void-journal-mismatch')
+            comments = [c for c in tasks[0].get('comments', [])
+                        if str(c.get('id')) == entry['comment_id']]
+            if len(comments) != 1:
+                raise ValueError('lifecycle-void-journal-mismatch')
+            comment = comments[0]
+            if (comment.get('author') != payload['actor'] or comment.get('created_at') != entry['created_at']
+                    or comment.get('text') != PREFIX + canonical_bytes(payload).decode()):
+                raise ValueError('lifecycle-void-journal-mismatch')
+            valid[key] = entry
+        except (ValueError, TypeError, KeyError):
+            reasons[event_id] = reason
+    retracted = set()
+    from review_workflow import _recorded_at
+    for key, entry in valid.items():
+        payload = entry['payload']
+        if payload['operation'] != 'retract':
+            continue
+        target = valid.get(payload['target_void'])
+        if (target is None or target['payload']['operation'] != 'void' or target['payload']['binding'] != payload['binding']
+                or payload['target_void'] in retracted
+                or _recorded_at(entry['created_at']) < _recorded_at(target['created_at'])):
+            reasons[payload['binding']['event_id']] = 'lifecycle-void-journal-mismatch'
+        else:
+            retracted.add(payload['target_void'])
+    for key, entry in valid.items():
+        payload = entry['payload']
+        if payload['operation'] == 'void' and key not in retracted:
+            reasons.setdefault(payload['binding']['event_id'], 'voided')
+    return dict(reasons=reasons, global_reason=UNKNOWN_JOURNAL if journal.get('invalid') else None,
+                entries=entries, invalid=journal.get('invalid', []), retracted=retracted)
+
+
+class Snapshot(list):
+    """Host context carried separately from untrusted native JSON fields."""
+    def __init__(self, rows, correction_context):
+        super().__init__(rows)
+        self.lifecycle_corrections = correction_context
+
+
+def snapshot(rows, project=None, journal=None):
+    journal = read_journal(project) if journal is None else journal
+    if not journal['entries'] and not journal['invalid']:
+        return rows
+    return Snapshot(rows, context(rows, journal))
+
+
+def audit(rows, operators=None, owners=None, limit=50, offset=0):
+    """Read-only bounded event page; attribution/approval evidence is not fraud detection.
+
+    Historical principal ownership cannot be proved by today's registry. The
+    approval column therefore names its native-author/approval-assignee snapshot
+    basis explicitly, and ambiguous timestamps or missing snapshots are unknown.
+    """
+    import lifecycle
+    import review_workflow as reviews
+    if type(limit) is not int or not 1 <= limit <= 100 or type(offset) is not int or offset < 0:
+        raise ValueError('Lifecycle audit needs limit 1..100 and nonnegative offset')
+    events = lifecycle.classified_events(rows)
+    issues = {r['id']: r for r in rows if isinstance(r, dict) and r.get('id')
+              and r.get('issue_type') != 'event' and not r.get('malformed')}
+    native_events = [r for r in rows if isinstance(r, dict)
+                     and (r.get('issue_type') == 'event' or record_json.selected(r, types=['event']))]
+    classified = {e['id'] for e in events}
+    unclassifiable = sum(1 for row in native_events if row.get('id') not in classified)
+    ordered = sorted(events, key=lambda e: (e['task'], e['dimension'],
+                     e['order'] if e['order'] is not None else -1, e['id']))
+    if offset > len(ordered):
+        raise ValueError('Lifecycle audit offset exceeds its total')
+    items = []
+    loaded_owners = []
+    def once_owners():
+        if not loaded_owners:
+            loaded_owners.append(reviews.owner_map(owners))
+        return loaded_owners[0]
+    for event in ordered[offset:offset + limit]:
+        issue = issues.get(event['task'], {})
+        payload = event['payload']
+        recorder = payload['actor'] if payload else next(
+            (r.get('created_by') for r in native_events if r.get('id') == event['id']), None)
+        stamp = reviews._recorded_at(event['created_at'])
+        approval = None
+        reason = None
+        try:
+            operator = reviews.listed_operator_actor(recorder, operators, once_owners)
+        except (ValueError, OSError):
+            operator = None
+        if payload is not None and stamp is not None:
+            preceding = []
+            ambiguous = False
+            for comment in issue.get('comments', []):
+                if not isinstance(comment.get('text'), str) or not comment['text'].startswith(
+                        (reviews.PREFIX, reviews.recovery.PREFIX, reviews.REVERT_PREFIX)):
+                    continue
+                at = reviews._recorded_at(comment.get('created_at'))
+                if at is None or at == stamp:
+                    ambiguous = True
+                elif at < stamp:
+                    preceding.append(comment)
+            if not ambiguous:
+                try:
+                    history = reviews.history(dict(issue, comments=preceding), operators=operators)
+                    view = reviews.projection(*history, closed=issue.get('status') == 'closed')
+                    contribution = view.get('contribution')
+                    decision = reviews.approving_entry(history[0], contribution['comment_id']) if contribution else None
+                    if contribution is None:
+                        approval = False
+                    elif contribution['commit'].lower() != payload['scope']['source_commit'].lower():
+                        approval = False
+                    elif view.get('review_state') != 'awaiting-integration' or decision is None:
+                        approval = False
+                    else:
+                        snapshot_owner = decision[0].get('assignee_at_approval')
+                        if not isinstance(snapshot_owner, str) or not snapshot_owner:
+                            reason = 'approval-assignee-history-unavailable'
+                        else:
+                            approval = (reviews.author_key(decision[1].get('author')) != reviews.author_key(contribution.get('author'))
+                                        and reviews.author_key(decision[1].get('author')) != reviews.author_key(snapshot_owner))
+                except (ValueError, KeyError, TypeError):
+                    reason = 'review-history-unclassifiable'
+            else:
+                reason = 'review-record-time-unclassifiable'
+        else:
+            reason = 'lifecycle-payload-or-time-unclassifiable'
+        item = dict(task=event['task'], dimension=event['dimension'], event_id=event['id'],
+                    native_time=event['created_at'], recorder=recorder,
+                    current_assignee=issue.get('assignee'), recorder_is_current_assignee=bool(
+                        recorder and recorder == issue.get('assignee')), recorder_is_listed_operator=operator,
+                    independent_approval_at_recording=approval,
+                    approval_basis='native-authors-and-approval-assignee-snapshot',
+                    historical_principal_ownership_verified=False)
+        if reason:
+            item['classification_reason'] = reason
+        if event.get('void_reason'):
+            item['lifecycle_reason'] = event['void_reason']
+        item['questionable'] = bool(reason or event.get('void_reason') or
+            (not item['recorder_is_current_assignee'] and operator is not True) or
+            (event['dimension'] in ('reviewed', 'integrated') and approval is not True))
+        items.append(item)
+    return dict(items=items, total=len(ordered), offset=offset, limit=limit,
+                omitted_before=offset, omitted_after=max(0, len(ordered) - offset - len(items)),
+                next_offset=offset + len(items) if offset + len(items) < len(ordered) else None,
+                unclassifiable_native_event_count=unclassifiable,
+                unclassifiable_fact_count=sum(e['payload'] is None or reviews._recorded_at(e['created_at']) is None
+                                              for e in ordered),
+                unclassifiable_in_page=sum(bool(item.get('classification_reason')) for item in items),
+                questionable_in_page=sum(item['questionable'] for item in items),
+                meaning='Questionable evidence for operator review, not a finding of fraud. Historical '
+                        'principal ownership is not proved by the current registry.')
+
+
+def _writable(directory):
+    """Use the existing real pre-write probe, with this family's recovery name."""
+    import review_workflow
+    try:
+        return review_workflow.revert_journal_writable(directory)
+    except ValueError as error:
+        raise ValueError(str(error).replace(review_workflow.JOURNAL_DIR, DIRECTORY)) from None
+
+
+def publish(project, entry):
+    from coordination import atomic
+    validate_entry(entry)
+    directory = Path(project) / DIRECTORY
+    if directory.is_symlink():
+        raise ValueError('Lifecycle void journal is a symlink')
+    directory.mkdir(exist_ok=True)
+    _writable(directory)
+    target = directory / (entry['sha256'] + '.json')
+    if target.is_symlink() or target.with_suffix('.tmp').is_symlink():
+        raise ValueError('Lifecycle void journal record is a symlink')
+    atomic(target, entry)
+    return target
+
+
+def apply(rows, actor, payload, run, project, operators=None, owners=None, enabled=False):
+    """Caller holds the project and deployment-config locks; native-first exact retry.
+
+    A publication failure after the one native effect is explicitly uncertain and
+    names the stable operation key. Its exact retry republishes that comment's
+    missing record, following the existing integration-revert repair pattern.
+    """
+    from review_workflow import listed_operator_actor
+    validate_payload(payload)
+    if actor != payload['actor'] or not listed_operator_actor(actor, operators, owners):
+        raise ValueError('Lifecycle correction requires a currently listed operator or its bound actor')
+    if not enabled:
+        raise ValueError('lifecycle_void_writes is off; after restoring support on every installation, '
+                         'an operator enables it with admin.py lifecycle_void_writes on --actor OPERATOR; nothing was changed')
+    binding = payload['binding']; targets = [r for r in rows if r.get('id') == binding['event_id']]
+    if len(targets) != 1 or event_binding(targets[0]) != binding:
+        raise ValueError('Lifecycle correction target changed; operator reconciliation required')
+    tasks = [r for r in rows if r.get('id') == binding['task']]
+    if len(tasks) != 1 or tasks[0].get('issue_type') == 'event':
+        raise ValueError('Lifecycle correction task is missing or ambiguous')
+    journal = read_journal(project)
+    if journal['invalid']:
+        raise ValueError('Lifecycle void journal cannot be read; operator repairs it before a write')
+    state = context(rows, journal)
+    if payload['operation'] == 'retract':
+        prior = journal['entries'].get(payload['target_void'])
+        if prior is None or prior['payload']['operation'] != 'void' or prior['payload']['binding'] != binding:
+            raise ValueError('Retraction must name this exact host-issued void operation')
+        if state['reasons'].get(binding['event_id']) not in (None, 'voided'):
+            raise ValueError('Void binding is damaged; operator reconciliation required before retraction')
+    body = PREFIX + canonical_bytes(payload).decode()
+    found = []
+    for comment in tasks[0].get('comments', []):
+        raw = comment.get('text', '')
+        if not isinstance(raw, str) or not raw.startswith(PREFIX):
+            continue
+        try:
+            other = record_json.loads(raw[len(PREFIX):])
+            validate_payload(other)
+        except (ValueError, TypeError):
+            continue
+        if other['operation_id'] == payload['operation_id']:
+            if other != payload or comment.get('author') != actor:
+                raise ValueError('Lifecycle correction operation identity already names different content/actor')
+            found.append(comment)
+    if len(found) > 1:
+        raise ValueError('Lifecycle correction operation identity has ambiguous native comments')
+    if not found:
+        if payload['operation'] == 'void' and binding['event_id'] in state['reasons']:
+            raise ValueError('This lifecycle event is already voided or its correction is damaged')
+        if payload['operation'] == 'retract' and payload['target_void'] in state['retracted']:
+            raise ValueError('This lifecycle void was already retracted')
+    # The bounded reader must be able to read every record the writer emits.
+    # Keep room to retract every outstanding void rather than filling the family
+    # with corrections that its current operators could no longer retract.
+    estimated = dict(schema_version=1, payload=payload, sha256=content_hash(payload),
+                     comment_id='x' * 300, created_at='x' * 100)
+    estimated_bytes = len(entry_bytes(estimated))
+    if estimated_bytes > MAX_RECORD_BYTES:
+        raise ValueError('Lifecycle correction plus native binding exceeds the journal record byte bound; no native write attempted')
+    if payload['operation_id'] not in journal['entries']:
+        active = sum(entry['payload']['operation'] == 'void' and key not in state['retracted']
+                     for key, entry in journal['entries'].items())
+        reserved = active + (1 if payload['operation'] == 'void' else -1)
+        total_bytes = journal['bytes']
+        if (len(journal['entries']) + 1 + reserved > MAX_RECORDS
+                or total_bytes + estimated_bytes + max(0, reserved) * MAX_RECORD_BYTES > MAX_FAMILY_BYTES):
+            raise ValueError('Lifecycle void journal capacity keeps space for outstanding retractions; '
+                             'no native write attempted. An operator retains the existing journal and uses '
+                             'a restore-capable kit with larger validated bounds before adding corrections.')
+    directory = Path(project) / DIRECTORY
+    if directory.is_symlink():
+        raise ValueError('Lifecycle void journal is a symlink; no native write attempted')
+    directory.mkdir(exist_ok=True)
+    target = directory / (content_hash(payload) + '.json')
+    temporary = target.with_suffix('.tmp')
+    if (target.is_symlink() or temporary.is_symlink()
+            or temporary.exists() and not temporary.is_file()):
+        raise ValueError('Lifecycle void publication path is not a regular host path; no native write attempted')
+    _writable(directory)
+    if not found:
+        try:
+            comment = json.loads(run(['comments', 'add', binding['task'], body, '--json']))
+            # bd's create reply carries its pre-storage nanosecond clock; pinned
+            # Dolt persists the comment time at second precision. Bind the actual
+            # stored comment returned by a native read, not that transient reply.
+            created_id = str(comment['id'])
+            raw = run(['comments', binding['task'], '--json'])
+            if len(raw.encode('utf-8')) > MAX_FAMILY_BYTES:
+                raise ValueError('Native correction comment read exceeds its byte bound')
+            stored = record_json.loads(raw)
+            if not isinstance(stored, list):
+                raise ValueError('Native correction comment read is not a list')
+            stored = [c for c in stored if isinstance(c, dict) and str(c.get('id')) == created_id]
+            if (len(stored) != 1 or stored[0].get('author') != actor or stored[0].get('text') != body):
+                raise ValueError('Native correction comment cannot be bound after its write')
+            comment = stored[0]
+        except Exception as error:
+            raise ValueError('Lifecycle correction outcome is uncertain for operation ' + payload['operation_id']
+                             + '; reconcile the native comment before retry: ' + str(error)[:300]) from None
+    else:
+        comment = found[0]
+    try:
+        entry = dict(schema_version=1, payload=payload, sha256=content_hash(payload),
+                     comment_id=str(comment['id']), created_at=comment['created_at'])
+        validate_entry(entry)
+        publish(project, entry)
+    except (ValueError, OSError, KeyError, TypeError) as error:
+        raise ValueError('Lifecycle correction native effect may exist, but its host record is uncertain for operation '
+                         + payload['operation_id'] + '; retry the exact payload/actor to persist the entry: '
+                         + str(error)[:300]) from None
+    return dict(operation_id=payload['operation_id'], comment_id=entry['comment_id'],
+                event_id=binding['event_id'], task=binding['task'], operation=payload['operation'],
+                journal_sha256=entry['sha256'], reconciled=bool(found))
