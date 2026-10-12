@@ -289,13 +289,26 @@ in-checkpoint keys are rejected.
   capability_records.py:73).
 - Two contributions, as proposed: **fields and the read first, the page second.**
 
-## 8. Relationship to `kittrial-5bb.207` (not here)
+## 8. The prose-direction case, found on this task itself
+
+Recorded as the design's own evidence, not as a new design element. On this task the coordinator
+directed a merge-forward as a plain comment (`01a12f2e`, 2026-10-12T08:16Z: main has moved, merge it,
+keep both sides, deliver as a superseding contribution). While that direction was outstanding,
+`work --mine` still returned the task as `awaiting-review` with `pending_review_items` 0, so the
+documented read path said there was nothing to do while the coordinator was in fact waiting on the
+lane. The direction surfaced only through the brief's `next_action`, which had to be read as prose,
+and only because a worker went looking. A `Kind: lane-state-v1` record with
+`state: waiting-on-coordinator` and an `expect_by` would have made that row self-describing, and the
+board's `waiting_too_long` flag on a stale checkpoint would have pushed it to the party who had to
+act instead of leaving it to be discovered.
+
+## 9. Relationship to `kittrial-5bb.207` (not here)
 
 `state` is deliberately the same vocabulary `kittrial-5bb.207` needs when it pushes a change to a
 waiting agent, so that work adds the push and does not redefine the state. The record lives beside
 the checkpoint precisely so that the push work can extend it without reopening the checkpoint schema.
 
-## 9. Decisions taken (the two former owner questions are closed)
+## 10. Decisions taken (the two former owner questions are closed)
 
 1. **Threshold** — 15 minutes by default, given as an argument of the read and of the page, **not** a
    new installation setting. A flag is never silenced by age.
@@ -303,7 +316,7 @@ the checkpoint precisely so that the push work can extend it without reopening t
    role; show the id when given.
 3. **`expect_by`** — a past value is accepted and flagged; refuse only what cannot be parsed.
 
-## 10. What this note does not do
+## 11. What this note does not do
 
 No implementation. No change to `briefing.py`, `endpoint.py`, `http_service.py`, `work.py`,
 `worker.py`, `capability_records.py`, `reserved_comments.py` or any test. This is the note the task
