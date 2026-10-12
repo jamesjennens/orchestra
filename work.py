@@ -273,7 +273,8 @@ def help_payload(action='work'):
     """Machine-readable help returned through the normal JSON envelope on exit 0."""
     usage = {
         'work': 'work [--mine | --owner ACTOR] [--state STATE] [--claimable] [--limit N] [--offset N] '
-                '[--handoff-limit N] [--handoff-offset N] [--ref-limit N] [--ref-offset N] [--json]',
+                '[--handoff-limit N] [--handoff-offset N] [--ref-limit N] [--ref-offset N] [--json]'
+                ' | work lanes [--idle-minutes N] [--limit N] [--offset N] [--json]',
         'review': 'review TASK [--file payload.json]',
         'handoff': 'handoff TASK --file payload.json',
         'brief': 'brief TASK [--items-offset N] [--items-limit N] [--full] [--json]',
@@ -288,6 +289,7 @@ def help_payload(action='work'):
                'exit_codes': {'0': 'result or help JSON on stdout',
                               '2': 'validation/transport error on stderr; stdout is not written'}}
     if action == 'work':
+        import lanes
         payload['limits'] = {
             'limit': '%d..%d' % (WORK_LIMIT_MIN, WORK_LIMIT_MAX),
             'offset': '>= %d' % WORK_OFFSET_MIN,
@@ -299,6 +301,9 @@ def help_payload(action='work'):
             'proposal-offset': '>= %d' % WORK_OFFSET_MIN,
             'capability-limit': '%d..%d' % (WORK_LIMIT_MIN, WORK_LIMIT_MAX),
             'capability-offset': '>= %d' % WORK_OFFSET_MIN,
+            'lanes-idle-minutes': '%d..%d (work lanes; the threshold is an argument of the read, not a '
+                                  'setting)' % (lanes.IDLE_MINUTES_MIN, lanes.IDLE_MINUTES_MAX),
+            'lanes-limit': '%d..%d (work lanes)' % (lanes.LANES_LIMIT_MIN, lanes.LANES_LIMIT_MAX),
         }
         payload['output'] = {
             'top_level': ['owner', 'total', 'your_move', 'items', 'next_offset', 'coverage', 'attention', 'guidance'],
@@ -367,6 +372,20 @@ def help_payload(action='work'):
                             'newer_activity_by_others', 'newer_activity_own',
                             'newer_activity_coverage', 'unresolved_directions',
                             'recommended', 'recommended_by', 'contribution_author'],
+            'lanes': 'work lanes is the lanes board (kittrial-5bb.263, docs/LANE_BOARD_DESIGN.md): ONE '
+                     'export plus the session registry, one row per lane keyed by the session\'s '
+                     'registered name (a task with no lane reads as its assignee actor), bounded with '
+                     'total/items/next_offset like this queue. Each holding row carries its held tasks '
+                     '(id, title, review_state, whose_move, next_actor, work_state) and the declared '
+                     'state/waiting_on/expect_by of the newest usable Kind: lane-state-v1 record with the '
+                     'age of the checkpoint it names and the age of the lane\'s newest write anywhere; '
+                     'inferred true marks a row whose state is not declared. Three flags are carried: '
+                     'waiting_too_long (a waiting state older than --idle-minutes), expect_by_passed (a '
+                     'declared expect_by in the past) and your_move_idle (the holder\'s own move with no '
+                     'write for longer than the threshold). Lanes that hold nothing and wrote within 24 '
+                     'hours are listed idle with the age of that write. --idle-minutes is an argument of '
+                     'the read (default 15), not an installation setting. The contributor route shows a '
+                     'caller only its own lane\'s row.',
         }
     elif action == 'review':
         payload['operations'] = ['read (review TASK)', 'contribute', 'request-changes',
@@ -754,7 +773,7 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
         # request-changes records still unresolved.
         checkpoint_at=None;newer_activity=None
         try:
-            from briefing import checkpoint_state
+            from briefing import checkpoint_state, lane_state_record
             checkpoint_states[row['id']]=checkpoint_state(row,normalize=False)
             latest_checkpoint=checkpoint_states[row['id']]['current']
             open_items=len(latest_checkpoint[0]['open_items']) if latest_checkpoint else 0
@@ -765,7 +784,14 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
                 position=next(index for index,comment in enumerate(comments)
                               if str(comment.get('id'))==str(latest_checkpoint[1].get('id')))
                 checkpoint_at=latest_checkpoint[1].get('created_at')
+                # The lane-state record written WITH this checkpoint (same author, naming this
+                # checkpoint) is part of the checkpoint, not a later write by another actor: it
+                # must not wake the task (kittrial-5bb.263 review). A record naming an older
+                # checkpoint, or by another author, is ordinary activity and still wakes it.
+                checkpoint_id=str(latest_checkpoint[1].get('id'))
+                checkpoint_author=latest_checkpoint[1].get('author')
                 newer_activity=any(comment.get('author')!=row.get('assignee')
+                                   and not lane_state_record(comment,checkpoint_id,checkpoint_author)
                                    for comment in comments[position+1:])
         except (ValueError,TypeError,KeyError,StopIteration):
             open_items=None;blocking_items=None;checkpoint_at=None;newer_activity=None
@@ -934,14 +960,20 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
     return result
 
 def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None,review_writes=None,
-            independent_approval=False,coordinator_writes=False,owners=None,verified_web_authority=False):
+            independent_approval=False,coordinator_writes=False,owners=None,verified_web_authority=False,
+            lanes_scope='all'):
     """``independent_approval``, ``coordinator_writes`` and ``owners`` are the slices
     6 and 7 settings and the project's actor -> principal map (kittrial-5bb.197),
     supplied by the endpoint; all default OFF/absent, so nothing changes for an
     installation that configures nothing. ``owners`` may be a callable, so the
     registry is read only when a rule needs it. ``verified_web_authority`` says the configured
     web authority verified an owner, coordinator, or agent with the project grant
-    (kittrial-5bb.199, kittrial-5bb.209)."""
+    (kittrial-5bb.199, kittrial-5bb.209).
+
+    ``lanes_scope`` is the route's lanes isolation (kittrial-5bb.263): ``'all'`` on the
+    host route and the bound-key coordinator route, ``'own'`` for a bound key whose actor
+    is not a configured operator, so a lane sees only its own board row. It defaults to
+    ``'all'``, so every existing caller is unchanged."""
     # Help is recognised anywhere as a standalone token and never touches the
     # native export, the coordination lock or an attachment.
     if help_requested(args):
@@ -955,6 +987,15 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
         rows=record_json.classify(rows,run,sorted(RECORD_ANCHOR_LABELS)+['gt:slot'], ['event','gate'])
         from lifecycle import host_snapshot
         rows=host_snapshot(rows, run=run, project=path)
+        if args[:1]==['lanes']:
+            # The lanes board (kittrial-5bb.263) reads the SAME export this action already
+            # loaded, plus the project's session registry: one pass, no per-task comment
+            # read. Its flags and aging live in lanes.py only. Preserve the host VOID
+            # snapshot so lane eligibility uses the same classified lifecycle evidence.
+            from lanes import read as lanes_read
+            from sessions import read_registry
+            return lanes_read(rows,actor,read_registry(path),args[1:],operators=operators,
+                              journal=path,scope=lanes_scope)
         return queue(rows,actor,args,path/'.handoff-requests', operators=operators, journal=path,
                      reference_attention=True, verifiers=verifiers,
                      independent_approval=independent_approval,owners=owners)

@@ -372,11 +372,47 @@ def checkpoints(issue):
     state=checkpoint_state(issue)
     return state['current'],state['invalid']
 
-def excluding_checkpoint(data,cid):
-    """Reuse the snapshot and its entry hashes when excluding its newest receipt."""
+def lane_state_record(comment,cid,author):
+    """True when a native comment is the ``Kind: lane-state-v1`` record written WITH checkpoint ``cid``.
+
+    The declared wait state travels beside its checkpoint, written by that checkpoint's own
+    author in the same act (kittrial-5bb.263; docs/LANE_BOARD_DESIGN.md section 1). It is
+    therefore part of the checkpoint's own receipt, NOT activity the checkpoint failed to
+    incorporate, and must not make that checkpoint read stale. A record that names another
+    checkpoint, or was written by another author, is not this checkpoint's and stays
+    ordinary activity. An older kit does not know the record at all, so it reads it as
+    activity and reports the checkpoint stale; that rollback reading is deliberate and
+    documented (docs/LANE_BOARD_DESIGN.md section 5, the capability record).
+    """
+    if not isinstance(comment,dict) or author is None or comment.get('author')!=author:
+        return False
+    from lane_state import parse
+    payload=parse(comment.get('text'))
+    return payload is not None and str(payload.get('checkpoint'))==str(cid)
+
+def lane_state_entry_ids(data,cid,author):
+    """Snapshot entry ids of the lane-state records that belong to checkpoint ``cid``."""
+    found=set()
+    for entry in data.get('entries') or []:
+        if entry.get('kind')!='comment':continue
+        if lane_state_record({'author':entry.get('author'),'text':entry.get('body')},cid,author):
+            found.add(entry['entry_id'])
+    return found
+
+def excluding_checkpoint(data,cid,author=None):
+    """Reuse the snapshot and its entry hashes when excluding its newest receipt.
+
+    The reserved ``Kind: lane-state-v1`` record written with this checkpoint, by this
+    checkpoint's own author, is part of the same receipt and is excluded with it, so
+    declaring a wait state can never make the checkpoint it belongs to read stale
+    (kittrial-5bb.263 review ``lane-state-must-not-stale-its-own-checkpoint``). A record
+    that names an older checkpoint, or was written by another author, is kept as activity.
+    ``author`` is the checkpoint comment's author; when it is unknown nothing is excluded.
+    """
     eid=data['task']+'-c'+str(cid)
-    return dict(data,entries=[e for e in data['entries'] if e['entry_id']!=eid],
-                entry_digests={k:v for k,v in entry_digests(data).items() if k!=eid})
+    dropped={eid}|lane_state_entry_ids(data,cid,author)
+    return dict(data,entries=[e for e in data['entries'] if e['entry_id'] not in dropped],
+                entry_digests={k:v for k,v in entry_digests(data).items() if k not in dropped})
 
 def clip(value,limit):
     value=str(value or '')
@@ -768,7 +804,7 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
             ids+=(f' (+{dir_out["omitted"]} more)' if dir_out['omitted'] else '')
             next_action='OUTSTANDING DIRECTIONS ('+str(dir_out['total'])+'): '+ids+' — resolve or supersede with evidence. '+next_action
     if p is not None:
-        excluded=excluding_checkpoint(data,c['id'])
+        excluded=excluding_checkpoint(data,c['id'],c.get('author'))
         excluded_cursor=activity_cursor(excluded)
         stale=not cursor_matches(p['activity_cursor'],excluded,compatible=excluded_cursor)
         if stale:
@@ -922,7 +958,19 @@ PROVENANCE_OFF=('checkpoint_provenance_writes is off (the installation default).
 SERVER_DERIVED='carried and direction_owner are server-derived; omit them from the request'
 
 def save_checkpoint(rows,project,task,p,actor,run,provenance_writes=False):
+    # The declared wait state travels BESIDE the checkpoint in the same payload file
+    # (kittrial-5bb.263; docs/LANE_BOARD_DESIGN.md section 1). `lane_state` is popped out
+    # here, before the checkpoint is validated, so the checkpoint object keeps its closed
+    # field set: nothing existing grows a key, an unknown field is still refused, and an
+    # older kit reads and re-checkpoints the task exactly as it did before. The checkpoint
+    # write below is the ONLY writer of a lane-state record.
+    lane=None
+    if isinstance(p,dict) and 'lane_state' in p:
+        p=dict(p);lane=p.pop('lane_state')
     problems=checkpoint_problems(p,task)
+    if lane is not None:
+        from lane_state import problems as lane_state_problems
+        problems=problems+lane_state_problems(lane,task)
     if problems:
         # A record that is refused anyway is told everything else that would refuse it, the
         # installation switch included (review 01a10c0b). A record with nothing else wrong
@@ -947,6 +995,10 @@ def save_checkpoint(rows,project,task,p,actor,run,provenance_writes=False):
     # (provenance, carried dispositions) are excluded from identity; a changed
     # payload still differs and is not reconciled.
     body={k:v for k,v in p.items() if k not in ('incorporated_digests','provenance','carried','direction_owner')}
+    # Identity is the checkpoint body alone: the committed checkpoint receipt cannot carry
+    # lane_state (its field set is closed and an older kit must read it unchanged). A
+    # retry therefore reconciles the checkpoint exactly as before, and the declared wait
+    # state is completed or refused beside it by `lane_state.ensure` below.
     identity=request_identity(body)
     comments={str(c['id']):c for c in issue.get('comments') or []}
     for cid,existing in state['history']:
@@ -954,7 +1006,14 @@ def save_checkpoint(rows,project,task,p,actor,run,provenance_writes=False):
         if c.get('author')!=actor:continue
         if request_identity(existing)==identity:
             recorded=state['provenance'][cid] or {'covered':0}
-            return {'comment_id':str(c['id']),'reconciled':True,'covered':recorded['covered'],'bytes':len(str(c['text']))}
+            answer={'comment_id':str(c['id']),'reconciled':True,'covered':recorded['covered'],'bytes':len(str(c['text']))}
+            if lane is not None:
+                # A retry that reconciles the checkpoint must still end with the record
+                # present: a crash between the two writes is completed here, and a second
+                # identical write publishes nothing.
+                from lane_state import ensure as ensure_lane_state
+                answer['lane_state']=ensure_lane_state(run,issue.get('comments'),actor,task,lane,str(c['id']))
+            return answer
     # Direction dispositions must reference the digests actually incorporated for a
     # NEW write (a stored receipt was already validated when it was written).
     if not provenance_writes and any(k in p for k in ('incorporated_digests','provenance','directions')):
@@ -1028,7 +1087,13 @@ def save_checkpoint(rows,project,task,p,actor,run,provenance_writes=False):
     if p['activity_cursor']!=activity_cursor(snap):raise ValueError('Activity changed; read/reconcile history and obtain a fresh activity cursor')
     transition(current[0] if current else None,payload)
     result=json.loads(run(['comments','add',task,PREFIX+canonical_bytes(payload).decode(),'--json']))
-    return {'comment_id':str(result['id']),'reconciled':False,'covered':payload.get('provenance',{}).get('covered',0),'bytes':size}
+    answer={'comment_id':str(result['id']),'reconciled':False,'covered':payload.get('provenance',{}).get('covered',0),'bytes':size}
+    if lane is not None:
+        # The lane-state record names the checkpoint just published and is written in the
+        # same act, through the same internal run path.
+        from lane_state import ensure as ensure_lane_state
+        answer['lane_state']=ensure_lane_state(run,issue.get('comments'),actor,task,lane,answer['comment_id'])
+    return answer
 
 def verify_checkpoint(rows,project,task):
     """Verify retained evidence using one linked, parsed checkpoint state."""
@@ -1039,7 +1104,7 @@ def verify_checkpoint(rows,project,task):
         return {'task':task,'checkpoint':None,'coverage':'none',
                 'fresh':len(snap['entries']),'changed':0,'unchanged':0,'unverified':0,
                 'note':'No checkpoint exists; every entry is unincorporated.'}
-    cid=str(current[1]['id']);snap=excluding_checkpoint(snap,cid);total=len(snap['entries'])
+    cid=str(current[1]['id']);snap=excluding_checkpoint(snap,cid,current[1].get('author'));total=len(snap['entries'])
     exact,trunc,recorded=chain_evidence(state['history'],state['provenance'])
     if not recorded:
         return {'task':task,'checkpoint':cid,'coverage':'unknown',
@@ -1084,7 +1149,7 @@ def checkpoint_queue_fields(rows,row,state=None):
             state=dict(state,provenance={cid:normalize_provenance(p) for cid,p in state['history']})
         if state['current'] is None or state['invalid']:return empty
         p,c=state['current'];project=untoken(p['activity_cursor']).get('project','work-queue')
-        data=excluding_checkpoint(snapshot(rows,project,row['id']),c['id'])
+        data=excluding_checkpoint(snapshot(rows,project,row['id']),c['id'],c.get('author'))
         dispositions=chain_dispositions(state['history'])
         context=direction_context(row,state);direction_data=direction_entries(data,context)
         if cursor_matches(p['activity_cursor'],data):own=others=0;coverage='current'
@@ -1460,6 +1525,7 @@ def help_limits(action):
             'item text/reason':'<= %d characters'%CHECKPOINT_TEXT_LIMIT,
             'item source/evidence':'<= %d characters'%CHECKPOINT_SOURCE_LIMIT,
             'payload':'<= %d KB canonical bytes'%(CHECKPOINT_MAX_BYTES//1000),
+            'lane_state.waiting_on':'<= 96 characters (a role or an actor id)',
             'error field names':'<= %d names, each <= %d characters'%(FIELD_NAME_COUNT,FIELD_NAME_LIMIT)})
     return limits
 
@@ -1530,6 +1596,15 @@ def help_notes(action):
             '(text; empty when there is none), intent, acceptance, summary, next_action, open_items (each: id, kind, '
             'text, source; kind is one of blocker, correction, decision, dependency, question) and resolved (each: '
             'id, reason, evidence).',
+            'An optional sibling key lane_state (kittrial-5bb.263) writes one Kind: lane-state-v1 record beside '
+            'this checkpoint in the same act. Its fields are schema_version (1), task, state (one of working, '
+            'waiting-on-coordinator, waiting-on-review, waiting-on-user, idle), waiting_on (a role coordinator/'
+            'reviewer/user or an actor id; required with a waiting state and refused without one) and expect_by '
+            '(optional ISO-8601 with an offset; a past value is accepted). Do not send checkpoint: the writer '
+            'sets it to the comment id this checkpoint just published, which is what makes the record name the '
+            'task\'s newest checkpoint at write time. It is NOT a checkpoint field: the checkpoint object '
+            'above is unchanged and its field set stays closed, and lane_state is popped out before the checkpoint '
+            'is validated. Nothing is inferred: no person, and no actor turned into a role.',
             'A refusal names every problem with the record at once: the sentence itself for one problem, and for '
             'more a numbered list of the same sentences ("Invalid checkpoint (N problems): [1] ... [2] ..."), at '
             'most %d of them. A stale previous and a changed activity cursor are separate refusals.'

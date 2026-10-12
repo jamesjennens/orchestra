@@ -218,6 +218,8 @@ class NoUnguardedParseTests(unittest.TestCase):
                                "ROW_NESTING_MAX (one call), each row of a deeper answer in _row under the same count (one "
                                "call), and _row_id parses single string literals (one call)"),
         'keyed_records.py': (2, 'bd output'),
+        'lane_state.py': (1, 'bd output (the receipt of the comments add that published the reserved '
+                             'lane-state record; the record body itself is read through record_json.loads)'),
         'lifecycle.py': (3, "bd output, plus the endpoint's release-query and group answers on the caller's machine (kittrial-5bb.107 rev3)"),
         'lifecycle_voids.py': (1, 'the bd comments-add receipt; native record bodies and bounded host journal files use the guard'),
         'native.py': (2, 'bd output'),
@@ -293,10 +295,12 @@ class NoUnguardedParseTests(unittest.TestCase):
             # record_json.loads_rows (the row bound); the web merge-slot payload adds a fifth guarded parse.
             'briefing.py': 3, 'coordination.py': 3, 'endpoint.py': 5, 'export_requirements.py': 1, 'feedback.py': 3, 'guidance.py': 3,
             # Requirements request bodies use the guard and reject duplicate fields.
+            # lane_state.py reads the body of a reserved Kind: lane-state-v1 record comment
+            # (kittrial-5bb.263): any actor's comments can carry one, so it is parsed through
+            # the guard and a nested body is dropped as an unusable record.
             # http_authority reads the operation of an attached review record through the guard,
             # exactly as work.py does, to know which capability the request needs (kittrial-5bb.261).
-            'http_authority.py': 1,
-            'handoff.py': 1, 'http_service.py': 3, 'lifecycle.py': 1, 'recovery.py': 1, 'requirements.py': 1, 'requirement_records.py': 1, 'reserved_comments.py': 1,
+            'handoff.py': 1, 'http_authority.py': 1, 'http_service.py': 3, 'lane_state.py': 1, 'lifecycle.py': 1, 'recovery.py': 1, 'requirements.py': 1, 'requirement_records.py': 1, 'reserved_comments.py': 1,
             # The simple owner adapter guards bd's decision-create receipt too.
             'requirement_http.py': 2,
             'web_merge_slot.py': 4,

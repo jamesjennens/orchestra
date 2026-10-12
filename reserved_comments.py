@@ -204,6 +204,12 @@ OPEN_ITEM_PREFIX = 'Kind: open-item-v1\n'
 ITEM_RESOLUTION_PREFIX = 'Kind: item-resolution-v1\n'
 OWNER_ANSWER_PREFIX = 'Kind: owner-answer-v1\n'
 COORDINATOR_DECISION_PREFIX = 'Kind: coordinator-decision-v1\n'
+# kittrial-5bb.263 (docs/LANE_BOARD_DESIGN.md). One lane's declared wait state, written
+# BESIDE a checkpoint in the same act by the checkpoint writer (lane_state.py). Reserved
+# here so the raw `comments add` path can never plant one; deliberately NOT added to
+# RECORD_ANCHOR_FAMILIES or RECORD_COMMENT_FAMILIES, so it anchors no row and every
+# surface -- an older kit included -- reads it as an ordinary comment.
+LANE_STATE_PREFIX = 'Kind: lane-state-v1\n'
 
 RESERVED = (
     (REVIEW_PREFIX, 'contribution/review record', 'review TASK --file payload.json'),
@@ -236,6 +242,7 @@ RESERVED = (
     (OWNER_ANSWER_PREFIX, 'owner answer', 'questions answer on the coordination host or in the web interface'),
     (COORDINATOR_DECISION_PREFIX, 'coordinator decision',
      'decisions record on the coordination host or in the web interface'),
+    (LANE_STATE_PREFIX, 'lane state', 'checkpoint TASK --file checkpoint.json (the lane_state key)'),
 )
 
 PREFIXES = tuple(prefix for prefix, _, _ in RESERVED)
