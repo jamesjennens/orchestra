@@ -17,13 +17,19 @@ class SlotError(ValueError):
 
 FIELDS = {'check': set(), 'acquire': {'task', 'target'}, 'release': set(),
           'force-release': {'expected_holder', 'reason'}, 'create': set()}
+#: Fields an operation may carry beyond FIELDS. A force-release names the task the page saw
+#: held (kittrial-5bb.268 item 4): a holder who released and took the slot again for another
+#: task is a different acquisition, and a stale page must not release it. Optional so an
+#: older named client (holder only) keeps working with the holder-only comparison.
+OPTIONAL = {'force-release': {'expected_task'}}
 
 
 def validate(payload):
     if not isinstance(payload, dict) or payload.get('operation') not in FIELDS:
         raise SlotError(422, 'Supply a merge-slot operation')
     operation = payload['operation']
-    if set(payload) != FIELDS[operation] | {'operation'}:
+    extra = set(payload) - FIELDS[operation] - {'operation'}
+    if not FIELDS[operation] | {'operation'} <= set(payload) or not extra <= OPTIONAL.get(operation, set()):
         raise SlotError(422, 'Invalid fields for merge-slot ' + operation)
     if operation == 'acquire':
         if not isinstance(payload['task'], str) or len(payload['task']) > 96:
@@ -38,6 +44,13 @@ def validate(payload):
         text(payload['expected_holder'], 'expected_holder', 96)
         text(payload['reason'], 'reason', 1000)
         plain(payload['reason'], 'reason')
+        if 'expected_task' in payload:
+            if not isinstance(payload['expected_task'], str) or len(payload['expected_task']) > 96:
+                raise SlotError(422, 'expected_task must be a short native task id')
+            try:
+                coordination.identifier(payload['expected_task'])
+            except ValueError:
+                raise SlotError(422, 'expected_task must be a short native task id') from None
     return operation
 
 
@@ -63,6 +76,16 @@ def plain(value, field):
 
 
 def snapshot(run, project, *, repair=False):
+    """The slot as the page sees it: bd's check, the slot row and the context file.
+
+    The endpoint calls this with the project's `.coordination.lock` held for a read too
+    (about 1.1 s on real bd: two bd calls). That is deliberate (kittrial-5bb.268 item 6): the
+    holder comes from bd's check and the task from `.merge-context.json`, which an acquire
+    writes BEFORE bd takes the slot (coordination.apply_native). Read without the lock, a page
+    could pair one acquisition's holder with another's task, and item 4's force-release
+    comparison would then accept or refuse the wrong acquisition. The lock lives in
+    endpoint.py, which this change leaves alone.
+    """
     try:
         state = record_json.loads(run(['merge-slot', 'check', '--json']))
     except (ValueError, OSError):
@@ -124,6 +147,8 @@ def apply(payload, actor, run, project, operation_id, *, operators=None,
         # holder comparison. A stale page cannot release the next holder's slot.
         if before['available'] or before['holder'] != payload['expected_holder']:
             raise SlotError(409, 'The merge-slot holder changed; read it again before forcing a release.')
+        if 'expected_task' in payload and (before['context'] or {}).get('task') != payload['expected_task']:
+            raise SlotError(409, 'The merge slot is now held for another task; read it again before forcing a release.')
         native = record_json.loads(run(['merge-slot', 'release', '--holder', payload['expected_holder'], '--json']))
     else:
         command = {'operation': 'merge-' + operation}

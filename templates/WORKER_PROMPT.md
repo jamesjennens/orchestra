@@ -144,7 +144,12 @@ onboarding-template dependency (.36). If that section is missing or ambiguous,
 stop and ask the coordinator rather than inventing a push permission, branch name
 or bundle destination. Keep delivery, review, integration, deployment and live
 verification separate. Before interruption or handoff, publish a fresh structured
-checkpoint and use the saved actor to resume. Do not merge, deploy, edit another
+checkpoint and use the saved actor to resume. Declare your lane's wait state in that
+same checkpoint payload's sibling `lane_state` key (`state`; `waiting_on`, a role or an
+actor id, required with a waiting state; and an optional `expect_by`, ISO-8601 with an
+offset, where a past value is accepted and flagged), set at claim, at every checkpoint
+and whenever a wait begins, so `work lanes` shows the board and flags a wait that has run
+too long. Do not merge, deploy, edit another
 worker's checkout or create tasks to stay busy. Leave the task open awaiting review.
 
 After delivery, use only the mode authorized for this worker:

@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 import briefing
+import lane_state
 import render
 import review_workflow as rw
 import work
@@ -47,6 +48,22 @@ class WorkQueueTests(unittest.TestCase):
         self.assertFalse(row['newer_activity'])
         data[0]['comments'].append(dict(id='other',author='http/agent/b',created_at='2026-10-04T10:00:00Z',text='Other worker.'))
         self.assertTrue(work.queue(data,'http/agent/a',[])['items'][0]['newer_activity'])
+
+    def test_a_lane_state_record_does_not_wake_its_own_checkpoint(self):
+        # The checkpoint is written by an operator, not by the assignee, so every comment
+        # after it counts as another actor's write. The lane-state record written WITH it
+        # does not (kittrial-5bb.263 review); an ordinary comment still does.
+        data=rows()
+        data[0]['comments'].append(dict(id='cp',author='operator',created_at='2026-10-04T10:00:00Z',
+                                        text=briefing.PREFIX+canonical_bytes(checkpoint(data)).decode()))
+        record=dict(schema_version=1,task=TASK,checkpoint='cp',state='waiting-on-coordinator',
+                    waiting_on='coordinator')
+        data[0]['comments'].append(dict(id='ls',author='operator',created_at='2026-10-04T10:01:00Z',
+                                        text=lane_state.PREFIX+canonical_bytes(record).decode()))
+        self.assertFalse(work.queue(data,'alice/session',[])['items'][0]['newer_activity'])
+        data[0]['comments'].append(dict(id='note',author='operator',created_at='2026-10-04T10:02:00Z',
+                                        text='Ordinary progress.'))
+        self.assertTrue(work.queue(data,'alice/session',[])['items'][0]['newer_activity'])
 
     def test_resolved_checkpoint_has_zero_open_items(self):
         data=rows();item=dict(id='question',kind='blocker',text='Need a key.',source='build')

@@ -1073,7 +1073,8 @@ class EndpointReviewSwitchTests(unittest.TestCase):
 
         def fake_work(path, actor, action, args, attachments, runner, operators=None,
                       verifiers=None, review_writes=None, independent_approval=False,
-                      coordinator_writes=False, owners=None, verified_web_authority=False):
+                      coordinator_writes=False, owners=None, verified_web_authority=False,
+                      lanes_scope='all'):
             seen['review_writes'] = review_writes
             seen['independent_approval'] = independent_approval
             seen['coordinator_writes'] = coordinator_writes

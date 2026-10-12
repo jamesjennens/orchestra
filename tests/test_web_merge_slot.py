@@ -51,6 +51,21 @@ class BoundaryTests(unittest.TestCase):
         self.assertEqual(web_merge_slot.validate(
             {'operation': 'force-release', 'expected_holder': 'ops\u200b', 'reason': 'Stuck'}), 'force-release')
 
+    def test_force_release_may_name_the_task_it_saw(self):
+        # kittrial-5bb.268 item 4: optional, bounded, a native id, and nothing else is added.
+        base = {'operation': 'force-release', 'expected_holder': 'ops', 'reason': 'Gone'}
+        self.assertEqual(web_merge_slot.validate(base), 'force-release')
+        self.assertEqual(web_merge_slot.validate(dict(base, expected_task='pp-1')), 'force-release')
+        for bad in ({'expected_task': 'x' * 97}, {'expected_task': 5}, {'expected_task': '../pp-1'},
+                    {'expected_task': 'pp-1', 'expected_acquired_at': 'now'}):
+            with self.subTest(bad=bad), self.assertRaises(web_merge_slot.SlotError):
+                web_merge_slot.validate(dict(base, **bad))
+        for operation in ('acquire', 'release', 'create'):
+            body = {'operation': operation, 'expected_task': 'pp-1'}
+            if operation == 'acquire':body.update(task='pp-1', target='main')
+            with self.subTest(operation=operation), self.assertRaises(web_merge_slot.SlotError):
+                web_merge_slot.validate(body)
+
     def test_slot_operations_share_the_endpoint_capability_table(self):
         cases = {
             'coordinate': {'merge-check': http_authority.CAP_READ,
@@ -226,6 +241,67 @@ class NativeWebSlotTests(RulesHelpers, unittest.TestCase):
         before = self.rows();reply = self.request(harness, agent_token, 'acquire', body, key='demoted-agent-slot-1')
         self.assertEqual(reply.status, 403, reply.data);self.assertEqual(self.rows(), before)
 
+    def test_a_coordinator_person_may_not_force_release_or_create(self):
+        # kittrial-5bb.268 item 1: only an owner or a superuser; a coordinator takes and
+        # releases its own slot but neither forces another holder out nor creates/repairs.
+        self.deployment(operators=['ops'], coordinator_writes=True)
+        harness, owner = self.web();task = self.task()
+        uid = harness.create_account(owner, 'slot-coordinator', 'slot-password-1')
+        self.assertEqual(harness.request('PUT', '/v1/projects/pp/members/' + uid, {'role': 'coordinator'},
+                                         token=owner).status, 200)
+        coordinator = harness.login('slot-coordinator', 'slot-password-1')[0]
+        self.coordinate('ops', 'merge-acquire', task, 'main')
+        before = self.rows()
+        refused = self.request(harness, coordinator, 'force-release',
+                               {'expected_holder': 'ops', 'reason': 'Coordinator tries'}, key='coordinator-force-1')
+        self.assertEqual(refused.status, 403, refused.data);self.assertEqual(self.rows(), before)
+        refused = self.request(harness, coordinator, 'create', {}, key='coordinator-create-1')
+        self.assertEqual(refused.status, 403, refused.data);self.assertEqual(self.rows(), before)
+        self.assertFalse(self.request(harness, coordinator, 'read').data['can_force_release'])
+        # The same requests from the owner go through: the refusal is the role, not the body.
+        allowed = self.request(harness, owner, 'force-release', {'expected_holder': 'ops', 'reason': 'Owner frees it'},
+                               key='owner-force-after-coordinator-1')
+        self.assertEqual(allowed.status, 200, allowed.data)
+        self.assertEqual(self.request(harness, owner, 'create', {}, key='owner-create-after-coordinator-1').status, 200)
+
+    def test_a_stale_page_does_not_release_a_new_acquisition_by_the_same_holder(self):
+        # kittrial-5bb.268 item 4, both directions: the task the page saw must still be held.
+        harness, owner = self.web();first = self.task('First');second = self.task('Second')
+        self.coordinate('ops', 'merge-acquire', first, 'main')
+        seen = self.request(harness, owner, 'read').data
+        self.assertEqual((seen['holder'], seen['context']['task']), ('ops', first))
+        self.coordinate('ops', 'merge-release');self.coordinate('ops', 'merge-acquire', second, 'main')
+        before = self.rows()
+        stale = self.request(harness, owner, 'force-release',
+                             {'expected_holder': 'ops', 'reason': 'Stale page', 'expected_task': first}, key='stale-task-1')
+        self.assertEqual(stale.status, 409, stale.data);self.assertEqual(self.rows(), before)
+        self.assertIn('another task', stale.data['error']['message'])
+        bad = self.request(harness, owner, 'force-release',
+                           {'expected_holder': 'ops', 'reason': 'Bad', 'expected_task': '../x'}, key='bad-task-1')
+        self.assertEqual(bad.status, 422, bad.data);self.assertEqual(self.rows(), before)
+        current = self.request(harness, owner, 'force-release',
+                               {'expected_holder': 'ops', 'reason': 'Current page', 'expected_task': second},
+                               key='current-task-1')
+        self.assertEqual(current.status, 200, current.data);self.assertTrue(current.data['slot']['available'])
+        self.assertEqual(current.data['task_id'], second)
+
+    def test_an_unreadable_context_is_freed_as_the_deployment_guide_says(self):
+        # kittrial-5bb.268 item 3: the read refuses with its sentence; once an operator moves the
+        # file aside, an owner force-releases from the page with no task to compare.
+        harness, owner = self.web();task = self.task()
+        self.coordinate('ops', 'merge-acquire', task, 'main')
+        context = self.project / '.merge-context.json'
+        context.write_text('{"holder": ', encoding='utf-8')
+        read = self.request(harness, owner, 'read')
+        self.assertEqual(read.status, 503, read.data)
+        self.assertIn('installation operator', read.data['error']['message'])
+        context.rename(self.project / 'merge-context.unreadable.json')
+        read = self.request(harness, owner, 'read')
+        self.assertEqual((read.status, read.data['holder'], read.data['context']), (200, 'ops', None))
+        freed = self.request(harness, owner, 'force-release', {'expected_holder': 'ops', 'reason': 'Context was unreadable'},
+                             key='unreadable-context-1')
+        self.assertEqual(freed.status, 200, freed.data);self.assertTrue(freed.data['slot']['available'])
+
     def test_committed_audit_survives_a_lost_http_receipt_without_duplicate(self):
         from unittest.mock import patch
         harness, owner = self.web();task = self.task();commit = harness.service.idempotency_commit
@@ -316,6 +392,33 @@ class NativeWebSlotTests(RulesHelpers, unittest.TestCase):
         committed = [e for e in harness.service.state['audit'] if e['action'] == 'merge-slot.create' and e['outcome'] == 'committed']
         self.assertEqual(len(committed), 1);self.assertEqual(committed[0]['holder_after'], 'ops')
         self.coordinate('ops', 'merge-release')
+
+
+class PageSentenceTests(unittest.TestCase):
+    """kittrial-5bb.268 items 2 and 5, on the real page with a fake API: a 503 read says what is
+    wrong and who repairs it; an uncertain write says the page does not retry by itself."""
+
+    def test_the_page_says_what_is_wrong_and_who_repairs_it(self):
+        import shutil
+        from test_http_web import run_node_module
+        node = shutil.which('node')
+        if not node:self.skipTest('Node is unavailable; the real page is not exercised')
+        done = run_node_module(self, node, 'await import(process.argv[1])',
+                               (KIT / 'tests/web_merge_slot_message_screen.mjs').as_uri(),
+                               (KIT / 'tests/web_dom_shim.mjs').as_uri(),
+                               (KIT / 'web/js/views/merge_slot.js').as_uri())
+        self.assertEqual(done.returncode, 0, done.stderr[-3000:])
+        seen = json.loads(done.stdout.strip().splitlines()[-1])
+        damaged = 'The merge slot is damaged. A signed-in owner or superuser must use the explicit create/repair action.'
+        self.assertEqual(seen['contributor'], 'The merge slot cannot be used: ' + damaged
+                         + ' A project owner or superuser can repair it from this page.')
+        self.assertEqual(seen['owner'], 'The merge slot cannot be used: ' + damaged
+                         + ' You can repair it with Create or repair slot below.')
+        self.assertTrue(seen['ownerHasRepair']);self.assertFalse(seen['contributorHasRepair'])
+        self.assertTrue(seen['operator'].endswith('An installation operator repairs this on the host.'))
+        self.assertNotIn('could not confirm whether this was saved', seen['owner'])
+        self.assertIn('This page does not retry by itself', seen['uncertain'])
+        self.assertEqual(seen['forced'], {'holder': 'ops', 'reason': 'Gone', 'task': 'pp-7'})
 
 
 if __name__ == '__main__':unittest.main()
