@@ -104,8 +104,9 @@ def _caller_move(state, task, owned, named_reviewer=False, pending_items=0, rede
     name = str(task or 'the task')
     try:
         items = int(pending_items or 0)
-    except (TypeError, ValueError):
-        raise ValueError('pending_items must be a number')
+    except (TypeError, ValueError, OverflowError):
+        # An infinite count is not a number either (kittrial-5bb.264 item 5).
+        raise ValueError('pending_items must be a number') from None
     items = max(0, items)
     plural = 'item' if items == 1 else 'items'
     back = '`review %s`' % name if way_back is None else way_back
@@ -179,6 +180,19 @@ def review_move(state, task, owned, named_reviewer=False, pending_items=0, redel
     return move, text
 
 
+def is_redelivery(contribution_id, open_requests):
+    """Whether every open review item was filed on an earlier contribution.
+
+    A superseding redelivery that has not been answered: the current contribution
+    replaces the one the items were filed on, so only the responses are owed
+    (kittrial-5bb.249 review, item 3b). ONE rule, used by the ``work`` projection and
+    by the in-process backend (kittrial-5bb.264 item 4).
+    """
+    return (bool(contribution_id) and bool(open_requests) and
+            all(str(item.get('contribution') or '') != str(contribution_id)
+                for item in open_requests))
+
+
 def quoted_checkpoint_text(value):
     """One checkpoint line, safe inside the sentence's double quotes.
 
@@ -190,7 +204,9 @@ def quoted_checkpoint_text(value):
     """
     from briefing import plain_text
     text = plain_text(str(value or '').replace('\\', '\\\\'))
-    return text.replace('"', '\\"').replace('\n', '\\n')
+    # A raw TAB is kept by plain_text on purpose (kittrial-5bb.264 item 1): escape it
+    # here too, with the quote and the newline.
+    return text.replace('"', '\\"').replace('\n', '\\n').replace('\t', '\\t')
 
 
 def checkpoint_wait_move_text(state):
@@ -204,10 +220,11 @@ def checkpoint_wait_move_text(state):
     if not isinstance(state, dict) or state.get('invalid') or state.get('current') is None:
         return None
     payload = state['current'][0] if state['current'] else None
-    for entry in (payload or {}).get('open_items') or []:
-        if isinstance(entry, dict) and entry.get('kind') in ('blocker', 'dependency'):
-            return entry.get('text')
-    return None
+    found = [entry for entry in (payload or {}).get('open_items') or []
+             if isinstance(entry, dict) and entry.get('kind') in ('blocker', 'dependency')]
+    if not found:
+        return None
+    return {'text': found[0].get('text'), 'more': max(0, len(found) - 1)}
 
 
 def waiting_move(blocker_text):
@@ -223,8 +240,15 @@ def waiting_move(blocker_text):
     text = blocker_text.get('text') if isinstance(blocker_text, dict) else blocker_text
     if not text:
         return None
-    return ('You recorded a blocker or dependency in your own checkpoint: "%s".'
-            % quoted_checkpoint_text(text))
+    # Bound the quote and say when there is more than one entry (kittrial-5bb.264 item 7).
+    more = ''
+    if isinstance(blocker_text, dict) and blocker_text.get('more'):
+        more = ' and %d more' % int(blocker_text['more'])
+    quoted = quoted_checkpoint_text(text)
+    if len(quoted) > 600:
+        quoted = quoted[:600] + '...'
+    return ('You recorded a blocker or dependency in your own checkpoint: "%s"%s.'
+            % (quoted, more))
 
 
 def checkpoint_wait(row, actor, state, delivered=False):
@@ -634,6 +658,9 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
                           # A malformed row is never claimable and carries no next-action actor
                           # beyond the operator who must repair it (kittrial-5bb.6).
                           'claimable':False,'work_state':'error','next_actor':'operator',
+                          # A malformed row has no validated contribution, so it is never
+                          # a redelivery (kittrial-5bb.264 item 2).
+                          'redelivered':False,
                           'reconciliation_needed':False,'reconciliation_reasons':[]})
             continue
         # The merge slot is an internal record (kittrial-5bb.113): on real bd it is a
@@ -778,8 +805,7 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
         # contribution the current one replaces, so only the responses are owed
         # (kittrial-5bb.249 review, item 3b).
         contribution_id=contribution.get('comment_id')
-        redelivered=bool(contribution_id) and bool(pending_requests) and all(
-            str(pending.get('contribution') or '')!=str(contribution_id) for pending in pending_requests)
+        redelivered=is_redelivery(contribution_id, pending_requests)
         # The one bounded claimability answer for this row (kittrial-5bb.6 deliverable b).
         # It is computed before the move because next_actor needs it: an unassigned,
         # undelivered row may name `anyone` only when somebody could actually take it.
