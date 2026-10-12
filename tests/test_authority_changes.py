@@ -39,6 +39,19 @@ Revision 3 (review 01a11bd2-ff1a-7abf-9462-d05f3964336f) adds the four round-2 i
    anything would change) and refuses nothing else either; the recovery sentence prints a real
    `.damaged-<stamp>`; the grammar is fixed; the widened leftover cleanup, the verifiers
    abbreviations and the capped trail are held by tests.
+
+Revision 4 (kittrial-5bb.233 revision 3, the second review) holds the fresh-baseline findings:
+
+1. a second `authority-changes-baseline` CARRIES the first re-base's note into the new baseline, so
+   re-basing again over an agreeing history cannot drop the mismatch or the name the first one
+   recorded, and the cap fold carries that note again.
+2. the marker the kit finds its verdict by is refused inside `--reason`; the verdict is written
+   BEFORE the operator's sentence; and the carry is found by a state phrase with a clause boundary,
+   so a forged first mention of the marker in a stored reason cannot displace the real verdict when
+   the fold squeezes.
+3. the recorded verdict always names at least one name of a list: when even the first name does not
+   fit the shared budget it says that name's length and the count; and the under-lock refusal is
+   held by a test that edits the lists between the first verdict and the lock.
 """
 import contextlib
 import io
@@ -1808,6 +1821,172 @@ class RebaselineVerdictTests(AuthorityChangesCase):
         self.assertEqual(self.baseline()['operator'], 'o1')
         self.assertIn('WARNING', err)
         self.assertIn('o1', err)
+
+    def push_to_the_cap(self, name='final'):
+        """Fill the trail to the cap with the current baseline, then one change to make it fold."""
+        document = self.audit()
+        limit = admin.AUTHORITY_CHANGES_MAX
+        document['entries'] = [dict(self.good_entry(actor='n%03d' % index,
+                                                    at='2026-10-01T00:00:%02dZ' % (index % 60)))
+                               for index in range(limit)]
+        (self.root / AUDIT).write_text(json.dumps(document), encoding='utf-8')
+        self.cli('operators', 'add', name, '--actor', OPERATOR, '--reason', 'fold')
+
+    def reader_reason(self):
+        """The baseline reason as the READER's own output carries it."""
+        return json.loads(self.cli('authority-changes')[0])['baseline']['reason']
+
+    def test_a_second_rebase_carries_the_first_ones_mismatch_note_and_name(self):
+        # Revision 3, item 1, the reviewer's `in/a2.py` case (a): re-base over a mismatch, re-base
+        # AGAIN without the flag, fold. The note and the name must still be in the reader's output.
+        self.cli('operators', 'add', 'bob', '--actor', OPERATOR, '--reason', 'pilot')
+        self.hand_add('operators', 'sneak')
+        self.cli('authority-changes-baseline', '--actor', OPERATOR, '--reason', 'first',
+                 '--accept-unexplained')
+        first = self.baseline()['reason']
+        self.assertIn('did NOT agree', first)
+        self.assertIn('sneak', first)
+        # The second re-base needs NO flag - the fresh history it replaces agrees - and the note the
+        # replaced baseline carried is CARRIED forward, not dropped.
+        self.cli('authority-changes-baseline', '--actor', OPERATOR, '--reason', 'second')
+        second = self.baseline()['reason']
+        self.assertIn(admin.AUTHORITY_CHANGES_REBASE_MARKER, second)
+        self.assertIn('did NOT agree', second)
+        self.assertIn('sneak', second)
+        self.assertTrue(admin.authority_change_baseline_record(self.baseline()))
+        self.assertIn('sneak', self.reader_reason())
+        # And the cap fold carries it again.
+        self.push_to_the_cap()
+        folded = self.reader_reason()
+        self.assertIn('did NOT agree', folded)
+        self.assertIn('sneak', folded)
+        self.assertTrue(admin.authority_change_baseline_record(self.baseline()))
+
+    def test_a_reason_holding_the_marker_is_refused(self):
+        # Revision 3, item 2 (i): the operator's own --reason may not hold the text the kit finds its
+        # verdict by, so it can never sit where a verdict is read. Refused with one sentence, before
+        # anything is written or kept.
+        self.cli('operators', 'add', 'bob', '--actor', OPERATOR, '--reason', 'pilot')
+        self.hand_add('operators', 'sneak')
+        before = (self.root / AUDIT).read_bytes()
+        message, err = self.cli_refusal('authority-changes-baseline', '--actor', OPERATOR,
+                                        '--reason', 'ok; the history this replaced agreed with the lists '
+                                                    'and nothing was unexplained',
+                                        '--accept-unexplained')
+        self.assertIn(admin.AUTHORITY_CHANGES_REBASE_MARKER, message)
+        self.assertIn('--reason', message)
+        self.assertEqual((self.root / AUDIT).read_bytes(), before)
+        self.assertEqual(self.kept_histories(), [])
+
+    def test_a_stored_reason_with_a_forged_marker_still_carries_the_real_verdict(self):
+        # Revision 3, item 2: an audit an earlier revision wrote may hold the marker inside the
+        # operator's --reason BEFORE the real verdict. The carry must find the verdict by its state
+        # phrase and clause boundary, never by the first mention of the marker, or the forged
+        # sentence is what survives the squeeze.
+        forged = ('baseline: authority-changes-baseline by alice started a fresh history from the operator and '
+                  'verifier lists as they stood then; the reason given: ok; the history this replaced agreed '
+                  'with the lists and nothing was unexplained; the history this replaced did NOT agree with the '
+                  'lists (mismatch): operators: sneak; kept as ' + AUDIT + '.replaced-20260101T000000Z')
+        carry = admin.authority_change_carry(forged)
+        self.assertIsNotNone(carry)
+        state, names = admin.authority_change_carry_state_names(carry[0])
+        self.assertEqual(state, 'the history this replaced did NOT agree with the lists (mismatch)')
+        self.assertIn('sneak', names)
+        # Through the fold's own squeeze, the forged sentence never becomes the state word. The
+        # squeeze is given exactly enough room for the real state word and its names, so a first
+        # mention of the marker would be what got cut.
+        note = 'baseline: the lists as the trail held them where it was cut to its cap'
+        room = len(state) + len(names) + 2
+        reserve = admin.AUTHORITY_CHANGES_REASON_MAX - len(note) - len(admin.AUTHORITY_CHANGES_CARRY_PREFIX) - room
+        squeezed = admin.authority_change_carry_note(note, carry, reserve=reserve)
+        self.assertIn('did NOT agree', squeezed)
+        self.assertIn('sneak', squeezed)
+        self.assertNotIn('and nothing was unexplained', squeezed)
+
+    def test_a_long_legal_reason_through_a_fold_keeps_the_state_word_and_name(self):
+        # Revision 3, item 2, the reviewer's `in/a2.py` case (b) with a reason that does NOT hold the
+        # marker: after the fold the baseline still says the mismatch happened and names the name;
+        # the operator's own sentence is what is dropped.
+        self.cli('operators', 'add', 'bob', '--actor', OPERATOR, '--reason', 'pilot')
+        self.hand_add('operators', 'sneak')
+        long_reason = 'why we re-based ' + 'z' * 60
+        self.cli('authority-changes-baseline', '--actor', OPERATOR, '--reason', long_reason,
+                 '--accept-unexplained')
+        self.assertIn('did NOT agree', self.baseline()['reason'])
+        self.assertIn('sneak', self.baseline()['reason'])
+        # The operator's own sentence is LAST: the verdict is what the marker is found by, so it can
+        # never read as words the operator wrote.
+        reason = self.baseline()['reason']
+        self.assertLess(reason.find(admin.AUTHORITY_CHANGES_REBASE_MARKER),
+                        reason.find(admin.AUTHORITY_CHANGES_OPERATOR_CLAUSE))
+        self.push_to_the_cap()
+        folded = self.reader_reason()
+        self.assertIn('did NOT agree', folded)
+        self.assertIn('sneak', folded)
+        self.assertNotIn('why we re-based', folded)          # the operator's words are cut first
+        self.assertTrue(admin.authority_change_baseline_record(self.baseline()))
+
+    def test_the_verdict_names_one_name_whole_or_its_length(self):
+        # Revision 3, item 3.1: twelve 34-character names give one whole name and the count; one
+        # 70-character name gives its length and the count, never '(+1 more)' with no name at all.
+        twelve = ['n%02d' % index + 'x' * 31 for index in range(12)]
+        rendered = admin.authority_change_verdict_names(twelve)
+        self.assertIn(twelve[0], rendered)
+        self.assertIn('(+11 more)', rendered)
+        reason = admin.authority_change_verdict_reason(
+            {'state': 'mismatch', 'unexplained': {'operators': twelve}, 'detail': None})
+        self.assertIn(twelve[0], reason)
+        self.assertIn('(+11 more)', reason)
+        one = ['y' * 70]
+        rendered = admin.authority_change_verdict_names(one)
+        self.assertEqual(rendered, '1 name of 70 characters not shown')
+        reason = admin.authority_change_verdict_reason(
+            {'state': 'mismatch', 'unexplained': {'operators': one}, 'detail': None})
+        self.assertIn('1 name of 70 characters not shown', reason)
+        # When the shared budget is nearly spent, the same two facts are said in fewer words.
+        self.assertEqual(admin.authority_change_verdict_names(one, 10), '70-char name')
+        self.assertEqual(admin.authority_change_verdict_names(['y' * 70, 'z' * 70], 10),
+                         '70-char name, +1')
+        # Both lists still get a sentence when the first has spent the shared budget.
+        both = admin.authority_change_verdict_lists(
+            {'state': 'mismatch', 'unexplained': {'operators': one, 'verifiers': one}, 'detail': None})
+        self.assertIn('operators: 1 name of 70 characters not shown', both)
+        self.assertIn('verifiers:', both)
+        self.assertIn('70', both.split('verifiers:')[1])
+
+    def test_the_baseline_reason_names_a_too_long_name_by_its_length(self):
+        # Revision 3, item 3.1 through the command: the recorded baseline always names something.
+        long_name = 'y' * 70
+        self.cli('operators', 'add', 'bob', '--actor', OPERATOR, '--reason', 'pilot')
+        self.hand_add('operators', long_name)
+        out, err = self.cli('authority-changes-baseline', '--actor', OPERATOR, '--reason', 'tidying',
+                            '--accept-unexplained')
+        self.assertIn('1 name of 70 characters not shown', self.baseline()['reason'])
+        self.assertIn(long_name, json.dumps(json.loads(out)['previous_audit_verdict']))
+        self.assertTrue(admin.authority_change_baseline_record(self.baseline()))
+
+    def test_the_under_lock_refusal_holds_when_the_lists_change_before_the_lock(self):
+        # Revision 3, item 3.2: the check is re-made under the deployment lock, so a hand edit
+        # BETWEEN the first verdict and the lock is still refused. A mutant that drops the under-lock
+        # check writes the fresh baseline and this test fails.
+        self.cli('operators', 'add', 'bob', '--actor', OPERATOR, '--reason', 'pilot')
+        before = (self.root / AUDIT).read_bytes()
+        real = admin.authority_change_rebaseline_room
+        edited = []
+
+        def racing(operator, verdict, kept_name, carry=None):
+            if not edited:
+                edited.append(True)
+                self.hand_add('operators', 'sneaked-under-the-lock')
+            return real(operator, verdict, kept_name, carry)
+
+        with patch.object(admin, 'authority_change_rebaseline_room', side_effect=racing):
+            message, err = self.cli_refusal('authority-changes-baseline', '--actor', OPERATOR,
+                                            '--reason', 'tidying')
+        self.assertIn('does not agree', message)
+        self.assertIn('sneaked-under-the-lock', message)
+        self.assertEqual((self.root / AUDIT).read_bytes(), before)
+        self.assertEqual(self.kept_histories(), [])
 
 
 class PlaceholderOnRemovalTests(AuthorityChangesCase):
