@@ -60,7 +60,16 @@ class HttpApiError(Exception):
         self.key = key
 
     def __str__(self):
-        text = '%s (%s)' % (self.message, self.code)
+        # The message is the SERVER's own text: a kit program that prints this exception (for
+        # example tools/demonstrate_review_targeting.py prints `{error}`) must not let a server
+        # rewrite the terminal, so it goes through the client's one escape for server text
+        # (kittrial-5bb.241). Imported here, not at the top: this module prints nothing itself, and
+        # a copy shipped without client.py beside it keeps printing the message as it always did.
+        try:
+            from client import server_text
+        except ImportError:
+            server_text = str
+        text = '%s (%s)' % (server_text(self.message), self.code)
         if self.request_id:
             text += ' [%s]' % self.request_id
         return text

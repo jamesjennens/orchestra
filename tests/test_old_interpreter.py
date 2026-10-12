@@ -213,6 +213,74 @@ class ClientSaysItTests(unittest.TestCase):
                 said = self.answered(returncode, stdout, stderr)
                 self.assertTrue(said.startswith('SSH failed (%d); outcome may be uncertain. ' % returncode), said)
 
+    #: One of each class of character a terminal obeys, as a server's stderr can carry them
+    #: (kittrial-5bb.241): ESC, BEL, BS, NUL, a C1 control, a bidirectional override and a line
+    #: separator, with printable text around them and the endpoint's own advice at the end.
+    HOSTILE = ('\x1b[31m red \x07 bell \x08 back \x00 nul \x9b c1 \u202e override \u2028 sep '
+               'Set "python" in the client configuration.')
+    RAW = ('\x1b', '\x07', '\x08', '\x00', '\x9b', '\u202e', '\u2028')
+
+    def assert_no_raw_controls(self, said):
+        for character in self.RAW:
+            self.assertNotIn(character, said)
+
+    def assert_escaped_forms(self, said):
+        self.assertIn('\\x1b[31m', said)
+        for escaped in ('\\x07', '\\x08', '\\x00', '\\x9b', '\\u202e', '\\u2028'):
+            self.assertIn(escaped, said)
+
+    def test_the_general_failure_line_escapes_what_a_terminal_would_obey(self):
+        """kittrial-5bb.241: the general failure line prints up to 1000 characters of the server's
+        stderr, and every character a terminal obeys is shown escaped; the bound stays 1000."""
+        said = self.answered(1, '', self.HOSTILE)
+        self.assertTrue(said.startswith('SSH failed (1); outcome may be uncertain. '), said)
+        self.assert_no_raw_controls(said)
+        self.assert_escaped_forms(said)
+        # A tab and a newline in the server's text are NOT escaped: they are not terminal controls
+        # that rewrite a line.
+        kept = self.answered(1, '', 'one\ttwo\nthree')
+        self.assertIn('one\ttwo\nthree', kept)
+        # The bound is the same 1000 characters: 1100 characters stop at 1000.
+        bounded = self.answered(1, '', 'x' * 1100)
+        self.assertIn('x' * 1000, bounded)
+        self.assertNotIn('x' * 1001, bounded)
+
+    def test_the_old_interpreter_path_escapes_its_server_text_too(self):
+        """The old-interpreter path prints the endpoint's own sentence and, when it is recognised,
+        the server's advice tail: both are server text, and every configuration escapes them
+        (kittrial-5bb.241)."""
+        head = ('endpoint.py needs Python 3.10 or newer and was started with Python 3.6.8 (/usr/bin/python3). '
+                'Nothing was carried out. ')
+        for name, config in (('plain', self.SSH), ('forced', dict(self.SSH, forced_command=True))):
+            with self.subTest(configuration=name):
+                said = self.answered(2, '', head + self.HOSTILE + '\n')
+                self.assertTrue(said.startswith('SSH: endpoint.py needs Python 3.10 or newer'), said)
+                self.assert_no_raw_controls(said)
+                self.assert_escaped_forms(said)
+                self.assertIn('\\x1b[31m red', said)
+        # The fixed sentence itself is server text: controls in it are escaped as well.
+        said = self.answered(2, '', head.replace('Nothing', 'Nothing\x07') + 'advice without a tail\n')
+        self.assert_no_raw_controls(said)
+        self.assertIn('\\x07', said)
+        self.assertIn('advice without a tail', said)
+
+    def test_a_hostile_advice_tail_is_recognised_up_to_600_characters(self):
+        """The 600-character bound is applied to the RAW server text, not to the escaped text: a
+        full-length tail holding controls is still recognised (kittrial-5bb.222's bound with
+        kittrial-5bb.241's escape)."""
+        head = ('endpoint.py needs Python 3.10 or newer and was started with Python 3.6.8 (/usr/bin/python3). '
+                'Nothing was carried out. ')
+        tail = ('\x1b' * 200) + ('y' * 400)                     # exactly 600 characters
+        said = self.answered(2, '', head + tail + '\n')
+        self.assertTrue(said.startswith('SSH: endpoint.py needs Python 3.10 or newer'), said)
+        self.assert_no_raw_controls(said)
+        self.assertIn('\\x1b\\x1b', said)
+        self.assertIn('y' * 400, said)
+        # 601 characters is not the advice: the uncertain warning stays, and it is escaped too.
+        said = self.answered(2, '', head + tail + 'y\n')
+        self.assertTrue(said.startswith('SSH failed (2); outcome may be uncertain. '), said)
+        self.assert_no_raw_controls(said)
+
 
 class SourceTests(unittest.TestCase):
     """What a stand-in cannot show: the check runs on a real 3.6 only if 3.6 can read it and nothing precedes it."""
