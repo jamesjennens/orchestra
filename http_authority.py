@@ -2146,8 +2146,9 @@ def descriptor_actor_denial(request, authority_config, reserved):
 #: route that sends it. A mapping value is keyed by the action's operation (the first
 #: argument; for ``review`` the ``operation`` of the attached record), with ``None`` for
 #: every other operation of that action. An action or operation that is not here is not
-#: judged by ``block_mismatch_denial`` (the five service-only actions carry their own exact
-#: check, ``project_creation.SERVICE_ACTIONS``).
+#: judged for its capability by ``block_mismatch_denial``. The five service-only actions
+#: are not judged there at all: they carry their own exact check
+#: (``project_creation.SERVICE_ACTIONS``).
 BLOCK_CAPABILITIES = {
     'bd': {'create': CAP_TASKS,            # tasks.create
            'update': CAP_TASKS},           # tasks.update, tasks.claim
@@ -2211,6 +2212,12 @@ def block_mismatch_denial(request, authority_config):
         return None
     authority = request.get('authority')
     if not isinstance(authority, dict):
+        return None
+    from project_creation import SERVICE_ACTIONS
+    if request.get('action') in SERVICE_ACTIONS:
+        # The service-only actions hold this rule themselves, with their own sentences
+        # (``project_creation.service_descriptor``: exactly the capability of the action; and
+        # the project, where the action has one). They are answered as before.
         return None
     if authority.get('project') != request.get('project'):
         return _envelope(126, stderr='The live-authority descriptor names another project than the one this request '

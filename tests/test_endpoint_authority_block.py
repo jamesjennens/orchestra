@@ -386,6 +386,25 @@ class BlockMatchesRequestTests(EndpointHarness):
         self.assertEqual(0, asked['returncode'], asked)
         self.assertEqual(1, len([command for _, command in self.tracker.writes if command[:2] == ['comments', 'add']]))
 
+    def test_the_service_only_actions_keep_their_own_check_and_their_own_sentence(self):
+        # set-onboarding and owner-requirements compare the block themselves (capability and
+        # project); this check leaves them to it, so their answers are the ones they had.
+        import project_creation
+        for action in project_creation.SERVICE_ACTIONS:
+            with self.subTest(action=action):
+                self.assertIsNone(http_authority.block_mismatch_denial(
+                    {'project': OTHER_PROJECT, 'actor': OWNER, 'action': action, 'args': [],
+                     'authority': session_block(OWNER, 'read')}, self.config))
+        with self.assertRaises(ValueError) as refused:
+            self.web({'project': OTHER_PROJECT, 'actor': OWNER, 'action': 'set-onboarding', 'args': ['clear'],
+                      'operation_id': 'onboarding-1'}, session_block(OWNER, 'project.admin'))
+        self.assertIn('set-onboarding needs a descriptor for this project', str(refused.exception))
+        with self.assertRaises(ValueError) as refused:
+            self.web({'project': PROJECT, 'actor': OWNER, 'action': 'set-onboarding', 'args': ['clear'],
+                      'operation_id': 'onboarding-2'}, session_block(OWNER, 'reviews.approve'))
+        self.assertIn('set-onboarding needs a session descriptor for project.admin', str(refused.exception))
+        self.assertEqual([], self.tracker.calls)
+
     def test_the_host_route_ignores_a_block_as_before(self):
         # No launch configuration: the block is not read at all, whatever it says.
         request = dict(self.payload_request('review', [TASK], {'schema_version': 1, 'operation': 'approve', 'task': TASK}),
