@@ -346,11 +346,43 @@ audit entry does not read as agreeing, and `status` says so. Both `status` and
 `on` read the authorized_keys file named by `--file` (default this account's
 `~/.ssh/authorized_keys`) and report `would_be_refused`: the lines of this kit and this root that
 the setting refuses, or would refuse while it is off. So the operator sees what `on` is about to
-cut off before it happens, and `on` prints that list - after reading and building it and before it
-writes the flip, so a slow or failing read of the keys file never leaves the setting on with
-nothing printed. The keys file is read at most its first 1 MiB, and `would_be_refused` names at most
+cut off before it happens, and `on` prints BOTH groups after reading and building them and
+BEFORE it writes the flip, so a slow or failing read of the keys file never leaves the setting
+on with nothing printed. The keys file is read at most its first 1 MiB, and `would_be_refused` names at most
 20 line numbers with `would_be_refused_more` (and an "and N more" in the note) saying how many more
-there are, so a hand-written file cannot flood the terminal. It is operator-gated (`--actor` must be
+there are, so a hand-written file cannot flood the terminal; `status` reports the same
+`would_be_refused`, `would_be_refused_more` and `truncated` fields with the same warnings, so the
+preview it prints is never incomplete without saying so (kittrial-5bb.250 F1). **`on` refuses to
+turn the setting on when the keys file cannot be read or was only partly inspected** - a file that
+is missing, a directory, a fifo (which this command refuses to wait on), or larger than the 1 MiB
+bound: an operator who cannot see what will be cut off must say so deliberately, with
+`--without-preview`, and the refusal names that option; nothing is changed by the refusal
+(kittrial-5bb.250 F2, the coordinator's decision). The preview decides by ONE rule, in three
+groups (kittrial-5bb.250 r5): **refused** - a line whose command is EXACTLY the shape
+`authorized-keys` prints: one ABSOLUTE interpreter path, then zero or more of the two words
+`-E` and `-s` each alone (no other flag, no combined `-Es`, no `-W` that takes the wrapper
+path as its own value, no `-i`), then this kit's wrapper by absolute path as the next word -
+or the wrapper path as the first word. The interpreter's NAME is not judged: the preview
+trusts the first word to be the interpreter the kit printed, and a line of that shape whose
+interpreter is not Python is the operator's own doing. The command must need no shell at all
+(a whitelist of plain ASCII characters: letters, digits, `-_.+/=,:` and space - a tab or a
+non-ASCII letter is shell), name the wrapper by an absolute path of at most 512 bytes, and
+carry an absolute `--root` serving this root, parsing as unbound. Group one means **not
+served once on**, not served today: a wrapper file that is not executable, a relative
+`--endpoint` or an ill-formed project name serve nothing now and are still group one.
+**may be refused** - every OTHER line that has a `command=` at all:
+any other wrapper or root, shell syntax (`cd KIT && ...`, `2>/dev/null`, `; true`, `&`, `#`, a
+glob, an assignment, `/bin/sh -c`, quotes), a relative or `$HOME` path, and lines that run
+another program - not decided here, with whether the wrapper file names the setting said as a
+HINT (the kit opens the file first and judges the open descriptor - a fifo is opened
+non-blocking and never read, a symlink is not followed - and reads up to 64 KiB of it, one
+listing per command, so once per file per `status` and per `on`; a word in a file is a hint,
+not a decision; `wrapper_names_setting` carries it in the listing, in `status` and in `on`);
+and lines the wrapper refuses for another reason, refused either way. A line with no
+`command=` at all, and a fully BOUND line of this kit that the setting does not touch, are
+outside the groups. `status` and `on` PRINT the second group - its count and line
+numbers, at most twenty with `may_be_refused_more`, in the JSON and on stderr - so no line that
+has a command is cut off unnamed, whatever it runs. It is operator-gated (`--actor` must be
 on the deployment operator allowlist) and every flip is recorded in the deployment document's
 `bound_keys_only_audit`, with the value it replaced, keeping the last 20 flips; a flip that changes
 nothing writes nothing. `off` on a value that is not true or false is a real flip: it writes false,
@@ -374,9 +406,10 @@ unrestricted key, another program's `command=`, a project's rules, and rules 1 a
 
 **What it does not do, said plainly.** A line printed before an upgrade names the wrapper and the
 endpoint of the release it was printed from, by absolute path, and on an office installation that
-path carries the release. Such a line runs THAT release's wrapper and endpoint - which know
-nothing of this setting, or of rules 1 to 3 - against the live runtime, for as long as that
-release's directory is there, and nothing in the new kit can refuse it. **Clean
+path carries the release. Such a line runs THAT release's wrapper and endpoint against the live
+runtime, for as long as that release's directory is there. A release older than bound keys only
+knows nothing of the setting; every release from it on refuses an unbound line itself - which is
+why the preview reports such a line as **may be refused**, not decided here. **Clean
 `authorized_keys` by hand**: remove or reprint every line that points at another release. The
 setting closes a forgotten line of the CURRENT kit; it does nothing about an older release's.
 `admin.py authorized-keys-list` flags each line that points at a kit other than the installed one
@@ -387,8 +420,11 @@ setting is on or off, so it is the preview before `on`. The setting is decided b
 wrapper's own command line decides: the wrapper FILE the line runs and its LAST `--root` (its
 argparse takes the last when a line names it twice); an `--endpoint` argument that names another
 kit's file does not move the line out of this kit's reach. A line that runs another kit's wrapper,
-or whose last `--root` is another runtime, is never counted as refused: this setting does not reach
-it (that line is served by the release or the root it names), and the note says so. A named line
+or whose last `--root` is another runtime, or whose command needs the shell or names a relative
+path, is not decided by this preview: it is reported in `may_be_refused` (at most twenty numbers
+with the count beyond, and `wrapper_names_setting` saying whether its wrapper file carries the
+word as a hint read from the first 64 KiB of the open regular file), never as refused by this
+setting and never as out of its reach. A named line
 the wrapper refuses for another reason (a bad or unknown argument, a binding named twice) is listed
 as refused with a sentence saying the setting is not why.
 
@@ -649,7 +685,7 @@ history](#malformed-structured-history) (`void-record`).
 | `authority-changes` | read-only: the recorded changes of the operator and verifier lists - which list, the actor added or removed, the change, when, and the recorded `--actor`/`--reason` (`null` when the caller gave neither) | none: read-only |
 | `review-writes status\|on\|off --actor OPERATOR` | read or set the per-installation switch that allows **writing** the new review-workflow record shapes (`withdraw`, `request-review`, `resolve-item`, `decline-review`, an item `severity`, a request-changes `summary`). Readers in this kit understand those shapes either way; with the switch off (the default) a write of one is refused before any native write. See [Review-workflow write switch](#review-workflow-write-switch) | the deployment operator allowlist, checked before any write; `deployment.private.json` is the only source (there is no environment fallback) |
 | `checkpoint-provenance-writes status\|on\|off --actor OPERATOR` | read or set the per-installation switch that allows **writing** checkpoint provenance and direction dispositions (acknowledge, resolve, supersede). Readers in this kit understand them either way; with the switch off (the default) a checkpoint that asks for them is refused before any native write. See [Checkpoint provenance write switch](#checkpoint-provenance-write-switch) | the deployment operator allowlist, checked before any write; `deployment.private.json` is the only source |
-| `bound-keys-only status\|on\|off --actor OPERATOR [--file AUTHORIZED_KEYS]` | read or set the per-installation setting that **accepts bound keys only**: with it on, the forced command of an `authorized_keys` line refuses a line that names no project or no principal, and `setup-status` reports it. `status` and `on` report `would_be_refused` (the lines of this kit and this root the setting refuses, or would refuse while it is off), read from `--file` or `~/.ssh/authorized_keys`. Off is the default and the absent key, so an installation that configures nothing behaves as before. See [Accept bound keys only](#accept-bound-keys-only) | the deployment operator allowlist, checked before any write; `deployment.private.json` is the only source |
+| `bound-keys-only status\|on\|off --actor OPERATOR [--file AUTHORIZED_KEYS]` | read or set the per-installation setting that **accepts bound keys only**: with it on, the forced command of an `authorized_keys` line refuses a line that names no project or no principal, and `setup-status` reports it. `status` and `on` report `would_be_refused` (the lines of this kit and this root the setting refuses, or would refuse while it is off) and `may_be_refused` with `may_be_refused_more` (the `command=` lines this preview does not decide, at most twenty named), read from `--file` or `~/.ssh/authorized_keys`; `on --without-preview` turns the setting on past the refusal an unreadable or partly-inspected keys file raises. Off is the default and the absent key, so an installation that configures nothing behaves as before. See [Accept bound keys only](#accept-bound-keys-only) | the deployment operator allowlist, checked before any write; `deployment.private.json` is the only source |
 | `coordinator-rules status\|on\|off [--rule lifecycle_authors\|independent_approval\|coordinator_writes] --actor OPERATOR` | read or set the three per-installation rules of the coordinators design, slices 6 and 7 (kittrial-5bb.197): who may record which lifecycle fact, that nobody passes their own work, and that approval and the merge slot belong to a listed actor of the project. `status` reports **all three**; `--rule` names the one `on`/`off` flips and is required for `on`/`off` (given at most once). Off is the default and the absent key, so an installation that configures nothing behaves as before. See [The coordinator rules](#the-coordinator-rules-who-may-write-which-fact-and-who-may-approve) | the deployment operator allowlist, checked before any write; `deployment.private.json` is the only source (there is no environment fallback) |
 | `lifecycle-authors PROJECT [--limit N]` | read-only: for every recorded trusted lifecycle fact of the project, the actor who recorded it, whether the `lifecycle_authors` rule would allow it (`allowed`, `would_be_refused`, `reason`) and the totals (`counts.would_be_refused`), plus whether the setting is currently on. Run it **before** turning `lifecycle_authors` on. It writes nothing and takes no `--actor`: shell access to the service account is already authority over the installation. At most `--limit` tasks (default 200) are listed and `truncated` says when there are more | none: read-only |
 | `proposal-review PROJECT --actor OPERATOR --file review.json` | record a coordinator disposition on a requirement proposal. The payload is `{schema_version, operation_id, key, previous, proposal_sha256, to_state, ...}`: `previous` is the `disposition_comment_id` and `proposal_sha256` the `sha256` that `proposal get` returned, so a stale read is refused before any write. `to_state` is `under-review` (the claim), `rejected` (with `reason`), `duplicate-of` (with `duplicate_of`), `needs-info` (with `question`), `escalated-to-owner` (with `escalation: {question, owner_identity, due_by}`) or `incorporated` (with `incorporation`, checked against the requirement record) | the deployment operator allowlist, checked before any read; the actor must be mapped to a person and must not be the submitter |

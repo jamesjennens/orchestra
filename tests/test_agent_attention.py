@@ -21,6 +21,7 @@ import http_service
 import test_http_agents
 import test_http_proposals
 import test_http_review_fixes as fixes
+import work
 
 COMMIT2 = 'd' * 40
 
@@ -129,9 +130,10 @@ class EndpointAttentionTests(fixes.EndpointCase):
         # kittrial-5bb.249: the next-actions answer carries the same move sentence as the
         # canonical `work --mine` row, so an agent is never left to read a state alone.
         self.assertEqual(action['whose_move'], 'you')
+        route = '/v1/projects/%s/tasks/%s/brief' % (self.project, first)
         self.assertEqual(action['next'],
-                         'This is your work now: 2 outstanding review items. Read `review %s`, deliver '
-                         'a revision that supersedes this contribution and respond to each item.' % first)
+                         'This is your work now: 2 outstanding review items. Read `%s`, deliver '
+                         'a revision that supersedes this contribution and respond to each item.' % route)
         self.assertEqual((data['attention']['state'], data['attention']['counts']['changes_requested'],
                           data['attention']['counts']['awaiting_review']), ('changes-requested', 1, 0))
         self.assertIn('1 contribution(s) have changes requested', data['attention']['summary'])
@@ -183,10 +185,9 @@ class EndpointAttentionTests(fixes.EndpointCase):
         unreadable checkpoint; a reviewer or the coordinator holds awaiting work), so it carries
         neither field: kind `checkpoint-error` can no longer pair `who: operator` with
         `whose_move: you`, and kind `blocked` no longer contradicts the queue's own sentence.
-        Where the kind IS changes-requested, the words are the canonical row's, built by the same
-        helper the queue uses.
+        Where the kind IS changes-requested, the words are the canonical work ROW's, compared
+        against that row rather than against a second call to the helper (kittrial-5bb.253 item 1).
         """
-        from work import review_move
         first, second, third, spare = self.tasks
         for task in (first, second, third):
             self.claim(task)
@@ -211,14 +212,50 @@ class EndpointAttentionTests(fixes.EndpointCase):
                               contribution=contribution, items=[{'id': 'tests', 'text': 'Add a test.'}])
         self.assertTrue(request)
         data = self.next()
+        actor = data['agent']['actor']
         action = next(item for item in data['next_actions'] if item['kind'] == 'changes-requested')
-        expected = review_move('changes-requested', first, True, pending_items=1)
-        self.assertEqual((action['whose_move'], action['next']), expected)
+        # The words are the canonical work ROW's, not a second call to the helper
+        # (kittrial-5bb.253 item 1); the only deliberate difference is the way back, which is
+        # this task's brief route for a web agent instead of the client command.
+        row = next(r for r in work.queue(self.canonical_rows(), actor, ['--mine'])['items']
+                   if r['task'] == first)
+        route = '/v1/projects/%s/tasks/%s/brief' % (self.project, first)
+        self.assertEqual(action['whose_move'], row['whose_move'])
+        self.assertEqual(action['next'].replace('`%s`' % route, '`review %s`' % first), row['next'])
         for other in data['next_actions']:
             if other['kind'] != 'changes-requested':
                 with self.subTest(kind=other['kind']):
                     self.assertNotIn('whose_move', other)
                     self.assertNotIn('next', other)
+
+    def test_the_web_answer_matches_the_work_row_after_a_superseding_redelivery(self):
+        """kittrial-5bb.253 item 1: the row's redelivered fact reaches the next-actions answer.
+
+        After a revision that supersedes the contribution the open items were filed on, the
+        web answer must owe only the responses, exactly as the work ROW over the same rows
+        does; comparing with the row (not with a second ``review_move`` call) is the point.
+        """
+        first = self.tasks[0]
+        actor = self.next()['agent']['actor']
+        self.claim(first)
+        contribution = self.contribute(first)
+        request = self.review(self.people['blair'], first, 'request-changes', previous=contribution,
+                              contribution=contribution, items=[{'id': 'tests', 'text': 'Add a test.'}])
+        self.review(self.secret, first, 'contribute', previous=request,
+                    **dict(fixes.CONTRIBUTION, commit=COMMIT2, supersedes=contribution))
+        action = next(a for a in self.next()['next_actions'] if a['task'] == first)
+        row = next(r for r in work.queue(self.canonical_rows(), actor, ['--mine'])['items']
+                   if r['task'] == first)
+        self.assertTrue(row['redelivered'])
+        route = '/v1/projects/%s/tasks/%s/brief' % (self.project, first)
+        self.assertEqual(action['whose_move'], row['whose_move'])
+        self.assertEqual(action['next'].replace('`%s`' % route, '`review %s`' % first), row['next'])
+        for sentence in (action['next'], row['next']):
+            with self.subTest(sentence=sentence):
+                self.assertIn('has already been delivered', sentence)
+                self.assertNotIn('deliver a revision that supersedes', sentence)
+        # The web agent is given the write route as well, not only the client command's absence.
+        self.assertTrue(action['links']['reviews'].endswith('/reviews'))
 
     def test_one_unfiltered_work_read_supplies_own_and_claimable_tasks(self):
         self.claim(self.tasks[0])
@@ -507,6 +544,9 @@ class EndpointAttentionTests(fixes.EndpointCase):
             # The canonical page says no item count here, so the move sentence falls back
             # to the request ids it can see (kittrial-5bb.249).
             'pending_review_items': None,
+            # An older/omitted field reads unknown, which `review_move` treats as not
+            # redelivered (kittrial-5bb.253 item 1).
+            'redelivered': None,
             'checkpoint_at': '2026-10-04T10:00:00Z', 'newer_activity': True})
         self.assertEqual(asked, [['--owner', 'me', '--limit', '100', '--offset', '0', '--json'],
                                  ['--owner', 'me', '--limit', '100', '--offset', '100', '--json']])
@@ -586,9 +626,11 @@ class InProcessAttentionTests(test_http_agents.AgentHarness):
         actor = self.next()['agent']['actor']
         row = self.backend.agent_tasks(self.project, actor)['tasks'][0]
         # `pending_review_items` is additive (kittrial-5bb.249): the canonical open-item
-        # count the move sentence needs, carried by both backends alike.
+        # count the move sentence needs, carried by both backends alike. `redelivered` is
+        # additive too (kittrial-5bb.253 item 1).
         self.assertEqual(sorted(row), ['assignee', 'blocking_items', 'checkpoint_at', 'contribution_id', 'id', 'newer_activity',
                                        'open_items', 'pending_change_requests', 'pending_review_items',
+                                       'redelivered',
                                        'review_state', 'status', 'title'])
         self.assertEqual(self.backend.agent_tasks(self.project)['tasks'], [row])   # unfiltered: every held task
 
