@@ -33,6 +33,7 @@ import weakref
 from pathlib import Path
 from contextlib import contextmanager
 from bootstrap import install as install_binaries
+import actor_names
 import record_json
 from requirements import content_hash
 from urllib.parse import unquote, urlsplit
@@ -1382,6 +1383,20 @@ def audit_field(value,limit=AUDIT_FIELD_MAX):
     return escaped if len(escaped)<=limit else escaped[:limit]+'...'
 
 
+def escaped_text(value):
+    """One value with every non-printable character escaped, and nothing cut short.
+
+    :func:`audit_field` above is the BOUNDED form, for one hand-editable value in a message.
+    A command the operator is told to paste, or a path named in a sentence, must not be cut at
+    80 characters - a truncated command cannot be pasted at all - but a control character in
+    one must not reach the terminal or the set-up page either (kittrial-5bb.251 item 1). A
+    backslash is left alone: it is a path character, not a control, and doubling it would print
+    a different command.
+    """
+    return ''.join(ch if ch.isprintable() else ch.encode('unicode_escape').decode('ascii','backslashreplace')
+                   for ch in str(value))
+
+
 def audit_agreement(damage,last,current):
     """``(audit_agrees, audit_note)`` for a value and the last recorded flip.
 
@@ -2555,8 +2570,11 @@ def systemd_quote(word):
     if not value:
         return '""'
     if any(unit_unspellable(ch) for ch in value):
+        # The path is named in a sentence an operator reads on a terminal and a member reads on
+        # the set-up page: printed raw, a control character in it rewrites the line it is shown
+        # on (kittrial-5bb.251 item 3). Escaped as every other hand-editable value is.
         raise ValueError('no systemd ExecStart line can name the path "%s" literally: it holds a $, a quote, a '
-                         'backslash or a control character systemd refuses or expands'%value)
+                         'backslash or a control character systemd refuses or expands'%escaped_text(value))
     if any(ch.isspace() or ch=='%' for ch in value):
         return '"%s"'%value.replace('%','%%')
     return value
@@ -2569,13 +2587,24 @@ def scheduled_backup_execstart(root):
     service. A line whose interpreter came through ``current`` but whose ``admin.py``
     named ``releases/<ID>`` kept running the release that printed it after the next
     upgrade (kittrial-5bb.182 item 2). The interpreter and module are quoted for systemd,
-    not for a shell (kittrial-5bb.220 F4); ``root`` is NOT quoted because ``root_path``
-    already accepts only a path without a space, quote, backslash or specifier.
+    not for a shell (kittrial-5bb.220 F4). ``root`` is quoted only when it must be: systemd
+    splits the line on whitespace, so a runtime root with a space in it reached the unit as two
+    arguments, and a ``%`` in it begins a specifier, so it is doubled (kittrial-5bb.251 item 7).
+    ``root`` is NOT put through :func:`systemd_quote`, which refuses a quote, a backslash or a
+    control character in the EXECUTABLE name (``systemd.service(5)``): the root here is an
+    argument, and refusing a backslash in it would make every Windows root unnameable
+    (kittrial-5bb.251 review item 4, small). Nothing a command line can produce is lost by the
+    quoting below: :func:`root_path` admits only ``/[A-Za-z0-9_./-]+``, so a ``--root`` with a
+    space, a backslash, a ``%`` or a control character is refused long before this function is
+    reached, and the quoting is kept for a library caller that hands in its own root.
     """
     python=install_current_path(sys.executable)
     module=install_current_path(Path(__file__).resolve())
+    root_text=str(root)
+    if any(ch.isspace() or ch=='%' for ch in root_text):
+        root_text='"'+root_text.replace('%','%%')+'"'
     return ('ExecStart=%s %s --root %s backup --all'
-            %(systemd_quote(python),systemd_quote(module),root))
+            %(systemd_quote(python),systemd_quote(module),root_text))
 
 def host_command(root,*words):
     """A host command as the service user pastes it into a shell: interpreter, this module,
@@ -2590,7 +2619,11 @@ def host_command(root,*words):
     import shlex
     python=install_current_path(sys.executable)
     module=install_current_path(Path(__file__).resolve())
-    return ' '.join(shlex.quote(str(word)) for word in (python,module,'--root',root,*words))
+    command=' '.join(shlex.quote(str(word)) for word in (python,module,'--root',root,*words))
+    # A runtime root holding a control character (a hand-made --root, or a path a member can
+    # influence) reached the terminal raw in the command the operator is told to paste
+    # (kittrial-5bb.251 item 1). Escaped, and NOT cut short: a truncated command cannot be pasted.
+    return escaped_text(command)
 
 def backup_now_command(root):
     """The command that backs up every project of this runtime now."""
@@ -2634,15 +2667,22 @@ def _execstart_values(text):
         if value:yield value
 
 def _mentions_root(tokens,root):
-    """True when a parsed command line names this runtime root."""
+    """True when a parsed command line names this runtime root.
+
+    A ``%`` in the root is written DOUBLED in an ``ExecStart`` line (systemd expands a specifier),
+    so the token is tested with ``%%`` turned back into ``%`` as well: without that the kit read
+    its own line as another runtime's and told the operator to install a schedule it had already
+    installed (kittrial-5bb.251 review item 4, small).
+    """
     for index,token in enumerate(tokens):
         if token=='--root' and index+1<len(tokens):candidate=tokens[index+1]
         elif token.startswith('--root='):candidate=token.split('=',1)[1]
         elif token==str(root):return True
         else:continue
-        try:
-            if Path(candidate).expanduser().resolve()==root:return True
-        except OSError:pass
+        for spelling in (candidate,candidate.replace('%%','%')):
+            try:
+                if Path(spelling).expanduser().resolve()==root:return True
+            except OSError:pass
     return False
 
 def _project_arguments(tokens):
@@ -2709,13 +2749,17 @@ def scheduled_backup_timer_target(text,path):
     base=Path(path).name
     return base[:-len('.timer')]+'.service' if base.endswith('.timer') else None
 
-def scheduled_backup_enabled_timer_targets(directory):
+def scheduled_backup_enabled_timer_targets(directory,unreadable=None):
     """The service names an enabled ``beads-*backup*.timer`` schedules, or an empty set.
 
     An enabled user timer is a unit under ``timers.target.wants`` (``systemctl enable``
     puts a symlink there, but a real file there enables it too); a timer only in the unit
     directory is installed but not enabled, so it will not run. Reading the timer through
     the symlink gives its ``[Timer] Unit=``.
+
+    A timer that cannot be read names no target, which on its own would read as "not
+    enabled": pass a list as ``unreadable`` to be told which ones those were, so the caller
+    can answer "could not check" instead (kittrial-5bb.251 item 7d).
     """
     targets=set()
     try:
@@ -2725,7 +2769,12 @@ def scheduled_backup_enabled_timer_targets(directory):
         return targets
     for path in paths:
         try:text=path.read_text(encoding='utf-8')
-        except OSError:continue
+        except (OSError,ValueError):
+            # A timer that cannot be read names no unit: the caller is told, so a covering unit
+            # whose timer was unreadable reads "could not check", not "todo" (kittrial-5bb.251
+            # item 7d). ``unreadable`` is an optional list the caller passes in.
+            if unreadable is not None:unreadable.append(str(path))
+            continue
         target=scheduled_backup_timer_target(text,path)
         if target:targets.add(target)
     return targets
@@ -2748,18 +2797,24 @@ def scheduled_backup_covers(root,name):
         paths=sorted(path for path in directory.glob('beads-*backup*.service') if path.is_file())
     except OSError:
         return None
-    enabled=scheduled_backup_enabled_timer_targets(directory)
+    timer_unreadable=[]
+    enabled=scheduled_backup_enabled_timer_targets(directory,unreadable=timer_unreadable)
     unreadable=False
     covering=[]
     for path in paths:
         try:text=path.read_text(encoding='utf-8')
-        except OSError:
+        except (OSError,ValueError):
             unreadable=True;continue
         report=scheduled_backup_unit_report(text,root)
         if report['all_line'] or name in report['named'] or name in report['wrapper_projects']:
             covering.append(Path(path).name)
     if covering:
-        return any(service in enabled for service in covering)
+        if any(service in enabled for service in covering):
+            return True
+        # A covering unit was read and no ENABLED timer runs it. If a timer file could not be read,
+        # its Unit= is unknown, so this is "could not check" and not "not covered"
+        # (kittrial-5bb.251 item 7d: it read "todo" before).
+        return None if timer_unreadable else False
     return None if unreadable else False
 
 def project_merge_slot_state(root,name,path=None):
@@ -2925,7 +2980,7 @@ def project_setup_status(root,name,path=None):
         result['creation_record']='The creation record of project %s could not be checked; an operator must look at it first'%name
     return result
 
-def scheduled_backup_coverage(root,name):
+def _scheduled_backup_coverage_report(root,name):
     """(durably_covers_every_project, message) for the INSTALLED schedule.
 
     ``True`` only for a schedule that durably covers every project of this runtime: an
@@ -2944,30 +2999,70 @@ def scheduled_backup_coverage(root,name):
     enables a unit.
     """
     directory=scheduled_backup_unit_dir()
+    reason=None
     try:
         line=scheduled_backup_execstart(root)
-        both=schedule_text(root)
     except ValueError as error:
         # A path systemd cannot name must not cut the whole report short (kittrial-5bb.220 review 2
         # item 2a): say so once, and print everything else.
+        reason=str(error)
         line=None
+    # The commands the schedule text carries, without the unit line: an installation whose path
+    # systemd cannot name still gets the run-now and check commands (kittrial-5bb.251 item 4).
+    commands_only=(f'To run a backup of every project now, as this account (a shell command):\n  '
+                   f'{backup_now_command(root)}\n'
+                   f'To check afterwards: `systemctl --user list-timers`, and\n  '
+                   f'{host_command(root,"backup-status","--require-complete")}')
+    # Every branch below that points the operator at the unit-file line uses ONE of these, so an
+    # installation whose path systemd cannot name keeps the commands that do not need a line in
+    # EVERY branch - it was only the branch with no unit installed at all that carried them, and
+    # the others said "not a shell command:" with nothing after it, or "needs the line below" with
+    # no line below (kittrial-5bb.251 item 4, review item 3c).
+    if line:
+        line_sentence='it is a line of the unit file, not a shell command:\n  %s'%line
+        both=schedule_text(root)
+    else:
+        line_sentence=('no line for a schedule can be printed for this installation: %s. Install the schedule by '
+                       'hand, or move the installation to a path systemd can name. The commands that do not need '
+                       'one are:\n%s'%(reason,commands_only))
         both=('No line for a schedule can be printed for this installation: %s. Install the schedule by hand, or '
-              'move the installation to a path systemd can name.'%error)
-    # Where the unit-file line would be shown, or nothing when there is none to print.
-    suggest=('\n  %s'%line) if line else ''
+              'move the installation to a path systemd can name.\n%s'%(reason,commands_only))
     dropins=(f'Systemd drop-ins ({directory}/*.service.d/*.conf) are not inspected, so this reports the unit '
              f'files themselves.')
-    # A unit file is not a schedule: an enabled timer must run it (kittrial-5bb.220 F4).
-    enabled=scheduled_backup_enabled_timer_targets(directory)
+    # A unit file is not a schedule: an enabled timer must run it (kittrial-5bb.220 F4). A timer
+    # file that cannot be read names no unit: without it the report below would claim "no enabled
+    # timer runs them" where the read cannot support that, while the status for the same files says
+    # could-not-check (kittrial-5bb.251 item 7d). So the unreadable ones are collected here and the
+    # sentences that count timers use them (review item 3b).
+    timer_unreadable=[]
+    enabled=scheduled_backup_enabled_timer_targets(directory,unreadable=timer_unreadable)
+    # What to say where a covering unit has no enabled timer to run it. When a timer file could
+    # not be read it names no unit, so "no enabled timer runs them" would be a claim the read
+    # cannot support while the status for the same files says could-not-check (kittrial-5bb.251
+    # item 7d): the report says could-not-check too (review item 3b).
+    if timer_unreadable:
+        no_timer=('which of them an enabled beads-*backup*.timer runs could not be checked: %s could not be read. '
+                  'Read the timer file(s) by hand, or record that backups are scheduled elsewhere.'
+                  %'; '.join(escaped_text(path) for path in timer_unreadable))
+    else:
+        no_timer=('no enabled beads-*backup*.timer runs them, so they will not run. Install and enable a timer '
+                  'for one, or record that backups are scheduled elsewhere.')
     paths=scheduled_backup_unit_paths()
     if not paths:
+        if line:
+            return False,(f'No installed scheduled backup unit matching beads-*backup*.service was found in '
+                          f'{directory}, so no project of this runtime is on a schedule. A schedule that covers '
+                          f'every project, including {name}, needs the line below.\n{both}')
+        # ONE thing is said, not "needs the line below" and then "no line can be printed", and the
+        # commands the schedule text carried are kept (kittrial-5bb.251 item 4).
         return False,(f'No installed scheduled backup unit matching beads-*backup*.service was found in '
-                      f'{directory}, so no project of this runtime is on a schedule. A schedule that covers '
-                      f'every project, including {name}, needs the line below.\n{both}')
+                      f'{directory}, so no project of this runtime is on a schedule. No line for a schedule can '
+                      f'be printed for this installation, so {name} cannot be put on one from here: {reason}\n'
+                      f'{commands_only}')
     read=[];unreadable=[];durable=[];wrappers=[];named={};wrapper_projects={};foreign=[]
     for path in paths:
         try:text=path.read_text(encoding='utf-8')
-        except OSError as error:
+        except (OSError,ValueError) as error:
             unreadable.append('%s (%s)'%(path,error));continue
         read.append(str(path))
         report=scheduled_backup_unit_report(text,root)
@@ -2987,9 +3082,7 @@ def scheduled_backup_coverage(root,name):
                           f'including {name}, so no change is needed (durable backup --all: '+', '.join(durable)+
                           ').'+note+' '+dropins)
         return False,(f'The installed scheduled backup unit(s) read for this runtime cover every project '
-                      f'(durable backup --all: '+', '.join(durable)+f'), but no enabled beads-*backup*.timer runs '
-                      f'them, so they will not run. Install and enable a timer for one, or record that backups '
-                      f'are scheduled elsewhere.\n{both}')
+                      f'(durable backup --all: '+', '.join(durable)+f'), but '+no_timer+'\n{both}')
     covered=sorted({item for names in named.values() for item in names} |
                    {item for names in wrapper_projects.values() for item in names})
     individual=list(named)+list(wrapper_projects)
@@ -3013,10 +3106,19 @@ def scheduled_backup_coverage(root,name):
                           f'named projects with --all in one command.')
             else:
                 message+=(f' Replace that project list with the durable form (do not combine named projects with '
-                          f'--all in one command); it is a line of the unit file, not a shell command:{suggest}')
+                          f'--all in one command); {line_sentence}')
             if not covers_with_timer:
-                message+=(f' No enabled beads-*backup*.timer runs them, so they will not run; install and enable '
-                          f'a timer for one, or record that backups are scheduled elsewhere.')
+                # Same rule as scheduled_backup_covers (kittrial-5bb.251 item 7d): a covering unit
+                # with no enabled timer read for it is "not covered" only when every timer could be
+                # read. One unreadable timer might be the one that runs it, so that is
+                # could-not-check, and the report says so (review item 3b).
+                if timer_unreadable:
+                    message+=(' Which of them an enabled beads-*backup*.timer runs could not be checked: %s '
+                              'could not be read; read the timer file(s) by hand, or record that backups are '
+                              'scheduled elsewhere.'%'; '.join(escaped_text(path) for path in timer_unreadable))
+                else:
+                    message+=(' No enabled beads-*backup*.timer runs them, so they will not run; install and enable '
+                              'a timer for one, or record that backups are scheduled elsewhere.')
             return False,message+note+' '+dropins
         message=(f'The installed scheduled backup unit(s) read for this runtime cover only '
                  f'{", ".join(covered) if covered else "no project"}, so they do not include {name}.')
@@ -3031,7 +3133,7 @@ def scheduled_backup_coverage(root,name):
                           f'projects with --all in one command.')
         else:
             message+=(f' Add {name} there, or replace the project list with the durable form (do not combine named '
-                      f'projects with --all in one command); it is a line of the unit file, not a shell command:{suggest}')
+                      f'projects with --all in one command); {line_sentence}')
         return False,message+note+' '+dropins
     details=[]
     if foreign:details.append('these units do not back up this runtime: '+', '.join(foreign))
@@ -3042,7 +3144,31 @@ def scheduled_backup_coverage(root,name):
                       f'schedule that covers every project.\n{both}')
     return False,(f'The installed scheduled backup unit(s) read ('+', '.join(read)+f') do not cover {name}'
                   +(' ('+'; '.join(details)+')' if details else '')
-                  +f'. A schedule that covers every project needs the line below. '+dropins+f'\n{both}')
+                  +('. A schedule that covers every project needs the line below. ' if line else
+                    '. A schedule that covers every project cannot be installed from here: %s. '%reason)
+                  +dropins+f'\n{both}')
+
+def scheduled_backup_coverage(root,name):
+    """The report :func:`_scheduled_backup_coverage_report` builds, with the operator's note.
+
+    The note is the operator's own statement that backups are scheduled elsewhere. It is shown
+    on the set-up page, and it must be shown where add-project prints this report too
+    (kittrial-5bb.251 item 7c: add-project did not read it). The report has several returns, so
+    the sentence is added here, once, rather than in each of them.
+    """
+    covered,message=_scheduled_backup_coverage_report(root,name)
+    recorded=read_backup_schedule_note(root)
+    if recorded:
+        # The three values come from a file an operator (or a mistake) can edit by hand, and
+        # add-project prints this report on the terminal where admin.py ran: printed raw, ESC in
+        # one rewrote the line it was shown on and a bidi override reordered it (kittrial-5bb.251
+        # item 1). The reader refuses those characters and this escapes and bounds what it returns,
+        # so neither the terminal nor the page can be rewritten by the file's contents.
+        message=('%s\nAn operator recorded on this server that backups are scheduled elsewhere: "%s" '
+                 '(by %s at %s).'%(message,audit_field(recorded['note']),
+                                    audit_field(recorded['recorded_by']),
+                                    audit_field(recorded['recorded_at'])))
+    return covered,message
 
 #: Where ``retire-project`` moves a project directory, and its append-only journal.
 RETIRED_DIR='retired'
@@ -4193,6 +4319,22 @@ def utc_timestamp(value):
     """True for the exact second-precision UTC form this file writes."""
     return isinstance(value,str) and bool(re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z',value))
 
+def real_utc_timestamp(value):
+    """True for that exact form AND a time that exists (kittrial-5bb.251 item 5).
+
+    ``utc_timestamp`` checks the shape only, so a hand-made ``2026-99-99T99:99:99Z`` passed it:
+    a month of 99, a day of 32 and a 25th hour all read as a time this kit recorded.
+    """
+    if not utc_timestamp(value):return False
+    # ...and ASCII digits only: ``\\d`` in the shape above, and ``%Y`` below, both accept a digit
+    # from another script, so a hand-made note could carry ٢٠٢٦ where the year belongs and read as
+    # a time this kit recorded (kittrial-5bb.251 item 1).
+    if not re.fullmatch(r'[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z',value):return False
+    import datetime
+    try:datetime.datetime.strptime(value,'%Y-%m-%dT%H:%M:%SZ')
+    except ValueError:return False
+    return True
+
 def open_item_labelled(labels):
     """The open items family or state labels among ``labels``: ``open-item`` and ``open-item:*``."""
     return sorted(label for label in labels or [] if isinstance(label,str)
@@ -4584,10 +4726,17 @@ BACKUP_SCHEDULE_NOTE_NAME='backup-schedule-note.json'
 #: The note is one short line of operator text, so a file much bigger than this is not read.
 BACKUP_SCHEDULE_NOTE_MAX=300
 BACKUP_SCHEDULE_NOTE_FILE_MAX=4096
+#: ``recorded_by`` is an actor name, not free text: a hand-made note carrying a 3,000-character or
+#: multi-line one is no note (kittrial-5bb.251 item 5).
+BACKUP_SCHEDULE_ACTOR_MAX=200
 #: Every set and clear is appended (who, when, which) to this bounded log beside the note
 #: (kittrial-5bb.220 review 2 item 4a): the note itself is only the current statement.
 BACKUP_SCHEDULE_LOG_NAME='backup-schedule-log.jsonl'
 BACKUP_SCHEDULE_LOG_MAX=100
+#: Bounded by BYTES as well as lines (kittrial-5bb.251 item 6): 100 lines of a bounded note and a
+#: bounded actor are small, but the bound must not rest on that, and the byte bound is what the log
+#: is trimmed to when a hand-written line makes it big.
+BACKUP_SCHEDULE_LOG_BYTES_MAX=65536
 
 def backup_schedule_log(root):
     """The recorded set and clear history, oldest first, as a read-only list of entries.
@@ -4608,27 +4757,49 @@ def backup_schedule_log(root):
     return entries
 
 def _append_backup_schedule_log(root,entry):
-    """Append one set or clear line, keeping only the newest ``BACKUP_SCHEDULE_LOG_MAX``.
+    """Append one set or clear line, keeping the newest lines within the line AND byte bounds.
 
     A convenience log, never a gate: a log that cannot be read or written does not fail the
     command that recorded the note. A log holding bytes that are not UTF-8 cannot be read
     line by line, so the damaged file is kept aside and a new log started rather than
     failing every later set and clear (kittrial-5bb.220 review 3 item 4).
+
+    Returns a sentence to show when a log was set aside, or None. It is bounded by BYTES as
+    well as lines now (kittrial-5bb.251 item 6): bounding by lines alone left the mutant that
+    dropped the bound alive, and nothing but the line count stood behind the size.
     """
     backups=root/'backups'
-    if backups.is_symlink() or not backups.is_dir():return
+    if backups.is_symlink() or not backups.is_dir():return None
     path=backups/BACKUP_SCHEDULE_LOG_NAME
-    if path.is_symlink():return
-    lines=[]
+    if path.is_symlink():return None
+    lines=[];set_aside=None
     try:
         if path.is_file():lines=[line for line in path.read_text(encoding='utf-8').splitlines() if line.strip()]
     except (OSError,ValueError):
         lines=[]
-        try:path.replace(path.with_name(path.name+'.damaged'))
-        except OSError:pass
+        # The damaged log is kept aside AND said, so an operator is not left wondering why the
+        # history starts again (kittrial-5bb.251 item 6). An earlier set-aside is not overwritten
+        # silently: the first free name wins and is the one the sentence names (review item 4,
+        # small).
+        try:
+            index=1
+            damaged=path.with_name(path.name+'.damaged')
+            while damaged.exists():
+                index+=1
+                damaged=path.with_name('%s.damaged.%d'%(path.name,index))
+            path.replace(damaged)
+            set_aside='The backup schedule log could not be read, so it was kept aside as %s and a new log was started.'%damaged.name
+        except OSError:
+            set_aside=('The backup schedule log could not be read, and it could not be kept aside either, so a new '
+                       'log replaced it.')
     lines.append(json.dumps(entry,sort_keys=True,ensure_ascii=True))
-    try:atomic_private_write(path,'\n'.join(lines[-BACKUP_SCHEDULE_LOG_MAX:])+'\n')
+    lines=lines[-BACKUP_SCHEDULE_LOG_MAX:]
+    # The byte bound: drop the OLDEST lines while the text is too big, keeping the new entry.
+    while len(lines)>1 and len(('\n'.join(lines)+'\n').encode('utf-8'))>BACKUP_SCHEDULE_LOG_BYTES_MAX:
+        lines=lines[1:]
+    try:atomic_private_write(path,'\n'.join(lines)+'\n')
     except (OSError,ValueError):pass
+    return set_aside
 
 def read_backup_schedule_note(root):
     """The recorded statement that backups are scheduled elsewhere, or None.
@@ -4646,12 +4817,27 @@ def read_backup_schedule_note(root):
         if path.stat().st_size>BACKUP_SCHEDULE_NOTE_FILE_MAX:return None
         record=record_json.loads(path.read_text(encoding='utf-8'))
     except (OSError,ValueError):return None
-    if not isinstance(record,dict) or record.get('schema_version')!=1:return None
+    # The version must be the INTEGER 1: True == 1 and 1.0 == 1 in Python, so a hand-made
+    # `schema_version: true` or `1.0` passed the plain comparison (kittrial-5bb.251 item 5).
+    if not isinstance(record,dict) or type(record.get('schema_version')) is not int \
+            or record.get('schema_version')!=1:return None
     note,by,at=record.get('note'),record.get('recorded_by'),record.get('recorded_at')
     if not isinstance(note,str) or not note.strip():return None
-    if not isinstance(by,str) or not by.strip():return None
-    if not isinstance(at,str) or not utc_timestamp(at):return None
-    return {'note':note.strip(),'recorded_at':at,'recorded_by':by.strip()}
+    # The WRITER refuses a control, format or line-separator character in the note, and a lone
+    # surrogate (see write_backup_schedule_note). A hand-made file skipped all of that, so ESC, a
+    # bidi override or U+2028 in the note reached the terminal and the set-up page
+    # (kittrial-5bb.251 item 1). The same categories are refused HERE, on the read path, so a
+    # record an older kit wrote still reads as long as its text is plain.
+    if any(unicodedata.category(ch) in ('Cc','Cf','Zl','Zp','Cs') for ch in note):return None
+    # The actor is a name, and one of the shape a name that reads as itself has: the rule
+    # actor_names applies to a head. Bounded AND shaped, because a hand-made note could otherwise
+    # carry ESC, a space, a bidi override or 3,000 characters where the note's author belongs
+    # (kittrial-5bb.251 item 1). Surrounding whitespace is stripped first, as the note's is.
+    author=by.strip() if isinstance(by,str) else None
+    if not isinstance(author,str) or not actor_names.HEAD_SHAPE.fullmatch(author):return None
+    if len(author)>BACKUP_SCHEDULE_ACTOR_MAX:return None
+    if not isinstance(at,str) or not real_utc_timestamp(at):return None
+    return {'note':note.strip(),'recorded_at':at,'recorded_by':author}
 
 def write_backup_schedule_note(root,note,actor):
     """Record the operator's statement that backups are scheduled elsewhere, and log the set."""
@@ -4664,6 +4850,12 @@ def write_backup_schedule_note(root,note,actor):
     # is refused as a newline is (kittrial-5bb.220 review 2 item 3).
     if any(unicodedata.category(ch) in ('Cc','Cf','Zl','Zp') for ch in note):
         raise ValueError('The note must not contain control or format characters')
+    # A note the shell decoded from a byte that is not valid UTF-8 holds a lone surrogate
+    # (category Cs): written as UTF-8 it raised UnicodeEncodeError from coordination.atomic, after
+    # nothing was written (kittrial-5bb.251 item 1). Refused here, in one sentence.
+    if any(unicodedata.category(ch)=='Cs' for ch in note):
+        raise ValueError('The note must be text that can be written as UTF-8; it holds a character that cannot '
+                         '(a byte that is not valid UTF-8 reached the command line)')
     actor=(actor or '').strip()
     if not actor:raise ValueError('Name the operator recording it with --actor')
     backups=root/'backups'
@@ -4671,7 +4863,8 @@ def write_backup_schedule_note(root,note,actor):
         raise ValueError('The backups directory does not exist under this root; prepare the runtime first')
     record={'schema_version':1,'note':note,'recorded_at':utc_stamp(),'recorded_by':actor}
     atomic(backups/BACKUP_SCHEDULE_NOTE_NAME,record)
-    _append_backup_schedule_log(root,{'at':record['recorded_at'],'by':actor,'action':'set'})
+    warning=_append_backup_schedule_log(root,{'at':record['recorded_at'],'by':actor,'action':'set'})
+    if warning:record['log_warning']=warning
     return record
 
 def clear_backup_schedule_note(root,actor=None):
@@ -4684,7 +4877,8 @@ def clear_backup_schedule_note(root,actor=None):
     elif path.exists():
         raise ValueError('Backup schedule note is not a file')
     if removed and isinstance(actor,str) and actor.strip():
-        _append_backup_schedule_log(root,{'at':utc_stamp(),'by':actor.strip(),'action':'clear'})
+        warning=_append_backup_schedule_log(root,{'at':utc_stamp(),'by':actor.strip(),'action':'clear'})
+        if warning:print(warning)          # the operator asked on the command line; say it there
     return removed
 
 def degraded_projects(root,record):
