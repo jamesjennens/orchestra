@@ -27,6 +27,7 @@ import json
 import re
 from datetime import datetime, timezone
 
+import record_json
 from requirements import canonical_bytes
 from reserved_comments import LANE_STATE_PREFIX as PREFIX, _reserved_prefix_view
 
@@ -178,8 +179,11 @@ def parse(text):
     if not is_record(text):
         return None
     try:
-        payload = json.loads(_reserved_prefix_view(text)[len(PREFIX):])
-    except (json.JSONDecodeError, RecursionError, ValueError):
+        # record_json.loads: a comment body is other people's text, so it is read through
+        # the same bounded guard every other record comment uses (a too-deep one raises,
+        # and this drops it like an invalid checkpoint rather than failing the whole read).
+        payload = record_json.loads(_reserved_prefix_view(text)[len(PREFIX):])
+    except (RecursionError, TypeError, ValueError):
         return None
     return payload if isinstance(payload, dict) else None
 
