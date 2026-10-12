@@ -1711,7 +1711,23 @@ class Service:
         return submitted_actor
 
     # -- projects and membership ----------------------------------------------
-    def create_project(self, principal, name, project_id=None):
+    def create_project(self, principal, name, project_id=None, registered_by=None):
+        """Write the web record of a project the caller creates in the ordinary way.
+
+        ``registered_by`` is the mark the endpoint backend's register route keeps on a
+        record a superuser stood behind (kittrial-5bb.80). It is written inside this one
+        save, so no window remains between the project record and its mark in which a
+        failure or a kill leaves a project on disk without it (kittrial-5bb.255). The
+        ordinary create route passes none, so its records carry no such mark.
+
+        A save that raises takes the record and the membership back out of memory
+        before the error is re-raised (kittrial-5bb.255, the register half of R1):
+        otherwise the next save of anything -- a GET's last-use stamp is enough --
+        would make an unaudited registration durable, leaving a usable project with no
+        committed ``projects.create`` audit entry whose key, and every new key, refuse
+        as "already registered". Both callers (the ordinary create route and the
+        register route) get the same undo, because both come through here.
+        """
         if principal is None or principal.via == 'credential':
             raise forbidden('A worker credential cannot create projects')
         self._validate_project_name(name)
@@ -1723,12 +1739,27 @@ class Service:
             pid = project_id or 'proj_' + secrets.token_hex(8)
             if pid in self.state['projects']:
                 raise conflict('Project identifier already exists')
-            self.state['projects'][pid] = {
+            record = {
                 'id': pid, 'name': name, 'created_by': principal.user_id,
                 'created_at': now_iso(self._now()), 'archived': False,
             }
+            if registered_by is not None:
+                record['registered_by'] = registered_by
+            # The record is new (the id was just shown absent), so it is removed
+            # exactly; a membership under this id can only be stale state, so it is
+            # put back exactly as it was rather than assumed absent.
+            prior_members = self.state['memberships'].get(pid)
+            self.state['projects'][pid] = record
             self.state['memberships'][pid] = {principal.user_id: 'owner'}
-            self.store.save()
+            try:
+                self.store.save()
+            except BaseException:
+                self.state['projects'].pop(pid, None)
+                if prior_members is None:
+                    self.state['memberships'].pop(pid, None)
+                else:
+                    self.state['memberships'][pid] = prior_members
+                raise
         return self.project_view(principal, pid)
 
     @staticmethod
