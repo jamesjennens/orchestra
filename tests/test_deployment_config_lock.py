@@ -198,8 +198,11 @@ class DeploymentLockWaitTests(unittest.TestCase):
                            lambda: admin.merge_verifiers(self.root, ['another']),
                            lambda: project_creation.set_server_limit(self.root, 7, 'ops')):
                 _, error = self.bounded(change)
+                # kittrial-5bb.218, N1 of the .223 review: the refusal names what may hold
+                # the lock - a deployment change OR an adopt-actor run (which takes it too).
                 self.assertRegex(error or '', r'^Nothing was changed: another change to '
-                                              r'deployment\.private\.json still holds its lock')
+                                              r'deployment\.private\.json or an adopt-actor run '
+                                              r'still holds its lock')
         self.assertEqual(self.marker.read_bytes(), before)
         self.assertFalse(self.flip('status')['checkpoint_provenance_writes'])   # reads take no lock
         result, _ = admin.review_writes_command(self.root, 'ops', 'status')
@@ -220,7 +223,8 @@ class DeploymentLockWaitTests(unittest.TestCase):
             env={key: value for key, value in os.environ.items() if key != 'ORCHESTRA_OPERATORS'})
         self.assertEqual((done.returncode, done.stdout), (1, ''), done.stderr)
         self.assertRegex(done.stderr.strip(), r'^ValueError: Nothing was changed: another change to '
-                                              r'deployment\.private\.json still holds its lock \(\.review-writes\.lock\) '
+                                              r'deployment\.private\.json or an adopt-actor run '
+                                              r'still holds its lock \(\.review-writes\.lock\) '
                                               r'after 0 s\. Run the command again')
         self.assertEqual(self.marker.read_bytes(), before)
         self.assertEqual(project_creation.server_limit(self.root), project_creation.SERVER_LIMIT_DEFAULT)
