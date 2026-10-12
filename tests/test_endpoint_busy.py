@@ -96,7 +96,7 @@ class EndpointTests(unittest.TestCase):
         with self.assertRaises(ValueError) as refused:
             admin.require_creatable_project(root, 'alpha')
         self.assertIn('Deployment is not installed; run install first', str(refused.exception))
-        self.assertIn('Nothing was created', str(refused.exception))
+        self.assertIn('No project was created', str(refused.exception))
         self.assertFalse((root / 'projects' / 'alpha').exists())
         self.assertNotIsInstance(refused.exception, FileNotFoundError)
 
@@ -107,7 +107,7 @@ class EndpointTests(unittest.TestCase):
         (root / 'deployment.private.json').symlink_to(root / 'gone.json')
         with self.assertRaises(ValueError) as refused:
             admin.require_creatable_project(root, 'alpha')
-        self.assertIn('Nothing was created', str(refused.exception))
+        self.assertIn('No project was created', str(refused.exception))
         self.assertFalse((root / 'projects' / 'alpha').exists())
 
     def test_odd_port_strings_are_refused_without_python_errors(self):
@@ -137,7 +137,7 @@ class EndpointTests(unittest.TestCase):
                 admin.run_main()
         # run_main shortens the kit's own refusal to one line; nothing is made.
         self.assertIn('ValueError: Deployment is not installed; run install first', str(stopped.exception))
-        self.assertIn('Nothing was created', str(stopped.exception))
+        self.assertIn('No project was created', str(stopped.exception))
         self.assertFalse((root / 'projects' / 'alpha').exists())
 
     def test_add_project_with_no_usable_port_is_refused_and_leaves_nothing(self):

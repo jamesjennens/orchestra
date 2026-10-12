@@ -87,6 +87,11 @@ carries the facts it needs, and this is the table per view:
   (the shared projection's integration disagreement, with both scopes and both values) or
   `lifecycle-scope-lags` (the newest recorded lifecycle scope names a PRIOR revision of
   the current contribution while the current one records no pass).
+- **`redelivered`** (boolean) is true when the current contribution supersedes the one
+  every open review item was filed on: a revision is already delivered and only the
+  responses are owed. It is the one rule from `work.is_redelivery`, used by the
+  `work` projection and by the in-process backend alike (kittrial-5bb.264 item 2/4).
+  A malformed row carries it as `false`.
 - **`claimable`** is the one bounded claimability rule: open, unassigned, no contribution,
   and neither a record anchor nor an epic, decision, gate or job — by issue TYPE or by the
   `decision` LABEL (`reference_records.py` treats that label as a decision whatever the

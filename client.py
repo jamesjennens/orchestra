@@ -166,6 +166,28 @@ def _wire(project,actor,args,action,path):
     if len(wire) > MAX_WIRE:raise ValueError('Request exceeds 2 MB')
     return wire
 
+#: The characters a terminal obeys and a server must not be able to send through the client's own
+#: messages: the C0 controls except newline and tab, DEL and the C1 controls, the Unicode
+#: bidirectional controls, and the line and paragraph separators (kittrial-5bb.241). Server text
+#: that reached the terminal raw could rewrite the line it was shown on or reorder it; the client
+#: is what every lane and office user runs, so it escapes them before printing.
+TERMINAL_CONTROL = re.compile('[\x00-\x08\x0b-\x1f\x7f-\x9f'
+                              '\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069\u2028\u2029]')
+
+def server_text(text):
+    """``text`` from a server, with the characters a terminal obeys shown escaped.
+
+    The ONE place server-supplied text passes through before the client prints it
+    (kittrial-5bb.241): ``\\x1b`` for a C0 or C1 control other than newline and tab, which stay as
+    they are, and ``\\u202e`` for a bidirectional control or a line/paragraph separator. Printable
+    text comes back untouched, and the caller's own bound is applied BEFORE this, so the bounds
+    (600 and 1000 characters) are unchanged.
+    """
+    if not text:
+        return text or ''
+    return TERMINAL_CONTROL.sub(lambda match: '\\x%02x'%ord(match.group())
+                                if ord(match.group())<256 else '\\u%04x'%ord(match.group()),text)
+
 #: What endpoint.py answers, and only that, when it was started by an interpreter too old for
 #: it: exit 2, nothing on stdout, this one line (kittrial-5bb.191).
 TOO_OLD=re.compile(r'(endpoint\.py needs Python 3\.10 or newer and was started with Python \d+\.\d+\.\d+ \([^\n]{0,400}\)\. '
@@ -184,16 +206,18 @@ def _interpreter_refusal(returncode,stdout,stderr,config):
     found=TOO_OLD.fullmatch(stderr or '') if returncode==2 and not stdout else None
     if not found:return None
     if config.get('transport','ssh')=='ssh' and config.get('forced_command') is True:
-        tail=(found.group(2) or '').strip()
+        raw_tail=(found.group(2) or '').strip()
+        tail=server_text(raw_tail)
         note=(' This key runs a forced command, so the interpreter is the one in its '
               'authorized_keys line on the server, not "python" in this configuration: ask the operator to '
               'print that line again (admin.py authorized-keys) with an interpreter of 3.10 or newer.')
         # The endpoint's own advice says to set "python" here; under a forced command that is
         # wrong (the key's authorized_keys line decides), so the note replaces it (kittrial-5bb.222).
-        if tail.startswith(SET_PYTHON):
-            return found.group(1)+note
-        return found.group(1)+(' '+tail if tail else '')+note
-    return stderr.strip()
+        # The recogniser reads the RAW tail; the text printed is escaped (kittrial-5bb.241).
+        if raw_tail.startswith(SET_PYTHON):
+            return server_text(found.group(1))+note
+        return server_text(found.group(1))+(' '+tail if tail else '')+note
+    return server_text(stderr.strip())
 
 def request(config,project,actor,args,action='bd',path=None):
     argv,label = _argv(config)
@@ -208,7 +232,7 @@ def request(config,project,actor,args,action='bd',path=None):
     if p.returncode:
         too_old=_interpreter_refusal(p.returncode,p.stdout,p.stderr,config)
         if too_old:raise RuntimeError(f'{label}: {too_old}')
-        raise RuntimeError(f'{label} failed ({p.returncode}); outcome may be uncertain. {p.stderr[:1000]}')
+        raise RuntimeError(f'{label} failed ({p.returncode}); outcome may be uncertain. {server_text(p.stderr[:1000])}')
     try:return json.loads(p.stdout)
     except json.JSONDecodeError:raise RuntimeError('Invalid endpoint response; inspect state before retrying.') from None
 

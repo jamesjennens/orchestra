@@ -108,6 +108,8 @@ class ReviewMoveTests(unittest.TestCase):
         item = next(row for row in page['items'] if row['task'] == 'bad-row')
         self.assertEqual((item['review_state'], item['whose_move'], item['next']),
                          ('error', 'unknown', work.UNKNOWN_MOVE_TEXT))
+        # kittrial-5bb.264 item 2: a malformed row is never a redelivery.
+        self.assertIs(item['redelivered'], False)
 
     def test_a_named_reviewers_own_open_review_is_the_callers_move(self):
         data = rows()
@@ -376,6 +378,75 @@ class ServedRuleTests(unittest.TestCase):
                 self.assertIn('cannot wait or schedule', text)
                 self.assertIn('instead of refusing', text)
                 self.assertNotIn('do not poll or loop', text)
+
+
+    def test_a_tab_in_the_quoted_entry_is_escaped(self):
+        # kittrial-5bb.264 item 1: plain_text keeps a TAB on purpose; the quote escapes it.
+        quoted = work.quoted_checkpoint_text('a\tb')
+        self.assertEqual('a\\tb', quoted)
+        self.assertNotIn('\t', quoted.replace('\\t', ''))
+
+    def test_an_infinite_pending_count_is_a_value_error(self):
+        # kittrial-5bb.264 item 5.
+        with self.assertRaises(ValueError):
+            work.review_move('changes-requested', 't', True, pending_items=float('inf'))
+
+    def test_the_waiting_sentence_says_and_n_more_and_is_bounded(self):
+        # kittrial-5bb.264 item 7.
+        sentence = work.waiting_move({'text': 'x' * 2000, 'more': 2})
+        self.assertIn('and 2 more', sentence)
+        self.assertLess(len(sentence), 700)
+        one = work.waiting_move({'text': 'short', 'more': 0})
+        self.assertNotIn('and ', one.split('checkpoint:')[1])
+        self.assertIn('short', one)
+
+    def test_the_in_process_backend_uses_the_one_redelivered_rule(self):
+        # kittrial-5bb.264 item 4: mutants 'always false' and 'any instead of all' survive
+        # without this. The backend calls work.is_redelivery, not its own copy.
+        import http_service
+        import inspect
+        source = inspect.getsource(http_service.InProcessBackend)
+        self.assertIn('from work import is_redelivery', source)
+        self.assertIn('is_redelivery(', source)
+        self.assertIs(work.is_redelivery('c1', [{'contribution': 'c0'}]), True)
+        self.assertIs(work.is_redelivery('c1', [{'contribution': 'c0'}, {'contribution': 'c1'}]), False)
+
+    def test_the_quoted_entry_is_the_first_blocker_with_a_question_before_it(self):
+        # kittrial-5bb.264 item 4: which entry is quoted when there are several.
+        data = rows()
+        append_checkpoint(data, 'own-cp', checkpoint(data, open_items=[
+            {'id': 'q1', 'kind': 'question', 'text': 'A question first', 'source': 'here'},
+            {'id': 'b1', 'kind': 'blocker', 'text': 'The real blocker', 'source': 'here'},
+            {'id': 'b2', 'kind': 'blocker', 'text': 'A second blocker', 'source': 'here'},
+        ], next_action='ignored'))
+        wait = work.waiting_move(work.checkpoint_wait_move_text(briefing.checkpoint_state(data[0])))
+        self.assertIn('The real blocker', wait)
+        self.assertNotIn('A question first', wait)
+        self.assertIn('and 1 more', wait)
+
+    def test_a_non_iterable_pending_change_requests_is_ignored_not_a_500(self):
+        # kittrial-5bb.264 item 6.
+        import http_service
+        attention = http_service.EndpointBackend._attention_fields
+        fields = attention({'pending_change_requests': 7, 'open_items': 1, 'redelivered': True})
+        self.assertEqual([], fields['pending_change_requests'])
+        self.assertIs(fields['redelivered'], True)
+        fields = attention({'pending_change_requests': 'abc', 'redelivered': False})
+        self.assertEqual([], fields['pending_change_requests'])
+
+    def test_redelivered_true_is_on_the_row_itself(self):
+        # kittrial-5bb.264 item 4: on a ROW, not only in the web test.
+        data = test_work_queue.reviewed_rows()
+        add_to(data[0], dict(test_work_queue.contribute(), operation_id='send-2', previous='feedback',
+                             supersedes='delivery', commit='e' * 40), 'delivery-2', 'alice/session')
+        item = owned(data)['items'][0]
+        self.assertIs(item['redelivered'], True)
+
+    def test_is_redelivery_is_the_one_rule(self):
+        self.assertTrue(work.is_redelivery('c1', [{'contribution': 'c0'}]))
+        self.assertFalse(work.is_redelivery('c1', [{'contribution': 'c1'}]))
+        self.assertFalse(work.is_redelivery(None, [{'contribution': 'c0'}]))
+        self.assertFalse(work.is_redelivery('c1', []))
 
 
 if __name__ == '__main__':

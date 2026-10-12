@@ -232,17 +232,22 @@ class CheckpointSwitchLockAndAuditTests(unittest.TestCase):
         def flip(action,actor,barrier):
             try:
                 barrier.wait(5)
-                with redirect_stderr(io.StringIO()):
-                    changed.append(admin.checkpoint_provenance_switch(self.root,action,actor)['changed'])
+                changed.append(admin.checkpoint_provenance_switch(self.root,action,actor)['changed'])
             except Exception as error:   # reported below, never swallowed
                 errors.append(error)
 
-        for _ in range(12):
-            barrier=threading.Barrier(2)
-            workers=[threading.Thread(target=flip,args=('on','ops',barrier)),
-                     threading.Thread(target=flip,args=('off','ops2',barrier))]
-            for worker in workers:worker.start()
-            for worker in workers:worker.join(10)
+        # ONE redirect for the whole test, in THIS thread, around the workers. redirect_stderr
+        # swaps the PROCESS-WIDE sys.stderr, and two threads entering and leaving it in the wrong
+        # order (one saves the other's buffer and restores it last) left a StringIO installed for
+        # the rest of the suite, so every later NOTE printed into that dead buffer
+        # (kittrial-5bb.235).
+        with redirect_stderr(io.StringIO()):
+            for _ in range(12):
+                barrier=threading.Barrier(2)
+                workers=[threading.Thread(target=flip,args=('on','ops',barrier)),
+                         threading.Thread(target=flip,args=('off','ops2',barrier))]
+                for worker in workers:worker.start()
+                for worker in workers:worker.join(10)
         self.assertEqual(errors,[])
         cfg=json.loads(self.marker.read_text())
         audit=cfg['checkpoint_provenance_audit']
@@ -263,16 +268,18 @@ class CheckpointSwitchLockAndAuditTests(unittest.TestCase):
 
         def checkpoint_on():
             barrier.wait(5)
-            with redirect_stderr(io.StringIO()):
-                admin.checkpoint_provenance_switch(self.root,'on','ops')
+            admin.checkpoint_provenance_switch(self.root,'on','ops')
 
         def review_on():
             barrier.wait(5)
             admin.review_writes_command(self.root,'ops2','on')
 
-        workers=[threading.Thread(target=checkpoint_on),threading.Thread(target=review_on)]
-        for worker in workers:worker.start()
-        for worker in workers:worker.join(10)
+        # The same one-redirect-around-the-workers shape as the test above: no thread may swap
+        # the process-wide stream (kittrial-5bb.235).
+        with redirect_stderr(io.StringIO()):
+            workers=[threading.Thread(target=checkpoint_on),threading.Thread(target=review_on)]
+            for worker in workers:worker.start()
+            for worker in workers:worker.join(10)
         cfg=json.loads(self.marker.read_text())
         self.assertIs(cfg.get('checkpoint_provenance_writes'),True)
         self.assertIs(cfg.get('review_workflow_writes'),True)

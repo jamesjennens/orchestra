@@ -616,6 +616,12 @@ creation lock.
   already run `admin.py add-project`. The action gives such a caller nothing new, and
   nothing here stops them.
 
+**One creation at a time on the host.** The creation lock is per HOST, not per project:
+while any creation runs (`add-project` or this interface), another `add-project` or
+`restore-new` of a different name is refused at once and told which project is being
+made (kittrial-5bb.225 item 1). An operator's multi-create script should wait and retry
+when it reads that sentence.
+
 **When a creation stops half way.** The host keeps one record per creation in
 `<root>/project-creations/NAME.json`: the intent is written before the first write and
 the result after the last. `admin.py add-project` keeps the same record, so a creation it
@@ -2894,7 +2900,9 @@ line separately and unconfined.
   no longer read are excluded. Nothing is cached across requests
   by the attention calculation, and live authority is checked before every project.
   - **One action per own task, in this order:** `changes-requested` (priority 1, with
-    `requests`, the request-changes record ids), `blocked` (2: the latest checkpoint
+    `requests`, the request-changes record ids, and whose_move/next from the brief
+    route; `links.reviews` points at `GET /v1/projects/{id}/tasks/{task}/brief`
+    where a web agent reads the item text), `blocked` (2: the latest checkpoint
     lists an open `blocker` or `dependency` on undelivered work; with `open_items`,
     `blocking_items`, `blocked_since` and `newer_activity`),
     `in-progress` (3: claimed, not closed, nothing delivered yet, with `newer_activity`), then
