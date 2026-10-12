@@ -2031,7 +2031,7 @@ def open_review_requests_by(rows, actor, operators=None, journal=None):
 
 
 def execute(rows, task, actor, payload, run, operators=None, journal=None, review_writes=None,
-            independent_approval=False, coordinator_writes=False, owners=None, web_approval=False):
+            independent_approval=False, coordinator_writes=False, owners=None, verified_web_authority=False):
     """Validate, CAS and append once; return receipt and projected review state.
 
     ``journal`` is the project directory holding the host-issued
@@ -2049,11 +2049,11 @@ def execute(rows, task, actor, payload, run, operators=None, journal=None, revie
     both default OFF, so an installation that configures nothing behaves as before).
     ``owners`` is the project's actor -> principal map (``sessions.owners``), or a
     callable returning it so the registry is read only when a rule needs it, used by
-    the principal half of both rules. ``web_approval`` says the request came through the
-    web route with a verified web approval (owner, coordinator, or agent with the grant):
-    the web service has already established who the caller is (kittrial-5bb.199,
-    kittrial-5bb.209), so ``coordinator_writes`` does
-    not refuse it; the merge slot is not on that route and stays with listed actors.
+    the principal half of both rules. ``verified_web_authority`` says the request came through the
+    web route with a verified approval capability for an owner, coordinator, or granted
+    agent. The configured live authority establishes the caller (kittrial-5bb.199,
+    kittrial-5bb.209), so ``coordinator_writes`` does not refuse it. Web slot operations
+    use the same helper for their capability; host operations retain listed actors.
     """
     for row in rows or []:
         if isinstance(row, dict) and row.get('id') == task and is_merge_slot(row):
@@ -2152,7 +2152,7 @@ def execute(rows, task, actor, payload, run, operators=None, journal=None, revie
         # refusal writes nothing.
         if independent_approval or coordinator_writes:
             contribution=state.get('contribution') or {}
-            if coordinator_writes and not web_approval and not listed_operator_actor(actor,operators,owners):
+            if coordinator_writes and not verified_web_authority and not listed_operator_actor(actor,operators,owners):
                 raise CoordinatorRuleRefusal('approve refused: the installation setting coordinator_writes is on, so only a '
                                  'listed operator of this project may approve a contribution (or an actor of a '
                                  'listed operator\'s principal), and %s is neither. A worker still contributes, '
