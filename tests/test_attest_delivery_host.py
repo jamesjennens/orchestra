@@ -150,6 +150,33 @@ class AttestDeliveryCase(unittest.TestCase):
         return self.cli('attest-delivery', 'trial', '--actor', actor, '--task', TASK,
                         '--bundle', str(bundle), '--reason', reason, *extra)
 
+    @staticmethod
+    def run_with_timeout(function, seconds=20, label='call'):
+        """Run ``function()`` with a wall-clock timeout.
+
+        A mutant that opens a fifo WITHOUT ``O_NONBLOCK`` must fail this test by
+        assertion, not hang the module and every test after it (review item
+        ``a-fifo-hangs``). The work runs on a daemon thread, so a blocked call can be
+        abandoned without stopping the run.
+        """
+        import threading
+        box = {}
+
+        def target():
+            try:
+                box['value'] = function()
+            except BaseException as error:              # noqa: BLE001 - ferried to the caller
+                box['error'] = error
+
+        thread = threading.Thread(target=target, daemon=True)
+        thread.start()
+        thread.join(seconds)
+        if thread.is_alive():
+            raise AssertionError('%s did not answer in %ds: a fifo was opened blocking' % (label, seconds))
+        if 'error' in box:
+            raise box['error']
+        return box.get('value')
+
 
 class DocumentedCommandTests(AttestDeliveryCase):
     """Item 1: the command works as documented, without --operation-id, on a real bundle."""
@@ -245,6 +272,22 @@ class HostBoundsTests(AttestDeliveryCase):
         with self.assertRaisesRegex(ValueError, 'not a git bundle'):
             self.attest(bundle=text)
 
+    @unittest.skipUnless(hasattr(os, 'mkfifo'), 'FIFOs are POSIX-only')
+    def test_a_fifo_bundle_is_refused_without_blocking_the_command(self):
+        # Review item `a-fifo-hangs`: the observation open used O_RDONLY without
+        # O_NONBLOCK, so `attest-delivery --bundle <fifo>` never returned. Run the REAL
+        # command on a fifo under a wall-clock timeout and require the refusal sentence;
+        # the mutant without O_NONBLOCK dies by assertion here instead of hanging.
+        bundle, sha = self.make_bundle()
+        digest = hashlib.sha256(bundle.read_bytes()).hexdigest()
+        self.contribute(sha, digest)
+        fifo = self.root / 'planted.bundle'
+        os.mkfifo(str(fifo))
+        before = len(self.issue['comments'])
+        with self.assertRaisesRegex(ValueError, 'not a regular file'):
+            self.run_with_timeout(lambda: self.attest(bundle=fifo), label='attest-delivery on a fifo')
+        self.assertEqual(len(self.issue['comments']), before)
+
     def test_a_symlink_to_a_file_is_refused(self):
         bundle, sha = self.make_bundle()
         digest = hashlib.sha256(bundle.read_bytes()).hexdigest()
@@ -284,6 +327,42 @@ class HostBoundsTests(AttestDeliveryCase):
         result = json.loads(self.attest(actor=W2B, bundle=bundle))
         self.assertFalse([line for line in result.get('warnings') or [] if 'parties' in line])
         self.assertEqual(w.project(self.issue)['verification'], 'verified')
+
+
+class DefaultIdAndRetryTests(AttestDeliveryCase):
+    """Item 2(1): the default id names the actor, and a same-actor rerun reconciles.
+
+    The default operation id is derived from the observation, so a rerun by the same
+    verifier rebuilds the same id; but the host command derives ``previous`` from the
+    chain head, so the rerun's payload names the record the first run wrote. It must
+    reconcile to that record, not answer "Operation ID already used with different
+    payload or actor". A second listed verifier must get its own id, because the
+    default id names the acting verifier.
+    """
+
+    def test_an_exact_rerun_by_the_same_verifier_reconciles(self):
+        bundle, sha = self.make_bundle()
+        digest = hashlib.sha256(bundle.read_bytes()).hexdigest()
+        self.contribute(sha, digest)
+        first = json.loads(self.attest(bundle=bundle))
+        before = len(self.issue['comments'])
+        second = json.loads(self.attest(bundle=bundle))
+        self.assertTrue(second['reconciled'])
+        self.assertEqual(second['comment_id'], first['comment_id'])
+        self.assertEqual(len(self.issue['comments']), before)
+        self.assertEqual(w.project(self.issue)['verification'], 'verified')
+
+    def test_a_second_listed_verifier_gets_its_own_default_id(self):
+        bundle, sha = self.make_bundle()
+        digest = hashlib.sha256(bundle.read_bytes()).hexdigest()
+        self.contribute(sha, digest)
+        first = json.loads(self.attest(actor=VERIFIER, bundle=bundle))
+        second = json.loads(self.attest(actor=W2B, bundle=bundle))
+        self.assertFalse(second.get('reconciled', False))
+        self.assertNotEqual(second['comment_id'], first['comment_id'])
+        state = w.project(self.issue)
+        self.assertEqual(state['verification'], 'verified')
+        self.assertEqual(state['attestation']['author'], W2B)
 
 
 @POSIX

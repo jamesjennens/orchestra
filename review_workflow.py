@@ -813,8 +813,11 @@ def read_bundle_observation(path, git=None):
     Bounds and order (kittrial-5bb.10 review item 3), so a listed verifier cannot turn
     this into an arbitrary-file digest oracle and a planted file cannot exhaust memory:
 
-    * the file is opened with ``O_NOFOLLOW`` and must be a REGULAR file (``fstat``), so a
-      symlink is refused instead of followed and a device, fifo or directory is refused;
+    * the file is opened with ``O_NONBLOCK`` and ``O_NOFOLLOW`` and must be a REGULAR
+      file (``fstat`` on the open descriptor), so a symlink is refused instead of
+      followed and a device, fifo or directory is refused WITHOUT waiting on it: a fifo
+      put in place of the bundle answers at once instead of blocking for ever (review
+      item ``a-fifo-hangs``);
     * its first line must match the git bundle signature BEFORE anything is hashed: a file
       that is not a bundle is refused, so its SHA-256 and size are never returned;
     * the digest is computed in ``BUNDLE_BLOCK_BYTES`` blocks, never by reading the whole
@@ -833,7 +836,13 @@ def read_bundle_observation(path, git=None):
         raise ValueError('Delivered bundle must not be a symlink: %s' % bundle)
     if bundle.is_dir():
         raise ValueError('Delivered bundle is not a regular file: %s' % bundle)
-    flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0)
+    # O_NONBLOCK never waits on a fifo: without it, opening a fifo O_RDONLY blocks for
+    # ever until a writer appears, so a listed verifier pointing --bundle at a fifo - or
+    # a path swapped for one between the checks above and this open - hung the command
+    # (kittrial-5bb.10 review item ``a-fifo-hangs``). fstat then judges the descriptor
+    # that was actually opened, and the S_ISREG check below refuses the fifo at once.
+    flags = (os.O_RDONLY | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_NOFOLLOW', 0)
+             | getattr(os, 'O_BINARY', 0) | getattr(os, 'O_CLOEXEC', 0))
     try:
         handle_fd = os.open(str(bundle), flags)
     except OSError as exc:
@@ -2468,15 +2477,28 @@ def _recorded_operator(actor, operators, owners):
 
 
 def _retry_matches(stored, incoming):
-    """Whether a retried payload matches the stored record apart from the snapshot.
+    """Whether a retried payload matches the stored record apart from server-derived fields.
 
     ``execute`` stamps ``assignee_at_approval`` before the append, so a caller can
     never reproduce the stored approve bytes exactly. The snapshot is ignored on
     both sides so a retry of the same operation stays idempotent even when the
     assignee changed in between.
+
+    ``attest`` additionally has its ``previous`` derived from the chain head by the
+    host command (``admin.py attest-delivery``), so an exact rerun of the same
+    observation by the same actor necessarily names the record it wrote first
+    instead of the record before it; that alone used to raise "Operation ID already
+    used with different payload or actor" (kittrial-5bb.10 review item
+    ``an-exact-rerun-and-the-load-rule``). ``previous`` is the chain-ordering
+    pointer, not part of the observed facts, so it is ignored for ``attest`` ALONE:
+    every other operation, and every other field of ``attest``, still refuses a
+    different payload.
     """
+    ignored = {ASSIGNEE_SNAPSHOT}
+    if isinstance(incoming, dict) and incoming.get('operation') == 'attest':
+        ignored.add('previous')
     def scrubbed(p):
-        return {k: v for k, v in p.items() if k != ASSIGNEE_SNAPSHOT} if isinstance(p, dict) else p
+        return {k: v for k, v in p.items() if k not in ignored} if isinstance(p, dict) else p
     return scrubbed(stored) == scrubbed(incoming)
 
 

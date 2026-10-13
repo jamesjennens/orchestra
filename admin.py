@@ -10110,9 +10110,13 @@ def main():
                                %observation['bytes'])
         # The default operation id must be a valid workflow ID: ``identity`` allows no
         # slash, and the old ``attest-delivery/HASH`` failed validation on every call
-        # that reached the write (review item 1).
+        # that reached the write (review item 1). The hash names the ACTOR as well, so
+        # two listed verifiers attesting the same bundle get different default ids and
+        # the second is not told the first one's id is already used (review item
+        # ``an-exact-rerun-and-the-load-rule``); the same actor on the same observation
+        # rebuilds the same id and reconciles.
         operation_id=args.operation_id or ('attest-delivery-'+content_hash(
-            {'task':args.task,'contribution':contribution_id,'commit':observed_commit,
+            {'task':args.task,'actor':args.actor,'contribution':contribution_id,'commit':observed_commit,
              'sha256':observation['sha256']})[:24])
         payload={'schema_version':1,'operation':'attest','operation_id':operation_id,'task':args.task,
                  'previous':state.get('latest_comment_id'),'contribution':contribution_id,

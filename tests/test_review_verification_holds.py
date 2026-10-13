@@ -255,6 +255,29 @@ class VerifiedAttestationTests(Harness):
         self.assertEqual(state['contribution']['commit'], COMMIT_1)
         self.assertEqual(state['contribution']['delivery']['sha256'], SHA_1)
 
+    def test_a_same_actor_attest_retry_with_a_new_previous_reconciles(self):
+        contribution = self.send(self.contribution())['comment_id']
+        payload = self.attest(contribution, sha256=SHA_1, bytes=10)
+        first = self.send(payload)
+        # The host command (`admin.py attest-delivery`) rebuilds `previous` from the
+        # chain head, so a rerun names the record the first run wrote. Same actor, same
+        # observation: reconcile, do not refuse it as a different payload (review item
+        # `an-exact-rerun-and-the-load-rule`).
+        retried = self.send(dict(payload, previous=first['comment_id']))
+        self.assertTrue(retried['reconciled'])
+        self.assertEqual(retried['comment_id'], first['comment_id'])
+        self.assertEqual(self.review_count(), 2)          # contribute, one attestation
+
+    def test_an_attest_retry_with_a_different_observation_still_refuses(self):
+        # The `previous` relaxation is scoped to the chain-ordering pointer alone: a
+        # different recorded observation on the same id is still refused, so nothing
+        # else about the "different payload" rule is weakened.
+        contribution = self.send(self.contribution())['comment_id']
+        payload = self.attest(contribution, sha256=SHA_1, bytes=10)
+        first = self.send(payload)
+        with self.assertRaisesRegex(ValueError, 'different payload or actor'):
+            self.send(dict(payload, previous=first['comment_id'], reason='A different reading'))
+
     def test_a_wrong_checksum_can_never_be_recorded_as_verified(self):
         contribution = self.send(self.contribution())['comment_id']
         before = self.review_count()
@@ -810,6 +833,35 @@ class BundleObservationTests(unittest.TestCase):
         with scratch() as tmp:
             with self.assertRaisesRegex(ValueError, 'not a readable file'):
                 w.read_bundle_observation(Path(tmp) / 'nothing.bundle')
+
+    def bounded(self, call, seconds=20):
+        """``call()`` on a daemon thread with a wall-clock timeout (review item
+        ``a-fifo-hangs``): a fifo opened WITHOUT ``O_NONBLOCK`` blocks for ever, so a
+        regression fails by assertion here instead of hanging the module."""
+        import threading
+        outcome = {}
+
+        def target():
+            try:
+                outcome['value'] = call()
+            except BaseException as error:              # noqa: BLE001 - ferried to the caller
+                outcome['error'] = error
+
+        worker = threading.Thread(target=target, daemon=True)
+        worker.start()
+        worker.join(seconds)
+        self.assertFalse(worker.is_alive(), 'the observation blocked: a fifo was opened blocking')
+        if 'error' in outcome:
+            raise outcome['error']
+        return outcome.get('value')
+
+    @unittest.skipUnless(hasattr(os, 'mkfifo'), 'FIFOs are POSIX-only')
+    def test_a_fifo_in_place_of_a_bundle_is_refused_without_blocking(self):
+        with scratch() as tmp:
+            fifo = Path(tmp) / 'planted.bundle'
+            os.mkfifo(str(fifo))
+            with self.assertRaisesRegex(ValueError, 'not a regular file'):
+                self.bounded(lambda: w.read_bundle_observation(fifo))
 
     def test_a_file_that_is_not_a_git_bundle_is_refused_before_it_is_hashed(self):
         # A mutant that removed the signature check would return the arbitrary file's
