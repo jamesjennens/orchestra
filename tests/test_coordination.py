@@ -60,6 +60,10 @@ class Native:
 
     def __call__(self, args):
         self.calls.append(list(args))
+        if args == ['export', '--all']:
+            # merge-acquire reads the export for a stored hold (kittrial-5bb.10 review
+            # item 4) whatever the review-writes switch says; this stub holds no rows.
+            return ''
         if args[0] == 'list':
             if self.hide_label_reads > 0:
                 self.hide_label_reads -= 1

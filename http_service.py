@@ -1196,9 +1196,10 @@ class InProcessBackend:
 #: its ``state=`` filter accept them too or the two transports disagree
 #: (kittrial-5bb.110 item 9).
 ACTIVE_REVIEW_STATES = ('changes-requested', 'error', 'awaiting-review', 'legacy-review-ready',
-                        'awaiting-integration', 'approved', 'withdrawn', 'superseded')
+                        'awaiting-integration', 'approved', 'withdrawn', 'superseded', 'held')
 QUEUE_PRIORITY = {'changes-requested': 0, 'error': 1, 'awaiting-review': 2,
-                  'legacy-review-ready': 2, 'awaiting-integration': 3, 'approved': 3}
+                  'legacy-review-ready': 2, 'awaiting-integration': 3, 'approved': 3,
+                  'held': 3}
 
 #: Review-payload fields the HTTP route accepts beyond the canonical per-operation
 #: set. ``task_id`` is filled from the path and ``actor`` is bound to the
@@ -2002,6 +2003,9 @@ class EndpointBackend:
         'request-review': ('contribution', 'reviewer'),
         'resolve-item': ('contribution', 'request', 'item', 'reason'),
         'decline-review': ('contribution', 'request', 'reason'),
+        # Verifier attestations and integration holds (kittrial-5bb.10) are deliberately
+        # ABSENT: they are host-only in this kit (item 6), so the web route refuses them
+        # with its own sentence in `_command` rather than mapping them to a capability.
     }
     #: Operations whose canonical record takes no ``previous``.
     REVIEW_NO_PREVIOUS = ('recommend',)
@@ -2116,7 +2120,20 @@ class EndpointBackend:
             # operation came back in a 5,204-character error (kittrial-5bb.110 item 4).
             # An operation sent as a list or object used to raise TypeError (an
             # unhashable dict key) and answer 500; the str check makes it this 422.
-            if not isinstance(operation, str) or operation not in self.REVIEW_FIELDS:
+            if not isinstance(operation, str):
+                raise invalid('Unsupported review operation; expected one of: %s'
+                              % ', '.join(sorted(self.REVIEW_FIELDS)))
+            if operation in ('attest', 'hold', 'release-hold'):
+                # Verifier attestations and integration holds are HOST-ONLY in this kit
+                # (kittrial-5bb.10 item 6). The verifiers and operators lists are host
+                # authority and this route cannot judge them, so it refuses these three
+                # with a sentence instead of mapping them to a capability any caller with
+                # reviews.write would then hold.
+                raise invalid('The review operation %s is host-only in this kit: a listed verifier records an '
+                              'attestation with `admin.py attest-delivery` on the coordination host, and a '
+                              'listed operator sets or releases an integration hold with the host review '
+                              'transport. It is not accepted over the web route.' % operation)
+            if operation not in self.REVIEW_FIELDS:
                 raise invalid('Unsupported review operation; expected one of: %s'
                               % ', '.join(sorted(self.REVIEW_FIELDS)))
             common = tuple(field for field in self.REVIEW_COMMON
@@ -3231,6 +3248,8 @@ def next_action(task):
         return {'who': 'assignee', 'text': 'Address the requested changes'}
     if state in ('approved', 'awaiting-integration'):
         return {'who': 'owner', 'text': 'Integrate the approved contribution'}
+    if state == 'held':
+        return {'who': 'coordinator', 'text': 'Release the integration hold or record a corrected verification'}
     if state == 'error':
         return {'who': 'owner', 'text': 'Needs operator attention'}
     if task.get('assignee'):

@@ -514,12 +514,171 @@ Records written before this rule are read as before: where one actor has two sta
 * When an operator voids a decision (`admin.py void-record`), a recommendation written before that decision stays hidden, because the reader counts the voided decision's position. The reviewer records it again.
 * A recommendation is not a review request and does not close one.
 
+### Verifier attestations: what a verifier actually observed
+
+A declared delivery is what the contributor **says** they delivered (`contribution.commit`,
+`base_commit` and, for a bundle, `delivery.sha256`). Verification is a separate, append-only
+record of what somebody **observed**, so the declaration is never silently rewritten:
+
+```json
+{
+  "schema_version": 1,
+  "operation": "attest",
+  "operation_id": "attest-001",
+  "task": "example-task",
+  "previous": "LATEST_WORKFLOW_COMMENT_ID",
+  "contribution": "CURRENT_CONTRIBUTION_COMMENT_ID",
+  "verdict": "verified",
+  "commit": "THE_OBSERVED_DELIVERED_TIP",
+  "base_commit": "THE_DECLARED_BASE_COMMIT",
+  "method": "bundle sha256 + git rev-parse of the imported tip",
+  "reason": "Checksum and tip matched the declared delivery.",
+  "sha256": "THE_OBSERVED_BUNDLE_SHA256",
+  "bytes": 4096
+}
+```
+
+`verdict` is one of `verified`, `failed` or `unknown`; `sha256` and `bytes` are optional, so
+a remote delivery (which has no bundle bytes) is attested without inventing them.
+
+* **What the kit itself checks, exactly.** The `attest` operation reads no bundle, computes
+  no hash and runs no git. On the write path it checks the record's shape and plain text, and
+  for a `verified` verdict it checks that the observation matches the DECLARED delivery: the
+  observed `commit` is the declared delivered tip, `base_commit` is the declared base, and for
+  a bundle the observed `sha256` equals the declared `delivery.sha256` with a positive `bytes`.
+  It cannot know that a commit exists anywhere or that a bundle exists at all, so a `verified`
+  record naming a well-formed commit that exists nowhere is accepted when it matches the
+  declaration. **The host command is what makes the observation real**: a listed verifier runs
+  ```
+  python3 admin.py attest-delivery PROJECT --actor VERIFIER --task TASK \
+      --bundle /path/to/delivered.bundle --reason "..." [--verdict verified|failed|unknown]
+  ```
+  on the coordination host. It reads the bundle file itself, computes its byte count and
+  SHA-256, lists the refs the bundle advertises with `git bundle list-heads`, takes the
+  observed commit from those heads (or from `--commit`), and writes the `attest` record from
+  those values. **Order and bounds.** The command authorizes the caller FIRST (a listed
+  verifier or listed operator that is not the author's or the assignee's party), then opens
+  the path WITHOUT following a symlink, requires a regular file, requires the git bundle
+  signature line BEFORE hashing anything, hashes in blocks under a stated 2 GiB limit, bounds
+  `git` with a 60-second timeout, and records nothing for a file that is not a git bundle. It
+  only ever reads a LOCAL bundle file: it never contacts a remote, so it refuses to attest a
+  contribution whose declared delivery is `remote` (attest that one on the host review
+  transport). Omitting `--operation-id` uses a stable `attest-delivery-<hash>` id, so an
+  interrupted run retries as the same record. A verifier who records an attestation without
+  such an observation records a claim, not a proof.
+* **`failed`** states a delivery that was positively disproven. It needs a reason, and it
+  holds the contribution from integration (the `held` state below) until a later attestation
+  or a corrected delivery supersedes it.
+* **`unknown`** is the honest reading for a delivery a verifier could not reach (for example
+  remote credentials unavailable). It needs a reason, it is surfaced on every read with a
+  warning, and it is never promoted to a pass. `unknown` does **not** by itself hold a
+  contribution: it is explicit and visible, and a coordinator decides what to do with an
+  approved contribution whose remote could not be read. Only an explicit hold or a positively
+  `failed` attestation holds.
+* **Who may attest.** Only a listed verifier (the deployment `verifiers` list) or a listed
+  operator (the one `listed_operator_actor` rule), never the contribution's author or the
+  task's assignee, or a party of either; an unlisted contributor cannot record any verdict,
+  including `failed`. The party comparison is **not** one of the switchable coordinator rules:
+  the project's actor-to-principal map is read for `attest`, `hold` and `release-hold` whatever
+  `coordinator_writes` and `independent_approval` say, on the endpoint route and in
+  `admin.py attest-delivery` alike, so "never their party" holds by default. If the session
+  registry exists but cannot be read, the write still compares names and **says in its answer
+  that parties could not be compared** (`warnings`), rather than silently dropping the principal
+  half. A `failed` attestation is cleared only by a later attestation from a
+  listed verifier or operator, or by a superseding revision that then needs its own
+  attestation. The three operations are host-only: the web route refuses `attest`, `hold` and
+  `release-hold` with a sentence rather than mapping them to a capability.
+
+`commit` and `base_commit` are validated as exact 40- or 64-hex object ids, so an abbreviated
+hash is refused at the record's own boundary; whether a well-formed hash names a real object is
+a matter for the verifier's observation, not for the record's shape. `review TASK` returns the newest
+attestation for the current revision as `attestation` (with `verified`, `problems`, `author`
+and `timestamp`), a bounded `attestations` audit list, and the one-word `verification` reading
+(`verified`, `failed`, `unknown`, or absent when the contribution carries no attestation,
+which reads the same as `unverified`). A stored record whose observation no longer matches the
+delivery is demoted to `unverified` with `problems` on read; it is never counted as a pass. An
+attestation never changes the declared delivery and never by itself makes a contribution
+integration-ready. The keys are present only when they carry something, so a chain written
+before these operations existed reads exactly as it did before them.
+
+### Explicit integration holds
+
+A hold is an audited coordinator control that says "do not integrate this yet", separate from
+the reviewer's `request-changes` items:
+
+```json
+{
+  "schema_version": 1,
+  "operation": "hold",
+  "operation_id": "hold-001",
+  "task": "example-task",
+  "previous": "LATEST_WORKFLOW_COMMENT_ID",
+  "contribution": "CURRENT_CONTRIBUTION_COMMENT_ID",
+  "reason": "Checksum reviewed by hand; not release-ready."
+}
+```
+
+and the release names exactly one open hold:
+
+```json
+{
+  "schema_version": 1,
+  "operation": "release-hold",
+  "operation_id": "release-hold-001",
+  "task": "example-task",
+  "previous": "LATEST_WORKFLOW_COMMENT_ID",
+  "contribution": "CURRENT_CONTRIBUTION_COMMENT_ID",
+  "hold": "HOLD_RECORD_COMMENT_ID",
+  "reason": "Hold cleared after re-verification."
+}
+```
+
+* **A held contribution never reads `awaiting-integration`.** An APPROVED contribution with an
+  open hold (or a positively `failed` attestation) shows `review_state` `held` in `review`,
+  `brief` and `work` alike; `next_actor` and `whose_move` are the coordinator's, and only a
+  listed operator can release it. A hold on a revision that is NOT approved does not take that
+  revision out of review: a revision still awaiting review stays in the reviewers' queue with
+  the hold shown beside it, and a revision whose author still has open requested changes reads
+  `changes-requested` (the author still owes the changes) with the hold shown too. Every
+  refusal driven by the hold - merge-acquire, a `reviewed`/`integrated` fact, the release
+  selection, or a release that names the task - says what is wrong AND who can release it.
+* **Approve while held is accepted, and the state stays `held`.** An approval recorded while a
+  hold is open does not clear the hold and does not make the contribution integration-ready;
+  the effective state stays `held` until a `release-hold` clears it.
+* **A hold survives retries and new revisions.** It is not cleared by a new `contribute`, an
+  approval, a withdrawal or an exact retry of the hold's own operation id (which reconciles to
+  the original record). It names the revision it was audited against for the audit trail, but
+  it stays in force across revisions until it is released.
+* **Only an explicit release clears it.** `release-hold` names one open hold by its record
+  comment id. A release naming a hold that does not exist, or one already released, is
+  **refused on the write path** and **ignored on the read path** (`ignored_hold_releases`,
+  with a warning), so a stray, duplicated or replayed release can never clear a later hold.
+  An operator `void-record` cannot clear a hold: a hold record is part of the surviving
+  contribution history, so the void is refused. **A hold is cleared by `release-hold` only.**
+* **A stored hold outlives the write switch; the switch governs WRITES only.** Once a hold has
+  been written, every reader honours it and every gate refuses integration whatever
+  `review_workflow_writes` says: `review`/`brief`/`work` show `held`, and
+  `coordination merge-acquire`, the `reviewed`/`integrated` facts, the release selection and a
+  release that names the task all refuse. The **way out** is to turn the switch on, record the
+  `release-hold` (the release is itself a new-shaped write and is refused while the switch is
+  off), then turn it off again if desired, exactly as for the lifecycle void released in
+  kittrial-5bb.1013s. With **nothing stored**, nothing differs from main: the merge-slot and
+  release gates find no hold and behave as they always did.
+* **Both are coordinator actions and both are audited.** They are refused unless the actor is
+  a listed operator of this project by the kit's one listed-operator rule (a listed name, or an
+  actor of a listed operator's principal); `attest` additionally accepts a listed verifier and
+  refuses the contribution's author, the task's assignee, or a party of either. Each record
+  carries its actor, time and reason. Contributor-visible holds remain the ordinary
+  `request-changes` items. These three operations are **host-only** in this kit: the web route
+  refuses `attest`, `hold` and `release-hold` with a sentence, so no web capability is mapped
+  to them.
+
 ### Staged rollout: writing the new shapes is opt-in
 
 kittrial-5bb.94's coordinator direction is a **two-step ship**, because every shape above is one an older kit fails closed on.
 
-* The **readers in this kit understand every new operation and field unconditionally**: `review`, `brief`, `work` and `history` parse and project `withdraw`, `request-review`, `resolve-item`, `decline-review`, an item `severity` and a request-changes `summary` in both settings below.
-* **Writing** them is refused unless the per-installation setting `review_workflow_writes` is on. It is a boolean in the deployment configuration `deployment.private.json` at the runtime root, **absent or false means OFF**, and a value that is not a boolean is **read as OFF with a warning** rather than refused (kittrial-5bb.110 item 2), so a hand-set `"yes"` cannot make `work` and `review` fail for every actor. With it off, `execute` refuses `withdraw`, `resolve-item`, `request-review` and `decline-review`, a `request-changes` that carries `summary`, and a `request-changes` item that carries `severity`, all **before any native write**. The refusal names the operation or the field at fault (`request-changes summary`, `request-changes item severity`, `operation withdraw`). A legacy `{id, text}` request-changes item is an old shape and is still written with the switch off, and an **exact retry** of an operation id already in the chain still reconciles, so a record written while the switch was on stays recoverable after it is turned off.
+* The **readers in this kit understand every new operation and field unconditionally**: `review`, `brief`, `work` and `history` parse and project `withdraw`, `request-review`, `resolve-item`, `decline-review`, `attest`, `hold`, `release-hold`, an item `severity` and a request-changes `summary` in both settings below.
+* **Writing** them is refused unless the per-installation setting `review_workflow_writes` is on. It is a boolean in the deployment configuration `deployment.private.json` at the runtime root, **absent or false means OFF**, and a value that is not a boolean is **read as OFF with a warning** rather than refused (kittrial-5bb.110 item 2), so a hand-set `"yes"` cannot make `work` and `review` fail for every actor. With it off, `execute` refuses `withdraw`, `resolve-item`, `request-review`, `decline-review`, `attest`, `hold` and `release-hold`, a `request-changes` that carries `summary`, and a `request-changes` item that carries `severity`, all **before any native write**. The refusal names the operation or the field at fault (`request-changes summary`, `request-changes item severity`, `operation withdraw`). A legacy `{id, text}` request-changes item is an old shape and is still written with the switch off, and an **exact retry** of an operation id already in the chain still reconciles, so a record written while the switch was on stays recoverable after it is turned off.
 * **Every flip is audited as a short append-only history** in `review-writes.audit.json` beside the deployment file, under an exclusive deployment lock (kittrial-5bb.110 item 3). Each entry names WHO set it, WHEN and the value it replaced; the history is bounded to the last 20 flips, an `on` (or `off`) that changes nothing appends nothing rather than overwriting the record, and the pre-history single-record form is still read. `review-writes status` returns `audit`, `audit_history` and `audit_agrees`, and **warns when the switch and the last recorded value disagree** - what an older kit (which does not know the file) or a hand edit leaves behind. The audit file is parsed through the same bounded-nesting guard as every other caller-written JSON, so a deeply nested file is a refusal, never a `RecursionError` traceback.
 * There is deliberately **no `ORCHESTRA_*` environment fallback**: `deployment.private.json` is the single source, exactly as for `operators` and `verifiers`, and the endpoint supplies the value to the review write path. A contributor cannot set it from a payload.
 * The coordinator turns it on once the **rollback target is a kit that reads the new shapes**:
@@ -534,7 +693,7 @@ The actor must be on the deployment operator allowlist. Until the switch is on, 
 
 ### Rollback compatibility of the additive operations
 
-`withdraw`, `request-review`, `resolve-item` and `decline-review` are new `operation` values in the same reserved `Kind: contribution-review-v1` chain, and `severity`, the request-changes `summary` and the `disposition` fields are optional additions to existing operations. **Records written before this change keep validating and reading unchanged** in this kit: an item without `severity` reads as `blocking`, a request-changes without `summary` is unchanged, and `note_requests`/`pending_review_requests`/`declined_review_requests`/`withdrawal` read empty or null. In the other direction an older kit meets an `operation` it does not know inside a task's chain, fails closed on that chain ("Malformed contribution-review history; operator reconciliation required") and needs an operator void or an upgraded kit - it never silently misreads the record. That is exactly why writing them is behind `review_workflow_writes`: with the switch off (the default) a deployment that may still be rolled back never writes a shape the older kit cannot read, and the coordinator turns it on once the rollback target reads them. The same limits as the `assignee_at_approval` snapshot apply: decide the rollback position before deploying, and use `admin.py void-record` to reconcile a chain an older kit cannot read.
+`withdraw`, `request-review`, `resolve-item`, `decline-review`, `attest`, `hold` and `release-hold` are new `operation` values in the same reserved `Kind: contribution-review-v1` chain, and `severity`, the request-changes `summary` and the `disposition` fields are optional additions to existing operations. **Records written before this change keep validating and reading unchanged** in this kit: an item without `severity` reads as `blocking`, a request-changes without `summary` is unchanged, and `note_requests`/`pending_review_requests`/`declined_review_requests`/`withdrawal`/`attestation`/`holds` read empty or null. In the other direction an older kit meets an `operation` it does not know inside a task's chain, fails closed on that chain ("Malformed contribution-review history; operator reconciliation required") and needs an operator void or an upgraded kit - it never silently misreads the record. That is exactly why writing them is behind `review_workflow_writes`: with the switch off (the default) a deployment that may still be rolled back never writes a shape the older kit cannot read, and the coordinator turns it on once the rollback target reads them. The same limits as the `assignee_at_approval` snapshot apply: decide the rollback position before deploying, and use `admin.py void-record` to reconcile a chain an older kit cannot read.
 
 ## Target the contribution record, not the latest comment
 
@@ -571,6 +730,7 @@ b work --mine
 b work --state changes-requested
 b work --state awaiting-review
 b work --state awaiting-integration
+b work --state held
 b work --state reconciliation-needed
 b work --claimable
 b brief example-task
@@ -583,8 +743,8 @@ The queue sorts requested changes first and shows task status, owner, review sta
 
 `review TASK`, `brief` and `work` combine the workflow chain and lifecycle evidence in **one shared projection**, so they cannot disagree about whether a contribution is integrated. The review write receipt (`review TASK --file payload.json`) reports the same effective `review_state` as those reads, plus the same additive `workflow_state` and `integration` fields, so an approval whose scoped integration evidence was recorded earlier is receipted as `integrated` rather than `awaiting-integration`. Additive fields:
 
-- `review_state` is the effective state and may now be `integrated`, or `withdrawn`/`superseded` after a `withdraw` operation.
-- `workflow_state` is the raw append-only workflow state, kept clearly separate (`none`, `awaiting-review`, `changes-requested`, `awaiting-integration`, `withdrawn`, `superseded`, or `legacy-review-ready` for the legacy label).
+- `review_state` is the effective state and may now be `integrated`, `held` (an open integration hold or a positively failed verification), or `withdrawn`/`superseded` after a `withdraw` operation.
+- `workflow_state` is the raw append-only workflow state, kept clearly separate (`none`, `awaiting-review`, `changes-requested`, `awaiting-integration`, `held`, `withdrawn`, `superseded`, or `legacy-review-ready` for the legacy label).
 - `integration` reports `fact`, `scope`, `scope_token`, `source_commit`, `integration_commit`, `matches_contribution`, `newest_fact`, `newest_scope_token`, `newest_scope`, `reverted`, `reverted_commits` (bounded) and `reverted_total` for the current contribution. Each `prior_contributions` entry carries the same block for its own FULL commit, so a follow-on read also answers whether the replaced revision is integrated. A top-level `integration_disagreements` list (and, in `brief`/`work`, a matching human-readable warning) names both facts and both scopes whenever `newest_fact` differs from `fact`, and carries a `reverted` entry naming the removed commit(s) whenever a host-issued revert applies to the contribution.
 - `next_actor` is the next-action actor as a caller-neutral ROLE (`assignee`, `reviewer`, `coordinator`, `operator`, `anyone`, `none`, `unknown`) from the same decision that gives `work`'s `whose_move`: `whose_move` is the caller-relative answer, `next_actor` is that decision's role, and both say `unknown` where the decision cannot be told (integrated work; a withdrawn or superseded final revision with no open item). It is never null: a malformed chain or row reads `operator`. It is deliberately separate from the assignee and never a person.
 - `work_state` is the review state shown, or `reconciliation-needed` when the shared projection found recorded evidence that must be reconciled first; `reconciliation_needed` is true exactly for those rows and `reconciliation_reasons` names the facts (`integration-facts-disagree`, with both scopes and both values; or `lifecycle-scope-lags`, naming the current contribution's commit and the prior commit the newest recorded scope names). Both are selection signals: they never replace `review_state`, never clear an item or blocker, and infer neither abandonment nor deployment. The `Reconciliation needed: ...` line is added to the EXISTING `warnings`/`integration_warnings`, not to a new field.

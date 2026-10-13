@@ -137,7 +137,7 @@ def snapshot(run, project, *, repair=False):
 
 
 def apply(payload, actor, run, project, operation_id, *, operators=None,
-          coordinator_writes=False, independent_approval=False, owners=None):
+          coordinator_writes=False, independent_approval=False, owners=None, review_writes=False):
     operation = validate(payload)
     before = snapshot(run, project, repair=operation == 'create')
     if operation == 'check':
@@ -164,7 +164,8 @@ def apply(payload, actor, run, project, operation_id, *, operators=None,
             native = coordination.apply_native(command, actor, run, project, operators=operators,
                                                coordinator_writes=coordinator_writes,
                                                independent_approval=independent_approval,
-                                               owners=owners, verified_web_authority=True)
+                                               owners=owners, verified_web_authority=True,
+                                               review_writes=review_writes)
         except CoordinatorRuleRefusal:
             # Keep the rule type for the endpoint marker and full HTTP sentence.
             raise

@@ -1095,12 +1095,15 @@ class EndpointReviewSwitchTests(unittest.TestCase):
 
     def test_the_endpoint_reads_the_coordinator_rules_from_the_deployment(self):
         # kittrial-5bb.197: the two approval rules are OFF on an installation that
-        # configures nothing, and no session registry is read while coordinator_writes
-        # is off.
+        # configures nothing. A review action still carries the actor -> principal map,
+        # LAZILY: the attest/hold/release-hold party rule is not one of the switchable
+        # coordinator rules (kittrial-5bb.10 review item 2), so the endpoint supplies a
+        # reader and a project with no registry has no principals.
         seen, _ = self._run(False)
         self.assertFalse(seen['independent_approval'])
         self.assertFalse(seen['coordinator_writes'])
-        self.assertIsNone(seen['owners'])
+        self.assertTrue(callable(seen['owners']))
+        self.assertEqual(seen['owners'](), {})
         self.assertFalse(seen['verified_web_authority'])
         seen, _ = self._run(False, independent_approval=True, coordinator_writes=True)
         self.assertTrue(seen['independent_approval'])

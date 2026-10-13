@@ -137,6 +137,15 @@ def next_actor(state, assignee=None, closed=False, pending_items=0, claimable=No
         return 'reviewer'
     if state in ('awaiting-integration', 'approved'):
         return 'coordinator'
+    if state == 'held':
+        # An explicit integration hold, or a positively FAILED verification, is the
+        # coordinator's to resolve (release the hold, or record a corrected delivery
+        # attestation). It is never a move for the author to guess at (kittrial-5bb.10).
+        # The author still owes any OPEN requested changes, though, so with pending items
+        # the move is the assignee's and the readers say both facts (item 7).
+        if pending_items:
+            return 'assignee' if assignee else 'unknown'
+        return 'coordinator'
     if state in ('error', RECONCILIATION_STATE):
         return 'operator'
     if state in (None, 'none'):
