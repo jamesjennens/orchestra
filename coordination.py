@@ -435,13 +435,14 @@ def apply_native(p, actor, run, project, operators=None, coordinator_writes=Fals
             if issue is not None:
                 require_independent_approval(issue,'merge-acquire',p['task'],
                                              operators=operators,owners=owners,journal=project)
-    if op=='merge-acquire' and review_writes:
+    if op=='merge-acquire':
         # A contribution held from integration is not integration-ready (kittrial-5bb.10
         # item 4): taking the merge slot for it is refused here, BEFORE the slot is read
-        # or reserved, so a refusal writes nothing. ``review_writes`` is the installation's
-        # review-workflow switch, supplied by the endpoint: with it off no hold could have
-        # been written here, so the export is not read at all and an installation that
-        # configures nothing behaves exactly as on main.
+        # or reserved, so a refusal writes nothing. A stored hold stays in effect whatever
+        # the switch says, so this check runs with ``review_writes`` ON OR OFF
+        # (kittrial-5bb.10 review item 4): the switch governs WRITING the three operations
+        # (attest/hold/release-hold), never whether a stored hold is honoured. With nothing
+        # stored the export yields no hold and the operation behaves exactly as on main.
         from lifecycle import read_event_rows
         from briefing import task_row
         from review_workflow import project as review_project, integration_hold_sentence, CoordinatorRuleRefusal

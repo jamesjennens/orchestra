@@ -72,8 +72,10 @@ required deployment order is documented in ``docs/REVIEWS.md``.
 """
 import json
 import hashlib
+import os
 import record_json
 import re
+import stat
 from pathlib import Path
 import recovery
 from coordination import is_merge_slot, merge_slot_sentence
@@ -211,6 +213,16 @@ JOURNAL_FIELDS = {
 #: Bound on one journal file, so a planted giant file cannot be read into memory.
 JOURNAL_FILE_LIMIT = 256000
 COMMIT_TEXT = re.compile(r'(?:[a-fA-F0-9]{40}|[a-fA-F0-9]{64})')
+#: The host observation of a delivered bundle (kittrial-5bb.10 review item 3). The
+#: file is opened without following a symlink and must be a regular file, its first
+#: line must be a git bundle signature (``# v2 git bundle`` / ``# v3 git bundle``)
+#: before a single byte is hashed, the digest is computed in blocks so a large file
+#: cannot be read into memory, and the file is refused outright above a stated size.
+BUNDLE_MAX_BYTES = 2 * 1024 ** 3
+BUNDLE_BLOCK_BYTES = 1024 * 1024
+#: The bound on ``git bundle list-heads`` for the host observation, in seconds.
+BUNDLE_GIT_TIMEOUT = 60
+BUNDLE_SIGNATURE = re.compile(rb'# v[23] git bundle')
 
 
 #: The text limits of a review record, by the field name its error uses. The validator
@@ -469,6 +481,35 @@ def approval_owners(owners):
                          'cannot be read. An operator turns the rule off with '
                          '`admin.py coordinator-rules off --rule independent_approval --actor OPERATOR`, '
                          'or repairs the session registry; nothing was changed.') from None
+
+
+#: The three operations whose "never the author's or the assignee's party" check is
+#: NOT switchable (kittrial-5bb.10 review item 2). The map is read for them whatever
+#: the coordinator settings say, and an unreadable registry is reported rather than
+#: silently degrading the comparison to names.
+PARTY_OPERATIONS = ('attest', 'hold', 'release-hold')
+PARTY_MAP_UNREADABLE = ('the session registry could not be read, so the parties (principals) of the actor, the '
+                        'contribution author and the task assignee could not be compared; names were compared '
+                        'instead')
+
+
+def load_party_owners(owners):
+    """Resolve the actor -> principal map for the party rule of the three operations.
+
+    "Never the contribution author's or the task assignee's party" is a rule of the
+    kit, not a per-installation setting (kittrial-5bb.10 review item 2): the endpoint
+    and ``admin.py attest-delivery`` supply the project's map for ``attest``, ``hold``
+    and ``release-hold`` whatever the coordinator rules say. Returns ``(mapping,
+    problem)``: ``mapping`` is a plain dict :func:`same_party` can read (``{}`` when
+    nothing is available), and ``problem`` is a sentence for the write's answer when a
+    registry exists but cannot be read, so the caller can still compare names and SAY
+    that parties could not be compared.
+    """
+    try:
+        mapping = owner_map(owners)
+    except (ValueError, OSError):
+        return {}, PARTY_MAP_UNREADABLE
+    return (mapping if isinstance(mapping, dict) else {}), None
 
 
 def listed_operator_actor(actor, operators=None, owners=None):
@@ -767,15 +808,61 @@ def read_bundle_observation(path, git=None):
     ``git`` runner is supplied - lists the refs the bundle advertises with
     ``git bundle list-heads``. Returns ``{path, bytes, sha256, heads, heads_error}``;
     ``heads`` is a list of ``{commit, ref}`` (empty for a bundle with no advertised ref,
-    never guessed) and ``heads_error`` names why they could not be read. The digest and
-    the byte count need no git, so they are always returned.
+    never guessed) and ``heads_error`` names why they could not be read.
+
+    Bounds and order (kittrial-5bb.10 review item 3), so a listed verifier cannot turn
+    this into an arbitrary-file digest oracle and a planted file cannot exhaust memory:
+
+    * the file is opened with ``O_NOFOLLOW`` and must be a REGULAR file (``fstat``), so a
+      symlink is refused instead of followed and a device, fifo or directory is refused;
+    * its first line must match the git bundle signature BEFORE anything is hashed: a file
+      that is not a bundle is refused, so its SHA-256 and size are never returned;
+    * the digest is computed in ``BUNDLE_BLOCK_BYTES`` blocks, never by reading the whole
+      file into memory, and a file above ``BUNDLE_MAX_BYTES`` is refused with that stated
+      limit;
+    * the caller's ``git`` runner is expected to bound its own subprocess (the host
+      command passes ``BUNDLE_GIT_TIMEOUT``); a runner that raises has its message kept in
+      ``heads_error`` rather than propagating.
     """
     bundle = Path(path)
-    if not bundle.is_file():
-        raise ValueError('Delivered bundle is not a readable file: %s' % bundle)
-    data = bundle.read_bytes()
-    observation = {'path': str(bundle), 'bytes': len(data),
-                   'sha256': hashlib.sha256(data).hexdigest(),
+    # lstat first for a clear, portable refusal, then O_NOFOLLOW closes the race on hosts
+    # that support it. ``is_symlink`` never follows. ``is_dir`` is asked explicitly because
+    # some platforms refuse to open a directory at all (EACCES/IsADirectoryError) rather than
+    # returning a descriptor ``fstat`` can classify.
+    if bundle.is_symlink():
+        raise ValueError('Delivered bundle must not be a symlink: %s' % bundle)
+    if bundle.is_dir():
+        raise ValueError('Delivered bundle is not a regular file: %s' % bundle)
+    flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0)
+    try:
+        handle_fd = os.open(str(bundle), flags)
+    except OSError as exc:
+        raise ValueError('Delivered bundle is not a readable file: %s' % bundle) from exc
+    try:
+        info = os.fstat(handle_fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError('Delivered bundle is not a regular file: %s' % bundle)
+        if info.st_size > BUNDLE_MAX_BYTES:
+            raise ValueError('Delivered bundle is larger than the %d-byte observation limit: %s (%d bytes)'
+                             % (BUNDLE_MAX_BYTES, bundle, info.st_size))
+        with os.fdopen(handle_fd, 'rb') as handle:
+            handle_fd = -1
+            first = handle.readline(200)
+            if not BUNDLE_SIGNATURE.match(first):
+                raise ValueError('Delivered bundle is not a git bundle (its first line is not a bundle '
+                                 'signature): %s' % bundle)
+            digest = hashlib.sha256(first)
+            size = len(first)
+            while True:
+                block = handle.read(BUNDLE_BLOCK_BYTES)
+                if not block:
+                    break
+                size += len(block)
+                digest.update(block)
+    finally:
+        if handle_fd >= 0:
+            os.close(handle_fd)
+    observation = {'path': str(bundle), 'bytes': size, 'sha256': digest.hexdigest(),
                    'heads': [], 'heads_error': None}
     if git is None:
         observation['heads_error'] = 'no git runner was supplied, so the bundle heads were not listed'
@@ -2439,7 +2526,11 @@ def execute(rows, task, actor, payload, run, operators=None, journal=None, revie
     both default OFF, so an installation that configures nothing behaves as before).
     ``owners`` is the project's actor -> principal map (``sessions.owners``), or a
     callable returning it so the registry is read only when a rule needs it, used by
-    the principal half of both rules. ``verified_web_authority`` says the request came through the
+    the principal half of both rules. For ``attest``, ``hold`` and ``release-hold`` the
+    map is resolved whatever the coordinator settings say, because the party rule is not
+    switchable (kittrial-5bb.10 review item 2); an unreadable registry compares names
+    and the receipt carries a ``warnings`` sentence saying parties could not be compared.
+    ``verified_web_authority`` says the request came through the
     web route with a verified approval capability for an owner, coordinator, or granted
     agent. The configured live authority establishes the caller (kittrial-5bb.199,
     kittrial-5bb.209), so ``coordinator_writes`` does not refuse it. Web slot operations
@@ -2468,12 +2559,24 @@ def execute(rows, task, actor, payload, run, operators=None, journal=None, revie
     ordered, voids, invalid, refused, positions, reverts, invalid_reverts = history(issue, operators, journal)
     state = projection(ordered, voids, invalid, refused, positions, reverts, invalid_reverts, closed=closed)
     effective_state = receipt(state, rows, task)['review_state']
+    # The party rule of attest/hold/release-hold is NOT one of the switchable
+    # coordinator rules (kittrial-5bb.10 review item 2): resolve the actor -> principal
+    # map for these three operations whatever the installation rules say. An unreadable
+    # registry compares names and the answer carries `party_problem`, so the caller is
+    # told parties could not be compared instead of the principal half being dropped
+    # silently.
+    party_problem = None
+    if payload['operation'] in PARTY_OPERATIONS:
+        owners, party_problem = load_party_owners(owners)
     # Exact retries remain recoverable after ownership changes or later revisions,
     # including after the write switch is turned off: the record already exists.
     for p, c in ordered:
         if p['operation_id'] == payload['operation_id']:
             if _retry_matches(p, payload) and c['author'] == actor:
-                return dict(comment_id=str(c['id']), reconciled=True, **receipt(state, rows, task))
+                answer = dict(comment_id=str(c['id']), reconciled=True, **receipt(state, rows, task))
+                if party_problem:
+                    answer['warnings'] = list(answer.get('warnings') or []) + [party_problem]
+                return answer
             raise ValueError('Operation ID already used with different payload or actor')
     # Staged rollout (item 3): a new-shaped write is refused unless this
     # installation turned the switch on. Reads are unaffected.
@@ -2614,7 +2717,10 @@ def execute(rows, task, actor, payload, run, operators=None, journal=None, revie
         require_integrated_follow_on(payload, state, ordered, rows, task, issue.get('assignee'),
                                      operators, journal, owners)
     result = json.loads(run(['comments', 'add', task, PREFIX + canonical_bytes(payload).decode(), '--json']))
-    return dict(comment_id=str(result['id']), reconciled=False, **receipt(preview, rows, task))
+    answer = dict(comment_id=str(result['id']), reconciled=False, **receipt(preview, rows, task))
+    if party_problem:
+        answer['warnings'] = list(answer.get('warnings') or []) + [party_problem]
+    return answer
 
 
 def _voided_operation_ids(issue, voids):

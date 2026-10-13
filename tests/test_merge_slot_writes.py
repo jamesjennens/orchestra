@@ -455,6 +455,8 @@ class SlotNative:
         return (self.row.get('metadata') or {}).get('holder')
 
     def __call__(self, argv):
+        if argv == ['export', '--all']:
+            return ''                       # merge-acquire reads for a stored hold; none here
         if argv[:2] == ['merge-slot', 'create']:
             return json.dumps({'id': SLOT, 'status': self.row['status']})
         if argv[:2] == ['merge-slot', 'check']:

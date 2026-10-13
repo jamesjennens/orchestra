@@ -556,8 +556,16 @@ a remote delivery (which has no bundle bytes) is attested without inventing them
   on the coordination host. It reads the bundle file itself, computes its byte count and
   SHA-256, lists the refs the bundle advertises with `git bundle list-heads`, takes the
   observed commit from those heads (or from `--commit`), and writes the `attest` record from
-  those values. A verifier who records an attestation without such an observation records a
-  claim, not a proof.
+  those values. **Order and bounds.** The command authorizes the caller FIRST (a listed
+  verifier or listed operator that is not the author's or the assignee's party), then opens
+  the path WITHOUT following a symlink, requires a regular file, requires the git bundle
+  signature line BEFORE hashing anything, hashes in blocks under a stated 2 GiB limit, bounds
+  `git` with a 60-second timeout, and records nothing for a file that is not a git bundle. It
+  only ever reads a LOCAL bundle file: it never contacts a remote, so it refuses to attest a
+  contribution whose declared delivery is `remote` (attest that one on the host review
+  transport). Omitting `--operation-id` uses a stable `attest-delivery-<hash>` id, so an
+  interrupted run retries as the same record. A verifier who records an attestation without
+  such an observation records a claim, not a proof.
 * **`failed`** states a delivery that was positively disproven. It needs a reason, and it
   holds the contribution from integration (the `held` state below) until a later attestation
   or a corrected delivery supersedes it.
@@ -570,7 +578,13 @@ a remote delivery (which has no bundle bytes) is attested without inventing them
 * **Who may attest.** Only a listed verifier (the deployment `verifiers` list) or a listed
   operator (the one `listed_operator_actor` rule), never the contribution's author or the
   task's assignee, or a party of either; an unlisted contributor cannot record any verdict,
-  including `failed`. A `failed` attestation is cleared only by a later attestation from a
+  including `failed`. The party comparison is **not** one of the switchable coordinator rules:
+  the project's actor-to-principal map is read for `attest`, `hold` and `release-hold` whatever
+  `coordinator_writes` and `independent_approval` say, on the endpoint route and in
+  `admin.py attest-delivery` alike, so "never their party" holds by default. If the session
+  registry exists but cannot be read, the write still compares names and **says in its answer
+  that parties could not be compared** (`warnings`), rather than silently dropping the principal
+  half. A `failed` attestation is cleared only by a later attestation from a
   listed verifier or operator, or by a superseding revision that then needs its own
   attestation. The three operations are host-only: the web route refuses `attest`, `hold` and
   `release-hold` with a sentence rather than mapping them to a capability.
@@ -639,6 +653,17 @@ and the release names exactly one open hold:
   comment id. A release naming a hold that does not exist, or one already released, is
   **refused on the write path** and **ignored on the read path** (`ignored_hold_releases`,
   with a warning), so a stray, duplicated or replayed release can never clear a later hold.
+  An operator `void-record` cannot clear a hold: a hold record is part of the surviving
+  contribution history, so the void is refused. **A hold is cleared by `release-hold` only.**
+* **A stored hold outlives the write switch; the switch governs WRITES only.** Once a hold has
+  been written, every reader honours it and every gate refuses integration whatever
+  `review_workflow_writes` says: `review`/`brief`/`work` show `held`, and
+  `coordination merge-acquire`, the `reviewed`/`integrated` facts, the release selection and a
+  release that names the task all refuse. The **way out** is to turn the switch on, record the
+  `release-hold` (the release is itself a new-shaped write and is refused while the switch is
+  off), then turn it off again if desired, exactly as for the lifecycle void released in
+  kittrial-5bb.1013s. With **nothing stored**, nothing differs from main: the merge-slot and
+  release gates find no hold and behave as they always did.
 * **Both are coordinator actions and both are audited.** They are refused unless the actor is
   a listed operator of this project by the kit's one listed-operator rule (a listed name, or an
   actor of a listed operator's principal); `attest` additionally accepts a listed verifier and

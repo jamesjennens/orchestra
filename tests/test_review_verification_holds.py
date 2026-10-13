@@ -367,12 +367,51 @@ class VerifiedAttestationTests(Harness):
     def test_the_author_and_assignee_may_not_attest_even_if_listed(self):
         # The contribution's author, even when listed as a verifier.
         contribution = self.send(self.contribution())['comment_id']
+        before = self.review_count()
         with self.assertRaisesRegex(w.CoordinatorRuleRefusal, "contribution author's party"):
             self.send(self.attest(contribution), AUTHOR, verifiers=(AUTHOR,))
+        # The refusal is the AUTHOR check, not a later failure: nothing was written. A
+        # mutant that dropped the party check would write a record here and die on this
+        # assertion rather than on an incidental downstream error.
+        self.assertEqual(self.review_count(), before)
+        self.assertNotIn('attestation', w.project(self.issue))
         # The task's assignee, even when listed as a verifier.
         self.issue['assignee'] = VERIFIER
         with self.assertRaisesRegex(w.CoordinatorRuleRefusal, "assignee's party"):
             self.send(self.attest(contribution), VERIFIER)
+        self.assertEqual(self.review_count(), before)
+        self.assertNotIn('attestation', w.project(self.issue))
+
+    def test_the_party_rule_holds_with_every_coordinator_rule_off(self):
+        # The coordinator rules are all OFF here: send() passes neither independent_approval
+        # nor coordinator_writes. "Never the author's or assignee's party" must still hold,
+        # because the map is loaded for attest whatever the rules say (review item 2). w1b
+        # is a listed verifier adopted into the SAME principal as the author w1.
+        contribution = self.send(self.contribution())['comment_id']
+        owners = {AUTHOR: 'lane:w1', 'w1b': 'lane:w1', 'w2b': 'lane:w2'}
+        before = self.review_count()
+        with self.assertRaisesRegex(w.CoordinatorRuleRefusal, "author's party"):
+            self.send(self.attest(contribution, sha256=SHA_1, bytes=4096), 'w1b',
+                      verifiers=(VERIFIER, 'w1b', 'w2b'), owners=owners)
+        self.assertEqual(self.review_count(), before)
+        # A listed verifier of ANOTHER principal is accepted, with no "parties could not be
+        # compared" warning (the registry was read).
+        receipt = self.send(self.attest(contribution, sha256=SHA_1, bytes=4096), 'w2b',
+                            verifiers=(VERIFIER, 'w1b', 'w2b'), owners=owners)
+        self.assertEqual(w.project(self.issue)['verification'], 'verified')
+        self.assertFalse([line for line in receipt.get('warnings') or [] if 'parties' in line])
+
+    def test_an_unreadable_registry_compares_names_and_says_so_in_the_answer(self):
+        contribution = self.send(self.contribution())['comment_id']
+
+        class Damaged:
+            def __call__(self):
+                raise ValueError('the session registry is damaged')
+
+        receipt = self.send(self.attest(contribution, sha256=SHA_1, bytes=4096), VERIFIER,
+                            owners=Damaged())
+        self.assertEqual(w.project(self.issue)['verification'], 'verified')
+        self.assertTrue(any('parties' in line for line in receipt.get('warnings') or []))
 
     def test_a_failed_attestation_is_cleared_only_by_an_authorized_reading_or_a_new_revision(self):
         contribution = self.approved()
@@ -594,9 +633,36 @@ class IntegrationHoldTests(Harness):
         self.assertEqual(state['review_state'], 'held')
         self.assertNotEqual(state['review_state'], 'awaiting-integration')
 
+    def test_the_brief_says_which_reason_the_contribution_is_held(self):
+        # Item 5: the held sentence used to say "an integration hold is open, OR verification
+        # failed"; the shared projection knows which, so the brief must say it.
+        import briefing
+        from test_briefing import PROJECT
+        contribution = self.approved()
+        hold_id = self.send(self.hold(contribution))['comment_id']
+        action = briefing.brief(self.rows, PROJECT, TASK)['next_action']
+        self.assertIn(hold_id, action)
+        self.assertIn('integration hold', action)
+        self.assertNotIn('or verification failed', action)
+        # A failed verification says so instead, naming the attestation record.
+        second = Harness()
+        second.setUp()
+        failed_contribution = second.approved()
+        failed_id = second.send(second.attest(failed_contribution, verdict='failed',
+                                              reason='the bundle checksum differs'), VERIFIER)['comment_id']
+        failed_action = briefing.brief(second.rows, PROJECT, TASK)['next_action']
+        self.assertIn(failed_id, failed_action)
+        self.assertIn('FAILED attestation', failed_action)
+        self.assertNotIn('integration hold', failed_action)
+
+    def test_the_work_help_says_held_means_approved_and_held(self):
+        text = json.dumps(work.help_payload('work'))
+        self.assertIn('held means an APPROVED contribution is held', text)
+        self.assertIn('unapproved revision under a hold', text)
+
 
 class IntegrationHoldStopsIntegrationTests(unittest.TestCase):
-    """Item 4: with the switch on, a held contribution is never integration-ready."""
+    """Item 4: a stored hold is honoured whatever the switch says."""
 
     def merge_run(self, rows):
         calls = []
@@ -627,6 +693,32 @@ class IntegrationHoldStopsIntegrationTests(unittest.TestCase):
         # The refusal happens before the slot is read or reserved.
         self.assertEqual([call for call in calls if call[:2] == ['merge-slot', 'check']], [])
         self.assertEqual([call for call in calls if call[:2] == ['merge-slot', 'acquire']], [])
+
+    def test_merge_acquire_is_refused_by_a_stored_hold_with_the_switch_off(self):
+        # The mutant this kills: gating the hold check on `review_writes` again. A hold
+        # stored while the switch was on must still refuse the merge slot after the switch
+        # is turned off (review item 4: the switch governs WRITES only).
+        issue, _ = chain('trial-a')
+        run, calls = self.merge_run([issue])
+        with scratch() as tmp:
+            with self.assertRaisesRegex(w.CoordinatorRuleRefusal, 'open integration hold'):
+                coordination.apply_native({'operation': 'merge-acquire', 'task': 'trial-a',
+                                           'target': 'refs/heads/main'},
+                                          OPERATOR, run, Path(tmp), review_writes=False)
+        self.assertEqual([call for call in calls if call[:2] == ['merge-slot', 'check']], [])
+        self.assertEqual([call for call in calls if call[:2] == ['merge-slot', 'acquire']], [])
+
+    def test_merge_acquire_is_unchanged_with_the_switch_off_and_nothing_stored(self):
+        # With nothing stored, nothing differs from main: the same acquisition succeeds
+        # with the switch off, so an installation that configures nothing is unaffected.
+        run, calls = self.merge_run([row('trial-a')])
+        with scratch() as tmp:
+            result = coordination.apply_native({'operation': 'merge-acquire', 'task': 'trial-a',
+                                                'target': 'refs/heads/main'},
+                                               OPERATOR, run, Path(tmp), review_writes=False)
+        self.assertTrue(result['acquired'])
+        self.assertEqual([call for call in calls if call[:2] == ['merge-slot', 'acquire']],
+                         [['merge-slot', 'acquire', '--holder', OPERATOR, '--json']])
 
     def test_merge_acquire_is_allowed_once_the_hold_is_released(self):
         issue, contribution = chain('trial-a')
@@ -706,7 +798,7 @@ class BundleObservationTests(unittest.TestCase):
     def test_the_observation_reads_the_file_bytes_and_digest_without_git(self):
         with scratch() as tmp:
             path = Path(tmp) / 'delivery.bundle'
-            data = b'not a real bundle, but real bytes'
+            data = b'# v2 git bundle\n' + b'not a real bundle body, but real bytes'
             path.write_bytes(data)
             observation = w.read_bundle_observation(path)
             self.assertEqual(observation['bytes'], len(data))
@@ -718,6 +810,41 @@ class BundleObservationTests(unittest.TestCase):
         with scratch() as tmp:
             with self.assertRaisesRegex(ValueError, 'not a readable file'):
                 w.read_bundle_observation(Path(tmp) / 'nothing.bundle')
+
+    def test_a_file_that_is_not_a_git_bundle_is_refused_before_it_is_hashed(self):
+        # A mutant that removed the signature check would return the arbitrary file's
+        # digest and size, so this asserts the refusal AND that no observation came back
+        # (review item 5: the is-a-file/signature checks must die by assertion).
+        with scratch() as tmp:
+            path = Path(tmp) / 'not-a-bundle.txt'
+            path.write_bytes(b'this is a plain text file, not a bundle\n' * 10)
+            with self.assertRaisesRegex(ValueError, 'not a git bundle'):
+                w.read_bundle_observation(path)
+            # A directory is refused as a non-regular file, with the message, rather than
+            # raising IsADirectoryError from read_bytes.
+            with self.assertRaisesRegex(ValueError, 'not a regular file'):
+                w.read_bundle_observation(Path(tmp))
+            # A symlink is refused instead of followed, so a verifier cannot point the
+            # command at any file the host account can read.
+            link = Path(tmp) / 'link.bundle'
+            try:
+                link.symlink_to(path)
+            except (OSError, NotImplementedError):
+                pass
+            else:
+                with self.assertRaisesRegex(ValueError, 'not be a symlink'):
+                    w.read_bundle_observation(link)
+
+    def test_a_bundle_over_the_stated_size_limit_is_refused(self):
+        with scratch() as tmp:
+            path = Path(tmp) / 'big.bundle'
+            path.write_bytes(b'# v2 git bundle\n' + b'x')
+            import review_workflow
+            saved = review_workflow.BUNDLE_MAX_BYTES
+            review_workflow.BUNDLE_MAX_BYTES = 4
+            self.addCleanup(setattr, review_workflow, 'BUNDLE_MAX_BYTES', saved)
+            with self.assertRaisesRegex(ValueError, 'larger than the 4-byte observation limit'):
+                w.read_bundle_observation(path)
 
     def git(self, *args, cwd):
         done = subprocess.run(['git', *args], cwd=str(cwd), capture_output=True, text=True)

@@ -73,6 +73,21 @@ def owner_loader(path,rule):
                              %(rule,rule)) from None
     return load
 
+
+def party_owner_loader(path):
+    """A lazy actor -> principal reader for the attest/hold/release-hold party rule.
+
+    That rule is NOT one of the switchable coordinator rules (kittrial-5bb.10 review
+    item 2), so a review action carries this map whatever ``coordinator_writes`` and
+    ``independent_approval`` say. Unlike :func:`owner_loader` a damaged registry does
+    not raise here: the review write catches it, compares names, and says in its answer
+    that parties could not be compared.
+    """
+    def load():
+        import sessions
+        return sessions.owners(path)
+    return load
+
 ALLOWED={'list','show','ready','search','count','create','update','close','reopen','comments','dep','state','lint'}
 # Legacy name kept for operators reading this file; enforcement is the
 # spelling-aware reserved_comments.operator_only_in_args() below.
@@ -871,8 +886,17 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
         # reads retain name comparison on failure; independent-approval writers
         # must load ownership strictly, even for a directly listed operator.
         registry_rule='coordinator_writes' if rules['coordinator_writes'] else 'independent_approval'
-        owners=(owner_loader(path,registry_rule)
-                if (rules['coordinator_writes'] or rules['independent_approval']) else None)
+        if rules['coordinator_writes'] or rules['independent_approval']:
+            owners=owner_loader(path,registry_rule)
+        elif action=='review':
+            # The party rule of attest/hold/release-hold is not switchable
+            # (kittrial-5bb.10 review item 2): a review action always carries the lazy
+            # map, and a damaged registry is reported by the write ("parties could not
+            # be compared") instead of refusing. Nothing else reads it while the rules
+            # are off.
+            owners=party_owner_loader(path)
+        else:
+            owners=None
         # The lanes read's route isolation (kittrial-5bb.263): the host route and a key
         # bound to an operator may see every lane; any other bound key sees only its own
         # row. `configured_operators` is read once here and passed on unchanged.

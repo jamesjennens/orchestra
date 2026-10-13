@@ -980,6 +980,14 @@ def review_chain_state(row):
     Best effort, exactly like :func:`current_contribution_commits`: a row with no review
     chain, or a chain this read cannot parse, yields ``None`` and the caller treats the
     task as unheld rather than inventing a hold. Nothing here changes what is recorded.
+
+    It projects with ``records(row, None)`` - no operator voids and no revert journal -
+    which is safe for the two facts it is asked: a void can only REMOVE a chain record
+    (so ignoring voids can only ADD a hold, never clear one: fail-closed), an operator
+    void-record of a hold record is itself refused as part of the surviving contribution
+    history, and the revert journal never touches the ``holds``/``attestation`` records
+    this projection reads. Every authoritative write path still reads the full chain
+    with voids and journal.
     """
     try:
         from review_workflow import records, projection

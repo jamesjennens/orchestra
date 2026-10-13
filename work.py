@@ -499,7 +499,10 @@ def help_options(action):
             {'flag': '--owner ACTOR', 'description': 'show only tasks owned by ACTOR (mutually exclusive with --mine; malformed rows remain visible)'},
             {'flag': '--state STATE', 'description': 'filter by the review state the row SHOWS: ' + ', '.join(WORK_STATES)
                                                       + ' (reconciliation-needed selects rows whose recorded evidence must '
-                                                        'be reconciled, whatever review state they show)'},
+                                                        'be reconciled, whatever review state they show). held means an '
+                                                        'APPROVED contribution is held: an unapproved revision under a '
+                                                        'hold still shows its own awaiting-review/changes-requested state, '
+                                                        'with the hold shown on the row'},
             {'flag': '--claimable', 'description': 'bounded claimable-work view: open, unassigned, no contribution, '
                                                    'excluding epics, decisions, gates, jobs, tasks labelled decision '
                                                    'and record anchors'},
