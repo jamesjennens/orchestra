@@ -11,6 +11,7 @@ off-machine copy helper (which stages, locks and replaces a destination instead 
 merging into it).
 """
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -1591,15 +1592,123 @@ class BackupCopyCase(RuntimeCase):
                                    'coordination': 'backups/' + name + '.coordination.json'}}
                          for name in names]})
 
-    def test_the_copy_refuses_an_incomplete_runtime_and_copies_nothing(self):
+    def test_the_copy_skips_an_incomplete_project_and_copies_the_rest(self):
+        # kittrial-5bb.160: one bad project no longer stops the off-host copy of the others.
         self.record()
         (self.root / 'backups' / 'beta').rmdir()
         stdout, stderr, code = self.run_admin('backup-copy', str(self.destination))
+        self.assertNotEqual(code, 0)
+        self.assertIn('backup-copy skipped beta: native backup directory is missing', stderr)
+        self.assertIn('This is a partial copy', stdout)
+        self.assertIn('Copied 1 of 2 project(s)', stdout)
+        # The healthy project was copied; the bad one was not, and its (absent) previous copy
+        # was not replaced by an empty folder.
+        self.assertTrue((self.destination / 'alpha').is_dir())
+        self.assertFalse((self.destination / 'beta').exists())
+        # A partial run publishes no completeness record, so it cannot read as a full success,
+        # and it records itself in the run record beside where that record would go.
+        self.assertFalse((self.destination / admin.BACKUP_STATUS_NAME).exists())
+        run = json.loads((self.destination / admin.BACKUP_COPY_RUN_NAME).read_text(encoding='utf-8'))
+        self.assertEqual(run['status'], 'partial')
+        self.assertIsNone(run['full_record'])
+
+    def test_all_or_nothing_refuses_an_incomplete_runtime_and_copies_nothing(self):
+        self.record()
+        (self.root / 'backups' / 'beta').rmdir()
+        stdout, stderr, code = self.run_admin('backup-copy', str(self.destination), '--all-or-nothing')
         self.assertNotEqual(code, 0)
         self.assertIn('beta', stderr)
         self.assertIn('native backup directory is missing', stderr)
         self.assertEqual(stdout, '')
         self.assertFalse(self.destination.exists())
+
+    def test_a_skipped_project_keeps_its_previous_off_machine_copy_byte_for_byte(self):
+        # The condition: a project that is skipped must leave its PREVIOUS off-host copy
+        # untouched, never a half-copied or emptied folder.
+        self.record()
+        (self.destination / 'beta').mkdir(parents=True)
+        (self.destination / 'beta' / 'older-native-chunk').write_bytes(b'previous copy')
+        (self.destination / 'beta.coordination.json').write_bytes(b'{"schema_version":1,"status":"complete"}')
+        before = {path.name: path.read_bytes() for path in (self.destination / 'beta').iterdir()}
+        sidecar_before = (self.destination / 'beta.coordination.json').read_bytes()
+        # beta's pair is now incomplete: a directory sits where its sidecar copy belongs.
+        (self.root / 'backups' / 'beta.coordination.json').unlink()
+        (self.root / 'backups' / 'beta.coordination.json').mkdir()
+        (self.root / 'backups' / 'beta.coordination.json' / 'operator-notes.txt').write_text(
+            "not the kit's", encoding='utf-8')
+        stdout, stderr, code = self.run_admin('backup-copy', str(self.destination))
+        self.assertNotEqual(code, 0)
+        self.assertIn('backup-copy skipped beta', stderr)
+        self.assertIn('coordination sidecar is not a regular file', stderr)
+        self.assertTrue((self.destination / 'alpha').is_dir())
+        self.assertEqual((self.destination / 'beta.coordination.json').read_bytes(), sidecar_before)
+        self.assertEqual({path.name: path.read_bytes()
+                          for path in (self.destination / 'beta').iterdir()}, before)
+
+    def test_a_partial_copy_keeps_the_destination_completeness_record_byte_for_byte(self):
+        # kittrial-5bb.160 review 2 item 1: the completeness record already at the destination
+        # is the only statement there of when the LAST FULL copy was made (and that the skipped
+        # projects' copies, which this run leaves byte-identical, were complete then). A partial
+        # run must not remove or rewrite it; it publishes its own run record beside it instead.
+        self.record()
+        (self.root / 'backups' / 'beta').rmdir()
+        self.destination.mkdir(parents=True)
+        old = json.dumps({'schema_version': 1, 'scope': 'all', 'generated_at': '2026-09-27T16:00:00Z',
+                          'status': 'complete', 'projects': []}).encode('utf-8')
+        (self.destination / admin.BACKUP_STATUS_NAME).write_bytes(old)
+        stdout, stderr, code = self.run_admin('backup-copy', str(self.destination))
+        self.assertNotEqual(code, 0)
+        # The old record's bytes are unchanged after a partial run, and nothing else that was at
+        # the destination was removed or rewritten either.
+        self.assertEqual((self.destination / admin.BACKUP_STATUS_NAME).read_bytes(), old)
+        # Beside it, the record of THIS run says partial, names what it copied with the
+        # generation, what it skipped and why, and which full record the skipped copy belongs to.
+        run = json.loads((self.destination / admin.BACKUP_COPY_RUN_NAME).read_text(encoding='utf-8'))
+        self.assertEqual(run['schema_version'], 1)
+        self.assertEqual(run['kind'], 'backup-copy-run')
+        self.assertEqual(run['status'], 'partial')
+        self.assertFalse(run['all_or_nothing'])
+        self.assertEqual([item['name'] for item in run['copied']], ['alpha'])
+        self.assertEqual([item['name'] for item in run['skipped']], ['beta'])
+        self.assertIn('native backup directory is missing', run['skipped'][0]['reason'])
+        generation = run['copied'][0]['generation']
+        self.assertEqual(generation['completed_at'], '2026-09-27T16:00:00Z')
+        self.assertEqual(generation['coordination_sha256'],
+                         hashlib.sha256(
+                             (self.destination / 'alpha.coordination.json').read_bytes()).hexdigest())
+        self.assertEqual(run['full_record']['name'], admin.BACKUP_STATUS_NAME)
+        self.assertEqual(run['full_record']['generated_at'], '2026-09-27T16:00:00Z')
+        self.assertEqual(run['full_record']['sha256'], hashlib.sha256(old).hexdigest())
+        self.assertIn('full record', run['note'])
+        self.assertIn('alpha', stdout)
+
+    def test_a_full_copy_publishes_a_complete_run_record_beside_the_record(self):
+        # Every run writes the run record, so a partial record from an earlier run can never
+        # describe a later, superseded run: a full run replaces it and says complete.
+        self.record()
+        stdout, stderr, code = self.run_admin('backup-copy', str(self.destination))
+        self.assertEqual(code, 0, stderr)
+        run = json.loads((self.destination / admin.BACKUP_COPY_RUN_NAME).read_text(encoding='utf-8'))
+        self.assertEqual(run['status'], 'complete')
+        self.assertEqual(run['skipped'], [])
+        self.assertEqual([item['name'] for item in run['copied']], ['alpha', 'beta'])
+        self.assertEqual(run['full_record']['sha256'],
+                         hashlib.sha256(
+                             (self.destination / admin.BACKUP_STATUS_NAME).read_bytes()).hexdigest())
+        self.assertEqual(run['full_record']['generated_at'], '2026-09-27T16:00:00Z')
+
+    def test_a_failed_copy_leaves_the_destination_completeness_record_alone(self):
+        # The failure path used to unlink the destination's record with errors swallowed; a
+        # failure must publish nothing new and remove nothing either (kittrial-5bb.160 review 2).
+        self.record()
+        self.destination.mkdir(parents=True)
+        old = b'{"schema_version":1,"scope":"all","generated_at":"2026-09-27T16:00:00Z","status":"complete","projects":[]}'
+        (self.destination / admin.BACKUP_STATUS_NAME).write_bytes(old)
+        with patch('shutil.copytree', side_effect=PermissionError('destination is not writable')):
+            stdout, stderr, code = self.run_admin('backup-copy', str(self.destination))
+        self.assertNotEqual(code, 0)
+        self.assertIn('backup-copy failed', stderr)
+        self.assertEqual((self.destination / admin.BACKUP_STATUS_NAME).read_bytes(), old)
 
     def degraded(self):
         self.record()
@@ -1630,13 +1739,29 @@ class BackupCopyCase(RuntimeCase):
         self.assertNotIn('egraded', stdout)
         self.assertTrue((self.destination / 'alpha').is_dir())
 
-    def test_the_copy_refuses_a_project_initialized_after_the_run(self):
+    def test_the_copy_skips_a_project_initialized_after_the_run_and_copies_the_rest(self):
+        # kittrial-5bb.160: a project added after the last run is skipped and named, and the
+        # projects the run did cover are copied.
         self.record()
         make_project(self.root, 'gamma')
         stdout, stderr, code = self.run_admin('backup-copy', str(self.destination))
         self.assertNotEqual(code, 0)
+        self.assertIn('backup-copy skipped gamma', stderr)
+        self.assertIn('absent from the last run record', stderr)
+        self.assertIn('Copied 2 of 3 project(s)', stdout)
+        self.assertTrue((self.destination / 'alpha').is_dir())
+        self.assertTrue((self.destination / 'beta').is_dir())
+        self.assertFalse((self.destination / 'gamma').exists())
+        self.assertFalse((self.destination / admin.BACKUP_STATUS_NAME).exists())
+
+    def test_all_or_nothing_refuses_a_project_initialized_after_the_run(self):
+        self.record()
+        make_project(self.root, 'gamma')
+        other = Path(self.temp.name) / 'off-machine-flag'
+        stdout, stderr, code = self.run_admin('backup-copy', str(other), '--all-or-nothing')
+        self.assertNotEqual(code, 0)
         self.assertIn('gamma', stderr)
-        self.assertFalse(self.destination.exists())
+        self.assertFalse(other.exists())
 
     def test_the_copy_copies_every_complete_pair_when_the_gate_passes(self):
         self.record()
@@ -1740,16 +1865,19 @@ class BackupCopyCase(RuntimeCase):
             stdout, stderr, code = self.run_admin('backup-copy', str(self.destination))
         self.assertNotEqual(code, 0)
         self.assertIn('backup-copy failed', stderr)
-        self.assertIn('does not look complete', stderr)
+        self.assertIn('no new completeness record was published', stderr)
         self.assertNotIn('Traceback', stderr)
         # The record that would make the destination look complete is not published.
         self.assertFalse((self.destination / admin.BACKUP_STATUS_NAME).exists())
+        self.assertFalse((self.destination / admin.BACKUP_COPY_RUN_NAME).exists())
         self.assertEqual(list(self.destination.glob('.backup-copy-staging-*')), [])
 
     def test_the_copy_rechecks_the_pair_under_the_lock(self):
         self.record()
         (self.root / 'backups' / 'beta').rmdir()
-        with patch.object(admin, 'require_complete_problems', return_value=[]):
+        # The pre-copy selection is bypassed so the pair can only be caught by the re-check
+        # taken under the project's locks (kittrial-5bb.160 made the selection per project).
+        with patch.object(admin, 'backup_copy_skips', return_value=[]):
             stdout, stderr, code = self.run_admin('backup-copy', str(self.destination))
         self.assertNotEqual(code, 0)
         self.assertIn('no longer a complete pair', stderr)
