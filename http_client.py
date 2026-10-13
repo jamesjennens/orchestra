@@ -43,6 +43,47 @@ import ssl
 import sys
 from urllib.parse import quote, urlencode, urlsplit
 
+
+def _lifecycle_body_file(path):
+    """Bound caller text before decoding, while keeping the copied client standalone."""
+    with open(path, 'rb') as stream:
+        raw = stream.read(1024 * 1024 + 1)
+    if len(raw) > 1024 * 1024:
+        raise ValueError('Lifecycle request file exceeds 1 MiB')
+    text = raw.decode('utf-8-sig')
+    depth = 0
+    quoted = escaped = False
+    for char in text:
+        if quoted:
+            if escaped:
+                escaped = False
+            elif char == '\\':
+                escaped = True
+            elif char == '"':
+                quoted = False
+        elif char == '"':
+            quoted = True
+        elif char in '[{':
+            depth += 1
+            if depth > 64:
+                raise ValueError('JSON nested too deeply (more than 64 levels)')
+        elif char in ']}':
+            depth -= 1
+    def fields(pairs):
+        body = {}
+        for name, value in pairs:
+            if name in body:
+                raise ValueError('Duplicate lifecycle request field: ' + name)
+            body[name] = value
+        return body
+    try:
+        body = json.loads(text, object_pairs_hook=fields)
+    except RecursionError:
+        raise ValueError('JSON nested too deeply (more than 64 levels)') from None
+    if not isinstance(body, dict):
+        raise ValueError('The lifecycle request body must be a JSON object')
+    return body
+
 MUTATING = ('POST', 'PUT', 'PATCH', 'DELETE')
 LOOPBACK = ('127.0.0.1', '::1', 'localhost')
 
@@ -504,8 +545,7 @@ def main(argv=None):
             else:
                 if not args.file:parser.error('scope and fact require --file')
                 if args.operation == 'fact' and not args.dimension:parser.error('fact requires --dimension')
-                with open(args.file, encoding='utf-8-sig') as stream:body = json.load(stream)
-                if not isinstance(body, dict):parser.error('the lifecycle request body must be a JSON object')
+                body = _lifecycle_body_file(args.file)
                 result = client._write_lifecycle(args.project, args.task, args.operation, body,
                                                  args.idempotency_key, args.dimension)
             print(json.dumps(result, indent=2));return 0

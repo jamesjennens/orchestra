@@ -7,6 +7,8 @@ from pathlib import Path
 import shutil
 import sys
 import unittest
+from unittest.mock import patch
+import tempfile
 
 sys.path[:0]=[str(Path(__file__).resolve().parents[1]),str(Path(__file__).resolve().parent)]
 from test_http_agents import AgentHarness
@@ -59,5 +61,31 @@ class BrowserClientTests(AgentHarness):
         self.assertEqual(result,0);self.assertEqual(json.loads(output.getvalue())['dimension'],'implemented')
         self.assertEqual(client.lifecycle(self.pid,self.tid)['facts']['implemented']['trigger'],'Awaiting further evidence')
 
+
+
+class CopiedClientInputTests(unittest.TestCase):
+    def test_copied_cli_refuses_bad_file_before_any_request(self):
+        with tempfile.TemporaryDirectory() as folder:
+            copied=Path(folder)/'http_client.py';shutil.copyfile(KIT/'http_client.py',copied)
+            spec=importlib.util.spec_from_file_location('copied_bounded_lifecycle_client',copied)
+            module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+            body=Path(folder)/'body.json'
+            bad=['['*65+'0'+']'*65, '{"scope":{},"scope":{}}', '{"a":{"x":1,"x":2}}',
+                 '[1]', '{', ' '* (1024*1024+1)]
+            with patch.object(module.Client,'request',side_effect=AssertionError('Bad input reached transport')) as request:
+                for text in bad:
+                    with self.subTest(text=text[:40]):
+                        body.write_text(text,encoding='utf-8');stderr=io.StringIO()
+                        with contextlib.redirect_stderr(stderr):
+                            code=module.main(['--base-url','http://127.0.0.1','--token','synthetic',
+                                'lifecycle','p','t','scope','--file',str(body),'--idempotency-key','same-key'])
+                        self.assertEqual(code,1);self.assertIn('ERROR:',stderr.getvalue())
+                request.assert_not_called()
+            # Brackets and escaped quotes inside evidence strings are not nesting.
+            value={'evidence':['['*100+'"'+chr(92)+']'*100], 'scope':{'source_commit':'a'*40}}
+            body.write_text(json.dumps(value),encoding='utf-8')
+            self.assertEqual(module._lifecycle_body_file(body),value)
+            body.write_text('{"x":'+ '['*63+'0'+']'*63+'}',encoding='utf-8')
+            self.assertIn('x',module._lifecycle_body_file(body))
 
 if __name__=='__main__':unittest.main()
