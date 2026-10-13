@@ -161,6 +161,35 @@ class DirectoryInPlaceOfACopyTests(native_sync.RuntimeCase):
                 self.assertEqual(code, 0, stderr)
                 self.assertEqual(admin.backup_pair_state(self.root, 'alpha'), (True, None))
 
+    def test_a_symlink_to_a_directory_is_not_refused_and_the_link_is_replaced(self):
+        """kittrial-5bb.160 item 2: the directory refusal is for a REAL directory.
+
+        The check is ``is_dir() and not is_symlink()``, so a symlink to a directory at the
+        canonical sidecar path is not refused: ``backup`` replaces the LINK with the regular
+        sidecar it writes and the directory the link pointed at keeps its contents. The
+        mutation that also refuses the symlink must die here.
+        """
+        target = self.root / 'backups' / 'elsewhere'
+        target.mkdir()
+        (target / 'operator-notes.txt').write_text("not the kit's", encoding='utf-8')
+        link = self.root / 'backups' / 'alpha.coordination.json'
+        if link.exists() or link.is_symlink():
+            link.unlink()
+        try:
+            link.symlink_to(target, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest('symlinks unavailable')
+        with patch.object(admin, 'native_backup_sync', return_value='Backup synced'):
+            stdout, stderr, code = self.run_admin('backup', 'alpha')
+        self.assertEqual(code, 0, stderr)
+        self.assertNotIn('is a directory where the coordination sidecar copy belongs', stderr)
+        # The link was replaced by the regular sidecar this kit writes ...
+        self.assertFalse(link.is_symlink())
+        self.assertTrue(link.is_file())
+        self.assertEqual(json.loads(link.read_text(encoding='utf-8'))['status'], 'complete')
+        # ... and the directory it pointed at was not touched.
+        self.assertEqual((target / 'operator-notes.txt').read_text(encoding='utf-8'), "not the kit's")
+
 
 if __name__ == '__main__':
     unittest.main()

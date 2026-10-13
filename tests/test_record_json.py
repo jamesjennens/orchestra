@@ -286,7 +286,12 @@ class NoUnguardedParseTests(unittest.TestCase):
             # records; a damaged or nested note reads as no note, never a traceback.
             # The seventh (kittrial-5bb.220 review 2 item 4a) reads one line of the
             # backup-schedule log the kit writes; a damaged line is skipped.
-            'admin.py': 7,
+            # The eighth and ninth (kittrial-5bb.160 review 2) read, for the off-machine
+            # copy's run record, the complete sidecar this run just copied and the
+            # completeness record already at the operator's destination: text this kit did
+            # not just write itself, so a deeply nested one is described rather than
+            # crashing the copy out of the guard.
+            'admin.py': 9,
             # endpoint.py's fifth (kittrial-5bb.195): the JSON payload of a coordinator
             # acceptance command, which the caller transports as a file attachment. It is
             # the caller's text, so it is parsed through the guard.
