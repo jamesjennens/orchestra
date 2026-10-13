@@ -358,6 +358,38 @@ class NativeVoidTests(fixture.RealBdLabelAliasTests):
         row=next(r for r in json.loads(answer.stdout) if r['id']==task)
         self.assertTrue(row.get('corrections_consulted',False));self.assertEqual(row['facts']['integrated'].get('reason'),'voided')
 
+    def test_real_metadata_without_family_establishes_only_correction_free_absence(self):
+        # A separate native fixture keeps other tests' correction comments out.
+        class FreshProject(fixture.RealBdLabelAliasTests):
+            pass
+        FreshProject.setUpClass()
+        self.addCleanup(FreshProject.tearDownClass)
+        fresh=FreshProject()
+        created=fresh.bd('create','synthetic metadata identity','--json')
+        self.assertEqual(created.returncode,0,created.stderr)
+        task=json.loads(created.stdout)['id']
+        metadata=json.loads((fresh.project/'.beads/metadata.json').read_text())
+        self.assertEqual(metadata['database'],'dolt')
+        self.assertEqual(metadata['dolt_database'],'pp')
+        rows=fresh.export_rows()
+        self.assertFalse((fresh.project/voids.DIRECTORY).exists())
+        self.assertTrue(lifecycle.offline_snapshot(rows,fresh.project).offline_corrections_consulted)
+        # The same real metadata must not certify an absent family once a native
+        # correction is exported, even if the folder claims this project's name.
+        known_task,known_target=self.make_fact()
+        import admin
+        cfg=json.loads((self.root/'deployment.private.json').read_text());cfg['operators']=['op']
+        (self.root/'deployment.private.json').write_text(json.dumps(cfg))
+        admin.lifecycle_void_switch(self.root,'on','op')
+        admin.lifecycle_correction_command(self.root,'pp','void',known_target['id'],'op',
+            'Synthetic missing family identity.',['synthetic round-three proof'],'metadata-'+known_task)
+        captured=lifecycle.offline_snapshot(self.export_rows(),fresh.project)
+        self.assertFalse(captured.offline_corrections_consulted)
+        fact=next(r for r in lifecycle.project_facts(captured) if r['id']==known_task)['facts']['integrated']
+        self.assertEqual(fact['value'],'unknown')
+        self.assertEqual(fact.get('reason'),'lifecycle-corrections-not-consulted')
+        self.assertFalse((fresh.project/voids.DIRECTORY).exists())
+
     def test_real_changed_target_keeps_unknown_and_stops_backup(self):
         import admin
         task,target=self.make_fact();cfg=json.loads((self.root/'deployment.private.json').read_text())

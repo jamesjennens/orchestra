@@ -87,13 +87,49 @@ class OfflineRoundTwoTests(unittest.TestCase):
         self.assertFalse(report.get('corrections_consulted',True));self.assertEqual(report['targets'],[])
 
     def test_absence_established_at_the_named_native_project_is_consulted(self):
-        metadata=self.project/'.beads';metadata.mkdir();(metadata/'metadata.json').write_text(json.dumps({'database':'p'}))
+        metadata=self.project/'.beads';metadata.mkdir();(metadata/'metadata.json').write_text(json.dumps({'database':'dolt','dolt_database':'p'}))
         got,_=self.cli('list','--journal',str(self.project))
         self.assertTrue(got[0].get('corrections_consulted',False))
         self.assertEqual(got[0]['facts']['integrated']['value'],'passed')
-        (metadata/'metadata.json').write_text(json.dumps({'database':'another'}))
+        (metadata/'metadata.json').write_text(json.dumps({'database':'dolt','dolt_database':'another'}))
         got,_=self.cli('list','--journal',str(self.project))
         self.assertFalse(got[0].get('corrections_consulted',True))
+
+    def test_matching_metadata_cannot_establish_absence_with_exported_correction(self):
+        self.apply(self.payload())
+        folder=self.project/'missing-family';folder.mkdir();metadata=folder/'.beads';metadata.mkdir()
+        for identity in ({'database':'p'}, {'database':'dolt','dolt_database':'p'}):
+            with self.subTest(metadata=identity):
+                (metadata/'metadata.json').write_text(json.dumps(identity))
+                got,warning=self.cli('list','--journal',str(folder))
+                self.assertFalse(got[0].get('corrections_consulted',True))
+                self.assertEqual(got[0]['facts']['integrated']['value'],'unknown')
+                self.assertEqual(got[0]['facts']['integrated'].get('reason'),'lifecycle-corrections-not-consulted')
+                self.assertNotIn('pass --journal',warning)
+                self.assertIn('supplied --journal',warning)
+                report=self.release('--journal',str(folder))
+                self.assertFalse(report.get('corrections_consulted',True));self.assertEqual(report['targets'],[])
+                self.assertNotIn('pass --journal',report['correction_note'])
+        self.assertFalse((folder/voids.DIRECTORY).exists())
+
+    def test_one_paired_comment_does_not_consult_an_unpaired_correction(self):
+        self.apply(self.payload())
+        unpaired=self.payload();unpaired['operation_id']='unpaired'
+        self.native_run(['comments','add','p-task',voids.PREFIX+lifecycle.canonical_bytes(unpaired).decode(),'--json'])
+        got,warning=self.cli('list','--journal',str(self.project))
+        self.assertFalse(got[0].get('corrections_consulted',True))
+        self.assertEqual(got[0]['facts']['integrated']['value'],'unknown')
+        self.assertEqual(got[0]['facts']['integrated'].get('reason'),'lifecycle-corrections-not-consulted')
+        self.assertEqual(self.release('--journal',str(self.project))['targets'],[])
+        self.assertNotIn('pass --journal',warning)
+
+    def test_database_backend_name_does_not_establish_project_identity(self):
+        metadata=self.project/'.beads';metadata.mkdir()
+        (metadata/'metadata.json').write_text(json.dumps({'database':'p'}))
+        got,warning=self.cli('list','--journal',str(self.project))
+        self.assertFalse(got[0].get('corrections_consulted',True))
+        self.assertEqual(got[0]['facts']['integrated']['value'],'passed')
+        self.assertNotIn('pass --journal',warning)
 
     def test_correct_family_consultation_survives_target_change(self):
         self.apply(self.payload());self.rows[2]['title']='changed after void'

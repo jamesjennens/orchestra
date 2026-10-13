@@ -51,11 +51,8 @@ payload. Recover `operation_id`, `actor`, `binding.event_id`, `reason` and every
 above with those exact values (one `--evidence` for each pointer). For an incomplete
 retraction, recover `target_void` and repeat `lifecycle-event-retract` instead.
 Keep the switch ON and the original issuing identity currently authorized for the
-retry. If it was removed, a currently listed operator must deliberately re-grant
-its exact listed principal/name using `operators add ... --actor CURRENT_OPERATOR
---reason "Repair incomplete correction OPERATION"`, retry, then remove that grant
-with an equally explicit reason. These list changes are audited; do not share or
-take over another actor. A missing/unrecoverable principal binding requires the
+retry. Do not share or take over another actor. A missing/unrecoverable principal
+binding requires the
 operator's normal identity reconciliation before retry; backups remain stopped.
 
 If another VOID key is now in effect, a current operator first records its linked
