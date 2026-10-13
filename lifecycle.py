@@ -1967,16 +1967,65 @@ def release_group_estimate(writes):
 
 
 def offline_snapshot(rows, project=None):
-    """An export cannot prove that the host has no correction family.
+    """Preserve legacy export truth except where the export shows a correction.
 
-    A named local project supplies the same bounded family reader as the host.
-    Without one, preserve native evidence but report its derived truth unknown.
+    A path alone is not evidence of consultation. Bind a read family to native
+    comments in THIS export; establish an absent family only at a native project
+    whose database identity agrees with the export's issue prefix.
     """
-    from lifecycle_voids import Snapshot, snapshot
+    from lifecycle_voids import Snapshot, context, read_journal, native_correction_comments
+    native = native_correction_comments(rows)
+    consulted = False
+    journal = None
     if project is not None:
-        return snapshot(rows, project)
-    return Snapshot(rows, dict(entries={},reasons={},invalid=[],retracted=set(),
-                              global_reason='lifecycle-corrections-not-consulted'))
+        directory = Path(project)
+        if not directory.is_dir():
+            raise ValueError('--journal must name an existing project directory')
+        journal = read_journal(directory)
+        # A matching native comment establishes the family/export association
+        # even when a target event was subsequently changed or deleted.
+        for entry in journal['entries'].values():
+            payload = entry['payload']
+            if any(c['task'] == payload['binding']['task']
+                   and c['id'] == entry['comment_id']
+                   and c['text'] == 'Kind: lifecycle-event-correction-v1\n' + canonical_bytes(payload).decode()
+                   for c in native):
+                consulted = True
+                break
+        if not consulted:
+            metadata = directory / '.beads' / 'metadata.json'
+            try:
+                identity = load_json(metadata).get('database')
+                prefixes = {row['id'].split('-', 1)[0] for row in rows
+                            if isinstance(row, dict) and isinstance(row.get('id'), str)}
+                consulted = bool(identity and prefixes == {identity})
+            except (OSError, ValueError, AttributeError):
+                pass
+    if consulted:
+        result = Snapshot(rows, context(rows, journal))
+    else:
+        reasons = {}
+        tasks = {}
+        from lifecycle_voids import PREFIX, validate_payload
+        for comment in native:
+            try:
+                payload = record_json.loads(comment['text'][len(PREFIX):])
+                validate_payload(payload)
+                if payload['binding']['task'] != comment['task']:
+                    raise ValueError('Correction names a different task')
+                reasons[payload['binding']['event_id']] = 'lifecycle-corrections-not-consulted'
+                if not any(isinstance(r,dict) and r.get('id') == payload['binding']['event_id'] for r in rows):
+                    tasks[comment['task']] = 'lifecycle-corrections-not-consulted'
+            except (ValueError, TypeError, KeyError):
+                tasks[comment['task']] = 'lifecycle-corrections-not-consulted'
+        result = Snapshot(rows, dict(entries={}, reasons=reasons, task_reasons=tasks,
+                                     invalid=[], retracted=set(), global_reason=None))
+    result.offline_corrections_consulted = consulted
+    return result
+
+
+OFFLINE_CORRECTION_NOTE = ('Lifecycle corrections were not consulted; pass --journal PROJECT_DIRECTORY. '
+                           'Only events named by correction comments in this export read unknown.')
 
 
 def main():
@@ -2202,11 +2251,9 @@ def main():
                 report['reverts_source']='local'
                 report['dry_run_revert_note']=DRY_RUN_REVERT_NOTE
                 warnings=warnings+[DRY_RUN_REVERT_NOTE]
-            report['corrections_consulted']=journal is not None
-            if journal is None:
-                report['correction_note']=('Lifecycle corrections were not consulted locally: pass --journal '
-                    'PROJECT_DIRECTORY for the host family. Offline facts are unknown; a writing release '
-                    'is checked by the endpoint before effects.')
+            report['corrections_consulted']=getattr(rows,'offline_corrections_consulted',False)
+            if not report['corrections_consulted']:
+                report['correction_note']=OFFLINE_CORRECTION_NOTE
                 warnings.append(report['correction_note'])
             if warnings:report['warnings']=warnings
             # Check every target and every derived operation ID for the WHOLE release
@@ -2263,20 +2310,27 @@ def main():
                 print(json.dumps(report,ensure_ascii=False,indent=2))
         elif a.command=='evidence-owed':
             from export_requirements import read_export
-            report=evidence_owed(offline_snapshot(read_export(a.export),a.journal or None))
-            if not a.journal:
-                print('Lifecycle corrections were not consulted; pass --journal PROJECT_DIRECTORY. '
-                      'Derived facts and the evidence owed are unknown.',file=sys.stderr)
+            rows=offline_snapshot(read_export(a.export),a.journal or None)
+            consulted=rows.offline_corrections_consulted
+            if not consulted and (rows.lifecycle_corrections['reasons'] or rows.lifecycle_corrections['task_reasons']):
+                raise ValueError('Lifecycle corrections were not consulted; evidence owed is unknown for '
+                                 'events with correction comments. Pass --journal PROJECT_DIRECTORY; '
+                                 'no empty evidence-owed result is asserted.')
+            report=evidence_owed(rows)
+            if not consulted:print(OFFLINE_CORRECTION_NOTE,file=sys.stderr)
+            for item in report:
+                item['corrections_consulted']=consulted
+                if not consulted:item['correction_note']=OFFLINE_CORRECTION_NOTE
             print(json.dumps(report,ensure_ascii=False,indent=2))
         else:
             from export_requirements import read_export
-            facts=project_facts(offline_snapshot(read_export(a.export),a.journal or None))
-            if not a.journal:
-                print('Lifecycle corrections were not consulted; pass --journal PROJECT_DIRECTORY. '
-                      'Derived facts are unknown.',file=sys.stderr)
+            rows=offline_snapshot(read_export(a.export),a.journal or None)
+            consulted=rows.offline_corrections_consulted
+            facts=project_facts(rows)
+            if not consulted:print(OFFLINE_CORRECTION_NOTE,file=sys.stderr)
             for fact in facts:
-                fact['corrections_consulted']=bool(a.journal)
-                if not a.journal:fact['correction_note']='Lifecycle corrections were not consulted; pass --journal PROJECT_DIRECTORY. Derived facts are unknown.'
+                fact['corrections_consulted']=consulted
+                if not consulted:fact['correction_note']=OFFLINE_CORRECTION_NOTE
             if a.implemented_not_deployed:facts=[r for r in facts if r['facts']['implemented']['value']=='passed' and r['facts']['deployed']['value'] not in ('passed','not-applicable')]
             print(json.dumps(facts,ensure_ascii=False,indent=2))
     except (ValueError,OSError,RuntimeError) as exc:raise SystemExit(str(exc))

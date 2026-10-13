@@ -229,7 +229,7 @@ class NativeVoidTests(fixture.RealBdLabelAliasTests):
         self.assertEqual(voids.context(rows,voids.read_journal(self.project))['reasons'][target['id']],'voided')
         self.assertEqual(next(row for row in rows if row['id']==target['id']),target)
 
-    def omitted_backup_restore(self,old_kit=None):
+    def omitted_backup_restore(self,old_kit=None,without_coordination=False):
         import admin,subprocess,sys
         from pathlib import Path
         task,target=self.make_fact()
@@ -250,8 +250,19 @@ class NativeVoidTests(fixture.RealBdLabelAliasTests):
             self.assertIn(voids.MANIFEST,bundle['files'])
             bundle['files']={k:v for k,v in bundle['files'].items() if k!=voids.MANIFEST and not k.startswith(voids.DIRECTORY+'/')}
             sidecar.write_text(json.dumps(bundle))
-        restored_name='oldercopy' if old_kit else 'tamperedcopy'
-        result=command(Path(admin.__file__),'restore-new','pp',restored_name)
+        restored_name='plaincopy' if without_coordination else 'oldercopy' if old_kit else 'tamperedcopy'
+        if without_coordination:
+            # The flag is only admitted for unusable sidecars. First pin that
+            # pre-native refusal, then exercise the actual native-only restore.
+            refused=command(Path(admin.__file__),'restore-new','pp',restored_name,'--without-coordination')
+            self.assertNotEqual(refused.returncode,0)
+            self.assertIn('--without-coordination is only for',refused.stderr)
+            self.assertFalse((self.root/'projects'/restored_name).exists())
+            sidecar.write_text('{')
+            fallback=admin.last_complete_sidecar_path(self.root,'pp')
+            if fallback.exists():fallback.write_text('{')
+        result=command(Path(admin.__file__),'restore-new','pp',restored_name,
+                       *(['--without-coordination'] if without_coordination else []))
         self.assertNotEqual(result.returncode,0,result.stdout+result.stderr)
         self.assertIn('Native lifecycle correction comments exist',result.stderr)
         destination=self.root/'projects'/restored_name
@@ -268,6 +279,102 @@ class NativeVoidTests(fixture.RealBdLabelAliasTests):
 
     def test_native_restore_refuses_whole_family_and_manifest_removed_together(self):
         self.omitted_backup_restore()
+
+    def test_native_without_coordination_cannot_override_a_missing_void_family(self):
+        self.omitted_backup_restore(without_coordination=True)
+
+    def test_incomplete_native_comment_recovery_from_its_retained_payload_resumes_backup(self):
+        import admin
+        from unittest import mock
+        task,target=self.make_fact();cfg=json.loads((self.root/'deployment.private.json').read_text())
+        cfg['operators']=['op'];(self.root/'deployment.private.json').write_text(json.dumps(cfg))
+        admin.lifecycle_void_switch(self.root,'on','op')
+        with mock.patch.object(voids,'publish',side_effect=OSError('synthetic publication cut')):
+            with self.assertRaisesRegex(ValueError,'uncertain'):
+                admin.lifecycle_correction_command(self.root,'pp','void',target['id'],'op',
+                    'Synthetic words recovered from native.',['synthetic round-two proof'],'recover-'+task)
+        before=self.export_rows()
+        with self.assertRaisesRegex(ValueError,'VOID family is missing|native correction comments without'):
+            voids.backup_files(self.project,before)
+        comment=next(c for row in before if row['id']==task for c in row.get('comments',[])
+                     if c['text'].startswith(voids.PREFIX))
+        recovered=json.loads(comment['text'][len(voids.PREFIX):])
+        answer=admin.lifecycle_correction_command(self.root,'pp','void',recovered['binding']['event_id'],
+            recovered['actor'],recovered['reason'],recovered['evidence'],recovered['operation_id'])
+        self.assertTrue(answer['reconciled']);self.assertEqual(answer['comment_id'],str(comment['id']))
+        self.assertEqual(self.export_rows(),before)
+        self.assertIn(voids.MANIFEST,voids.backup_files(self.project,before))
+        self.assertEqual(voids.audit(voids.snapshot(before,self.project))['incomplete_correction_count'],0)
+
+    def test_raw_guard_keeps_the_complete_released_valueerror_line(self):
+        import admin,subprocess,sys
+        before=self.export_rows()
+        request=dict(project='pp',actor='worker',action='bd',
+                     args=['create','synthetic refused','--labels','integrated:passed','--json'])
+        result=subprocess.run([sys.executable,fixture.endpoint.__file__,'--root',str(self.root)],
+                    input=json.dumps(request),env=admin.environment(self.root),capture_output=True,text=True,timeout=60)
+        self.assertEqual(result.returncode,0,result.stderr)
+        answer=json.loads(result.stdout);self.assertEqual(answer['returncode'],2)
+        self.assertEqual(answer['stderr'].splitlines()[0],
+            'ValueError: Reserved lifecycle namespace: lifecycle dimension, scope, enabled and live labels '
+            'require a lifecycle write. Use the dedicated lifecycle action (lifecycle.py record); no native write was attempted.')
+        self.assertEqual(self.export_rows(),before)
+
+    def test_real_export_offline_list_parity_and_wrong_journal_paths(self):
+        import admin,os,subprocess,sys
+        from pathlib import Path
+        base=os.environ.get('ORCHESTRA_F0_REVIEW_BASE')
+        if not base:self.skipTest('requires pinned pre-VOID kit for main-beside-tip offline CLI proof; never run in ordinary CI')
+        task,target=self.make_fact();exported=self.project/'round-two-export.jsonl'
+        def read(script,journal=None):
+            exported.write_text(''.join(json.dumps(r)+'\n' for r in self.export_rows()))
+            args=[sys.executable,str(script),'list','--export',str(exported)]
+            if journal is not None:args+=['--journal',str(journal)]
+            return subprocess.run(args,env=admin.environment(self.root),capture_output=True,text=True,timeout=60)
+        main=read(Path(base)/'lifecycle.py');tip=read(Path(lifecycle.__file__))
+        self.assertEqual(main.returncode,0,main.stderr);self.assertEqual(tip.returncode,0,tip.stderr)
+        current=json.loads(tip.stdout)
+        for row in current:
+            self.assertFalse(row.pop('corrections_consulted',True));self.assertIn('not consulted',row.pop('correction_note',''))
+        # Other tasks in this shared fixture already have correction comments;
+        # their deliberate unknown result is not a legacy-parity claim.
+        self.assertEqual(next(r for r in current if r['id']==task),
+                         next(r for r in json.loads(main.stdout) if r['id']==task))
+        cfg=json.loads((self.root/'deployment.private.json').read_text());cfg['operators']=['op'];(self.root/'deployment.private.json').write_text(json.dumps(cfg))
+        admin.lifecycle_void_switch(self.root,'on','op')
+        admin.lifecycle_correction_command(self.root,'pp','void',target['id'],'op',
+              'Synthetic offline CLI.',['synthetic round-two proof'],'offline-'+task)
+        empty=self.project/'no-family';empty.mkdir()
+        foreign=self.project/'foreign-project';foreign.mkdir();(foreign/'.beads').mkdir()
+        (foreign/'.beads'/'metadata.json').write_text(json.dumps({'database':'foreign'}))
+        for path in (None,empty,foreign):
+            answer=read(Path(lifecycle.__file__),path);self.assertEqual(answer.returncode,0,answer.stderr)
+            row=next(r for r in json.loads(answer.stdout) if r['id']==task)
+            self.assertFalse(row.get('corrections_consulted',True))
+            self.assertEqual(row['facts']['integrated'].get('reason'),'lifecycle-corrections-not-consulted')
+        answer=read(Path(lifecycle.__file__),self.project/'missing');self.assertNotEqual(answer.returncode,0)
+        self.assertIn('existing project directory',answer.stderr)
+        answer=read(Path(lifecycle.__file__),self.project);self.assertEqual(answer.returncode,0,answer.stderr)
+        row=next(r for r in json.loads(answer.stdout) if r['id']==task)
+        self.assertTrue(row.get('corrections_consulted',False));self.assertEqual(row['facts']['integrated'].get('reason'),'voided')
+
+    def test_real_changed_target_keeps_unknown_and_stops_backup(self):
+        import admin
+        task,target=self.make_fact();cfg=json.loads((self.root/'deployment.private.json').read_text())
+        cfg['operators']=['op'];(self.root/'deployment.private.json').write_text(json.dumps(cfg))
+        admin.lifecycle_void_switch(self.root,'on','op')
+        admin.lifecycle_correction_command(self.root,'pp','void',target['id'],'op',
+              'Synthetic target change.',['synthetic round-two proof'],'changed-'+task)
+        result=self.bd('update',target['id'],'--title','synthetic changed native event','--json',actor='op')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.addCleanup(lambda:self.assertEqual(
+            self.bd('update',target['id'],'--title',target['title'],'--json',actor='op').returncode,0))
+        captured=voids.snapshot(self.export_rows(),self.project)
+        fact=next(f for f in lifecycle.project_facts(captured) if f['id']==task)['facts']['integrated']
+        self.assertEqual(fact.get('reason'),'lifecycle-void-target-changed');self.assertEqual(fact['value'],'unknown')
+        self.assertEqual(voids.audit(captured)['damaged_correction_count'],1)
+        with self.assertRaisesRegex(ValueError,'native target/comment generation'):
+            voids.backup_files(self.project,self.export_rows())
 
     def test_native_restore_refuses_backup_created_by_pre_void_kit(self):
         import os

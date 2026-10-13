@@ -1701,6 +1701,9 @@ def main():
         answer={'returncode':75,'stdout':'','stderr':'Busy: %s. Nothing was done; try again shortly.\n'%waited}
     except Exception as e:
         answer={'returncode':2,'stdout':'','stderr':f'{type(e).__name__}: {e}\n'}
+        import raw_lifecycle
+        if isinstance(e,raw_lifecycle.Refusal):
+            answer['stderr']=f'ValueError: {e}\n'
         from review_workflow import CoordinatorRuleRefusal
         if isinstance(e,CoordinatorRuleRefusal):
             # Preserve the host's ValueError sentence while identifying a kit rule

@@ -74,9 +74,10 @@ class VoidReviewTests(unittest.TestCase):
     def test_offline_list_reads_named_family_and_does_not_claim_unconsulted_pass(self):
         self.apply(self.payload())
         facts,_=self.cli('list','--journal',str(self.project))
-        self.assertEqual((facts[0]['facts']['integrated']['value'],facts[0]['facts']['integrated']['reason']),('unknown','voided'))
+        self.assertEqual((facts[0]['facts']['integrated']['value'],facts[0]['facts']['integrated'].get('reason')),('unknown','voided'))
         facts,warning=self.cli('list')
-        self.assertFalse(facts[0]['corrections_consulted'])
+        self.assertFalse(facts[0].get('corrections_consulted',True))
+        self.assertIn('reason',facts[0]['facts']['integrated'])
         self.assertEqual(facts[0]['facts']['integrated']['value'],'unknown')
         self.assertEqual(facts[0]['facts']['integrated']['reason'],'lifecycle-corrections-not-consulted')
         self.assertIn('not consulted',warning)
@@ -115,7 +116,7 @@ class VoidReviewTests(unittest.TestCase):
         self.assertEqual({c['status'] for c in entries},{'retracted','retraction','incomplete'})
         for c in entries:
             self.assertEqual(c['operator'],'op');self.assertTrue(c['created_at']);self.assertTrue(c['reason']);self.assertTrue(c['evidence'])
-        self.assertEqual(len({p['questionable_fact_count'] for p in pages}),1)
+        self.assertEqual({p.get('questionable_fact_count') for p in pages},{1})
         self.assertEqual(pages[-1]['next_offset'],None)
 
     def test_cut_key_cannot_publish_second_void_after_other_key_succeeds(self):
@@ -211,9 +212,13 @@ class VoidReviewTests(unittest.TestCase):
         store.record(payload('trial-a','deployed',operation='deploy',scope_value=production))
         self.rows=store.rows
         data,_=self.cli('evidence-owed','--journal',str(self.project))
+        self.assertTrue(data)
         self.assertEqual(data[0]['tasks'][0]['deployed'],'passed')
         data,warning=self.cli('evidence-owed')
-        self.assertEqual(data,[]);self.assertIn('not consulted',warning)
+        self.assertTrue(data)
+        self.assertEqual(data[0]['tasks'][0]['deployed'],'passed')
+        self.assertFalse(data[0].get('corrections_consulted',True))
+        self.assertIn('not consulted',warning)
 
     def test_web_task_projection_carries_reason_beside_unknown(self):
         import http_service,types

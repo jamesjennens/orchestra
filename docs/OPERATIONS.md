@@ -40,6 +40,32 @@ different content or actor refuses. Retraction names the VOID operation key.
 If another key already voids the event, a pending/cut key cannot publish a second
 VOID on retry: the refusal names the operation already in effect.
 
+**An incomplete correction stops this project's backups** until its exact native
+comment is paired with a valid host entry. There is no abandon-incomplete command
+or permission to delete that comment. Losing the original command does not lose
+its words: `lifecycle-audit PROJECT` lists the incomplete operation, actor, reason
+and evidence. Read the task's native comments (`bd comments TASK --json`, through
+the configured host/client) for its full `Kind: lifecycle-event-correction-v1`
+payload. Recover `operation_id`, `actor`, `binding.event_id`, `reason` and every
+`evidence` pointer from that comment, and repeat the `lifecycle-event-void` command
+above with those exact values (one `--evidence` for each pointer). For an incomplete
+retraction, recover `target_void` and repeat `lifecycle-event-retract` instead.
+Keep the switch ON and the original issuing identity currently authorized for the
+retry. If it was removed, a currently listed operator must deliberately re-grant
+its exact listed principal/name using `operators add ... --actor CURRENT_OPERATOR
+--reason "Repair incomplete correction OPERATION"`, retry, then remove that grant
+with an equally explicit reason. These list changes are audited; do not share or
+take over another actor. A missing/unrecoverable principal binding requires the
+operator's normal identity reconciliation before retry; backups remain stopped.
+
+If another VOID key is now in effect, a current operator first records its linked
+retraction with a fresh key/reason/evidence, then retries the incomplete operation
+with the recovered exact values. If that newly published VOID should not remain
+effective, retract it with another fresh audited key. Retain all comments and
+host entries. If the native payload or target itself cannot be recovered, preserve
+the stopped project and use a verified complete native/coordination backup in an
+unused destination; never fabricate a journal entry to resume backups.
+
 Authority is checked under the project and deployment configuration locks. A
 currently listed operator's registered actor may act through the same bound
 principal; another principal or an unreadable registry grants no exemption.
@@ -59,6 +85,9 @@ are UNKNOWN with `voided` (or a specific binding/restore failure reason), includ
 historical scope and retry reads. An older pass cannot reappear by deleting or
 changing the target event. Independent valid scopes keep their existing meaning.
 Recorded release, rollback and capability-verification records are unchanged.
+A host-made invalid entry that names an event belonging to another task makes the
+entry's claimed task's whole lifecycle read UNKNOWN with its binding reason.
+The actual event is retained once; no duplicate event row is invented.
 
 Backups include this bounded family only when present, with a closed generation
 manifest carrying every member hash, count, byte count and a bounded hash of the
@@ -80,9 +109,18 @@ requires operator reconciliation.
 
 Offline `lifecycle.py list --export FILE --journal PROJECT_DIRECTORY`,
 `evidence-owed --export FILE --journal PROJECT_DIRECTORY`, and release selection
-read the same family. A list or dry-run release without a local `--journal`
-reports that corrections were not consulted and derives UNKNOWN, not PASSED.
-An evidence-owed command without it warns that its result is unknown. The
+read the same family. Without a usable journal for this export's project, ordinary
+facts and release targets keep main's answers, with additive
+`corrections_consulted: false` and one note. Only events named by a native
+correction comment in the export read UNKNOWN with
+`lifecycle-corrections-not-consulted`. An evidence-owed command with such comments
+refuses with a nonzero exit instead of reporting a misleading empty list. Without
+correction comments it preserves the owed releases (or a genuinely empty result)
+and adds the consultation note. A nonexistent `--journal` directory is an error.
+Another project's family or an ordinary folder without this project's native
+identity does not establish consultation. A family is associated through exact
+native correction comments; its absence can be established through the native
+project database identity matching the export's issue prefix. The
 writing release's local candidate report discloses an unconsulted family; the
 endpoint validates each actual target before any effects.
 
@@ -99,6 +137,9 @@ and `--without-coordination`. The refusal retains an incomplete restore marker;
 reads stay UNKNOWN, audit reports the incomplete corrections and backup refuses
 the destination. Preserve it and restore a complete VOID-capable backup into an
 unused destination.
+There is **NO override**, including `--without-coordination`, for a family-less
+backup that carries native correction comments. That flag can discard ordinary
+coordination state; it cannot discard this correction evidence or its marker.
 
 **Rollback:** an older kit ignores this family and can report the original fact.
 It also refuses a sidecar containing these new paths. Before rolling the kit back,
