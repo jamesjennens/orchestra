@@ -217,7 +217,7 @@ def is_lifecycle_row(row):
         isinstance(label, str) and label.startswith('integrated:') for label in row.get('labels') or []))
 
 
-def integrated_commits(rows, operators=None, journal=None):
+def integrated_commits(rows, operators=None, journal=None, corrections=None):
     """Every integrated commit the given native rows record (lowercase).
 
     `rows` must hold each task with its lifecycle event rows (a full export, or the
@@ -226,6 +226,9 @@ def integrated_commits(rows, operators=None, journal=None):
     task names the commit.
     """
     from lifecycle import integration_evidence
+    from lifecycle_voids import Snapshot, read_journal, snapshot
+    if not isinstance(rows, Snapshot):
+        rows = snapshot(rows, journal=read_journal(journal) if corrections is None else corrections)
     from review_state import reverts_by_task
     reverts, _ = reverts_by_task(rows, operators, journal)
     found = set()
@@ -259,6 +262,13 @@ class Integrated:
         self.known = {}
         self.export_rows = export_rows
         self.everything = None
+        self.corrections = None
+
+    def _corrections(self):
+        if self.corrections is None:
+            from lifecycle_voids import read_journal
+            self.corrections = read_journal(self.journal)
+        return self.corrections
 
     def _export(self):
         rows = self.export_rows
@@ -274,7 +284,7 @@ class Integrated:
                     rows.append(row)
         rows=record_json.classify(rows,self.run,types=['event'])
         rows=[row for row in rows if is_lifecycle_row(row)]
-        self.everything = integrated_commits(rows, self.operators, self.journal)
+        self.everything = integrated_commits(rows, self.operators, self.journal, self._corrections())
         self.export_rows = None
 
     def _narrow(self, commit):
@@ -306,7 +316,7 @@ class Integrated:
         if isinstance(shown, dict):
             shown = [shown]
         rows.extend(row for row in shown or [] if isinstance(row, dict) and row.get('id') in tasks)
-        return commit in integrated_commits(rows, self.operators, self.journal)
+        return commit in integrated_commits(rows, self.operators, self.journal, self._corrections())
 
     def __call__(self, commit):
         commit = str(commit or '').lower()

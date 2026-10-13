@@ -1,4 +1,5 @@
 import copy
+from void_test_helpers import without_void_tracker
 import json
 import sys
 import tempfile
@@ -157,6 +158,7 @@ class GovernanceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             governance.current(self.project, 'alpha')
 
+    @without_void_tracker
     def test_restore_new_keeps_history_and_validates_source_before_any_write(self):
         self.initialize(); self.set_mode('governed')
         original = governance.snapshot(self.project, 'alpha')

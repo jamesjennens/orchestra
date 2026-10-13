@@ -628,6 +628,9 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
     parser.add_argument('--capability-limit',type=int,default=20);parser.add_argument('--capability-offset',type=int,default=0)
     parser.add_argument('--json',action='store_true')  # output is always JSON; accepted for consistency
     a=parser.parse_args(args)
+    from lifecycle_voids import Snapshot, snapshot
+    if journal is not None and not isinstance(rows,Snapshot):
+        rows=snapshot(rows,journal)
     if not WORK_LIMIT_MIN<=a.limit<=WORK_LIMIT_MAX or a.offset<WORK_OFFSET_MIN or not WORK_LIMIT_MIN<=a.handoff_limit<=WORK_LIMIT_MAX or a.handoff_offset<WORK_OFFSET_MIN:
         raise ValueError('Invalid work page: --limit and --handoff-limit must be %d..%d; '
                          '--offset and --handoff-offset must be >= %d' % (WORK_LIMIT_MIN,WORK_LIMIT_MAX,WORK_OFFSET_MIN))
@@ -936,6 +939,13 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
                       'approval_requires_other_party':bool(independent_approval),
                       'waiting_for_approval':approval_wait(state,row['id'],actor,row.get('assignee'),
                           contribution.get('author'),independent_approval,owners,review_request,move_text)})
+        # Additive (kittrial-5bb.210 F0): the void snapshot's per-dimension reason is carried
+        # on the row so a reader can say WHY a lifecycle dimension reads the way it does. Kept
+        # BESIDE this lane's held state, not instead of it: a voided dimension and a hold are
+        # independent facts (kittrial-5bb.10 merge-forward-onto-24c9d0f).
+        reasons = {dim: state['reason'] for dim, state in fact.items() if state.get('reason')}
+        if reasons:
+            items[-1]['lifecycle_reasons'] = reasons
         # Additive (kittrial-5bb.10 item 7): a standing hold (or a verifier's reading) is
         # shown on the row even when the row stays in the reviewers' or the author's queue,
         # so a held revision is still reviewable AND says it is held. Present only when it
@@ -1059,10 +1069,13 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
         rows=record_json.loads_rows(run(['export','--all']))
         from reserved_comments import RECORD_ANCHOR_LABELS
         rows=record_json.classify(rows,run,sorted(RECORD_ANCHOR_LABELS)+['gt:slot'], ['event','gate'])
+        from lifecycle import host_snapshot
+        rows=host_snapshot(rows, run=run, project=path)
         if args[:1]==['lanes']:
             # The lanes board (kittrial-5bb.263) reads the SAME export this action already
             # loaded, plus the project's session registry: one pass, no per-task comment
-            # read. Its flags and aging live in lanes.py only.
+            # read. Its flags and aging live in lanes.py only. Preserve the host VOID
+            # snapshot so lane eligibility uses the same classified lifecycle evidence.
             from lanes import read as lanes_read
             from sessions import read_registry
             return lanes_read(rows,actor,read_registry(path),args[1:],operators=operators,
@@ -1076,6 +1089,8 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
         from briefing import task_row
         from lifecycle import read_event_rows
         rows=read_event_rows(run)
+        from lifecycle import host_snapshot
+        rows=host_snapshot(rows, run=run, project=path)
         issue=task_row(rows,task)
         from review_state import scopes_for
         return workflow(issue,scopes_for(rows,task),operators=operators,journal=path,
@@ -1096,6 +1111,8 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
         return handoff(path,actor,payload,run)
     from lifecycle import read_event_rows
     rows=read_event_rows(run)
+    from lifecycle import host_snapshot
+    rows=host_snapshot(rows, run=run, project=path)
     if payload.get('operation')=='recommend':
         # A reviewer's recommendation (kittrial-5bb.115) is a record beside the review
         # chain: it has its own writer and never passes through the chain's.

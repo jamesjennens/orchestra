@@ -520,7 +520,8 @@ class ReleaseCommandTests(unittest.TestCase):
         config = Path(root) / 'client.json'
         config.write_text('{}', encoding='utf-8')
         return ['lifecycle.py', 'release', '--config', str(config), '--project', 'example',
-                '--actor', ACTOR, '--file', str(request), '--export', str(export), '--repo', str(root)]
+                '--actor', ACTOR, '--file', str(request), '--export', str(export), '--repo', str(root),
+                '--journal', str(root)]
 
     def fixture_for(self, root, store, data):
         export = Path(root) / 'issues.jsonl'
@@ -530,7 +531,8 @@ class ReleaseCommandTests(unittest.TestCase):
         config = Path(root) / 'client.json'
         config.write_text('{}', encoding='utf-8')
         return ['lifecycle.py', 'release', '--config', str(config), '--project', 'example',
-                '--actor', ACTOR, '--file', str(request), '--export', str(export), '--repo', str(root)]
+                '--actor', ACTOR, '--file', str(request), '--export', str(export), '--repo', str(root),
+                '--journal', str(root)]
 
     def test_a_plain_release_round_trips_through_the_endpoint(self):
         # The CLI's chunk payload must be exactly a valid release payload: a plain
@@ -679,7 +681,7 @@ class ReleaseCommandTests(unittest.TestCase):
             export.write_text(''.join(json.dumps(row) + '\n' for row in store.rows),
                               encoding='utf-8')
             rows = json.loads(self.run_cli(['lifecycle.py', 'evidence-owed',
-                                            '--export', str(export)]))
+                                            '--export', str(export), '--journal', str(root)]))
             self.assertEqual(rows[0]['environment'], 'production')
             self.assertEqual(rows[0]['release_id'], 'release-1')
             self.assertEqual(rows[0]['tasks'][0]['task'], 'trial-a')
@@ -2428,7 +2430,8 @@ class RollbackCommandTests(ReleaseCommandTests):
         config = Path(root) / 'client.json'
         config.write_text('{}', encoding='utf-8')
         return ['lifecycle.py', 'release', '--config', str(config), '--project', 'example',
-                '--actor', ACTOR, '--file', str(request), '--export', str(export), '--repo', str(root)]
+                '--actor', ACTOR, '--file', str(request), '--export', str(export), '--repo', str(root),
+                '--journal', str(root)]
 
     def test_the_rollback_flag_sends_targets_and_supersede(self):
         store = (NativeStore(tasks=('trial-a', 'trial-b'))

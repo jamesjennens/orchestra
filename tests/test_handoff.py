@@ -1,5 +1,6 @@
 """Owner transfers preserve recovery and explicit authority."""
 import json
+from void_test_helpers import without_void_tracker
 import sys
 import tempfile
 import unittest
@@ -79,6 +80,7 @@ class HandoffTests(unittest.TestCase):
             self.native.owner='alice'
             with self.subTest(value=value),self.assertRaises(ValueError):self.execute()
         self.assertEqual(self.native.updates,1)
+    @without_void_tracker
     def test_backup_restore_preserves_completed_receipt_and_retry_identity(self):
         self.execute()
         source=next((self.path/'.handoffs').glob('*.json'))

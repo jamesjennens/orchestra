@@ -10,6 +10,7 @@ deploy-time `open-item-label-check`. These tests pin each table row and both dir
 of the journal validation, and that no kit module writes a record or a journal.
 """
 import contextlib
+from void_test_helpers import without_void_tracker
 import copy
 import io
 import json
@@ -399,6 +400,7 @@ class JournalTests(unittest.TestCase):
         self.assertNotIn('.owner-answers', admin.RECORD_JOURNALS)
         self.assertNotIn('.owner-answers', admin.RESERVATION_JOURNALS)
 
+    @without_void_tracker
     def test_both_journals_round_trip_through_backup_and_restore(self):
         files = {'.open-item-requests/' + 'a' * 64 + '.json': receipt(operation='questions-ask'),
                  '.open-item-requests/' + 'b' * 64 + '.json': receipt(status='pending')}
@@ -413,6 +415,7 @@ class JournalTests(unittest.TestCase):
         for name, record in files.items():
             self.assertEqual(json.loads((self.destination / name).read_text(encoding='utf-8')), record)
 
+    @without_void_tracker
     def test_a_malformed_entry_or_receipt_is_refused_before_anything_is_created(self):
         bad = [(entry_name(answer_entry()), dict(answer_entry(), item='kit-8')),
                ('.owner-answers/' + 'f' * 64 + '.json', answer_entry()),

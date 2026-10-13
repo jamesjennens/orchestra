@@ -407,7 +407,8 @@ def _guard_named_rows(root,path,name,args,attachments,actor,strict=False):
     rows,problem=_resolve_rows(root,path,actor,request['targets'],strict=strict)
     if problem:
         advice=(' '+raw_lifecycle.ADVICE) if strict else ''
-        raise ValueError('Refusing %s: %s, so the rows this would write are not known. Name each task by its id. Nothing was written.%s'%(command,problem,advice))
+        refusal=raw_lifecycle.Refusal if strict else ValueError
+        raise refusal('Refusing %s: %s, so the rows this would write are not known. Name each task by its id. Nothing was written.%s'%(command,problem,advice))
     slot=name+MERGE_SLOT_SUFFIX
     for row in rows:
         if row['id']==slot or is_merge_slot(row):
@@ -857,7 +858,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             return stdout
         # The instrumented runner is the work effect's only route to native state, so
         # a validation refusal raised before any write is provably pre-effect.
-        runner=NativeRunner(run)
+        runner=NativeRunner(run, project=path)
         # A malformed review_workflow_writes value reads as OFF and warns instead of
         # failing every work/review action (kittrial-5bb.110 item 2).
         switch_warnings=[]
@@ -930,7 +931,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             stdout,warnings=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
             if warnings:run_warnings.append(warnings)
             return stdout
-        runner=NativeRunner(run)
+        runner=NativeRunner(run, project=path)
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
             answer=web_action(root,path,name,request,authority_config,runner,guarded_write)
@@ -1102,7 +1103,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             elif looked_up is not None:counted(looked_up,True)
             return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
         payload=reference_records.write_payload(args,request.get('attachments',{}))
-        runner=NativeRunner(run)
+        runner=NativeRunner(run, project=path)
         def ref_effect():
             result=reference_records.apply_native(payload,actor,runner,path,operators=configured_operators(root))
             return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
@@ -1149,7 +1150,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                 except Exception:pass
             return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
         operators=configured_operators(root)
-        runner=NativeRunner(run)
+        runner=NativeRunner(run, project=path)
         def capability_effect():
             result=capability_records.write(args,request.get('attachments',{}),actor,runner,path,operators,
                                             verifiers=configured_verifiers(root))
@@ -1185,7 +1186,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             # service withholds coordinator text per caller from its server-bound identity.
             result=proposal_records.read(args,run,actor,operators,project=path,full=authority_config is not None)
             return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
-        runner=NativeRunner(run)
+        runner=NativeRunner(run, project=path)
         def proposal_effect():
             http=proposal_records.http_context(request,authority_config,require_authority)
             if authority_config is not None and http is None:
@@ -1259,7 +1260,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             stdout,warnings=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
             if warnings:run_warnings.append(warnings)
             return stdout
-        runner=NativeRunner(coordinator_run)
+        runner=NativeRunner(coordinator_run, project=path)
         import contextlib
         @contextlib.contextmanager
         def held():
@@ -1397,7 +1398,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             stdout,warnings=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
             if warnings:run_warnings.append(warnings)
             return stdout
-        runner=NativeRunner(run)
+        runner=NativeRunner(run, project=path)
         def briefing_effect():
             rules=configured_coordinator_rules(root,warnings=run_warnings)
             return {'returncode':0,'stdout':briefing_execute(root,path,name,actor,action,args,request.get('attachments',{}),runner,
@@ -1421,7 +1422,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             stdout,warnings=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
             if warnings:run_warnings.append(warnings)
             return stdout
-        runner=NativeRunner(slot_run)
+        runner=NativeRunner(slot_run, project=path)
         try:
             if not isinstance(args,list) or len(args)!=1 or not isinstance(args[0],str):
                 raise SlotError(422,'Expected one merge-slot JSON payload')
@@ -1473,7 +1474,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             stdout,warnings=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
             if warnings:run_warnings.append(warnings)
             return stdout
-        runner=NativeRunner(run)
+        runner=NativeRunner(run, project=path)
         # Slices 6 and 7 (kittrial-5bb.197): the three rules are read once, from the
         # installation's own file, and an installation that configures nothing reads
         # them all as OFF. A malformed value reads as OFF with a warning, as
@@ -1538,6 +1539,8 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                 return stdout
             refresh_warnings=[]
             rows=record_json.classify(rows,refresh_run,sorted(RECORD_ANCHOR_LABELS)+['gt:slot'], ['event','gate'])
+            from lifecycle import host_snapshot
+            rows=host_snapshot(rows, run=refresh_run, project=path)
             return {'returncode':0,'stdout':json.dumps(render(rows,path/'views',configured_operators(root),configured_verifiers(root)))+'\n','stderr':p.stderr+''.join(refresh_warnings)}
     if action!='bd':raise ValueError('Unknown action')
     args=request.get('args',[])
@@ -1603,8 +1606,21 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             fcntl.flock(lock,fcntl.LOCK_EX)
             # First the rows the write names (an existing id given to create, a write that names
             # none, the merge slot); then the guards that read what those rows carry.
-            lifecycle_guard=args[0] in ('create','update','dep','close','reopen') and actor not in configured_operators(root)
-            named=_guard_named_rows(root,path,name,args,request.get('attachments',{}),actor,strict=lifecycle_guard)
+            from review_workflow import listed_operator_actor, operator_owners
+            lifecycle_operators=configured_operators(root)
+            lifecycle_guard=args[0] in ('create','update','dep','close','reopen') and not listed_operator_actor(
+                actor, lifecycle_operators)
+            def bound_raw_exemption():
+                try:
+                    return listed_operator_actor(actor,lifecycle_operators,operator_owners(path))
+                except (ValueError,OSError):
+                    return False
+            try:
+                named=_guard_named_rows(root,path,name,args,request.get('attachments',{}),actor,strict=lifecycle_guard)
+            except raw_lifecycle.Refusal:
+                if not bound_raw_exemption():raise
+                lifecycle_guard=False
+                named=_guard_named_rows(root,path,name,args,request.get('attachments',{}),actor,strict=False)
             if lifecycle_guard:
                 resolved_request=write_targets(args,request.get('attachments',{}))
                 resolved_tokens=resolved_request['targets'] if resolved_request is not None else None
@@ -1619,7 +1635,14 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                     rows,problem=_resolve_rows(root,path,actor,tokens,strict=True)
                     if problem:raw_lifecycle.refuse('the affected tasks could not be read completely')
                     return rows
-                raw_lifecycle.guard(args,request.get('attachments',{}),lifecycle_rows)
+                try:
+                    raw_lifecycle.guard(args,request.get('attachments',{}),lifecycle_rows)
+                except raw_lifecycle.Refusal:
+                    # Ordinary raw work does not depend on a registry. Only an
+                    # otherwise refused lifecycle write needs principal evidence.
+                    # An unreadable registry proves no exemption; preserve the
+                    # lifecycle refusal rather than blocking unrelated writes.
+                    if not bound_raw_exemption():raise
             _guard_record_anchor_status(root,path,args,actor)
             _guard_record_anchor_title(root,path,args,actor,named)
             _guard_reserved_labels(root,path,args,actor)
@@ -1631,7 +1654,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                 refused=bd_refusals.refusal(p.returncode,p.stdout,p.stderr)
                 if refused is not None:return bd_refusals.envelope(*refused)
                 return {'returncode':p.returncode,'stdout':p.stdout,'stderr':p.stderr}
-            runner=NativeRunner(bd_dispatch)
+            runner=NativeRunner(bd_dispatch, project=path)
             def bd_effect():return runner(final)
             return guarded_write(root,request,journal_path(path),bd_effect,
                                authority_config=authority_config,
@@ -1692,6 +1715,9 @@ def main():
         answer={'returncode':75,'stdout':'','stderr':'Busy: %s. Nothing was done; try again shortly.\n'%waited}
     except Exception as e:
         answer={'returncode':2,'stdout':'','stderr':f'{type(e).__name__}: {e}\n'}
+        import raw_lifecycle
+        if isinstance(e,raw_lifecycle.Refusal):
+            answer['stderr']=f'ValueError: {e}\n'
         from review_workflow import CoordinatorRuleRefusal
         if isinstance(e,CoordinatorRuleRefusal):
             # Preserve the host's ValueError sentence while identifying a kit rule

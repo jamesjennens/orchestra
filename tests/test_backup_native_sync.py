@@ -123,6 +123,10 @@ class RuntimeCase(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name) / 'runtime'
+        # Unit cases for native-sync staging/sidecar generations supply no
+        # tracker. Actual native VOID restore tests exercise this pair boundary.
+        for name,value in [('backup_lifecycle_void_family',{}),('restore_lifecycle_void_family',False)]:
+            patcher=patch.object(admin,name,return_value=value);patcher.start();self.addCleanup(patcher.stop)
         (self.root / 'backups').mkdir(parents=True)
         (self.root / 'projects').mkdir()
         (self.root / 'deployment.private.json').write_text(json.dumps(

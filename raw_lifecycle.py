@@ -18,8 +18,12 @@ _LABEL_FLAGS = {'--labels', '--add-label', '--set-labels', '--remove-label'}
 _STRUCTURAL = {'--type', '--title', '--description', '--body-file', '--parent'}
 
 
+class Refusal(ValueError):
+    """A lifecycle guard refusal for which a bound operator may be exempt."""
+
+
 def refuse(reason):
-    raise ValueError('Reserved lifecycle namespace: '+reason+'. '+ADVICE)
+    raise Refusal('Reserved lifecycle namespace: '+reason+'. '+ADVICE)
 
 
 def reserved_label(label):

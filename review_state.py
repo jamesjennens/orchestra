@@ -287,7 +287,7 @@ def integration(contribution, scopes, reverts=None):
         value='unknown'
     removed=sorted({str((entry.get('scope') or {}).get('integration_commit'))
                     for entry in matching if is_reverted(entry)})
-    return {'fact':value,
+    answer = {'fact':value,
             'scope':chosen.get('scope') if chosen else None,
             'scope_token':chosen.get('scope_token') if chosen else None,
             'newest_scope':newest.get('scope') if newest else None,
@@ -302,6 +302,11 @@ def integration(contribution, scopes, reverts=None):
             'reverted':bool(removed),
             'reverted_commits':removed[:REVERTED_COMMITS_LIMIT],
             'reverted_total':len(removed)}
+    if chosen and (chosen.get('integrated') or {}).get('reason'):
+        answer['reason'] = chosen['integrated']['reason']
+    if newest and (newest.get('integrated') or {}).get('reason'):
+        answer['newest_reason'] = newest['integrated']['reason']
+    return answer
 
 
 def integration_disagreements(result):

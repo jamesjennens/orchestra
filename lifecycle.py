@@ -415,16 +415,52 @@ def scoped_event(events,task,dim,scope):
     return max(matching,key=lambda e:e['order'])
 
 
+def classified_events(rows):
+    """Every historical lifecycle event, with optional trusted host correction context.
+
+    Keep a voided event in its ordering position. Dropping it could revive an older
+    passed event. A changed/deleted target gets the same bound position from the
+    host record; native JSON fields cannot supply this host context.
+    """
+    from lifecycle_voids import Snapshot
+    correction = rows.lifecycle_corrections if isinstance(rows, Snapshot) else {}
+    reasons = correction.get('reasons', {})
+    found = []
+    positions = set()
+    native_positions = set()
+    for row in rows:
+        event = native_event(row)
+        if event and event['dimension'] in (*DIMENSIONS, 'lifecycle-scope', ENABLED, LIVE):
+            reason = (correction.get('global_reason')
+                      or correction.get('task_reasons',{}).get(event['task'])
+                      or reasons.get(event['id']))
+            if reason:
+                event['void_reason'] = reason
+            found.append(event)
+            positions.add((event['task'], event['dimension'], event['id']))
+            native_positions.add(event['id'])
+    for entry in correction.get('entries', {}).values():
+        binding = entry['payload']['binding']
+        key = (binding['task'], binding['dimension'], binding['event_id'])
+        reason = correction.get('global_reason') or reasons.get(binding['event_id'])
+        if reason and key not in positions and binding['event_id'] not in native_positions:
+            suffix = binding['event_id'].removeprefix(binding['task'] + '.')
+            found.append(dict(task=binding['task'], dimension=binding['dimension'],
+                              value=binding['value'], payload=binding['payload'],
+                              id=binding['event_id'], order=int(suffix) if suffix.isdigit() else None,
+                              created_at=binding['created_at'], void_reason=reason))
+            positions.add(key)
+    return found
+
+
 def events_by_dimension(rows):
-    """Every exported lifecycle-shaped state event, grouped by (task, dimension)."""
+    """All classified current/historical state events, grouped by task/dimension."""
     # An unreadable event has no trustworthy parent or dimension. An older
     # readable fact cannot establish current truth for any task in this snapshot.
     if unreadable_events(rows):return {}
     events={}
-    for row in rows:
-        event=native_event(row)
-        if event and event['dimension'] in (*DIMENSIONS,'lifecycle-scope',ENABLED,LIVE):
-            events.setdefault((event['task'],event['dimension']),[]).append(event)
+    for event in classified_events(rows):
+        events.setdefault((event['task'],event['dimension']),[]).append(event)
     return events
 
 
@@ -444,12 +480,19 @@ def trusted_payloads(rows,events=None):
     already-recorded scope therefore never hides the current scope's fact.
     """
     if events is None:events=events_by_dimension(rows)
+    from lifecycle_voids import Snapshot
+    global_reason = rows.lifecycle_corrections.get('global_reason') if isinstance(rows, Snapshot) else None
     trusted={}
     for row in rows:
         if not isinstance(row, dict) or row.get('issue_type')=='event' or row.get('malformed') or not row.get('id'):continue
         task=row['id'];labels=row.get('labels') or []
         scope_event=latest_event(events,task,'lifecycle-scope')
         scope=scope_event['payload']['scope'] if label_agrees(labels,scope_event,'lifecycle-scope') and scope_event['payload'] else None
+        scope_reason = ((scope_event.get('void_reason') if scope_event else None)
+                        or (rows.lifecycle_corrections.get('task_reasons',{}).get(task)
+                            if isinstance(rows,Snapshot) else None))
+        if scope_reason:
+            scope = None
         dimensions={}
         for dim in (*DIMENSIONS,ENABLED,LIVE):
             newest=latest_event(events,task,dim)
@@ -457,12 +500,18 @@ def trusted_payloads(rows,events=None):
                       and label_agrees(labels,newest,dim))
             e=scoped_event(events,task,dim,scope) if scope is not None else None
             valid=labelled and e is not None
+            reason = (global_reason or scope_reason or (e.get('void_reason') if e else None)
+                      or (newest.get('void_reason') if newest and (not labelled or e is None) else None))
+            if reason:
+                valid = False
             # The event id names the event the value came from when the value is
             # trusted; when it is not, it still names the newest event of the
             # dimension, so a caller can see WHICH event made it unknown.
             dimensions[dim]={'scope':scope,'value':e['value'] if valid else 'unknown',
                              'event_id':e['id'] if valid else (newest['id'] if newest is not None else None),
                              'payload':e['payload'] if valid else None}
+            if reason:
+                dimensions[dim]['reason'] = reason
         trusted[task]=dimensions
     return trusted
 
@@ -493,6 +542,8 @@ def project_facts(rows):
                 value='unknown';evidence=[]
             facts[dim]={'value':value,'event_id':state['event_id'],
                         'evidence':evidence,'provenance':payload['provenance'] if payload else None}
+            if state.get('reason'):
+                facts[dim]['reason'] = state['reason']
         result.append({'id':row['id'],'title':row.get('title',''),'status':row.get('status'),
                        'scope':dimensions[DIMENSIONS[0]]['scope'],'facts':facts,'live':live,
                        'has_lifecycle':any((row['id'],dim) in events for dim in (*DIMENSIONS,'lifecycle-scope'))})
@@ -516,6 +567,8 @@ def enabled_states(rows):
                        'evidence':payload['evidence'] if payload else [],
                        'defect_task':payload.get('defect_task') if payload else None,
                        'actor':payload['actor'] if payload else None,'scope':state['scope']})
+        if state.get('reason'):
+            result[-1]['reason'] = state['reason']
     return result
 
 
@@ -537,6 +590,8 @@ def untrusted_reason(dim,labels,found,scope_trusted,orders):
     if len([v for v in labels if v.startswith(dim+':')])>1:
         return 'the task has more than one native %s: label'%dim
     newest=max(found,key=lambda e:e['order'])
+    if newest.get('void_reason') and newest['payload'] is None:
+        return newest['void_reason']
     if newest['payload'] is None:
         return 'the newest %s event has no structured lifecycle payload (raw native set-state)'%dim
     if not label_agrees(labels,newest,dim):
@@ -597,10 +652,15 @@ def scoped_evidence(rows,dimensions=('integrated',)):
                 slot=per_token.setdefault(token,{})
                 prior=slot.get(dim)
                 if prior is None or key>prior[0]:
-                    slot[dim]=(key,{'value':event['value'],'event_id':event['id'],
-                                    'evidence':payload['evidence'],'provenance':payload['provenance'],
+                    reason = event.get('void_reason')
+                    state = {'value':'unknown' if reason else event['value'],'event_id':event['id'],
+                                    'evidence':[] if reason else payload['evidence'],
+                                    'provenance':None if reason else payload['provenance'],
                                     'actor':payload['actor'],'trigger':payload.get('trigger'),
-                                    'defect_task':payload.get('defect_task')})
+                                    'defect_task':payload.get('defect_task')}
+                    if reason:
+                        state['reason'] = reason
+                    slot[dim] = (key, state)
         # One pass over the recorded scopes: the newest recording of a token wins.
         scopes={}
         for event in events.get((task,'lifecycle-scope'),[]):
@@ -612,9 +672,16 @@ def scoped_evidence(rows,dimensions=('integrated',)):
         entries=[]
         for token,(key,event,scope_value) in sorted(scopes.items(),key=lambda kv:(kv[1][0],kv[0]),reverse=True):
             entry={'scope_token':token,'scope':scope_value,'order':event['order']}
+            scope_reason = event.get('void_reason')
+            if scope_reason:
+                entry['scope_reason'] = scope_reason
             for dim in dims:
                 got=per_token.get(token,{}).get(dim)
                 entry[dim]=dict(got[1]) if got else None
+                if scope_reason:
+                    entry[dim] = dict(value='unknown', event_id=got[1]['event_id'] if got else None,
+                                      evidence=[], provenance=None, actor=None, trigger=None,
+                                      defect_task=None, reason=scope_reason)
                 # The recording order of that scope's fact, so a per-environment
                 # liveness reader can order two scopes by the newest LIVE event
                 # rather than by when each scope token first appeared (rev3 item 1).
@@ -1044,7 +1111,11 @@ def release_selection(rows,scope,is_ancestor,previous_commit=None,subset=None,re
         chosen=None;reason=entry['untrusted'].get('integrated')
         for candidate in sorted(scopes,key=lambda c:((c.get('integrated') or {}).get('order') or -1,
                                                       (c.get('integrated') or {}).get('event_id') or ''),reverse=True):
-            if (candidate.get('integrated') or {}).get('value')!='passed':continue
+            integration = candidate.get('integrated') or {}
+            if integration.get('value')!='passed':
+                if integration.get('reason'):
+                    reason = 'integrated evidence is unknown: ' + integration['reason']
+                continue
             commit=candidate['scope']['integration_commit']
             if not COMMIT.fullmatch(commit):
                 reason='integration commit is not a full lowercase commit: '+str(commit);continue
@@ -1260,14 +1331,23 @@ def _native_event_row(event_id,task,dimension,value,reason,actor):
             'dependencies':[{'issue_id':event_id,'depends_on_id':task,'type':'parent-child'}]}
 
 
+class OperationIndex(dict):
+    def __init__(self):
+        super().__init__()
+        self.blocked = {}
+
+
 def _operation_index(rows):
     """``{operation_id: (payload, event_id)}`` from one pass over the export."""
-    index={}
+    index=OperationIndex()
     for row in rows:
         if record_json.selected(row, types=['event']) and row.get('malformed'):
             raise ValueError('Event row %s cannot be parsed: %s; operator must reconcile or repair the event'
                              % (row.get('id') or 'unknown', row.get('error') or 'malformed'))
-        event=native_event(row)
+    for event in classified_events(rows):
+        if event['payload'] and event.get('void_reason'):
+            index.blocked[event['payload']['operation_id']] = event['void_reason']
+            continue
         if event and event['payload'] and event['payload']['operation_id'] not in index:
             index[event['payload']['operation_id']]=(event['payload'],event['id'])
     return index
@@ -1282,7 +1362,7 @@ def read_event_rows(run):
     """One export; only an unreadable row needs a complete native event-ID read."""
     rows=record_json.loads_rows(run(['export','--all']))
     try:
-        return record_json.classify(rows,run,types=['event'])
+        return host_snapshot(record_json.classify(rows,run,types=['event']), run=run)
     except (ValueError,OSError,subprocess.SubprocessError) as error:
         raise ValueError('Lifecycle event membership cannot be read: %s; operator must reconcile or repair the event index'
                          % error) from None
@@ -1303,7 +1383,15 @@ def _apply_fact(payload,actor,rows,run,current_scope,op_index,issues,recorded=No
     scope, so evidence for an older release can be recorded without moving what is
     live (rev2 item 3). A scope that was never recorded is still refused.
     """
+    from lifecycle_voids import Snapshot
+    correction=rows.lifecycle_corrections if isinstance(rows,Snapshot) else {}
+    if correction.get('global_reason'):
+        raise ValueError('Lifecycle correction family is damaged or its restore is incomplete ('
+                         +correction['global_reason']+'); an operator repairs the family before recording facts')
     prior=op_index.get(payload['operation_id'])
+    if payload['operation_id'] in getattr(op_index, 'blocked', {}):
+        raise ValueError('Lifecycle operation names an event that reads unknown ('
+                         + op_index.blocked[payload['operation_id']] + '); operator reconciliation required')
     if prior is not None:
         if prior[0]!=payload:raise ValueError('operation ID already used for different content')
         return {'event_id':prior[1],'reconciled':True}
@@ -1563,6 +1651,9 @@ def _check_release_operations(plans,negative,op_index,evidence,operation_id):
     """
     identities={}
     for planned in [p for plan in plans.values() for _,p in plan]+[p for _,p in negative]:
+        if planned['operation_id'] in getattr(op_index, 'blocked', {}):
+            raise ValueError('Release operation names a voided or mismatched lifecycle event; '
+                             'operator reconciliation required for operation ' + operation_id)
         earlier=identities.setdefault(planned['operation_id'],planned)
         if earlier!=planned:raise ValueError('operation ID already used for different content in the same plan; a new operation ID is needed: '+operation_id)
         prior=op_index.get(planned['operation_id'])
@@ -1819,8 +1910,27 @@ def recorded_scope_tokens(rows):
     One pass over the export, shared by the single-fact and release paths so a fact
     may be recorded against any scope a task already has, not only its newest.
     """
-    return {entry['id']:{content_hash(c['scope']) for c in entry['scopes']}
+    return {entry['id']:{content_hash(c['scope']) for c in entry['scopes'] if not c.get('scope_reason')}
             for entry in scoped_evidence(rows,())}
+
+
+def host_snapshot(rows, run=None, project=None):
+    """Attach a host family's context once to this request's native snapshot."""
+    from lifecycle_voids import Snapshot, read_journal, snapshot
+    if isinstance(rows, Snapshot):
+        return rows
+    project = project if project is not None else getattr(run, 'lifecycle_project', None)
+    if project is None:
+        return rows
+    cached = getattr(run, '_lifecycle_void_journal', None) if run is not None else None
+    if cached is None or cached[0] != str(project):
+        cached = (str(project), read_journal(project))
+        if run is not None:
+            try:
+                run._lifecycle_void_journal = cached
+            except (AttributeError, TypeError):
+                pass
+    return snapshot(rows, journal=cached[1])
 
 
 def _declared_targets(raw):
@@ -1935,6 +2045,74 @@ def release_group_estimate(writes):
     return round(DRY_RUN_FIXED_SECONDS+DRY_RUN_SECONDS_PER_WRITE*writes,1)
 
 
+def offline_snapshot(rows, project=None):
+    """Preserve legacy export truth except where the export shows a correction.
+
+    A path alone is not evidence of consultation. Bind a read family to native
+    comments in THIS export; establish an absent family only at a native project
+    whose database identity agrees with the export's issue prefix.
+    """
+    from lifecycle_voids import Snapshot, context, read_journal, native_correction_comments
+    native = native_correction_comments(rows)
+    consulted = False
+    journal = None
+    if project is not None:
+        directory = Path(project)
+        if not directory.is_dir():
+            raise ValueError('--journal must name an existing project directory')
+        journal = read_journal(directory)
+        # Matching every native comment establishes the family/export association
+        # even when a target event was subsequently changed or deleted.
+        consulted = bool(native) and all(
+            any(c['task'] == entry['payload']['binding']['task']
+                and c['id'] == entry['comment_id']
+                and c['text'] == 'Kind: lifecycle-event-correction-v1\n' + canonical_bytes(entry['payload']).decode()
+                for entry in journal['entries'].values()) for c in native)
+        # Metadata can establish absence only when the export has no corrections.
+        if not native:
+            metadata = directory / '.beads' / 'metadata.json'
+            try:
+                identity = load_json(metadata).get('dolt_database')
+                prefixes = {row['id'].split('-', 1)[0] for row in rows
+                            if isinstance(row, dict) and isinstance(row.get('id'), str)}
+                consulted = bool(identity and prefixes == {identity})
+            except (OSError, ValueError, AttributeError):
+                pass
+    if consulted:
+        result = Snapshot(rows, context(rows, journal))
+    else:
+        reasons = {}
+        tasks = {}
+        from lifecycle_voids import PREFIX, validate_payload
+        for comment in native:
+            try:
+                payload = record_json.loads(comment['text'][len(PREFIX):])
+                validate_payload(payload)
+                if payload['binding']['task'] != comment['task']:
+                    raise ValueError('Correction names a different task')
+                reasons[payload['binding']['event_id']] = 'lifecycle-corrections-not-consulted'
+                if not any(isinstance(r,dict) and r.get('id') == payload['binding']['event_id'] for r in rows):
+                    tasks[comment['task']] = 'lifecycle-corrections-not-consulted'
+            except (ValueError, TypeError, KeyError):
+                tasks[comment['task']] = 'lifecycle-corrections-not-consulted'
+        result = Snapshot(rows, dict(entries={}, reasons=reasons, task_reasons=tasks,
+                                     invalid=[], retracted=set(), global_reason=None))
+    result.offline_corrections_consulted = consulted
+    return result
+
+
+OFFLINE_CORRECTION_NOTE = ('Lifecycle corrections were not consulted; pass --journal PROJECT_DIRECTORY. '
+                           'Only events named by correction comments in this export read unknown.')
+
+
+def offline_correction_note(project):
+    if not project:
+        return OFFLINE_CORRECTION_NOTE
+    return ('Lifecycle corrections were not consulted: the supplied --journal directory '
+            'did not establish the correction family for this export. '
+            'Only events named by correction comments in this export read unknown.')
+
+
 def main():
     parser=argparse.ArgumentParser(description=__doc__);sub=parser.add_subparsers(dest='command',required=True)
     record=sub.add_parser('record')
@@ -1962,8 +2140,8 @@ def main():
     # without it (a remote worker usually cannot read the host journal) no revert
     # is trusted locally and the endpoint, which always has both, is authoritative.
     release.add_argument('--journal')
-    view=sub.add_parser('list');view.add_argument('--export',required=True);view.add_argument('--implemented-not-deployed',action='store_true')
-    owed=sub.add_parser('evidence-owed');owed.add_argument('--export',required=True)
+    view=sub.add_parser('list');view.add_argument('--export',required=True);view.add_argument('--implemented-not-deployed',action='store_true');view.add_argument('--journal')
+    owed=sub.add_parser('evidence-owed');owed.add_argument('--export',required=True);owed.add_argument('--journal')
     a=parser.parse_args()
     try:
         if a.command=='record':
@@ -1990,6 +2168,11 @@ def main():
                 raise ValueError('--target/--rollback cannot be combined: a rollback resolves its own targets')
             rows=read_export(a.export)
             journal=a.journal or None
+            # Offline selection must consult the same family as host readers.
+            # A writing release still has its authoritative endpoint check; its
+            # local candidate report below discloses an unconsulted family.
+            if a.dry_run or journal is not None:
+                rows=offline_snapshot(rows,journal)
             is_ancestor=git_ancestry(a.repo)
             config=load_json(a.config)
             warnings=[]
@@ -2153,6 +2336,10 @@ def main():
                 report['reverts_source']='local'
                 report['dry_run_revert_note']=DRY_RUN_REVERT_NOTE
                 warnings=warnings+[DRY_RUN_REVERT_NOTE]
+            report['corrections_consulted']=getattr(rows,'offline_corrections_consulted',False)
+            if not report['corrections_consulted']:
+                report['correction_note']=offline_correction_note(a.journal)
+                warnings.append(report['correction_note'])
             if warnings:report['warnings']=warnings
             # Check every target and every derived operation ID for the WHOLE release
             # before the first group request, so a conflict or a stale target in group
@@ -2208,10 +2395,30 @@ def main():
                 print(json.dumps(report,ensure_ascii=False,indent=2))
         elif a.command=='evidence-owed':
             from export_requirements import read_export
-            print(json.dumps(evidence_owed(read_export(a.export)),ensure_ascii=False,indent=2))
+            rows=offline_snapshot(read_export(a.export),a.journal or None)
+            consulted=rows.offline_corrections_consulted
+            report=evidence_owed(rows)
+            if not consulted and (rows.lifecycle_corrections['reasons'] or rows.lifecycle_corrections['task_reasons']):
+                def debts(groups):
+                    return {(g['environment'],g['release_id'],t['task']) for g in groups for t in g['tasks']}
+                if debts(evidence_owed(list(rows))) - debts(report):
+                    raise ValueError('Lifecycle corrections were not consulted; evidence owed is unknown for '
+                                     'release rows hidden by correction comments. Pass --journal PROJECT_DIRECTORY; '
+                                     'no empty or partial evidence-owed result is asserted.')
+            if not consulted:print(offline_correction_note(a.journal),file=sys.stderr)
+            for item in report:
+                item['corrections_consulted']=consulted
+                if not consulted:item['correction_note']=offline_correction_note(a.journal)
+            print(json.dumps(report,ensure_ascii=False,indent=2))
         else:
             from export_requirements import read_export
-            facts=project_facts(read_export(a.export))
+            rows=offline_snapshot(read_export(a.export),a.journal or None)
+            consulted=rows.offline_corrections_consulted
+            facts=project_facts(rows)
+            if not consulted:print(offline_correction_note(a.journal),file=sys.stderr)
+            for fact in facts:
+                fact['corrections_consulted']=consulted
+                if not consulted:fact['correction_note']=offline_correction_note(a.journal)
             if a.implemented_not_deployed:facts=[r for r in facts if r['facts']['implemented']['value']=='passed' and r['facts']['deployed']['value'] not in ('passed','not-applicable')]
             print(json.dumps(facts,ensure_ascii=False,indent=2))
     except (ValueError,OSError,RuntimeError) as exc:raise SystemExit(str(exc))

@@ -863,7 +863,9 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
             'deployed_delivery_is_current_contribution':deployed_current,
             'deployed_live':deployed_live,
             'dependencies':{'total':len(deps),'items':[{k:clip(d.get(k),160) for k in ('depends_on_id','type')} for d in deps[:8]],'omitted':max(0,len(deps)-8)},
-            'lifecycle':{dim:dict(value=f['value'],event_id=f['event_id']) for dim,f in facts['facts'].items()},
+            'lifecycle':{dim:dict(value=f['value'],event_id=f['event_id'],
+                                 **({'reason':f['reason']} if f.get('reason') else {}))
+                         for dim,f in facts['facts'].items()},
             'lifecycle_scope':{k:clip(v,160) for k,v in (facts['scope'] or {}).items()},
             # The additive `Reconciliation needed:` line is appended AFTER the top-level
             # warning lines main already had, so the FIRST warning a reader sees is still
