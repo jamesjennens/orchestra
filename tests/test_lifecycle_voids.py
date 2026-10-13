@@ -1,8 +1,16 @@
 """Host correction boundary, durable reading and native-first cut recovery."""
+import atexit
+import contextlib
 import copy
+import importlib.util
+import io
 import json
 import os
 from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tarfile
 import tempfile
 import unittest
 from unittest import mock
@@ -10,6 +18,11 @@ from unittest import mock
 import lifecycle
 import lifecycle_voids as voids
 from requirements import canonical_bytes, content_hash
+
+
+#: The released F0 kit this project's rollback target is measured against
+#: (kittrial-5bb.271 item 1): main at the time of the revision.
+RELEASED_F0_COMMIT = '04ed25d1453dc0112a740aacae7ac495e6fd1d95'
 
 
 def rows():
@@ -31,6 +44,149 @@ def rows():
                            created_at='2026-10-01T00:00:0' + str(number) + 'Z',
                            dependencies=[dict(type='parent-child', depends_on_id=task['id'])]))
     return [task] + events
+
+
+def _extract_kit(root, commit, destination):
+    """Export the tracked tree at ``commit`` into ``destination`` (no working copy)."""
+    archive = subprocess.run(['git', '-C', str(root), 'archive', '--format=tar', commit],
+                             capture_output=True, timeout=180)
+    if archive.returncode:
+        raise OSError(archive.stderr.decode('utf-8', 'replace')[:300])
+    with tarfile.open(fileobj=io.BytesIO(archive.stdout)) as bundle:
+        bundle.extractall(destination)
+
+
+_RELEASED_KIT = []
+_RELEASED_RESOLVED = []
+
+
+def resolve_released_f0_kit():
+    """A directory holding the released F0 kit (04ed25d), or None.
+
+    ``ORCHESTRA_F0_RELEASED_KIT`` names one explicitly. Otherwise the commit is
+    exported from this checkout's own history, so an ordinary CI checkout with
+    full history runs the released-kit reader test instead of skipping. None
+    means neither source is available and the caller decides (skip, or fail on
+    CI, exactly as the older-kit tests do).
+    """
+    if not _RELEASED_RESOLVED:
+        _RELEASED_KIT.append(_resolve_released_f0_kit())
+        _RELEASED_RESOLVED.append(True)
+    return _RELEASED_KIT[0]
+
+
+def _resolve_released_f0_kit():
+    configured = os.environ.get('ORCHESTRA_F0_RELEASED_KIT')
+    if configured:
+        return Path(configured)
+    root = Path(lifecycle.__file__).resolve().parent
+    if not (root / '.git').exists():
+        return None
+    try:
+        found = subprocess.run(['git', '-C', str(root), 'rev-parse', '--verify', '--quiet',
+                                RELEASED_F0_COMMIT + '^{commit}'],
+                               capture_output=True, text=True, timeout=60)
+        if found.returncode or found.stdout.strip() != RELEASED_F0_COMMIT:
+            return None
+        destination = Path(tempfile.mkdtemp(prefix='orchestra-released-f0-kit-'))
+        atexit.register(shutil.rmtree, destination, ignore_errors=True)
+        _extract_kit(root, RELEASED_F0_COMMIT, destination)
+        return destination
+    except (OSError, subprocess.SubprocessError, tarfile.TarError):
+        return None
+
+
+class ReleasedKitTests(unittest.TestCase):
+    """kittrial-5bb.271 item 1: what the RELEASED F0 kit reads once an abandonment exists."""
+
+    def setUp(self):
+        self.scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(self.scratch.cleanup)
+        self.project = Path(self.scratch.name)
+        self.rows = rows()
+        self.native_writes = 0
+
+    def payload(self, operation='void', key='void-one', target=None, actor='op'):
+        return dict(schema_version=1, operation=operation, operation_id=key, actor=actor,
+                    reason='Operator reviewed the source evidence.', evidence=['synthetic review'],
+                    binding=voids.event_binding(self.rows[2]), target_void=target)
+
+    def native_run(self, argv):
+        if argv == ['comments', 'p-task', '--json']:
+            return json.dumps(self.rows[0]['comments'])
+        self.native_writes += 1
+        comment = dict(id=str(self.native_writes), author=json.loads(argv[3][len(voids.PREFIX):])['actor'],
+                       text=argv[3], created_at='2026-10-02T00:00:0' + str(self.native_writes) + 'Z')
+        self.rows[0]['comments'].append(comment)
+        return json.dumps(comment)
+
+    def abandoned_project(self):
+        """A project with an issued void, a cut retraction and the abandonment of it."""
+        voids.apply(self.rows, 'op', self.payload(), self.native_run, self.project,
+                    operators=['op'], enabled=True)
+        cut = self.payload('retract', 'retract-cut', 'void-one')
+        with mock.patch.object(voids, 'publish', side_effect=OSError('synthetic cut')):
+            with self.assertRaisesRegex(ValueError, 'uncertain'):
+                voids.apply(self.rows, 'op', cut, self.native_run, self.project,
+                            operators=['op'], enabled=True)
+        comment = self.rows[0]['comments'][-1]
+        voids.abandon(self.rows, 'op', dict(schema_version=1, operation='abandon',
+                                            operation_id='abandon-released', actor='op',
+                                            reason='Operator closed the cut.',
+                                            evidence=['synthetic audit'], binding=cut['binding'],
+                                            target_void=cut['operation_id']),
+                      self.project, operators=['op'], enabled=True, comment_id=comment['id'],
+                      recorded_at='2026-10-05T00:00:00Z')
+        return comment
+
+    def released(self):
+        base = resolve_released_f0_kit()
+        if base is None:
+            message = ('no released F0 kit: set ORCHESTRA_F0_RELEASED_KIT or run from a git checkout '
+                       'with history holding ' + RELEASED_F0_COMMIT)
+            if os.environ.get('GITHUB_ACTIONS'):
+                self.fail('CI must not skip this test: ' + message)
+            self.skipTest(message)
+        return base
+
+    def test_the_released_reader_reads_a_project_that_holds_an_abandonment(self):
+        base = self.released()
+        comment = self.abandoned_project()
+        # The family itself is schema-1 void/retract only: no abandon member exists.
+        journal = voids.read_journal(self.project)
+        self.assertEqual({e['payload']['operation'] for e in journal['entries'].values()}, {'void'})
+        self.assertEqual(set(journal['abandons']), {'abandon-released'})
+        # The released reader reads the family, so no lifecycle fact is UNKNOWN for
+        # a journal reason and the issued void is still honoured.
+        spec = importlib.util.spec_from_file_location('released_f0_lifecycle_voids',
+                                                      base / 'lifecycle_voids.py')
+        released = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(released)
+        released_journal = released.read_journal(self.project)
+        self.assertEqual(released_journal['invalid'], [])
+        released_state = released.context(self.rows, released_journal)
+        self.assertEqual(released_state['global_reason'], None)
+        self.assertEqual(released_state['reasons'], {'p-task.2': 'voided'})
+        # The released kit cannot see the abandonment store, so the abandoned
+        # comment is honestly UNPAIRED there (that is the documented rollback limit).
+        self.assertEqual([c['id'] for c in released_state['incomplete']], [comment['id']])
+        with self.assertRaisesRegex(ValueError, 'native correction comments without their host entries'):
+            released.backup_files(self.project, self.rows)
+        # And running the released kit's own CLI on the export agrees: it never
+        # falls to lifecycle-void-journal-unreadable, it names the abandoned
+        # comment's event as not-consulted, and our kit reads the void.
+        exported = self.project / 'released-export.jsonl'
+        exported.write_text(''.join(json.dumps(row) + '\n' for row in self.rows))
+        result = subprocess.run([sys.executable, str(base / 'lifecycle.py'), 'list',
+                                 '--export', str(exported), '--journal', str(self.project)],
+                                capture_output=True, text=True, timeout=120)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn('lifecycle-void-journal-unreadable', result.stdout)
+        row = next(r for r in json.loads(result.stdout) if r['id'] == 'p-task')
+        self.assertEqual(row['facts']['integrated'].get('reason'), 'lifecycle-corrections-not-consulted')
+        self.assertEqual(voids.context(self.rows, voids.read_journal(self.project))['reasons'],
+                         {'p-task.2': 'voided'})
+        self.assertIn(voids.ABANDON_FILE, voids.backup_files(self.project, self.rows))
 
 
 class HostCorrectionTests(unittest.TestCase):
@@ -63,6 +219,279 @@ class HostCorrectionTests(unittest.TestCase):
 
     def reading(self):
         return voids.context(self.rows, voids.read_journal(self.project))
+
+    def family(self):
+        """The on-disk ``.lifecycle-voids`` family only (never the abandonment store)."""
+        return voids.read_journal(self.project)['entries']
+
+    def cut(self, operation='void', key='void-one', target=None):
+        """A native correction comment whose host record was cut before publication."""
+        payload = self.payload(operation, key, target)
+        with mock.patch.object(voids, 'publish', side_effect=OSError('synthetic cut')):
+            with self.assertRaisesRegex(ValueError, 'uncertain'):
+                self.apply(payload)
+        return payload
+
+    def abandon_payload(self, cut, key='abandon-one', actor='op'):
+        return dict(schema_version=1, operation='abandon', operation_id=key, actor=actor,
+                    reason='Operator closed the cut without the original words.',
+                    evidence=['synthetic audit pointer'], binding=cut['binding'],
+                    target_void=cut['operation_id'])
+
+    def test_abandon_closes_an_incomplete_correction_without_touching_the_family(self):
+        """Item 1: the record is a sidecar, so a family with an abandonment stays schema-1."""
+        cut = self.cut()
+        comment = self.rows[0]['comments'][0]
+        self.assertEqual([c['id'] for c in self.reading()['incomplete']], [comment['id']])
+        payload = self.abandon_payload(cut)
+        answer = voids.abandon(self.rows, 'op', payload, self.project, operators=['op'], enabled=True,
+                               comment_id=comment['id'], recorded_at='2026-10-05T00:00:00Z')
+        self.assertFalse(answer['reconciled'])
+        # Host evidence only: the native comment is neither re-written nor deleted.
+        self.assertEqual(self.native_writes, 1)
+        self.assertEqual(self.rows[0]['comments'], [comment])
+        # The family itself is untouched and holds no abandon operation; the record
+        # is beside it in ABANDON_FILE.
+        self.assertNotIn('abandon', {e['payload']['operation'] for e in self.family().values()})
+        self.assertTrue((self.project / voids.ABANDON_FILE).is_file())
+        self.assertEqual(set(voids.read_journal(self.project)['abandons']), {'abandon-one'})
+        journal = voids.read_journal(self.project)
+        self.assertEqual(journal['abandons']['abandon-one']['comment_id'], comment['id'])
+        state = self.reading()
+        self.assertEqual(state['incomplete'], [])
+        self.assertEqual(state['reasons'], {})
+        page = voids.audit(voids.snapshot(self.rows, self.project), operators=['op'])
+        self.assertEqual((page['abandoned_correction_count'], page['incomplete_correction_count'],
+                          page['correction_status']), (1, 0, 'complete'))
+        item = next(c for c in page['corrections'] if c['operation'] == 'abandon')
+        self.assertEqual((item['status'], item['operator'], item['reason'], item['comment_id']),
+                         ('abandoned', 'op', 'Operator closed the cut without the original words.',
+                          comment['id']))
+        files = voids.backup_files(self.project, self.rows)
+        self.assertIn(voids.MANIFEST, files)
+        self.assertIn(voids.ABANDON_FILE, files)
+        self.assertEqual([name for name in files if name.startswith(voids.DIRECTORY + '/')], [])
+        retry = voids.abandon(self.rows, 'op', payload, self.project, operators=['op'], enabled=True,
+                              comment_id=comment['id'], recorded_at='2026-10-05T00:00:00Z')
+        self.assertTrue(retry['reconciled'])
+        self.assertEqual(set(voids.read_journal(self.project)['abandons']), {'abandon-one'})
+        self.assertEqual(self.family(), {})
+
+    def test_abandon_records_beside_an_issued_family_and_survives_backup_restore(self):
+        answer = self.apply(self.payload())
+        cut = self.cut('retract', 'retract-two', 'void-one')
+        comment = self.rows[0]['comments'][-1]
+        voids.abandon(self.rows, 'op', self.abandon_payload(cut, key='abandon-two'), self.project,
+                      operators=['op'], enabled=True, comment_id=comment['id'],
+                      recorded_at='2026-10-05T00:00:00Z')
+        files = voids.backup_files(self.project, self.rows)
+        self.assertIn(voids.DIRECTORY + '/' + answer['journal_sha256'] + '.json', files)
+        self.assertIn(voids.ABANDON_FILE, files)
+        destination = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__('shutil').rmtree(destination, ignore_errors=True))
+        self.assertTrue(voids.restore_files(destination, files, self.rows))
+        restored = voids.read_journal(destination)
+        self.assertEqual(set(restored['entries']), {'void-one'})
+        self.assertEqual(set(restored['abandons']), {'abandon-two'})
+
+    def test_abandonment_store_damage_reads_closed_never_changes_a_fact(self):
+        cut = self.cut()
+        comment = self.rows[0]['comments'][0]
+        voids.abandon(self.rows, 'op', self.abandon_payload(cut), self.project, operators=['op'],
+                      enabled=True, comment_id=comment['id'], recorded_at='2026-10-05T00:00:00Z')
+        (self.project / voids.ABANDON_FILE).write_text('{"schema_version": 2, "records": {}}')
+        state = self.reading()
+        self.assertEqual(state['abandon_problems'], ['Invalid lifecycle abandonment store'])
+        self.assertEqual([c['id'] for c in state['incomplete']], [comment['id']])
+        self.assertEqual(state['reasons'], {})
+        page = voids.audit(voids.snapshot(self.rows, self.project), operators=['op'])
+        self.assertEqual((page['correction_status'], page['abandon_problems']),
+                         ('damaged', ['Invalid lifecycle abandonment store']))
+        with self.assertRaisesRegex(ValueError, 'unreadable lifecycle abandonment store'):
+            voids.backup_files(self.project, self.rows)
+        self.assertEqual(voids.read_journal(self.project)['entries'], {})
+
+    def test_abandon_refuses_an_issued_correction_off_switch_and_unlisted_actor(self):
+        self.apply(self.payload())                      # an issued void, with a host entry
+        comment = self.rows[0]['comments'][0]
+        issued = self.abandon_payload(self.payload())
+        with self.assertRaisesRegex(ValueError, 'already has a host entry'):
+            voids.abandon(self.rows, 'op', issued, self.project, operators=['op'], enabled=True,
+                          comment_id=comment['id'], recorded_at='2026-10-05T00:00:00Z')
+        cut = self.cut('retract', 'retract-one', 'void-one')
+        comment = self.rows[0]['comments'][-1]
+        cut_payload = self.abandon_payload(cut, key='abandon-two')
+        with self.assertRaisesRegex(ValueError, 'lifecycle_void_writes is off'):
+            voids.abandon(self.rows, 'op', cut_payload, self.project, operators=['op'], enabled=False,
+                          comment_id=comment['id'], recorded_at='2026-10-05T00:00:00Z')
+        with self.assertRaisesRegex(ValueError, 'currently listed operator'):
+            voids.abandon(self.rows, 'mallory', dict(cut_payload, actor='mallory'), self.project,
+                          operators=['op'], enabled=True, comment_id=comment['id'],
+                          recorded_at='2026-10-05T00:00:00Z')
+        self.assertEqual(set(voids.read_journal(self.project)['entries']), {'void-one'})
+        self.assertEqual(voids.read_journal(self.project)['abandons'], {})
+        # A second abandonment of the same comment under a new key is refused too.
+        voids.abandon(self.rows, 'op', cut_payload, self.project, operators=['op'], enabled=True,
+                      comment_id=comment['id'], recorded_at='2026-10-05T00:00:00Z')
+        with self.assertRaisesRegex(ValueError, 'already has a host entry'):
+            voids.abandon(self.rows, 'op', dict(cut_payload, operation_id='abandon-three'), self.project,
+                          operators=['op'], enabled=True, comment_id=comment['id'],
+                          recorded_at='2026-10-05T00:00:00Z')
+
+    def test_abandon_binds_the_named_comment_even_after_its_target_changes(self):
+        cut = self.cut()
+        comment = self.rows[0]['comments'][0]
+        altered = copy.deepcopy(self.rows)
+        altered[2]['title'] = 'changed after the cut'
+        voids.abandon(altered, 'op', self.abandon_payload(cut), self.project, operators=['op'],
+                      enabled=True, comment_id=comment['id'], recorded_at='2026-10-05T00:00:00Z')
+        state = voids.context(altered, voids.read_journal(self.project))
+        self.assertEqual(state['incomplete'], [])
+        self.assertEqual(state['reasons'], {})
+        self.assertIn(voids.MANIFEST, voids.backup_files(self.project, altered))
+
+    def test_abandon_closes_an_incomplete_retraction_without_clearing_the_void(self):
+        self.apply(self.payload())                      # issued void stays in effect
+        retract = self.cut('retract', 'retract-one', 'void-one')
+        comment = self.rows[0]['comments'][-1]
+        self.assertEqual([c['id'] for c in self.reading()['incomplete']], [comment['id']])
+        voids.abandon(self.rows, 'op', self.abandon_payload(retract), self.project, operators=['op'],
+                      enabled=True, comment_id=comment['id'], recorded_at='2026-10-05T00:00:00Z')
+        state = self.reading()
+        self.assertEqual(state['incomplete'], [])
+        self.assertEqual(state['reasons'], {'p-task.2': 'voided'})
+        self.assertIn(voids.MANIFEST, voids.backup_files(self.project, self.rows))
+
+    def test_an_abandoned_correction_is_final_so_its_exact_retry_is_refused(self):
+        """Item 2, the stated rule: abandonment is final; a fresh void under a new key is the way."""
+        cut = self.cut()
+        comment = self.rows[0]['comments'][0]
+        voids.abandon(self.rows, 'op', self.abandon_payload(cut), self.project, operators=['op'],
+                      enabled=True, comment_id=comment['id'], recorded_at='2026-10-05T00:00:00Z')
+        with self.assertRaisesRegex(ValueError, r'abandoned .*final'):
+            self.apply(cut)
+        self.assertEqual(self.reading()['reasons'], {})
+        self.assertEqual([c['id'] for c in self.reading()['incomplete']], [])
+        self.assertEqual(self.native_writes, 1)
+        # The way to void the event afterwards is a fresh operation identity.
+        fresh = self.payload('void', 'void-after-abandon')
+        answer = self.apply(fresh)
+        self.assertFalse(answer['reconciled'])
+        self.assertEqual(self.reading()['reasons'], {'p-task.2': 'voided'})
+        page = voids.audit(voids.snapshot(self.rows, self.project), operators=['op'])
+        self.assertEqual((page['abandoned_correction_count'], page['in_effect_void_count']), (1, 1))
+        rows = [c for c in page['corrections'] if c['comment_id'] == comment['id']]
+        self.assertEqual([row['status'] for row in rows], ['abandoned'])
+
+    def test_abandon_and_the_exact_retry_race_leaves_exactly_one_winner(self):
+        """Item 2 (ii): the two racing writers serialize; never both in effect."""
+        # Order one: the abandonment is written first, so the exact retry is refused.
+        cut = self.cut('void', 'race-void-a')
+        comment = self.rows[0]['comments'][-1]
+        voids.abandon(self.rows, 'op', self.abandon_payload(cut, key='race-abandon-a'), self.project,
+                      operators=['op'], enabled=True, comment_id=comment['id'],
+                      recorded_at='2026-10-05T00:00:00Z')
+        with self.assertRaisesRegex(ValueError, 'abandoned'):
+            self.apply(cut)
+        self.assertEqual(self.family(), {})
+        self.assertEqual(set(voids.read_journal(self.project)['abandons']), {'race-abandon-a'})
+        self.assertEqual(self.reading()['reasons'], {})
+        # Order two, a second project with its own rows: the retry publishes its
+        # entry first, so the abandonment of that same comment is refused.
+        rows_two = rows()
+        writes = []
+
+        def run(argv):
+            if argv == ['comments', 'p-task', '--json']:
+                return json.dumps(rows_two[0]['comments'])
+            writes.append(argv)
+            comment = dict(id=str(len(writes)), author=json.loads(argv[3][len(voids.PREFIX):])['actor'],
+                           text=argv[3], created_at='2026-10-02T00:00:0' + str(len(writes)) + 'Z')
+            rows_two[0]['comments'].append(comment)
+            return json.dumps(comment)
+
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        project = Path(scratch.name)
+        second = dict(schema_version=1, operation='void', operation_id='race-void-b', actor='op',
+                      reason='Operator reviewed the source evidence.', evidence=['synthetic review'],
+                      binding=voids.event_binding(rows_two[2]), target_void=None)
+        voids.apply(rows_two, 'op', second, run, project, operators=['op'], enabled=True)
+        with self.assertRaisesRegex(ValueError, 'already has a host entry'):
+            voids.abandon(rows_two, 'op', self.abandon_payload(second, key='race-abandon-b'),
+                          project, operators=['op'], enabled=True,
+                          comment_id=rows_two[0]['comments'][0]['id'],
+                          recorded_at='2026-10-05T00:00:00Z')
+        self.assertEqual(set(voids.read_journal(project)['entries']), {'race-void-b'})
+        self.assertEqual(voids.read_journal(project)['abandons'], {})
+        self.assertEqual(voids.context(rows_two, voids.read_journal(project))['reasons'],
+                         {'p-task.2': 'voided'})
+
+    @unittest.skipUnless(os.name == 'posix', 'the host abandon command takes the POSIX project lock')
+    def test_admin_abandon_command_prints_the_lost_entry_rule_before_the_write(self):
+        import admin
+        cut = self.cut()
+        comment = self.rows[0]['comments'][0]
+        (self.project / '.beads').mkdir(exist_ok=True)
+        (self.project / '.beads' / 'metadata.json').write_text('{}')
+        exported = '\n'.join(json.dumps(row) for row in self.rows)
+        captured = io.StringIO()
+        printed_at_write = []
+
+        def check(*args, **options):
+            printed_at_write.append(voids.ABANDON_LOST_ENTRY_RULE in captured.getvalue())
+            return dict(operation='abandon', comment_id=comment['id'])
+
+        with contextlib.redirect_stdout(captured), \
+                mock.patch.object(admin, 'project_dir', return_value=self.project), \
+                mock.patch.object(admin, 'operators', return_value=['op']), \
+                mock.patch.object(admin, 'run_bd', return_value=exported), \
+                mock.patch.object(admin, 'lifecycle_void_writes', return_value=True), \
+                mock.patch.object(admin, 'deployment_config_lock',
+                                  return_value=contextlib.nullcontext()), \
+                mock.patch('review_workflow.operator_owners', return_value={}), \
+                mock.patch('review_workflow.listed_operator_actor', return_value=True), \
+                mock.patch.object(voids, 'abandon', side_effect=check) as writer:
+            admin.lifecycle_abandon_command(self.project, 'pp', comment['id'], 'op',
+                                            'Operator closed the cut.', ['synthetic audit'],
+                                            'admin-abandon-one')
+        self.assertTrue(writer.called)
+        self.assertEqual(printed_at_write, [True])
+        self.assertIn(voids.ABANDON_LOST_ENTRY_RULE, captured.getvalue())
+        self.assertIn('LOST', voids.ABANDON_LOST_ENTRY_RULE)
+        operations = (Path(lifecycle.__file__).resolve().parent / 'docs' / 'OPERATIONS.md').read_text(
+            encoding='utf-8')
+        self.assertIn('restore that family from the backup', operations)
+        self.assertIn('exact retry of an abandoned', operations)
+
+    @unittest.skipUnless(os.name == 'posix', 'the host abandon command takes the POSIX project lock')
+    def test_admin_abandon_command_writes_host_evidence_without_recreating_the_comment(self):
+        import admin
+        cut = self.cut()
+        comment = self.rows[0]['comments'][0]
+        (self.project / '.beads').mkdir(exist_ok=True)
+        (self.project / '.beads' / 'metadata.json').write_text('{}')
+        exported = '\n'.join(json.dumps(row) for row in self.rows)
+        with mock.patch.object(admin, 'project_dir', return_value=self.project), \
+                mock.patch.object(admin, 'operators', return_value=['op']), \
+                mock.patch.object(admin, 'run_bd', return_value=exported), \
+                mock.patch.object(admin, 'lifecycle_void_writes', return_value=True), \
+                mock.patch.object(admin, 'deployment_config_lock',
+                                  return_value=contextlib.nullcontext()), \
+                mock.patch('review_workflow.operator_owners', return_value={}), \
+                mock.patch('review_workflow.listed_operator_actor', return_value=True), \
+                contextlib.redirect_stdout(io.StringIO()):
+            answer = admin.lifecycle_abandon_command(self.project, 'pp', comment['id'], 'op',
+                                                     'Operator closed the cut.', ['synthetic audit'],
+                                                     'admin-abandon-one')
+        self.assertEqual(answer['operation'], 'abandon')
+        self.assertEqual(answer['comment_id'], comment['id'])
+        self.assertEqual(self.native_writes, 1)
+        record = voids.read_journal(self.project)['abandons']['admin-abandon-one']
+        self.assertEqual(record['comment_id'], comment['id'])
+        self.assertEqual((record['payload']['actor'], record['payload']['reason']),
+                         ('op', 'Operator closed the cut.'))
+        self.assertEqual(self.family(), {})
 
     def test_read_and_off_refusal_create_no_family_and_raw_comment_is_not_authority(self):
         before = copy.deepcopy(self.rows)

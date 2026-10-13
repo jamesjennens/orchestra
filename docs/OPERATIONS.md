@@ -40,28 +40,96 @@ different content or actor refuses. Retraction names the VOID operation key.
 If another key already voids the event, a pending/cut key cannot publish a second
 VOID on retry: the refusal names the operation already in effect.
 
-**An incomplete correction stops this project's backups** until its exact native
-comment is paired with a valid host entry. There is no abandon-incomplete command
-or permission to delete that comment. Losing the original command does not lose
-its words: `lifecycle-audit PROJECT` lists the incomplete operation, actor, reason
-and evidence. Read the task's native comments (`bd comments TASK --json`, through
-the configured host/client) for its full `Kind: lifecycle-event-correction-v1`
-payload. Recover `operation_id`, `actor`, `binding.event_id`, `reason` and every
-`evidence` pointer from that comment, and repeat the `lifecycle-event-void` command
-above with those exact values (one `--evidence` for each pointer). For an incomplete
-retraction, recover `target_void` and repeat `lifecycle-event-retract` instead.
-Keep the switch ON and the original issuing identity currently authorized for the
-retry. Do not share or take over another actor. A missing/unrecoverable principal
-binding requires the
-operator's normal identity reconciliation before retry; backups remain stopped.
+**An incomplete correction stops this project's backups** until the native comment
+is either paired with a valid host entry or abandoned. Losing the original command
+does not lose its words: `lifecycle-audit PROJECT` lists the incomplete operation,
+actor, reason and evidence. Read the task's native comments (`bd comments TASK
+--json`, through the configured host/client) for its full
+`Kind: lifecycle-event-correction-v1` payload. Recover `operation_id`, `actor`,
+`binding.event_id`, `reason` and every `evidence` pointer from that comment, and
+repeat the `lifecycle-event-void` command above with those exact values (one
+`--evidence` for each pointer). For an incomplete retraction, recover `target_void`
+and repeat `lifecycle-event-retract` instead. Keep the switch ON and the original
+issuing identity currently authorized for the retry. Do not share or take over
+another actor. A missing/unrecoverable principal binding requires the
+operator's normal identity reconciliation before retry.
+
+When the original actor cannot be restored, or the operator decides not to complete
+the cut, a currently listed operator closes it **without the original words**:
+
+```sh
+python3 admin.py --root ROOT lifecycle-event-abandon PROJECT COMMENT_ID --actor OPERATOR \
+  --reason "Why this incomplete correction is abandoned" --evidence AUDIT_POINTER --operation-id UNIQUE_KEY
+```
+
+`COMMENT_ID` is the native correction comment `lifecycle-audit PROJECT` lists as
+incomplete (its `corrections[].comment_id`). The kit reads that retained comment for
+the exact binding and abandoned operation id, so the reason, evidence and key do not
+have to be reproduced. The command is applicable ONLY to a correction comment that
+has no journal entry: a void or retraction that already has a host entry (in effect
+or retracted) is refused, and `lifecycle_void_writes` must be ON. It is audited with
+who (the operator), when (the abandonment time) and why (the reason), writes only
+the host record, and never changes or deletes native data: the abandoned comment
+stays in place and `lifecycle-audit` lists it with status `abandoned` (counted by
+`abandoned_correction_count`). Backups resume once every native correction comment
+is bound. The exact retry of the *abandonment* with the same operation id reconciles;
+a reused id naming different content refuses.
+
+**The abandonment record is written BESIDE the family, never in it.** It lives in
+`.lifecycle-void-abandons.json` in the project directory; `.lifecycle-voids/` keeps
+only `void` and `retract` schema-version-1 members, so the released F0 kit (04ed25d)
+reads the family unchanged. An `abandon` member of a schema-version-1 family is what
+made the released reader report every lifecycle fact of every task unknown
+(`lifecycle-void-journal-unreadable`) and its family audit `damaged`, so no version
+of this kit writes one there. The store is part of this kit's coordination backup
+(and only when it holds a record), and a restore installs or removes it with the
+family, so the pairing round-trips. A damaged or unreadable store never changes a
+lifecycle fact: it is reported (`abandon_problems`, audit `damaged`) and the
+abandoned comment reads `incomplete` again, so backups stay stopped until an
+operator repairs or re-runs the abandonment.
+
+**Abandonment also closes a void whose journal entry was LOST**, not only a cut
+before publication: a void that was in effect and whose family member was then
+removed by hand leaves exactly the same unpaired native comment. The command
+therefore prints this sentence before it writes, every time:
+
+```text
+Before abandoning, rule out a LOST journal entry rather than a cut: compare the newest complete
+backup's .lifecycle-voids-manifest.json with this project's live .lifecycle-voids directory. A member
+<sha256>.json listed there but absent live is a LOST entry - restore that family from the backup
+instead of abandoning. Abandon only when no complete backup lists a missing member, i.e. the
+correction never took effect. Abandonment closes the comment for good: its exact retry is refused.
+```
+
+Rule a lost entry out FIRST, because abandoning discards a correction that was in
+effect: list the family members the newest complete backup's
+`.lifecycle-voids-manifest.json` names (`files`), compare them with the live
+`.lifecycle-voids/` directory, and compare the manifest's
+`native_corrections_sha256` with the current export's native correction generation.
+A member the backup names but the live family does not have was LOST, not cut:
+restore that complete backup, or its family, instead of abandoning. Only when no
+complete backup names a missing member, and the operator accepts that the correction
+never took effect, is abandonment the right tool. The who, when and why stay in the
+audit row, so the decision is never silent.
+
+**An abandoned correction is final.** This is the one rule stated for the retry: an
+abandoned operation is never put into effect afterwards. The exact retry of an abandoned
+void (or retraction) is refused, naming the abandoning operator and time,
+and the audit keeps ONE row for that comment, `abandoned` - never an in-effect row
+beside it, so nothing reads "voided, then abandoned". To void that event afterwards,
+issue a fresh `lifecycle-event-void` under a NEW operation identity; the abandoned
+comment itself is never paired. Two writers racing - the abandonment and the exact
+retry - serialize on the project lock, and exactly one of them wins: whichever writes
+first, the other is refused by name (the retry as abandoned, the abandonment as
+"already has a host entry").
 
 If another VOID key is now in effect, a current operator first records its linked
 retraction with a fresh key/reason/evidence, then retries the incomplete operation
 with the recovered exact values. If that newly published VOID should not remain
 effective, retract it with another fresh audited key. Retain all comments and
-host entries. If the native payload or target itself cannot be recovered, preserve
-the stopped project and use a verified complete native/coordination backup in an
-unused destination; never fabricate a journal entry to resume backups.
+host entries. If both the native payload and the abandonment are impossible,
+preserve the stopped project and use a verified complete native/coordination backup
+in an unused destination; never fabricate a journal entry to resume backups.
 
 Authority is checked under the project and deployment configuration locks. A
 currently listed operator's registered actor may act through the same bound
@@ -84,7 +152,20 @@ changing the target event. Independent valid scopes keep their existing meaning.
 Recorded release, rollback and capability-verification records are unchanged.
 A host-made invalid entry that names an event belonging to another task makes the
 entry's claimed task's whole lifecycle read UNKNOWN with its binding reason.
-The actual event is retained once; no duplicate event row is invented.
+The actual event is retained once; no duplicate event row is invented. Limiting the
+damage to the named event was considered and not taken: the reader cannot prove from
+a damaged host record which task the entry was meant for, so the entry's own claimed
+task stays UNKNOWN until an operator reconciles the family.
+**A void does not stop a later record.** While the coordinator rules are off (the
+default), after a void the assignee can record the same fact again under a new
+operation id and every reader shows `passed` again; `lifecycle-audit` lists the new
+record as questionable, because only approval and authorship evidence makes it
+trustworthy, not the void. The `lifecycle_authors` coordinator rule closes this: it
+limits `implemented`, `tested` and `lifecycle-scope` to the task's assignee or a
+listed operator, and `reviewed`, `integrated`, `deployed`, `live-verified`, `enabled`,
+`live` and a release deploy to a listed operator. Preview what it would refuse with
+`admin.py lifecycle-authors PROJECT`, then turn it on with
+`admin.py coordinator-rules on --rule lifecycle_authors --actor OPERATOR`.
 
 Backups include this bounded family only when present, with a closed generation
 manifest carrying every member hash, count, byte count and a bounded hash of the
@@ -1806,6 +1887,62 @@ python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime res
 It refuses a populated destination, restores status and comments, and retains original issue IDs. The native restore is Dolt's own restore through the SQL client (`CALL DOLT_BACKUP('restore', '--force', 'file://.../backups/SOURCE', 'DEST')` over the loopback connection, bounded by the same explicit 30-minute ceiling as `backup`), not `bd backup restore`, which has the same fixed client read timeout of about ten seconds as `bd backup sync`: a 588 MB backup failed under `bd backup restore` at exactly 10 s (`i/o timeout`, `invalid connection`) and takes about a minute through the SQL client. The client runs in its own session/process group with the password in the environment, never on a command line; a normal `SIGTERM`, Ctrl-C or the ceiling stops that whole process group before the source's backup lock is released. Because bd does not run the restore, the kit then performs the one step `bd backup restore --force` would have performed itself: it writes the restored database's `_project_id` into the destination's `.beads/metadata.json` (every other key is kept), so bd accepts the restored project instead of refusing it with `PROJECT IDENTITY MISMATCH`; a backup that records no project identity leaves the file unchanged, as bd does. The command prints `Restored backups/SOURCE into DEST through the Dolt SQL client in N s.` and, when the identity changed, the identity it adopted. A destination with no Dolt server metadata in `.beads/metadata.json` has no SQL coordinates and keeps the `bd backup restore` path, as `backup` keeps `bd backup sync`. The native restore also carries the source project's recorded backup target, so `.beads/dolt-backup.json` and the restored `dolt_backups` row would still name `backups/SOURCE`; `restore-new` re-points the destination at `backups/DEST` immediately after the restore, and `backup` refuses (before any native command) a project whose recorded target is not its own `backups/<name>`, naming the recorded URL and the expected directory, so a clone that was never re-pointed cannot overwrite the source project's backup directory. A clone restored before that re-point existed (or whose re-point failed) is repaired in place with `admin.py backup-repoint DEST`, which runs `bd backup init backups/DEST` under the kit environment and verifies both `.beads/dolt-backup.json` and the `dolt_backups` row before reporting success; do not run a bare `bd backup init` (it fails without the kit environment, `Error 1045 Access denied for user root`) and do not re-run `restore-new` onto an existing name (it is refused and would discard the clone). Re-pointing moves no data: if the clone was ever backed up while still mis-pointed, the SOURCE project's `backups/SOURCE` may hold the clone's data, so back the SOURCE project up again before relying on that backup. Inspect records and comments before any cutover. Checkpoint activity cursors name the project they were taken in, and `restore-new` gives the project a new name. From kittrial-5bb.131 a kit compares a retained checkpoint's cursor under the project it names, so a restored task whose content has not changed reads as current, as it already did on `work --mine`, and real activity after the restore is still reported as newer activity. Because current no longer prompts for it, `brief` says where such a checkpoint was taken (kittrial-5bb.136): `checkpoint.taken_in_project` names the source project, the text form adds `Checkpoint taken in project: NAME`, and the next action starts with `CHECKPOINT FROM PROJECT NAME:` asking you to confirm the history before relying on it. The name comes from text a checkpoint writer supplied, so it is shown only when it is a project name (2-24 lowercase letters and digits, beginning with a letter); anything else shows as `(unrecognised project name)` (kittrial-5bb.142). A kit before kittrial-5bb.131 makes every retained checkpoint read as newer activity after a rename (STALE CHECKPOINT in `brief`), even when native task bytes are unchanged; that is a scope change, not proof of a new comment. On such a kit, reconcile the restored history and write a fresh checkpoint under the destination name before trusting its next action. Cursors are written the same way by every kit, so mixed kits read each other's checkpoints. Do not run both copies as live coordination trackers. A complete host-loss recovery requires reinstalling the pinned kit on a replacement host, placing the saved backup and its coordination sidecar under its backups directory (with timestamps preserved, see below), using restore-new, verifying it, then updating client project/host settings. If `restore-new` refuses because no copy of the coordination sidecar can be used, first look for an intact copy of the pair, for example in your off-machine copies. Run `backup-authority SOURCE` to see what each copy says. Use `--without-coordination` only when the native tracker data alone is acceptable, then reconcile sessions, handoffs, requests and merge context by hand. No manual restore through the SQL client or edit of `.beads/metadata.json` is needed at any project size: `restore-new` does both. Re-grant operators and verifiers deliberately afterwards (the restore reports them as NOT restored), and take a fresh `backup` of the restored project before relying on it. A separate-deployment drill exercises backup transfer; actual replacement-host outage recovery remains an operator exercise.
 
 ### Coordination journals and interrupted recovery
+
+**Plan backups around lifecycle corrections.** A project that carries native
+lifecycle correction comments (a `.lifecycle-voids` family) cannot be restored from
+a backup that omits that family, and there is **NO override**: `restore-new` refuses
+it and retains an incomplete-restore marker, with or without
+`--without-coordination`, so the destination reads UNKNOWN and cannot itself be
+backed up. Take a **complete** VOID-capable backup for a project before its first
+correction is written: a native backup taken earlier carries no family, and an older
+kit's backup never carries one. On the refusal, preserve the destination and restore
+a complete VOID-capable backup into an unused one; do not delete the marker to make
+the partial restore look done. An operator cannot force the family-less case, by
+design: silently restoring with every correction read UNKNOWN would hide exactly the
+evidence the family exists to keep. See
+[Lifecycle event audit and host corrections](#lifecycle-event-audit-and-host-corrections)
+for the family, the switch and the abandon command that closes an incomplete cut.
+
+**Rollback to the released F0 kit (04ed25d), exactly.** Rolling a host back to the
+released kit is supported for a project **while that project holds no abandonment
+record**. The abandonment store `.lifecycle-void-abandons.json` is not a family
+member and no version of this kit writes one into `.lifecycle-voids/`, so 04ed25d
+reads the family (a schema-version-1 `void`/`retract` journal) unchanged and its
+backup of such a project works. Once an abandonment record exists, 04ed25d:
+
+* reads every lifecycle fact of the project **correctly** - `brief`, `work`,
+  `review`, `lifecycle-audit` and `lifecycle.py list --journal` do not fail with
+  `lifecycle-void-journal-unreadable` and do not call the family `damaged`; an
+  issued void is still honoured, and a void or retraction of another event is still
+  accepted;
+* reports the abandoned native correction comment as `incomplete`
+  (`native-correction-without-host-entry`), because it cannot know the abandonment
+  store, and an offline read of that comment's export names its event
+  `lifecycle-corrections-not-consulted`;
+* **cannot back up or restore that project**: `backup` refuses it (its own rule that
+  a native correction comment must have a host family entry), and `restore-new` of a
+  backup that carries the abandonment store is refused as an invalid coordination
+  backup path. Backups this kit took **before** the first abandonment carry no
+  abandonment store and are unaffected.
+
+Procedure before rolling a host back to 04ed25d, in order:
+
+1. `lifecycle-audit PROJECT` on the running kit: if `abandoned_correction_count` is
+   not 0 for a project, that project is not rollback-clean. Do not delete
+   `.lifecycle-void-abandons.json`, the abandoned native comment or the family to
+   make it look clean: deleting the store re-reads as `incomplete` and deleting the
+   comment destroys evidence.
+2. Take a complete backup with the *current* kit for every project you intend to
+   roll back, and keep a copy of the abandonment store and the family outside the
+   runtime. The rolled-back kit cannot take that backup itself afterwards.
+3. A project with abandonments may still be **restored** by 04ed25d into an unused
+   destination from an older complete backup whose native generation predates the
+   abandoned correction comment (the manifest's `native_corrections_sha256` must
+   match the restored data). That destination then carries no abandonment and is
+   rollback-clean; it is a copy, not the live project.
+4. If a live project with abandonments must run on 04ed25d, accept that its backup
+   and restore stay refused until the host is upgraded to a kit that reads the
+   abandonment store. Roll **forward** to reconcile it; there is no override.
 
 Session registrations in `.sessions.json` are included in the coordination sidecar, alongside the private project onboarding entry point. Restore with a kit version supporting these records. Preserve original actor IDs for resumed workers; do not create a second live authority from a restored registry.
 

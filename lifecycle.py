@@ -2060,7 +2060,8 @@ def offline_snapshot(rows, project=None):
     comments in THIS export; establish an absent family only at a native project
     whose database identity agrees with the export's issue prefix.
     """
-    from lifecycle_voids import Snapshot, context, read_journal, native_correction_comments
+    from lifecycle_voids import (Snapshot, context, read_journal, native_correction_comments,
+                                 entry_binds_comment)
     native = native_correction_comments(rows)
     consulted = False
     journal = None
@@ -2070,12 +2071,15 @@ def offline_snapshot(rows, project=None):
             raise ValueError('--journal must name an existing project directory')
         journal = read_journal(directory)
         # Matching every native comment establishes the family/export association
-        # even when a target event was subsequently changed or deleted.
+        # even when a target event was subsequently changed or deleted. An
+        # abandonment record - in the store beside the family (kittrial-5bb.271
+        # item 1) or in a legacy family member the reviewed kit wrote - binds an
+        # existing cut comment the same way a void/retraction entry binds the
+        # comment it created.
+        records = list(journal['entries'].values()) + list((journal.get('abandons') or {}).values())
         consulted = bool(native) and all(
-            any(c['task'] == entry['payload']['binding']['task']
-                and c['id'] == entry['comment_id']
-                and c['text'] == 'Kind: lifecycle-event-correction-v1\n' + canonical_bytes(entry['payload']).decode()
-                for entry in journal['entries'].values()) for c in native)
+            any(entry_binds_comment(entry, comment) for entry in records)
+            for comment in native)
         # Metadata can establish absence only when the export has no corrections.
         if not native:
             metadata = directory / '.beads' / 'metadata.json'
@@ -2149,7 +2153,10 @@ def main():
     # is trusted locally and the endpoint, which always has both, is authoritative.
     release.add_argument('--journal')
     view=sub.add_parser('list');view.add_argument('--export',required=True);view.add_argument('--implemented-not-deployed',action='store_true');view.add_argument('--journal')
-    owed=sub.add_parser('evidence-owed');owed.add_argument('--export',required=True);owed.add_argument('--journal')
+    owed=sub.add_parser('evidence-owed',help='list release evidence still owed from an exported snapshot; '
+        'without --journal it exits 1 when a correction comment names an event of a release row, because '
+        'that hidden row makes the owed list unknown')
+    owed.add_argument('--export',required=True);owed.add_argument('--journal')
     a=parser.parse_args()
     try:
         if a.command=='record':
