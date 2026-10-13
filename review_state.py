@@ -127,10 +127,10 @@ def next_actor(state, assignee=None, closed=False, pending_items=0, claimable=No
     shows and never invents. ``closed`` keeps its meaning from the ``work`` queue: a
     closed task whose review is not still active is ``none``, never an invitation.
     """
-    if not active_work('closed' if closed else 'open', state, pending_items):
-        return 'none'
     if state in ('withdrawn', 'superseded') and not pending_items:
         return 'unknown'
+    if not active_work('closed' if closed else 'open', state, pending_items):
+        return 'none'
     if state in ('changes-requested', 'withdrawn', 'superseded'):
         return 'assignee' if assignee else 'unknown'
     if state in ('awaiting-review', 'legacy-review-ready'):

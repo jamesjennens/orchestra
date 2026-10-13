@@ -1,7 +1,11 @@
 """Closed approval is history, not an integration invitation (.210 F1)."""
 import copy
 import json
+import sys
 import unittest
+from pathlib import Path
+
+sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 
 import briefing
 import review_state
@@ -61,7 +65,12 @@ class ClosedQueueTests(unittest.TestCase):
         row=work.queue(data,'alice/session',['--mine'])['items'][0]
         self.assertEqual((row['review_state'],row['pending_review_items'],row['next_actor']),
                          ('withdrawn',1,'assignee'))
-        self.assertEqual(review_state.next_actor('withdrawn','alice/session',closed=True,pending_items=0),'none')
+        final=self.approved()
+        payload.update(previous='approval',operation_id='final-no-items')
+        add(final,payload,'final','alice/session')
+        self.assertEqual(work.queue(final,'alice/session',['--mine'])['total'],0)
+        self.assertEqual(work.workflow(final[0])['next_actor'],'unknown')
+        self.assertEqual(work.move_decision('withdrawn',TASK,True,assignee='alice/session',closed=True)[2],'unknown')
 
     def test_closed_caller_never_gets_integration_sentence(self):
         for state in ('awaiting-integration','approved'):

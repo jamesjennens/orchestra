@@ -163,7 +163,8 @@ def move_decision(state, task, owned, named_reviewer=False, pending_items=0, red
     item 4).
     """
     if not active_work('closed' if closed else 'open', state, pending_items):
-        return 'unknown', 'This task is closed; its review and lifecycle records remain in history.', 'none'
+        return ('unknown', 'This task is closed; its review and lifecycle records remain in history.',
+                next_actor(state, assignee, closed, pending_items=pending_items, claimable=claimable))
     move, text = _caller_move(state, task, owned, named_reviewer, pending_items, redelivered,
                              way_back=way_back)
     return move, text, next_actor(state, assignee, closed, pending_items=pending_items,
