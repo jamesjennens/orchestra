@@ -311,8 +311,10 @@ class NoUnguardedParseTests(unittest.TestCase):
             'requirement_http.py': 2,
             'web_merge_slot.py': 4,
             # F0: bounded host entries/restore marker and native correction/comment
-            # bodies use the guard; none is trusted merely because it parses.
-            'lifecycle_voids.py': 5,
+            # bodies use the guard; none is trusted merely because it parses. The
+            # abandonment target lookup (kittrial-5bb.271) adds one more: the retained
+            # payload of a cut native correction comment the operator names.
+            'lifecycle_voids.py': 6,
             'review_recommendations.py': 2, 'review_workflow.py': 4, 'work.py': 1, 'worker_gate.py': 1})
 
     def test_the_parsers_that_do_not_call_it_directly_reach_it(self):

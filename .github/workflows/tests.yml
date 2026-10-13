@@ -22,6 +22,10 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+          # Full history so the two pre-VOID compatibility tests can export the
+          # kit from the repository's own history (tests/test_lifecycle_voids_native.py)
+          # instead of skipping for want of ORCHESTRA_F0_REVIEW_BASE.
+          fetch-depth: 0
       - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python }}

@@ -1004,6 +1004,57 @@ def lifecycle_correction_command(root, project, operation, target, actor, reason
         return voids.apply(rows, actor, payload, run, path, authority, owners, enabled)
 
 
+def lifecycle_abandon_command(root, project, comment_id, actor, reason, evidence,
+                              operation_id=None):
+    """Host-only closing of one incomplete correction, without its original words.
+
+    The operator names the native correction comment the audit lists as
+    incomplete; the kit reads that comment's retained payload for the exact
+    binding and abandoned operation id, so the reason, evidence and key do not
+    have to be reproduced. Nothing native is written or deleted, the abandoned
+    comment stays in place and the audit lists it as ``abandoned``. A comment
+    that already has a host entry is refused (an issued void is never abandoned).
+    """
+    import fcntl
+    import lifecycle_voids as voids
+    from recovery import identity
+    from review_workflow import operator_owners, listed_operator_actor
+    identity(actor, 'Invalid actor identity')
+    voids._identity(str(comment_id), 'native correction comment identity')
+    key = operation_id or ('lifecycle-abandon-' + secrets.token_hex(16))
+    voids._identity(key, 'operation identity')
+    voids._text(reason, 'reason', 1000)
+    if not isinstance(evidence, list) or not 1 <= len(evidence) <= 20:
+        raise ValueError('Evidence needs one to twenty nonblank pointers')
+    for pointer in evidence:
+        voids._text(pointer, 'evidence')
+    path = project_dir(root, project)
+    if not (path / '.beads/metadata.json').is_file():
+        raise ValueError('Unknown/uninitialized project')
+    if (path / '.coordination.lock').is_symlink():
+        raise ValueError('Coordination lock must not be a symlink')
+    with (path / '.coordination.lock').open('a') as lock, deployment_config_lock(root):
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        authority = operators(root, strict=True)
+        owners = operator_owners(path)
+        if not listed_operator_actor(actor, authority, owners):
+            raise ValueError('Lifecycle abandonment requires a currently listed operator or its bound actor')
+        enabled = lifecycle_void_writes(root)
+        if not enabled:
+            raise ValueError('lifecycle_void_writes is off; nothing was changed')
+        def run(argv):
+            return run_bd(root, project, ['--actor', actor, *argv])
+        rows = record_json.loads_rows(run(['export', '--all']))
+        target = voids.incomplete_correction(rows, comment_id)
+        if target is None:
+            raise ValueError('Lifecycle abandonment target is missing or its correction payload is unreadable')
+        payload = dict(schema_version=1, operation='abandon', operation_id=key, actor=actor,
+                       reason=reason, evidence=evidence, binding=target['binding'],
+                       target_void=target['target_void'])
+        return voids.abandon(rows, actor, payload, path, authority, owners, enabled,
+                             comment_id=comment_id, recorded_at=utc_stamp())
+
+
 #: The key of the installation setting that accepts bound keys only, and the key of its short
 #: operator audit list, in the same deployment.private.json (kittrial-5bb.196, slice 4 of
 #: docs/COORDINATORS_PER_PROJECT_DESIGN.md).
@@ -9428,6 +9479,13 @@ def main():
         a.add_argument('--actor',required=True);a.add_argument('--reason',required=True)
         a.add_argument('--evidence',required=True,action='append')
         a.add_argument('--operation-id',default=None,help='retain the returned identity for an exact retry after uncertainty')
+    a=sub.add_parser('lifecycle-event-abandon',help='host-only: close one native correction comment that has NO host '
+                     'entry (a cut before publication), without its original words; nothing native is written or '
+                     'deleted and an issued void is never a target',allow_abbrev=False)
+    a.add_argument('project');a.add_argument('comment_id',help='the native correction comment the audit lists as incomplete')
+    a.add_argument('--actor',required=True);a.add_argument('--reason',required=True)
+    a.add_argument('--evidence',required=True,action='append')
+    a.add_argument('--operation-id',default=None,help='retain the returned identity for an exact retry after uncertainty')
     a=sub.add_parser('capability-verify',help='record verified capability checks (operator allowlist or verifiers list)')
     a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('authorized-keys',help='print the confined contributor and unrestricted operator authorized_keys lines for one public key')
@@ -10176,6 +10234,9 @@ def main():
         operation='void' if args.command=='lifecycle-event-void' else 'retract'
         target=args.event if operation=='void' else args.void_operation
         print(json.dumps(lifecycle_correction_command(root,args.project,operation,target,args.actor,
+                         args.reason,args.evidence,args.operation_id)))
+    elif args.command=='lifecycle-event-abandon':
+        print(json.dumps(lifecycle_abandon_command(root,args.project,args.comment_id,args.actor,
                          args.reason,args.evidence,args.operation_id)))
     elif args.command=='authorized-keys':
         authorized_keys(root,args.key_file,args.role,args.python,args.comment,args.project,args.principal)

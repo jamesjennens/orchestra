@@ -11,6 +11,7 @@ import hashlib
 import os
 import re
 import stat
+import time
 from pathlib import Path
 
 import record_json
@@ -75,7 +76,7 @@ def validate_payload(payload):
         raise ValueError('Invalid lifecycle correction fields')
     if type(payload['schema_version']) is not int or payload['schema_version'] != 1:
         raise ValueError('Invalid lifecycle correction version')
-    if payload['operation'] not in ('void', 'retract'):
+    if payload['operation'] not in ('void', 'retract', 'abandon'):
         raise ValueError('Invalid lifecycle correction operation')
     _identity(payload['operation_id'], 'operation identity')
     _identity(payload['actor'], 'actor')
@@ -114,10 +115,16 @@ def validate_payload(payload):
     if payload['operation'] == 'void':
         if payload['target_void'] is not None:
             raise ValueError('A void has no retraction target')
-    else:
+    elif payload['operation'] == 'retract':
         _identity(payload['target_void'], 'void operation identity')
         if payload['target_void'] == payload['operation_id']:
             raise ValueError('A retraction cannot name itself')
+    else:
+        # An abandonment names the cut correction operation it closes, so the
+        # record binds the exact native comment rather than only its task/event.
+        _identity(payload['target_void'], 'abandoned operation identity')
+        if payload['target_void'] == payload['operation_id']:
+            raise ValueError('An abandonment cannot name itself')
     if len(canonical_bytes(payload)) > MAX_RECORD_BYTES:
         raise ValueError('Lifecycle correction exceeds its byte bound')
     return payload
@@ -140,6 +147,65 @@ def validate_entry(entry, name=None):
     if len(entry_bytes(entry)) > MAX_RECORD_BYTES:
         raise ValueError('Lifecycle void journal entry exceeds its byte bound')
     return entry
+
+
+def correction_payload(comment):
+    """The validated correction payload a native comment carries, or None.
+
+    One reader for the two places that must recognize a native correction
+    comment without trusting its JSON shape: the journal/comment match and the
+    abandonment target lookup. A comment that does not start the reserved
+    prefix, or whose payload is missing or invalid, has no correction payload.
+    """
+    text = comment.get('text') if isinstance(comment, dict) else None
+    if not isinstance(text, str) or not text.startswith(PREFIX):
+        return None
+    try:
+        return validate_payload(record_json.loads(text[len(PREFIX):]))
+    except (ValueError, TypeError):
+        return None
+
+
+def entry_binds_comment(entry, comment):
+    """True when ``entry`` is the host record for the native correction ``comment``.
+
+    A void/retraction entry binds the comment whose text IS its payload. An
+    abandonment entry instead binds an existing cut comment by id, and its
+    payload names the abandoned operation and target, because the operator may
+    not have the original words to re-create the void payload. A raw row comment
+    carries no ``task`` of its own; an inventory item from
+    :func:`native_correction_comments` does, and it must agree.
+    """
+    payload = entry['payload']
+    if (not isinstance(comment, dict) or str(comment.get('id')) != str(entry['comment_id'])
+            or (comment.get('task') is not None and comment.get('task') != payload['binding']['task'])):
+        return False
+    original = correction_payload(comment)
+    if original is None:
+        return False
+    if payload['operation'] == 'abandon':
+        return (original['operation'] in ('void', 'retract')
+                and original['operation_id'] == payload['target_void']
+                and original['binding'] == payload['binding'])
+    return comment.get('text') == PREFIX + canonical_bytes(payload).decode()
+
+
+def incomplete_correction(rows, comment_id):
+    """``binding``/``target_void`` for one unpaired native correction, or None.
+
+    The host abandonment command calls this before its write, so the operator
+    names only the comment the audit lists and does not reproduce the original
+    reason, evidence or key. Only a void/retraction comment is a correction
+    target; an unreadable payload has no binding to record.
+    """
+    for comment in native_correction_comments(rows):
+        if comment['id'] != str(comment_id):
+            continue
+        original = correction_payload(comment)
+        if original is None or original['operation'] not in ('void', 'retract'):
+            return None
+        return dict(binding=original['binding'], target_void=original['operation_id'])
+    return None
 
 
 def _read_regular(path):
@@ -412,10 +478,14 @@ def context(rows, journal):
     task_reasons = {}
     for key, entry in entries.items():
         payload = entry['payload']; binding = payload['binding']; event_id = binding['event_id']
+        abandon = payload['operation'] == 'abandon'
         targets = issues.get(event_id, [])
-        reason = 'lifecycle-void-target-changed'
+        # An abandonment certifies a comment, not the live event: a cut may name a
+        # target that was changed or removed, and closing it must not re-decide the
+        # event. A void/retraction still has to bind the exact current event.
+        reason = 'lifecycle-void-journal-mismatch' if abandon else 'lifecycle-void-target-changed'
         try:
-            if len(targets) != 1 or event_binding(targets[0]) != binding:
+            if not abandon and (len(targets) != 1 or event_binding(targets[0]) != binding):
                 raise ValueError('lifecycle-void-target-changed')
             reason = 'lifecycle-void-journal-mismatch'
             tasks = issues.get(binding['task'], [])
@@ -426,14 +496,19 @@ def context(rows, journal):
             if len(comments) != 1:
                 raise ValueError('lifecycle-void-journal-mismatch')
             comment = comments[0]
-            if (comment.get('author') != payload['actor'] or comment.get('created_at') != entry['created_at']
-                    or comment.get('text') != PREFIX + canonical_bytes(payload).decode()):
+            if not entry_binds_comment(entry, comment):
+                raise ValueError('lifecycle-void-journal-mismatch')
+            # The abandoner is not the comment's author and its time is the host
+            # abandonment time, so only an issued void/retraction carries the
+            # native author/time binding.
+            if not abandon and (comment.get('author') != payload['actor']
+                    or comment.get('created_at') != entry['created_at']):
                 raise ValueError('lifecycle-void-journal-mismatch')
             valid[key] = entry
         except (ValueError, TypeError, KeyError):
             reasons[event_id] = reason
             entry_reasons[key] = reason
-            if len(targets)==1:
+            if not abandon and len(targets)==1:
                 from lifecycle import native_event
                 actual=native_event(targets[0])
                 if actual is not None and actual['task']!=binding['task']:
@@ -495,6 +570,7 @@ def correction_audit(correction):
         comment=native.get((binding['task'],entry['comment_id']))
         problem=correction.get('entry_reasons',{}).get(key)
         status=('damaged' if problem else 'retraction' if payload['operation']=='retract'
+                else 'abandoned' if payload['operation']=='abandon'
                 else 'retracted' if key in retracted else 'in-effect')
         item=dict(operation_id=key,operation=payload['operation'],task=binding['task'],
                   event_id=binding['event_id'],operator=payload['actor'],
@@ -639,6 +715,7 @@ def audit(rows, operators=None, owners=None, limit=50, offset=0):
                 retracted_void_count=sum(c['status']=='retracted' for c in corrections),
                 incomplete_correction_count=sum(c['status']=='incomplete' for c in corrections),
                 damaged_correction_count=sum(c['status']=='damaged' for c in corrections),
+                abandoned_correction_count=sum(c['status']=='abandoned' for c in corrections),
                 family_reason=correction.get('global_reason'),
                 family_problems=correction.get('invalid',[]),
                 correction_status=('damaged' if correction.get('global_reason') or correction.get('entry_reasons')
@@ -801,3 +878,79 @@ def apply(rows, actor, payload, run, project, operators=None, owners=None, enabl
     return dict(operation_id=payload['operation_id'], comment_id=entry['comment_id'],
                 event_id=binding['event_id'], task=binding['task'], operation=payload['operation'],
                 journal_sha256=entry['sha256'], reconciled=bool(found))
+
+
+def abandon(rows, actor, payload, project, operators=None, owners=None, enabled=False,
+            comment_id=None, recorded_at=None):
+    """Close one unpaired native correction comment without recreating its words.
+
+    Host-only and audited. A listed operator names an existing correction comment
+    that has no journal entry (a cut before publication); this writes ONLY the host
+    record that abandons it, creating the family when it is absent but never
+    touching, deleting or re-writing the native comment. A correction whose comment
+    already has an entry is refused, so an issued void/retraction (in effect or
+    retracted) is never a target. The entry binds the comment by native id and the
+    abandoned operation id, so readers stop counting it as incomplete and backups
+    resume; ``context`` never turns it into a void reason. The exact retry with the
+    same ``operation_id`` reconciles the already-published host record.
+    """
+    from review_workflow import listed_operator_actor
+    validate_payload(payload)
+    if payload['operation'] != 'abandon':
+        raise ValueError('Not an abandonment payload')
+    if actor != payload['actor'] or not listed_operator_actor(actor, operators, owners):
+        raise ValueError('Lifecycle abandonment requires a currently listed operator or its bound actor')
+    if not enabled:
+        raise ValueError('lifecycle_void_writes is off; after restoring support on every installation, '
+                         'an operator enables it with admin.py lifecycle_void_writes on --actor OPERATOR; nothing was changed')
+    binding = payload['binding']
+    journal = read_journal(project)
+    if journal['invalid']:
+        raise ValueError('Lifecycle void journal cannot be read; operator repairs it before a write')
+    prior = journal['entries'].get(payload['operation_id'])
+    if prior is not None:
+        if prior['payload'] != payload:
+            raise ValueError('Lifecycle correction operation identity already names different content/actor')
+        return dict(operation_id=payload['operation_id'], comment_id=prior['comment_id'],
+                    event_id=binding['event_id'], task=binding['task'], operation='abandon',
+                    journal_sha256=prior['sha256'], reconciled=True)
+    native = native_correction_comments(rows)
+    candidates = [c for c in native if comment_id is None or c['id'] == str(comment_id)]
+    matches = []
+    for comment in candidates:
+        original = correction_payload(comment)
+        if (original is not None and original['operation'] in ('void', 'retract')
+                and original['operation_id'] == payload['target_void']
+                and original['binding'] == binding
+                and comment['task'] == binding['task']):
+            matches.append(comment)
+    if len(matches) != 1:
+        raise ValueError('Lifecycle abandonment target is missing or ambiguous; name an incomplete native '
+                         'correction comment that has no host entry')
+    comment = matches[0]
+    for entry in journal['entries'].values():
+        if entry['comment_id'] == comment['id']:
+            raise ValueError('That native correction comment already has a host entry; an issued void or '
+                             'retraction is never abandoned')
+    if recorded_at is None:
+        recorded_at = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+    entry = dict(schema_version=1, payload=payload, sha256=content_hash(payload),
+                 comment_id=comment['id'], created_at=recorded_at)
+    validate_entry(entry)
+    state = context(rows, journal)
+    active = sum(recorded['payload']['operation'] == 'void' and key not in state['retracted']
+                 for key, recorded in journal['entries'].items())
+    if (len(journal['entries']) + 1 + active > MAX_RECORDS
+            or journal['bytes'] + len(entry_bytes(entry)) + active * MAX_RECORD_BYTES > MAX_FAMILY_BYTES):
+        raise ValueError('Lifecycle void journal capacity keeps space for outstanding retractions; '
+                         'no host record was written. An operator retains the existing journal and uses '
+                         'a restore-capable kit with larger validated bounds before adding corrections.')
+    try:
+        publish(project, entry)
+    except (ValueError, OSError, KeyError, TypeError) as error:
+        raise ValueError('Lifecycle abandonment could not publish its host record for operation '
+                         + payload['operation_id'] + '; the native comment was not changed and the exact '
+                         'retry is safe: ' + str(error)[:300]) from None
+    return dict(operation_id=payload['operation_id'], comment_id=entry['comment_id'],
+                event_id=binding['event_id'], task=binding['task'], operation='abandon',
+                journal_sha256=entry['sha256'], reconciled=False)

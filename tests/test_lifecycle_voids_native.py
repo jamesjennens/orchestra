@@ -1,12 +1,73 @@
 """Pinned native correction and bound-principal raw-write proofs in disposable data."""
+import atexit
 import copy
+import io
 import json
+import os
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
 import unittest
+from pathlib import Path
 
 import test_bd_label_aliases as fixture
 import lifecycle
 import lifecycle_voids as voids
 from requirements import content_hash
+
+
+def _extract_kit(root, commit, destination):
+    """Export the tracked tree at ``commit`` into ``destination`` (no working copy)."""
+    archive = subprocess.run(['git', '-C', str(root), 'archive', '--format=tar', commit],
+                             capture_output=True, timeout=180)
+    if archive.returncode:
+        raise OSError(archive.stderr.decode('utf-8', 'replace')[:300])
+    with tarfile.open(fileobj=io.BytesIO(archive.stdout)) as bundle:
+        bundle.extractall(destination)
+
+
+def resolve_pre_void_kit():
+    """A directory holding the kit before lifecycle corrections existed, or None.
+
+    ``ORCHESTRA_F0_REVIEW_BASE`` names one explicitly. Otherwise, when this
+    checkout has git history, the parent of the first commit that added
+    ``lifecycle_voids.py`` is exported from the repository's own history, so an
+    ordinary CI checkout with full history runs the two compatibility tests.
+    None means neither source is available and the caller skips with its reason.
+    """
+    configured = os.environ.get('ORCHESTRA_F0_REVIEW_BASE')
+    if configured:
+        return Path(configured)
+    root = Path(lifecycle.__file__).resolve().parent
+    if not (root / '.git').exists():
+        return None
+    try:
+        added = subprocess.run(
+            ['git', '-C', str(root), 'log', '--diff-filter=A', '--reverse', '--format=%H',
+             '--', 'lifecycle_voids.py'], capture_output=True, text=True, timeout=60)
+        commits = added.stdout.split()
+        if added.returncode or not commits:
+            return None
+        destination = Path(tempfile.mkdtemp(prefix='orchestra-pre-void-kit-'))
+        atexit.register(shutil.rmtree, destination, ignore_errors=True)
+        _extract_kit(root, commits[0] + '^', destination)
+        return destination
+    except (OSError, subprocess.SubprocessError, tarfile.TarError):
+        return None
+
+
+_PRE_VOID_KIT = []
+_PRE_VOID_RESOLVED = []
+
+
+def pre_void_kit():
+    """Resolve the pre-void kit once for the whole module (extraction is not free)."""
+    if not _PRE_VOID_RESOLVED:
+        _PRE_VOID_KIT.append(resolve_pre_void_kit())
+        _PRE_VOID_RESOLVED.append(True)
+    return _PRE_VOID_KIT[0]
 
 
 class NativeVoidTests(fixture.RealBdLabelAliasTests):
@@ -323,8 +384,8 @@ class NativeVoidTests(fixture.RealBdLabelAliasTests):
     def test_real_export_offline_list_parity_and_wrong_journal_paths(self):
         import admin,os,subprocess,sys
         from pathlib import Path
-        base=os.environ.get('ORCHESTRA_F0_REVIEW_BASE')
-        if not base:self.skipTest('requires pinned pre-VOID kit for main-beside-tip offline CLI proof; never run in ordinary CI')
+        base=pre_void_kit()
+        if not base:self.skipTest('no pre-VOID kit: set ORCHESTRA_F0_REVIEW_BASE or run from a git checkout with full history')
         task,target=self.make_fact();exported=self.project/'round-two-export.jsonl'
         def read(script,journal=None):
             exported.write_text(''.join(json.dumps(r)+'\n' for r in self.export_rows()))
@@ -409,9 +470,8 @@ class NativeVoidTests(fixture.RealBdLabelAliasTests):
             voids.backup_files(self.project,self.export_rows())
 
     def test_native_restore_refuses_backup_created_by_pre_void_kit(self):
-        import os
-        base=os.environ.get('ORCHESTRA_F0_REVIEW_BASE')
-        if not base:self.skipTest('requires explicit pinned pre-VOID kit for native backup compatibility')
+        base=pre_void_kit()
+        if not base:self.skipTest('no pre-VOID kit: set ORCHESTRA_F0_REVIEW_BASE or run from a git checkout with full history')
         self.omitted_backup_restore(base)
 
 
