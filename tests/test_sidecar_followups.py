@@ -161,6 +161,7 @@ class DirectoryInPlaceOfACopyTests(native_sync.RuntimeCase):
                 self.assertEqual(code, 0, stderr)
                 self.assertEqual(admin.backup_pair_state(self.root, 'alpha'), (True, None))
 
+    @unittest.skipUnless(os.name == 'posix', 'replacing a symlink to a directory with a file is a POSIX rename; Windows refuses it')
     def test_a_symlink_to_a_directory_is_not_refused_and_the_link_is_replaced(self):
         """kittrial-5bb.160 item 2: the directory refusal is for a REAL directory.
 
