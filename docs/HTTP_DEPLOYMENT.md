@@ -67,6 +67,18 @@ authority locks before the effect. Recording a fact writes evidence; it does not
 merge code, deploy a release or perform a verification. Shared native policy
 refusals are shown as complete sentences on the page.
 
+An open native integration hold or a failed verifier attestation refuses every
+`reviewed` and `integrated` value and merge-slot acquisition, including exact
+retries through HTTP, backend result and endpoint receipt caches. The same native
+hold sentences identify the record and who can clear it, and the page disables
+those actions. Stored holds remain effective when `review_workflow_writes` is
+OFF; that setting governs writing `attest`, `hold` and `release-hold`, which stay
+host-only. The merge adapter forwards the configured setting to the native gate.
+Releasing an explicit hold, or superseding a failed attestation as described in
+[reviews](REVIEWS.md), restores eligibility subject to the ordinary source,
+approval, party and slot checks. An `unknown` attestation remains visible and
+does not itself hold a contribution.
+
 Every write needs an `Idempotency-Key`. After an ambiguous response, keep the exact
 body and key; the named client's `UncertainOutcome` retains the key. The browser
 stores lifecycle intents in actor-scoped session storage before sending, and offers

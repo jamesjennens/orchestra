@@ -1462,6 +1462,16 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                     denied_status.append(403)
                     raise web_lifecycle.LifecycleError(403,'Verified web authority required in this project')
                 return True
+            def lifecycle_identity():
+                lifecycle_authority()
+                if payload and payload['dimension'] in ('reviewed','integrated'):
+                    from lifecycle import read_event_rows, require_unheld_fact
+                    rows=read_event_rows(runner)
+                    issue=next((row for row in rows if row.get('id')==body['task']),None)
+                    try:require_unheld_fact(issue,payload['dimension'],body['task'])
+                    except ValueError as error:
+                        denied_status.append(409)
+                        raise web_lifecycle.LifecycleError(409,str(error)) from None
             def lifecycle_parties(label):
                 # Same full party policy as HTTP approval, from the configured
                 # store under its held lock. No descriptor supplies this state.
@@ -1501,9 +1511,9 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                         return lifecycle_effect()
                 answer=guarded_write(root,request,journal_path(path),lifecycle_effect,
                                      authority_config=authority_config,require_authority=True,
-                                     runner=runner,identity_check=lifecycle_authority)
+                                     runner=runner,identity_check=lifecycle_identity)
                 if denied_status and answer.get('returncode')==2:
-                    answer['lifecycle_status']=403
+                    answer['lifecycle_status']=denied_status[-1]
                 return answer
         except web_lifecycle.LifecycleError as error:
             return {'returncode':2,'stdout':'','stderr':str(error)+'\n','lifecycle_status':error.status}
@@ -1531,6 +1541,19 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                         or (operation in ('create','force-release') and descriptor.get('via')!='session')):
                     denied_status.append(403)
                     raise SlotError(403,'Verified web authority required for this merge-slot operation in this project')
+            def slot_identity():
+                slot_authority()
+                if operation=='acquire':
+                    from lifecycle import read_event_rows
+                    from coordination import require_unheld_merge_task
+                    rows=read_event_rows(runner)
+                    issue=next((row for row in rows if row.get('id')==payload['task']),None)
+                    try:
+                        require_unheld_merge_task(issue,payload['task'],
+                            configured_operators(root) if rules['independent_approval'] else None,path)
+                    except CoordinatorRuleRefusal:
+                        denied_status.append(409)
+                        raise
             rules=configured_coordinator_rules(root,warnings=run_warnings)
             def slot_effect():
                 result=slot_apply(payload,actor,runner,path,request.get('operation_id'),
@@ -1551,8 +1574,8 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                     raise SlotError(422,'A stable operation identity is required for a merge-slot write')
                 answer=guarded_write(root,request,journal_path(path),slot_effect,
                                      authority_config=authority_config,require_authority=True,
-                                     runner=runner,identity_check=slot_authority)
-                if denied_status and answer.get('returncode')==2:answer['merge_slot_status']=403
+                                     runner=runner,identity_check=slot_identity)
+                if denied_status and answer.get('returncode')==2:answer['merge_slot_status']=denied_status[-1]
                 return answer
         except CoordinatorRuleRefusal as error:
             # Preserve the slot's conflict status and identify the native rule refusal.

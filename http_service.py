@@ -1550,6 +1550,12 @@ class EndpointBackend:
                                                      now=self.service._expiry_now()),
                          require_authority=True)
 
+    def lifecycle_replay_guard(self, principal, project_id, task_id, dimension):
+        state = self.lifecycle_read(principal, project_id, task_id)
+        sentence = (state.get('hold_refusals') or {}).get(dimension)
+        if sentence:
+            raise conflict(sentence)
+
     # -- transport -------------------------------------------------------------
     # A project's tasks live in a canonical Beads project that only an operator creates on
     # the host (admin.py add-project), so the HTTP route only REGISTERS an existing one
@@ -2021,15 +2027,20 @@ class EndpointBackend:
             raise not_implemented('Canonical backend cannot perform %s: %s'
                                   % (route, self.UNRESOLVED[route]))
         result_key = self._result_key(principal, project_id, route, key, target) if key else None
+        cached = None
         with self.service.store.lock:
             if authorize is not None:
                 authorize()
             if result_key is not None and self.service.has_result(result_key):
-                # The endpoint is not asked: the time is the one kept with the stored result,
-                # and none where none was kept (a result stored before the time was kept).
-                # Never the service's clock, which is the time of the retry (kittrial-5bb.97).
-                WRITTEN.at = self.service.result_written_at(result_key) or False
-                return self.service.result_get(result_key)
+                cached = (self.service.result_get(result_key), self.service.result_written_at(result_key))
+        if cached is not None:
+            if route == 'lifecycle.fact' and payload.get('dimension') in ('reviewed','integrated'):
+                self.lifecycle_replay_guard(principal, project_id, payload['task_id'], payload['dimension'])
+            elif route == 'merge-slot.acquire':
+                self.lifecycle_replay_guard(principal, project_id, payload['task_id'], 'merge-acquire')
+            # Keep the original time and response after the current native hold check.
+            WRITTEN.at = cached[1] or False
+            return cached[0]
         # The row rule for a credential issued before it is settled ONCE, here, before the
         # write is sent: the credential then carries the outcome and no later write reads
         # the tracker (kittrial-5bb.188 item 5).
@@ -3941,7 +3952,7 @@ class ApiHandler(BaseHTTPRequestHandler):
     def _mutate(self, ctx, route_name, project_id, fn, *, capability, allow_self_user=None,
                 status=200, idempotent=True, replay_status=None, serialize=True,
                 canonical=False, reason=None, refused_reason=None,
-                audit_success=True, state_saved=None, audit_metadata=None):
+                audit_success=True, state_saved=None, audit_metadata=None, replay_check=None):
         """Run one authorized, idempotent mutation.
 
         ``capability`` names the authority the route needs. The idempotency key is
@@ -3966,6 +3977,9 @@ class ApiHandler(BaseHTTPRequestHandler):
                 ctx.principal, project_id, idem_route, key, ctx.body_hash,
                 canonical=canonical and serialize is False)
             if kind == 'replay':
+                if replay_check is not None:
+                    ctx.authorize()
+                    replay_check()
                 # An exact retry must not re-deliver a one-time secret; the caller
                 # marks that with replay_status (200 metadata-only for issue routes).
                 # The header carries the time of the write, as kept with the stored answer.
@@ -5145,8 +5159,13 @@ class ApiHandler(BaseHTTPRequestHandler):
                 except (OSError, TimeoutError):
                     raise UncertainOutcome() from None
             return result, result
+        def replay_check():
+            if (operation == 'fact' and ctx.params['dimension'] in ('reviewed','integrated')
+                    and hasattr(self.backend, 'lifecycle_replay_guard')):
+                self.backend.lifecycle_replay_guard(ctx.principal, ctx.params['pid'],
+                    ctx.params['tid'], ctx.params['dimension'])
         return self._mutate(ctx, route_name, ctx.params['pid'], write, capability=CAP_COORDINATE,
-                            status=201, serialize=False, canonical=True, audit_success=False)
+                            status=201, serialize=False, canonical=True, audit_success=False, replay_check=replay_check)
 
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/lifecycle/scope')
     def lifecycle_scope(self, ctx):
@@ -5230,9 +5249,13 @@ class ApiHandler(BaseHTTPRequestHandler):
         # Persist the audit before the HTTP receipt. A lost canonical response
         # reconciles through the existing guarded receipt, with its original
         # before/after holder metadata, without releasing a later holder.
+        def replay_check():
+            if operation == 'acquire' and hasattr(self.backend, 'lifecycle_replay_guard'):
+                self.backend.lifecycle_replay_guard(ctx.principal, ctx.params['pid'],
+                    ctx.payload['task_id'], 'merge-acquire')
         return self._mutate(ctx, 'merge-slot.' + operation, ctx.params['pid'], write,
                             capability=capability, serialize=False, canonical=True,
-                            audit_success=False)
+                            audit_success=False, replay_check=replay_check)
 
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/merge-slot/acquire')
     def merge_slot_acquire(self, ctx):

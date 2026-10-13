@@ -1851,6 +1851,16 @@ def release_query(payload,actor,run,operators=None,journal=None):
             'live_releases':live}
 
 
+def require_unheld_fact(issue, dimension, task):
+    """The native hold gate, also used before web approval checks and receipt replay."""
+    if dimension in ('reviewed','integrated'):
+        sentence=held_issue_sentence(issue)
+        if sentence:
+            raise ValueError('Refusing to record %s for %s: %s. A held contribution is not '
+                             'integration-ready; the hold must be released (or a corrected attestation '
+                             'recorded) first.'%(dimension,task,sentence))
+
+
 def apply_native(payload, actor, run, operators=None, journal=None, lifecycle_authors=False,
                  independent_approval=False, owners=None):
     """Caller holds project lock; run(argv) invokes pinned bd and returns stdout.
@@ -1893,16 +1903,7 @@ def apply_native(payload, actor, run, operators=None, journal=None, lifecycle_au
             from review_workflow import require_independent_approval
             require_independent_approval(issue,payload['dimension'],payload['task'],
                                          operators=operators,owners=owners,journal=journal)
-    # A task whose CURRENT contribution is held is not integration-ready (kittrial-5bb.10
-    # item 4): `reviewed` and `integrated` facts for it are refused with the hold's own
-    # sentence, before any write, so a held contribution cannot be recorded as reviewed or
-    # integrated. Judged from the same export the rest of this write already reads.
-    if payload['dimension'] in ('reviewed','integrated'):
-        sentence=held_issue_sentence(issues.get(payload['task']))
-        if sentence:
-            raise ValueError('Refusing to record %s for %s: %s. A held contribution is not '
-                             'integration-ready; the hold must be released (or a corrected attestation '
-                             'recorded) first.'%(payload['dimension'],payload['task'],sentence))
+    require_unheld_fact(issues.get(payload['task']), payload['dimension'], payload['task'])
     # A SINGLE fact must name the task's CURRENT scope: a fact recorded under an
     # older, previously recorded scope is refused here with main's rule (rev3 item
     # 2). Only the release operation may write a fact under an already-recorded

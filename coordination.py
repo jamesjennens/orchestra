@@ -320,6 +320,20 @@ def repair_merge_slot(run,slot):
     if changes:run(['update',slot,*changes,'--json'])
     return fixed,wanted
 
+def require_unheld_merge_task(issue, task, operators=None, project=None):
+    """Shared native hold refusal for acquisition, including web receipt replay."""
+    from review_workflow import project as review_project, integration_hold_sentence, CoordinatorRuleRefusal
+    state=None
+    if issue is not None:
+        try: state=review_project(issue,operators=operators,journal=project)
+        except ValueError: state=None
+    sentence=integration_hold_sentence(state) if state else None
+    if sentence:
+        raise CoordinatorRuleRefusal('merge-acquire refused for %s: %s. A held contribution is not '
+                         'integration-ready, so the merge slot is not taken until the hold is released.'
+                         %(task,sentence))
+
+
 def apply_native(p, actor, run, project, operators=None, coordinator_writes=False, independent_approval=False,
                  owners=None, verified_web_authority=False, review_writes=False):
     """Caller holds canonical project lock. Journals belong to runtime, never Git.
@@ -449,15 +463,7 @@ def apply_native(p, actor, run, project, operators=None, coordinator_writes=Fals
         rows=read_event_rows(run)
         try: issue=task_row(rows,p['task'])
         except ValueError: issue=None
-        state=None
-        if issue is not None:
-            try: state=review_project(issue,operators=operators,journal=project)
-            except ValueError: state=None
-        sentence=integration_hold_sentence(state) if state else None
-        if sentence:
-            raise CoordinatorRuleRefusal('merge-acquire refused for %s: %s. A held contribution is not '
-                             'integration-ready, so the merge slot is not taken until the hold is released.'
-                             %(p['task'],sentence))
+        require_unheld_merge_task(issue, p['task'], operators, project)
     context_path=project/'.merge-context.json'
     if op=='merge-create':
         # Creates the slot, or says it exists; either way a damaged row is put right.

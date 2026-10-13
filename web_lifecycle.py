@@ -173,20 +173,36 @@ def read(task, actor, run, project, *, coordinate=False, mark_writes=False,
         mark_admission(project, mark_writes)
     except LifecycleError as error:
         mark_reason = str(error)
+    hold_refusals = {}
+    for dimension in ('reviewed', 'integrated'):
+        try:
+            lifecycle.require_unheld_fact(issue, dimension, task)
+        except ValueError as error:
+            hold_refusals[dimension] = str(error)
+    from coordination import require_unheld_merge_task
+    try:
+        require_unheld_merge_task(issue, task, operators, project)
+    except ValueError as error:
+        hold_refusals['merge-acquire'] = str(error)
     affordances = {}
     for dimension in lifecycle.DIMENSIONS:
         why = None if coordinate else 'Current coordinate permission is required'
         if why is None and scope is None:
             why = 'Set a lifecycle scope first'
         if why is None and dimension in ('reviewed', 'integrated'):
-            why = reason
+            try:
+                lifecycle.require_unheld_fact(issue, dimension, task)
+            except ValueError as error:
+                why = str(error)
+            if why is None:
+                why = reason
         affordances[dimension] = dict(allowed=why is None, reason=why)
         if dimension == 'integrated':
             affordances[dimension]['passed'] = dict(allowed=why is None and mark_reason is None,
                                                     reason=why or mark_reason)
     return dict(task=task, scope=scope, scope_token=content_hash(scope) if scope is not None else None,
                 facts=facts, contribution=review.get('contribution'),
-                standing_approval=approval, approval_reason=reason,
+                standing_approval=approval, approval_reason=reason, hold_refusals=hold_refusals,
                 scope_write=dict(allowed=coordinate, reason=None if coordinate else 'Current coordinate permission is required'),
                 affordances=affordances, mark_writer_enabled=mark_writes is True)
 
@@ -214,6 +230,10 @@ def apply(body, actor, run, project, project_name, operation_id, *, authority,
             raise LifecycleError(409, 'Lifecycle scope changed; use the current scope')
     strict = payload['dimension'] in ('reviewed', 'integrated')
     if strict:
+        try:
+            lifecycle.require_unheld_fact(issue, payload['dimension'], body['task'])
+        except ValueError as error:
+            raise LifecycleError(409, str(error)) from None
         approved_source(issue, payload['scope'], operators, owners, project, parties)
         held_slot(run, project, actor, body['task'])
     marked = payload['dimension'] == 'integrated' and payload['value'] == 'passed'
