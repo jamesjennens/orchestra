@@ -1,5 +1,154 @@
 # Installation and recovery
 
+## Lifecycle event audit and host corrections
+
+`admin.py --root ROOT lifecycle-audit PROJECT --limit 50 --offset 0` is a read-only,
+bounded page of recorded lifecycle attribution and standing approval evidence.
+It reports omitted and unclassifiable counts, project-wide questionable fact
+counts, and every correction's operation key, operator, native time, reason and
+evidence. Active VOID, retracted VOID, retraction and incomplete native comments
+remain visible. `correction_status` says incomplete or damaged; an unpaired
+native comment never establishes issuance authority or silently reads as a
+clean audit. Event and correction pages share `--limit` and `--offset`;
+`page_total` and `next_offset` cover both streams, and their omitted counts are
+reported separately. A recorder's current assignee or
+operator relationship is shown separately from approval at recording time;
+historical principal ownership cannot be proved by today's registry. Questionable
+evidence is for operator review, not a finding of fraud. Reads create no store.
+
+The host-only writer is OFF on a new installation and stays OFF on upgrade unless
+an operator explicitly changes it. First install this reader, backup and restore
+support on **every installation that may hold or restore the project**. Then a
+listed deployment operator may use. The switch takes a **plain listed name
+only**; a project principal's bound actor may issue VOID/retraction, but cannot
+flip this installation setting merely by its principal binding:
+
+```sh
+python3 admin.py --root ROOT lifecycle_void_writes status --actor OPERATOR
+python3 admin.py --root ROOT lifecycle_void_writes on --actor OPERATOR
+python3 admin.py --root ROOT lifecycle-event-void PROJECT EVENT_ID --actor OPERATOR --reason "Evidence is incorrect" --evidence REVIEW_POINTER --operation-id UNIQUE_KEY
+python3 admin.py --root ROOT lifecycle-event-retract PROJECT UNIQUE_KEY --actor CURRENT_OPERATOR --reason "Evidence reconciled" --evidence RECONCILIATION_POINTER --operation-id NEW_UNIQUE_KEY
+python3 admin.py --root ROOT lifecycle_void_writes off --actor OPERATOR
+```
+
+Use a fresh unpredictable operation key, or omit `--operation-id` to allocate one.
+Retain the returned key and exact reason/evidence/actor for retry. A failure after
+the native comment write says the effect is uncertain and names that key. The
+exact retry binds the already stored native comment and publishes its missing
+host record; it does not create another native comment. A reused key naming
+different content or actor refuses. Retraction names the VOID operation key.
+If another key already voids the event, a pending/cut key cannot publish a second
+VOID on retry: the refusal names the operation already in effect.
+
+**An incomplete correction stops this project's backups** until its exact native
+comment is paired with a valid host entry. There is no abandon-incomplete command
+or permission to delete that comment. Losing the original command does not lose
+its words: `lifecycle-audit PROJECT` lists the incomplete operation, actor, reason
+and evidence. Read the task's native comments (`bd comments TASK --json`, through
+the configured host/client) for its full `Kind: lifecycle-event-correction-v1`
+payload. Recover `operation_id`, `actor`, `binding.event_id`, `reason` and every
+`evidence` pointer from that comment, and repeat the `lifecycle-event-void` command
+above with those exact values (one `--evidence` for each pointer). For an incomplete
+retraction, recover `target_void` and repeat `lifecycle-event-retract` instead.
+Keep the switch ON and the original issuing identity currently authorized for the
+retry. Do not share or take over another actor. A missing/unrecoverable principal
+binding requires the
+operator's normal identity reconciliation before retry; backups remain stopped.
+
+If another VOID key is now in effect, a current operator first records its linked
+retraction with a fresh key/reason/evidence, then retries the incomplete operation
+with the recovered exact values. If that newly published VOID should not remain
+effective, retract it with another fresh audited key. Retain all comments and
+host entries. If the native payload or target itself cannot be recovered, preserve
+the stopped project and use a verified complete native/coordination backup in an
+unused destination; never fabricate a journal entry to resume backups.
+
+Authority is checked under the project and deployment configuration locks. A
+currently listed operator's registered actor may act through the same bound
+principal; another principal or an unreadable registry grants no exemption.
+This intentionally extends the raw native-write operator exemption to a listed
+operator's bound actor as well. Unbound actor names remain attribution on a
+trusted host, not authentication. Contributor routes cannot issue corrections.
+Registry damage proves no exemption for a lifecycle-shaped raw write. Ordinary
+create, update, dependency, close and reopen requests do not need that exemption
+and do not read the registry merely for this guard.
+
+A correction binds the exact native event, original payload, parent task, native
+author/time, and matching correction comment to `.lifecycle-voids/`. The comment
+alone has no authority. An issued VOID remains effective after operator
+replacement until a currently authorized operator records its linked retraction.
+The original lifecycle event and labels are unchanged: affected derived values
+are UNKNOWN with `voided` (or a specific binding/restore failure reason), including
+historical scope and retry reads. An older pass cannot reappear by deleting or
+changing the target event. Independent valid scopes keep their existing meaning.
+Recorded release, rollback and capability-verification records are unchanged.
+A host-made invalid entry that names an event belonging to another task makes the
+entry's claimed task's whole lifecycle read UNKNOWN with its binding reason.
+The actual event is retained once; no duplicate event row is invented.
+
+Backups include this bounded family only when present, with a closed generation
+manifest carrying every member hash, count, byte count and a bounded hash of the
+complete native correction-comment generation. An older sidecar paired with newer
+native correction comments is refused. Both target and native
+comment bindings and the retraction graph must validate. An absent family leaves
+legacy backup bytes unchanged. A trusted host restore restores issuance evidence;
+it never re-grants the recorded operator. A copied native comment without the host
+family remains unissued and is listed as incomplete by the audit. A native generation that differs from the sidecar requires
+operator reconciliation and stays UNKNOWN.
+
+The family has a lifetime limit of **1,000 records and 4 MiB per project**;
+retracted VOID/retraction pairs still count. The writer reserves room to retract
+outstanding VOID records. At the limit, retain the family and native evidence,
+turn the writer OFF if necessary, and upgrade every reader/restorer to a kit with
+larger validated bounds before adding corrections. Do not delete/prune old
+entries or native comments to make space: doing so loses binding/history and
+requires operator reconciliation.
+
+Offline `lifecycle.py list --export FILE --journal PROJECT_DIRECTORY`,
+`evidence-owed --export FILE --journal PROJECT_DIRECTORY`, and release selection
+read the same family. Without a usable journal for this export's project, ordinary
+facts and release targets keep main's answers, with additive
+`corrections_consulted: false` and one note. Only events named by a native
+correction comment in the export read UNKNOWN with
+`lifecycle-corrections-not-consulted`. When that hides an otherwise reported release
+row, evidence-owed refuses with a nonzero exit instead of a misleading empty or
+partial list. A correction to a different fact does not suppress known debt, and
+a genuinely debt-free export still returns an empty list with the note. Without
+correction comments it preserves the owed releases (or a genuinely empty result)
+and adds the consultation note. A nonexistent `--journal` directory is an error.
+Another project's family or an ordinary folder without this project's native
+identity does not establish consultation. A family is associated through exact
+native correction comments; its absence can be established through the native
+project database identity matching the export's issue prefix. The
+writing release's local candidate report discloses an unconsulted family; the
+endpoint validates each actual target before any effects.
+
+Restore installs `.lifecycle-void-restore.json` before any member replacement and
+clears it only after the complete family/native pair matches. A cut retains this
+marker, and readers report UNKNOWN even if an earlier pass is still present.
+Repeat the exact restore with its original manifest to complete it. A different
+manifest, damaged existing family, or a legacy backup that would discard an
+existing VOID family refuses; preserve the files and reconcile using a complete
+VOID-capable backup. Do not delete the marker to make a partial restore look done.
+This also refuses a backup whose manifest **and all family members** were
+omitted while native correction comments remain, including an older-kit backup
+and `--without-coordination`. The refusal retains an incomplete restore marker;
+reads stay UNKNOWN, audit reports the incomplete corrections and backup refuses
+the destination. Preserve it and restore a complete VOID-capable backup into an
+unused destination.
+There is **NO override**, including `--without-coordination`, for a family-less
+backup that carries native correction comments. That flag can discard ordinary
+coordination state; it cannot discard this correction evidence or its marker.
+
+**Rollback:** an older kit ignores this family and can report the original fact.
+It also refuses a sidecar containing these new paths. Before rolling the kit back,
+take and retain a final complete backup using this kit. If both old and new readers
+must agree, explicitly retract outstanding VOID corrections while this kit still
+runs and retain their evidence. Turning the writer OFF does not retract corrections.
+Never use an older kit to back up or restore a project with this family, or assume
+its lifecycle report reflects the correction. Upgrade to a restore-capable kit to
+recover the retained complete generation.
+
 ## Install on Linux
 
 Use an ordinary service account with a writable home, Python 3.10+, user systemd, and HTTPS access to GitHub release assets. Copy this kit to `/home/beads/beads-team-kit` in this example. Each deployment needs its own root, port and service name. Installation refuses unmanaged binaries or an existing service with the same name.
@@ -2389,7 +2538,7 @@ On an older kit a released row holds no key either, and it is never claimable:
 
 #### Operator removal and restore policy
 
-`admin.py operators remove OPERATOR` is a revocation, not a cleanup: voids that operator authored stop applying on read, the incident is reported as unreconciled again, and re-adding the operator restores those dispositions. The same holds for the requirement-proposal dispositions, owner decisions and contribution settings they recorded; the refusal names the proposals and settings that change (see "Requirement proposals" above). Every affected list in that refusal is capped at five entries with `(+N more)`; `operators remove OPERATOR --all-revoked` names all of them instead. Because that destroys recorded dispositions, `remove` refuses unless `--confirm-revoke` acknowledges the consequence.
+`admin.py operators remove OPERATOR` is a revocation, not a cleanup: the existing review and keyed-record voids that operator authored stop applying on read, the incident is reported as unreconciled again, and re-adding the operator restores those dispositions. The same holds for the requirement-proposal dispositions, owner decisions and contribution settings they recorded; the refusal names the proposals and settings that change (see "Requirement proposals" above). Every affected list in that refusal is capped at five entries with `(+N more)`; `operators remove OPERATOR --all-revoked` names all of them instead. Because that destroys recorded dispositions, `remove` refuses unless `--confirm-revoke` acknowledges the consequence.
 
 The allowlist is deployment configuration rather than a native Beads object, so each project's complete coordination sidecar records the allowlist in force at backup time. **A restore does not re-grant it by default.** The allowlist is authority for *every* project on the deployment, so a backup taken before `operators remove ACTOR --confirm-revoke` would otherwise silently restore that actor's authority deployment-wide — including for projects the backup has nothing to do with. `restore-new` therefore restores the native records, the coordination sidecar and the operation journal, but leaves the deployment allowlist untouched. When the backup records operators this host does not list, the command prints them by name, states that they were **NOT** restored, and explains that void records they authored stay inert on the restored project until authority is granted again. Nothing is deleted: the void comments and their `original` bytes are intact, and they apply again as soon as the actor is deliberately re-added.
 

@@ -221,6 +221,7 @@ class NoUnguardedParseTests(unittest.TestCase):
         'lane_state.py': (1, 'bd output (the receipt of the comments add that published the reserved '
                              'lane-state record; the record body itself is read through record_json.loads)'),
         'lifecycle.py': (3, "bd output, plus the endpoint's release-query and group answers on the caller's machine (kittrial-5bb.107 rev3)"),
+        'lifecycle_voids.py': (1, 'the bd comments-add receipt; native record bodies and bounded host journal files use the guard'),
         'native.py': (2, 'bd output'),
         'office_service.py': (1, 'host configuration'),
         'proposal_records.py': (4, 'bd output, the host session file, and a copy of a structure the kit built'),
@@ -299,10 +300,14 @@ class NoUnguardedParseTests(unittest.TestCase):
             # the guard and a nested body is dropped as an unusable record.
             # http_authority reads the operation of an attached review record through the guard,
             # exactly as work.py does, to know which capability the request needs (kittrial-5bb.261).
-            'handoff.py': 1, 'http_authority.py': 1, 'http_service.py': 3, 'lane_state.py': 1, 'lifecycle.py': 1, 'recovery.py': 1, 'requirements.py': 1, 'requirement_records.py': 1, 'reserved_comments.py': 1,
+            # lifecycle.py also guards exported correction payloads in its offline reader.
+            'handoff.py': 1, 'http_authority.py': 1, 'http_service.py': 3, 'lane_state.py': 1, 'lifecycle.py': 2, 'recovery.py': 1, 'requirements.py': 1, 'requirement_records.py': 1, 'reserved_comments.py': 1,
             # The simple owner adapter guards bd's decision-create receipt too.
             'requirement_http.py': 2,
             'web_merge_slot.py': 4,
+            # F0: bounded host entries/restore marker and native correction/comment
+            # bodies use the guard; none is trusted merely because it parses.
+            'lifecycle_voids.py': 5,
             'review_recommendations.py': 2, 'review_workflow.py': 4, 'work.py': 1, 'worker_gate.py': 1})
 
     def test_the_parsers_that_do_not_call_it_directly_reach_it(self):

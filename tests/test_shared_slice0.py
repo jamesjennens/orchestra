@@ -9,6 +9,7 @@ directions, every surface of the shared ten-surface list, the `proposals` scope,
 the deployment `verifiers` key, a rollback round trip and the absence of any writer.
 """
 import contextlib
+from void_test_helpers import without_void_tracker
 import io
 import json
 import os
@@ -222,6 +223,7 @@ class JournalTests(unittest.TestCase):
         path.parent.mkdir(exist_ok=True)
         path.write_text(json.dumps(record), encoding='utf-8')
 
+    @without_void_tracker
     def test_a_later_slice_journal_round_trips_through_backup_and_restore(self):
         for journal, record in SLICE1_RECEIPTS.items():
             self.write(journal, record)
@@ -235,6 +237,7 @@ class JournalTests(unittest.TestCase):
             restored = json.loads((self.destination / self.name(journal)).read_text(encoding='utf-8'))
             self.assertEqual(restored, record)
 
+    @without_void_tracker
     def test_malformed_receipts_are_refused_on_backup_validation_and_restore(self):
         bad = [receipt(sha256='nothex'), receipt(status='done'), receipt(revision=0),
                receipt(revision=True), receipt(actor=''), receipt(id=' '),

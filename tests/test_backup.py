@@ -40,6 +40,10 @@ class BackupTests(unittest.TestCase):
         self.patcher = patch.dict(sys.modules, {'fcntl': self.fake_fcntl})
         self.patcher.start()
         self.addCleanup(self.patcher.stop)
+        # These cases isolate coordination sidecars from the tracker. The
+        # native VOID pair is exercised with a real tracker in native tests.
+        for name,value in [('backup_lifecycle_void_family',{}),('restore_lifecycle_void_family',False)]:
+            patcher=patch.object(admin,name,return_value=value);patcher.start();self.addCleanup(patcher.stop)
 
     def allow_operator(self, actor='operator-1'):
         """The reconcile host commands check the deployment operator allowlist (kittrial-5bb.85)."""
@@ -802,6 +806,8 @@ class RequirementJournalBackupTests(unittest.TestCase):
     """
 
     def setUp(self):
+        for name,value in [('backup_lifecycle_void_family',{}),('restore_lifecycle_void_family',False)]:
+            patcher=patch.object(admin,name,return_value=value);patcher.start();self.addCleanup(patcher.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)

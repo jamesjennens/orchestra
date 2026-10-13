@@ -1,4 +1,5 @@
 import contextlib
+from void_test_helpers import without_void_tracker
 import io
 import json
 import tempfile
@@ -44,6 +45,7 @@ class OnboardingTests(unittest.TestCase):
         except OSError:self.skipTest('No symlink privilege')
         with self.assertRaises(ValueError):self.call('docs',['project'])
         with self.assertRaises(ValueError):o.write_project(path,'replacement')
+    @without_void_tracker
     def test_project_document_restores_as_text(self):
         dest=self.root/'projects'/'dest';dest.mkdir(parents=True)
         files={'ONBOARDING.md':{'text':'Restored project 漢'}}

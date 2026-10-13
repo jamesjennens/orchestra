@@ -8,6 +8,7 @@ without `--restore-verifiers`. `admin.py capability-verify` is the only route th
 writes a verified capability check.
 """
 import contextlib
+from void_test_helpers import without_void_tracker
 import io
 import json
 import os
@@ -194,6 +195,7 @@ class BackupRestoreTests(VerifiersCase):
             admin.backup_project(self.root, 'trial')
         return json.loads((self.root / 'backups' / 'trial.coordination.json').read_text(encoding='utf-8'))
 
+    @without_void_tracker
     def restore(self, **flags):
         (self.root / 'projects' / 'other').mkdir(exist_ok=True)
         with contextlib.redirect_stdout(io.StringIO()) as out:

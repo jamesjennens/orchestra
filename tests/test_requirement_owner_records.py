@@ -1,4 +1,5 @@
 import copy
+from void_test_helpers import without_void_tracker
 import json
 import sys
 import tempfile
@@ -592,6 +593,7 @@ class OwnerEvidenceTests(unittest.TestCase):
             http.empty_creation(receipt, self.context, 'new-requirement', self.native)
         self.assertEqual(path.read_bytes(), before)
 
+    @without_void_tracker
     def test_actual_backup_restore_preserves_optional_binding_and_release_audit(self):
         import admin
         from http_authority import NativeRunner, OperationJournal, journal_path
