@@ -2312,11 +2312,14 @@ def main():
             from export_requirements import read_export
             rows=offline_snapshot(read_export(a.export),a.journal or None)
             consulted=rows.offline_corrections_consulted
-            if not consulted and (rows.lifecycle_corrections['reasons'] or rows.lifecycle_corrections['task_reasons']):
-                raise ValueError('Lifecycle corrections were not consulted; evidence owed is unknown for '
-                                 'events with correction comments. Pass --journal PROJECT_DIRECTORY; '
-                                 'no empty evidence-owed result is asserted.')
             report=evidence_owed(rows)
+            if not consulted and (rows.lifecycle_corrections['reasons'] or rows.lifecycle_corrections['task_reasons']):
+                def debts(groups):
+                    return {(g['environment'],g['release_id'],t['task']) for g in groups for t in g['tasks']}
+                if debts(evidence_owed(list(rows))) - debts(report):
+                    raise ValueError('Lifecycle corrections were not consulted; evidence owed is unknown for '
+                                     'release rows hidden by correction comments. Pass --journal PROJECT_DIRECTORY; '
+                                     'no empty or partial evidence-owed result is asserted.')
             if not consulted:print(OFFLINE_CORRECTION_NOTE,file=sys.stderr)
             for item in report:
                 item['corrections_consulted']=consulted

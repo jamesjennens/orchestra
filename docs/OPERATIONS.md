@@ -113,8 +113,10 @@ read the same family. Without a usable journal for this export's project, ordina
 facts and release targets keep main's answers, with additive
 `corrections_consulted: false` and one note. Only events named by a native
 correction comment in the export read UNKNOWN with
-`lifecycle-corrections-not-consulted`. An evidence-owed command with such comments
-refuses with a nonzero exit instead of reporting a misleading empty list. Without
+`lifecycle-corrections-not-consulted`. When that hides an otherwise reported release
+row, evidence-owed refuses with a nonzero exit instead of a misleading empty or
+partial list. A correction to a different fact does not suppress known debt, and
+a genuinely debt-free export still returns an empty list with the note. Without
 correction comments it preserves the owed releases (or a genuinely empty result)
 and adds the consultation note. A nonexistent `--journal` directory is an error.
 Another project's family or an ordinary folder without this project's native

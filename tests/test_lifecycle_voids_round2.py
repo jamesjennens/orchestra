@@ -51,8 +51,9 @@ class OfflineRoundTwoTests(unittest.TestCase):
         self.assertIsNone(context['global_reason'])
         self.assertEqual(context['reasons'],{'p-task.2':'lifecycle-corrections-not-consulted'})
         self.assertEqual(self.release()['targets'],[])
-        with self.assertRaisesRegex(SystemExit,'evidence owed is unknown'):
-            self.cli('evidence-owed')
+        debt,warning=self.cli('evidence-owed')
+        self.assertEqual(debt,[])  # This fixture never deployed anything.
+        self.assertIn('not consulted',warning)
 
     def test_nonexistent_journal_is_an_error_for_list_release_and_owed(self):
         missing=self.project/'absent'
@@ -74,8 +75,7 @@ class OfflineRoundTwoTests(unittest.TestCase):
         self.assertEqual(got[0]['facts']['integrated'].get('reason'),'lifecycle-corrections-not-consulted')
         report=self.release('--journal',str(other))
         self.assertFalse(report.get('corrections_consulted',True));self.assertEqual(report['targets'],[])
-        with self.assertRaisesRegex(SystemExit,'evidence owed is unknown'):
-            self.cli('evidence-owed','--journal',str(other))
+        self.assertEqual(self.cli('evidence-owed','--journal',str(other))[0],[])
 
     def test_folder_without_family_or_project_identity_does_not_claim_consultation(self):
         self.apply(self.payload())
@@ -112,6 +112,39 @@ class OfflineRoundTwoTests(unittest.TestCase):
         fact=self.cli('list')[0][0]['facts']['integrated']
         self.assertEqual(fact['value'],'unknown')
         self.assertEqual(fact.get('reason'),'lifecycle-corrections-not-consulted')
+
+    def deployed_with_comment(self,dimension):
+        from test_lifecycle_release import NativeStore,payload,scope
+        from requirements import canonical_bytes
+        store=NativeStore(tasks=('trial-a',)).seed('trial-a')
+        production=scope(release='synthetic',environment='synthetic')
+        store.record(payload('trial-a','lifecycle-scope',operation='deploy-scope',scope_value=production))
+        store.record(payload('trial-a','deployed',operation='deploy',scope_value=production))
+        self.rows=store.rows
+        event=next(r for r in self.rows if (lifecycle.native_event(r) or {}).get('dimension')==dimension)
+        correction=dict(schema_version=1,operation='void',operation_id='synthetic-owed-void',actor='op',
+                        reason='Synthetic offline debt correction.',evidence=['synthetic review'],
+                        binding=voids.event_binding(event),target_void=None)
+        voids.validate_payload(correction)
+        task=next(r for r in self.rows if r['id']=='trial-a')
+        task.setdefault('comments',[]).append(dict(id='synthetic-comment',author='op',
+            created_at='2026-10-03T00:00:00Z',text=voids.PREFIX+canonical_bytes(correction).decode()))
+
+    def test_unconsulted_unrelated_correction_keeps_known_evidence_owed(self):
+        self.deployed_with_comment('integrated')
+        try:
+            report,warning=self.cli('evidence-owed')
+        except SystemExit as failure:
+            self.fail('An unrelated correction must not refuse known debt: '+str(failure))
+        self.assertTrue(report)
+        self.assertEqual(report[0]['tasks'][0]['deployed'],'passed')
+        self.assertFalse(report[0].get('corrections_consulted',True))
+        self.assertIn('not consulted',warning)
+
+    def test_unconsulted_deployment_correction_cannot_hide_owed_release_as_empty(self):
+        self.deployed_with_comment('deployed')
+        with self.assertRaisesRegex(SystemExit,'evidence owed is unknown'):
+            self.cli('evidence-owed')
 
 
 if __name__=='__main__':unittest.main()
