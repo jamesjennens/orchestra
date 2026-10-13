@@ -300,7 +300,8 @@ class NoUnguardedParseTests(unittest.TestCase):
             # the guard and a nested body is dropped as an unusable record.
             # http_authority reads the operation of an attached review record through the guard,
             # exactly as work.py does, to know which capability the request needs (kittrial-5bb.261).
-            'handoff.py': 1, 'http_authority.py': 1, 'http_service.py': 3, 'lane_state.py': 1, 'lifecycle.py': 1, 'recovery.py': 1, 'requirements.py': 1, 'requirement_records.py': 1, 'reserved_comments.py': 1,
+            # lifecycle.py also guards exported correction payloads in its offline reader.
+            'handoff.py': 1, 'http_authority.py': 1, 'http_service.py': 3, 'lane_state.py': 1, 'lifecycle.py': 2, 'recovery.py': 1, 'requirements.py': 1, 'requirement_records.py': 1, 'reserved_comments.py': 1,
             # The simple owner adapter guards bd's decision-create receipt too.
             'requirement_http.py': 2,
             'web_merge_slot.py': 4,
