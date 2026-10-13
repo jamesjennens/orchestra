@@ -49,6 +49,17 @@ JOURNAL_STORE_NAME='.http-operations.sqlite3'
 #: off-machine copy can read which projects have a complete backup pair.
 BACKUP_STATUS_NAME='backup-status.json'
 
+#: The per-run record an off-machine ``backup-copy`` publishes BESIDE the completeness record
+#: at the destination (kittrial-5bb.160 review 2). A partial run must not remove or rewrite the
+#: completeness record already there — that record is the destination's only statement of when
+#: the last FULL copy was made and that the skipped projects' copies, which a partial run
+#: rightly leaves byte-identical, were complete then — so this file carries the run's own
+#: outcome instead: the time, each project copied with the generation copied, each project
+#: skipped and why, and which completeness record the skipped projects' copies belong to. Every
+#: run (full or partial) writes it, so it never describes a superseded run. It lives only at an
+#: operator's off-machine destination, never in a runtime.
+BACKUP_COPY_RUN_NAME='backup-copy-run.json'
+
 #: Explicit ceiling for one project's native Dolt sync through the SQL client. Unlike
 #: ``bd backup sync``, the SQL client has no fixed ~10 s read timeout, so this only
 #: bounds a genuinely hung server; a large database legitimately needs minutes.
@@ -5247,6 +5258,171 @@ def require_complete_problems(root,record):
             add(name,'%s: the last run recorded %s, not complete'%(name,entry['status']))
     return problems
 
+def backup_copy_skips(root,record):
+    """``[(name, why)]``: the projects a per-project off-machine copy must skip (kittrial-5bb.160).
+
+    The default ``backup-copy`` copies every project whose pair is complete now instead of
+    refusing the whole run for one bad project. A project is copyable only when BOTH the last
+    run recorded it ``complete`` AND its pair is still complete on disk: a failed run puts the
+    previous complete sidecar back, so a record that says ``failed`` must win over a canonical
+    sidecar that merely looks complete. Everything else is skipped with the same reason
+    ``--require-complete`` would name. A retired project is not part of the runtime and is not
+    listed. Sorted by name so the output is deterministic.
+    """
+    entries={entry['name']:entry for entry in record['projects']}
+    live=initialized_projects(root)
+    retired={name for name,_ in retired_entries(root)}-set(live)
+    reasons={}
+    def add(name,reason):
+        if name not in reasons:reasons[name]=reason
+    for entry in record['projects']:
+        if entry['name'] in retired:continue
+        complete,reason=backup_pair_state(root,entry['name'])
+        if not complete:add(entry['name'],reason)
+    for name in live:
+        entry=entries.get(name)
+        if entry is None:
+            add(name,'initialized project is absent from the last run record (added after it, or not on the '
+                    'schedule); run backup --all')
+        elif entry['status']!='complete':
+            add(name,'the last run recorded %s, not complete'%entry['status'])
+    return sorted(reasons.items())
+
+def backup_copy_generation(entry,sidecar_bytes):
+    """The generation of the pair a copy run wrote, named from what the destination holds.
+
+    Native directory, complete sidecar and operation-journal snapshot are one generation, and
+    the complete sidecar is the small file that identifies it, so the SHA-256 of the sidecar
+    bytes copied is the generation's own name at the destination. The UTC time the last run
+    recorded for the project travels alongside, and the native directory's recorded manifest
+    digest when the sidecar carries one (a sidecar written by an older kit records none), so a
+    reader at the destination can tell which copy came from which run (kittrial-5bb.160 review
+    2). Never raises: the caller has the bytes it just copied.
+    """
+    generation={'completed_at':entry.get('completed_at'),
+                'coordination_sha256':hashlib.sha256(sidecar_bytes).hexdigest()}
+    # Through the record guard, not a bare json.loads: a sidecar an older kit or an
+    # operator wrote is still text this kit did not just create, and a deeply nested one
+    # must read as "no manifest to name", never as a RecursionError out of a copy run.
+    try:record=record_json.loads(sidecar_bytes)
+    except (UnicodeDecodeError,ValueError):record=None
+    manifest=record.get(NATIVE_MANIFEST_KEY) if isinstance(record,dict) else None
+    if isinstance(manifest,dict) and isinstance(manifest.get('digest'),str):
+        generation['native_manifest']=manifest['digest']
+    return generation
+
+def backup_copy_full_record(path):
+    """What the completeness record at the destination says, or ``None`` when there is none.
+
+    A partial run must not touch that record, so this only READS it: its own ``generated_at``
+    and ``scope`` name the last full copy, and its SHA-256 pins the exact bytes a reader sees.
+    The record is described rather than validated: a hand-made or older record at an operator's
+    destination is still the record the skipped projects' copies belong to, and refusing to
+    describe it would hide that from the run record.
+    """
+    path=Path(path)
+    if path.is_symlink() or not path.is_file():return None
+    try:raw=path.read_bytes()
+    except OSError:return None
+    described={'name':BACKUP_STATUS_NAME,'sha256':hashlib.sha256(raw).hexdigest()}
+    # The record guard again: this file sits at an operator's off-machine destination, so
+    # it may be hand-made or written by an older kit, and a deeply nested one must be
+    # described by name and SHA-256 rather than fail the run record.
+    try:parsed=record_json.loads(raw)
+    except (UnicodeDecodeError,ValueError):parsed=None
+    if isinstance(parsed,dict):
+        for key in ('generated_at','scope','status'):
+            value=parsed.get(key)
+            if isinstance(value,str):described[key]=value
+    return described
+
+def backup_copy_run_record(full_record,copied,skipped,all_or_nothing,generated_at):
+    """The schema-1 record of ONE off-machine copy run, to publish beside the full record.
+
+    ``status`` is ``partial`` exactly when a project was skipped. ``full_record`` names the
+    completeness record already at the destination (never this run's, unless this run published
+    one), and ``note`` says in words which record the skipped projects' copies belong to. The
+    text is deliberately explicit: from the destination alone, with no log and no runtime, a
+    reader must be able to tell which copy came from which run (kittrial-5bb.160 review 2).
+    """
+    partial=bool(skipped)
+    if partial and full_record is not None:
+        note=('The copies of the skipped projects at this destination are those of the full record named in '
+              'full_record (%s, generated_at %s); this partial run copied only the projects in copied, published '
+              'no new completeness record, and left every other file here unchanged.'
+              %(full_record['name'],full_record.get('generated_at','(no generated_at)')))
+    elif partial:
+        note=('This destination held no completeness record when this partial run ran, so any copy of a skipped '
+              'project here cannot be attributed to a full record; this partial run copied only the projects in '
+              'copied and left every other file here unchanged.')
+    else:
+        note=('This run copied every project it selected and published the completeness record named in '
+              'full_record; every entry in copied is this run\'s copy.')
+    return {'schema_version':1,'kind':'backup-copy-run','status':'partial' if partial else 'complete',
+            'generated_at':generated_at,'all_or_nothing':bool(all_or_nothing),
+            'copied':copied,'skipped':skipped,'full_record':full_record,'note':note}
+
+def validate_backup_copy_run(record):
+    """Validate a run record before it is written, so a destination never gets one that lies.
+
+    The record is a statement a reader at a backup destination may have to trust without the
+    runtime, so it is checked with the same strictness as the other schema-1 records: a known
+    kind and status, a real UTC time, a status that agrees with whether anything was skipped,
+    no repeated project, and a generation or a reason for every entry.
+    """
+    if not isinstance(record,dict):raise ValueError('Backup-copy run record must be an object')
+    if record.get('schema_version')!=1:raise ValueError('Backup-copy run record schema_version must be 1')
+    if record.get('kind')!='backup-copy-run':
+        raise ValueError('Backup-copy run record kind must be backup-copy-run')
+    if record.get('status') not in ('complete','partial'):
+        raise ValueError('Backup-copy run record status must be complete or partial')
+    if not real_utc_timestamp(record.get('generated_at')):
+        raise ValueError('Backup-copy run record generated_at must be a UTC timestamp')
+    if not isinstance(record.get('all_or_nothing'),bool):
+        raise ValueError('Backup-copy run record all_or_nothing must be true or false')
+    copied=record.get('copied');skipped=record.get('skipped')
+    if not isinstance(copied,list) or not isinstance(skipped,list):
+        raise ValueError('Backup-copy run record must list copied and skipped projects')
+    if (record.get('status')=='partial')!=(len(skipped)>0):
+        raise ValueError('Backup-copy run record status must be partial exactly when a project was skipped')
+    seen=set()
+    for item in copied:
+        if not isinstance(item,dict):raise ValueError('Backup-copy run copied entry must be an object')
+        name=item.get('name')
+        try:validate_name(name)
+        except (TypeError,ValueError):raise ValueError('Backup-copy run copied name is invalid: %r'%(name,)) from None
+        if name in seen:raise ValueError('Backup-copy run record repeats project '+name)
+        seen.add(name)
+        generation=item.get('generation')
+        if not isinstance(generation,dict):
+            raise ValueError('Backup-copy run copied entry for %s must carry its generation'%name)
+        digest=generation.get('coordination_sha256')
+        if not isinstance(digest,str) or not re.fullmatch(r'[0-9a-f]{64}',digest):
+            raise ValueError('Backup-copy run generation for %s needs the coordination sidecar sha256'%name)
+        completed=generation.get('completed_at')
+        if completed is not None and not real_utc_timestamp(completed):
+            raise ValueError('Backup-copy run generation completed_at must be a UTC timestamp or absent for %s'%name)
+    for item in skipped:
+        if not isinstance(item,dict):raise ValueError('Backup-copy run skipped entry must be an object')
+        name=item.get('name')
+        try:validate_name(name)
+        except (TypeError,ValueError):raise ValueError('Backup-copy run skipped name is invalid: %r'%(name,)) from None
+        if name in seen:raise ValueError('Backup-copy run record repeats project '+name)
+        seen.add(name)
+        reason=item.get('reason')
+        if not isinstance(reason,str) or not reason.strip():
+            raise ValueError('Backup-copy run skipped entry must say why %s was skipped'%name)
+    full=record.get('full_record')
+    if full is not None:
+        if not isinstance(full,dict):
+            raise ValueError('Backup-copy run full_record must be an object or null')
+        digest=full.get('sha256')
+        if not isinstance(digest,str) or not re.fullmatch(r'[0-9a-f]{64}',digest):
+            raise ValueError('Backup-copy run full_record needs the completeness record sha256')
+    note=record.get('note')
+    if not isinstance(note,str) or not note.strip():
+        raise ValueError('Backup-copy run record must say in note which record the skipped copies belong to')
+
 def copy_destination_path(value):
     """Validate the operator's off-machine copy destination.
 
@@ -5309,12 +5485,23 @@ def _replace_with(staged,target):
             try:previous.unlink()
             except OSError:pass
 
-def backup_copy(root,destination,require_clean=False):
+def backup_copy(root,destination,require_clean=False,all_or_nothing=False):
     """Reference off-machine copy of every project's last complete backup pair.
 
-    The gate is exactly ``backup-status --require-complete``: every initialized project
-    must be in the last run record with a complete pair on disk, or this refuses and
-    names what is missing, copying nothing. Each project is written as
+    By default the copy is PER PROJECT: a project the last run did not record complete, or
+    whose pair is no longer complete on disk (its native directory, sidecar or journal is
+    missing, pending, unreadable or changed), is skipped and named with why, every other
+    project is copied, and the run still exits non-zero because something was skipped. A
+    skipped project's previous off-machine copy is never touched, and nothing already at the
+    destination is removed or rewritten: the completeness record of the last FULL copy stays
+    exactly where it is, byte-identical, and this run publishes its own record beside it
+    (``backup-copy-run.json``) saying that the run was partial, what it copied with each
+    project's generation, what it skipped and why, and which completeness record the skipped
+    projects' copies belong to, so a destination reader can tell which copy came from which
+    run (kittrial-5bb.160 review 2).
+    ``--all-or-nothing`` keeps the older, stricter behaviour: the
+    ``backup-status --require-complete`` gate over every initialized project, refusing and
+    copying nothing when any project is not complete. Each project is written as
     ``<DEST>/<name>`` (its native backup directory), ``<DEST>/<name>.coordination.json``
     (its complete sidecar) and — when the project has one — its operation-journal
     snapshot under the same file name the runtime's ``backups/`` directory uses
@@ -5334,19 +5521,30 @@ def backup_copy(root,destination,require_clean=False):
     project's ``copytree``: a directory that no longer matches — a killed or interrupted run
     can leave it partly rewritten — is refused instead of copied, and a sidecar that records
     no manifest is reported as unverifiable rather than called clean. The completeness record
-    that gated the copy is published last; if anything fails, the destination is left without
-    it and the command exits non-zero with a clear error. The scheduled, encrypted
+    is published last, and only when every project was copied; a partial run leaves the record
+    already at the destination untouched and records itself beside it, and if anything fails
+    the command exits non-zero with a clear error and publishes nothing new. The scheduled,
+    encrypted
     off-machine system, its retention and its encryption stay the operator's: this is a
     generic, credential-free reference the operator can gate and schedule. It reads and
     copies files only; it never touches a unit, timer or schedule.
     """
     import fcntl
     import shutil
+    generated_at=utc_stamp()
     record=read_backup_status(root)
-    problems=require_complete_problems(root,record)
-    if problems:
-        raise SystemExit('backup-copy refused: not every initialized project has a complete backup pair '
-                         'on disk: '+'; '.join(problems))
+    retired={name for name,_ in retired_entries(root)}-set(initialized_projects(root))
+    if all_or_nothing:
+        problems=require_complete_problems(root,record)
+        if problems:
+            raise SystemExit('backup-copy refused: not every initialized project has a complete backup pair '
+                             'on disk: '+'; '.join(problems))
+        skipped=[]
+    else:
+        skipped=backup_copy_skips(root,record)
+    skipped_names={name for name,_ in skipped}
+    to_copy=[entry for entry in sorted(record['projects'],key=lambda item:item['name'])
+             if entry['name'] not in retired and entry['name'] not in skipped_names]
     # A degraded project copies (its tracker backup is restorable), but never silently:
     # each one is named with its message, and --require-clean refuses instead.
     degraded=degraded_projects(root,record)
@@ -5354,6 +5552,7 @@ def backup_copy(root,destination,require_clean=False):
         raise SystemExit('backup-copy refused (--require-clean): %s. %s'%(
             degraded_summary(degraded),' '.join('%s: %s'%item for item in degraded)))
     for name,message in degraded:
+        if name in skipped_names:continue
         print('Degraded, copied as it is: %s: %s'%(name,message))
     try:
         destination=copy_destination_path(destination)
@@ -5370,12 +5569,11 @@ def backup_copy(root,destination,require_clean=False):
     staging=destination/('.backup-copy-staging-'+secrets.token_hex(8))
     if staging.exists():shutil.rmtree(staging)
     staging.mkdir()
-    staged=[];journals=0;copied=[]
+    staged=[];journals=0;copied=[];copied_meta=[]
     try:
-        # Stage every project first, each under its locks, so a copy error touches
+        # Stage every selected project first, each under its locks, so a copy error touches
         # nothing in the destination.
-        retired={name for name,_ in retired_entries(root)}-set(initialized_projects(root))
-        for entry in sorted(record['projects'],key=lambda item:item['name']):
+        for entry in to_copy:
             name=entry['name']
             # A project retired since the run is not part of the runtime any more: its
             # recorded entry is neither a gap (the gate) nor something to copy.
@@ -5437,38 +5635,87 @@ def backup_copy(root,destination,require_clean=False):
                 state,detail=native_backup_change(root,name,sidecar_record)
                 if state=='changed':
                     raise SystemExit('backup-copy refused: the native backup of %s changed while it was '
-                                     'being copied: %s. No completeness record was published under %s.'%(
+                                     'being copied: %s. Nothing new was published under %s, and the '
+                                     'completeness record already there was left unchanged.'%(
                                          name,detail,destination))
-            staged.append((name,staging/name,staging/(name+'.coordination.json'),staged_journal))
+            staged.append((name,staging/name,staging/(name+'.coordination.json'),staged_journal,
+                           backup_copy_generation(entry,(staging/(name+'.coordination.json')).read_bytes())))
         # Every project staged: move each pair into place, replacing (not merging) the
         # destination, then publish the completeness record last.
-        for name,native_staged,sidecar_staged,journal_staged in staged:
+        for name,native_staged,sidecar_staged,journal_staged,generation in staged:
             _replace_with(native_staged,destination/name)
             _replace_with(sidecar_staged,destination/(name+'.coordination.json'))
             if journal_staged is not None:
                 _replace_with(journal_staged,destination/journal_staged.name)
             copied.append(name)
+            copied_meta.append({'name':name,'generation':generation})
             print('Copied %s: %s -> %s'%(name,backups/name,destination/name))
             print('Copied %s: %s -> %s'%(name,backups/(name+'.coordination.json'),
                                          destination/(name+'.coordination.json')))
             if journal_staged is not None:
                 print('Copied %s journal snapshot: %s -> %s'%(
                     name,journal_snapshot_path(root,name),destination/journal_staged.name))
-        _atomic_copy(backups/BACKUP_STATUS_NAME,staging/BACKUP_STATUS_NAME)
-        _replace_with(staging/BACKUP_STATUS_NAME,target_status)
-        print('Copied the completeness record: %s -> %s'%(backups/BACKUP_STATUS_NAME,target_status))
-    except Exception as error:
-        # A copy that did not finish must not leave a destination that looks complete.
+        if not skipped:
+            _atomic_copy(backups/BACKUP_STATUS_NAME,staging/BACKUP_STATUS_NAME)
+            _replace_with(staging/BACKUP_STATUS_NAME,target_status)
+            print('Copied the completeness record: %s -> %s'%(backups/BACKUP_STATUS_NAME,target_status))
+        # kittrial-5bb.160 review 2: a partial run must not remove or rewrite the completeness
+        # record already at the destination. It is the destination's only statement of when the
+        # LAST FULL copy was made and that the skipped projects' copies, which this run rightly
+        # leaves byte-identical, were complete then; deleting it would make the destination say
+        # less than it knows, remove a file from a backup destination, and hide a failure to
+        # remove it. The run's own outcome goes into the run record published beside it: the
+        # time, each project copied with its generation, each project skipped with its reason,
+        # and which completeness record the skipped projects' copies belong to. Every run writes
+        # it, so it never describes a superseded run.
         try:
-            if target_status.is_file() and not target_status.is_symlink():target_status.unlink()
-        except OSError:
-            pass
-        raise SystemExit('backup-copy failed: %s; no completeness record was published under %s, so the '
-                         'destination does not look complete. Re-run after fixing the cause.'%(error,destination))
+            run_record=backup_copy_run_record(backup_copy_full_record(target_status),copied_meta,
+                                              [{'name':name,'reason':reason} for name,reason in skipped],
+                                              all_or_nothing,generated_at)
+            validate_backup_copy_run(run_record)
+            _atomic_write_bytes(staging/BACKUP_COPY_RUN_NAME,
+                                (json.dumps(run_record,sort_keys=True,indent=2)+'\n').encode('utf-8'))
+            _replace_with(staging/BACKUP_COPY_RUN_NAME,destination/BACKUP_COPY_RUN_NAME)
+        except Exception as error:
+            # Its own message: the copies (and, for a full run, the completeness record) are
+            # already in place, and nothing that was there before was removed.
+            raise SystemExit('backup-copy: the project copies are in place%s, but this run could not be '
+                             'recorded beside the completeness record under %s: %s. No file that was already '
+                             'at the destination was removed. Re-run after fixing the cause.'
+                             %(' and the destination completeness record was left unchanged' if skipped
+                               else ' and the completeness record was published',
+                               destination,error))
+        print('Recorded this run (partial: %s): %s -> %s'
+              %('yes' if skipped else 'no',BACKUP_COPY_RUN_NAME,destination/BACKUP_COPY_RUN_NAME))
+    except Exception as error:
+        # A copy that did not finish must not leave a destination that looks complete, and it
+        # must not remove anything already there either: the completeness record of the last
+        # full copy and the previous run record stay as they are (kittrial-5bb.160 review 2).
+        raise SystemExit('backup-copy failed: %s; nothing already under %s was removed, and no new completeness '
+                         'record was published, so the destination still shows only the last full copy (if any). '
+                         'Re-run after fixing the cause.'%(error,destination))
     finally:
         shutil.rmtree(staging,ignore_errors=True)
     if retired_entries(root):
         print('Retired projects (not initialized, not copied): %s'%', '.join(entry for _,entry in retired_entries(root)))
+    if skipped:
+        # The summary line and the exit code both say this was not a full copy, the skipped
+        # projects' previous copies were not touched, and the completeness record already at
+        # the destination was left exactly as it was; this run recorded itself in the run
+        # record beside it (kittrial-5bb.160 review 2).
+        for name,reason in skipped:
+            print('backup-copy skipped %s: %s'%(name,reason),file=sys.stderr)
+        total=len(copied)+len(skipped)
+        print('Copied %d of %d project(s) and %d operation-journal snapshot(s) to %s; skipped %d (%s). '
+              'This is a partial copy: the destination completeness record was left unchanged and this run '
+              'was recorded in %s.'
+              %(len(copied),total,journals,destination,len(skipped),', '.join(name for name,_ in skipped),
+                BACKUP_COPY_RUN_NAME))
+        raise SystemExit('backup-copy copied %d of %d project(s) and skipped %d (%s); each skipped project\'s '
+                         'previous off-machine copy is unchanged, the completeness record already under %s was '
+                         'left byte-identical, and this partial run is recorded in %s.'
+                         %(len(copied),total,len(skipped),' '.join(name for name,_ in skipped),destination,
+                           BACKUP_COPY_RUN_NAME))
     print('Copied %d complete project pair(s) and %d operation-journal snapshot(s) of %d initialized to %s.'
           %(len(copied),journals,len(initialized_projects(root)),destination))
     return copied
@@ -9262,8 +9509,12 @@ def main():
                    help='everything --require-complete checks, and also exit non-zero when any project is '
                         'recorded degraded (complete, but missing something it should carry); for a release gate')
     a=sub.add_parser('backup-copy');a.add_argument('destination',metavar='DEST',
-                   help='copy every project\'s last complete backup pair under this off-machine directory; '
-                        'refuses unless backup-status --require-complete would pass')
+                   help='copy under this off-machine directory every project whose last backup pair is '
+                        'complete; a project that is not complete is skipped and named, the run exits '
+                        'non-zero and publishes no completeness record')
+    a.add_argument('--all-or-nothing',action='store_true',dest='all_or_nothing',
+                   help='the older gate: copy nothing unless every initialized project has a complete pair '
+                        '(backup-status --require-complete over the whole runtime)')
     a.add_argument('--require-clean',action='store_true',dest='require_clean',
                    help='also refuse when any project is recorded degraded; without it a degraded project is '
                         'copied and named')
@@ -9979,7 +10230,8 @@ def main():
         else:
             if not args.note:raise ValueError('backup-schedule needs --note TEXT, or --clear to remove it')
             print(json.dumps(write_backup_schedule_note(root,args.note,args.actor),sort_keys=True))
-    elif args.command=='backup-copy':backup_copy(root,args.destination,require_clean=args.require_clean)
+    elif args.command=='backup-copy':backup_copy(root,args.destination,require_clean=args.require_clean,
+                                                 all_or_nothing=args.all_or_nothing)
     elif args.command=='backup-repoint':print(json.dumps(repoint_backup(root,args.project),sort_keys=True))
     elif args.command=='retire-project':
         result=retire_project(root,args.project,args.actor,args.reason,force=args.force)

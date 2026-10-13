@@ -639,8 +639,12 @@ Schedule these separate commands while the service is up:
 `health` exits nonzero if the database or web listener is down, if a backup
 failed, or if no completed backup is recorded. It reports a missing backup as
 `unknown`, never as success. `backup --all` writes `backup-status.json` and
-preserves the previous complete pair on failure. `backup-copy` gates on all
-initialized projects having complete pairs. The external scheduler owns the
+preserves the previous complete pair on failure. `backup-copy` is per project
+(kittrial-5bb.160): it copies every project whose pair is complete, skips and
+names the rest, leaves the skipped projects' previous off-machine copies and the
+destination's completeness record untouched, records the partial run in
+`backup-copy-run.json` beside that record, and exits non-zero; `--all-or-nothing`
+keeps the older gate over all initialized projects. The external scheduler owns the
 timer, encryption, retention and alert destination.
 
 Collect a read-only, machine-readable UAT record after startup and backup:
