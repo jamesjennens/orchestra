@@ -117,7 +117,7 @@ def next_actor(state, assignee=None, closed=False, pending_items=0, claimable=No
     closed task whose review is not still active is ``none``, never an invitation.
     """
     if closed and state not in ('changes-requested', 'error', 'awaiting-integration',
-                                'withdrawn', 'superseded'):
+                                'withdrawn', 'superseded', 'held'):
         return 'none'
     if state in ('withdrawn', 'superseded') and not pending_items:
         return 'unknown'
@@ -126,6 +126,11 @@ def next_actor(state, assignee=None, closed=False, pending_items=0, claimable=No
     if state in ('awaiting-review', 'legacy-review-ready'):
         return 'reviewer'
     if state in ('awaiting-integration', 'approved'):
+        return 'coordinator'
+    if state == 'held':
+        # An explicit integration hold, or a positively FAILED verification, is the
+        # coordinator's to resolve (release the hold, or record a corrected delivery
+        # attestation). It is never a move for the author to guess at (kittrial-5bb.10).
         return 'coordinator'
     if state in ('error', RECONCILIATION_STATE):
         return 'operator'

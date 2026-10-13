@@ -1686,8 +1686,10 @@ printing a host path, and the sentence names the document.
   `review`, `handoff`. It is stable and is what dependencies reference.
 - **Comment ID**: `contribution_id`, `contribution.comment_id`, `latest_comment_id`,
   checkpoint `comment_id`. In a `contribute`/`request-changes`/`respond`/`approve`/
-  `withdraw`/`request-review`/`resolve-item`/`decline-review`/`recommend` payload, `contribution` is the
+  `withdraw`/`request-review`/`resolve-item`/`decline-review`/`recommend`/`attest`/`hold`/
+  `release-hold` payload, `contribution` is the
   **contribution record's comment ID** — never a Git SHA and never `latest_comment_id`.
+  `release-hold` also names the open hold's own record comment ID in `hold`.
 - **Git commit**: `contribution.commit` / `base_commit` are exact 40- or 64-character
   hexadecimal revisions. They are not comment IDs.
 - **`activity_cursor`**: identifies the current task snapshot. `brief` emits it;
@@ -1747,8 +1749,13 @@ it by failing.
 | `review` | item `severity` | `blocking` or `note` (absent means `blocking`) |
 | `review` | `withdraw` `reason` / `request-review` `reviewer` / `resolve-item` `reason` | <= 1000 characters / an actor identity (may contain `@` or `/`) / <= 1000 characters |
 | `review` | `decline-review` `reason` | <= 1000 characters |
+| `review` | `attest` `method` | <= 200 characters |
+| `review` | `attest` `reason` / `hold` `reason` / `release-hold` `reason` | <= 1000 characters each |
+| `review` | `attest` `commit`, `base_commit` | an exact 40/64-hex object id (a `verified` verdict must name the declared delivered tip and declared base) |
+| `review` | `attest` `sha256` / `bytes` | 64-hex digest / a non-negative integer (both optional; a `verified` bundle observation needs the declared digest and a positive byte count) |
+| `review` | `release-hold` `hold` | the record comment id of one OPEN hold |
 | `review` | open `request-review` requests per requester | 10 (project-wide) |
-| `review` | writing a new shape (`withdraw`, `request-review`, `resolve-item`, `decline-review`, item `severity`, request-changes `summary`) | refused unless `deployment.private.json` sets `review_workflow_writes` true (`admin.py review-writes on`); readers always understand them |
+| `review` | writing a new shape (`withdraw`, `request-review`, `resolve-item`, `decline-review`, `attest`, `hold`, `release-hold`, item `severity`, request-changes `summary`) | refused unless `deployment.private.json` sets `review_workflow_writes` true (`admin.py review-writes on`); readers always understand them |
 | `review` | `repository`, delivery `remote`, bundle `path` | <= 1000 characters each |
 | `review` | delivery `branch` | <= 300 characters |
 | `review` | item `text`; resolution `reason`, `evidence` | <= 1000 characters each |

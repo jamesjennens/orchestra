@@ -23,6 +23,7 @@ from lifecycle import (DEFECT_VALUE, ENABLED, LIVE, RELEASE, RELEASE_QUERY, RELE
                        integration_evidence, project_facts, release_query, release_selection,
                        release_targets, reverted_integrations, rollback_selection, scoped_evidence,
                        validate_payload, validate_query_payload, validate_release_payload)
+from test_lifecycle import legacy_scope_rule
 from requirements import canonical_bytes, content_hash
 
 ACTOR = 'alice/session'
@@ -285,7 +286,7 @@ class ReleaseWriteTests(unittest.TestCase):
                                  (dict(live_verified='yes'), 'live_verified must be true or false'),
                                  (dict(value='pending'), 'invalid lifecycle dimension/value'),
                                  (dict(scope=scope(source='', integration='merge-a')),
-                                  'full release commit'),
+                                  'exact 40/64 hexadecimal commit'),
                                  (dict(scope=scope(source=SOURCE_A)),
                                   'no single source commit'),
                                  (dict(scope=scope(source='', release='',
@@ -312,9 +313,10 @@ class ReleaseWriteTests(unittest.TestCase):
 
 class ReleaseSelectionTests(unittest.TestCase):
     def test_selection_keeps_ancestors_and_reports_the_rest_as_skipped(self):
-        store = (NativeStore().seed('trial-a')
-                 .seed('trial-b', integration=MERGE_B, source=SOURCE_B)
-                 .seed('trial-c', integration='merge-c'))
+        with legacy_scope_rule():
+            store = (NativeStore().seed('trial-a')
+                     .seed('trial-b', integration=MERGE_B, source=SOURCE_B)
+                     .seed('trial-c', integration='merge-c'))
         targets, skipped = release_targets(
             store.rows, {'source_commit': '', 'integration_commit': RELEASE_COMMIT,
                          'release_id': 'release-1', 'environment': 'production'},
@@ -1318,8 +1320,9 @@ class SmallAndTestsTests(unittest.TestCase):
     def test_a_non_commit_integration_never_reaches_the_git_command_line(self):
         store = NativeStore(tasks=('trial-help',))
         odd = scope(integration='--help')
-        store.record(payload('trial-help', 'lifecycle-scope', operation='scope-help', scope_value=odd))
-        store.record(payload('trial-help', 'integrated', operation='integrated-help', scope_value=odd))
+        with legacy_scope_rule():
+            store.record(payload('trial-help', 'lifecycle-scope', operation='scope-help', scope_value=odd))
+            store.record(payload('trial-help', 'integrated', operation='integrated-help', scope_value=odd))
         def never(commit, release):
             raise AssertionError('the non-commit guard must keep %r off the git command line' % commit)
         selection = release_selection(store.rows,

@@ -6,7 +6,7 @@ from lifecycle import integration_evidence, project_facts
 from review_state import RECONCILIATION_STATE, next_actor
 
 CONTRACT_VERSION = 'cli-contract-v1'
-WORK_STATES = ['none','awaiting-review','changes-requested','awaiting-integration','integrated','reconciliation-needed','legacy-review-ready','withdrawn','superseded','error']
+WORK_STATES = ['none','awaiting-review','changes-requested','awaiting-integration','held','integrated','reconciliation-needed','legacy-review-ready','withdrawn','superseded','error']
 WORK_LIMIT_MIN, WORK_LIMIT_MAX = 1, 100
 WORK_OFFSET_MIN = 0
 
@@ -130,6 +130,13 @@ def _caller_move(state, task, owned, named_reviewer=False, pending_items=0, rede
     if state in ('awaiting-integration', 'approved'):
         # `approved` is the web service's in-process name for the same state.
         return 'coordinator', "Nothing is for you to do: the next move is the coordinator's."
+    if state == 'held':
+        # An explicit integration hold, or a positively failed verification
+        # (kittrial-5bb.10): the coordinator releases it or records a corrected
+        # attestation, so this is not the author's move to guess at.
+        return 'coordinator', ("Nothing is for you to do: the contribution is held from integration "
+                               "until the coordinator releases the hold or records a corrected "
+                               "verification; read %s" % back)
     if state in ('withdrawn', 'superseded') and items:
         return 'you', ('This is your work now: %d outstanding review %s on a final contribution. '
                        'Read %s and deliver a new contribution that answers each item.'
@@ -414,7 +421,8 @@ def help_payload(action='work'):
     elif action == 'review':
         payload['operations'] = ['read (review TASK)', 'contribute', 'request-changes',
                                  'respond', 'approve', 'withdraw', 'request-review',
-                                 'resolve-item', 'decline-review', 'recommend']
+                                 'resolve-item', 'decline-review', 'recommend',
+                                 'attest', 'hold', 'release-hold']
         payload['notes'] = [
             'Contribution payloads use contribution = the contribution record comment_id, '
             'never a Git SHA and never latest_comment_id.',
@@ -433,6 +441,18 @@ def help_payload(action='work'):
             'item severity, a request-changes summary) is refused unless this installation has '
             'review_workflow_writes on; readers here understand them either way. An operator '
             'turns it on with `admin.py review-writes on --actor OPERATOR`.',
+            'attest records what a VERIFIER actually observed, kept separate from the declared '
+            'delivery: {schema_version, operation, operation_id, task, previous, contribution, '
+            'verdict: verified|failed|unknown, commit, base_commit, method, reason} plus optional '
+            'sha256 and bytes. A verified verdict is refused unless the observed commit is the '
+            'declared delivered tip, the base is the declared base, and a bundle matches the '
+            'declared SHA-256 with a positive byte count; an unreachable remote is recorded as '
+            'unknown with its reason, never as a pass.',
+            'hold sets an explicit integration hold ({contribution, reason}) and release-hold '
+            'clears exactly one open hold ({contribution, hold, reason}, hold = the hold record '
+            'comment_id). Both are coordinator actions, both are audited, and a hold survives '
+            'retries and new revisions until it is explicitly released. A held contribution '
+            'never reads awaiting-integration.',
             'A text field over its limit is refused with the field, its length and the limit; for a '
             'review item or a resolution the error also names which one (its index and id). The limits '
             'are listed in `limits`.',
@@ -916,7 +936,7 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
             wait_text=waiting_move(checkpoint_wait_move_text(checkpoint_states.get(item['task'])))
             if wait_text:
                 item['next']=wait_text
-    priority={'changes-requested':0,'error':1,'awaiting-review':2,'legacy-review-ready':2,'awaiting-integration':3}
+    priority={'changes-requested':0,'error':1,'awaiting-review':2,'legacy-review-ready':2,'awaiting-integration':3,'held':3}
     # Items where the next move is the CALLER's sort first (kittrial-5bb.249); inside each
     # group the review-state order above is unchanged, so a revision request still leads
     # the caller's own undelivered work.

@@ -131,6 +131,12 @@ REVERT_PREFIX = 'Kind: integration-revert-v1\n'
 # owed only when the current scope explicitly records pending or failed.
 DEPLOYMENT_DIMENSIONS = ('deployed','live-verified')
 COMMIT = re.compile(r'[0-9a-f]{40}')
+#: A commit in a lifecycle SCOPE (kittrial-5bb.10): an exact 40- or 64-hex object id, in
+#: either case. ``validate_scope`` refuses a non-empty ``source_commit``/``integration_commit``
+#: that is not one, so an abbreviated or unverified hash can never be recorded as if it
+#: identified a commit. The single stored-record read path (``native_event``) still reads a
+#: legacy scope tolerantly, so an installation's existing history keeps its meaning.
+COMMIT_ANY = re.compile(r'(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})')
 LABEL = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.@/-]{0,160}')
 SCOPE_ROLL_NOTE = ('The release scope becomes each target\'s current scope, so the six-fact readers '
                    '(brief, work, lifecycle.py list) show integrated=unknown (and any earlier-scope fact '
@@ -306,10 +312,25 @@ def lifecycle_authors_report(rows,operators=None,owners=None,limit=AUTHORS_REPOR
             'task_limit':limit,'truncated':tasks_with_facts>len(listed)}
 
 
-def validate_scope(scope):
+def validate_scope(scope, commits=True):
+    """One lifecycle scope: four strings, at least one identifying some work.
+
+    ``commits`` is the WRITE rule (kittrial-5bb.10): a non-empty ``source_commit`` or
+    ``integration_commit`` must be an exact 40/64-hex object id, so an abbreviated or
+    unverified hash is never recorded as a commit. A payload already in history is read
+    through :func:`validate_stored_payload`, which re-validates a scope refused by this
+    rule alone with ``commits=False``, so an installation's existing history keeps its
+    meaning rather than turning into unknown facts.
+    """
     if not isinstance(scope,dict) or set(scope)!=SCOPE_KEYS or any(not isinstance(v,str) for v in scope.values()):
         raise ValueError('scope requires source_commit, integration_commit, release_id and environment strings')
     if not any(v.strip() for v in scope.values()):raise ValueError('scope must identify some work')
+    if commits:
+        for key in ('source_commit','integration_commit'):
+            value=scope[key]
+            if value.strip() and not COMMIT_ANY.fullmatch(value):
+                raise ValueError('%s must be an exact 40/64 hexadecimal commit, not an abbreviated or '
+                                 'unverified hash'%key)
 
 
 def one_line(value,name,maxlen=TEXT_MAX):
@@ -319,11 +340,11 @@ def one_line(value,name,maxlen=TEXT_MAX):
     return value
 
 
-def validate_payload(p):
+def validate_payload(p, commits=True):
     if not isinstance(p,dict) or set(p)-set(OPTIONAL_FIELDS)!=PAYLOAD_FIELDS or type(p.get('schema_version')) is not int or p['schema_version']!=1:raise ValueError('invalid lifecycle payload')
     for key in ('operation_id','task','actor'):
         if not isinstance(p[key],str) or not LABEL.fullmatch(p[key]):raise ValueError('invalid '+key)
-    validate_scope(p['scope'])
+    validate_scope(p['scope'], commits=commits)
     if not isinstance(p['evidence'],list) or any(not isinstance(x,str) or not x.strip() for x in p['evidence']):raise ValueError('evidence must be a list of pointers')
     if p['provenance'] not in ('performed','reported','imported'):raise ValueError('invalid provenance')
     if 'note' in p:one_line(p['note'],'note')
@@ -355,6 +376,22 @@ def validate_payload(p):
     else:raise ValueError('invalid lifecycle dimension/value')
 
 
+def validate_stored_payload(p):
+    """``validate_payload`` for a payload already in history (kittrial-5bb.10).
+
+    The 40/64-hex commit rule is a WRITE rule. A scope stored before the rule existed
+    must still READ, so a payload refused ONLY by that rule is re-validated with the
+    rule relaxed; every other refusal propagates exactly as before, so an older-kit
+    simulation that replaces ``validate_payload`` still decides the outcome.
+    """
+    try:
+        validate_payload(p)
+    except ValueError as exc:
+        if 'exact 40/64 hexadecimal commit' not in str(exc):
+            raise
+        validate_payload(p, commits=False)
+
+
 def native_event(row):
     if not isinstance(row, dict) or row.get('issue_type')!='event' or row.get('malformed') or not row.get('id'):return None
     match=re.fullmatch(r'(?:Set |Changed )([A-Za-z0-9-]+)(?: from [^\n]+)? to ([^\n]+)(?:\n\nReason: ([\s\S]*))?',row.get('description',''))
@@ -368,7 +405,7 @@ def native_event(row):
     payload=None
     if reason and reason.startswith(PREFIX):
         try:
-            payload=record_json.loads(reason[len(PREFIX):]);validate_payload(payload)
+            payload=record_json.loads(reason[len(PREFIX):]);validate_stored_payload(payload)
             if canonical_bytes(payload).decode()!=reason[len(PREFIX):] or payload['task']!=parents[0] or payload['dimension']!=dimension or payload['value']!=value or payload['actor']!=row.get('created_by'):payload=None
         except (ValueError,TypeError):payload=None
     suffix=row['id'].removeprefix(parents[0]+'.')

@@ -43,6 +43,18 @@ one must not write them. The coordinator turns the switch on
 (``admin.py review-writes on``) once the rollback target is a kit that reads
 them. See ``docs/REVIEWS.md`` and ``docs/OPERATIONS.md``.
 
+Verifier attestations and explicit integration holds (kittrial-5bb.10) are additive
+operations in the SAME chain: ``attest`` records what a verifier actually observed (the
+delivered tip, the base, a bundle's byte count and SHA-256) as a record SEPARATE from the
+declared delivery, and ``hold``/``release-hold`` set and release an audited integration
+hold. They are new record shapes, so writing them is behind the same
+``review_workflow_writes`` switch. A hold is NOT cleared by a new contribution: it
+survives retries and revisions and is released only by an explicit ``release-hold``, so a
+held contribution can never read ``awaiting-integration`` (its effective state is
+``held``). A ``verified`` attestation that does not match the declared delivery is
+refused on the write path and demoted to ``unverified`` on the read path; an unreachable
+remote is an explicit ``unknown`` with a reason, never a fabricated pass.
+
 A revert comment alone is NOT authority. On the SSH/endpoint path the stored
 native author is the self-declared request actor, so until this prefix was
 reserved on the contributor transport a contributor could post a body that read
@@ -84,6 +96,14 @@ EXTRA = {
     'resolve-item': {'contribution', 'request', 'item', 'reason'},
     # The named reviewer closes their own request (kittrial-5bb.94 item 4).
     'decline-review': {'contribution', 'request', 'reason'},
+    # Verifier attestations and explicit integration holds (kittrial-5bb.10). A
+    # verifier attestation is a SEPARATE record from the declared delivery: the
+    # contribution keeps the commit and checksum its author declared, and this record
+    # states what the verifier actually observed. An integration hold is set and
+    # released by an audited record of its own.
+    'attest': {'contribution', 'verdict', 'commit', 'base_commit', 'method', 'reason'},
+    'hold': {'contribution', 'reason'},
+    'release-hold': {'contribution', 'hold', 'reason'},
 }
 #: Fields an operation accepts in addition to ``EXTRA``; each is optional and
 #: additive to the operation's exact legacy field set.
@@ -93,11 +113,16 @@ OPTIONAL = {
     'request-review': {'summary'},
     'withdraw': {'disposition'},
     'resolve-item': {'disposition'},
+    # A remote delivery has no bundle bytes, so the two observation values are
+    # optional: an attestation that cannot observe them says so in its method and
+    # never invents a digest (kittrial-5bb.10).
+    'attest': {'sha256', 'bytes'},
 }
-#: The operation values that write a NEW record shape (kittrial-5bb.94 item 3).
-#: Every one is refused unless the per-installation ``review_workflow_writes``
-#: setting is on; the readers understand them either way.
-NEW_WRITE_OPERATIONS = ('withdraw', 'resolve-item', 'request-review', 'decline-review')
+#: The operation values that write a NEW record shape (kittrial-5bb.94 item 3,
+#: extended by kittrial-5bb.10). Every one is refused unless the per-installation
+#: ``review_workflow_writes`` setting is on; the readers understand them either way.
+NEW_WRITE_OPERATIONS = ('withdraw', 'resolve-item', 'request-review', 'decline-review',
+                        'attest', 'hold', 'release-hold')
 #: At most this many OPEN review requests may stand against one requester at a
 #: time, counted across every task (kittrial-5bb.94 item 4: one actor put 25 tasks
 #: into another's queue in 71 seconds).
@@ -120,6 +145,23 @@ PLAIN_JOINER = re.compile('[\u200c\u200d]')
 #: Item severity on a request-changes item. Absent means ``blocking`` so every
 #: record written before severity existed keeps blocking approval.
 SEVERITIES = ('blocking', 'note')
+#: The three readings a verifier attestation may record (kittrial-5bb.10). ``verified``
+#: is only honoured when the observation matches the DECLARED delivery (commit == the
+#: delivered tip, base == the declared base, and for a bundle the declared SHA-256 and a
+#: positive byte count); ``failed`` states a positively disproven delivery; ``unknown``
+#: states that verification could not be performed (an unreachable remote is an explicit
+#: unknown, never a fabricated pass). ``failed``/``unknown`` both need a reason.
+ATTEST_VERDICTS = ('verified', 'failed', 'unknown')
+#: Bound on the ``method`` text of an attestation (how the verifier checked).
+METHOD_LIMIT = 200
+#: How many attestations one read returns (newest last). The full chain stays in
+#: history; this is only the bounded projection field.
+ATTEST_LIMIT = 20
+#: How much of a record's own text a warning line repeats, so a 1000-character reason
+#: cannot put a paragraph (or a newline) into every read.
+WARNING_TEXT_LIMIT = 160
+#: The reading of a contribution that carries no attestation at all.
+VERIFICATION_UNVERIFIED = 'unverified'
 #: How a contribution stops awaiting review: withdrawn, or marked superseded.
 WITHDRAW_DISPOSITIONS = ('withdrawn', 'superseded')
 #: How the requester disposes of their own item: resolve it, or leave it as a note.
@@ -174,7 +216,8 @@ COMMIT_TEXT = re.compile(r'(?:[a-fA-F0-9]{40}|[a-fA-F0-9]{64})')
 #: below and the `review` help both read this table (kittrial-5bb.97).
 TEXT_LIMITS = {'summary': 1200, 'repository': 1000, 'remote': 1000, 'branch': 300, 'bundle path': 1000,
                'review text': 1000, 'resolution reason': 1000, 'resolution evidence': 1000,
-               'assignee snapshot': 300, 'decline reason': 1000, 'withdraw reason': 1000}
+               'assignee snapshot': 300, 'decline reason': 1000, 'withdraw reason': 1000,
+               'method': METHOD_LIMIT, 'reason': 1000}
 ITEMS_MAX = 20
 PAYLOAD_MAX_BYTES = 24000
 
@@ -238,7 +281,7 @@ def check_plain_text(payload):
     before any native write. Reads never call it: an old record with such
     characters stays readable.
     """
-    for key in ('summary', 'reason'):
+    for key in ('summary', 'reason', 'method'):
         value = payload.get(key)
         if isinstance(value, str):
             plain_text(value, key)
@@ -556,6 +599,28 @@ def validate(p, task):
         elif op == 'decline-review':
             identity(p['request'])
             limited(p['reason'], 'decline reason')
+        elif op == 'attest':
+            # Shape only: the cross-check against the DECLARED delivery lives in
+            # ``attestation_problems``, which ``projection`` applies as a tolerant
+            # demotion and ``execute`` applies as a hard refusal before any write.
+            if p['verdict'] not in ATTEST_VERDICTS:
+                raise ValueError('Attestation verdict must be verified, failed or unknown')
+            for key in ('commit', 'base_commit'):
+                if not isinstance(p[key], str) or not COMMIT_TEXT.fullmatch(p[key]):
+                    raise ValueError(f'{key}: require exact 40/64 hexadecimal commit')
+            limited(p['method'], 'method'); limited(p['reason'], 'reason')
+            observed = p.get('sha256')
+            if observed is not None and (not isinstance(observed, str)
+                                         or not re.fullmatch(r'[a-fA-F0-9]{64}', observed)):
+                raise ValueError('Attestation sha256 must be a 64-hex digest, or absent')
+            size = p.get('bytes')
+            if size is not None and (type(size) is not int or size < 0):
+                raise ValueError('Attestation bytes must be a non-negative integer, or absent')
+        elif op == 'hold':
+            limited(p['reason'], 'reason')
+        elif op == 'release-hold':
+            identity(p['hold'])
+            limited(p['reason'], 'reason')
         elif op == 'withdraw':
             limited(p['reason'], 'withdraw reason')
             # The READ path stays tolerant: a record an older kit stored with an
@@ -572,6 +637,56 @@ def validate(p, task):
     if len(canonical_bytes(p)) > PAYLOAD_MAX_BYTES:
         raise ValueError('Review workflow payload: %d canonical bytes, the limit is %d (24 KB)'
                          % (len(canonical_bytes(p)), PAYLOAD_MAX_BYTES))
+
+
+def warning_text(value, limit=WARNING_TEXT_LIMIT):
+    """One bounded, single-line rendering of a record's own text for a warning line."""
+    if not isinstance(value, str):
+        return ''
+    flat = ' '.join(value.split())
+    return flat if len(flat) <= limit else flat[:max(0, limit - 1)] + '\u2026'
+
+
+def attestation_problems(p, contribution):
+    """Why a ``verified`` attestation does NOT verify the contribution it names.
+
+    Read as a tolerant DEMOTION by ``projection`` (a stored record whose observation no
+    longer matches the delivery reads as unverified, never as verified) and as a hard
+    refusal by ``execute`` before the native write, so a wrong checksum, a wrong base or
+    a commit that is not the declared delivered tip can never be recorded as verified.
+
+    A ``failed`` or ``unknown`` record asserts nothing about a match and returns no
+    problems here; it is explicit by its own verdict and reason. A contribution with no
+    verifiable declaration (no commit at all) fails closed: the observation cannot be
+    shown to be the delivered tip.
+    """
+    contribution = contribution if isinstance(contribution, dict) else {}
+    if p.get('verdict') != 'verified':
+        return []
+    problems = []
+    declared = str(contribution.get('commit') or '')
+    if not declared or str(p.get('commit') or '').lower() != declared.lower():
+        problems.append('the observed commit is not the declared delivered commit')
+    declared_base = str(contribution.get('base_commit') or '')
+    if not declared_base or str(p.get('base_commit') or '').lower() != declared_base.lower():
+        problems.append('the observed base is not the declared base commit')
+    delivery = contribution.get('delivery') if isinstance(contribution.get('delivery'), dict) else {}
+    kind = delivery.get('kind')
+    if kind == 'bundle':
+        declared_sha = str(delivery.get('sha256') or '')
+        observed = p.get('sha256')
+        if not isinstance(observed, str) or observed.lower() != declared_sha.lower():
+            problems.append('the observed bundle SHA-256 is not the declared delivery checksum')
+        size = p.get('bytes')
+        if type(size) is not int or size <= 0:
+            problems.append('a verified bundle attestation needs the delivered byte count')
+    elif kind == 'remote':
+        # The delivered tip IS the observed commit, and that is compared above; a remote
+        # delivery declares no digest of its own, so there is nothing else to match.
+        pass
+    else:
+        problems.append('the declared delivery is not a verifiable remote or bundle delivery')
+    return problems
 
 
 def records(issue, voided=None):
@@ -1441,6 +1556,12 @@ def projection(ordered, voids=None, invalid=None, refused=None, positions=None, 
     contribution = None; prior = []; pending = {}; notes = {}; reviews = {}
     declined = []; approved = False; approved_id = None; latest = None; withdrawal = None
     ignored_withdrawals = []
+    # Verifier attestations and explicit integration holds (kittrial-5bb.10). An
+    # attestation belongs to the revision it was recorded against, so it resets with a
+    # new contribution; a HOLD does not: it survives retries and new revisions and is
+    # cleared only by an explicit, audited ``release-hold`` record.
+    attestation = None; attestations = []
+    holds = {}; hold_releases = []; ignored_releases = []
     for p, c in ordered:
         cid = str(c['id']); op = p['operation']
         metadata = {'comment_id': cid, 'author': c['author'], 'timestamp': c['created_at']}
@@ -1462,9 +1583,13 @@ def projection(ordered, voids=None, invalid=None, refused=None, positions=None, 
             if contribution is not None:
                 prior.append(dict(contribution, relation=relation))
             # A new contribution starts review again: it clears any withdrawal and
-            # every review request that named the replaced revision.
+            # every review request that named the replaced revision. It does NOT clear
+            # an integration HOLD (kittrial-5bb.10): a hold outlives the revision it was
+            # set against and is released only by an explicit ``release-hold``, so a new
+            # revision can never accidentally clear it. The verifier attestation belongs
+            # to the revision, so it does reset here.
             contribution = dict(p, **metadata); approved = False; approved_id = None
-            withdrawal = None; reviews = {}
+            withdrawal = None; reviews = {}; attestation = None
         else:
             if not current or p['contribution'] != current:
                 raise ValueError(describe_contribution_mismatch(op, p['contribution'], current, latest))
@@ -1543,6 +1668,36 @@ def projection(ordered, voids=None, invalid=None, refused=None, positions=None, 
                 declined.append(dict(request=p['request'], reviewer=request['reviewer'],
                                      reason=p['reason'], contribution=current,
                                      author=c['author'], timestamp=c['created_at']))
+            elif op == 'attest':
+                # Kept SEPARATE from the declared delivery: this entry records what the
+                # verifier observed and whether it matched. A stored record that no longer
+                # matches is demoted here (verified=False + problems) and never raises, so
+                # an old chain keeps reading; ``execute`` refuses such a write outright.
+                problems = attestation_problems(p, contribution)
+                attestation = dict(comment_id=cid, contribution=current, verdict=p['verdict'],
+                                   commit=p['commit'], base_commit=p['base_commit'],
+                                   sha256=p.get('sha256'), bytes=p.get('bytes'),
+                                   method=p['method'], reason=p['reason'],
+                                   author=c['author'], timestamp=c['created_at'],
+                                   verified=(p['verdict'] == 'verified' and not problems),
+                                   problems=problems)
+                attestations.append(attestation)
+            elif op == 'hold':
+                holds[cid] = dict(comment_id=cid, contribution=current, reason=p['reason'],
+                                  author=c['author'], timestamp=c['created_at'])
+            elif op == 'release-hold':
+                # A release clears exactly the hold it names, and only while that hold is
+                # open. A stray, duplicated or already-released name changes nothing and is
+                # warned about, so a retry or a new revision can never clear a hold by
+                # accident (kittrial-5bb.10).
+                target = holds.get(p['hold'])
+                if target is None:
+                    ignored_releases.append(cid)
+                else:
+                    del holds[p['hold']]
+                    hold_releases.append(dict(comment_id=cid, hold=p['hold'],
+                                              contribution=current, reason=p['reason'],
+                                              author=c['author'], timestamp=c['created_at']))
             elif op == 'withdraw':
                 if withdrawal is not None:
                     # A second withdraw must not flip the disposition (item 5). The
@@ -1605,8 +1760,25 @@ def projection(ordered, voids=None, invalid=None, refused=None, positions=None, 
                 stale_approval.append(p['target'])
         if stale_approval:
             approved = False
+    # Verification reading (kittrial-5bb.10): what the newest attestation for the CURRENT
+    # revision actually established. A demoted record (problems) reads ``unverified``,
+    # never ``verified``; no attestation at all also reads ``unverified``. A ``failed``
+    # reading is a positive disproof, so it holds the contribution exactly as an explicit
+    # hold does; ``unknown`` (an unreachable remote) is surfaced but never fabricated into
+    # a pass and never silently treated as one.
+    if attestation is None:
+        verification = VERIFICATION_UNVERIFIED
+    elif attestation['verified']:
+        verification = 'verified'
+    elif attestation['problems']:
+        verification = VERIFICATION_UNVERIFIED
+    else:
+        verification = attestation['verdict']
+    verification_failed = verification == 'failed'
+    held = bool(holds) or verification_failed
     state = ('none' if contribution is None else
              withdrawal['disposition'] if withdrawal else
+             'held' if held else
              'changes-requested' if pending else
              'awaiting-integration' if approved else 'awaiting-review')
     recoveries = [{'comment_id': str(c['id']), 'disposition': p['disposition'], 'target': p['target'],
@@ -1644,16 +1816,60 @@ def projection(ordered, voids=None, invalid=None, refused=None, positions=None, 
         warnings.append('Ignored a second withdraw record on the same contribution (records: ' +
                         ', '.join(ignored_withdrawals[:5]) + '); a contribution is withdrawn once, so the '
                         'first disposition stands and the later record changed nothing')
-    return dict(contribution=contribution, prior_contributions=prior, review_state=state,
-                pending_requests=list(pending.values()), latest_comment_id=latest,
-                # Additive (kittrial-5bb.94): non-blocking items, open first-class
-                # review requests, the requests their named reviewer declined, and
-                # the withdrawal/supersede record for the current contribution. All
-                # are absent/empty on an old-shaped chain.
-                note_requests=list(notes.values()), pending_review_requests=list(reviews.values()),
-                declined_review_requests=declined,
-                withdrawal=withdrawal,
-                recoveries=recoveries, warnings=warnings, reverts=list(reverts or []))
+    open_holds = [dict(h) for h in holds.values()]
+    if open_holds:
+        warnings.append('Integration hold(s) in force (records: ' +
+                        ', '.join(h['comment_id'] for h in open_holds[:5]) +
+                        '); this contribution is not integration-ready until each hold is '
+                        'explicitly released with a release-hold record')
+    if attestation is not None and attestation['problems']:
+        warnings.append('Verifier attestation ' + attestation['comment_id'] +
+                        ' does not match the declared delivery (' +
+                        '; '.join(attestation['problems'][:3]) +
+                        '); it is read as unverified, never as verified')
+    if verification == 'failed':
+        warnings.append('Verifier attestation ' + str(attestation['comment_id']) +
+                        ' records the delivery as FAILED (' + warning_text(attestation['reason']) +
+                        '); the contribution is held from integration until a later attestation or '
+                        'a corrected delivery supersedes it')
+    elif verification == 'unknown':
+        warnings.append('Verifier attestation ' + str(attestation['comment_id']) +
+                        ' records the delivery as an explicit UNKNOWN (' +
+                        warning_text(attestation['reason']) + '); no pass is recorded and '
+                        'integration must not be inferred from the declared checksum alone')
+    if ignored_releases:
+        warnings.append('Ignored release-hold record(s) naming no open hold: ' +
+                        ', '.join(ignored_releases[:5]) + '; a release clears exactly one open hold '
+                        'and changes nothing else')
+    answer = dict(contribution=contribution, prior_contributions=prior, review_state=state,
+                  pending_requests=list(pending.values()), latest_comment_id=latest,
+                  # Additive (kittrial-5bb.94): non-blocking items, open first-class
+                  # review requests, the requests their named reviewer declined, and
+                  # the withdrawal/supersede record for the current contribution. All
+                  # are absent/empty on an old-shaped chain.
+                  note_requests=list(notes.values()), pending_review_requests=list(reviews.values()),
+                  declined_review_requests=declined,
+                  withdrawal=withdrawal,
+                  recoveries=recoveries, warnings=warnings, reverts=list(reverts or []))
+    # Additive (kittrial-5bb.10) and present ONLY when they carry something, exactly as
+    # the reconciliation signal does: a chain written before these operations existed then
+    # reads byte-identically to before them (the bounded brief has a size budget), and an
+    # absent ``verification`` means the same thing as ``unverified``. ``holds`` and
+    # ``verification`` are the two a reader asks about a contribution that is not
+    # integration-ready; ``attestations``/``hold_releases``/``ignored_hold_releases`` are
+    # the bounded audit lists.
+    if attestation is not None:
+        answer['attestation'] = attestation
+        answer['verification'] = verification
+    if attestations:
+        answer['attestations'] = attestations[-ATTEST_LIMIT:]
+    if open_holds:
+        answer['holds'] = open_holds
+    if hold_releases:
+        answer['hold_releases'] = hold_releases
+    if ignored_releases:
+        answer['ignored_hold_releases'] = ignored_releases
+    return answer
 
 
 def project(issue, operators=None, journal=None, reverts=None, invalid_reverts=None):
@@ -2126,6 +2342,31 @@ def execute(rows, task, actor, payload, run, operators=None, journal=None, revie
             elif actor != issue.get('assignee'):
                 raise ValueError('Only the current assigned owner or a configured coordinator may '
                                  'request a review')
+    if payload['operation'] == 'attest':
+        # A `verified` attestation must actually verify the DECLARED delivery: the observed
+        # commit must be the delivered tip, the base must be the declared base, and a bundle
+        # must match the declared SHA-256 with a positive byte count. Otherwise the record
+        # reads as a failure or an unknown, so record that instead of a false pass
+        # (kittrial-5bb.10). Judged here, before the sole native write.
+        problems = attestation_problems(payload, state.get('contribution') or {})
+        if problems:
+            raise ValueError('Attestation cannot read as verified: ' + '; '.join(problems) +
+                             '. Record verdict "failed" or "unknown" with the reason instead, or '
+                             'correct the observation')
+    if payload['operation'] in ('hold', 'release-hold'):
+        # An integration hold is an audited coordinator control, exactly like the manual
+        # `request-changes` hold it complements; a worker does not clear another party's
+        # hold. The endpoint's verified web authority establishes a caller the same way it
+        # does for approve (kittrial-5bb.199/.209).
+        authority = recovery.configured_operators(operators)
+        if actor not in authority and not verified_web_authority:
+            raise ValueError('Only a configured coordinator may set or release an integration hold')
+    if payload['operation'] == 'release-hold':
+        open_holds = [h['comment_id'] for h in state.get('holds') or []]
+        if payload['hold'] not in open_holds:
+            raise ValueError('release-hold must name an OPEN hold of this task (open holds: ' +
+                             (', '.join(sorted(open_holds)) or 'none') + '); a released or unknown '
+                             'hold cannot be released again')
     if payload['operation'] == 'request-review':
         # The self-approval refusal is unchanged and request-review may not route
         # around it by naming the contribution's own author as the reviewer.

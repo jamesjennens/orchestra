@@ -1195,9 +1195,10 @@ class InProcessBackend:
 #: its ``state=`` filter accept them too or the two transports disagree
 #: (kittrial-5bb.110 item 9).
 ACTIVE_REVIEW_STATES = ('changes-requested', 'error', 'awaiting-review', 'legacy-review-ready',
-                        'awaiting-integration', 'approved', 'withdrawn', 'superseded')
+                        'awaiting-integration', 'approved', 'withdrawn', 'superseded', 'held')
 QUEUE_PRIORITY = {'changes-requested': 0, 'error': 1, 'awaiting-review': 2,
-                  'legacy-review-ready': 2, 'awaiting-integration': 3, 'approved': 3}
+                  'legacy-review-ready': 2, 'awaiting-integration': 3, 'approved': 3,
+                  'held': 3}
 
 #: Review-payload fields the HTTP route accepts beyond the canonical per-operation
 #: set. ``task_id`` is filled from the path and ``actor`` is bound to the
@@ -1999,6 +2000,12 @@ class EndpointBackend:
         'request-review': ('contribution', 'reviewer'),
         'resolve-item': ('contribution', 'request', 'item', 'reason'),
         'decline-review': ('contribution', 'request', 'reason'),
+        # Verifier attestations and explicit integration holds (kittrial-5bb.10). Without
+        # these the canonical backend refuses them as unknown operations, so a web verifier
+        # could not record an observation and a web coordinator could not hold or release.
+        'attest': ('contribution', 'verdict', 'commit', 'base_commit', 'method', 'reason'),
+        'hold': ('contribution', 'reason'),
+        'release-hold': ('contribution', 'hold', 'reason'),
     }
     #: Operations whose canonical record takes no ``previous``.
     REVIEW_NO_PREVIOUS = ('recommend',)
@@ -2014,6 +2021,7 @@ class EndpointBackend:
         'request-review': ('summary',),
         'withdraw': ('disposition',),
         'resolve-item': ('disposition',),
+        'attest': ('sha256', 'bytes'),
     }
     CHECKPOINT_FIELDS = ('schema_version', 'previous', 'activity_cursor', 'source_commit',
                          'branch', 'intent', 'acceptance', 'summary', 'next_action',
@@ -3221,6 +3229,8 @@ def next_action(task):
         return {'who': 'assignee', 'text': 'Address the requested changes'}
     if state in ('approved', 'awaiting-integration'):
         return {'who': 'owner', 'text': 'Integrate the approved contribution'}
+    if state == 'held':
+        return {'who': 'coordinator', 'text': 'Release the integration hold or record a corrected verification'}
     if state == 'error':
         return {'who': 'owner', 'text': 'Needs operator attention'}
     if task.get('assignee'):

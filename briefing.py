@@ -755,6 +755,7 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
     review_next={'changes-requested':'Address the outstanding review requests for the current contribution; read review '+task+'.',
                  'awaiting-review':'Reviewer: retrieve and verify the current contribution, then record review feedback or approval.',
                  'awaiting-integration':'Authorized integrator: integrate the approved contribution and record scoped integration evidence.',
+                 'held':'A coordinator released no integration hold yet and verification did not pass: read review '+task+' for the open hold or failed/unknown attestation, then release the hold or record a corrected verification.',
                  'integrated':'Integration is recorded for this contribution; follow the project release/deployment workflow and scoped lifecycle evidence.',
                  'withdrawn':'The current contribution was withdrawn by its author or a coordinator; read review '+task+' or deliver a new revision.',
                  'superseded':'The current contribution was marked superseded; read review '+task+' or deliver a new revision.'}

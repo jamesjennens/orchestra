@@ -33,7 +33,7 @@ import work
 from lifecycle import integration_evidence, project_facts
 from requirements import canonical_bytes
 from test_briefing import PROJECT, TASK
-from test_lifecycle import NativeStore, payload, scope
+from test_lifecycle import MERGE_COMMIT, NativeStore, payload, scope
 
 COMMIT = 'a' * 40
 OTHER = 'e' * 40
@@ -101,7 +101,7 @@ class SharedProjectionTests(unittest.TestCase):
         for block in (review['integration'], brief['review']['integration'], item['integration']):
             self.assertEqual(block['fact'], 'passed')
             self.assertEqual(block['source_commit'], COMMIT)
-            self.assertEqual(block['integration_commit'], 'merge-a')
+            self.assertEqual(block['integration_commit'], MERGE_COMMIT)
             self.assertTrue(block['matches_contribution'])
             self.assertEqual(block['scope']['source_commit'], COMMIT)
 
@@ -191,7 +191,7 @@ class ProjectionEdgeCaseTests(unittest.TestCase):
     def test_newer_failed_scope_does_not_undo_an_older_pass_for_the_same_commit(self):
         """Probe 7a: any-pass-wins is deliberate and `newest_fact` exposes it."""
         store = reviewed()
-        second = scope(source_commit=COMMIT, integration_commit='merge-b', release_id='release-2')
+        second = scope(source_commit=COMMIT, integration_commit='d' * 40, release_id='release-2')
         store.record(payload('lifecycle-scope', operation='scope-2', scope=second))
         store.record(payload('integrated', 'failed', 'fact-2', scope=second,
                              evidence=['report:newer-failure']))
@@ -199,15 +199,15 @@ class ProjectionEdgeCaseTests(unittest.TestCase):
         block = review['integration']
         self.assertTrue(block['matches_contribution'])
         self.assertEqual(block['fact'], 'passed')
-        self.assertEqual(block['integration_commit'], 'merge-a')
+        self.assertEqual(block['integration_commit'], MERGE_COMMIT)
         self.assertEqual(block['newest_fact'], 'failed')
         self.assertEqual(result_states(review, brief, item), ['integrated'] * 3)
 
     def test_recurring_scope_token_reports_the_newest_recording(self):
         """Probe 6b: a re-recorded scope token must not keep its oldest position."""
         store = NativeStore()
-        first = scope(source_commit=COMMIT, integration_commit='merge-a')
-        other = scope(source_commit=COMMIT, integration_commit='merge-d', release_id='release-d')
+        first = scope(source_commit=COMMIT, integration_commit=MERGE_COMMIT)
+        other = scope(source_commit=COMMIT, integration_commit='d' * 40, release_id='release-d')
         store.record(payload('lifecycle-scope', operation='scope-1', scope=first))
         store.record(payload('integrated', operation='fact-a', scope=first))
         store.record(payload('lifecycle-scope', operation='scope-2', scope=other))
@@ -220,9 +220,9 @@ class ProjectionEdgeCaseTests(unittest.TestCase):
         review, brief, item = surfaces(store)
         scopes = integration(store)
         self.assertEqual([entry['scope']['integration_commit'] for entry in scopes],
-                         ['merge-a', 'merge-d'])
+                         [MERGE_COMMIT, 'd' * 40])
         self.assertEqual(scopes[0]['order'], max(entry['order'] for entry in scopes))
-        self.assertEqual(review['integration']['scope']['integration_commit'], 'merge-a')
+        self.assertEqual(review['integration']['scope']['integration_commit'], MERGE_COMMIT)
         self.assertEqual(review['integration']['scope_token'], scopes[0]['scope_token'])
         self.assertEqual(result_states(review, brief, item), ['integrated'] * 3)
 
