@@ -755,11 +755,20 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
     review_next={'changes-requested':'Address the outstanding review requests for the current contribution; read review '+task+'.',
                  'awaiting-review':'Reviewer: retrieve and verify the current contribution, then record review feedback or approval.',
                  'awaiting-integration':'Authorized integrator: integrate the approved contribution and record scoped integration evidence.',
+                 'held':'The contribution is held; read review '+task+' for the record.',
                  'integrated':'Integration is recorded for this contribution; follow the project release/deployment workflow and scoped lifecycle evidence.',
                  'withdrawn':'The current contribution was withdrawn by its author or a coordinator; read review '+task+' or deliver a new revision.',
                  'superseded':'The current contribution was marked superseded; read review '+task+' or deliver a new revision.'}
     if issue.get('status')=='closed' and review['review_state']=='awaiting-integration':
         review_next['awaiting-integration']='This task is closed; approval and integration evidence remain readable in review '+task+'. Closure is not approval or integration.'
+    if review.get('review_state')=='held':
+        # Say WHICH reason the contribution is held (kittrial-5bb.10 review item 5): an
+        # open hold and a failed attestation are different records with different
+        # remedies, and the shared projection already knows which one applies.
+        from review_workflow import integration_hold_sentence
+        held_sentence=integration_hold_sentence(review)
+        if held_sentence:
+            review_next['held']=held_sentence[:1].upper()+held_sentence[1:]+' Read review '+task+'.'
     # The integration overlay warnings (kittrial-5bb.52) are part of the shared
     # projection's warnings; surface them in the compact read too, so a revert, a
     # resolved-elsewhere fact conflict or an ignored revert record is visible

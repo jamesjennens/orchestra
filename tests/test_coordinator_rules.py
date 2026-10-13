@@ -245,6 +245,7 @@ class MergeSlotTests(unittest.TestCase):
     def slot_run(self,calls):
         def run(argv):
             calls.append(list(argv))
+            if argv==['export','--all']:return ''   # merge-acquire reads for a stored hold; none here
             if argv[:2]==['merge-slot','check']:return json.dumps({'available':True,'holder':None,'waiters':[]})
             if argv[:2]==['merge-slot','acquire']:return json.dumps({'acquired':True})
             if argv[:1]==['show']:return '[]'

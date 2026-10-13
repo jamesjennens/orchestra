@@ -974,6 +974,58 @@ def current_contribution_commits(rows):
     return result
 
 
+def review_chain_state(row):
+    """The shared review projection of one row, or ``None`` when it cannot be read.
+
+    Best effort, exactly like :func:`current_contribution_commits`: a row with no review
+    chain, or a chain this read cannot parse, yields ``None`` and the caller treats the
+    task as unheld rather than inventing a hold. Nothing here changes what is recorded.
+
+    It projects with ``records(row, None)`` - no operator voids and no revert journal -
+    which is safe for the two facts it is asked: a void can only REMOVE a chain record
+    (so ignoring voids can only ADD a hold, never clear one: fail-closed), an operator
+    void-record of a hold record is itself refused as part of the surviving contribution
+    history, and the revert journal never touches the ``holds``/``attestation`` records
+    this projection reads. Every authoritative write path still reads the full chain
+    with voids and journal.
+    """
+    try:
+        from review_workflow import records, projection
+    except ImportError:return None
+    if not isinstance(row,dict) or not isinstance(row.get('id'),str):return None
+    from coordination import is_merge_slot
+    if row.get('issue_type') in ('event','gate') or is_merge_slot(row):return None
+    try:
+        return projection(records(row,None))
+    except (ValueError,KeyError,TypeError):return None
+
+
+def held_tasks(rows):
+    """``{task: sentence}`` for tasks whose CURRENT contribution is held (kittrial-5bb.10).
+
+    A hold, or a positively FAILED verifier attestation, makes a contribution not
+    integration-ready, so the release selection skips the task with the sentence that
+    names the open hold (or the failed attestation) and who can release it. Best effort:
+    a chain this read cannot parse simply yields no entry, exactly as the delivery flag
+    read does.
+    """
+    from review_workflow import integration_hold_sentence
+    result={}
+    for row in rows:
+        state=review_chain_state(row)
+        if state is None:continue
+        sentence=integration_hold_sentence(state)
+        if sentence:result[row['id']]=sentence
+    return result
+
+
+def held_issue_sentence(issue):
+    """The hold sentence for one task row, or ``None`` (kittrial-5bb.10 item 4)."""
+    from review_workflow import integration_hold_sentence
+    state=review_chain_state(issue)
+    return None if state is None else integration_hold_sentence(state)
+
+
 def run_advances_past(live_scope,release,is_ancestor):
     """Does running ``release`` here ADVANCE the environment past this live scope?
 
@@ -1053,10 +1105,17 @@ def release_selection(rows,scope,is_ancestor,previous_commit=None,subset=None,re
     if reverted is None:reverted=reverted_integrations(rows,operators,journal)
     if current_commits is None:current_commits=current_contribution_commits(rows)
     wanted=set(subset) if subset else None
+    # A held contribution is not integration-ready (kittrial-5bb.10 item 4): the release
+    # selection skips the task with the sentence naming the open hold (or the failed
+    # attestation) and who can release it, instead of offering it as a target.
+    held=held_tasks(rows)
     targets=[];skipped=[];flags=[];verifying=[];restoring=[]
     for entry in scoped_evidence(rows,('integrated','deployed','live-verified',LIVE)):
         task=entry['id'];scopes=entry['scopes']
         if wanted is not None and task not in wanted:continue
+        if task in held:
+            skipped.append({'task':task,'reason':'held from integration: '+held[task]})
+            continue
         chosen=None;reason=entry['untrusted'].get('integrated')
         for candidate in sorted(scopes,key=lambda c:((c.get('integrated') or {}).get('order') or -1,
                                                       (c.get('integrated') or {}).get('event_id') or ''),reverse=True):
@@ -1649,6 +1708,24 @@ def apply_release(payload,actor,run,operators=None,journal=None,lifecycle_author
                            enforce=lifecycle_authors,
                            subject=payload['scope'].get('release_id') or None)
     rows=read_event_rows(run)
+    # A release that explicitly NAMES a held task is refused with the hold's own sentence
+    # (kittrial-5bb.10 item 4), before any plan or write: a held contribution is not
+    # integration-ready, so a caller cannot release it by naming it. The selection already
+    # skipped it; this is the explicit refusal.
+    held=held_tasks(rows)
+    named=set()
+    for target in payload.get('targets') or []:
+        if isinstance(target,str):named.add(target)
+        elif isinstance(target,dict) and isinstance(target.get('task'),str):named.add(target['task'])
+    for task in payload.get('supersede') or []:
+        if isinstance(task,str):named.add(task)
+    for item in payload.get('supersede_scopes') or []:
+        if isinstance(item,dict) and isinstance(item.get('task'),str):named.add(item['task'])
+    refused=sorted(task for task in named if task in held)
+    if refused:
+        raise ValueError('Refusing a release that names %s: %s. A held contribution is not integration-ready; '
+                         'the hold must be released (or a corrected attestation recorded) first.'
+                         %(', '.join(refused[:5]),'; '.join('%s: %s'%(task,held[task]) for task in refused[:5])))
     if payload.get('rollback'):require_rollback_target_deployed(rows,payload['scope'])
     selected,plans,issues,evidence=_release_plan(rows,payload,operators,journal)
     superseded=_supersede_plan(rows,payload,issues,evidence)
@@ -1816,6 +1893,16 @@ def apply_native(payload, actor, run, operators=None, journal=None, lifecycle_au
             from review_workflow import require_independent_approval
             require_independent_approval(issue,payload['dimension'],payload['task'],
                                          operators=operators,owners=owners,journal=journal)
+    # A task whose CURRENT contribution is held is not integration-ready (kittrial-5bb.10
+    # item 4): `reviewed` and `integrated` facts for it are refused with the hold's own
+    # sentence, before any write, so a held contribution cannot be recorded as reviewed or
+    # integrated. Judged from the same export the rest of this write already reads.
+    if payload['dimension'] in ('reviewed','integrated'):
+        sentence=held_issue_sentence(issues.get(payload['task']))
+        if sentence:
+            raise ValueError('Refusing to record %s for %s: %s. A held contribution is not '
+                             'integration-ready; the hold must be released (or a corrected attestation '
+                             'recorded) first.'%(payload['dimension'],payload['task'],sentence))
     # A SINGLE fact must name the task's CURRENT scope: a fact recorded under an
     # older, previously recorded scope is refused here with main's rule (rev3 item
     # 2). Only the release operation may write a fact under an already-recorded

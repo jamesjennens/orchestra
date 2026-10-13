@@ -819,7 +819,14 @@ class BdRowTests(unittest.TestCase):
     def test_coordination_merge_acquire_refuses_malformed_task(self):
         import coordination
         bad_task = '[{"id": "t-bad", "title": "Bad", "data": ' + deep(1000) + '}]'
-        run = lambda cmd: bad_task if cmd[:2] == ['show', 't-bad'] else '{"available": true}'
+
+        def run(cmd):
+            if cmd[:2] == ['show', 't-bad']:
+                return bad_task
+            if cmd == ['export', '--all']:
+                return ''                   # the stored-hold read finds nothing
+            return '{"available": true}'
+
         p = {'operation': 'merge-acquire', 'task': 't-bad', 'target': 'origin/main'}
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaisesRegex(ValueError, r'Task t-bad is malformed:'):

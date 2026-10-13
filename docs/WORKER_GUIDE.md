@@ -307,6 +307,46 @@ Before a handoff, preserve the actual implementation as either:
 - A contribution branch on an authorized remote, with repository URL, branch, exact commit and PR if applicable. Push only when branch-push permission is already established. Verify the remote branch tip, for example with `git ls-remote REMOTE refs/heads/BRANCH`, and record it. Remote visibility under your credentials alone does not prove the reviewer has access; identify the intended recipient's access or obtain acknowledgement.
 - An explicit Git bundle transfer when pushing is unavailable or unauthorized. Create a self-contained bundle of the contribution branch, for example `git bundle create contribution.bundle BRANCH`, verify it with `git bundle verify contribution.bundle`, then place it at an agreed recipient-accessible location. Record its checksum, contained branch, exact commit and transfer location. A bundle sitting only in the same isolated workspace is not a transfer. The recipient verifies/fetches it before relying on the handoff.
 
+### Detached HEAD and renamed bundles
+
+A worker whose checkout is detached (a CI checkout, a `git checkout <sha>`) has no branch
+name to bundle. Bundle the `HEAD` pseudo-ref, never a bare commit id:
+
+```
+git bundle create contribution.bundle HEAD      # records "<sha> HEAD"; no branch ref
+git bundle list-heads contribution.bundle       # prints "<sha> HEAD"
+git bundle verify contribution.bundle
+```
+
+`git bundle create FILE <sha>` is refused ("Refusing to create empty bundle"), so a bare
+commit id is not an alternative. Because such a bundle carries no branch, `git clone
+contribution.bundle` lands the recipient in detached HEAD and a bare `git fetch
+contribution.bundle` fills only `FETCH_HEAD` and creates no local branch. Import it
+explicitly, by the exact commit the bundle advertises:
+
+```
+git init recipient && cd recipient
+git fetch /path/to/contribution.bundle <sha>:refs/heads/contribution
+git rev-parse refs/heads/contribution           # must equal <sha>
+```
+
+Record the exact commit you advertised, not the file name. A **renamed bundle** is the same
+delivery: the file name and path are labels, and the identity is the SHA-256 of the bytes.
+Copying or renaming a bundle for a revision changes nothing about what it contains, so a
+verifier reads the checksum of the bytes actually delivered and the commit the bundle
+itself advertises; a delivery is never identified, matched or attested by its path. When a
+revision renames or moves its bundle, declare the new checksum you actually produced.
+
+A verifier records what it observed as a separate attestation (`review TASK` operation
+`attest`, see [reviews](REVIEWS.md)), never by overwriting the declared delivery: the
+commit observed must be the declared delivered tip, a bundle must match the declared
+SHA-256 and a positive byte count, and an unreachable remote is recorded as an explicit
+`unknown` with its reason rather than as a pass. On the coordination host a listed verifier
+makes the observation real with `python3 admin.py attest-delivery PROJECT --actor VERIFIER
+--task TASK --bundle FILE --reason TEXT`, which reads the file's bytes and SHA-256, lists
+the heads the bundle advertises and writes the record from those values; `attest`, `hold`
+and `release-hold` are host-only, and only a listed verifier or listed operator may attest.
+
 Push permission for a contribution branch is separate from permission to merge, update a shared branch or deploy. If project instructions do not establish push authority, ask for that narrow decision or agree a bundle transfer. Do not infer broad Git permissions from a claimed task.
 
 A local commit alone is insufficient. Uncommitted files and local-only evidence must be listed as outstanding work, not as a transferable completed implementation. Do not put credentials or private runtime data into a branch/bundle.

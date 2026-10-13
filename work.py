@@ -6,7 +6,7 @@ from lifecycle import integration_evidence, project_facts
 from review_state import RECONCILIATION_STATE, next_actor, active_work
 
 CONTRACT_VERSION = 'cli-contract-v1'
-WORK_STATES = ['none','awaiting-review','changes-requested','awaiting-integration','integrated','reconciliation-needed','legacy-review-ready','withdrawn','superseded','error']
+WORK_STATES = ['none','awaiting-review','changes-requested','awaiting-integration','held','integrated','reconciliation-needed','legacy-review-ready','withdrawn','superseded','error']
 WORK_LIMIT_MIN, WORK_LIMIT_MAX = 1, 100
 WORK_OFFSET_MIN = 0
 
@@ -130,6 +130,19 @@ def _caller_move(state, task, owned, named_reviewer=False, pending_items=0, rede
     if state in ('awaiting-integration', 'approved'):
         # `approved` is the web service's in-process name for the same state.
         return 'coordinator', "Nothing is for you to do: the next move is the coordinator's."
+    if state == 'held':
+        # An explicit integration hold, or a positively failed verification
+        # (kittrial-5bb.10): the coordinator releases it or records a corrected
+        # attestation, so this is not the author's move to guess at. Open requested
+        # changes are still owed, though, so when there are any the author's move and the
+        # sentence say BOTH facts (item 7) instead of "nothing is for you to do".
+        if items:
+            return 'you', ('This is your work now: %d outstanding review %s, and the contribution is held '
+                           'from integration until the coordinator releases the hold or records a corrected '
+                           'verification. Read %s and address each item.' % (items, plural, back))
+        return 'coordinator', ("Nothing is for you to do: the contribution is held from integration "
+                               "until the coordinator releases the hold or records a corrected "
+                               "verification; read %s" % back)
     if state in ('withdrawn', 'superseded') and items:
         return 'you', ('This is your work now: %d outstanding review %s on a final contribution. '
                        'Read %s and deliver a new contribution that answers each item.'
@@ -417,7 +430,8 @@ def help_payload(action='work'):
     elif action == 'review':
         payload['operations'] = ['read (review TASK)', 'contribute', 'request-changes',
                                  'respond', 'approve', 'withdraw', 'request-review',
-                                 'resolve-item', 'decline-review', 'recommend']
+                                 'resolve-item', 'decline-review', 'recommend',
+                                 'attest', 'hold', 'release-hold']
         payload['notes'] = [
             'Contribution payloads use contribution = the contribution record comment_id, '
             'never a Git SHA and never latest_comment_id.',
@@ -432,10 +446,29 @@ def help_payload(action='work'):
             'request-changes summary that asked for it.',
             'withdraw (author or coordinator, with reason) or request-review (naming a reviewer) '
             'is additive; older kits refuse the unknown operation rather than misreading it.',
-            'Writing the new shapes (withdraw, request-review, resolve-item, decline-review, an '
-            'item severity, a request-changes summary) is refused unless this installation has '
-            'review_workflow_writes on; readers here understand them either way. An operator '
-            'turns it on with `admin.py review-writes on --actor OPERATOR`.',
+            'Writing the new shapes (withdraw, request-review, resolve-item, decline-review, attest, '
+            'hold, release-hold, an item severity, a request-changes summary) is refused unless this '
+            'installation has review_workflow_writes on; readers here understand them either way. An '
+            'operator turns it on with `admin.py review-writes on --actor OPERATOR`.',
+            'attest records what a VERIFIER actually observed, kept separate from the declared '
+            'delivery: {schema_version, operation, operation_id, task, previous, contribution, '
+            'verdict: verified|failed|unknown, commit, base_commit, method, reason} plus optional '
+            'sha256 and bytes. Only a listed verifier or a listed operator may attest, never the '
+            'contribution\'s author, the task\'s assignee or their party. The operation itself reads '
+            'no bundle, computes no hash and runs no git: on the host `admin.py attest-delivery` '
+            'reads the bundle file, computes its SHA-256 and byte count, lists its heads and writes '
+            'the record from what it found. A verified verdict is refused unless the observed commit '
+            'is the declared delivered tip, the base is the declared base, and a bundle matches the '
+            'declared SHA-256 with a positive byte count; an unreachable remote is recorded as '
+            'unknown with its reason, never as a pass, and unknown does not hold.',
+            'hold sets an explicit integration hold ({contribution, reason}) and release-hold '
+            'clears exactly one open hold ({contribution, hold, reason}, hold = the hold record '
+            'comment_id). Only a listed operator may set or release one; both are audited, and a '
+            'hold survives retries and new revisions until it is explicitly released. An APPROVED '
+            'contribution with an open hold (or a failed attestation) reads held, never '
+            'awaiting-integration; a revision still awaiting review stays in the reviewers\' queue '
+            'with the hold shown. attest, hold and release-hold are host-only: the web route '
+            'refuses them.',
             'A text field over its limit is refused with the field, its length and the limit; for a '
             'review item or a resolution the error also names which one (its index and id). The limits '
             'are listed in `limits`.',
@@ -469,7 +502,10 @@ def help_options(action):
             {'flag': '--owner ACTOR', 'description': 'show only tasks owned by ACTOR (mutually exclusive with --mine; malformed rows remain visible)'},
             {'flag': '--state STATE', 'description': 'filter by the review state the row SHOWS: ' + ', '.join(WORK_STATES)
                                                       + ' (reconciliation-needed selects rows whose recorded evidence must '
-                                                        'be reconciled, whatever review state they show)'},
+                                                        'be reconciled, whatever review state they show). held means an '
+                                                        'APPROVED contribution is held: an unapproved revision under a '
+                                                        'hold still shows its own awaiting-review/changes-requested state, '
+                                                        'with the hold shown on the row'},
             {'flag': '--claimable', 'description': 'bounded claimable-work view: open, unassigned, no contribution, '
                                                    'excluding epics, decisions, gates, jobs, tasks labelled decision '
                                                    'and record anchors'},
@@ -851,6 +887,16 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
                                           named_reviewer=review_request,pending_items=pending_items,
                                           redelivered=redelivered,assignee=row.get('assignee'),
                                           closed=row.get('status')=='closed',claimable=row_claimable)
+        # A standing hold (or a failed attestation) is shown BESIDE the state the row
+        # already reads (kittrial-5bb.10 item 7): a revision still awaiting review stays in
+        # the reviewers' queue, and an author with open requested changes is told the
+        # changes are owed AND that the contribution is held, rather than "nothing is for
+        # you to do". The `held` state's own sentence already says it.
+        if state != 'held' and (review.get('holds') or review.get('verification') == 'failed'):
+            from review_workflow import integration_hold_sentence
+            hold_sentence=integration_hold_sentence(review)
+            if hold_sentence and hold_sentence not in move_text:
+                move_text=move_text+' Integration hold: '+hold_sentence+'.'
         items.append({'open_items':open_items,'blocking_items':blocking_items,
                       'checkpoint_at':checkpoint_at,'newer_activity':newer_activity,
                       'pending_change_requests':pending_change_requests[:PENDING_REQUEST_IDS_MAX],
@@ -898,9 +944,21 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
                       'approval_requires_other_party':bool(independent_approval),
                       'waiting_for_approval':approval_wait(state,row['id'],actor,row.get('assignee'),
                           contribution.get('author'),independent_approval,owners,review_request,move_text)})
+        # Additive (kittrial-5bb.210 F0): the void snapshot's per-dimension reason is carried
+        # on the row so a reader can say WHY a lifecycle dimension reads the way it does. Kept
+        # BESIDE this lane's held state, not instead of it: a voided dimension and a hold are
+        # independent facts (kittrial-5bb.10 merge-forward-onto-24c9d0f).
         reasons = {dim: state['reason'] for dim, state in fact.items() if state.get('reason')}
         if reasons:
             items[-1]['lifecycle_reasons'] = reasons
+        # Additive (kittrial-5bb.10 item 7): a standing hold (or a verifier's reading) is
+        # shown on the row even when the row stays in the reviewers' or the author's queue,
+        # so a held revision is still reviewable AND says it is held. Present only when it
+        # carries something, so a chain without one reads exactly as before.
+        if review.get('holds'):
+            items[-1]['holds']=[h['comment_id'] for h in review['holds']]
+        if review.get('verification'):
+            items[-1]['verification']=review['verification']
     from briefing import checkpoint_queue_fields
     task_rows={row['id']:row for row in rows if isinstance(row,dict) and row.get('id')}
     # The bounded claimable-work view (kittrial-5bb.6 deliverable b): filter to the rows
@@ -924,7 +982,7 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
             wait_text=waiting_move(checkpoint_wait_move_text(checkpoint_states.get(item['task'])))
             if wait_text:
                 item['next']=wait_text
-    priority={'changes-requested':0,'error':1,'awaiting-review':2,'legacy-review-ready':2,'awaiting-integration':3}
+    priority={'changes-requested':0,'error':1,'awaiting-review':2,'legacy-review-ready':2,'awaiting-integration':3,'held':3}
     # Items where the next move is the CALLER's sort first (kittrial-5bb.249); inside each
     # group the review-state order above is unchanged, so a revision request still leads
     # the caller's own undelivered work.
@@ -1068,7 +1126,8 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
     from review_workflow import execute as review
     result=review(rows,task,actor,payload,run, operators=operators, journal=path,
                   review_writes=review_writes, independent_approval=independent_approval,
-                  coordinator_writes=coordinator_writes, owners=owners, verified_web_authority=verified_web_authority)
+                  coordinator_writes=coordinator_writes, owners=owners, verified_web_authority=verified_web_authority,
+                  verifiers=verifiers)
     if payload.get('operation')=='request-changes':
         # Retry repairs a label update interrupted after the durable review comment.
         run(['update',task,'--remove-label','review-ready','--json'])

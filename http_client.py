@@ -318,7 +318,7 @@ class Client:
                    summary=None, actor=None, key=None, repository=None, delivery=None,
                    supersedes=None, follows=None, contribution=None, items=None, resolutions=None,
                    reason=None, reviewer=None, request=None, item=None, disposition=None,
-                   verdict=None):
+                   verdict=None, method=None, sha256=None, bytes_=None, hold=None):
         """Record one contribution/review operation.
 
         The canonical backend forwards exactly the fields the operation needs, so the
@@ -329,6 +329,9 @@ class Client:
         ``reason``/``reviewer``/``request``/``item`` and ``disposition`` carry the
         additive operations (withdraw, request-review, resolve-item, decline-review) and
         the request-changes ``summary`` over HTTP (kittrial-5bb.110 item 9).
+        ``method``/``sha256``/``bytes_``/``hold`` carry the verifier attestation and the
+        integration hold operations (``attest``/``hold``/``release-hold``,
+        kittrial-5bb.10); ``bytes_`` is sent as the canonical field name ``bytes``.
 
         A null OPTIONAL field is not sent at all: sending ``"summary": null`` for an
         unset request-changes summary made the canonical writer refuse every legacy
@@ -346,7 +349,8 @@ class Client:
                 'supersedes': supersedes, 'follows': follows, 'contribution': contribution,
                 'items': items, 'resolutions': resolutions, 'reason': reason,
                 'reviewer': reviewer, 'request': request, 'item': item,
-                'disposition': disposition, 'verdict': verdict}
+                'disposition': disposition, 'verdict': verdict, 'method': method,
+                'sha256': sha256, 'bytes': bytes_, 'hold': hold}
         kept_nullable = {'operation_id'}
         if operation != 'recommend':
             kept_nullable.add('previous')
