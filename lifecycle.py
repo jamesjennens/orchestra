@@ -1925,10 +1925,12 @@ def recorded_scope_tokens(rows):
 def host_snapshot(rows, run=None, project=None):
     """Attach a host family's context once to this request's native snapshot."""
     from lifecycle_voids import Snapshot, read_journal, snapshot
-    if isinstance(rows, Snapshot):
-        return rows
     project = project if project is not None else getattr(run, 'lifecycle_project', None)
     if project is None:
+        return rows
+    if getattr(rows, 'offline_corrections_consulted', None) is False:
+        return rows              # a journal that did not bind this export is not authority
+    if getattr(rows, 'web_lifecycle_mark_directory', None) == str(project):
         return rows
     cached = getattr(run, '_lifecycle_void_journal', None) if run is not None else None
     if cached is None or cached[0] != str(project):
@@ -1938,7 +1940,15 @@ def host_snapshot(rows, run=None, project=None):
                 run._lifecycle_void_journal = cached
             except (AttributeError, TypeError):
                 pass
-    return snapshot(rows, journal=cached[1])
+    corrected = rows if isinstance(rows, Snapshot) else snapshot(rows, journal=cached[1])
+    import web_lifecycle_marks as marks
+    marked = getattr(run, '_web_lifecycle_mark_journal', None) if run is not None else None
+    if marked is None or marked[0] != str(project):
+        marked = (str(project), marks.read_journal(project))
+        if run is not None:
+            try:run._web_lifecycle_mark_journal = marked
+            except (AttributeError, TypeError):pass
+    return marks.snapshot(corrected, project, marked[1])
 
 
 def _declared_targets(raw):

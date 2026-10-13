@@ -50,6 +50,97 @@ export function createApi(transport) {
   const uncertainKeys = new Map();
   const UNCERTAIN_KEYS_MAX = 50;
 
+  // Only lifecycle request bodies are stored here: no login, reset, grant or
+  // credential request can reach this cache. Keys are saved BEFORE the write,
+  // scoped to the authenticated actor, and survive a tab reload.
+  let lifecycleActor = null;
+  let lifecycleKeys = new Map();
+  let lifecycleStorageFault = false;
+  function lifecycleStorageKey() { return 'orchestra-lifecycle-retries-v1:' + encodeURIComponent(lifecycleActor); }
+  function loadLifecycleActor(actor) {
+    if (typeof actor !== 'string' || !actor || actor === lifecycleActor) return;
+    lifecycleActor = actor; lifecycleKeys = new Map(); lifecycleStorageFault = false;
+    try {
+      const text = sessionStorage.getItem(lifecycleStorageKey());
+      if (!text) return;
+      if (text.length > 256000) { lifecycleStorageFault = true; return; }
+      const entries = JSON.parse(text);
+      if (!Array.isArray(entries) || entries.length > 50) { lifecycleStorageFault = true; return; }
+      for (const entry of entries) {
+        if (!Array.isArray(entry) || entry.length !== 2 || typeof entry[0] !== 'string'
+            || entry[0].length > 200000 || !entry[0].startsWith('POST /v1/projects/')
+            || !entry[0].includes('/lifecycle/') || !/^[A-Za-z0-9_-]{8,128}$/.test(entry[1])) { lifecycleStorageFault = true; return; }
+      }
+      lifecycleKeys = new Map(entries);
+    } catch { lifecycleStorageFault = true; }
+  }
+  function saveLifecycleKeys() {
+    const text = JSON.stringify([...lifecycleKeys]);
+    if (lifecycleKeys.size > 50 || text.length > 256000)
+      throw new ApiError(409, 'pending_lifecycle_limit', 'Reconcile saved lifecycle requests before starting another.', null, null);
+    try { sessionStorage.setItem(lifecycleStorageKey(), text); }
+    catch { throw new ApiError(409, 'retry_storage_unavailable', 'This browser cannot save the retry key. Restore tab storage before recording lifecycle facts.', null, null); }
+  }
+  async function readLifecycle(pid, tid) {
+    const result = await call('GET', `/v1/projects/${encodeURIComponent(pid)}/tasks/${encodeURIComponent(tid)}/lifecycle`);
+    loadLifecycleActor(result.current_actor);
+    return result;
+  }
+  async function writeLifecycle(pid, tid, suffix, body) {
+    if (!lifecycleActor) await readLifecycle(pid, tid);
+    if (!lifecycleActor) throw new ApiError(409, 'lifecycle_actor_unknown', 'Read the current lifecycle state before recording a fact.', null, null);
+    if (lifecycleStorageFault) throw new ApiError(409, 'retry_storage_unreadable', 'Saved lifecycle retry keys cannot be read. Reconcile the current facts before clearing tab storage.', null, null);
+    const path = `/v1/projects/${encodeURIComponent(pid)}/tasks/${encodeURIComponent(tid)}/lifecycle/${suffix}`;
+    function sorted(value) {
+      if (Array.isArray(value)) return value.map(sorted);
+      if (value && typeof value === 'object') return Object.fromEntries(Object.keys(value).sort().map(k => [k, sorted(value[k])]));
+      return value;
+    }
+    const fixedBody = sorted(JSON.parse(JSON.stringify(body)));
+    const intent = 'POST ' + path + ' ' + JSON.stringify(fixedBody);
+    const key = lifecycleKeys.get(intent) || newKey();
+    const existing = lifecycleKeys.has(intent);
+    lifecycleKeys.set(intent, key);
+    try { saveLifecycleKeys(); }
+    catch (error) { if (!existing) lifecycleKeys.delete(intent); throw error; }
+    try {
+      const result = await call('POST', path, { body: fixedBody, key });
+      lifecycleKeys.delete(intent);
+      try { saveLifecycleKeys(); }
+      catch {
+        lifecycleKeys.set(intent, key);
+        throw new ApiError(503, 'uncertain', 'The write completed but its retry key could not be cleared. Retry the identical request to reconcile it.', null, null);
+      }
+      return result;
+    } catch (caught) {
+      const error = caught instanceof ApiError ? caught : new ApiError(0, 'network',
+        'The lifecycle response was lost. Retry the identical request to reconcile it.', null, null);
+      if (error instanceof ApiError && error.uncertain) {
+        error.retry = () => writeLifecycle(pid, tid, suffix, fixedBody);
+      } else {
+        lifecycleKeys.delete(intent);
+        try { saveLifecycleKeys(); } catch { /* Keep the original native refusal sentence. */ }
+      }
+      throw error;
+    }
+  }
+  function pendingLifecycle(pid, tid) {
+    const prefix = `POST /v1/projects/${encodeURIComponent(pid)}/tasks/${encodeURIComponent(tid)}/lifecycle/`;
+    const items = [];
+    for (const [intent] of lifecycleKeys) {
+      if (!intent.startsWith(prefix)) continue;
+      const rest = intent.slice(prefix.length), space = rest.indexOf(' ');
+      const suffix = rest.slice(0, space);
+      if (space < 0 || !/^(scope|facts\/(implemented|tested|reviewed|integrated|deployed|live-verified))$/.test(suffix)) continue;
+      try {
+        const body = JSON.parse(rest.slice(space + 1));
+        if (!body || typeof body !== 'object' || Array.isArray(body)) { lifecycleStorageFault = true; continue; }
+        items.push({ operation: suffix, body, retry: () => writeLifecycle(pid, tid, suffix, body) });
+      } catch { /* Damaged requests are never replayed by guessing their body. */ }
+    }
+    return items;
+  }
+
   async function mutate(method, path, body) {
     const intent = method + ' ' + path + ' ' + JSON.stringify(body === undefined ? null : body);
     const key = uncertainKeys.get(intent) || newKey();
@@ -85,7 +176,11 @@ export function createApi(transport) {
       return result;
     },
     hasCsrf: () => Boolean(csrf),
-    async logout() { try { await call('DELETE', '/v1/sessions/current'); } finally { csrf = null; } },
+    async logout() { try { await call('DELETE', '/v1/sessions/current'); } finally {
+      csrf = null;
+      if (lifecycleActor) { try { sessionStorage.removeItem(lifecycleStorageKey()); } catch {} }
+      lifecycleActor = null; lifecycleKeys = new Map();
+    } },
     redeemReset: (uid, reset_value, new_password) => call('POST', `/v1/accounts/${uid}/reset/redeem`, { body: { reset_value, new_password }, key: newKey() }),
     changePassword: (uid, current_password, new_password) => mutate('POST', `/v1/accounts/${uid}/password`, { current_password, new_password }),
 
@@ -100,6 +195,10 @@ export function createApi(transport) {
     // projects
     projects: () => call('GET', '/v1/projects'),
     project: (pid) => call('GET', `/v1/projects/${pid}`),
+    lifecycle: readLifecycle,
+    pendingLifecycle,
+    setLifecycleScope: (pid, tid, body) => writeLifecycle(pid, tid, 'scope', body),
+    recordLifecycleFact: (pid, tid, dimension, body) => writeLifecycle(pid, tid, 'facts/' + encodeURIComponent(dimension), body),
     createProject: (name) => mutate('POST', '/v1/projects', { name }),
     registerProject: (projectId, name) => mutate('POST', '/v1/projects', name ? { project_id: projectId, name } : { project_id: projectId }),
     // Create the project on the server as well (an account a superuser granted that, or a superuser).

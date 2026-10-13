@@ -228,6 +228,33 @@ class Client:
     def merge_slot(self, project):
         return self.request('GET', '/v1/projects/%s/merge-slot' % quote(project, safe=''))
 
+    def lifecycle(self, project, task):
+        return self.request('GET', '/v1/projects/%s/tasks/%s/lifecycle'
+                            % (quote(project, safe=''), quote(task, safe='')))
+
+    def _write_lifecycle(self, project, task, operation, body, key=None, dimension=None):
+        identity = key or new_idempotency_key()
+        suffix = 'scope' if operation == 'scope' else 'facts/' + quote(dimension, safe='')
+        path = '/v1/projects/%s/tasks/%s/lifecycle/%s' % (quote(project, safe=''), quote(task, safe=''), suffix)
+        try:
+            return self.request('POST', path, body, key=identity)
+        except OSError:
+            raise UncertainOutcome(0, 'uncertain', 'Connection lost; reconcile the identical lifecycle request',
+                                   None, None, identity) from None
+
+    def set_lifecycle_scope(self, project, task, scope, expected_scope_token, evidence,
+                            provenance='performed', note=None, key=None):
+        body = dict(scope=scope, expected_scope_token=expected_scope_token, evidence=evidence, provenance=provenance)
+        if note is not None:body['note'] = note
+        return self._write_lifecycle(project, task, 'scope', body, key)
+
+    def record_lifecycle_fact(self, project, task, dimension, value, scope, evidence,
+                              provenance='performed', note=None, trigger=None, key=None):
+        body = dict(scope=scope, value=value, evidence=evidence, provenance=provenance)
+        if note is not None:body['note'] = note
+        if trigger is not None:body['trigger'] = trigger
+        return self._write_lifecycle(project, task, 'fact', body, key, dimension)
+
     def _write_merge_slot(self, project, operation, body, key):
         identity = key or new_idempotency_key()
         try:
@@ -420,6 +447,12 @@ def _build_parser():
     slot.add_argument('--expected-holder')
     slot.add_argument('--reason')
     slot.add_argument('--idempotency-key', help='reuse exactly this key and request after an uncertain result')
+    life = sub.add_parser('lifecycle', help='read or record task scope and lifecycle facts')
+    life.add_argument('project');life.add_argument('task')
+    life.add_argument('operation', choices=('read','scope','fact'))
+    life.add_argument('--dimension', choices=('implemented','tested','reviewed','integrated','deployed','live-verified'))
+    life.add_argument('--file', help='UTF-8 JSON HTTP request body for scope or fact')
+    life.add_argument('--idempotency-key', help='reuse exactly this key and body after an uncertain result')
     call = sub.add_parser('call', help='issue one raw JSON request')
     call.add_argument('method')
     call.add_argument('path')
@@ -466,6 +499,16 @@ def main(argv=None):
                 result = client.force_release_merge_slot(args.project, args.expected_holder, args.reason, args.idempotency_key)
             print(json.dumps(result, indent=2))
             return 0
+        if args.command == 'lifecycle':
+            if args.operation == 'read':result = client.lifecycle(args.project, args.task)
+            else:
+                if not args.file:parser.error('scope and fact require --file')
+                if args.operation == 'fact' and not args.dimension:parser.error('fact requires --dimension')
+                with open(args.file, encoding='utf-8-sig') as stream:body = json.load(stream)
+                if not isinstance(body, dict):parser.error('the lifecycle request body must be a JSON object')
+                result = client._write_lifecycle(args.project, args.task, args.operation, body,
+                                                 args.idempotency_key, args.dimension)
+            print(json.dumps(result, indent=2));return 0
         if args.credential:
             client.use_credential(args.credential)
         body = json.loads(args.body) if args.body else None

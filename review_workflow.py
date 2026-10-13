@@ -2388,8 +2388,8 @@ def recorded_integrations(rows, task, prior, operators=None, journal=None, owner
 
     ``prior`` is the integration evidence of ``task``'s prior revision (``review_state.integration``).
     A commit reads ``later`` when a passed ``integrated`` fact on ANY task of the project
-    names it as its scope's ``integration_commit``, **that fact was recorded by a listed
-    operator**, the event that recorded it was created after the event that recorded the
+    names it as its scope's ``integration_commit``, **that fact has an eligible
+    recorder**, the event that recorded it was created after the event that recorded the
     prior revision's integration, and no operator revert that the host journal confirms
     names the commit, on any task. Both times are the tracker's own stamps on the event
     rows, never a caller's. The tracker stamps whole seconds, and two events stamped the
@@ -2398,11 +2398,14 @@ def recorded_integrations(rows, task, prior, operators=None, journal=None, owner
     refused, never an earlier one accepted. A time that is missing or cannot be read is
     not "after".
 
-    **Only an operator's fact counts** (kittrial-5bb.155). Any actor can record an
+    **Only an eligible recorder's fact counts** (kittrial-5bb.155/.210): a present
+    listed operator/bound principal or an exact host-issued web-coordinate mark.
+    Marks retain historical authority after roles and grants change; plain exports
+    with no trusted host context cannot confer it. Any actor can record an
     ``integrated`` fact on a task of its own making, so a fact recorded by anybody else
     names no base: a contributor could otherwise make any commit acceptable with a decoy
-    task. ``operators`` is the installation's allowlist; with none configured no later
-    base is accepted. This is the interim rule until kittrial-5bb.106 settles who may
+    task. ``operators`` is the installation's allowlist; without an eligible operator
+    or valid issued mark no later base is accepted. This is the interim rule until kittrial-5bb.106 settles who may
     write lifecycle facts. It does not stop a caller who reaches the endpoint over SSH and
     names itself as an operator: there an actor name is a declared label. Over HTTP the
     actor is the authenticated account.
@@ -2413,7 +2416,12 @@ def recorded_integrations(rows, task, prior, operators=None, journal=None, owner
     fact recorded with the wrong commit, would pass; the reviewer checks the base as for
     any contribution. A commit of main that no lifecycle fact names is never accepted.
     """
-    from lifecycle import integration_evidence
+    from lifecycle import integration_evidence, host_snapshot
+    import web_lifecycle_marks as marks
+    if journal is not None:
+        rows = host_snapshot(rows, project=journal)
+    native_events = {row.get('id'): row for row in rows
+                     if isinstance(row, dict) and row.get('issue_type') == 'event'}
     from review_state import reverts_by_task
     # When each event was recorded: the tracker's stamp. Two events stamped the same second
     # cannot be ordered: the export lists rows by id, not by time (measured on real bd,
@@ -2448,7 +2456,7 @@ def recorded_integrations(rows, task, prior, operators=None, journal=None, owner
                 reading = 'reverted'
             elif prior_time is None or stamp is None or not stamp > prior_time:
                 reading = 'earlier'
-            elif _recorded_operator(fact.get('actor'), operators, once_owners):
+            elif marks.snapshot_eligible(rows, native_events.get(fact.get('event_id')), operators, once_owners):
                 reading = 'later'
             else:
                 # Later, and recorded by somebody who is not a listed operator: not a base. The
