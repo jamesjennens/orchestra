@@ -886,7 +886,10 @@ class AdoptionTests(unittest.TestCase):
         # lock happens UNDER the deployment lock, so it is bounded like that one - a stuck
         # holder makes the command refuse (nothing changed, the deployment lock released
         # with the process) instead of hanging every deployment change for good.
-        import fcntl
+        try:
+            import fcntl
+        except ImportError:
+            self.skipTest('fcntl is POSIX-only: there is no flock to hold on this platform')
         if not hasattr(fcntl, 'LOCK_NB'):
             self.skipTest('non-blocking flock unavailable on this platform')
         held = (self.root/'projects'/'alpha'/'.coordination.lock').open('a')
