@@ -758,6 +758,8 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
                  'integrated':'Integration is recorded for this contribution; follow the project release/deployment workflow and scoped lifecycle evidence.',
                  'withdrawn':'The current contribution was withdrawn by its author or a coordinator; read review '+task+' or deliver a new revision.',
                  'superseded':'The current contribution was marked superseded; read review '+task+' or deliver a new revision.'}
+    if issue.get('status')=='closed' and review['review_state']=='awaiting-integration':
+        review_next['awaiting-integration']='This task is closed; approval and integration evidence remain readable in review '+task+'. Closure is not approval or integration.'
     # The integration overlay warnings (kittrial-5bb.52) are part of the shared
     # projection's warnings; surface them in the compact read too, so a revert, a
     # resolved-elsewhere fact conflict or an ignored revert record is visible

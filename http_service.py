@@ -1087,8 +1087,8 @@ class InProcessBackend:
             if not task.get('assignee') or (actor is not None and task.get('assignee') != actor):
                 continue
             review = self._review_view(task)
-            if task.get('status') == 'closed' and review['state'] not in ('changes-requested', 'error',
-                                                                       'awaiting-integration', 'approved'):
+            from review_state import active_work
+            if not active_work(task.get('status'), review['state'], review['open_requests']):
                 continue
             rows.append({'id': task['id'], 'title': task.get('title'), 'status': task.get('status'),
                          'assignee': task.get('assignee'), 'review_state': review['state'],
@@ -1172,8 +1172,8 @@ class InProcessBackend:
         items = []
         for task in self.read_tasks(project_id)['items']:
             review = self._review_view(task)
-            if task.get('status') == 'closed' and review['state'] not in ('changes-requested', 'error',
-                                                                       'awaiting-integration', 'approved'):
+            from review_state import active_work
+            if not active_work(task.get('status'), review['state'], review['open_requests']):
                 continue
             items.append(queue_item(
                 project_id, task, review['state'], review['contribution'],
@@ -1188,8 +1188,9 @@ class InProcessBackend:
         return {'items': items, 'complete': True, 'warnings': []}
 
 
-#: Review states that still need someone to act (``work.queue`` keeps these even on a
-#: closed task). ``approved`` is the in-process name for ``awaiting-integration``.
+#: Review-state filter vocabulary, including open tasks awaiting integration.
+#: Closed-task eligibility comes from review_state.active_work, not this vocabulary.
+#: ``approved`` is the in-process name for ``awaiting-integration``.
 #: ``withdrawn``/``superseded`` are additive (kittrial-5bb.94): the canonical ``work``
 #: queue lists such a task while a blocking item is still open, so the HTTP queue and
 #: its ``state=`` filter accept them too or the two transports disagree
@@ -2851,8 +2852,8 @@ class EndpointBackend:
 
         ``bd list`` rows carry no review state, so the task list merges this in. The
         ``work`` queue lists every open task and every closed task whose review is
-        still active; a closed task it omits has a finished (or no) review, which is
-        reported as unknown rather than guessed. ``complete`` is false when the
+        still actionable; a closed task it omits may retain historical approval,
+        so its review is reported as unknown rather than guessed. ``complete`` is false when the
         bounded walk stopped early; tasks past the bound are unknown too.
         """
         queue = queue if queue is not None else self.review_queue(project_id)
@@ -3215,7 +3216,8 @@ def _canonical_payload(stdout):
 def next_action(task):
     """Who acts next on a task, derived only from its status, assignee and review state."""
     state = task.get('review_state')
-    if task.get('status') == 'closed' and state not in ACTIVE_REVIEW_STATES:
+    from review_state import active_work
+    if not active_work(task.get('status'), state, task.get('open_requests', 0)):
         return None
     if state is None:
         # Unknown (the canonical projection did not cover this row): say nothing
