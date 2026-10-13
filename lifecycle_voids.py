@@ -20,10 +20,26 @@ from requirements import canonical_bytes, content_hash
 DIRECTORY = '.lifecycle-voids'
 MANIFEST = '.lifecycle-voids-manifest.json'
 RESTORE_MARKER = '.lifecycle-void-restore.json'
+#: Abandonments live BESIDE the family, never inside it (kittrial-5bb.271 item 1).
+#: The released F0 reader (main 04ed25d) reads a schema-version-1 family member
+#: and refuses any operation but ``void``/``retract``; an abandonment written as
+#: a family member therefore turned EVERY lifecycle fact of the project unknown
+#: (``lifecycle-void-journal-unreadable``). Kept out of ``DIRECTORY``, a family
+#: that holds an abandonment stays a family the released reader reads unchanged.
+ABANDON_FILE = '.lifecycle-void-abandons.json'
 PREFIX = 'Kind: lifecycle-event-correction-v1\n'
 MAX_RECORD_BYTES = 24000
 MAX_RECORDS = 1000
 MAX_FAMILY_BYTES = 4 * 1024 * 1024
+#: Printed by ``admin.py lifecycle-event-abandon`` before it writes, and stated in
+#: docs/OPERATIONS.md: an abandonment also closes a void whose journal entry was
+#: lost, so the operator must rule that out first (kittrial-5bb.271 item 3).
+ABANDON_LOST_ENTRY_RULE = (
+    'Before abandoning, rule out a LOST journal entry rather than a cut: compare the newest complete '
+    'backup\'s .lifecycle-voids-manifest.json with this project\'s live .lifecycle-voids directory. A member '
+    '<sha256>.json listed there but absent live is a LOST entry - restore that family from the backup '
+    'instead of abandoning. Abandon only when no complete backup lists a missing member, i.e. the '
+    'correction never took effect. Abandonment closes the comment for good: its exact retry is refused.')
 BINDING_FIELDS = {'event_id', 'task', 'dimension', 'value', 'created_by', 'payload',
                   'created_at', 'payload_sha256', 'native_sha256'}
 PAYLOAD_FIELDS = {'schema_version', 'operation', 'operation_id', 'actor', 'reason',
@@ -71,12 +87,21 @@ def event_binding(row):
                 native_sha256=content_hash(bound))
 
 
-def validate_payload(payload):
+def validate_payload(payload, allow_abandon=False):
+    """Validate one correction payload.
+
+    ``allow_abandon`` is true only for the abandonment store (and for reading a
+    legacy family the reviewed-but-unintegrated kit could have written). A journal
+    member is validated WITHOUT it, so the released F0 rule is preserved exactly:
+    a schema-version-1 family member may name only ``void`` or ``retract``, and any
+    other operation is refused with 'Invalid lifecycle correction operation'.
+    """
     if not isinstance(payload, dict) or set(payload) != PAYLOAD_FIELDS:
         raise ValueError('Invalid lifecycle correction fields')
     if type(payload['schema_version']) is not int or payload['schema_version'] != 1:
         raise ValueError('Invalid lifecycle correction version')
-    if payload['operation'] not in ('void', 'retract', 'abandon'):
+    allowed = ('void', 'retract', 'abandon') if allow_abandon else ('void', 'retract')
+    if payload['operation'] not in allowed:
         raise ValueError('Invalid lifecycle correction operation')
     _identity(payload['operation_id'], 'operation identity')
     _identity(payload['actor'], 'actor')
@@ -130,12 +155,12 @@ def validate_payload(payload):
     return payload
 
 
-def validate_entry(entry, name=None):
+def validate_entry(entry, name=None, allow_abandon=False):
     if not isinstance(entry, dict) or set(entry) != ENTRY_FIELDS:
         raise ValueError('Invalid lifecycle void journal entry')
     if type(entry['schema_version']) is not int or entry['schema_version'] != 1:
         raise ValueError('Invalid lifecycle void journal version')
-    validate_payload(entry['payload'])
+    validate_payload(entry['payload'], allow_abandon=allow_abandon)
     _identity(entry['comment_id'], 'native correction comment identity')
     _text(entry['created_at'], 'native correction timestamp', 100)
     from review_workflow import _recorded_at
@@ -208,29 +233,121 @@ def incomplete_correction(rows, comment_id):
     return None
 
 
-def _read_regular(path):
+def _read_regular(path, limit=MAX_RECORD_BYTES):
     if path.is_symlink():
         raise ValueError('Lifecycle void journal entry is a symlink')
     flags = os.O_RDONLY | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_NOFOLLOW', 0)
     fd = os.open(path, flags)
     try:
         info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_RECORD_BYTES:
+        if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
             raise ValueError('Lifecycle void journal entry is not a bounded regular file')
         with os.fdopen(fd, 'rb', closefd=False) as stream:
-            blob = stream.read(MAX_RECORD_BYTES + 1)
-        if len(blob) > MAX_RECORD_BYTES:
+            blob = stream.read(limit + 1)
+        if len(blob) > limit:
             raise ValueError('Lifecycle void journal entry exceeds its byte bound')
         return blob
     finally:
         os.close(fd)
 
 
-def read_journal(project):
-    """Bounded host-family read; damage never silently restores a voided fact."""
-    result = dict(entries={}, invalid=[], present=False, bytes=0)
+def abandon_document(records):
+    """The closed abandonment store document for ``records`` (keyed by operation id)."""
+    return dict(schema_version=1, records={key: records[key] for key in sorted(records)})
+
+
+def validate_abandons(document):
+    """A closed, bounded abandonment store: only abandonment records, hash-checked."""
+    if (not isinstance(document, dict) or set(document) != {'schema_version', 'records'}
+            or type(document['schema_version']) is not int or document['schema_version'] != 1):
+        raise ValueError('Invalid lifecycle abandonment store')
+    records = document['records']
+    if not isinstance(records, dict) or len(records) > MAX_RECORDS:
+        raise ValueError('Invalid lifecycle abandonment store records')
+    validated = {}
+    total = 0
+    for key, record in records.items():
+        _identity(key, 'operation identity')
+        validate_entry(record, allow_abandon=True)
+        if record['payload']['operation'] != 'abandon' or record['payload']['operation_id'] != key:
+            raise ValueError('Invalid lifecycle abandonment store record identity')
+        total += len(entry_bytes(record))
+        if total > MAX_FAMILY_BYTES:
+            raise ValueError('Lifecycle abandonment store exceeds its byte bound')
+        validated[key] = record
+    return validated
+
+
+def read_abandons(project):
+    """Bounded read of the abandonment store beside the family; never creates a file.
+
+    An unreadable store is reported, never trusted: its records are simply absent,
+    so an abandoned native correction comment reads ``incomplete`` again (backups
+    stop) instead of being silently treated as closed. It can never change a
+    voided fact either way.
+    """
+    result = dict(records={}, problems=[], present=False)
     if project is None:
         return result
+    path = Path(project) / ABANDON_FILE
+    if not path.exists() and not path.is_symlink():
+        return result
+    result['present'] = True
+    try:
+        if path.is_symlink():
+            raise ValueError('Lifecycle abandonment store is a symlink')
+        blob = _read_regular(path, MAX_FAMILY_BYTES)
+        result['records'] = validate_abandons(record_json.loads(blob.decode('utf-8')))
+    except (ValueError, OSError, UnicodeError) as error:
+        result['problems'].append(str(error)[:300])
+    return result
+
+
+def publish_abandon(project, record):
+    """Atomically add one abandonment record to the store beside the family.
+
+    The store is rewritten whole under the caller's project lock. It is never a
+    family member, so a family that holds an abandonment stays readable by the
+    released F0 kit.
+    """
+    from coordination import atomic
+    validate_entry(record, allow_abandon=True)
+    if record['payload']['operation'] != 'abandon':
+        raise ValueError('Not an abandonment record')
+    path = Path(project) / ABANDON_FILE
+    if path.is_symlink() or path.with_suffix('.tmp').is_symlink():
+        raise ValueError('Lifecycle abandonment store must not be a symlink')
+    current = read_abandons(project)
+    if current['problems']:
+        raise ValueError('Lifecycle abandonment store cannot be read; operator repairs it before a write')
+    records = dict(current['records'])
+    existing = records.get(record['payload']['operation_id'])
+    if existing is not None and existing != record:
+        raise ValueError('Lifecycle correction operation identity already names different content/actor')
+    records[record['payload']['operation_id']] = record
+    document = abandon_document(records)
+    if len(entry_bytes(record)) > MAX_RECORD_BYTES or len(entry_bytes(document)) > MAX_FAMILY_BYTES:
+        raise ValueError('Lifecycle abandonment store exceeds its byte bound')
+    atomic(path, document)
+    return path
+
+
+def read_journal(project):
+    """Bounded host-family read plus the abandonment store beside it.
+
+    Damage never silently restores a voided fact. ``abandons`` is the separate
+    store the writer uses; a family member that itself carries an abandonment (the
+    shape the reviewed-but-unintegrated kit wrote once) is still read, and
+    :func:`context` treats it as an abandonment, so no history is silently
+    re-interpreted and no family is turned unreadable by a shape this kit shipped.
+    """
+    result = dict(entries={}, invalid=[], present=False, bytes=0,
+                  abandons={}, abandon_problems=[])
+    if project is None:
+        return result
+    store = read_abandons(project)
+    result['abandons'] = store['records']
+    result['abandon_problems'] = store['problems']
     # Written before replacing any restore member and cleared only after the
     # complete family/native pair is checked. Any shape means uncertainty.
     if os.path.lexists(str(Path(project) / RESTORE_MARKER)):
@@ -264,7 +381,8 @@ def read_journal(project):
                 total += len(blob)
                 if total > MAX_FAMILY_BYTES:
                     raise ValueError('Lifecycle void journal exceeds its byte bound')
-                record = validate_entry(record_json.loads(blob.decode('utf-8')), name)
+                record = validate_entry(record_json.loads(blob.decode('utf-8')), name,
+                                        allow_abandon=True)
                 key = record['payload']['operation_id']
                 if key in result['entries']:
                     raise ValueError('Conflicting lifecycle correction operation identity')
@@ -289,11 +407,15 @@ def read_journal(project):
 
 
 def backup_files(project, rows=None):
-    """Allowlisted bounded family plus its exact generation manifest; no read writes."""
+    """Allowlisted bounded family, its generation manifest and the abandonment store."""
     journal = read_journal(project)
     if journal['invalid']:
         raise ValueError('Cannot back up an unreadable/incomplete lifecycle VOID family')
-    if not journal['present']:
+    if journal['abandon_problems']:
+        raise ValueError('Cannot back up an unreadable lifecycle abandonment store: '
+                         + journal['abandon_problems'][0])
+    abandons = journal['abandons']
+    if not journal['present'] and not abandons:
         if rows is not None and native_correction_comments(rows):
             raise ValueError('Native lifecycle correction comments exist but their VOID family is missing; '
                              'an operator preserves the native data and recovers a complete VOID-capable backup')
@@ -302,10 +424,16 @@ def backup_files(project, rows=None):
         raise ValueError('A lifecycle VOID backup requires its native snapshot')
     files = {DIRECTORY + '/' + entry['sha256'] + '.json': entry
              for entry in journal['entries'].values()}
-    members = {name: hashlib.sha256(entry_bytes(record)).hexdigest() for name, record in files.items()}
-    files[MANIFEST] = dict(schema_version=1, family=DIRECTORY, count=len(members),
+    files[MANIFEST] = dict(schema_version=1, family=DIRECTORY, count=len(files),
                            bytes=sum(len(entry_bytes(record)) for record in files.values()),
-                           files=members, native_corrections_sha256=native_generation(rows))
+                           files={name: hashlib.sha256(entry_bytes(record)).hexdigest()
+                                  for name, record in files.items()},
+                           native_corrections_sha256=native_generation(rows))
+    if abandons:
+        # The abandonment store is a sidecar, never a family member: the released
+        # F0 kit reads this backup's family unchanged (it refuses the unknown
+        # sidecar path on restore, which docs/OPERATIONS.md states exactly).
+        files[ABANDON_FILE] = abandon_document(abandons)
     validate_backup(files, rows)
     return files
 
@@ -345,12 +473,13 @@ def native_generation(rows):
 
 
 def validate_backup(files, rows=None):
-    """Closed manifest, every member/hash/bound, and linked retraction graph."""
+    """Closed manifest, every member/hash/bound, linked retraction graph and abandonment store."""
     if not isinstance(files, dict) or any(not isinstance(name, str) for name in files):
         raise ValueError('Invalid lifecycle VOID backup files')
     members = {name: value for name, value in files.items() if name.startswith(DIRECTORY + '/')}
     manifest = files.get(MANIFEST)
-    if not members and manifest is None:
+    store = files.get(ABANDON_FILE)
+    if not members and manifest is None and store is None:
         return None
     if (not isinstance(manifest, dict)
             or set(manifest) != {'schema_version', 'family', 'count', 'bytes', 'files', 'native_corrections_sha256'}
@@ -361,13 +490,14 @@ def validate_backup(files, rows=None):
         raise ValueError('Invalid lifecycle VOID backup manifest')
     if not isinstance(manifest['native_corrections_sha256'], str) or not re.fullmatch('[a-f0-9]{64}', manifest['native_corrections_sha256']):
         raise ValueError('Invalid lifecycle VOID native generation hash')
+    abandons = validate_abandons(store) if store is not None else {}
     entries = {}
     for name, entry in members.items():
         if not re.fullmatch(re.escape(DIRECTORY) + r'/[a-f0-9]{64}\.json', name):
             raise ValueError('Invalid lifecycle VOID backup path')
-        validate_entry(entry, name.partition('/')[2])
+        validate_entry(entry, name.partition('/')[2], allow_abandon=True)
         key = entry['payload']['operation_id']
-        if key in entries:
+        if key in entries or key in abandons:
             raise ValueError('Conflicting lifecycle VOID backup operation identity')
         entries[key] = entry
     total = sum(len(entry_bytes(record)) for record in members.values())
@@ -387,7 +517,7 @@ def validate_backup(files, rows=None):
                 or payload['target_void'] in retracted):
             raise ValueError('Invalid lifecycle VOID backup retraction graph')
         retracted.add(payload['target_void'])
-    journal = dict(entries=entries, invalid=[], present=True)
+    journal = dict(entries=entries, invalid=[], present=True, abandons=abandons, abandon_problems=[])
     if rows is not None:
         if native_generation(rows) != manifest['native_corrections_sha256']:
             raise ValueError('Lifecycle VOID backup does not bind the native correction comment generation')
@@ -411,8 +541,10 @@ def restore_files(project, files, rows):
     journal = validate_backup(files)
     directory = project / DIRECTORY
     marker = project / RESTORE_MARKER
+    store_path = project / ABANDON_FILE
     if journal is None:
-        if os.path.lexists(str(directory)) or os.path.lexists(str(marker)):
+        if (os.path.lexists(str(directory)) or os.path.lexists(str(marker))
+                or os.path.lexists(str(store_path)) or read_abandons(project)['records']):
             raise ValueError('Legacy backup has no VOID manifest; preserve the current family and reconcile '
                              'with a complete VOID-capable backup before restoring')
         if native_correction_comments(rows):
@@ -425,7 +557,8 @@ def restore_files(project, files, rows):
                              'Preserve this destination and restore a complete VOID-capable backup into '
                              'an unused destination; do not use or back up this incomplete tracker.')
         return False
-    if directory.is_symlink() or marker.is_symlink() or marker.with_suffix('.tmp').is_symlink():
+    if (directory.is_symlink() or marker.is_symlink() or marker.with_suffix('.tmp').is_symlink()
+            or store_path.is_symlink() or store_path.with_suffix('.tmp').is_symlink()):
         raise ValueError('Lifecycle VOID restore paths must not be symlinks')
     if directory.exists() and not directory.is_dir():
         raise ValueError('Lifecycle VOID restore directory is not a directory')
@@ -455,9 +588,18 @@ def restore_files(project, files, rows):
         name = DIRECTORY + '/' + entry['sha256'] + '.json'
         if name not in expected:
             (project / name).unlink()
+    # The abandonment store is part of this generation: install the backup's
+    # store, or remove a live one the backup does not carry, so a restore never
+    # leaves more abandonment evidence than the backup proves.
+    if ABANDON_FILE in files:
+        atomic(store_path, files[ABANDON_FILE])
+    elif os.path.lexists(str(store_path)):
+        store_path.unlink()
     # Read and compare every installed member before clearing uncertainty.
     actual = read_journal(project)
     if (actual['entries'] != journal['entries']
+            or actual['abandons'] != journal['abandons']
+            or actual['abandon_problems']
             or actual['invalid'] != ['lifecycle-void-restore-incomplete']):
         raise ValueError('Lifecycle VOID restore verification failed; marker retained')
     validate_backup(files, rows)
@@ -468,7 +610,13 @@ def restore_files(project, files, rows):
 def context(rows, journal):
     """One native snapshot's effective corrections; never recheck today's operator list."""
     reasons = {}
-    entries = journal.get('entries', {})
+    entries = dict(journal.get('entries') or {})
+    # The abandonment store lives beside the family (kittrial-5bb.271 item 1), so
+    # merge it here: every reader below then sees one correction view whether a
+    # record came from the family or the store. A legacy family member that itself
+    # carries an abandonment is already in ``entries``.
+    for key, record in (journal.get('abandons') or {}).items():
+        entries.setdefault(key, record)
     issues = {}
     for row in rows:
         if isinstance(row, dict) and row.get('id'):
@@ -540,7 +688,8 @@ def context(rows, journal):
     return dict(reasons=reasons, global_reason=UNKNOWN_JOURNAL if invalid else None,
                 entries=entries, invalid=invalid, retracted=retracted,
                 entry_reasons=entry_reasons,task_reasons=task_reasons,
-                native_comments=native_comments,incomplete=incomplete)
+                native_comments=native_comments,incomplete=incomplete,
+                abandon_problems=list(journal.get('abandon_problems') or []))
 
 
 class Snapshot(list):
@@ -552,7 +701,8 @@ class Snapshot(list):
 
 def snapshot(rows, project=None, journal=None):
     journal = read_journal(project) if journal is None else journal
-    if not journal['entries'] and not journal['invalid']:
+    if (not journal['entries'] and not journal['invalid']
+            and not journal.get('abandons') and not journal.get('abandon_problems')):
         try:
             if not native_correction_comments(rows):return rows
         except ValueError:pass
@@ -718,7 +868,9 @@ def audit(rows, operators=None, owners=None, limit=50, offset=0):
                 abandoned_correction_count=sum(c['status']=='abandoned' for c in corrections),
                 family_reason=correction.get('global_reason'),
                 family_problems=correction.get('invalid',[]),
+                abandon_problems=correction.get('abandon_problems',[]),
                 correction_status=('damaged' if correction.get('global_reason') or correction.get('entry_reasons')
+                                   or correction.get('abandon_problems')
                                    else 'incomplete' if correction.get('incomplete') else 'complete'),
                 questionable_fact_count=questionable_total,
                 questionable_native_record_count=questionable_total+unclassifiable,
@@ -803,6 +955,22 @@ def apply(rows, actor, payload, run, project, operators=None, owners=None, enabl
             found.append(comment)
     if len(found) > 1:
         raise ValueError('Lifecycle correction operation identity has ambiguous native comments')
+    # kittrial-5bb.271 item 2, the rule this kit states: an abandoned correction
+    # is FINAL. apply() therefore consults the abandonment of the operation it
+    # binds - whether the record is in the store beside the family or in a legacy
+    # family member - and refuses the exact retry instead of re-applying a
+    # correction the operator closed. A fresh void under a new key is the way.
+    abandoned = [record for record in
+                 list((journal.get('abandons') or {}).values())
+                 + [entry for entry in journal['entries'].values()
+                    if entry['payload']['operation'] == 'abandon']
+                 if record['payload']['target_void'] == payload['operation_id']]
+    if abandoned:
+        closed = abandoned[0]
+        raise ValueError('Lifecycle correction operation ' + payload['operation_id'] + ' was abandoned by '
+                         + closed['payload']['actor'] + ' at ' + closed['created_at']
+                         + '; an abandoned correction is final and is never put into effect. Publish a fresh '
+                           'void under a new operation identity, or reconcile with that operator.')
     if payload['operation']=='void':
         other_voids=[key for key,entry in journal['entries'].items()
                      if key!=payload['operation_id'] and entry['payload']['operation']=='void'
@@ -885,17 +1053,24 @@ def abandon(rows, actor, payload, project, operators=None, owners=None, enabled=
     """Close one unpaired native correction comment without recreating its words.
 
     Host-only and audited. A listed operator names an existing correction comment
-    that has no journal entry (a cut before publication); this writes ONLY the host
-    record that abandons it, creating the family when it is absent but never
-    touching, deleting or re-writing the native comment. A correction whose comment
-    already has an entry is refused, so an issued void/retraction (in effect or
-    retracted) is never a target. The entry binds the comment by native id and the
-    abandoned operation id, so readers stop counting it as incomplete and backups
-    resume; ``context`` never turns it into a void reason. The exact retry with the
-    same ``operation_id`` reconciles the already-published host record.
+    that has no journal entry (a cut before publication, or a void whose entry was
+    lost); this writes ONLY the host abandonment store that closes it
+    (:data:`ABANDON_FILE`, beside the family - never a family member, so a family
+    that holds an abandonment stays readable by the released F0 kit) and never
+    touches, deletes or re-writes the native comment. A correction whose comment
+    already has a host entry (in the family or the store) is refused, so an issued
+    void/retraction (in effect or retracted) is never a target. The record binds the
+    comment by native id and the abandoned operation id, so readers stop counting it
+    as incomplete and backups resume; ``context`` never turns it into a void reason,
+    and no abandonment record ever changes a lifecycle fact.
+
+    An abandonment is FINAL: the exact retry of the abandoned operation is refused
+    by :func:`apply`, and a fresh void under a new operation identity is the way to
+    void the event afterwards. The exact retry of the *abandonment* with the same
+    ``operation_id`` reconciles the already-published store record.
     """
     from review_workflow import listed_operator_actor
-    validate_payload(payload)
+    validate_payload(payload, allow_abandon=True)
     if payload['operation'] != 'abandon':
         raise ValueError('Not an abandonment payload')
     if actor != payload['actor'] or not listed_operator_actor(actor, operators, owners):
@@ -907,7 +1082,12 @@ def abandon(rows, actor, payload, project, operators=None, owners=None, enabled=
     journal = read_journal(project)
     if journal['invalid']:
         raise ValueError('Lifecycle void journal cannot be read; operator repairs it before a write')
-    prior = journal['entries'].get(payload['operation_id'])
+    if journal['abandon_problems']:
+        raise ValueError('Lifecycle abandonment store cannot be read; operator repairs it before a write')
+    prior = (journal.get('abandons') or {}).get(payload['operation_id'])
+    if prior is None:
+        legacy = journal['entries'].get(payload['operation_id'])
+        prior = legacy if legacy is not None and legacy['payload']['operation'] == 'abandon' else None
     if prior is not None:
         if prior['payload'] != payload:
             raise ValueError('Lifecycle correction operation identity already names different content/actor')
@@ -928,7 +1108,7 @@ def abandon(rows, actor, payload, project, operators=None, owners=None, enabled=
         raise ValueError('Lifecycle abandonment target is missing or ambiguous; name an incomplete native '
                          'correction comment that has no host entry')
     comment = matches[0]
-    for entry in journal['entries'].values():
+    for entry in list(journal['entries'].values()) + list((journal.get('abandons') or {}).values()):
         if entry['comment_id'] == comment['id']:
             raise ValueError('That native correction comment already has a host entry; an issued void or '
                              'retraction is never abandoned')
@@ -936,17 +1116,14 @@ def abandon(rows, actor, payload, project, operators=None, owners=None, enabled=
         recorded_at = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
     entry = dict(schema_version=1, payload=payload, sha256=content_hash(payload),
                  comment_id=comment['id'], created_at=recorded_at)
-    validate_entry(entry)
-    state = context(rows, journal)
-    active = sum(recorded['payload']['operation'] == 'void' and key not in state['retracted']
-                 for key, recorded in journal['entries'].items())
-    if (len(journal['entries']) + 1 + active > MAX_RECORDS
-            or journal['bytes'] + len(entry_bytes(entry)) + active * MAX_RECORD_BYTES > MAX_FAMILY_BYTES):
-        raise ValueError('Lifecycle void journal capacity keeps space for outstanding retractions; '
-                         'no host record was written. An operator retains the existing journal and uses '
-                         'a restore-capable kit with larger validated bounds before adding corrections.')
+    validate_entry(entry, allow_abandon=True)
+    stored = journal.get('abandons') or {}
+    if len(stored) + 1 > MAX_RECORDS or journal['bytes'] + len(entry_bytes(entry)) > MAX_FAMILY_BYTES:
+        raise ValueError('Lifecycle abandonment store capacity is exhausted; no host record was written. '
+                         'An operator retains the store and uses a restore-capable kit with larger validated '
+                         'bounds before adding abandonments.')
     try:
-        publish(project, entry)
+        publish_abandon(project, entry)
     except (ValueError, OSError, KeyError, TypeError) as error:
         raise ValueError('Lifecycle abandonment could not publish its host record for operation '
                          + payload['operation_id'] + '; the native comment was not changed and the exact '

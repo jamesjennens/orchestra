@@ -1014,6 +1014,12 @@ def lifecycle_abandon_command(root, project, comment_id, actor, reason, evidence
     have to be reproduced. Nothing native is written or deleted, the abandoned
     comment stays in place and the audit lists it as ``abandoned``. A comment
     that already has a host entry is refused (an issued void is never abandoned).
+    The record is written to the abandonment store BESIDE the family, so a family
+    that holds an abandonment stays readable by the released F0 kit. Before the
+    write the command prints the rule that an abandonment also closes a void whose
+    entry was LOST, so the operator rules that out first (kittrial-5bb.271 item 3).
+    An abandonment is final: apply() refuses the exact retry of the abandoned
+    operation, and a fresh void under a new key is the way to void the event.
     """
     import fcntl
     import lifecycle_voids as voids
@@ -1051,6 +1057,8 @@ def lifecycle_abandon_command(root, project, comment_id, actor, reason, evidence
         payload = dict(schema_version=1, operation='abandon', operation_id=key, actor=actor,
                        reason=reason, evidence=evidence, binding=target['binding'],
                        target_void=target['target_void'])
+        # kittrial-5bb.271 item 3: say it before the write, every time.
+        print(voids.ABANDON_LOST_ENTRY_RULE)
         return voids.abandon(rows, actor, payload, path, authority, owners, enabled,
                              comment_id=comment_id, recorded_at=utc_stamp())
 
@@ -4022,7 +4030,7 @@ def validate_coordination_files(files):
     for name,record in files.items():
         quarantine = isinstance(name,str) and re.fullmatch(r'\.feedback\.jsonl\.(?:[a-f0-9]{16}|[a-f0-9]{64})\.incomplete',name)
         journal = isinstance(name,str) and re.fullmatch(r'(?:\.coordination-requests|\.handoffs|\.handoff-requests|\.handoff-recoveries|\.requirement-requests|\.requirement-owner-requests|\.requirement-backfills|\.integration-reverts|\.lifecycle-voids|\.reference-requests|\.proposal-requests|\.capability-requests|\.open-item-requests|\.owner-answers)/[a-f0-9]{64}\.json',name)
-        if name not in ('.merge-context.json','ONBOARDING.md','GUIDANCE.md','.guidance.json','.guidance-clear.json','.sessions.json','.feedback.jsonl','.requirements-governance.json','.requirements-governance-source.json','.lifecycle-voids-manifest.json') and not quarantine and not journal:raise ValueError('Invalid coordination backup path')
+        if name not in ('.merge-context.json','ONBOARDING.md','GUIDANCE.md','.guidance.json','.guidance-clear.json','.sessions.json','.feedback.jsonl','.requirements-governance.json','.requirements-governance-source.json','.lifecycle-voids-manifest.json','.lifecycle-void-abandons.json') and not quarantine and not journal:raise ValueError('Invalid coordination backup path')
         if not isinstance(record,dict):raise ValueError('Invalid coordination record')
         if name=='.sessions.json':
             from sessions import validate
@@ -6229,7 +6237,7 @@ def restore_coordination(root,source,destination,restore_operators=False,restore
     import lifecycle_voids as voids
     restore_lifecycle_void_family(root,destination,files)
     for name,record in files.items():
-        if name==voids.MANIFEST or name.startswith(voids.DIRECTORY+'/'):
+        if name==voids.MANIFEST or name.startswith(voids.DIRECTORY+'/') or name==voids.ABANDON_FILE:
             continue
         target=project_dir(root,destination)/name
         target.parent.mkdir(exist_ok=True)

@@ -2072,10 +2072,13 @@ def offline_snapshot(rows, project=None):
         journal = read_journal(directory)
         # Matching every native comment establishes the family/export association
         # even when a target event was subsequently changed or deleted. An
-        # abandonment entry binds an existing cut comment the same way a
-        # void/retraction entry binds the comment it created.
+        # abandonment record - in the store beside the family (kittrial-5bb.271
+        # item 1) or in a legacy family member the reviewed kit wrote - binds an
+        # existing cut comment the same way a void/retraction entry binds the
+        # comment it created.
+        records = list(journal['entries'].values()) + list((journal.get('abandons') or {}).values())
         consulted = bool(native) and all(
-            any(entry_binds_comment(entry, comment) for entry in journal['entries'].values())
+            any(entry_binds_comment(entry, comment) for entry in records)
             for comment in native)
         # Metadata can establish absence only when the export has no corrections.
         if not native:

@@ -1,5 +1,6 @@
 """Pinned native correction and bound-principal raw-write proofs in disposable data."""
 import atexit
+import contextlib
 import copy
 import io
 import json
@@ -11,8 +12,10 @@ import tarfile
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import test_bd_label_aliases as fixture
+import test_lifecycle_voids as unit_voids
 import lifecycle
 import lifecycle_voids as voids
 from requirements import content_hash
@@ -56,6 +59,23 @@ def resolve_pre_void_kit():
         return destination
     except (OSError, subprocess.SubprocessError, tarfile.TarError):
         return None
+
+
+def require_kit(test, base, what, variable='ORCHESTRA_F0_REVIEW_BASE'):
+    """Return ``base``, or skip - a FAILURE on CI (kittrial-5bb.271 item 3).
+
+    The workflow checks out full history (``fetch-depth: 0``), so a runner where
+    git refuses the directory must not pass these compatibility tests by
+    skipping. Off CI the historical kit may genuinely be unavailable (a source
+    tarball), and the skip names the variable that would provide it.
+    """
+    if base is not None:
+        return base
+    message = ('no %s: set %s, or run from a git checkout with full history'
+               % (what, variable))
+    if os.environ.get('GITHUB_ACTIONS'):
+        test.fail('CI must not skip this test (the workflow fetches full history): ' + message)
+    test.skipTest(message)
 
 
 _PRE_VOID_KIT = []
@@ -384,8 +404,7 @@ class NativeVoidTests(fixture.RealBdLabelAliasTests):
     def test_real_export_offline_list_parity_and_wrong_journal_paths(self):
         import admin,os,subprocess,sys
         from pathlib import Path
-        base=pre_void_kit()
-        if not base:self.skipTest('no pre-VOID kit: set ORCHESTRA_F0_REVIEW_BASE or run from a git checkout with full history')
+        base=require_kit(self,pre_void_kit(),'pre-VOID kit')
         task,target=self.make_fact();exported=self.project/'round-two-export.jsonl'
         def read(script,journal=None):
             exported.write_text(''.join(json.dumps(r)+'\n' for r in self.export_rows()))
@@ -470,9 +489,73 @@ class NativeVoidTests(fixture.RealBdLabelAliasTests):
             voids.backup_files(self.project,self.export_rows())
 
     def test_native_restore_refuses_backup_created_by_pre_void_kit(self):
-        base=pre_void_kit()
-        if not base:self.skipTest('no pre-VOID kit: set ORCHESTRA_F0_REVIEW_BASE or run from a git checkout with full history')
+        base=require_kit(self,pre_void_kit(),'pre-VOID kit')
         self.omitted_backup_restore(base)
+
+    def test_released_f0_kit_reads_a_project_that_holds_an_abandonment(self):
+        """Item 1 on real native data: the RELEASED F0 kit beside our abandonment store.
+
+        The released kit reads the family (no ``lifecycle-void-journal-unreadable``)
+        and honours an issued void, but it cannot see the abandonment store, so the
+        abandoned native comment stays unpaired there: an ``incomplete`` audit and a
+        refused backup. That is the exact limit docs/OPERATIONS.md states, and the
+        reason this kit writes the record BESIDE the family.
+        """
+        import admin
+        import importlib.util
+        base = require_kit(self, unit_voids.resolve_released_f0_kit(), 'released F0 kit (04ed25d)',
+                           'ORCHESTRA_F0_RELEASED_KIT')
+        # A fresh tracker keeps this abandonment out of the shared fixture other
+        # tests read (the pattern of test_real_metadata_without_family_...).
+        class FreshProject(fixture.RealBdLabelAliasTests):
+            make_fact = NativeVoidTests.make_fact
+        FreshProject.setUpClass()
+        self.addCleanup(FreshProject.tearDownClass)
+        fresh = FreshProject()
+        cfg = json.loads((fresh.root / 'deployment.private.json').read_text())
+        cfg['operators'] = ['op']
+        (fresh.root / 'deployment.private.json').write_text(json.dumps(cfg))
+        admin.lifecycle_void_switch(fresh.root, 'on', 'op')
+        issued_task, issued_target = fresh.make_fact()
+        admin.lifecycle_correction_command(fresh.root, 'pp', 'void', issued_target['id'], 'op',
+            'Synthetic released-kit proof.', ['synthetic native test'], 'released-void-' + issued_task)
+        cut_task, cut_target = fresh.make_fact()
+        with mock.patch.object(voids, 'publish', side_effect=OSError('synthetic cut')):
+            with self.assertRaisesRegex(ValueError, 'uncertain'):
+                admin.lifecycle_correction_command(fresh.root, 'pp', 'void', cut_target['id'], 'op',
+                    'Synthetic released-kit cut.', ['synthetic native test'], 'released-cut-' + cut_task)
+        rows = fresh.export_rows()
+        comment = next(c for row in rows if row['id'] == cut_task for c in row.get('comments', [])
+                       if c['text'].startswith(voids.PREFIX))
+        printed = io.StringIO()
+        with contextlib.redirect_stdout(printed):
+            abandoned = admin.lifecycle_abandon_command(fresh.root, 'pp', comment['id'], 'op',
+                'Synthetic abandonment of the cut.', ['synthetic native test'],
+                'released-abandon-' + cut_task)
+        self.assertIn(voids.ABANDON_LOST_ENTRY_RULE, printed.getvalue())
+        self.assertEqual(abandoned['comment_id'], str(comment['id']))
+        rows = fresh.export_rows()
+        # Our kit pairs the comment through the store, so the project is complete
+        # and backable again; the family itself holds no abandon member.
+        self.assertEqual(voids.audit(voids.snapshot(rows, fresh.project))['correction_status'], 'complete')
+        self.assertNotIn('abandon', {e['payload']['operation']
+                                     for e in voids.read_journal(fresh.project)['entries'].values()})
+        files = voids.backup_files(fresh.project, rows)
+        self.assertIn(voids.ABANDON_FILE, files)
+        # The RELEASED kit, on the same real project.
+        spec = importlib.util.spec_from_file_location('released_f0_native_lifecycle_voids',
+                                                      base / 'lifecycle_voids.py')
+        released = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(released)
+        released_journal = released.read_journal(fresh.project)
+        self.assertEqual(released_journal['invalid'], [])
+        state = released.context(rows, released_journal)
+        self.assertEqual(state['global_reason'], None)
+        self.assertEqual(state['reasons'].get(issued_target['id']), 'voided')
+        self.assertEqual([c['id'] for c in state['incomplete']], [str(comment['id'])])
+        with self.assertRaisesRegex(ValueError, 'native correction comments without their host entries'):
+            released.backup_files(fresh.project, rows)
+        self.assertEqual(next(r for r in rows if r['id'] == issued_target['id']), issued_target)
 
 
 if __name__ == '__main__':
