@@ -58,11 +58,28 @@ class VoidReviewTests(unittest.TestCase):
                                   dict(id='approve',author='reviewer',created_at='2026-09-30T23:01:00Z',text=reviews.PREFIX+canonical_bytes(approve).decode())]
         self.apply(self.payload())
         for row in self.rows:row.setdefault('status','closed')
+        self.rows[0]['status']='in_progress'
+        comments=copy.deepcopy(self.rows[0]['comments'])
         render.render(voids.snapshot(self.rows,self.project),self.project/'views',operators=['op'])
         page=(self.project/'views/CURRENT.md').read_text()
         self.assertIn('[unknown](jobs/p-task.2.md) (voided)',page)
         self.assertIn('awaiting-integration',page)
         self.assertNotIn('| p-task | worker | closed | integrated |',page)
+        # Closing approved work removes its invitation, while the VOID truth and
+        # approval remain in lifecycle evidence, the task page and direct reads.
+        self.rows[0]['status']='closed'
+        snapshot=voids.snapshot(self.rows,self.project)
+        render.render(snapshot,self.project/'views',operators=['op'])
+        closed=(self.project/'views/CURRENT.md').read_text()
+        self.assertNotIn('awaiting-integration',closed)
+        self.assertIn('[unknown](jobs/p-task.2.md) (voided)',closed)
+        self.assertIn('Synthetic independent approval.',(self.project/'views/jobs/p-task.md').read_text())
+        import briefing
+        direct=briefing.brief(snapshot,'synthetic','p-task',operators=['op'],journal=self.project)
+        self.assertEqual(direct['review']['review_state'],'awaiting-integration')
+        self.assertEqual(direct['review']['next_actor'],'none')
+        self.assertEqual(direct['lifecycle']['integrated']['value'],'unknown')
+        self.assertEqual(self.rows[0]['comments'],comments)
 
     def cli(self,*args):
         exported=self.project/'export.jsonl';exported.write_text(''.join(json.dumps(r)+'\n' for r in self.rows))

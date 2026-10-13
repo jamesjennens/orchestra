@@ -157,7 +157,7 @@ class WorkQueueTests(unittest.TestCase):
             self.assertIn('withdraw-1',page)
     def test_old_integration_evidence_does_not_hide_new_approved_contribution(self):
         store=NativeStore().seed('integrated')
-        store.rows[0].update(status='closed',comments=[],assignee='alice/session')
+        store.rows[0].update(status='in_progress',comments=[],assignee='alice/session')
         add(store.rows,contribute(),'delivery','alice/session')
         add(store.rows,dict(schema_version=1,operation='approve',operation_id='approve-1',task=TASK,
             previous='delivery',contribution='delivery',summary='Reviewed new revision'),'approval')

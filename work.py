@@ -3,7 +3,7 @@ import argparse
 import json
 import record_json
 from lifecycle import integration_evidence, project_facts
-from review_state import RECONCILIATION_STATE, next_actor
+from review_state import RECONCILIATION_STATE, next_actor, active_work
 
 CONTRACT_VERSION = 'cli-contract-v1'
 WORK_STATES = ['none','awaiting-review','changes-requested','awaiting-integration','integrated','reconciliation-needed','legacy-review-ready','withdrawn','superseded','error']
@@ -147,8 +147,8 @@ def move_decision(state, task, owned, named_reviewer=False, pending_items=0, red
     One function gives all three answers, so no reader can be told one mover by
     ``whose_move`` and another by ``next_actor``:
 
-    * ``whose_move``/``next`` are the worker-facing, caller-relative answer and are
-      unchanged from main in every row;
+    * ``whose_move``/``next`` are the worker-facing, caller-relative answer;
+      closed tasks excluded from active work get a history-only sentence;
     * ``next_actor`` is the caller-neutral ROLE of that same decision, computed by
       :func:`review_state.next_actor` -- the one projection the ``review`` read and
       the ``brief`` also use -- and is ``'unknown'`` wherever the decision cannot be
@@ -162,6 +162,9 @@ def move_decision(state, task, owned, named_reviewer=False, pending_items=0, red
     to :func:`_caller_move`; it changes no word of the decision (kittrial-5bb.253 review,
     item 4).
     """
+    if not active_work('closed' if closed else 'open', state, pending_items):
+        return ('unknown', 'This task is closed; its review and lifecycle records remain in history.',
+                next_actor(state, assignee, closed, pending_items=pending_items, claimable=claimable))
     move, text = _caller_move(state, task, owned, named_reviewer, pending_items, redelivered,
                              way_back=way_back)
     return move, text, next_actor(state, assignee, closed, pending_items=pending_items,
@@ -742,19 +745,18 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
         disagreements=review.get('integration_disagreements') or []
         integration_warnings=[w for w in review.get('warnings') or [] if is_integration_warning(w)]
         fact=facts.get(row['id'],{}).get('facts',{})
-        # Closing a task clears its awaiting-review queue entry (kittrial-5bb.94
+        # Closing a task clears review and integration queue entries (kittrial-5bb.210;
+        # awaiting-review already did so under kittrial-5bb.94
         # item 1): the record stays in history and `review TASK` still reports it,
         # but a closed task is no longer offered to a reviewer. Outstanding
-        # requested changes, an approved-but-unintegrated revision and a malformed
+        # requested changes and a malformed
         # history stay visible: closure is not acceptance, and a broken chain must
         # still be surfaced. A WITHDRAWN (or superseded) contribution with a
         # blocking item still open stays visible for the same reason as
         # changes-requested: the item is actionable work although the revision is
         # final (kittrial-5bb.110 item 4).
         closed_open_item = bool(review.get('pending_requests'))
-        if (row.get('status')=='closed'
-                and select_state not in ('changes-requested','awaiting-integration','error')
-                and not (select_state in ('withdrawn','superseded') and closed_open_item)):
+        if not active_work(row.get('status'), select_state, closed_open_item):
             continue
         if a.state:
             # `--state` keeps its meaning on main for every value that existed there: it

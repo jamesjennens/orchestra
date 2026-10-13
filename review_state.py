@@ -88,6 +88,17 @@ def is_integration_warning(value):
     return isinstance(value, str) and value.startswith(INTEGRATION_WARNING_PREFIXES)
 
 
+def active_work(status, state, pending_items=0):
+    """Whether a task belongs in active work, independently of historical approval.
+
+    Closing work removes integration/review invitations, never its records. Keep
+    outstanding blocking feedback and malformed histories discoverable even on
+    closed tasks. Both host and HTTP readers use this same boundary.
+    """
+    return (status != 'closed' or state in ('changes-requested', 'error')
+            or (state in ('withdrawn', 'superseded') and bool(pending_items)))
+
+
 def next_actor(state, assignee=None, closed=False, pending_items=0, claimable=None):
     """The party that acts next, as a role token from :data:`NEXT_ACTORS`.
 
@@ -116,11 +127,10 @@ def next_actor(state, assignee=None, closed=False, pending_items=0, claimable=No
     shows and never invents. ``closed`` keeps its meaning from the ``work`` queue: a
     closed task whose review is not still active is ``none``, never an invitation.
     """
-    if closed and state not in ('changes-requested', 'error', 'awaiting-integration',
-                                'withdrawn', 'superseded'):
-        return 'none'
     if state in ('withdrawn', 'superseded') and not pending_items:
         return 'unknown'
+    if not active_work('closed' if closed else 'open', state, pending_items):
+        return 'none'
     if state in ('changes-requested', 'withdrawn', 'superseded'):
         return 'assignee' if assignee else 'unknown'
     if state in ('awaiting-review', 'legacy-review-ready'):

@@ -373,6 +373,26 @@ class EndpointAttentionTests(fixes.EndpointCase):
         self.assertNotIn(task,[x['task'] for x in data['next_actions']])
         self.assertEqual(data['attention']['counts']['claimed'],0)
 
+    def test_closed_approved_task_leaves_queue_my_work_and_agent_actions(self):
+        task=self.tasks[0];self.claim(task);delivery=self.contribute(task)
+        self.review(self.people['blair'],task,'approve',previous=delivery,contribution=delivery,summary='Reviewed')
+        self.assertIn(('awaiting-integration',task),kinds(self.next()))
+        before=json.loads(self.native('blair')(['comments',task,'--json']))
+        self.native('blair')(['update',task,'--status','closed'])
+        for route in ('/queue',):
+            result=self.request('GET','/v1/projects/'+self.project+route,token=self.secret)
+            self.assertEqual(result.status,200,result.data)
+            self.assertNotIn(task,[x['id'] for x in result.data['items']])
+        mine=self.request('GET','/v1/me/work',token=self.people['blair'])
+        self.assertEqual(mine.status,200,mine.data)
+        self.assertNotIn(task,[x['id'] for x in mine.data['assigned']+mine.data['to_review']])
+        data=self.next();self.assertNotIn(task,[x['task'] for x in data['next_actions']])
+        self.assertEqual(data['attention']['counts']['awaiting_integration'],0)
+        read=self.request('GET',self.base(task)+'/brief',token=self.secret)
+        self.assertEqual(read.status,200,read.data)
+        self.assertEqual(read.data['review']['state'],'awaiting-integration')
+        self.assertEqual(json.loads(self.native('blair')(['comments',task,'--json'])),before)
+
     @patch.dict(os.environ, {'PYTHONUTF8': '1'})
     def test_only_undelivered_blocked_or_working_tasks_count_as_newer(self):
         blocked, working, delivered, approved = self.tasks
@@ -648,6 +668,29 @@ class InProcessAttentionTests(test_http_agents.AgentHarness):
                       'bundle_sha256':test_http_agents.BUNDLE,'summary':'done'},token=self.secret)
         self.backend.state['tasks'][task]['status']='closed'
         self.assertNotIn(task,[x['task'] for x in self.next()['next_actions']])
+
+    def test_closed_approved_task_leaves_every_in_process_invitation(self):
+        task=self.task('approved');base='/v1/projects/%s/tasks/%s'%(self.project,task)
+        self.request('POST',base+'/claim',token=self.secret)
+        self.request('POST',base+'/reviews',{'operation':'contribute','commit':test_http_agents.COMMIT,
+                     'base_commit':test_http_agents.BASE,'bundle_sha256':test_http_agents.BUNDLE,
+                     'summary':'done'},token=self.secret)
+        # In-process review state is authoritative on its rows; no native records here.
+        self.backend.state['tasks'][task]['review_state']='approved'
+        self.assertIn(('awaiting-integration',task),kinds(self.next()))
+        self.backend.state['tasks'][task]['status']='closed'
+        before=json.dumps(self.backend.state,sort_keys=True)
+        for route in ('/queue',):
+            answer=self.request('GET','/v1/projects/'+self.project+route,token=self.secret)
+            self.assertEqual(answer.status,200,answer.data)
+            self.assertNotIn(task,[x['id'] for x in answer.data['items']])
+        mine=self.request('GET','/v1/me/work',token=self.alex)
+        self.assertEqual(mine.status,200,mine.data)
+        self.assertNotIn(task,[x['id'] for x in mine.data['assigned']+mine.data['to_review']])
+        data=self.next();self.assertNotIn(task,[x['task'] for x in data['next_actions']])
+        self.assertEqual(data['attention']['counts']['awaiting_integration'],0)
+        self.assertIsNone(http_service.next_action(self.backend.state['tasks'][task]))
+        self.assertEqual(json.dumps(self.backend.state,sort_keys=True),before)
 
     def test_unreadable_checkpoint_does_not_become_zero_open_items(self):
         task=self.task('unknown checkpoint')

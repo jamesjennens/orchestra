@@ -78,7 +78,10 @@ carries the facts it needs, and this is the table per view:
   on a withdrawn or superseded final contribution with no open item, and on an unassigned
   row nobody could claim. It is never null: a malformed row (a broken review chain, a
   malformed handoff journal or an unparseable native row) reads `operator`, the party who
-  must repair it. A closed task whose review is not still active reads `none`.
+  must repair it. A closed approved-but-unintegrated task reads `none` and leaves
+  active work/agent queues. Its raw approval and lifecycle evidence remain readable;
+  closure is not approval or integration. Closed blocking feedback and malformed
+  review history still name the assignee or operator who needs to act.
 - **`work_state`** is the review state the row SHOWS, or `reconciliation-needed` when the
   shared projection found recorded evidence that must be reconciled first. It never
   replaces `review_state`.
