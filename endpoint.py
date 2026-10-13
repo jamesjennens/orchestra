@@ -1441,7 +1441,8 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                                   operators=(configured_operators(root) if rules['independent_approval'] else None),
                                   coordinator_writes=rules['coordinator_writes'],
                                   independent_approval=rules['independent_approval'],
-                                  owners=owner_loader(path,'independent_approval'))
+                                  owners=owner_loader(path,'independent_approval'),
+                                  review_writes=configured_review_writes(root,warnings=run_warnings))
                 return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':warning_text(run_warnings)}
             with (path/'.coordination.lock').open('a') as lock:
                 fcntl.flock(lock,fcntl.LOCK_EX)
@@ -1498,7 +1499,8 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                 result=coordinate(payload,actor,runner,path,operators=coordinate_operators,
                                   coordinator_writes=rules['coordinator_writes'],
                                   independent_approval=rules['independent_approval'],
-                                  owners=owner_loader(path,'coordinator_writes'))
+                                  owners=owner_loader(path,'coordinator_writes'),
+                                  review_writes=configured_review_writes(root,warnings=switch_warnings))
             else:
                 from requirement_records import apply_native as requirement_apply
                 result=requirement_apply(payload,actor,runner,path)

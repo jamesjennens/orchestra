@@ -15,7 +15,7 @@ import work
 from requirements import canonical_bytes
 from lifecycle import DIMENSIONS
 from test_briefing import rows,checkpoint,append_checkpoint,save_cp,comment,TASK,PROJECT
-from test_lifecycle import SOURCE_COMMIT, NativeStore
+from test_lifecycle import NativeStore
 
 
 def contribute():
@@ -167,7 +167,7 @@ class WorkQueueTests(unittest.TestCase):
         self.assertEqual(item['review_state'],'awaiting-integration')
         self.assertFalse(item['lifecycle_matches_contribution'])
         self.assertEqual(item['lifecycle']['integrated'],'passed')
-        self.assertEqual(item['lifecycle_scope']['source_commit'],SOURCE_COMMIT)
+        self.assertEqual(item['lifecycle_scope']['source_commit'],'source-a')
 
     def test_queue_has_explicit_journal_input_and_surfaces_malformed_records(self):
         with tempfile.TemporaryDirectory() as temp:

@@ -541,20 +541,43 @@ record of what somebody **observed**, so the declaration is never silently rewri
 `verdict` is one of `verified`, `failed` or `unknown`; `sha256` and `bytes` are optional, so
 a remote delivery (which has no bundle bytes) is attested without inventing them.
 
-* **`verified` must actually verify.** It is refused before any native write when the
-  observed `commit` is not the declared delivered tip, when `base_commit` is not the declared
-  base, when a bundle's observed `sha256` is not the declared `delivery.sha256`, or when a
-  bundle observation carries no positive `bytes`. A wrong checksum or a missing commit can
-  never be recorded as a pass.
+* **What the kit itself checks, exactly.** The `attest` operation reads no bundle, computes
+  no hash and runs no git. On the write path it checks the record's shape and plain text, and
+  for a `verified` verdict it checks that the observation matches the DECLARED delivery: the
+  observed `commit` is the declared delivered tip, `base_commit` is the declared base, and for
+  a bundle the observed `sha256` equals the declared `delivery.sha256` with a positive `bytes`.
+  It cannot know that a commit exists anywhere or that a bundle exists at all, so a `verified`
+  record naming a well-formed commit that exists nowhere is accepted when it matches the
+  declaration. **The host command is what makes the observation real**: a listed verifier runs
+  ```
+  python3 admin.py attest-delivery PROJECT --actor VERIFIER --task TASK \
+      --bundle /path/to/delivered.bundle --reason "..." [--verdict verified|failed|unknown]
+  ```
+  on the coordination host. It reads the bundle file itself, computes its byte count and
+  SHA-256, lists the refs the bundle advertises with `git bundle list-heads`, takes the
+  observed commit from those heads (or from `--commit`), and writes the `attest` record from
+  those values. A verifier who records an attestation without such an observation records a
+  claim, not a proof.
 * **`failed`** states a delivery that was positively disproven. It needs a reason, and it
   holds the contribution from integration (the `held` state below) until a later attestation
   or a corrected delivery supersedes it.
 * **`unknown`** is the honest reading for a delivery a verifier could not reach (for example
   remote credentials unavailable). It needs a reason, it is surfaced on every read with a
-  warning, and it is never promoted to a pass.
+  warning, and it is never promoted to a pass. `unknown` does **not** by itself hold a
+  contribution: it is explicit and visible, and a coordinator decides what to do with an
+  approved contribution whose remote could not be read. Only an explicit hold or a positively
+  `failed` attestation holds.
+* **Who may attest.** Only a listed verifier (the deployment `verifiers` list) or a listed
+  operator (the one `listed_operator_actor` rule), never the contribution's author or the
+  task's assignee, or a party of either; an unlisted contributor cannot record any verdict,
+  including `failed`. A `failed` attestation is cleared only by a later attestation from a
+  listed verifier or operator, or by a superseding revision that then needs its own
+  attestation. The three operations are host-only: the web route refuses `attest`, `hold` and
+  `release-hold` with a sentence rather than mapping them to a capability.
 
 `commit` and `base_commit` are validated as exact 40- or 64-hex object ids, so an abbreviated
-or non-existent hash is refused at the record's own boundary. `review TASK` returns the newest
+hash is refused at the record's own boundary; whether a well-formed hash names a real object is
+a matter for the verifier's observation, not for the record's shape. `review TASK` returns the newest
 attestation for the current revision as `attestation` (with `verified`, `problems`, `author`
 and `timestamp`), a bounded `attestations` audit list, and the one-word `verification` reading
 (`verified`, `failed`, `unknown`, or absent when the contribution carries no attestation,
@@ -596,10 +619,18 @@ and the release names exactly one open hold:
 }
 ```
 
-* **A held contribution never reads `awaiting-integration`.** While a hold is open, the
-  effective `review_state` is `held` in `review`, `brief` and `work` alike; `next_actor` and
-  `whose_move` are the coordinator's. A positively `failed` attestation holds the contribution
-  the same way.
+* **A held contribution never reads `awaiting-integration`.** An APPROVED contribution with an
+  open hold (or a positively `failed` attestation) shows `review_state` `held` in `review`,
+  `brief` and `work` alike; `next_actor` and `whose_move` are the coordinator's, and only a
+  listed operator can release it. A hold on a revision that is NOT approved does not take that
+  revision out of review: a revision still awaiting review stays in the reviewers' queue with
+  the hold shown beside it, and a revision whose author still has open requested changes reads
+  `changes-requested` (the author still owes the changes) with the hold shown too. Every
+  refusal driven by the hold - merge-acquire, a `reviewed`/`integrated` fact, the release
+  selection, or a release that names the task - says what is wrong AND who can release it.
+* **Approve while held is accepted, and the state stays `held`.** An approval recorded while a
+  hold is open does not clear the hold and does not make the contribution integration-ready;
+  the effective state stays `held` until a `release-hold` clears it.
 * **A hold survives retries and new revisions.** It is not cleared by a new `contribute`, an
   approval, a withdrawal or an exact retry of the hold's own operation id (which reconciles to
   the original record). It names the revision it was audited against for the audit trail, but
@@ -609,9 +640,13 @@ and the release names exactly one open hold:
   **refused on the write path** and **ignored on the read path** (`ignored_hold_releases`,
   with a warning), so a stray, duplicated or replayed release can never clear a later hold.
 * **Both are coordinator actions and both are audited.** They are refused unless the actor is
-  on the project's configured operator allowlist, or a verified web authority established the
-  caller; each release is recorded with its actor, time and reason. Contributor-visible
-  holds remain the ordinary `request-changes` items.
+  a listed operator of this project by the kit's one listed-operator rule (a listed name, or an
+  actor of a listed operator's principal); `attest` additionally accepts a listed verifier and
+  refuses the contribution's author, the task's assignee, or a party of either. Each record
+  carries its actor, time and reason. Contributor-visible holds remain the ordinary
+  `request-changes` items. These three operations are **host-only** in this kit: the web route
+  refuses `attest`, `hold` and `release-hold` with a sentence, so no web capability is mapped
+  to them.
 
 ### Staged rollout: writing the new shapes is opt-in
 

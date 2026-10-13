@@ -30,7 +30,7 @@ import work
 from requirements import canonical_bytes
 from test_briefing import PROJECT, TASK, append_checkpoint, checkpoint, rows
 from test_http_agents import AgentHarness
-from test_lifecycle import NativeStore, legacy_scope_rule, payload, scope
+from test_lifecycle import NativeStore, payload, scope
 
 COMMIT = shared.COMMIT
 OTHER = shared.OTHER
@@ -195,7 +195,7 @@ class ReconciliationTests(unittest.TestCase):
     def disagreeing(self):
         """An approved contribution whose newer matching scope records a failure."""
         store = shared.reviewed()
-        second = scope(source_commit=COMMIT, integration_commit='d' * 40, release_id='release-2')
+        second = scope(source_commit=COMMIT, integration_commit='merge-b', release_id='release-2')
         store.record(payload('lifecycle-scope', operation='scope-2', scope=second))
         store.record(payload('integrated', 'failed', 'fact-2', scope=second,
                              evidence=['report:newer-failure']))
@@ -332,9 +332,8 @@ class ReconciliationTests(unittest.TestCase):
         """prefix-matching-accepted: only the FULL commit names a contribution."""
         store = NativeStore()
         short = scope(source_commit=COMMIT[:7], release_id='release-short')
-        with legacy_scope_rule():
-            store.record(payload('lifecycle-scope', operation='scope-short', scope=short))
-            store.record(payload('integrated', operation='fact-short', scope=short))
+        store.record(payload('lifecycle-scope', operation='scope-short', scope=short))
+        store.record(payload('integrated', operation='fact-short', scope=short))
         store.rows[0]['comments'] = []
         store.rows[0]['assignee'] = 'alice/session'
         shared.add(store.rows, shared.contribute(COMMIT, cid='delivery-1'), 'delivery-1')

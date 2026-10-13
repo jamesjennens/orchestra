@@ -4,20 +4,29 @@ The acceptance criteria this file pins:
 
 * a wrong checksum, a wrong base, or a commit that is not the delivered tip can never be
   recorded as ``verified``;
+* only a listed verifier or a listed operator may attest, never the contribution's author,
+  the task's assignee or a party of either;
 * an inaccessible remote is an explicit ``unknown`` with its reason, never a fabricated
-  pass;
-* a held contribution can never appear integration-ready (``review_state == 'held'``,
-  never ``awaiting-integration``, in ``review``, ``brief`` and ``work`` alike);
-* an exact retry and a new contribution revision cannot accidentally clear a hold;
+  pass, and ``unknown`` does not by itself hold;
+* an APPROVED contribution under an open hold (or a failed attestation) can never appear
+  integration-ready, and every gate that decides integration refuses it with a sentence
+  naming the hold and who can release it;
+* an exact retry and a new contribution revision cannot accidentally clear a hold, while a
+  revision under a standing hold stays reviewable and SHOWS the hold;
 * a detached-HEAD bundle (a bundle whose only ref is the ``HEAD`` pseudo-ref) and a
-  renamed/revised bundle import and verify through the documented commands, and the
+  renamed/revised bundle are observed by the kit's own host observation code, and the
   checksum rule follows the DECLARED delivery, not the file name.
 
 The reader tests build the chain through ``review_workflow.execute`` against a stub native
-runner, exactly as the other review-workflow tests do. The bundle tests use real ``git`` in
-a scratch directory and skip when git is unavailable.
+runner, exactly as the other review-workflow tests do. The bundle tests create a real bundle
+with ``git`` and then exercise ``review_workflow.read_bundle_observation`` (kit code); the
+digest/byte-count half of the observation needs no git at all and is pinned separately.
 """
+import contextlib
+import hashlib
 import json
+import os
+import secrets
 import shutil
 import subprocess
 import sys
@@ -26,10 +35,13 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import coordination
+import http_service
 import lifecycle
 import review_state
 import review_workflow as w
 import work
+from http_auth import HttpError
 
 TASK = 'task-1'
 COMMIT_1 = 'a' * 40
@@ -38,19 +50,100 @@ BASE = 'b' * 40
 SHA_1 = 'c' * 64
 SHA_2 = 'd' * 64
 OPERATOR = 'coordinator'
+VERIFIER = 'verifier'
+AUTHOR = 'worker'
+REVIEWER = 'reviewer'
 
 
-def row(comments=None, assignee='worker', status='in_progress'):
-    return dict(id=TASK, title='A task', issue_type='task', status=status,
+def row(task=TASK, comments=None, assignee=AUTHOR, status='in_progress'):
+    return dict(id=task, title='A task', issue_type='task', status=status,
                 assignee=assignee, description='Intent', acceptance_criteria='Acceptance',
                 labels=[], comments=list(comments or []))
+
+
+@contextlib.contextmanager
+def scratch():
+    """A disposable writable directory.
+
+    Prefers the platform temporary area and falls back to a directory under the checkout
+    (a confined sandbox can deny writes in the platform area). ``os.mkdir`` is used rather
+    than ``tempfile.mkdtemp`` because the latter's restrictive mode is denied in the
+    sandbox; cleanup never fails the test.
+    """
+    root = None
+    for parent in (Path(tempfile.gettempdir()), Path(__file__).resolve().parents[1]):
+        candidate = parent / ('scratch-' + secrets.token_hex(6))
+        try:
+            os.mkdir(candidate)
+            probe = candidate / '.probe'
+            probe.write_text('probe', encoding='utf-8')
+            probe.unlink()
+        except OSError:
+            shutil.rmtree(candidate, ignore_errors=True)
+            continue
+        root = candidate
+        break
+    if root is None:
+        raise unittest.SkipTest('no writable scratch directory')
+    try:
+        yield root
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def chain(task, commit=COMMIT_1, sha256=SHA_1, base=BASE, kind='bundle', approved=True,
+          hold=True, hold_actor=OPERATOR, operators=(OPERATOR,), verifiers=(VERIFIER,),
+          author=AUTHOR, assignee=AUTHOR):
+    """Build a review chain on a fresh native row; returns ``(issue, contribution_id)``.
+
+    A convenience for the lifecycle/merge-slot tests below, which need the same task row
+    a review chain and lifecycle evidence both describe.
+    """
+    issue = row(task, assignee=assignee)
+    rows = [issue]
+    holder = {'actor': author}
+
+    def run(argv):
+        if argv == ['export', '--all']:
+            return ''.join(json.dumps(r) + '\n' for r in rows)
+        if argv[:3] == ['comments', 'add', task]:
+            cid = str(len(issue['comments']) + 1)
+            issue['comments'].append(dict(id=cid, text=argv[3], author=holder['actor'],
+                                          created_at='2026-09-16T00:00:00Z'))
+            return json.dumps({'id': cid})
+        raise AssertionError('unexpected native command: ' + repr(argv))
+
+    counter = {'n': 0}
+
+    def payload(operation, **extra):
+        counter['n'] += 1
+        return dict(schema_version=1, operation=operation, operation_id='%s-%d' % (task, counter['n']),
+                    task=task, previous=w.project(issue, operators=list(operators))['latest_comment_id'],
+                    **extra)
+
+    def send(p, actor):
+        holder['actor'] = actor
+        return w.execute(rows, task, actor, p, run, operators=list(operators),
+                         verifiers=list(verifiers), review_writes=True)
+
+    delivery = (dict(kind='remote', remote='ssh://git.example/project', branch='contrib/x')
+                if kind == 'remote' else
+                dict(kind='bundle', path='reviewer:/deliveries/revision.bundle', sha256=sha256))
+    contribution = send(payload('contribute', repository='ssh://git.example/project', commit=commit,
+                                base_commit=base, delivery=delivery,
+                                summary='Implementation and test evidence', supersedes=None), author)['comment_id']
+    if approved:
+        send(payload('approve', contribution=contribution, summary='Approved'), REVIEWER)
+    if hold:
+        send(payload('hold', contribution=contribution, reason='Not release-ready'), hold_actor)
+    return issue, contribution
 
 
 class Harness(unittest.TestCase):
     def setUp(self):
         self.issue = row()
         self.rows = [self.issue]
-        self.actor = 'worker'
+        self.actor = AUTHOR
         self.count = 0
 
     def payload(self, op, **extra):
@@ -94,21 +187,22 @@ class Harness(unittest.TestCase):
                                            created_at='2026-09-16T00:00:00Z'))
         return json.dumps({'id': cid})
 
-    def send(self, p, actor=None, operators=(OPERATOR,), review_writes=True,
-             verified_web_authority=False):
-        # An integration hold is a coordinator control, so those two operations default to
-        # the configured operator; every other operation defaults to the contributing worker.
+    def send(self, p, actor=None, operators=(OPERATOR,), verifiers=(VERIFIER,),
+             review_writes=True, verified_web_authority=False, owners=None):
+        # An attestation is a listed verifier's or a listed operator's; a hold is a listed
+        # operator's; every other operation defaults to the contributing worker.
         if actor is None:
-            actor = OPERATOR if p.get('operation') in ('hold', 'release-hold') else 'worker'
+            actor = (VERIFIER if p.get('operation') == 'attest' else
+                     OPERATOR if p.get('operation') in ('hold', 'release-hold') else AUTHOR)
         self.actor = actor
         return w.execute(self.rows, TASK, actor, p, self.run_native, operators=list(operators),
-                         review_writes=review_writes,
-                         verified_web_authority=verified_web_authority)
+                         verifiers=list(verifiers), review_writes=review_writes,
+                         verified_web_authority=verified_web_authority, owners=owners)
 
     def review_count(self):
         return len([c for c in self.issue['comments'] if c['text'].startswith(w.PREFIX)])
 
-    def stored(self, p, author='worker', created_at='2026-09-16T00:00:00Z'):
+    def stored(self, p, author=AUTHOR, created_at='2026-09-16T00:00:00Z'):
         """Plant one already-written record directly (an older kit's own write)."""
         cid = str(len(self.issue['comments']) + 1)
         self.issue['comments'].append(dict(id=cid, text=w.PREFIX + w.canonical_bytes(p).decode(),
@@ -119,13 +213,20 @@ class Harness(unittest.TestCase):
         """A contributed and independently approved revision."""
         contribution = self.send(self.contribution(**contribution_extra))['comment_id']
         self.send(self.payload('approve', contribution=contribution, summary='Approved'),
-                  'reviewer')
+                  REVIEWER)
         self.assertEqual(w.project(self.issue)['review_state'], 'awaiting-integration')
         return contribution
 
     def shared(self):
         from review_state import project as reviewed, scopes_for
         return reviewed(self.issue, scopes_for(self.rows, TASK))
+
+
+class ChainHarness(Harness):
+    """An instantiable harness (no test method) for tests that need a chain helper."""
+
+    def runTest(self):
+        pass
 
 
 class VerifiedAttestationTests(Harness):
@@ -141,14 +242,14 @@ class VerifiedAttestationTests(Harness):
 
     def test_a_matching_bundle_observation_is_recorded_as_verified(self):
         contribution = self.send(self.contribution())['comment_id']
-        self.send(self.attest(contribution, sha256=SHA_1, bytes=4096), OPERATOR)
+        self.send(self.attest(contribution, sha256=SHA_1, bytes=4096))
         state = w.project(self.issue)
         self.assertEqual(state['verification'], 'verified')
         self.assertTrue(state['attestation']['verified'])
         self.assertEqual(state['attestation']['problems'], [])
         self.assertEqual(state['attestation']['sha256'], SHA_1)
         self.assertEqual(state['attestation']['bytes'], 4096)
-        self.assertEqual(state['attestation']['author'], OPERATOR)
+        self.assertEqual(state['attestation']['author'], VERIFIER)
         self.assertEqual(state['attestation']['commit'], COMMIT_1)
         # The declared delivery is untouched: the attestation is a SEPARATE record.
         self.assertEqual(state['contribution']['commit'], COMMIT_1)
@@ -174,14 +275,23 @@ class VerifiedAttestationTests(Harness):
 
     def test_a_nonexistent_or_abbreviated_commit_fails_validation(self):
         contribution = self.send(self.contribution())['comment_id']
-        # The reported defect: an old record cited `c6b25b2e5f7a` (not a valid object)
-        # while a 7-character prefix comparison matched.
+        # An abbreviated hash is refused at the record's own boundary.
         with self.assertRaisesRegex(ValueError, 'require exact 40/64 hexadecimal commit'):
             self.send(self.attest(contribution, commit='c6b25b2e5f7a'))
         with self.assertRaisesRegex(ValueError, 'require exact 40/64 hexadecimal commit'):
             self.send(self.attest(contribution, commit='c6b25b2'))
         with self.assertRaisesRegex(ValueError, '64-hex'):
             self.send(self.attest(contribution, sha256='abc', bytes=10))
+        # A well-formed hash that names nothing is refused by the OBSERVATION, where it can
+        # be decided: the commit is not one of the heads the bundle advertises, so the host
+        # command can never write it as a verified pass.
+        observation = {'path': '/deliveries/rev.bundle', 'bytes': 10, 'sha256': SHA_1,
+                       'heads': [{'commit': COMMIT_1, 'ref': 'HEAD'}], 'heads_error': None}
+        self.assertIn('is not one of the heads this bundle advertises',
+                      w.bundle_commit_problem(observation, 'deadbeef' + '0' * 32))
+        self.assertIsNone(w.bundle_commit_problem(observation, COMMIT_1))
+        self.assertIn('could not be listed',
+                      w.bundle_commit_problem(dict(observation, heads_error='no git'), COMMIT_1))
 
     def test_a_remote_delivery_verifies_on_its_delivered_tip(self):
         contribution = self.send(self.contribution(delivery_kind='remote'))['comment_id']
@@ -199,8 +309,10 @@ class VerifiedAttestationTests(Harness):
         self.assertFalse(state['attestation']['verified'])
         self.assertEqual(state['review_state'], 'awaiting-review')
         self.assertTrue(any('explicit UNKNOWN' in line for line in state['warnings']))
-        # It is never quietly promoted: a later reader still sees the unknown.
-        self.assertEqual(w.project(self.issue)['verification'], 'unknown')
+        # An APPROVED contribution with an unknown reading is NOT held: unknown is surfaced
+        # and never promoted to a pass, but it does not by itself stop integration.
+        self.send(self.payload('approve', contribution=contribution, summary='Approved'), REVIEWER)
+        self.assertEqual(w.project(self.issue)['review_state'], 'awaiting-integration')
 
     def test_unknown_and_failed_both_need_a_reason(self):
         contribution = self.send(self.contribution())['comment_id']
@@ -220,7 +332,7 @@ class VerifiedAttestationTests(Harness):
         self.assertEqual(state['review_state'], 'held')
         self.assertNotEqual(state['review_state'], 'awaiting-integration')
         self.assertTrue(any('FAILED' in line for line in state['warnings']))
-        # A later, matching attestation is the remedy: the newest reading wins.
+        # A later, matching attestation from a listed verifier is the remedy.
         self.send(self.attest(contribution, sha256=SHA_1, bytes=4096,
                               reason='re-checked after the delivery was corrected'))
         self.assertEqual(w.project(self.issue)['review_state'], 'awaiting-integration')
@@ -234,6 +346,62 @@ class VerifiedAttestationTests(Harness):
         self.assertFalse(state['attestation']['verified'])
         self.assertTrue(state['attestation']['problems'])
         self.assertTrue(any('read as unverified' in line for line in state['warnings']))
+
+    def test_only_a_listed_verifier_or_operator_may_attest(self):
+        contribution = self.send(self.contribution())['comment_id']
+        # An unlisted contributor records nothing at all.
+        with self.assertRaisesRegex(w.CoordinatorRuleRefusal,
+                                    'only a listed verifier or a listed operator'):
+            self.send(self.attest(contribution), 'stranger')
+        self.assertNotIn('attestation', w.project(self.issue))
+        # A listed verifier may.
+        self.send(self.attest(contribution, sha256=SHA_1, bytes=4096), VERIFIER)
+        self.assertEqual(w.project(self.issue)['verification'], 'verified')
+        # A listed operator may, and so may an actor of a listed operator's principal.
+        self.send(self.attest(contribution, sha256=SHA_1, bytes=4096, reason='operator spot check'),
+                  OPERATOR)
+        self.send(self.attest(contribution, sha256=SHA_1, bytes=4096, reason='principal check'),
+                  'agent-x', owners={'agent-x': 'principal-1', OPERATOR: 'principal-1'})
+        self.assertEqual(w.project(self.issue)['verification'], 'verified')
+
+    def test_the_author_and_assignee_may_not_attest_even_if_listed(self):
+        # The contribution's author, even when listed as a verifier.
+        contribution = self.send(self.contribution())['comment_id']
+        with self.assertRaisesRegex(w.CoordinatorRuleRefusal, "contribution author's party"):
+            self.send(self.attest(contribution), AUTHOR, verifiers=(AUTHOR,))
+        # The task's assignee, even when listed as a verifier.
+        self.issue['assignee'] = VERIFIER
+        with self.assertRaisesRegex(w.CoordinatorRuleRefusal, "assignee's party"):
+            self.send(self.attest(contribution), VERIFIER)
+
+    def test_a_failed_attestation_is_cleared_only_by_an_authorized_reading_or_a_new_revision(self):
+        contribution = self.approved()
+        self.send(self.attest(contribution, verdict='failed', reason='checksum mismatch'), VERIFIER)
+        self.assertEqual(w.project(self.issue)['review_state'], 'held')
+        # An unlisted contributor cannot clear it (or set anything else).
+        with self.assertRaisesRegex(w.CoordinatorRuleRefusal, 'listed verifier or a listed operator'):
+            self.send(self.attest(contribution, verdict='unknown', reason='let me pass it'), 'stranger')
+        self.assertEqual(w.project(self.issue)['review_state'], 'held')
+        # A superseding revision resets the attestation: the new revision needs its own.
+        revised = self.send(self.contribution(commit=COMMIT_2, path='/deliveries/revision-2.bundle',
+                                              sha256=SHA_2))['comment_id']
+        state = w.project(self.issue)
+        self.assertEqual(state['review_state'], 'awaiting-review')
+        self.assertNotIn('verification', state)
+        self.send(self.attest(revised, commit=COMMIT_2, sha256=SHA_2, bytes=20), VERIFIER)
+        self.assertEqual(w.project(self.issue)['verification'], 'verified')
+
+    def test_an_unlisted_contributor_cannot_hold_any_contribution(self):
+        contribution = self.approved()
+        before = self.review_count()
+        for operation in ('hold', 'release-hold'):
+            payload = (self.hold(contribution) if operation == 'hold'
+                       else self.release_hold(contribution, 'any'))
+            with self.subTest(operation=operation):
+                with self.assertRaisesRegex(ValueError, 'only a listed operator'):
+                    self.send(payload, 'stranger')
+        self.assertEqual(self.review_count(), before)
+        self.assertEqual(w.project(self.issue)['review_state'], 'awaiting-integration')
 
 
 class IntegrationHoldTests(Harness):
@@ -253,10 +421,11 @@ class IntegrationHoldTests(Harness):
         import briefing
         from test_briefing import PROJECT
         self.assertEqual(briefing.brief(self.rows, PROJECT, TASK)['review']['review_state'], 'held')
-        item = work.queue(self.rows, 'worker', ['--mine'])['items'][0]
+        item = work.queue(self.rows, AUTHOR, ['--mine'])['items'][0]
         self.assertEqual(item['review_state'], 'held')
         self.assertEqual(item['whose_move'], 'coordinator')
         self.assertEqual(item['next_actor'], 'coordinator')
+        self.assertEqual(item['holds'], [state['holds'][0]['comment_id']])
         self.assertNotEqual(item['review_state'], 'awaiting-integration')
 
     def test_a_hold_beats_recorded_integration_evidence(self):
@@ -277,8 +446,10 @@ class IntegrationHoldTests(Harness):
         contribution = self.approved()
         self.send(self.hold(contribution))
         self.assertIn('held', work.WORK_STATES)
-        self.assertEqual(review_state.next_actor('held', 'worker'), 'coordinator')
+        self.assertEqual(review_state.next_actor('held', AUTHOR), 'coordinator')
         self.assertEqual(review_state.next_actor('held', None), 'coordinator')
+        # The author still owes OPEN requested changes, so with any the move is theirs.
+        self.assertEqual(review_state.next_actor('held', AUTHOR, pending_items=1), 'assignee')
 
     def test_a_hold_survives_an_exact_retry(self):
         contribution = self.approved()
@@ -294,20 +465,25 @@ class IntegrationHoldTests(Harness):
         contribution = self.approved()
         hold_id = self.send(self.hold(contribution))['comment_id']
         # A new revision supersedes the held one. A withdrawal/approval resets; the HOLD
-        # does not, so the new revision is not accidentally integration-ready.
+        # does not, so the new revision is not accidentally integration-ready. The revision
+        # is still in the reviewers' queue, WITH the hold shown (item 7).
         revised = self.send(self.contribution(commit=COMMIT_2, path='/deliveries/revision-2.bundle',
                                               sha256=SHA_2))['comment_id']
         state = w.project(self.issue)
-        self.assertEqual(state['review_state'], 'held')
+        self.assertEqual(state['review_state'], 'awaiting-review')
         self.assertEqual([h['comment_id'] for h in state['holds']], [hold_id])
         # The hold still names the revision it was audited against.
         self.assertEqual(state['holds'][0]['contribution'], contribution)
-        self.send(self.payload('approve', contribution=revised, summary='Approved'), 'reviewer2')
+        item = work.queue(self.rows, REVIEWER, ['--state', 'awaiting-review'])['items'][0]
+        self.assertEqual(item['review_state'], 'awaiting-review')
+        self.assertEqual(item['holds'], [hold_id])
+        # An approval of the new revision does NOT clear it: the state stays held.
+        self.send(self.payload('approve', contribution=revised, summary='Approved'), REVIEWER)
         self.assertEqual(w.project(self.issue)['review_state'], 'held')
 
     def test_a_hold_survives_a_renamed_revised_bundle(self):
         contribution = self.approved()
-        self.send(self.hold(contribution))
+        hold_id = self.send(self.hold(contribution))['comment_id']
         # The same content delivered under a renamed path with a new declared checksum:
         # the checksum rule follows the DECLARED delivery, never the file name.
         revised = self.send(self.contribution(commit=COMMIT_2, path='/deliveries/renamed-rev2.bundle',
@@ -317,20 +493,28 @@ class IntegrationHoldTests(Harness):
         self.send(self.attest(revised, commit=COMMIT_2, sha256=SHA_2, bytes=20))
         state = w.project(self.issue)
         self.assertEqual(state['verification'], 'verified')
-        self.assertEqual(state['review_state'], 'held')    # the hold still stands
+        # The hold still stands against the new revision, which stays reviewable.
+        self.assertEqual(state['review_state'], 'awaiting-review')
+        self.assertEqual([h['comment_id'] for h in state['holds']], [hold_id])
 
-    def test_only_a_configured_coordinator_may_hold_or_release(self):
+    def test_only_a_listed_operator_may_hold_or_release(self):
         contribution = self.approved()
-        with self.assertRaisesRegex(ValueError, 'configured coordinator'):
-            self.send(self.hold(contribution), 'worker')
+        with self.assertRaisesRegex(ValueError, 'only a listed operator'):
+            self.send(self.hold(contribution), AUTHOR)
         hold_id = self.send(self.hold(contribution))['comment_id']
-        with self.assertRaisesRegex(ValueError, 'configured coordinator'):
-            self.send(self.release_hold(contribution, hold_id), 'worker')
+        with self.assertRaisesRegex(ValueError, 'only a listed operator'):
+            self.send(self.release_hold(contribution, hold_id), AUTHOR)
         self.assertEqual(w.project(self.issue)['review_state'], 'held')
-        # A verified web authority is the web route's equivalent of a listed operator.
-        self.send(self.release_hold(contribution, hold_id), 'web-owner',
-                  operators=(), verified_web_authority=True)
+        # An actor of a listed operator's principal may release it.
+        self.send(self.release_hold(contribution, hold_id), 'agent-x',
+                  owners={'agent-x': 'principal-1', OPERATOR: 'principal-1'})
         self.assertEqual(w.project(self.issue)['review_state'], 'awaiting-integration')
+        # A verified web authority ALONE cannot: these operations are host-only (item 6).
+        second = self.send(self.hold(contribution))['comment_id']
+        with self.assertRaisesRegex(ValueError, 'only a listed operator'):
+            self.send(self.release_hold(contribution, second), 'web-owner',
+                      operators=(), verified_web_authority=True)
+        self.assertEqual(w.project(self.issue)['review_state'], 'held')
 
     def test_release_hold_is_audited_and_clears_exactly_one_open_hold(self):
         contribution = self.approved()
@@ -359,9 +543,11 @@ class IntegrationHoldTests(Harness):
         # A release record planted for a hold that does not exist (or is not this task's).
         self.stored(self.release_hold(contribution, 'ghost-hold'), author=OPERATOR)
         state = w.project(self.issue)
-        self.assertEqual([h['comment_id'] for h in state['holds']], [hold_id])
+        # `.get` deliberately: a mutant that cleared every hold on a stray release would
+        # otherwise die with a KeyError instead of failing this assertion.
+        self.assertEqual([h['comment_id'] for h in state.get('holds', [])], [hold_id])
         self.assertEqual(state['review_state'], 'held')
-        self.assertEqual(state['ignored_hold_releases'], ['4'])
+        self.assertEqual(state.get('ignored_hold_releases'), ['4'])
         self.assertTrue(any('naming no open hold' in line for line in state['warnings']))
         # A duplicate release of the SAME hold (already released) is ignored too: the
         # second one cannot silently clear a later hold.
@@ -369,7 +555,7 @@ class IntegrationHoldTests(Harness):
         later = self.send(self.hold(contribution, reason='A later concern'))['comment_id']
         self.stored(self.release_hold(contribution, hold_id), author=OPERATOR)
         state = w.project(self.issue)
-        self.assertEqual([h['comment_id'] for h in state['holds']], [later])
+        self.assertEqual([h['comment_id'] for h in state.get('holds', [])], [later])
         self.assertEqual(state['review_state'], 'held')
 
     def test_the_new_shapes_are_refused_with_the_write_switch_off(self):
@@ -381,116 +567,255 @@ class IntegrationHoldTests(Harness):
             with self.subTest(operation=payload['operation']):
                 with self.assertRaisesRegex(ValueError, 'review_workflow_writes off'):
                     self.send(payload, operators=(OPERATOR,), review_writes=False)
+        # The refusal names the boundary that introduced the shape (item 6).
+        with self.assertRaisesRegex(ValueError, 'kittrial-5bb.10'):
+            self.send(self.attest(contribution, sha256=SHA_1, bytes=10), review_writes=False)
         self.assertEqual(self.review_count(), before)
 
+    def test_changes_requested_and_held_say_both(self):
+        contribution = self.approved()
+        hold_id = self.send(self.hold(contribution))['comment_id']
+        self.send(self.payload('request-changes', contribution=contribution, summary='Please fix',
+                               items=[{'id': 'item-1', 'text': 'Fix the thing'}]), REVIEWER)
+        state = w.project(self.issue)
+        self.assertEqual(state['review_state'], 'changes-requested')
+        self.assertEqual([h['comment_id'] for h in state.get('holds', [])], [hold_id])
+        item = work.queue(self.rows, AUTHOR, ['--mine'])['items'][0]
+        self.assertEqual(item['review_state'], 'changes-requested')
+        self.assertEqual(item['whose_move'], 'you')
+        self.assertIn('outstanding review', item['next'])
+        self.assertIn('Integration hold', item['next'])
 
-class DetachedHeadBundleTests(unittest.TestCase):
-    """The documented import path for a bundle with no branch ref (kittrial-5bb.10).
+    def test_approve_while_held_is_accepted_and_the_state_stays_held(self):
+        contribution = self.send(self.contribution())['comment_id']
+        self.send(self.hold(contribution))
+        self.send(self.payload('approve', contribution=contribution, summary='Approved'), REVIEWER)
+        state = w.project(self.issue)
+        self.assertEqual(state['review_state'], 'held')
+        self.assertNotEqual(state['review_state'], 'awaiting-integration')
 
-    ``git bundle create FILE HEAD`` from a detached HEAD records the ``HEAD`` pseudo-ref
-    and no branch, so a plain ``git clone`` lands detached and a plain ``git fetch`` leaves
-    only ``FETCH_HEAD``. The guide therefore documents the explicit
-    ``git fetch BUNDLE SHA:refs/heads/NAME`` form, and the renamed-bundle rule: the file
-    name is irrelevant, the bytes' SHA-256 is the identity.
-    """
 
-    def setUp(self):
-        if shutil.which('git') is None:
-            self.skipTest('git is not available')
-        self.temp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp.cleanup)
-        self.repo = Path(self.temp.name) / 'src'
-        self.repo.mkdir()
-        self.git('init', '-q')
-        self.git('config', 'user.email', 't@example.invalid')
-        self.git('config', 'user.name', 'Test')
-        (self.repo / 'a.txt').write_text('one\n', encoding='utf-8')
-        self.git('add', 'a.txt')
-        self.git('commit', '-q', '-m', 'one')
-        (self.repo / 'a.txt').write_text('two\n', encoding='utf-8')
-        self.git('commit', '-q', '-am', 'two')
-        self.git('checkout', '-q', '--detach')
-        self.sha = self.git('rev-parse', 'HEAD').strip()
+class IntegrationHoldStopsIntegrationTests(unittest.TestCase):
+    """Item 4: with the switch on, a held contribution is never integration-ready."""
 
-    def git(self, *args, cwd=None):
-        done = subprocess.run(['git', *args], cwd=str(cwd or self.repo), capture_output=True,
-                              text=True)
+    def merge_run(self, rows):
+        calls = []
+
+        def run(argv):
+            calls.append(list(argv))
+            if argv == ['export', '--all']:
+                return ''.join(json.dumps(r) + '\n' for r in rows)
+            if argv[:2] == ['merge-slot', 'check']:
+                return json.dumps({'available': True, 'holder': None, 'waiters': None})
+            if argv[:2] == ['merge-slot', 'acquire']:
+                return json.dumps({'acquired': True})
+            if argv[:1] == ['show']:
+                return json.dumps(rows)
+            raise AssertionError('unexpected native command: ' + repr(argv))
+
+        return run, calls
+
+    def test_merge_acquire_is_refused_for_a_held_contribution(self):
+        issue, _ = chain('trial-a')
+        run, calls = self.merge_run([issue])
+        with scratch() as tmp:
+            with self.assertRaisesRegex(w.CoordinatorRuleRefusal,
+                                        'open integration hold'):
+                coordination.apply_native({'operation': 'merge-acquire', 'task': 'trial-a',
+                                           'target': 'refs/heads/main'},
+                                          OPERATOR, run, Path(tmp), review_writes=True)
+        # The refusal happens before the slot is read or reserved.
+        self.assertEqual([call for call in calls if call[:2] == ['merge-slot', 'check']], [])
+        self.assertEqual([call for call in calls if call[:2] == ['merge-slot', 'acquire']], [])
+
+    def test_merge_acquire_is_allowed_once_the_hold_is_released(self):
+        issue, contribution = chain('trial-a')
+        run, _ = self.merge_run([issue])
+        with scratch() as tmp:
+            # Release the hold on the chain, then the same acquisition succeeds.
+            rows = [issue]
+            holder = {'actor': OPERATOR}
+
+            def chain_run(argv):
+                if argv == ['export', '--all']:
+                    return ''.join(json.dumps(r) + '\n' for r in rows)
+                cid = str(len(issue['comments']) + 1)
+                issue['comments'].append(dict(id=cid, text=argv[3], author=holder['actor'],
+                                              created_at='2026-09-16T00:00:00Z'))
+                return json.dumps({'id': cid})
+
+            hold_id = w.project(issue, operators=[OPERATOR])['holds'][0]['comment_id']
+            w.execute(rows, 'trial-a', OPERATOR,
+                      dict(schema_version=1, operation='release-hold', operation_id='release-1',
+                           task='trial-a', previous=w.project(issue)['latest_comment_id'],
+                           contribution=contribution, hold=hold_id, reason='Cleared'),
+                      chain_run, operators=[OPERATOR], verifiers=[VERIFIER], review_writes=True)
+            result = coordination.apply_native({'operation': 'merge-acquire', 'task': 'trial-a',
+                                                'target': 'refs/heads/main'},
+                                               OPERATOR, run, Path(tmp), review_writes=True)
+        self.assertTrue(result['acquired'])
+
+    def test_a_reviewed_or_integrated_fact_is_refused_for_a_held_contribution(self):
+        from test_lifecycle_release import (NativeStore, MERGE_A, SOURCE_A, ACTOR,
+                                            payload as lifecycle_payload, scope as lifecycle_scope)
+        issue, _ = chain('trial-a')
+        store = NativeStore(tasks=('trial-a',)).seed('trial-a')
+        store.rows[0]['comments'] = issue['comments']
+        before = len(store.rows)
+        for dimension in ('reviewed', 'integrated'):
+            with self.subTest(dimension=dimension):
+                with self.assertRaisesRegex(ValueError, 'held contribution is not integration-ready'):
+                    lifecycle.apply_native(
+                        lifecycle_payload('trial-a', dimension, 'passed',
+                                          operation='op-' + dimension,
+                                          scope_value=lifecycle_scope(source=SOURCE_A,
+                                                                      integration=MERGE_A)),
+                        ACTOR, store.run)
+        self.assertEqual(len(store.rows), before)
+
+    def test_the_release_selection_skips_a_held_task_with_the_reason(self):
+        from test_lifecycle_release import NativeStore, RELEASE_COMMIT
+        issue, _ = chain('trial-a')
+        store = NativeStore(tasks=('trial-a',)).seed('trial-a')
+        store.rows[0]['comments'] = issue['comments']
+        selection = lifecycle.release_selection(
+            store.rows,
+            {'source_commit': '', 'integration_commit': RELEASE_COMMIT,
+             'release_id': 'release-1', 'environment': 'production'},
+            lambda commit, release: True)
+        self.assertEqual(selection['targets'], [])
+        self.assertTrue(any('held from integration' in item['reason']
+                            for item in selection['skipped']))
+        self.assertTrue(any('open integration hold' in item['reason']
+                            for item in selection['skipped']))
+
+    def test_a_release_naming_a_held_task_is_refused(self):
+        from test_lifecycle_release import (NativeStore, ACTOR, release_payload, target)
+        issue, _ = chain('trial-a')
+        store = NativeStore(tasks=('trial-a',)).seed('trial-a')
+        store.rows[0]['comments'] = issue['comments']
+        before = len(store.rows)
+        with self.assertRaisesRegex(ValueError, 'Refusing a release that names trial-a'):
+            lifecycle.apply_release(release_payload([target('trial-a')]), ACTOR, store.run)
+        self.assertEqual(len(store.rows), before)
+
+
+class BundleObservationTests(unittest.TestCase):
+    """The kit's host observation of a delivered bundle (item 5)."""
+
+    def test_the_observation_reads_the_file_bytes_and_digest_without_git(self):
+        with scratch() as tmp:
+            path = Path(tmp) / 'delivery.bundle'
+            data = b'not a real bundle, but real bytes'
+            path.write_bytes(data)
+            observation = w.read_bundle_observation(path)
+            self.assertEqual(observation['bytes'], len(data))
+            self.assertEqual(observation['sha256'], hashlib.sha256(data).hexdigest())
+            self.assertEqual(observation['heads'], [])
+            self.assertTrue(observation['heads_error'])       # no git runner was supplied
+
+    def test_a_missing_file_is_refused(self):
+        with scratch() as tmp:
+            with self.assertRaisesRegex(ValueError, 'not a readable file'):
+                w.read_bundle_observation(Path(tmp) / 'nothing.bundle')
+
+    def git(self, *args, cwd):
+        done = subprocess.run(['git', *args], cwd=str(cwd), capture_output=True, text=True)
         if done.returncode != 0:
             raise AssertionError('git %s failed: %s' % (' '.join(args), done.stderr.strip()))
         return done.stdout
 
-    def test_a_detached_head_bundle_records_only_the_head_pseudo_ref(self):
-        bundle = Path(self.temp.name) / 'detached.bundle'
-        self.git('bundle', 'create', str(bundle), 'HEAD')
-        heads = self.git('bundle', 'list-heads', str(bundle))
-        self.assertEqual(heads.split(), [self.sha, 'HEAD'])
-        # A raw sha cannot even be bundled without a ref, so HEAD is the documented form.
-        with self.assertRaises(AssertionError):
-            self.git('bundle', 'create', str(bundle) + '.raw', self.sha)
+    def listing_git(self, cwd):
+        def run(argv):
+            return self.git(*argv, cwd=cwd)
+        return run
 
-    def test_the_documented_explicit_fetch_materialises_the_delivered_commit(self):
-        bundle = Path(self.temp.name) / 'detached.bundle'
-        self.git('bundle', 'create', str(bundle), 'HEAD')
-        imported = Path(self.temp.name) / 'imported'
-        imported.mkdir()
-        self.git('init', '-q', cwd=imported)
-        self.git('fetch', str(bundle), '%s:refs/heads/contribution' % self.sha, cwd=imported)
-        self.assertEqual(self.git('rev-parse', 'refs/heads/contribution', cwd=imported).strip(),
-                         self.sha)
-        # A default fetch from a HEAD-only bundle leaves only FETCH_HEAD: that is why the
-        # guide names the explicit refspec rather than a bare `git fetch`.
-        plain = Path(self.temp.name) / 'plain'
-        plain.mkdir()
-        self.git('init', '-q', cwd=plain)
-        self.git('fetch', str(bundle), cwd=plain)
-        self.assertEqual(self.git('for-each-ref', '--format=%(refname)', cwd=plain).strip(), '')
-        self.assertEqual(self.git('rev-parse', 'FETCH_HEAD', cwd=plain).strip(), self.sha)
+    def make_detached_bundle(self, root):
+        repo = root / 'src'
+        repo.mkdir()
+        self.git('init', '-q', cwd=repo)
+        self.git('config', 'user.email', 't@example.invalid', cwd=repo)
+        self.git('config', 'user.name', 'Test', cwd=repo)
+        (repo / 'a.txt').write_text('one\n', encoding='utf-8')
+        self.git('add', 'a.txt', cwd=repo)
+        self.git('commit', '-q', '-m', 'one', cwd=repo)
+        (repo / 'a.txt').write_text('two\n', encoding='utf-8')
+        self.git('commit', '-q', '-am', 'two', cwd=repo)
+        self.git('checkout', '-q', '--detach', cwd=repo)
+        sha = self.git('rev-parse', 'HEAD', cwd=repo).strip()
+        bundle = root / 'detached.bundle'
+        self.git('bundle', 'create', str(bundle), 'HEAD', cwd=repo)
+        return bundle, sha
 
-    def test_a_renamed_revised_bundle_verifies_by_its_bytes(self):
-        import hashlib
-        first = Path(self.temp.name) / 'revision-1.bundle'
-        self.git('bundle', 'create', str(first), 'HEAD')
-        renamed = Path(self.temp.name) / 'revision-2-renamed.bundle'
-        renamed.write_bytes(first.read_bytes())
-        self.assertEqual(hashlib.sha256(renamed.read_bytes()).hexdigest(),
-                         hashlib.sha256(first.read_bytes()).hexdigest())
-        self.git('bundle', 'verify', str(renamed))
-        imported = Path(self.temp.name) / 'renamed'
-        imported.mkdir()
-        self.git('init', '-q', cwd=imported)
-        self.git('fetch', str(renamed), '%s:refs/heads/contribution' % self.sha, cwd=imported)
-        self.assertEqual(self.git('rev-parse', 'refs/heads/contribution', cwd=imported).strip(),
-                         self.sha)
+    def test_a_detached_head_bundle_is_observed_by_the_kit(self):
+        if shutil.which('git') is None:
+            self.skipTest('git is not available')
+        with scratch() as tmp:
+            root = Path(tmp)
+            bundle, sha = self.make_detached_bundle(root)
+            observation = w.read_bundle_observation(bundle, git=self.listing_git(root))
+            self.assertEqual(observation['sha256'], hashlib.sha256(bundle.read_bytes()).hexdigest())
+            self.assertEqual(observation['bytes'], bundle.stat().st_size)
+            self.assertEqual(observation['heads'], [{'commit': sha, 'ref': 'HEAD'}])
+            self.assertIsNone(observation['heads_error'])
+            self.assertIsNone(w.bundle_commit_problem(observation, sha))
+            # The observation feeds a real attestation: a listed verifier records the
+            # observed tip, digest and byte count as verified.
+            h = ChainHarness()
+            h.setUp()
+            contribution = h.send(h.contribution(commit=sha, sha256=observation['sha256']))['comment_id']
+            h.send(h.attest(contribution, commit=sha, sha256=observation['sha256'],
+                            bytes=observation['bytes']), VERIFIER)
+            self.assertEqual(w.project(h.issue)['verification'], 'verified')
+
+    def test_a_renamed_bundle_observes_the_same_bytes(self):
+        if shutil.which('git') is None:
+            self.skipTest('git is not available')
+        with scratch() as tmp:
+            root = Path(tmp)
+            bundle, sha = self.make_detached_bundle(root)
+            renamed = root / 'revision-2-renamed.bundle'
+            renamed.write_bytes(bundle.read_bytes())
+            first = w.read_bundle_observation(bundle, git=self.listing_git(root))
+            again = w.read_bundle_observation(renamed, git=self.listing_git(root))
+            self.assertEqual(first['sha256'], again['sha256'])
+            self.assertEqual(first['bytes'], again['bytes'])
+            # The DECLARED path is a label: the same bytes' digest verifies a revision that
+            # declares a renamed path.
+            h = ChainHarness()
+            h.setUp()
+            contribution = h.send(h.contribution(commit=sha, path='/deliveries/renamed.bundle',
+                                                 sha256=again['sha256']))['comment_id']
+            h.send(h.attest(contribution, commit=sha, sha256=again['sha256'],
+                            bytes=again['bytes']), VERIFIER)
+            self.assertEqual(w.project(h.issue)['verification'], 'verified')
 
 
-class LifecycleScopeCommitTests(unittest.TestCase):
-    """The lifecycle scope write rule (kittrial-5bb.10): exact 40/64-hex commits only."""
+class WebRouteHostOnlyTests(unittest.TestCase):
+    """Item 6: the three operations are host-only, and the web route says so."""
 
-    def scope(self, source='a' * 40, integration=''):
-        return {'source_commit': source, 'integration_commit': integration,
-                'release_id': '', 'environment': ''}
+    def command(self, operation, **extra):
+        payload = dict(operation=operation, schema_version=1, operation_id='op-1',
+                       previous=None, task_id='task-1', contribution='1', reason='because',
+                       **extra)
+        # An instance without __init__: the review mapping needs only the class field table.
+        backend = http_service.EndpointBackend.__new__(http_service.EndpointBackend)
+        return backend._command('reviews.add', 'principal', 'proj', payload, 'op-1')
 
-    def test_a_nonempty_scope_commit_must_be_an_exact_full_hash(self):
-        lifecycle.validate_scope(self.scope())
-        lifecycle.validate_scope(self.scope(integration='f' * 64))
-        for value in ('c6b25b2e5f7a', 'c6b25b2', 'source-a', 'merge-a', 'zz' * 20):
-            with self.subTest(value=value):
-                with self.assertRaisesRegex(ValueError, 'exact 40/64 hexadecimal commit'):
-                    lifecycle.validate_scope(self.scope(source=value))
+    def test_the_web_route_refuses_attest_hold_and_release_hold(self):
+        for operation in ('attest', 'hold', 'release-hold'):
+            with self.subTest(operation=operation):
+                with self.assertRaises(HttpError) as raised:
+                    self.command(operation)
+                self.assertIn('host-only', str(raised.exception))
+                self.assertIn('admin.py attest-delivery', str(raised.exception))
 
-    def test_a_scope_with_no_commit_is_still_valid(self):
-        # A scope that identifies its work by release id/environment carries no commit;
-        # the commit rule only constrains a non-empty one.
-        lifecycle.validate_scope({'source_commit': '', 'integration_commit': '',
-                                  'release_id': 'release-1', 'environment': 'prod'})
+    def test_the_web_route_still_maps_the_ordinary_operations(self):
+        action, _, args, attachments = self.command('approve', summary='ok')
+        self.assertEqual(action, 'review')
+        body = json.loads(attachments['0']['text'])
+        self.assertEqual(body['operation'], 'approve')
 
-    def test_a_stored_legacy_scope_still_reads(self):
-        # The published contract predates the rule; the stored-record reader tolerates a
-        # legacy scope so an installation's existing history keeps its meaning.
-        payload = dict(schema_version=1, operation_id='op-1', task='trial-task',
-                       dimension='implemented', value='passed',
-                       scope=self.scope(source='source-a'),
-                       evidence=['commit:source-a'], provenance='performed', actor='alice')
-        lifecycle.validate_stored_payload(payload)
-        with self.assertRaisesRegex(ValueError, 'exact 40/64 hexadecimal commit'):
-            lifecycle.validate_payload(payload)
+
+if __name__ == '__main__':
+    unittest.main()

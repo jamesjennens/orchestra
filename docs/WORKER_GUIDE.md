@@ -341,7 +341,11 @@ A verifier records what it observed as a separate attestation (`review TASK` ope
 `attest`, see [reviews](REVIEWS.md)), never by overwriting the declared delivery: the
 commit observed must be the declared delivered tip, a bundle must match the declared
 SHA-256 and a positive byte count, and an unreachable remote is recorded as an explicit
-`unknown` with its reason rather than as a pass.
+`unknown` with its reason rather than as a pass. On the coordination host a listed verifier
+makes the observation real with `python3 admin.py attest-delivery PROJECT --actor VERIFIER
+--task TASK --bundle FILE --reason TEXT`, which reads the file's bytes and SHA-256, lists
+the heads the bundle advertises and writes the record from those values; `attest`, `hold`
+and `release-hold` are host-only, and only a listed verifier or listed operator may attest.
 
 Push permission for a contribution branch is separate from permission to merge, update a shared branch or deploy. If project instructions do not establish push authority, ask for that narrow decision or agree a bundle transfer. Do not infer broad Git permissions from a claimed task.
 

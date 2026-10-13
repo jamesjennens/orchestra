@@ -131,12 +131,6 @@ REVERT_PREFIX = 'Kind: integration-revert-v1\n'
 # owed only when the current scope explicitly records pending or failed.
 DEPLOYMENT_DIMENSIONS = ('deployed','live-verified')
 COMMIT = re.compile(r'[0-9a-f]{40}')
-#: A commit in a lifecycle SCOPE (kittrial-5bb.10): an exact 40- or 64-hex object id, in
-#: either case. ``validate_scope`` refuses a non-empty ``source_commit``/``integration_commit``
-#: that is not one, so an abbreviated or unverified hash can never be recorded as if it
-#: identified a commit. The single stored-record read path (``native_event``) still reads a
-#: legacy scope tolerantly, so an installation's existing history keeps its meaning.
-COMMIT_ANY = re.compile(r'(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})')
 LABEL = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.@/-]{0,160}')
 SCOPE_ROLL_NOTE = ('The release scope becomes each target\'s current scope, so the six-fact readers '
                    '(brief, work, lifecycle.py list) show integrated=unknown (and any earlier-scope fact '
@@ -312,25 +306,10 @@ def lifecycle_authors_report(rows,operators=None,owners=None,limit=AUTHORS_REPOR
             'task_limit':limit,'truncated':tasks_with_facts>len(listed)}
 
 
-def validate_scope(scope, commits=True):
-    """One lifecycle scope: four strings, at least one identifying some work.
-
-    ``commits`` is the WRITE rule (kittrial-5bb.10): a non-empty ``source_commit`` or
-    ``integration_commit`` must be an exact 40/64-hex object id, so an abbreviated or
-    unverified hash is never recorded as a commit. A payload already in history is read
-    through :func:`validate_stored_payload`, which re-validates a scope refused by this
-    rule alone with ``commits=False``, so an installation's existing history keeps its
-    meaning rather than turning into unknown facts.
-    """
+def validate_scope(scope):
     if not isinstance(scope,dict) or set(scope)!=SCOPE_KEYS or any(not isinstance(v,str) for v in scope.values()):
         raise ValueError('scope requires source_commit, integration_commit, release_id and environment strings')
     if not any(v.strip() for v in scope.values()):raise ValueError('scope must identify some work')
-    if commits:
-        for key in ('source_commit','integration_commit'):
-            value=scope[key]
-            if value.strip() and not COMMIT_ANY.fullmatch(value):
-                raise ValueError('%s must be an exact 40/64 hexadecimal commit, not an abbreviated or '
-                                 'unverified hash'%key)
 
 
 def one_line(value,name,maxlen=TEXT_MAX):
@@ -340,11 +319,11 @@ def one_line(value,name,maxlen=TEXT_MAX):
     return value
 
 
-def validate_payload(p, commits=True):
+def validate_payload(p):
     if not isinstance(p,dict) or set(p)-set(OPTIONAL_FIELDS)!=PAYLOAD_FIELDS or type(p.get('schema_version')) is not int or p['schema_version']!=1:raise ValueError('invalid lifecycle payload')
     for key in ('operation_id','task','actor'):
         if not isinstance(p[key],str) or not LABEL.fullmatch(p[key]):raise ValueError('invalid '+key)
-    validate_scope(p['scope'], commits=commits)
+    validate_scope(p['scope'])
     if not isinstance(p['evidence'],list) or any(not isinstance(x,str) or not x.strip() for x in p['evidence']):raise ValueError('evidence must be a list of pointers')
     if p['provenance'] not in ('performed','reported','imported'):raise ValueError('invalid provenance')
     if 'note' in p:one_line(p['note'],'note')
@@ -376,22 +355,6 @@ def validate_payload(p, commits=True):
     else:raise ValueError('invalid lifecycle dimension/value')
 
 
-def validate_stored_payload(p):
-    """``validate_payload`` for a payload already in history (kittrial-5bb.10).
-
-    The 40/64-hex commit rule is a WRITE rule. A scope stored before the rule existed
-    must still READ, so a payload refused ONLY by that rule is re-validated with the
-    rule relaxed; every other refusal propagates exactly as before, so an older-kit
-    simulation that replaces ``validate_payload`` still decides the outcome.
-    """
-    try:
-        validate_payload(p)
-    except ValueError as exc:
-        if 'exact 40/64 hexadecimal commit' not in str(exc):
-            raise
-        validate_payload(p, commits=False)
-
-
 def native_event(row):
     if not isinstance(row, dict) or row.get('issue_type')!='event' or row.get('malformed') or not row.get('id'):return None
     match=re.fullmatch(r'(?:Set |Changed )([A-Za-z0-9-]+)(?: from [^\n]+)? to ([^\n]+)(?:\n\nReason: ([\s\S]*))?',row.get('description',''))
@@ -405,7 +368,7 @@ def native_event(row):
     payload=None
     if reason and reason.startswith(PREFIX):
         try:
-            payload=record_json.loads(reason[len(PREFIX):]);validate_stored_payload(payload)
+            payload=record_json.loads(reason[len(PREFIX):]);validate_payload(payload)
             if canonical_bytes(payload).decode()!=reason[len(PREFIX):] or payload['task']!=parents[0] or payload['dimension']!=dimension or payload['value']!=value or payload['actor']!=row.get('created_by'):payload=None
         except (ValueError,TypeError):payload=None
     suffix=row['id'].removeprefix(parents[0]+'.')
@@ -944,6 +907,50 @@ def current_contribution_commits(rows):
     return result
 
 
+def review_chain_state(row):
+    """The shared review projection of one row, or ``None`` when it cannot be read.
+
+    Best effort, exactly like :func:`current_contribution_commits`: a row with no review
+    chain, or a chain this read cannot parse, yields ``None`` and the caller treats the
+    task as unheld rather than inventing a hold. Nothing here changes what is recorded.
+    """
+    try:
+        from review_workflow import records, projection
+    except ImportError:return None
+    if not isinstance(row,dict) or not isinstance(row.get('id'),str):return None
+    from coordination import is_merge_slot
+    if row.get('issue_type') in ('event','gate') or is_merge_slot(row):return None
+    try:
+        return projection(records(row,None))
+    except (ValueError,KeyError,TypeError):return None
+
+
+def held_tasks(rows):
+    """``{task: sentence}`` for tasks whose CURRENT contribution is held (kittrial-5bb.10).
+
+    A hold, or a positively FAILED verifier attestation, makes a contribution not
+    integration-ready, so the release selection skips the task with the sentence that
+    names the open hold (or the failed attestation) and who can release it. Best effort:
+    a chain this read cannot parse simply yields no entry, exactly as the delivery flag
+    read does.
+    """
+    from review_workflow import integration_hold_sentence
+    result={}
+    for row in rows:
+        state=review_chain_state(row)
+        if state is None:continue
+        sentence=integration_hold_sentence(state)
+        if sentence:result[row['id']]=sentence
+    return result
+
+
+def held_issue_sentence(issue):
+    """The hold sentence for one task row, or ``None`` (kittrial-5bb.10 item 4)."""
+    from review_workflow import integration_hold_sentence
+    state=review_chain_state(issue)
+    return None if state is None else integration_hold_sentence(state)
+
+
 def run_advances_past(live_scope,release,is_ancestor):
     """Does running ``release`` here ADVANCE the environment past this live scope?
 
@@ -1023,10 +1030,17 @@ def release_selection(rows,scope,is_ancestor,previous_commit=None,subset=None,re
     if reverted is None:reverted=reverted_integrations(rows,operators,journal)
     if current_commits is None:current_commits=current_contribution_commits(rows)
     wanted=set(subset) if subset else None
+    # A held contribution is not integration-ready (kittrial-5bb.10 item 4): the release
+    # selection skips the task with the sentence naming the open hold (or the failed
+    # attestation) and who can release it, instead of offering it as a target.
+    held=held_tasks(rows)
     targets=[];skipped=[];flags=[];verifying=[];restoring=[]
     for entry in scoped_evidence(rows,('integrated','deployed','live-verified',LIVE)):
         task=entry['id'];scopes=entry['scopes']
         if wanted is not None and task not in wanted:continue
+        if task in held:
+            skipped.append({'task':task,'reason':'held from integration: '+held[task]})
+            continue
         chosen=None;reason=entry['untrusted'].get('integrated')
         for candidate in sorted(scopes,key=lambda c:((c.get('integrated') or {}).get('order') or -1,
                                                       (c.get('integrated') or {}).get('event_id') or ''),reverse=True):
@@ -1595,6 +1609,24 @@ def apply_release(payload,actor,run,operators=None,journal=None,lifecycle_author
                            enforce=lifecycle_authors,
                            subject=payload['scope'].get('release_id') or None)
     rows=read_event_rows(run)
+    # A release that explicitly NAMES a held task is refused with the hold's own sentence
+    # (kittrial-5bb.10 item 4), before any plan or write: a held contribution is not
+    # integration-ready, so a caller cannot release it by naming it. The selection already
+    # skipped it; this is the explicit refusal.
+    held=held_tasks(rows)
+    named=set()
+    for target in payload.get('targets') or []:
+        if isinstance(target,str):named.add(target)
+        elif isinstance(target,dict) and isinstance(target.get('task'),str):named.add(target['task'])
+    for task in payload.get('supersede') or []:
+        if isinstance(task,str):named.add(task)
+    for item in payload.get('supersede_scopes') or []:
+        if isinstance(item,dict) and isinstance(item.get('task'),str):named.add(item['task'])
+    refused=sorted(task for task in named if task in held)
+    if refused:
+        raise ValueError('Refusing a release that names %s: %s. A held contribution is not integration-ready; '
+                         'the hold must be released (or a corrected attestation recorded) first.'
+                         %(', '.join(refused[:5]),'; '.join('%s: %s'%(task,held[task]) for task in refused[:5])))
     if payload.get('rollback'):require_rollback_target_deployed(rows,payload['scope'])
     selected,plans,issues,evidence=_release_plan(rows,payload,operators,journal)
     superseded=_supersede_plan(rows,payload,issues,evidence)
@@ -1762,6 +1794,16 @@ def apply_native(payload, actor, run, operators=None, journal=None, lifecycle_au
             from review_workflow import require_independent_approval
             require_independent_approval(issue,payload['dimension'],payload['task'],
                                          operators=operators,owners=owners,journal=journal)
+    # A task whose CURRENT contribution is held is not integration-ready (kittrial-5bb.10
+    # item 4): `reviewed` and `integrated` facts for it are refused with the hold's own
+    # sentence, before any write, so a held contribution cannot be recorded as reviewed or
+    # integrated. Judged from the same export the rest of this write already reads.
+    if payload['dimension'] in ('reviewed','integrated'):
+        sentence=held_issue_sentence(issues.get(payload['task']))
+        if sentence:
+            raise ValueError('Refusing to record %s for %s: %s. A held contribution is not '
+                             'integration-ready; the hold must be released (or a corrected attestation '
+                             'recorded) first.'%(payload['dimension'],payload['task'],sentence))
     # A SINGLE fact must name the task's CURRENT scope: a fact recorded under an
     # older, previously recorded scope is refused here with main's rule (rev3 item
     # 2). Only the release operation may write a fact under an already-recorded

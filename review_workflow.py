@@ -71,6 +71,7 @@ up and validated with the other coordination journals (``admin.py``), and the
 required deployment order is documented in ``docs/REVIEWS.md``.
 """
 import json
+import hashlib
 import record_json
 import re
 from pathlib import Path
@@ -216,8 +217,11 @@ COMMIT_TEXT = re.compile(r'(?:[a-fA-F0-9]{40}|[a-fA-F0-9]{64})')
 #: below and the `review` help both read this table (kittrial-5bb.97).
 TEXT_LIMITS = {'summary': 1200, 'repository': 1000, 'remote': 1000, 'branch': 300, 'bundle path': 1000,
                'review text': 1000, 'resolution reason': 1000, 'resolution evidence': 1000,
-               'assignee snapshot': 300, 'decline reason': 1000, 'withdraw reason': 1000,
-               'method': METHOD_LIMIT, 'reason': 1000}
+               'assignee snapshot': 300, 'decline reason': 1000, 'withdraw reason': 1000}
+#: The attestation's own text limits (kittrial-5bb.10). Kept OUT of ``TEXT_LIMITS``: that
+#: map is a released, exactly-asserted shape, and an attestation's ``method``/``reason``
+#: are validated with these constants directly (they are documented in docs/CLI_CONTRACT.md).
+REASON_LIMIT = 1000
 ITEMS_MAX = 20
 PAYLOAD_MAX_BYTES = 24000
 
@@ -353,8 +357,11 @@ def new_write_requested(payload):
 
 def new_write_refusal(payload):
     """The refusal text for a new-shaped write on an installation with the switch off."""
-    return ('Review workflow ' + (new_write_field(payload) or str(payload.get('operation'))) +
-            ' writes a new record shape that a kit built before kittrial-5bb.94 cannot read. '
+    operation = payload.get('operation')
+    boundary = ('kittrial-5bb.10 (verifier attestations and integration holds)'
+                if operation in ('attest', 'hold', 'release-hold') else 'kittrial-5bb.94')
+    return ('Review workflow ' + (new_write_field(payload) or str(operation)) +
+            ' writes a new record shape that a kit built before ' + boundary + ' cannot read. '
             'This installation has review_workflow_writes off (the default); the readers here '
             'understand the new operations and fields already, so this is a write switch, not a '
             'read limit. An operator turns it on with `admin.py review-writes on --actor OPERATOR` '
@@ -608,7 +615,8 @@ def validate(p, task):
             for key in ('commit', 'base_commit'):
                 if not isinstance(p[key], str) or not COMMIT_TEXT.fullmatch(p[key]):
                     raise ValueError(f'{key}: require exact 40/64 hexadecimal commit')
-            limited(p['method'], 'method'); limited(p['reason'], 'reason')
+            check_text(p['method'], 'method', METHOD_LIMIT)
+            check_text(p['reason'], 'reason', REASON_LIMIT)
             observed = p.get('sha256')
             if observed is not None and (not isinstance(observed, str)
                                          or not re.fullmatch(r'[a-fA-F0-9]{64}', observed)):
@@ -617,10 +625,10 @@ def validate(p, task):
             if size is not None and (type(size) is not int or size < 0):
                 raise ValueError('Attestation bytes must be a non-negative integer, or absent')
         elif op == 'hold':
-            limited(p['reason'], 'reason')
+            check_text(p['reason'], 'reason', REASON_LIMIT)
         elif op == 'release-hold':
             identity(p['hold'])
-            limited(p['reason'], 'reason')
+            check_text(p['reason'], 'reason', REASON_LIMIT)
         elif op == 'withdraw':
             limited(p['reason'], 'withdraw reason')
             # The READ path stays tolerant: a record an older kit stored with an
@@ -687,6 +695,130 @@ def attestation_problems(p, contribution):
     else:
         problems.append('the declared delivery is not a verifiable remote or bundle delivery')
     return problems
+
+
+def attest_authority_refusal(actor, contribution, assignee, operators=None, verifiers=None, owners=None):
+    """Why ``actor`` may NOT record a verifier attestation, or ``None`` when allowed.
+
+    An attestation is a VERIFIER's observation (kittrial-5bb.10 item 3): the actor must
+    be on the deployment verifiers list or be a listed operator (the ONE
+    ``listed_operator_actor`` rule, so an actor of a listed operator's principal counts),
+    and never the contribution's author or the task's assignee, or a party of either.
+    Authorization is judged before the observation, so an author or an unlisted
+    contributor cannot record a ``failed``/``unknown``/``verified`` verdict at all.
+    """
+    verifier_list = verifiers if verifiers is not None else ()
+    listed = listed_operator_actor(actor, operators, owners) or \
+        actor in recovery.configured_operators(verifier_list)
+    if not listed:
+        return ('attest refused: an attestation records a VERIFIER\'s observation, so only a listed '
+                'verifier or a listed operator may record one, and %s is neither. An operator adds a '
+                'verifier with `admin.py verifiers add ACTOR` on the coordination host.'
+                % named_rule_actor(actor))
+    contribution = contribution if isinstance(contribution, dict) else {}
+    for role, named in (('author', contribution.get('author')), ('assignee', assignee)):
+        if isinstance(named, str) and named and same_party(actor, named, owners):
+            return ('attest refused: %s is the contribution %s\'s party, and nobody attests to their own '
+                    'work; only another listed verifier or a listed operator may attest this delivery.'
+                    % (named_rule_actor(actor), role))
+    return None
+
+
+def hold_authority_refusal(actor, operators=None, owners=None):
+    """Why ``actor`` may NOT set or release an integration hold, or ``None``.
+
+    A hold is a coordinator control (kittrial-5bb.10 items 4 and 6): the actor must be a
+    listed operator of this project by the ONE ``listed_operator_actor`` rule (a name on
+    the allowlist, or an actor of a listed operator's principal).
+    """
+    if listed_operator_actor(actor, operators, owners):
+        return None
+    return ('hold refused: an integration hold is a coordinator control, so only a listed operator of '
+            'this project (or an actor of a listed operator\'s principal) may set or release one, and %s '
+            'is neither.' % named_rule_actor(actor))
+
+
+def read_bundle_observation(path, git=None):
+    """What a verifier can OBSERVE about a delivered bundle file (kittrial-5bb.10 item 5).
+
+    The ``attest`` operation itself reads no bundle, computes no hash and runs no git, so
+    this is the host-side observation the verifier's command uses BEFORE recording the
+    attestation: it reads the file's bytes, hashes them and counts them, and - when a
+    ``git`` runner is supplied - lists the refs the bundle advertises with
+    ``git bundle list-heads``. Returns ``{path, bytes, sha256, heads, heads_error}``;
+    ``heads`` is a list of ``{commit, ref}`` (empty for a bundle with no advertised ref,
+    never guessed) and ``heads_error`` names why they could not be read. The digest and
+    the byte count need no git, so they are always returned.
+    """
+    bundle = Path(path)
+    if not bundle.is_file():
+        raise ValueError('Delivered bundle is not a readable file: %s' % bundle)
+    data = bundle.read_bytes()
+    observation = {'path': str(bundle), 'bytes': len(data),
+                   'sha256': hashlib.sha256(data).hexdigest(),
+                   'heads': [], 'heads_error': None}
+    if git is None:
+        observation['heads_error'] = 'no git runner was supplied, so the bundle heads were not listed'
+        return observation
+    try:
+        raw = git(['bundle', 'list-heads', str(bundle)])
+    except (ValueError, OSError) as exc:
+        observation['heads_error'] = str(exc)[:200]
+        return observation
+    for line in str(raw or '').splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and re.fullmatch(r'[0-9a-fA-F]{40}|[0-9a-fA-F]{64}', parts[0]):
+            observation['heads'].append({'commit': parts[0].lower(), 'ref': parts[1]})
+    return observation
+
+
+def bundle_commit_problem(observation, commit):
+    """Why ``commit`` cannot be shown to exist in the observed bundle, or ``None``.
+
+    The host observation (``read_bundle_observation``) lists the heads a bundle
+    advertises. A ``verified`` attestation written by the host command is refused unless
+    the observed commit IS one of those heads, which is what makes "a missing commit is
+    never recorded as a pass" true on the host path: the record cannot name a commit the
+    delivered bytes do not carry. Returns the reason as a sentence, or ``None`` when the
+    commit is advertised (or when the caller supplied no heads to check, which the host
+    command treats as a refusal for a ``verified`` verdict).
+    """
+    observation = observation if isinstance(observation, dict) else {}
+    if observation.get('heads_error'):
+        return ('the bundle heads could not be listed (%s), so the observed commit cannot be '
+                'shown to exist in the bundle' % observation['heads_error'])
+    heads = [str(head.get('commit') or '').lower() for head in observation.get('heads') or []
+             if isinstance(head, dict)]
+    if not heads:
+        return 'the bundle advertises no head, so the observed commit cannot be shown to exist in it'
+    if str(commit or '').lower() not in heads:
+        return 'the observed commit %s is not one of the heads this bundle advertises' % commit
+    return None
+
+
+def integration_hold_sentence(state):
+    """A sentence naming why a projected contribution is held, and who can clear it.
+
+    ``state`` is a :func:`projection` result. Returns ``None`` when nothing holds the
+    contribution. The sentence names the open hold record(s) - or the failed
+    attestation record - and the authority that clears each (kittrial-5bb.10 items 3
+    and 4), so every refusal (merge-acquire, a reviewed/integrated fact, a release
+    selection or a release that names the task) can say both what is wrong and who can
+    release it, instead of only that something is wrong.
+    """
+    state = state if isinstance(state, dict) else {}
+    holds = [h for h in (state.get('holds') or []) if isinstance(h, dict)]
+    if holds:
+        ids = ', '.join(str(h.get('comment_id')) for h in holds[:5])
+        return ('an open integration hold (record%s %s) is in force, and only a listed operator clears '
+                'it with a release-hold record naming that hold'
+                % ('s' if len(holds) != 1 else '', ids))
+    if state.get('verification') == 'failed':
+        attestation = state.get('attestation') if isinstance(state.get('attestation'), dict) else {}
+        return ('a verifier recorded a FAILED attestation (record %s), cleared only by a later attestation '
+                'from a listed verifier or a listed operator, or by a superseding revision that carries its '
+                'own attestation' % (attestation.get('comment_id') or 'unknown'))
+    return None
 
 
 def records(issue, voided=None):
@@ -1776,10 +1908,17 @@ def projection(ordered, voids=None, invalid=None, refused=None, positions=None, 
         verification = attestation['verdict']
     verification_failed = verification == 'failed'
     held = bool(holds) or verification_failed
+    # The `held` STATE is what an APPROVED contribution shows INSTEAD OF
+    # awaiting-integration (kittrial-5bb.10 items 4 and 7). A hold (or a failed
+    # attestation) on a revision that is not approved does not take that revision out of
+    # review: the author's open requested changes still lead, and a revision still
+    # awaiting review stays in the reviewers' queue, with the hold shown beside it (the
+    # `holds`/`verification` fields and the warnings). A held contribution is therefore
+    # never integration-ready, while a revision under a standing hold stays reviewable.
     state = ('none' if contribution is None else
              withdrawal['disposition'] if withdrawal else
-             'held' if held else
              'changes-requested' if pending else
+             'held' if (held and approved) else
              'awaiting-integration' if approved else 'awaiting-review')
     recoveries = [{'comment_id': str(c['id']), 'disposition': p['disposition'], 'target': p['target'],
                    'target_kind': p['target_kind'], 'target_sha256': p['target_sha256'],
@@ -2247,7 +2386,8 @@ def open_review_requests_by(rows, actor, operators=None, journal=None):
 
 
 def execute(rows, task, actor, payload, run, operators=None, journal=None, review_writes=None,
-            independent_approval=False, coordinator_writes=False, owners=None, verified_web_authority=False):
+            independent_approval=False, coordinator_writes=False, owners=None, verified_web_authority=False,
+            verifiers=None):
     """Validate, CAS and append once; return receipt and projected review state.
 
     ``journal`` is the project directory holding the host-issued
@@ -2343,6 +2483,14 @@ def execute(rows, task, actor, payload, run, operators=None, journal=None, revie
                 raise ValueError('Only the current assigned owner or a configured coordinator may '
                                  'request a review')
     if payload['operation'] == 'attest':
+        # WHO may attest (kittrial-5bb.10 item 3): a listed verifier or a listed operator,
+        # never the contribution's author or the task's assignee or their party. Judged
+        # first, so an author or an unlisted contributor cannot even record a `failed`
+        # verdict that would hold somebody else's work.
+        refusal = attest_authority_refusal(actor, state.get('contribution') or {},
+                                           issue.get('assignee'), operators, verifiers, owners)
+        if refusal is not None:
+            raise CoordinatorRuleRefusal(refusal)
         # A `verified` attestation must actually verify the DECLARED delivery: the observed
         # commit must be the delivered tip, the base must be the declared base, and a bundle
         # must match the declared SHA-256 with a positive byte count. Otherwise the record
@@ -2356,11 +2504,11 @@ def execute(rows, task, actor, payload, run, operators=None, journal=None, revie
     if payload['operation'] in ('hold', 'release-hold'):
         # An integration hold is an audited coordinator control, exactly like the manual
         # `request-changes` hold it complements; a worker does not clear another party's
-        # hold. The endpoint's verified web authority establishes a caller the same way it
-        # does for approve (kittrial-5bb.199/.209).
-        authority = recovery.configured_operators(operators)
-        if actor not in authority and not verified_web_authority:
-            raise ValueError('Only a configured coordinator may set or release an integration hold')
+        # hold. Authority is the kit's ONE "listed operator" rule (kittrial-5bb.10 item 6):
+        # a name on the allowlist, or an actor of a listed operator's principal.
+        refusal = hold_authority_refusal(actor, operators, owners)
+        if refusal is not None:
+            raise CoordinatorRuleRefusal(refusal)
     if payload['operation'] == 'release-hold':
         open_holds = [h['comment_id'] for h in state.get('holds') or []]
         if payload['hold'] not in open_holds:

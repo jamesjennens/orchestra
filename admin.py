@@ -8912,6 +8912,19 @@ def main():
                        help='with --disposition complete, the exact native record to confirm')
         if name=='record-reconcile':a.add_argument('--kind',choices=['requirement','reference','capability','proposal'],required=True)
     a=sub.add_parser('void-record');a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
+    a=sub.add_parser('attest-delivery',help='a listed verifier reads a delivered bundle ON THIS HOST (its bytes, '
+                                            'SHA-256 and advertised heads) and writes the verifier attestation from '
+                                            'what it found; the review kit itself reads no bundle (kittrial-5bb.10)')
+    a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--task',required=True)
+    a.add_argument('--bundle',required=True,help='path to the delivered bundle file on this host')
+    a.add_argument('--contribution',default=None,help='the contribution record comment id; the current one by default')
+    a.add_argument('--verdict',choices=['verified','failed','unknown'],default='verified')
+    a.add_argument('--commit',default=None,help="the observed delivered tip; the bundle's single advertised head by default")
+    a.add_argument('--base-commit',dest='base_commit',default=None,help='the observed base; the declared base by default')
+    a.add_argument('--method',default=None,help='how the observation was made (<= 200 characters)')
+    a.add_argument('--reason',required=True,help='why this verdict (<= 1000 characters)')
+    a.add_argument('--operation-id',dest='operation_id',default=None,
+                   help='a stable id so an interrupted run retries as the same record')
     a=sub.add_parser('anchor-release',help='close a reference or capability anchor that holds no record and free its key, or with --duplicate release a named duplicate anchor of a key (operator allowlist)')
     a.add_argument('project');a.add_argument('--kind',choices=['reference','capability'],required=True)
     a.add_argument('--issue-id',dest='issue_id',required=True);a.add_argument('--actor',required=True)
@@ -9568,6 +9581,67 @@ def main():
             rows=record_json.loads_rows(run_bd(root,args.project,['export','--all']))
             print(json.dumps(apply_void(rows,payload['task'],args.actor,payload,run,operator=True,
                                         operators=authority,journal=path)))
+    elif args.command=='attest-delivery':
+        import fcntl
+        from review_workflow import (read_bundle_observation, bundle_commit_problem,
+                                     execute as review_execute, project as review_project)
+        from briefing import task_row
+        path=project_dir(root,args.project)
+        if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
+        authority=operators(root,strict=True)
+        verifier_list=verifiers(root,strict=True)
+        def run(argv):return run_bd(root,args.project,['--actor',args.actor,*argv])
+        def git_run(argv):
+            done=subprocess.run(['git',*argv],capture_output=True,text=True,cwd=str(path))
+            if done.returncode!=0:
+                raise ValueError('git %s failed: %s'%(' '.join(argv),(done.stderr or '').strip()[:200]))
+            return done.stdout
+        # The observation happens BEFORE any write and on the file itself: the byte
+        # count and the SHA-256 are computed here, and the heads are what the bundle
+        # advertises. The review record then names what was found, not what was claimed.
+        observation=read_bundle_observation(args.bundle,git=git_run)
+        rows=record_json.loads_rows(run_bd(root,args.project,['export','--all']))
+        issue=task_row(rows,args.task)
+        state=review_project(issue,operators=authority,journal=path)
+        contribution=state.get('contribution') or {}
+        contribution_id=args.contribution or contribution.get('comment_id')
+        if not contribution_id:
+            raise ValueError('There is no current contribution to attest; name one with --contribution')
+        observed_commit=args.commit
+        if observed_commit is None:
+            named=[head['commit'] for head in observation['heads'] if head['ref']!='HEAD'] \
+                or [head['commit'] for head in observation['heads']]
+            unique=sorted(set(named))
+            if len(unique)!=1:
+                raise ValueError('Name the observed commit with --commit: the bundle advertises %s'
+                                 %(', '.join(unique) or 'no head'))
+            observed_commit=unique[0]
+        base_commit=args.base_commit or contribution.get('base_commit')
+        if not isinstance(base_commit,str) or not base_commit:
+            raise ValueError('The base commit to attest is unknown; name it with --base-commit')
+        if args.verdict=='verified':
+            # A `verified` verdict must be something the delivered bytes actually carry:
+            # the observed commit has to be one of the heads the bundle advertises, so a
+            # commit that exists nowhere cannot be written as a pass (kittrial-5bb.10 item 5).
+            problem=bundle_commit_problem(observation,observed_commit)
+            if problem:
+                raise ValueError('Cannot record a verified attestation: '+problem+
+                                 '. Record --verdict failed or unknown with the reason instead.')
+        method=args.method or ('bundle bytes and SHA-256 read on the host; git bundle list-heads (%d bytes)'
+                               %observation['bytes'])
+        operation_id=args.operation_id or ('attest-delivery/'+content_hash(
+            {'task':args.task,'contribution':contribution_id,'commit':observed_commit,
+             'sha256':observation['sha256']})[:24])
+        payload={'schema_version':1,'operation':'attest','operation_id':operation_id,'task':args.task,
+                 'previous':state.get('latest_comment_id'),'contribution':contribution_id,
+                 'verdict':args.verdict,'commit':observed_commit,'base_commit':base_commit,
+                 'method':method,'reason':args.reason,'sha256':observation['sha256'],
+                 'bytes':observation['bytes']}
+        with (path/'.coordination.lock').open('a') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            result=review_execute(rows,args.task,args.actor,payload,run,operators=authority,journal=path,
+                                  review_writes=review_workflow_writes(root),verifiers=verifier_list)
+        print(json.dumps(dict(result,observation=observation),ensure_ascii=False))
     elif args.command=='revert-record':
         import fcntl
         from review_workflow import apply_revert

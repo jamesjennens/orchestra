@@ -61,7 +61,7 @@ class ReviewRecordTests(unittest.TestCase):
         self.assertEqual(review_workflow.TEXT_LIMITS, {
             'summary': 1200, 'repository': 1000, 'remote': 1000, 'branch': 300, 'bundle path': 1000,
             'review text': 1000, 'resolution reason': 1000, 'resolution evidence': 1000, 'assignee snapshot': 300,
-            'decline reason': 1000, 'withdraw reason': 1000, 'method': 200, 'reason': 1000})
+            'decline reason': 1000, 'withdraw reason': 1000})
         self.assertEqual((review_workflow.ITEMS_MAX, review_workflow.PAYLOAD_MAX_BYTES), (20, 24000))
 
     def test_a_field_at_its_limit_passes_and_one_over_is_refused_with_its_length(self):

@@ -13,7 +13,7 @@ import client
 import review_workflow as w
 from requirements import canonical_bytes
 from lifecycle import DIMENSIONS
-from test_lifecycle import MERGE_COMMIT, NativeStore, payload, scope
+from test_lifecycle import NativeStore, payload, scope
 
 TASK = 'trial-task'
 PROJECT = 'trial'
@@ -1504,8 +1504,6 @@ class IntegrationDisagreementBriefTests(unittest.TestCase):
     """
 
     COMMIT = 'a' * 40
-    MERGE_A = MERGE_COMMIT
-    MERGE_B = '4' * 40
 
     def _reviewed(self):
         store = NativeStore()
@@ -1520,7 +1518,7 @@ class IntegrationDisagreementBriefTests(unittest.TestCase):
 
     def test_brief_warns_and_renders_the_disagreement(self):
         store = self._reviewed()
-        second = scope(source_commit=self.COMMIT, integration_commit=self.MERGE_B,
+        second = scope(source_commit=self.COMMIT, integration_commit='merge-b',
                        release_id='release-2')
         store.record(payload('lifecycle-scope', operation='scope-2', scope=second))
         store.record(payload('integrated', 'failed', 'fact-2', scope=second,
@@ -1529,14 +1527,14 @@ class IntegrationDisagreementBriefTests(unittest.TestCase):
         warnings = [line for line in result['warnings']
                     if line.startswith('Integration fact disagreement')]
         self.assertEqual(len(warnings), 1)
-        for text in (self.MERGE_A, self.MERGE_B, 'passed', 'failed'):
+        for text in ('merge-a', 'merge-b', 'passed', 'failed'):
             self.assertIn(text, warnings[0])
         self.assertEqual(result['review']['integration']['fact'], 'passed')
         self.assertEqual(result['review']['integration']['newest_fact'], 'failed')
         rendered = b.format_brief(result)
         self.assertIn('Integration fact disagreement', rendered)
-        self.assertIn(self.MERGE_A, rendered)
-        self.assertIn(self.MERGE_B, rendered)
+        self.assertIn('merge-a', rendered)
+        self.assertIn('merge-b', rendered)
 
     def test_brief_has_no_warning_when_the_facts_agree(self):
         store = self._reviewed()

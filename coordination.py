@@ -321,7 +321,7 @@ def repair_merge_slot(run,slot):
     return fixed,wanted
 
 def apply_native(p, actor, run, project, operators=None, coordinator_writes=False, independent_approval=False,
-                 owners=None, verified_web_authority=False):
+                 owners=None, verified_web_authority=False, review_writes=False):
     """Caller holds canonical project lock. Journals belong to runtime, never Git.
 
     ``coordinator_writes`` and ``independent_approval`` are the per-installation
@@ -435,6 +435,28 @@ def apply_native(p, actor, run, project, operators=None, coordinator_writes=Fals
             if issue is not None:
                 require_independent_approval(issue,'merge-acquire',p['task'],
                                              operators=operators,owners=owners,journal=project)
+    if op=='merge-acquire' and review_writes:
+        # A contribution held from integration is not integration-ready (kittrial-5bb.10
+        # item 4): taking the merge slot for it is refused here, BEFORE the slot is read
+        # or reserved, so a refusal writes nothing. ``review_writes`` is the installation's
+        # review-workflow switch, supplied by the endpoint: with it off no hold could have
+        # been written here, so the export is not read at all and an installation that
+        # configures nothing behaves exactly as on main.
+        from lifecycle import read_event_rows
+        from briefing import task_row
+        from review_workflow import project as review_project, integration_hold_sentence, CoordinatorRuleRefusal
+        rows=read_event_rows(run)
+        try: issue=task_row(rows,p['task'])
+        except ValueError: issue=None
+        state=None
+        if issue is not None:
+            try: state=review_project(issue,operators=operators,journal=project)
+            except ValueError: state=None
+        sentence=integration_hold_sentence(state) if state else None
+        if sentence:
+            raise CoordinatorRuleRefusal('merge-acquire refused for %s: %s. A held contribution is not '
+                             'integration-ready, so the merge slot is not taken until the hold is released.'
+                             %(p['task'],sentence))
     context_path=project/'.merge-context.json'
     if op=='merge-create':
         # Creates the slot, or says it exists; either way a damaged row is put right.

@@ -1,5 +1,4 @@
 """Lifecycle evidence and retry checks using the pinned native export shape."""
-import contextlib
 import copy
 import json
 import sys
@@ -7,36 +6,12 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import lifecycle
 from lifecycle import DIMENSIONS, PREFIX, apply_native, native_event, project_facts, validate_payload
 from requirements import canonical_bytes, content_hash
 
 
-SOURCE_COMMIT = '1' * 40
-MERGE_COMMIT = '2' * 40
-OTHER_SOURCE_COMMIT = '3' * 40
-
-
-@contextlib.contextmanager
-def legacy_scope_rule():
-    """Store a fixture scope the way a pre-kittrial-5bb.10 kit could have stored it.
-
-    The 40/64-hex rule is a WRITE rule: a test that pins the READ behaviour of a legacy
-    value (a short hash, an odd integration id) records it with the rule relaxed, exactly
-    as an installation that already holds such a record would have.
-    """
-    original = lifecycle.validate_scope
-    lifecycle.validate_scope = lambda scope, commits=True: original(scope, commits=False)
-    try:
-        yield
-    finally:
-        lifecycle.validate_scope = original
-
-
 def scope(**changes):
-    # Full 40-hex commits: kittrial-5bb.10 requires an exact 40/64-hex object id in a
-    # non-empty scope commit on the write path, so a synthetic scope uses real-shaped ones.
-    return {'source_commit': SOURCE_COMMIT, 'integration_commit': MERGE_COMMIT,
+    return {'source_commit': 'source-a', 'integration_commit': 'merge-a',
             'release_id': 'release-a', 'environment': 'staging', **changes}
 
 
@@ -120,7 +95,7 @@ class LifecycleProjectionTests(unittest.TestCase):
         for n, dim in enumerate(DIMENSIONS[1:], 2):
             store.record(payload(dim, operation='fact-' + str(n)))
         prior = copy.deepcopy(store.rows)
-        store.record(payload('lifecycle-scope', operation='scope-2', scope=scope(source_commit=OTHER_SOURCE_COMMIT)))
+        store.record(payload('lifecycle-scope', operation='scope-2', scope=scope(source_commit='source-b')))
         self.assertEqual({f['value'] for f in store.view()['facts'].values()}, {'unknown'})
         self.assertTrue(all(not f['evidence'] for f in store.view()['facts'].values()))
         self.assertEqual(store.rows[1:len(prior)], prior[1:])
@@ -246,7 +221,7 @@ class LifecycleWriteTests(unittest.TestCase):
 
     def test_fact_requires_exact_current_scope(self):
         store = NativeStore().seed()
-        for p in (payload(operation='next', scope=scope(source_commit=OTHER_SOURCE_COMMIT)),
+        for p in (payload(operation='next', scope=scope(source_commit='source-b')),
                   payload(operation='other', task='missing-task')):
             with self.subTest(task=p['task']), self.assertRaises(ValueError): store.record(p)
         with self.assertRaisesRegex(ValueError, 'matching lifecycle scope'):

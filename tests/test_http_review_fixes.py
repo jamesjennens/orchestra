@@ -872,16 +872,6 @@ class HttpNewReviewOperationsCase(EndpointCase):
             ('resolve-item', {'contribution': cid, 'request': rid, 'item': 'fix',
                               'reason': 'Handled'}),
             ('decline-review', {'contribution': cid, 'request': rid, 'reason': 'Out'}),
-            # kittrial-5bb.10: the verifier attestation and the integration hold reach the
-            # canonical writer over HTTP too, with their optional observation values.
-            ('attest', {'contribution': cid, 'verdict': 'verified', 'commit': 'a' * 40,
-                        'base_commit': 'b' * 40, 'method': 'bundle sha256',
-                        'reason': 'Matched', 'sha256': 'c' * 64, 'bytes': 4096}),
-            ('attest', {'contribution': cid, 'verdict': 'unknown', 'commit': 'a' * 40,
-                        'base_commit': 'b' * 40, 'method': 'ls-remote',
-                        'reason': 'remote unreachable'}),
-            ('hold', {'contribution': cid, 'reason': 'Not release-ready'}),
-            ('release-hold', {'contribution': cid, 'hold': rid, 'reason': 'Cleared'}),
         ]
         for operation, extra in cases:
             with self.subTest(operation=operation):
