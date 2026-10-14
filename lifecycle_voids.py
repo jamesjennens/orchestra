@@ -902,6 +902,7 @@ def audit(rows, operators=None, owners=None, limit=50, offset=0):
     """
     import lifecycle
     import review_workflow as reviews
+    import web_lifecycle_marks as marks
     if type(limit) is not int or not 1 <= limit <= 100 or type(offset) is not int or offset < 0:
         raise ValueError('Lifecycle audit needs limit 1..100 and nonnegative offset')
     correction=(rows.lifecycle_corrections if isinstance(rows,Snapshot) else
@@ -927,6 +928,7 @@ def audit(rows, operators=None, owners=None, limit=50, offset=0):
         if not loaded_owners:
             loaded_owners.append(reviews.owner_map(owners))
         return loaded_owners[0]
+    native_by_id = {row.get('id'): row for row in native_events if isinstance(row, dict)}
     for index,event in enumerate(ordered):
         issue = issues.get(event['task'], {})
         payload = event['payload']
@@ -939,6 +941,7 @@ def audit(rows, operators=None, owners=None, limit=50, offset=0):
             operator = reviews.listed_operator_actor(recorder, operators, once_owners)
         except (ValueError, OSError):
             operator = None
+        marked = marks.snapshot_eligible(rows, native_by_id.get(event['id']), operators=[])
         if payload is not None and stamp is not None:
             preceding = []
             ambiguous = False
@@ -983,12 +986,15 @@ def audit(rows, operators=None, owners=None, limit=50, offset=0):
                     independent_approval_at_recording=approval,
                     approval_basis='native-authors-and-approval-assignee-snapshot',
                     historical_principal_ownership_verified=False)
+        if marked:
+            item['recorder_has_web_coordinate_mark'] = True
+            item['recorder_eligible'] = True
         if reason:
             item['classification_reason'] = reason
         if event.get('void_reason'):
             item['lifecycle_reason'] = event['void_reason']
         item['questionable'] = bool(reason or event.get('void_reason') or
-            (not item['recorder_is_current_assignee'] and operator is not True) or
+            (not item['recorder_is_current_assignee'] and operator is not True and not marked) or
             (event['dimension'] in ('reviewed', 'integrated') and approval is not True))
         questionable_total+=item['questionable']
         unclassifiable_total+=bool(item.get('classification_reason'))

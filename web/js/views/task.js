@@ -1,6 +1,7 @@
 import { h, time, confirmDialog, shortSha, toast } from '../dom.js';
 import { pageHead, reviewChip, statusChip, priority, empty, field, setFieldError, formValues, act, lifecycleStrip, describe, errorState } from '../ui.js';
 import { canWrite, canApprove, isOwner } from './project.js';
+import { lifecyclePanel } from './lifecycle.js';
 
 const ACTIONS = {
   'task-created': ['Created the task', ''], 'task-claimed': ['Claimed the task', 'accent'], 'task-updated': ['Edited the task', ''],
@@ -59,7 +60,9 @@ export async function detail(ctx, { pid, tid }) {
     h('strong', null, 'Next: '), next.text,
     next.who === 'owner' ? h('span', { class: 'muted' }, owner ? (isOwner(project) ? ' — that’s you (project owner).' : ' — that’s you (coordinator).') : ' — waiting on a project owner or coordinator.') :
     next.who === 'assignee' ? h('span', { class: 'muted' }, mine ? ' — that’s you.' : ` — waiting on ${t.assignee_name || 'the assignee'}.`) :
-    h('span', { class: 'muted' }, writer ? ' — any contributor can claim it.' : '')) : null;
+    h('span', { class: 'muted' }, writer ? ' — any contributor can claim it.' : ''),
+    ctx.api.lifecycle && ['approved', 'awaiting-integration'].includes(t.review_state)
+      ? h('a', { href: '#lifecycle-facts' }, ' Record integration evidence') : null) : null;
 
   // ---- brief -------------------------------------------------------------------
   const cp = brief.checkpoint;
@@ -189,6 +192,7 @@ export async function detail(ctx, { pid, tid }) {
     pageHead({ crumbs: [{ label: 'Projects', href: ctx.href('/projects') }, { label: project.name, href: ctx.href('/p/' + pid) }, { label: t.id }], title: t.title, actions }),
     h('div', { class: 'toolbar' }, statusChip(t.status), reviewChip(review.state), priority(t.priority)),
     lifecycleStrip(brief.lifecycle),
+    lifecyclePanel(ctx, project, t),
     nextBanner,
     h('div', { class: 'detail' }, h('div', { class: 'stack' }, editPanel, briefPanel, reviewPanel, historyPanel), side));
 }

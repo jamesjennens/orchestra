@@ -575,7 +575,7 @@ def reserved_actors(root,path,rows=False,own=()):
 #: ``host-coordination`` and ``host-projects`` are reads for the web interface (kittrial-5bb.198,
 #: host_reads.py): the operator list, the project's session names and the runtime's projects,
 #: which a bound key is not told.
-SERVICE_ONLY_ACTIONS=('create-project','project-creations','creation-standing','web-merge-slot',
+SERVICE_ONLY_ACTIONS=('create-project','project-creations','creation-standing','web-merge-slot','web-lifecycle',
                       'host-coordination','host-projects')
 
 def key_project_refusal(request,key_projects):
@@ -796,7 +796,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             raise ValueError('%s is available only to the web service'%answered)
     # Slot requests bind the block before project, tracker, or authority reads.
     # The shared table is the sole endpoint action/operation capability mapping.
-    if request.get('action') in ('coordinate','web-merge-slot'):
+    if request.get('action') in ('coordinate','web-merge-slot','web-lifecycle'):
         denied=block_mismatch_denial(request,authority_config)
         if denied is not None:return denied
     # Two actions exist only for the web service and name no existing project
@@ -1436,6 +1436,87 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             return guarded_write(root,request,journal_path(path),briefing_effect,
                                authority_config=authority_config,
                                require_authority=require_authority,runner=runner)
+    if action=='web-lifecycle':
+        from http_authority import (CAP_READ, CAP_COORDINATE, AuthorityDenied,
+                                    actor_parties, decide, file_lock, read_state)
+        from admin import web_lifecycle_mark_writes
+        import web_lifecycle
+        args=request.get('args',[])
+        run_warnings=[]
+        def lifecycle_run(argv):
+            stdout,warnings=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
+            if warnings:run_warnings.append(warnings)
+            return stdout
+        runner=NativeRunner(lifecycle_run,project=path)
+        denied_status=[]
+        try:
+            if not isinstance(args,list) or len(args)!=1 or not isinstance(args[0],str):
+                raise web_lifecycle.LifecycleError(422,'Expected one lifecycle JSON payload')
+            body=record_json.loads(args[0])
+            operation,payload=web_lifecycle.validate(body,actor,request.get('operation_id'))
+            capability=required_capability(request)
+            if capability is None:
+                raise web_lifecycle.LifecycleError(403,'This lifecycle operation has no endpoint capability binding')
+            def lifecycle_authority():
+                if not verified_web_authority(request,authority_config,capability,name):
+                    denied_status.append(403)
+                    raise web_lifecycle.LifecycleError(403,'Verified web authority required in this project')
+                return True
+            def lifecycle_identity():
+                lifecycle_authority()
+                if payload and payload['dimension'] in ('reviewed','integrated'):
+                    from lifecycle import read_event_rows, require_unheld_fact
+                    rows=read_event_rows(runner)
+                    issue=next((row for row in rows if row.get('id')==body['task']),None)
+                    try:require_unheld_fact(issue,payload['dimension'],body['task'])
+                    except ValueError as error:
+                        denied_status.append(409)
+                        raise web_lifecycle.LifecycleError(409,str(error)) from None
+            def lifecycle_parties(label):
+                # Same full party policy as HTTP approval, from the configured
+                # store under its held lock. No descriptor supplies this state.
+                return actor_parties(read_state(authority_config.store),label,name)
+            def lifecycle_effect():
+                strict=operation=='read' or (payload and payload['dimension'] in ('reviewed','integrated'))
+                operators=configured_operators(root) if strict else None
+                owners=owner_loader(path,'web lifecycle approval') if strict else None
+                try:
+                    enabled=web_lifecycle_mark_writes(root) if (operation=='read' or
+                              (payload['dimension']=='integrated' and payload['value']=='passed')) else False
+                except ValueError as error:
+                    raise web_lifecycle.LifecycleError(503,str(error)) from None
+                if operation=='read':
+                    descriptor=dict(request['authority'],capability=CAP_COORDINATE)
+                    try:
+                        decide(read_state(authority_config.store),descriptor)
+                        coordinate=True
+                    except AuthorityDenied:
+                        coordinate=False
+                    result=web_lifecycle.read(body['task'],actor,runner,path,coordinate=coordinate,
+                                              mark_writes=enabled,operators=operators,owners=owners,
+                                              parties=lifecycle_parties)
+                else:
+                    result=web_lifecycle.apply(body,actor,runner,path,name,request['operation_id'],
+                                               authority=lifecycle_authority,parties=lifecycle_parties,
+                                               mark_writes=enabled,operators=operators,owners=owners)
+                return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n',
+                        'stderr':warning_text(run_warnings)}
+            with (path/'.coordination.lock').open('a') as lock:
+                fcntl.flock(lock,fcntl.LOCK_EX)
+                if operation=='read':
+                    if authority_config is None:
+                        raise web_lifecycle.LifecycleError(403,'Configured web authority required for lifecycle reads')
+                    with file_lock(authority_config.lock):
+                        lifecycle_authority()
+                        return lifecycle_effect()
+                answer=guarded_write(root,request,journal_path(path),lifecycle_effect,
+                                     authority_config=authority_config,require_authority=True,
+                                     runner=runner,identity_check=lifecycle_identity)
+                if denied_status and answer.get('returncode')==2:
+                    answer['lifecycle_status']=denied_status[-1]
+                return answer
+        except web_lifecycle.LifecycleError as error:
+            return {'returncode':2,'stdout':'','stderr':str(error)+'\n','lifecycle_status':error.status}
     if action=='web-merge-slot':
         from http_authority import CAP_READ, CAP_COORDINATE, file_lock
         from web_merge_slot import SlotError, validate as slot_validate, apply as slot_apply
@@ -1460,6 +1541,19 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                         or (operation in ('create','force-release') and descriptor.get('via')!='session')):
                     denied_status.append(403)
                     raise SlotError(403,'Verified web authority required for this merge-slot operation in this project')
+            def slot_identity():
+                slot_authority()
+                if operation=='acquire':
+                    from lifecycle import read_event_rows
+                    from coordination import require_unheld_merge_task
+                    rows=read_event_rows(runner)
+                    issue=next((row for row in rows if row.get('id')==payload['task']),None)
+                    try:
+                        require_unheld_merge_task(issue,payload['task'],
+                            configured_operators(root) if rules['independent_approval'] else None,path)
+                    except CoordinatorRuleRefusal:
+                        denied_status.append(409)
+                        raise
             rules=configured_coordinator_rules(root,warnings=run_warnings)
             def slot_effect():
                 result=slot_apply(payload,actor,runner,path,request.get('operation_id'),
@@ -1480,8 +1574,8 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                     raise SlotError(422,'A stable operation identity is required for a merge-slot write')
                 answer=guarded_write(root,request,journal_path(path),slot_effect,
                                      authority_config=authority_config,require_authority=True,
-                                     runner=runner,identity_check=slot_authority)
-                if denied_status and answer.get('returncode')==2:answer['merge_slot_status']=403
+                                     runner=runner,identity_check=slot_identity)
+                if denied_status and answer.get('returncode')==2:answer['merge_slot_status']=denied_status[-1]
                 return answer
         except CoordinatorRuleRefusal as error:
             # Preserve the slot's conflict status and identify the native rule refusal.

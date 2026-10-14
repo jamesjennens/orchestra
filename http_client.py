@@ -43,6 +43,47 @@ import ssl
 import sys
 from urllib.parse import quote, urlencode, urlsplit
 
+
+def _lifecycle_body_file(path):
+    """Bound caller text before decoding, while keeping the copied client standalone."""
+    with open(path, 'rb') as stream:
+        raw = stream.read(1024 * 1024 + 1)
+    if len(raw) > 1024 * 1024:
+        raise ValueError('Lifecycle request file exceeds 1 MiB')
+    text = raw.decode('utf-8-sig')
+    depth = 0
+    quoted = escaped = False
+    for char in text:
+        if quoted:
+            if escaped:
+                escaped = False
+            elif char == '\\':
+                escaped = True
+            elif char == '"':
+                quoted = False
+        elif char == '"':
+            quoted = True
+        elif char in '[{':
+            depth += 1
+            if depth > 64:
+                raise ValueError('JSON nested too deeply (more than 64 levels)')
+        elif char in ']}':
+            depth -= 1
+    def fields(pairs):
+        body = {}
+        for name, value in pairs:
+            if name in body:
+                raise ValueError('Duplicate lifecycle request field: ' + name)
+            body[name] = value
+        return body
+    try:
+        body = json.loads(text, object_pairs_hook=fields)
+    except RecursionError:
+        raise ValueError('JSON nested too deeply (more than 64 levels)') from None
+    if not isinstance(body, dict):
+        raise ValueError('The lifecycle request body must be a JSON object')
+    return body
+
 MUTATING = ('POST', 'PUT', 'PATCH', 'DELETE')
 LOOPBACK = ('127.0.0.1', '::1', 'localhost')
 
@@ -227,6 +268,33 @@ class Client:
 
     def merge_slot(self, project):
         return self.request('GET', '/v1/projects/%s/merge-slot' % quote(project, safe=''))
+
+    def lifecycle(self, project, task):
+        return self.request('GET', '/v1/projects/%s/tasks/%s/lifecycle'
+                            % (quote(project, safe=''), quote(task, safe='')))
+
+    def _write_lifecycle(self, project, task, operation, body, key=None, dimension=None):
+        identity = key or new_idempotency_key()
+        suffix = 'scope' if operation == 'scope' else 'facts/' + quote(dimension, safe='')
+        path = '/v1/projects/%s/tasks/%s/lifecycle/%s' % (quote(project, safe=''), quote(task, safe=''), suffix)
+        try:
+            return self.request('POST', path, body, key=identity)
+        except OSError:
+            raise UncertainOutcome(0, 'uncertain', 'Connection lost; reconcile the identical lifecycle request',
+                                   None, None, identity) from None
+
+    def set_lifecycle_scope(self, project, task, scope, expected_scope_token, evidence,
+                            provenance='performed', note=None, key=None):
+        body = dict(scope=scope, expected_scope_token=expected_scope_token, evidence=evidence, provenance=provenance)
+        if note is not None:body['note'] = note
+        return self._write_lifecycle(project, task, 'scope', body, key)
+
+    def record_lifecycle_fact(self, project, task, dimension, value, scope, evidence,
+                              provenance='performed', note=None, trigger=None, key=None):
+        body = dict(scope=scope, value=value, evidence=evidence, provenance=provenance)
+        if note is not None:body['note'] = note
+        if trigger is not None:body['trigger'] = trigger
+        return self._write_lifecycle(project, task, 'fact', body, key, dimension)
 
     def _write_merge_slot(self, project, operation, body, key):
         identity = key or new_idempotency_key()
@@ -420,6 +488,12 @@ def _build_parser():
     slot.add_argument('--expected-holder')
     slot.add_argument('--reason')
     slot.add_argument('--idempotency-key', help='reuse exactly this key and request after an uncertain result')
+    life = sub.add_parser('lifecycle', help='read or record task scope and lifecycle facts')
+    life.add_argument('project');life.add_argument('task')
+    life.add_argument('operation', choices=('read','scope','fact'))
+    life.add_argument('--dimension', choices=('implemented','tested','reviewed','integrated','deployed','live-verified'))
+    life.add_argument('--file', help='UTF-8 JSON HTTP request body for scope or fact')
+    life.add_argument('--idempotency-key', help='reuse exactly this key and body after an uncertain result')
     call = sub.add_parser('call', help='issue one raw JSON request')
     call.add_argument('method')
     call.add_argument('path')
@@ -466,6 +540,15 @@ def main(argv=None):
                 result = client.force_release_merge_slot(args.project, args.expected_holder, args.reason, args.idempotency_key)
             print(json.dumps(result, indent=2))
             return 0
+        if args.command == 'lifecycle':
+            if args.operation == 'read':result = client.lifecycle(args.project, args.task)
+            else:
+                if not args.file:parser.error('scope and fact require --file')
+                if args.operation == 'fact' and not args.dimension:parser.error('fact requires --dimension')
+                body = _lifecycle_body_file(args.file)
+                result = client._write_lifecycle(args.project, args.task, args.operation, body,
+                                                 args.idempotency_key, args.dimension)
+            print(json.dumps(result, indent=2));return 0
         if args.credential:
             client.use_credential(args.credential)
         body = json.loads(args.body) if args.body else None

@@ -417,7 +417,7 @@ class FollowOnChainTests(unittest.TestCase):
             self.send(self.contribution(COMMIT_2, base=COMMIT_3, supersedes=None, follows=first))
         self.assertEqual(str(refused.exception),
                          'Contribution base_commit must be the prior integration commit %s, or an integration commit '
-                         'this project recorded after it (a passed integrated fact on any task, recorded by a listed operator, not reverted); none is '
+                         'this project recorded after it (a passed integrated fact on any task, recorded by a listed operator or carrying a valid host-issued web coordinate mark, not reverted); none is '
                          'recorded yet. %s is not accepted: this project has no passed integrated fact that names it '
                          'as an integration commit' % (MERGE_1, COMMIT_3))
         self.assertEqual(len(self.issue['comments']), before)
@@ -1481,7 +1481,7 @@ class LaterBaseTests(FollowOnChainTests):
         self.integrate('task-2', COMMIT_3, MERGE_2, '2026-09-17T08:30:00Z')
         self.assertEqual(self.refusal(first, COMMIT_3),
                          'Contribution base_commit must be the prior integration commit %s, or an integration commit '
-                         'this project recorded after it (a passed integrated fact on any task, recorded by a listed operator, not reverted); the '
+                         'this project recorded after it (a passed integrated fact on any task, recorded by a listed operator or carrying a valid host-issued web coordinate mark, not reverted); the '
                          'newest such commit is %s. %s is not accepted: this project has no passed integrated fact '
                          'that names it as an integration commit' % (MERGE_1, MERGE_2, COMMIT_3))
 
@@ -1645,7 +1645,7 @@ class OperatorRecordedBaseTests(LaterBaseTests):
         self.integrate('task-2', COMMIT_3, MERGE_2, '2026-09-17T08:30:00Z', actor='old-coordinator')
         said = self.refusal(first, MERGE_2)
         self.assertTrue(said.endswith(self.unlisted_sentence('"old-coordinator"')), said)
-        self.assertIn('recorded by a listed operator, not reverted); none is recorded yet. ', said)
+        self.assertIn('recorded by a listed operator or carrying a valid host-issued web coordinate mark, not reverted); none is recorded yet. ', said)
         # 3. A later base recorded by a listed operator: accepted.
         self.other('task-3')
         self.integrate('task-3', '7' * 40, '8' * 40, '2026-09-18T08:30:00Z')

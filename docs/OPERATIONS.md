@@ -280,6 +280,30 @@ Never use an older kit to back up or restore a project with this family, or assu
 its lifecycle report reflects the correction. Upgrade to a restore-capable kit to
 recover the retained complete generation.
 
+
+### Web integration marks: restore and rollback
+
+`restore-new SRC DST` requires an unused destination with a DIFFERENT project
+name. Web integration marks retain their source name. The command preserves
+these files as evidence and prints a loud warning: **marked eligibility does
+not survive this restore**. Successful data restore (rc 0) is not preserved
+mark authority. Lifecycle audit reports the formerly marked integrations as
+questionable in DST; they cannot qualify later contribution bases through mark
+authority. Retain the complete source backup and have an installation operator
+reconcile eligibility before continuing integrations. Re-granting web access
+does not rebind historical marks. A marks-free legacy backup restores no marks;
+absence in that backup does not establish absence in its source.
+
+**Rollback:** never use an older kit to back up or restore a project holding web
+integration marks. Its backup can return rc 0 while omitting the family and
+replacing the complete newer sidecar; its restore refuses a sidecar containing
+the new paths. Before downgrade, stop writers, take a complete backup with the
+mark-capable kit (native state, coordination sidecar and operation journal),
+and retain an immutable copy OUTSIDE the older kit's normal backup destination,
+with the capable kit and restore procedure. Older readers ignore marks, so they
+cannot recognize marked integrations as acceptable later bases. Perform recovery
+with the mark-capable kit and honor the renamed-destination warning above.
+
 ## Install on Linux
 
 Use an ordinary service account with a writable home, Python 3.10+, user systemd, and HTTPS access to GitHub release assets. Copy this kit to `/home/beads/beads-team-kit` in this example. Each deployment needs its own root, port and service name. Installation refuses unmanaged binaries or an existing service with the same name.

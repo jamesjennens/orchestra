@@ -861,6 +861,10 @@ def lifecycle_authors_command(root,project,limit=None):
     report=lifecycle.lifecycle_authors_report(rows,operators(root),owners=owners,limit=limit)
     report['project']=project
     report['setting']={'lifecycle_authors':coordinator_rule(root,'lifecycle_authors')}
+    report['preview_scope']='host-lifecycle-authors-only'
+    report['preview_note']=('allowed and would_be_refused preview only the host lifecycle_authors rule. '
+                            'They do not judge live web coordinate authority or historical web integration marks; '
+                            'use lifecycle-audit for recorded mark eligibility. The web route does not apply this host rule.')
     return report
 
 
@@ -903,6 +907,60 @@ def lifecycle_void_generation_command(root, project):
 LIFECYCLE_VOID_WRITES_KEY = 'lifecycle_void_writes'
 LIFECYCLE_VOID_AUDIT_KEY = 'lifecycle_void_writes_audit'
 LIFECYCLE_VOID_AUDIT_MAX = 20
+
+
+def web_lifecycle_mark_writes(root):
+    """Separate installation-only gate; no upgrade or VOID switch enables it."""
+    value = config(root).get('web_lifecycle_mark_writes', False)
+    if type(value) is not bool:
+        raise ValueError('web_lifecycle_mark_writes must be true or false; operator repairs the setting')
+    return value
+
+
+def web_lifecycle_mark_switch(root, action, actor):
+    """Operator-only audited gate, independent of the three rules and VOID gate."""
+    from recovery import identity
+    from review_workflow import _recorded_at
+    identity(actor, 'Invalid actor identity')
+    if action not in ('status', 'on', 'off'):
+        raise ValueError('Invalid web_lifecycle_mark_writes action')
+    if not (root / 'deployment.private.json').is_file():
+        raise ValueError('Deployment is not installed; run install first')
+    key = 'web_lifecycle_mark_writes'
+    audit_key = key + '_audit'
+    with deployment_config_lock(root):
+        if actor not in operators(root, strict=True):
+            raise ValueError('web_lifecycle_mark_writes requires a listed deployment operator')
+        cfg = config(root)
+        entries = cfg.get(audit_key, [])
+        if not isinstance(entries, list) or len(entries) > 20:
+            raise ValueError('Web lifecycle mark switch audit needs operator reconciliation')
+        for entry in entries:
+            if (not isinstance(entry, dict) or set(entry) != {'at', 'actor', 'previous', 'enabled'}
+                    or type(entry['previous']) is not bool or type(entry['enabled']) is not bool
+                    or _recorded_at(entry['at']) is None):
+                raise ValueError('Web lifecycle mark switch audit needs operator reconciliation')
+            identity(entry['actor'], 'Invalid web lifecycle mark switch audit actor')
+        raw = cfg.get(key, False)
+        damaged = type(raw) is not bool
+        current = raw if not damaged else None
+        if action == 'on' and damaged:
+            raise ValueError('Repair web_lifecycle_mark_writes with off before enabling it')
+        changed = action != 'status' and (damaged or current != (action == 'on'))
+        if changed:
+            if damaged:cfg[key + '_damaged_' + utc_stamp()] = raw
+            entries = (entries + [dict(at=utc_stamp(), actor=actor,
+                                      previous=raw if not damaged else False, enabled=action == 'on')])[-20:]
+            cfg[key] = action == 'on'
+            cfg[audit_key] = entries
+            atomic_private_write(root / 'deployment.private.json', json.dumps(cfg))
+            current = action == 'on'
+        last = entries[-1] if entries else None
+        return dict(web_lifecycle_mark_writes=current, changed=changed, audit_history=entries,
+                    audit_records=len(entries),
+                    audit_agrees=last['enabled'] == current if last and current is not None else None,
+                    enable_requirement='Install the mark reader and complete backup/restore support on every installation '
+                                       'before enabling writes. Older kits ignore marks; take a new-kit backup before downgrade.')
 
 
 def lifecycle_void_writes(root):
@@ -4057,8 +4115,8 @@ def validate_coordination_files(files):
     if not isinstance(files,dict):raise ValueError('Invalid coordination files map')
     for name,record in files.items():
         quarantine = isinstance(name,str) and re.fullmatch(r'\.feedback\.jsonl\.(?:[a-f0-9]{16}|[a-f0-9]{64})\.incomplete',name)
-        journal = isinstance(name,str) and re.fullmatch(r'(?:\.coordination-requests|\.handoffs|\.handoff-requests|\.handoff-recoveries|\.requirement-requests|\.requirement-owner-requests|\.requirement-backfills|\.integration-reverts|\.lifecycle-voids|\.reference-requests|\.proposal-requests|\.capability-requests|\.open-item-requests|\.owner-answers)/[a-f0-9]{64}\.json',name)
-        if name not in ('.merge-context.json','ONBOARDING.md','GUIDANCE.md','.guidance.json','.guidance-clear.json','.sessions.json','.feedback.jsonl','.requirements-governance.json','.requirements-governance-source.json','.lifecycle-voids-manifest.json','.lifecycle-void-abandons.json') and not quarantine and not journal:raise ValueError('Invalid coordination backup path')
+        journal = isinstance(name,str) and re.fullmatch(r'(?:\.coordination-requests|\.handoffs|\.handoff-requests|\.handoff-recoveries|\.requirement-requests|\.requirement-owner-requests|\.requirement-backfills|\.integration-reverts|\.lifecycle-voids|\.web-lifecycle-marks|\.reference-requests|\.proposal-requests|\.capability-requests|\.open-item-requests|\.owner-answers)/[a-f0-9]{64}\.json',name)
+        if name not in ('.merge-context.json','ONBOARDING.md','GUIDANCE.md','.guidance.json','.guidance-clear.json','.sessions.json','.feedback.jsonl','.requirements-governance.json','.requirements-governance-source.json','.lifecycle-voids-manifest.json','.web-lifecycle-marks-manifest.json','.lifecycle-void-abandons.json') and not quarantine and not journal:raise ValueError('Invalid coordination backup path')
         if not isinstance(record,dict):raise ValueError('Invalid coordination record')
         if name=='.sessions.json':
             from sessions import validate
@@ -4121,6 +4179,8 @@ def validate_coordination_files(files):
     validate_governance_files(files)
     from lifecycle_voids import validate_backup as validate_void_backup
     validate_void_backup(files)
+    from web_lifecycle_marks import validate_backup as validate_mark_backup
+    validate_mark_backup(files)
     # The guidance text and its audit record are one generation: a backup that
     # carries the text but not the matching record (or a record whose version is not
     # the hash of the text) is refused rather than restored as a mismatched pair
@@ -4518,10 +4578,14 @@ def guidance_backup_pair(path):
     return {'GUIDANCE.md': {'text': guidance_text}, GUIDANCE_META: guidance_meta}, None
 
 def backup_lifecycle_void_family(root,name):
-    """Check the native/host pair even when an older kit omitted the whole family."""
+    """One native generation for both host lifecycle families, under project lock."""
     from lifecycle_voids import backup_files
+    from web_lifecycle_marks import backup_files as mark_backup_files
     rows=record_json.loads_rows(run_bd(root,name,['export','--all']))
-    return backup_files(project_dir(root,name),rows)
+    path=project_dir(root,name)
+    files=backup_files(path,rows)
+    files.update(mark_backup_files(path,rows))
+    return files
 
 
 def backup_project(root,name):
@@ -6197,6 +6261,21 @@ def restore_lifecycle_void_family(root,destination,files):
         return voids.restore_files(path,files,native_rows)
 
 
+def restore_web_lifecycle_mark_family(root,destination,files):
+    import web_lifecycle_marks as marks
+    path=project_dir(root,destination)
+    if (marks.MANIFEST not in files and not any(name.startswith(marks.DIRECTORY+'/') for name in files)
+            and not os.path.lexists(path/marks.DIRECTORY) and not os.path.lexists(path/marks.RESTORE_MARKER)):
+        return False              # legacy absent family: no extra read, no invented mark
+    import fcntl
+    if (path/'.coordination.lock').is_symlink():
+        raise ValueError('Coordination restore lock must not be a symlink')
+    with (path/'.coordination.lock').open('a') as lock:
+        fcntl.flock(lock,fcntl.LOCK_EX)
+        native_rows=record_json.loads_rows(run_bd(root,destination,['export','--all']))
+        return marks.restore_files(path,files,native_rows)
+
+
 def restore_coordination(root,source,destination,restore_operators=False,restore_verifiers=False,authority=True,
                          actor=None,reason=None):
     from coordination import atomic
@@ -6204,6 +6283,7 @@ def restore_coordination(root,source,destination,restore_operators=False,restore
     files=coordination_backup(root,source)
     if files is None:
         restore_lifecycle_void_family(root,destination,{})
+        restore_web_lifecycle_mark_family(root,destination,{})
         print('Legacy backup has no coordination journal. Reconcile outstanding child requests and merge ownership before accepting writes.')
         return False
     from requirement_governance import restored_files as restored_governance_files
@@ -6219,6 +6299,8 @@ def restore_coordination(root,source,destination,restore_operators=False,restore
     report_native_backup_change(root,source)
     from lifecycle_voids import validate_backup as validate_void_backup
     validate_void_backup(files)
+    from web_lifecycle_marks import validate_backup as validate_mark_backup
+    validate_mark_backup(files)
     for name in files:
         target=path/name
         if target.is_symlink() or target.parent.is_symlink() or target.with_suffix('.tmp').is_symlink():raise ValueError('Coordination restore paths must not be symlinks')
@@ -6264,8 +6346,10 @@ def restore_coordination(root,source,destination,restore_operators=False,restore
     # retried; it cannot expose an older passing event between member writes.
     import lifecycle_voids as voids
     restore_lifecycle_void_family(root,destination,files)
+    import web_lifecycle_marks as marks
+    restore_web_lifecycle_mark_family(root,destination,files)
     for name,record in files.items():
-        if name==voids.MANIFEST or name.startswith(voids.DIRECTORY+'/') or name==voids.ABANDON_FILE:
+        if name in (voids.MANIFEST,marks.MANIFEST,voids.ABANDON_FILE) or name.startswith((voids.DIRECTORY+'/',marks.DIRECTORY+'/')):
             continue
         target=project_dir(root,destination)/name
         target.parent.mkdir(exist_ok=True)
@@ -9530,6 +9614,9 @@ def main():
     a=sub.add_parser('lifecycle_void_writes',help='read or flip the audited installation VOID writer gate (OFF by default)')
     a.add_argument('action',choices=['status','on','off'])
     a.add_argument('--actor',required=True)
+    a=sub.add_parser('web_lifecycle_mark_writes',help='read or flip the separate audited web integration mark gate (OFF by default)')
+    a.add_argument('action',choices=['status','on','off'])
+    a.add_argument('--actor',required=True)
     for command, target in (('lifecycle-event-void','event'), ('lifecycle-event-retract','void_operation')):
         a=sub.add_parser(command,help='host-only lifecycle correction; native facts remain unchanged',allow_abbrev=False)
         a.add_argument('project');a.add_argument(target)
@@ -10388,6 +10475,8 @@ def main():
         print(json.dumps(lifecycle_void_generation_command(root,args.project)))
     elif args.command=='lifecycle_void_writes':
         print(json.dumps(lifecycle_void_switch(root,args.action,args.actor)))
+    elif args.command=='web_lifecycle_mark_writes':
+        print(json.dumps(web_lifecycle_mark_switch(root,args.action,args.actor)))
     elif args.command in ('lifecycle-event-void','lifecycle-event-retract'):
         operation='void' if args.command=='lifecycle-event-void' else 'retract'
         target=args.event if operation=='void' else args.void_operation
@@ -10703,6 +10792,7 @@ def finish_restore(root,args,snapshot,step=None):
         # An explicit omission of coordination still cannot silently revive
         # native facts whose correction evidence the command can see.
         restore_lifecycle_void_family(root,args.destination,{})
+        restore_web_lifecycle_mark_family(root,args.destination,{})
         sidecar=False
     else:
         sidecar=restore_coordination(root,args.project,args.destination,authority=False)
@@ -10710,6 +10800,18 @@ def finish_restore(root,args,snapshot,step=None):
     # the merge-slot step below fails, so the notice must say what was not compared and not
     # re-granted, and it can only say that knowing this (kittrial-5bb.240 F1).
     args.sidecar_restored=sidecar
+    import web_lifecycle_marks as marks
+    mark_family=marks.read_journal(project_dir(root,args.destination))
+    if mark_family['entries']:
+        print('WARNING: restored web integration marks retain their original project binding. '
+              'restore-new requires a different project name: these marks DO NOT confer marked '
+              'integration eligibility in this destination. Historical marked integrations are '
+              'questionable here and cannot qualify later contribution bases on mark authority. '
+              'Preserve the complete original backup and ask an installation operator to reconcile '
+              'eligibility before continuing integrations.',file=sys.stderr)
+    else:
+        print('This backup restored no web integration mark family: no marked eligibility was restored. '
+              'An older kit may omit this family; absence here does not prove it was absent at the source.')
     restored=restore_journal(snapshot,
                              project_dir(root,args.destination)/JOURNAL_STORE_NAME)
     args.journal_restored=restored is not None
