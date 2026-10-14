@@ -1032,15 +1032,20 @@ def lifecycle_abandon_command(root, project, comment_id, actor, reason, evidence
     The operator names the native correction comment the audit lists as
     incomplete; the kit reads that comment's retained payload for the exact
     binding and abandoned operation id, so the reason, evidence and key do not
-    have to be reproduced. Nothing native is written or deleted, the abandoned
-    comment stays in place and the audit lists it as ``abandoned``. A comment
-    that already has a host entry is refused (an issued void is never abandoned).
-    The record is written to the abandonment store BESIDE the family, so a family
-    that holds an abandonment stays readable by the released F0 kit. Before the
-    write the command prints the rule that an abandonment also closes a void whose
-    entry was LOST, so the operator rules that out first (kittrial-5bb.271 item 3).
-    An abandonment is final: apply() refuses the exact retry of the abandoned
-    operation, and a fresh void under a new key is the way to void the event.
+    have to be reproduced. kittrial-5bb.274 item 1: the abandonment writes its OWN
+    native comment through the same guarded native write as a void (the proof, by
+    the abandoning actor) and then the host record BESIDE the family, so a family
+    that holds an abandonment stays readable by the released F0 kit. The abandoned
+    comment itself is never changed or deleted and the audit lists it as
+    ``abandoned``. Any listed operator or its bound actor may abandon; the author
+    of the cut need not still be listed, because the proof is the abandonment's own
+    comment. A comment that already has a host entry is refused (an issued void is
+    never abandoned). Before the write the command prints the rule that an
+    abandonment also closes a void whose entry was LOST, so the operator rules that
+    out first (kittrial-5bb.271 item 3). An abandonment is final: apply() refuses
+    the exact retry of the abandoned operation, and a fresh void under a new key is
+    the way to void the event - unless an older kit already re-opened it on a
+    rollback, where the void in effect wins and the abandonment reads superseded.
     """
     import fcntl
     import lifecycle_voids as voids
@@ -1082,8 +1087,8 @@ def lifecycle_abandon_command(root, project, comment_id, actor, reason, evidence
         # so the command's stdout stays exactly one JSON document (also when the
         # abandonment is then refused).
         print(voids.ABANDON_LOST_ENTRY_RULE, file=sys.stderr)
-        return voids.abandon(rows, actor, payload, path, authority, owners, enabled,
-                             comment_id=comment_id, recorded_at=utc_stamp())
+        return voids.abandon(rows, actor, payload, run, path, authority, owners, enabled,
+                             comment_id=comment_id)
 
 
 #: The key of the installation setting that accepts bound keys only, and the key of its short

@@ -123,7 +123,12 @@ class ReleasedKitTests(unittest.TestCase):
         return json.dumps(comment)
 
     def abandoned_project(self):
-        """A project with an issued void, a cut retraction and the abandonment of it."""
+        """A project with an issued void, a cut retraction and the abandonment of it.
+
+        kittrial-5bb.274 item 1: the abandonment writes its OWN native comment, so
+        two native correction comments exist (the cut and the abandonment) beside
+        the void. Returns ``(cut_comment, abandon_answer)``.
+        """
         voids.apply(self.rows, 'op', self.payload(), self.native_run, self.project,
                     operators=['op'], enabled=True)
         cut = self.payload('retract', 'retract-cut', 'void-one')
@@ -132,14 +137,14 @@ class ReleasedKitTests(unittest.TestCase):
                 voids.apply(self.rows, 'op', cut, self.native_run, self.project,
                             operators=['op'], enabled=True)
         comment = self.rows[0]['comments'][-1]
-        voids.abandon(self.rows, 'op', dict(schema_version=1, operation='abandon',
-                                            operation_id='abandon-released', actor='op',
-                                            reason='Operator closed the cut.',
-                                            evidence=['synthetic audit'], binding=cut['binding'],
-                                            target_void=cut['operation_id']),
-                      self.project, operators=['op'], enabled=True, comment_id=comment['id'],
-                      recorded_at='2026-10-05T00:00:00Z')
-        return comment
+        answer = voids.abandon(self.rows, 'op', dict(schema_version=1, operation='abandon',
+                                                     operation_id='abandon-released', actor='op',
+                                                     reason='Operator closed the cut.',
+                                                     evidence=['synthetic audit'], binding=cut['binding'],
+                                                     target_void=cut['operation_id']),
+                               self.native_run, self.project, operators=['op'], enabled=True,
+                               comment_id=comment['id'])
+        return comment, answer
 
     def released(self):
         base = resolve_released_f0_kit()
@@ -153,7 +158,7 @@ class ReleasedKitTests(unittest.TestCase):
 
     def test_the_released_reader_reads_a_project_that_holds_an_abandonment(self):
         base = self.released()
-        comment = self.abandoned_project()
+        comment, answer = self.abandoned_project()
         # The family itself is schema-1 void/retract only: no abandon member exists.
         journal = voids.read_journal(self.project)
         self.assertEqual({e['payload']['operation'] for e in journal['entries'].values()}, {'void'})
@@ -169,9 +174,11 @@ class ReleasedKitTests(unittest.TestCase):
         released_state = released.context(self.rows, released_journal)
         self.assertEqual(released_state['global_reason'], None)
         self.assertEqual(released_state['reasons'], {'p-task.2': 'voided'})
-        # The released kit cannot see the abandonment store, so the abandoned
-        # comment is honestly UNPAIRED there (that is the documented rollback limit).
-        self.assertEqual([c['id'] for c in released_state['incomplete']], [comment['id']])
+        # The released kit cannot see the abandonment store, so the abandoned cut
+        # comment AND the abandonment's own native comment are honestly UNPAIRED
+        # there (that is the documented rollback limit).
+        self.assertEqual({c['id'] for c in released_state['incomplete']},
+                         {str(comment['id']), str(answer['comment_id'])})
         with self.assertRaisesRegex(ValueError, 'native correction comments without their host entries'):
             released.backup_files(self.project, self.rows)
         # And running the released kit's own CLI on the export agrees: it never
@@ -220,8 +227,8 @@ class ReleasedKitTests(unittest.TestCase):
                                             reason='Operator closed the cut.',
                                             evidence=['synthetic audit'], binding=cut['binding'],
                                             target_void=cut['operation_id']),
-                      self.project, operators=['op'], enabled=True, comment_id=comment['id'],
-                      recorded_at='2026-10-05T00:00:00Z')
+                      self.native_run, self.project, operators=['op'], enabled=True,
+                      comment_id=comment['id'])
         destination = self.project / 'unused'
         destination.mkdir()
         self.assertEqual(released.restore_files(destination, older, older_rows), True)
@@ -232,10 +239,57 @@ class ReleasedKitTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r'abandoned .*final'):
             voids.apply(self.rows, 'op', cut, self.native_run, self.project,
                         operators=['op'], enabled=True)
-        answer = released.apply(self.rows, 'op', cut, self.native_run, destination,
+        answer = released.apply(self.rows, 'op', cut, self.native_run, self.project,
                                 operators=['op'], enabled=True)
         self.assertEqual((answer['operation'], answer['reconciled']), ('retract', True))
-        self.assertEqual(released.context(self.rows, released.read_journal(destination))['reasons'], {})
+        self.assertEqual(released.context(self.rows, released.read_journal(self.project))['reasons'], {})
+        # kittrial-5bb.274 item 2: COME BACK to this kit. The void in effect wins,
+        # the abandonment reads superseded by that later host entry, the audit is
+        # complete and the backup runs again - a defined, non-damaged reading.
+        state = voids.context(self.rows, voids.read_journal(self.project))
+        self.assertEqual(state['reasons'], {})
+        self.assertEqual(state['incomplete'], [])
+        self.assertEqual(state['abandon_problems'], [])
+        self.assertEqual(state['superseded_abandons'], {'rollback-abandon': 'rollback-cut'})
+        page = voids.audit(voids.snapshot(self.rows, self.project), operators=['op'])
+        self.assertEqual((page['correction_status'], page['damaged_correction_count'],
+                          page['superseded_abandonment_count'], page['incomplete_correction_count']),
+                         ('complete', 0, 1, 0))
+        by_key = {c['operation_id']: c for c in page['corrections']}
+        self.assertEqual(by_key['rollback-abandon']['status'], 'superseded')
+        self.assertEqual(by_key['rollback-abandon']['superseded_by'], 'rollback-cut')
+        self.assertEqual(by_key['rollback-abandon']['target_void'], 'rollback-cut')
+        # The re-opened correction reads in effect as its operation says (here a
+        # retraction); a re-opened void would read 'in-effect'.
+        self.assertEqual(by_key['rollback-cut']['status'], 'retraction')
+        files = voids.backup_files(self.project, self.rows)
+        self.assertIn(voids.ABANDON_FILE, files)
+        # The exact retry now reconciles with the entry already in effect instead
+        # of being refused as abandoned (the void in effect wins).
+        again = voids.apply(self.rows, 'op', cut, self.native_run, self.project,
+                            operators=['op'], enabled=True)
+        self.assertTrue(again['reconciled'])
+        self.assertEqual(self.native_writes, 3)
+        # A HAND-ADDED duplicate of the abandonment has no native abandonment
+        # comment of its own, so it stays damaged: that is the tell-apart.
+        hand = dict(schema_version=1, operation='abandon', operation_id='hand-added',
+                    actor='op', reason='typed into the file', evidence=['none'],
+                    binding=cut['binding'], target_void=cut['operation_id'])
+        entry = dict(schema_version=1, payload=hand, sha256=content_hash(hand),
+                     comment_id=comment['id'], created_at='2026-10-05T00:00:00Z')
+        store = voids.read_journal(self.project)['abandons']
+        hand_doc = voids.abandon_document(dict(store, **{hand['operation_id']: entry}))
+        (self.project / voids.ABANDON_FILE).write_text(
+            json.dumps(hand_doc, ensure_ascii=False, sort_keys=True))
+        if os.name == 'posix':
+            os.chmod(self.project / voids.ABANDON_FILE, 0o600)
+        damaged = voids.audit(voids.snapshot(self.rows, self.project), operators=['op'])
+        self.assertEqual(damaged['correction_status'], 'damaged')
+        self.assertEqual(damaged['superseded_abandonment_count'], 1)
+        handrow = next(c for c in damaged['corrections'] if c['operation_id'] == 'hand-added')
+        self.assertEqual((handrow['status'], handrow['native_operator_proof']),
+                         ('damaged', False))
+        self.assertEqual(handrow['classification_reason'], 'abandonment-without-native-operator-proof')
 
 
 class HostCorrectionTests(unittest.TestCase):
@@ -287,42 +341,55 @@ class HostCorrectionTests(unittest.TestCase):
                     evidence=['synthetic audit pointer'], binding=cut['binding'],
                     target_void=cut['operation_id'])
 
+    def abandon(self, payload, comment_id, **options):
+        """Abandon ``comment_id`` through the real guarded native write."""
+        return voids.abandon(self.rows, payload['actor'], payload, self.native_run, self.project,
+                             operators=options.pop('operators', ['op']),
+                             enabled=options.pop('enabled', True),
+                             comment_id=comment_id, **options)
+
     def test_abandon_closes_an_incomplete_correction_without_touching_the_family(self):
-        """Item 1: the record is a sidecar, so a family with an abandonment stays schema-1."""
+        """Item 1: its OWN native comment proves it; the family stays schema-1."""
         cut = self.cut()
         comment = self.rows[0]['comments'][0]
         self.assertEqual([c['id'] for c in self.reading()['incomplete']], [comment['id']])
         payload = self.abandon_payload(cut)
-        answer = voids.abandon(self.rows, 'op', payload, self.project, operators=['op'], enabled=True,
-                               comment_id=comment['id'], recorded_at='2026-10-05T00:00:00Z')
+        answer = self.abandon(payload, comment['id'])
         self.assertFalse(answer['reconciled'])
-        # Host evidence only: the native comment is neither re-written nor deleted.
-        self.assertEqual(self.native_writes, 1)
-        self.assertEqual(self.rows[0]['comments'], [comment])
+        # kittrial-5bb.274 item 1: the abandonment writes its OWN native comment
+        # through the guarded write; the cut comment is neither re-written nor deleted.
+        self.assertEqual(self.native_writes, 2)
+        self.assertEqual(self.rows[0]['comments'][0], comment)
+        own = self.rows[0]['comments'][1]
+        self.assertEqual(answer['comment_id'], own['id'])
+        self.assertEqual(answer['target_comment_id'], comment['id'])
+        self.assertEqual(json.loads(own['text'][len(voids.PREFIX):]), payload)
         # The family itself is untouched and holds no abandon operation; the record
         # is beside it in ABANDON_FILE.
         self.assertNotIn('abandon', {e['payload']['operation'] for e in self.family().values()})
         self.assertTrue((self.project / voids.ABANDON_FILE).is_file())
-        self.assertEqual(set(voids.read_journal(self.project)['abandons']), {'abandon-one'})
         journal = voids.read_journal(self.project)
-        self.assertEqual(journal['abandons']['abandon-one']['comment_id'], comment['id'])
+        self.assertEqual(set(journal['abandons']), {'abandon-one'})
+        self.assertEqual(journal['abandons']['abandon-one']['comment_id'], own['id'])
         state = self.reading()
         self.assertEqual(state['incomplete'], [])
         self.assertEqual(state['reasons'], {})
+        self.assertEqual(state['abandon_targets'], {'abandon-one': comment['id']})
         page = voids.audit(voids.snapshot(self.rows, self.project), operators=['op'])
         self.assertEqual((page['abandoned_correction_count'], page['incomplete_correction_count'],
                           page['correction_status']), (1, 0, 'complete'))
         item = next(c for c in page['corrections'] if c['operation'] == 'abandon')
-        self.assertEqual((item['status'], item['operator'], item['reason'], item['comment_id']),
+        self.assertEqual((item['status'], item['operator'], item['reason'], item['comment_id'],
+                          item['target_comment_id'], item['native_operator_proof']),
                          ('abandoned', 'op', 'Operator closed the cut without the original words.',
-                          comment['id']))
+                          own['id'], comment['id'], True))
         files = voids.backup_files(self.project, self.rows)
         self.assertIn(voids.MANIFEST, files)
         self.assertIn(voids.ABANDON_FILE, files)
         self.assertEqual([name for name in files if name.startswith(voids.DIRECTORY + '/')], [])
-        retry = voids.abandon(self.rows, 'op', payload, self.project, operators=['op'], enabled=True,
-                              comment_id=comment['id'], recorded_at='2026-10-05T00:00:00Z')
+        retry = self.abandon(payload, comment['id'])
         self.assertTrue(retry['reconciled'])
+        self.assertEqual(self.native_writes, 2)
         self.assertEqual(set(voids.read_journal(self.project)['abandons']), {'abandon-one'})
         self.assertEqual(self.family(), {})
 
@@ -330,9 +397,7 @@ class HostCorrectionTests(unittest.TestCase):
         answer = self.apply(self.payload())
         cut = self.cut('retract', 'retract-two', 'void-one')
         comment = self.rows[0]['comments'][-1]
-        voids.abandon(self.rows, 'op', self.abandon_payload(cut, key='abandon-two'), self.project,
-                      operators=['op'], enabled=True, comment_id=comment['id'],
-                      recorded_at='2026-10-05T00:00:00Z')
+        self.abandon(self.abandon_payload(cut, key='abandon-two'), comment['id'])
         files = voids.backup_files(self.project, self.rows)
         self.assertIn(voids.DIRECTORY + '/' + answer['journal_sha256'] + '.json', files)
         self.assertIn(voids.ABANDON_FILE, files)
@@ -347,8 +412,7 @@ class HostCorrectionTests(unittest.TestCase):
         """kittrial-5bb.274 item 1: the store is hashed in the manifest."""
         cut = self.cut()
         comment = self.rows[0]['comments'][0]
-        voids.abandon(self.rows, 'op', self.abandon_payload(cut), self.project, operators=['op'],
-                      enabled=True, comment_id=comment['id'], recorded_at='2026-10-05T00:00:00Z')
+        self.abandon(self.abandon_payload(cut), comment['id'])
         files = voids.backup_files(self.project, self.rows)
         manifest = files[voids.MANIFEST]
         self.assertEqual(manifest['files'][voids.ABANDON_FILE],
@@ -370,10 +434,15 @@ class HostCorrectionTests(unittest.TestCase):
         self.assertEqual(set(voids.read_journal(destination)['abandons']), {'abandon-one'})
 
     def test_store_record_without_a_native_operator_comment_is_flagged(self):
-        """kittrial-5bb.274 item 2: a hand-added record with any operator is named."""
+        """kittrial-5bb.274 item 1(b): a hand-added record naming the TRUE author is damaged.
+
+        A store record is proved ONLY by an abandonment comment of its own by its
+        operator, so a record typed into the file - even one naming the true author
+        of the cut - has no proof.
+        """
         cut = self.cut()
         comment = self.rows[0]['comments'][0]
-        payload = self.abandon_payload(cut, actor='nobody')
+        payload = self.abandon_payload(cut, actor='op')     # the TRUE author of the cut
         entry = dict(schema_version=1, payload=payload, sha256=content_hash(payload),
                      comment_id=comment['id'], created_at='2026-10-05T00:00:00Z')
         voids.validate_entry(entry, allow_abandon=True)
@@ -383,56 +452,77 @@ class HostCorrectionTests(unittest.TestCase):
         state = self.reading()
         self.assertEqual(state['reasons'], {})
         self.assertIn('no native comment by its operator', state['abandon_problems'][0])
+        self.assertEqual(state['unproved_abandons'], ['abandon-one'])
         page = voids.audit(voids.snapshot(self.rows, self.project), operators=['op'])
         self.assertEqual(page['correction_status'], 'damaged')
         self.assertEqual(page['unproved_abandonment_count'], 1)
         item = next(c for c in page['corrections'] if c['operation'] == 'abandon')
-        self.assertFalse(item['native_operator_proof'])
-        self.assertEqual(item['classification_reason'], 'abandonment-without-native-operator-proof')
+        self.assertEqual((item['status'], item['native_operator_proof'],
+                          item['classification_reason']),
+                         ('damaged', False, 'abandonment-without-native-operator-proof'))
         with self.assertRaisesRegex(ValueError, 'unproved or duplicate abandonment'):
             voids.backup_files(self.project, self.rows)
 
-    def test_abandonment_of_a_journaled_comment_is_flagged_not_listed_twice(self):
-        """kittrial-5bb.274 item 2: a store record for a journaled comment is flagged."""
-        self.apply(self.payload())                      # void-one, comment id '1'
-        comment = self.rows[0]['comments'][0]
-        void_payload = self.payload()
-        payload = dict(schema_version=1, operation='abandon', operation_id='hand-on-void', actor='op',
-                       reason='typed into the file', evidence=['none'],
-                       binding=void_payload['binding'], target_void='void-one')
-        entry = dict(schema_version=1, payload=payload, sha256=content_hash(payload),
-                     comment_id=comment['id'], created_at='2026-10-05T00:00:00Z')
-        (self.project / voids.ABANDON_FILE).write_text(json.dumps(
-            voids.abandon_document({payload['operation_id']: entry}), ensure_ascii=False, sort_keys=True))
-        os.chmod(self.project / voids.ABANDON_FILE, 0o600)   # item 6: isolate this flag
+    def test_a_proved_abandonment_superseded_by_a_later_host_entry_reads_clean(self):
+        """kittrial-5bb.274 item 2: the rollback-reopened correction is NOT damaged."""
+        cut = self.cut('void', 'void-two')              # a cut void on p-task.2
+        cut_comment = self.rows[0]['comments'][0]
+        self.abandon(self.abandon_payload(cut, key='abandon-two'), cut_comment['id'])
+        # The released kit re-opens the correction by its exact retry: a later host
+        # entry for the very operation the abandonment names, so the void in effect wins.
+        later = dict(schema_version=1, payload=cut, sha256=content_hash(cut),
+                     comment_id=cut_comment['id'], created_at=cut_comment['created_at'])
+        voids.publish(self.project, later)
         state = self.reading()
-        self.assertTrue(any('already has a host entry' in problem for problem in state['abandon_problems']),
-                        state['abandon_problems'])
+        self.assertEqual(state['reasons'], {'p-task.2': 'voided'})
+        self.assertEqual(state['abandon_problems'], [])
+        self.assertEqual(state['incomplete'], [])
+        self.assertEqual(state['superseded_abandons'], {'abandon-two': 'void-two'})
         page = voids.audit(voids.snapshot(self.rows, self.project), operators=['op'])
-        self.assertEqual(page['duplicate_correction_count'], 1)
-        duplicate = next(c for c in page['corrections'] if c['operation_id'] == 'hand-on-void')
-        self.assertTrue(duplicate['duplicate_host_entry'])
-        self.assertEqual(duplicate['classification_reason'], 'abandonment-duplicates-a-journaled-comment')
-        with self.assertRaisesRegex(ValueError, 'unproved or duplicate abandonment'):
-            voids.backup_files(self.project, self.rows)
+        self.assertEqual((page['correction_status'], page['damaged_correction_count'],
+                          page['superseded_abandonment_count'], page['in_effect_void_count']),
+                         ('complete', 0, 1, 1))
+        row = next(c for c in page['corrections'] if c['operation_id'] == 'abandon-two')
+        self.assertEqual((row['status'], row['superseded_by'], row['duplicate_host_entry']),
+                         ('superseded', 'void-two', True))
+        self.assertIn(voids.ABANDON_FILE, voids.backup_files(self.project, self.rows))
 
-    def test_abandon_refuses_an_operator_who_did_not_author_the_cut(self):
-        """kittrial-5bb.274 item 2: the abandonment is bound to the cut's native author."""
+    def test_abandon_by_another_listed_operator_closes_a_cut_whose_author_left(self):
+        """Item 1(a): the cut's author has left the list; another operator closes it."""
         cut = self.cut()
-        comment = self.rows[0]['comments'][0]
-        other = self.abandon_payload(cut, key='abandon-other', actor='other')
-        with self.assertRaisesRegex(ValueError, 'native comment by the abandoning operator'):
-            voids.abandon(self.rows, 'other', other, self.project, operators=['op', 'other'],
-                          enabled=True, comment_id=comment['id'], recorded_at='2026-10-05T00:00:00Z')
-        self.assertEqual(voids.read_journal(self.project)['abandons'], {})
+        cut_comment = self.rows[0]['comments'][0]
+        other = self.abandon_payload(cut, key='abandon-other', actor='op2')
+        answer = self.abandon(other, cut_comment['id'], operators=['op2'])
+        self.assertEqual(answer['target_comment_id'], cut_comment['id'])
+        self.assertEqual(self.rows[0]['comments'][-1]['author'], 'op2')
+        state = self.reading()
+        self.assertEqual(state['incomplete'], [])
+        self.assertEqual(state['abandon_problems'], [])
+        page = voids.audit(voids.snapshot(self.rows, self.project), operators=['op2'])
+        self.assertEqual(page['correction_status'], 'complete')
+        self.assertIn(voids.ABANDON_FILE, voids.backup_files(self.project, self.rows))
+
+    def test_abandon_by_a_bound_actor_of_the_listed_operator(self):
+        """Item 1: a listed operator's bound actor may abandon, and proves it itself."""
+        cut = self.cut()
+        cut_comment = self.rows[0]['comments'][0]
+        bound = self.abandon_payload(cut, key='abandon-bound', actor='session-one')
+        owners = {'op': 'person:owner', 'session-one': 'person:owner'}
+        answer = self.abandon(bound, cut_comment['id'], operators=['op'], owners=owners)
+        self.assertEqual(answer['comment_id'], self.rows[0]['comments'][-1]['id'])
+        self.assertEqual(self.rows[0]['comments'][-1]['author'], 'session-one')
+        state = self.reading()
+        self.assertEqual(state['incomplete'], [])
+        self.assertEqual(state['abandon_problems'], [])
+        page = voids.audit(voids.snapshot(self.rows, self.project), operators=['op'], owners=owners)
+        self.assertEqual(page['correction_status'], 'complete')
 
     @unittest.skipUnless(os.name == 'posix', 'POSIX mode bits on the host store')
     def test_abandonment_store_is_created_private_and_world_writable_is_flagged(self):
         """kittrial-5bb.274 item 6: create 600; complain about group/world write."""
         cut = self.cut()
         comment = self.rows[0]['comments'][0]
-        voids.abandon(self.rows, 'op', self.abandon_payload(cut), self.project, operators=['op'],
-                      enabled=True, comment_id=comment['id'], recorded_at='2026-10-05T00:00:00Z')
+        self.abandon(self.abandon_payload(cut), comment['id'])
         store = self.project / voids.ABANDON_FILE
         self.assertEqual(stat.S_IMODE(store.stat().st_mode), 0o600)
         os.chmod(store, 0o666)
@@ -468,13 +558,15 @@ class HostCorrectionTests(unittest.TestCase):
     def test_abandonment_store_damage_reads_closed_never_changes_a_fact(self):
         cut = self.cut()
         comment = self.rows[0]['comments'][0]
-        voids.abandon(self.rows, 'op', self.abandon_payload(cut), self.project, operators=['op'],
-                      enabled=True, comment_id=comment['id'], recorded_at='2026-10-05T00:00:00Z')
+        answer = self.abandon(self.abandon_payload(cut), comment['id'])
         (self.project / voids.ABANDON_FILE).write_text('{"schema_version": 2, "records": {}}')
         os.chmod(self.project / voids.ABANDON_FILE, 0o600)   # item 6: isolate the read problem
         state = self.reading()
         self.assertEqual(state['abandon_problems'], ['Invalid lifecycle abandonment store'])
-        self.assertEqual([c['id'] for c in state['incomplete']], [comment['id']])
+        # With the store unreadable, BOTH the cut and the abandonment's own comment
+        # read unpaired again, so backups stay stopped.
+        self.assertEqual({c['id'] for c in state['incomplete']},
+                         {str(comment['id']), str(answer['comment_id'])})
         self.assertEqual(state['reasons'], {})
         page = voids.audit(voids.snapshot(self.rows, self.project), operators=['op'])
         self.assertEqual((page['correction_status'], page['abandon_problems']),
@@ -488,35 +580,42 @@ class HostCorrectionTests(unittest.TestCase):
         comment = self.rows[0]['comments'][0]
         issued = self.abandon_payload(self.payload())
         with self.assertRaisesRegex(ValueError, 'already has a host entry'):
-            voids.abandon(self.rows, 'op', issued, self.project, operators=['op'], enabled=True,
-                          comment_id=comment['id'], recorded_at='2026-10-05T00:00:00Z')
+            self.abandon(issued, comment['id'])
         cut = self.cut('retract', 'retract-one', 'void-one')
         comment = self.rows[0]['comments'][-1]
         cut_payload = self.abandon_payload(cut, key='abandon-two')
         with self.assertRaisesRegex(ValueError, 'lifecycle_void_writes is off'):
-            voids.abandon(self.rows, 'op', cut_payload, self.project, operators=['op'], enabled=False,
-                          comment_id=comment['id'], recorded_at='2026-10-05T00:00:00Z')
+            self.abandon(cut_payload, comment['id'], enabled=False)
         with self.assertRaisesRegex(ValueError, 'currently listed operator'):
-            voids.abandon(self.rows, 'mallory', dict(cut_payload, actor='mallory'), self.project,
-                          operators=['op'], enabled=True, comment_id=comment['id'],
-                          recorded_at='2026-10-05T00:00:00Z')
+            self.abandon(dict(cut_payload, actor='mallory'), comment['id'])
         self.assertEqual(set(voids.read_journal(self.project)['entries']), {'void-one'})
         self.assertEqual(voids.read_journal(self.project)['abandons'], {})
+        self.assertEqual(self.native_writes, 2)
         # A second abandonment of the same comment under a new key is refused too.
-        voids.abandon(self.rows, 'op', cut_payload, self.project, operators=['op'], enabled=True,
-                      comment_id=comment['id'], recorded_at='2026-10-05T00:00:00Z')
+        self.abandon(cut_payload, comment['id'])
         with self.assertRaisesRegex(ValueError, 'already has a host entry'):
-            voids.abandon(self.rows, 'op', dict(cut_payload, operation_id='abandon-three'), self.project,
-                          operators=['op'], enabled=True, comment_id=comment['id'],
-                          recorded_at='2026-10-05T00:00:00Z')
+            self.abandon(dict(cut_payload, operation_id='abandon-three'), comment['id'])
+        self.assertEqual(self.native_writes, 3)
 
     def test_abandon_binds_the_named_comment_even_after_its_target_changes(self):
         cut = self.cut()
         comment = self.rows[0]['comments'][0]
         altered = copy.deepcopy(self.rows)
         altered[2]['title'] = 'changed after the cut'
-        voids.abandon(altered, 'op', self.abandon_payload(cut), self.project, operators=['op'],
-                      enabled=True, comment_id=comment['id'], recorded_at='2026-10-05T00:00:00Z')
+        writes = []
+
+        def run(argv):
+            if argv == ['comments', 'p-task', '--json']:
+                return json.dumps(altered[0]['comments'])
+            writes.append(argv)
+            written = dict(id=str(len(altered[0]['comments']) + 1),
+                           author=json.loads(argv[3][len(voids.PREFIX):])['actor'],
+                           text=argv[3], created_at='2026-10-06T00:00:0' + str(len(writes)) + 'Z')
+            altered[0]['comments'].append(written)
+            return json.dumps(written)
+
+        voids.abandon(altered, 'op', self.abandon_payload(cut), run, self.project,
+                      operators=['op'], enabled=True, comment_id=comment['id'])
         state = voids.context(altered, voids.read_journal(self.project))
         self.assertEqual(state['incomplete'], [])
         self.assertEqual(state['reasons'], {})
@@ -527,8 +626,7 @@ class HostCorrectionTests(unittest.TestCase):
         retract = self.cut('retract', 'retract-one', 'void-one')
         comment = self.rows[0]['comments'][-1]
         self.assertEqual([c['id'] for c in self.reading()['incomplete']], [comment['id']])
-        voids.abandon(self.rows, 'op', self.abandon_payload(retract), self.project, operators=['op'],
-                      enabled=True, comment_id=comment['id'], recorded_at='2026-10-05T00:00:00Z')
+        self.abandon(self.abandon_payload(retract), comment['id'])
         state = self.reading()
         self.assertEqual(state['incomplete'], [])
         self.assertEqual(state['reasons'], {'p-task.2': 'voided'})
@@ -538,13 +636,12 @@ class HostCorrectionTests(unittest.TestCase):
         """Item 2, the stated rule: abandonment is final; a fresh void under a new key is the way."""
         cut = self.cut()
         comment = self.rows[0]['comments'][0]
-        voids.abandon(self.rows, 'op', self.abandon_payload(cut), self.project, operators=['op'],
-                      enabled=True, comment_id=comment['id'], recorded_at='2026-10-05T00:00:00Z')
+        self.abandon(self.abandon_payload(cut), comment['id'])
         with self.assertRaisesRegex(ValueError, r'abandoned .*final'):
             self.apply(cut)
         self.assertEqual(self.reading()['reasons'], {})
         self.assertEqual([c['id'] for c in self.reading()['incomplete']], [])
-        self.assertEqual(self.native_writes, 1)
+        self.assertEqual(self.native_writes, 2)
         # The way to void the event afterwards is a fresh operation identity.
         fresh = self.payload('void', 'void-after-abandon')
         answer = self.apply(fresh)
@@ -552,17 +649,16 @@ class HostCorrectionTests(unittest.TestCase):
         self.assertEqual(self.reading()['reasons'], {'p-task.2': 'voided'})
         page = voids.audit(voids.snapshot(self.rows, self.project), operators=['op'])
         self.assertEqual((page['abandoned_correction_count'], page['in_effect_void_count']), (1, 1))
-        rows = [c for c in page['corrections'] if c['comment_id'] == comment['id']]
-        self.assertEqual([row['status'] for row in rows], ['abandoned'])
+        abandon_row = next(c for c in page['corrections'] if c['operation'] == 'abandon')
+        self.assertEqual((abandon_row['status'], abandon_row['target_comment_id']),
+                         ('abandoned', comment['id']))
 
     def test_abandon_and_the_exact_retry_race_leaves_exactly_one_winner(self):
         """Item 2 (ii): the two racing writers serialize; never both in effect."""
         # Order one: the abandonment is written first, so the exact retry is refused.
         cut = self.cut('void', 'race-void-a')
         comment = self.rows[0]['comments'][-1]
-        voids.abandon(self.rows, 'op', self.abandon_payload(cut, key='race-abandon-a'), self.project,
-                      operators=['op'], enabled=True, comment_id=comment['id'],
-                      recorded_at='2026-10-05T00:00:00Z')
+        self.abandon(self.abandon_payload(cut, key='race-abandon-a'), comment['id'])
         with self.assertRaisesRegex(ValueError, 'abandoned'):
             self.apply(cut)
         self.assertEqual(self.family(), {})
@@ -591,9 +687,8 @@ class HostCorrectionTests(unittest.TestCase):
         voids.apply(rows_two, 'op', second, run, project, operators=['op'], enabled=True)
         with self.assertRaisesRegex(ValueError, 'already has a host entry'):
             voids.abandon(rows_two, 'op', self.abandon_payload(second, key='race-abandon-b'),
-                          project, operators=['op'], enabled=True,
-                          comment_id=rows_two[0]['comments'][0]['id'],
-                          recorded_at='2026-10-05T00:00:00Z')
+                          run, project, operators=['op'], enabled=True,
+                          comment_id=rows_two[0]['comments'][0]['id'])
         self.assertEqual(set(voids.read_journal(project)['entries']), {'race-void-b'})
         self.assertEqual(voids.read_journal(project)['abandons'], {})
         self.assertEqual(voids.context(rows_two, voids.read_journal(project))['reasons'],
@@ -643,16 +738,34 @@ class HostCorrectionTests(unittest.TestCase):
         self.assertIn('lifecycle-void-generation', operations)
 
     @unittest.skipUnless(os.name == 'posix', 'the host abandon command takes the POSIX project lock')
-    def test_admin_abandon_command_writes_host_evidence_without_recreating_the_comment(self):
+    def test_admin_abandon_command_writes_its_own_comment_and_host_evidence(self):
         import admin
         cut = self.cut()
         comment = self.rows[0]['comments'][0]
         (self.project / '.beads').mkdir(exist_ok=True)
         (self.project / '.beads' / 'metadata.json').write_text('{}')
         exported = '\n'.join(json.dumps(row) for row in self.rows)
+        written = []
+
+        def run_bd(root, project, argv):
+            rest = argv[2:]
+            if rest == ['export', '--all']:
+                return exported
+            if rest[:2] == ['comments', 'add']:
+                written.append(rest)
+                record = dict(id=str(len(self.rows[0]['comments']) + 1),
+                              author=json.loads(rest[3][len(voids.PREFIX):])['actor'],
+                              text=rest[3],
+                              created_at='2026-10-07T00:00:0' + str(len(self.rows[0]['comments']) + 1) + 'Z')
+                self.rows[0]['comments'].append(record)
+                return json.dumps(record)
+            if rest == ['comments', 'p-task', '--json']:
+                return json.dumps(self.rows[0]['comments'])
+            raise AssertionError(rest)
+
         with mock.patch.object(admin, 'project_dir', return_value=self.project), \
                 mock.patch.object(admin, 'operators', return_value=['op']), \
-                mock.patch.object(admin, 'run_bd', return_value=exported), \
+                mock.patch.object(admin, 'run_bd', side_effect=run_bd), \
                 mock.patch.object(admin, 'lifecycle_void_writes', return_value=True), \
                 mock.patch.object(admin, 'deployment_config_lock',
                                   return_value=contextlib.nullcontext()), \
@@ -663,10 +776,13 @@ class HostCorrectionTests(unittest.TestCase):
                                                      'Operator closed the cut.', ['synthetic audit'],
                                                      'admin-abandon-one')
         self.assertEqual(answer['operation'], 'abandon')
-        self.assertEqual(answer['comment_id'], comment['id'])
+        self.assertEqual(answer['target_comment_id'], comment['id'])
+        own = self.rows[0]['comments'][-1]
+        self.assertEqual(answer['comment_id'], own['id'])
+        self.assertNotEqual(answer['comment_id'], comment['id'])
         self.assertEqual(self.native_writes, 1)
         record = voids.read_journal(self.project)['abandons']['admin-abandon-one']
-        self.assertEqual(record['comment_id'], comment['id'])
+        self.assertEqual(record['comment_id'], own['id'])
         self.assertEqual((record['payload']['actor'], record['payload']['reason']),
                          ('op', 'Operator closed the cut.'))
         self.assertEqual(self.family(), {})

@@ -11,7 +11,6 @@ import hashlib
 import os
 import re
 import stat
-import time
 from pathlib import Path
 
 import record_json
@@ -191,28 +190,44 @@ def correction_payload(comment):
         return None
 
 
+def abandoned_target(payload, comment):
+    """True when ``comment`` is the cut correction an abandonment payload names.
+
+    The abandonment's payload names the abandoned comment by operation identity
+    and binding (never by re-creating its words), so this is the only lookup that
+    pairs the two. A void/retraction payload has no target.
+    """
+    if payload['operation'] != 'abandon':
+        return False
+    original = correction_payload(comment)
+    return (original is not None and original['operation'] in ('void', 'retract')
+            and original['operation_id'] == payload['target_void']
+            and original['binding'] == payload['binding'])
+
+
 def entry_binds_comment(entry, comment):
-    """True when ``entry`` is the host record for the native correction ``comment``.
+    """True when ``entry`` is a host record for the native correction ``comment``.
 
     A void/retraction entry binds the comment whose text IS its payload. An
-    abandonment entry instead binds an existing cut comment by id, and its
-    payload names the abandoned operation and target, because the operator may
-    not have the original words to re-create the void payload. A raw row comment
-    carries no ``task`` of its own; an inventory item from
+    abandonment (kittrial-5bb.274 item 1) writes its OWN native comment - the
+    proof - and its payload names the cut comment it closes by operation identity,
+    so it binds either its own comment (by text) or the abandoned target it names.
+    The stronger proof rule used by :func:`context` - the abandonment's own
+    comment, authored by the abandoning operator, and nothing else - is
+    deliberately not enforced here, because the offline reader asks only whether
+    the journal was consulted about every native correction comment. A raw row
+    comment carries no ``task`` of its own; an inventory item from
     :func:`native_correction_comments` does, and it must agree.
     """
     payload = entry['payload']
-    if (not isinstance(comment, dict) or str(comment.get('id')) != str(entry['comment_id'])
-            or (comment.get('task') is not None and comment.get('task') != payload['binding']['task'])):
+    if not isinstance(comment, dict):
         return False
-    original = correction_payload(comment)
-    if original is None:
+    if comment.get('task') is not None and comment.get('task') != payload['binding']['task']:
         return False
-    if payload['operation'] == 'abandon':
-        return (original['operation'] in ('void', 'retract')
-                and original['operation_id'] == payload['target_void']
-                and original['binding'] == payload['binding'])
-    return comment.get('text') == PREFIX + canonical_bytes(payload).decode()
+    if (str(comment.get('id')) == str(entry['comment_id'])
+            and comment.get('text') == PREFIX + canonical_bytes(payload).decode()):
+        return True
+    return abandoned_target(payload, comment)
 
 
 def incomplete_correction(rows, comment_id):
@@ -352,9 +367,11 @@ def read_journal(project):
 
     Damage never silently restores a voided fact. ``abandons`` is the separate
     store the writer uses; a family member that itself carries an abandonment (the
-    shape the reviewed-but-unintegrated kit wrote once) is still read, and
-    :func:`context` treats it as an abandonment, so no history is silently
-    re-interpreted and no family is turned unreadable by a shape this kit shipped.
+    shape the reviewed-but-unintegrated kit wrote once) is still READ - no family
+    is turned unreadable by a shape this kit shipped - but :func:`context` no
+    longer accepts it as proof, because an abandonment is proved only by its own
+    native comment (kittrial-5bb.274 item 1). It therefore reads unproved and the
+    audit reads damaged until an operator reconciles it.
     """
     result = dict(entries={}, invalid=[], present=False, bytes=0,
                   abandons={}, abandon_problems=[])
@@ -658,24 +675,31 @@ def context(rows, journal):
     for row in rows:
         if isinstance(row, dict) and row.get('id'):
             issues.setdefault(row['id'], []).append(row)
+    invalid = list(journal.get('invalid', []))
+    try:
+        native_comments = native_correction_comments(rows)
+    except ValueError as error:
+        native_comments = []; invalid.append(str(error))
     valid = {}
     entry_reasons = {}
     task_reasons = {}
-    # kittrial-5bb.274 item 2: an abandonment is host-only evidence. A valid
-    # native binding alone does not prove that the listed operator acted, so a
-    # record whose operator is not the target correction comment's native author
-    # is flagged (never treated as proof, never used to re-decide a fact).
+    # kittrial-5bb.274 item 1: an abandonment is host-only evidence, so it must
+    # never add a ``reasons`` entry and never re-decide the event. It is proved
+    # ONLY by its OWN native comment, written by the abandoning actor through the
+    # same guarded native write as a void. A store record with no such comment -
+    # a hand-added record naming the true author of the cut, or one the
+    # reviewed-but-unintegrated kit wrote - is never proof and is flagged below.
     unproved = []
+    abandon_targets = {}
     for key, entry in entries.items():
         payload = entry['payload']; binding = payload['binding']; event_id = binding['event_id']
-        abandon = payload['operation'] == 'abandon'
+        if payload['operation'] == 'abandon':
+            continue
         targets = issues.get(event_id, [])
-        # An abandonment certifies a comment, not the live event: a cut may name a
-        # target that was changed or removed, and closing it must not re-decide the
-        # event. A void/retraction still has to bind the exact current event.
-        reason = 'lifecycle-void-journal-mismatch' if abandon else 'lifecycle-void-target-changed'
+        # A void/retraction binds the exact current event.
+        reason = 'lifecycle-void-target-changed'
         try:
-            if not abandon and (len(targets) != 1 or event_binding(targets[0]) != binding):
+            if len(targets) != 1 or event_binding(targets[0]) != binding:
                 raise ValueError('lifecycle-void-target-changed')
             reason = 'lifecycle-void-journal-mismatch'
             tasks = issues.get(binding['task'], [])
@@ -688,23 +712,46 @@ def context(rows, journal):
             comment = comments[0]
             if not entry_binds_comment(entry, comment):
                 raise ValueError('lifecycle-void-journal-mismatch')
-            # The abandoner is not the comment's author and its time is the host
-            # abandonment time, so only an issued void/retraction carries the
-            # native author/time binding.
-            if not abandon and (comment.get('author') != payload['actor']
+            if (comment.get('author') != payload['actor']
                     or comment.get('created_at') != entry['created_at']):
                 raise ValueError('lifecycle-void-journal-mismatch')
-            if abandon and comment.get('author') != payload['actor']:
-                unproved.append(key)
             valid[key] = entry
         except (ValueError, TypeError, KeyError):
             reasons[event_id] = reason
             entry_reasons[key] = reason
-            if not abandon and len(targets)==1:
+            if len(targets)==1:
                 from lifecycle import native_event
                 actual=native_event(targets[0])
                 if actual is not None and actual['task']!=binding['task']:
                     task_reasons[binding['task']]=reason
+    # The abandonment view (kittrial-5bb.274 item 1). The record is proved only by
+    # its own native comment - text, author and native time - and it must still
+    # name exactly one native cut correction. Anything else is flagged, never
+    # treated as proof and never turned into a lifecycle reason.
+    for key, entry in entries.items():
+        payload = entry['payload']
+        if payload['operation'] != 'abandon':
+            continue
+        binding = payload['binding']
+        tasks = issues.get(binding['task'], [])
+        own = None
+        if len(tasks) == 1:
+            matches = [c for c in tasks[0].get('comments', [])
+                       if str(c.get('id')) == str(entry['comment_id'])]
+            own = matches[0] if len(matches) == 1 else None
+        proved = bool(own is not None
+                      and own.get('author') == payload['actor']
+                      and own.get('created_at') == entry['created_at']
+                      and own.get('text') == PREFIX + canonical_bytes(payload).decode())
+        target = None
+        if proved:
+            targets = [c for c in native_comments if abandoned_target(payload, c)]
+            target = targets[0] if len(targets) == 1 else None
+        if not proved or target is None:
+            unproved.append(key)
+            continue
+        valid[key] = entry
+        abandon_targets[key] = str(target['id'])
     retracted = set()
     from review_workflow import _recorded_at
     for key, entry in valid.items():
@@ -723,37 +770,42 @@ def context(rows, journal):
         payload = entry['payload']
         if payload['operation'] == 'void' and key not in retracted:
             reasons.setdefault(payload['binding']['event_id'], 'voided')
-    invalid=list(journal.get('invalid',[]))
-    try:native_comments=native_correction_comments(rows)
-    except ValueError as error:
-        native_comments=[];invalid.append(str(error))
+    # A native comment is bound by a valid abandonment twice over: the
+    # abandonment's OWN comment (``comment_id``) and the cut comment its payload
+    # names (``abandon_targets``). Binding the target is what lets backups resume.
     bound_comments={(e['payload']['binding']['task'],e['comment_id']) for e in entries.values()}
+    for key, target_id in abandon_targets.items():
+        bound_comments.add((entries[key]['payload']['binding']['task'], target_id))
     incomplete=[c for c in native_comments if (c['task'],c['id']) not in bound_comments]
-    # kittrial-5bb.274 item 2 (second half): today a store record for a comment
-    # that already has a journal entry makes the audit list the comment twice.
-    # Flag the abandonment instead of silently accepting the duplicate.
-    comment_keys = {}
-    for key, entry in entries.items():
-        comment_keys.setdefault(entry['comment_id'], []).append(key)
-    duplicates = sorted(
-        key for key, entry in entries.items()
-        if entry['payload']['operation'] == 'abandon'
-        and any(other != key and entries[other]['payload']['operation'] != 'abandon'
-                for other in comment_keys[entry['comment_id']]))
+    # kittrial-5bb.274 item 2: after a rollback to the released kit, the exact
+    # retry of an abandoned correction is accepted there, so this family holds a
+    # host entry for the very operation the abandonment names. The void in effect
+    # WINS and the abandonment reads SUPERSEDED by that later host entry - a
+    # defined, complete reading - never a duplicate. Only a PROVED abandonment can
+    # be superseded; a hand-added record has no native abandonment comment and
+    # stays damaged above.
+    superseded = {}
+    for key, entry in valid.items():
+        payload = entry['payload']
+        if payload['operation'] != 'abandon':
+            continue
+        later = sorted(other for other, candidate in entries.items()
+                       if other != key and candidate['payload']['operation'] in ('void', 'retract')
+                       and candidate['payload']['operation_id'] == payload['target_void']
+                       and candidate['payload']['binding'] == payload['binding'])
+        if later:
+            superseded[key] = later[0]
     abandon_problems = list(journal.get('abandon_problems') or [])
     for key in sorted(unproved):
         abandon_problems.append(
             ('Lifecycle abandonment %s has no native comment by its operator %s'
              % (key, entries[key]['payload']['actor']))[:300])
-    for key in duplicates:
-        abandon_problems.append(
-            ('Lifecycle abandonment %s closes native comment %s that already has a host entry'
-             % (key, entries[key]['comment_id']))[:300])
     return dict(reasons=reasons, global_reason=UNKNOWN_JOURNAL if invalid else None,
                 entries=entries, invalid=invalid, retracted=retracted,
                 entry_reasons=entry_reasons,task_reasons=task_reasons,
                 native_comments=native_comments,incomplete=incomplete,
-                unproved_abandons=sorted(unproved), duplicate_abandons=duplicates,
+                unproved_abandons=sorted(unproved),
+                superseded_abandons=superseded, abandon_targets=abandon_targets,
                 abandon_problems=abandon_problems)
 
 
@@ -779,18 +831,27 @@ def correction_audit(correction):
     entries=correction.get('entries',{})
     retracted=correction.get('retracted',set())
     native={(c['task'],c['id']):c for c in correction.get('native_comments',[])}
-    # kittrial-5bb.274 item 2: name an abandonment that has no native comment by
-    # its own operator, and any abandonment that duplicates a journaled comment.
+    # kittrial-5bb.274 items 1 and 2: name an abandonment that has no native
+    # comment of its own by its operator, and read a PROVED abandonment an older
+    # kit superseded on a rollback as ``superseded`` (never as damage).
     unproved=set(correction.get('unproved_abandons') or [])
-    duplicates=set(correction.get('duplicate_abandons') or [])
+    superseded=dict(correction.get('superseded_abandons') or {})
+    targets=dict(correction.get('abandon_targets') or {})
     result=[]
     for key,entry in entries.items():
         payload=entry['payload'];binding=payload['binding']
         comment=native.get((binding['task'],entry['comment_id']))
         problem=correction.get('entry_reasons',{}).get(key)
-        status=('damaged' if problem else 'retraction' if payload['operation']=='retract'
-                else 'abandoned' if payload['operation']=='abandon'
-                else 'retracted' if key in retracted else 'in-effect')
+        if problem or (payload['operation']=='abandon' and key in unproved):
+            status='damaged'
+        elif payload['operation']=='abandon' and key in superseded:
+            status='superseded'
+        elif payload['operation']=='retract':
+            status='retraction'
+        elif payload['operation']=='abandon':
+            status='abandoned'
+        else:
+            status='retracted' if key in retracted else 'in-effect'
         item=dict(operation_id=key,operation=payload['operation'],task=binding['task'],
                   event_id=binding['event_id'],operator=payload['actor'],
                   created_at=entry['created_at'],reason=payload['reason'],evidence=payload['evidence'],
@@ -799,11 +860,14 @@ def correction_audit(correction):
                   native_time=comment['created_at'] if comment else None)
         if payload['operation']=='abandon':
             item['native_operator_proof']=(comment is not None
-                                           and comment['author']==payload['actor'])
-            item['duplicate_host_entry']=key in duplicates
+                                           and comment['author']==payload['actor']
+                                           and comment.get('text')==PREFIX+canonical_bytes(payload).decode())
+            item['target_comment_id']=targets.get(key)
+            item['duplicate_host_entry']=key in superseded
+            if key in superseded:
+                item['superseded_by']=superseded[key]
         if problem:item['classification_reason']=problem
         elif key in unproved:item['classification_reason']='abandonment-without-native-operator-proof'
-        elif key in duplicates:item['classification_reason']='abandonment-duplicates-a-journaled-comment'
         if key in retracted:
             item['retracted_by']=[k for k,e in entries.items() if e['payload']['operation']=='retract'
                                   and e['payload']['target_void']==key
@@ -946,6 +1010,7 @@ def audit(rows, operators=None, owners=None, limit=50, offset=0):
                     and c.get('native_operator_proof') is False),
                 duplicate_correction_count=sum(
                     1 for c in corrections if c.get('duplicate_host_entry')),
+                superseded_abandonment_count=sum(c['status']=='superseded' for c in corrections),
                 family_reason=correction.get('global_reason'),
                 family_problems=correction.get('invalid',[]),
                 abandon_problems=correction.get('abandon_problems',[]),
@@ -988,6 +1053,66 @@ def publish(project, entry):
     return target
 
 
+def _find_native_correction(rows, actor, payload):
+    """The native comments already carrying this exact operation identity.
+
+    Zero or one comment: a second comment with the same identity, or one that
+    names different content or actor, is refused. Shared by a void/retraction
+    (:func:`apply`) and an abandonment (:func:`abandon`), so the exact retry of
+    either reconciles instead of writing twice.
+    """
+    binding = payload['binding']
+    tasks = [r for r in rows if r.get('id') == binding['task']]
+    if len(tasks) != 1 or tasks[0].get('issue_type') == 'event':
+        raise ValueError('Lifecycle correction task is missing or ambiguous')
+    found = []
+    for comment in tasks[0].get('comments', []):
+        raw = comment.get('text', '')
+        if not isinstance(raw, str) or not raw.startswith(PREFIX):
+            continue
+        try:
+            other = record_json.loads(raw[len(PREFIX):])
+            validate_payload(other, allow_abandon=(payload['operation'] == 'abandon'))
+        except (ValueError, TypeError):
+            continue
+        if other['operation_id'] == payload['operation_id']:
+            if other != payload or comment.get('author') != actor:
+                raise ValueError('Lifecycle correction operation identity already names different content/actor')
+            found.append(comment)
+    if len(found) > 1:
+        raise ValueError('Lifecycle correction operation identity has ambiguous native comments')
+    return found
+
+
+def _write_native_correction(run, actor, payload):
+    """The ONE guarded native correction write, shared by a void and an abandonment.
+
+    Writes exactly one prefixed comment and then binds the comment the native
+    store actually kept (a read back by id), never the transient create reply, so
+    the host record can always name a real native comment. A failure here is
+    explicitly uncertain and names the stable operation key; the exact retry
+    reuses that comment through :func:`_find_native_correction`.
+    """
+    binding = payload['binding']
+    body = PREFIX + canonical_bytes(payload).decode()
+    try:
+        comment = json.loads(run(['comments', 'add', binding['task'], body, '--json']))
+        created_id = str(comment['id'])
+        raw = run(['comments', binding['task'], '--json'])
+        if len(raw.encode('utf-8')) > MAX_FAMILY_BYTES:
+            raise ValueError('Native correction comment read exceeds its byte bound')
+        stored = record_json.loads(raw)
+        if not isinstance(stored, list):
+            raise ValueError('Native correction comment read is not a list')
+        stored = [c for c in stored if isinstance(c, dict) and str(c.get('id')) == created_id]
+        if (len(stored) != 1 or stored[0].get('author') != actor or stored[0].get('text') != body):
+            raise ValueError('Native correction comment cannot be bound after its write')
+        return stored[0]
+    except Exception as error:
+        raise ValueError('Lifecycle correction outcome is uncertain for operation ' + payload['operation_id']
+                         + '; reconcile the native comment before retry: ' + str(error)[:300]) from None
+
+
 def apply(rows, actor, payload, run, project, operators=None, owners=None, enabled=False):
     """Caller holds the project and deployment-config locks; native-first exact retry.
 
@@ -1018,33 +1143,23 @@ def apply(rows, actor, payload, run, project, operators=None, owners=None, enabl
             raise ValueError('Retraction must name this exact host-issued void operation')
         if state['reasons'].get(binding['event_id']) not in (None, 'voided'):
             raise ValueError('Void binding is damaged; operator reconciliation required before retraction')
-    body = PREFIX + canonical_bytes(payload).decode()
-    found = []
-    for comment in tasks[0].get('comments', []):
-        raw = comment.get('text', '')
-        if not isinstance(raw, str) or not raw.startswith(PREFIX):
-            continue
-        try:
-            other = record_json.loads(raw[len(PREFIX):])
-            validate_payload(other)
-        except (ValueError, TypeError):
-            continue
-        if other['operation_id'] == payload['operation_id']:
-            if other != payload or comment.get('author') != actor:
-                raise ValueError('Lifecycle correction operation identity already names different content/actor')
-            found.append(comment)
-    if len(found) > 1:
-        raise ValueError('Lifecycle correction operation identity has ambiguous native comments')
+    found = _find_native_correction(rows, actor, payload)
     # kittrial-5bb.271 item 2, the rule this kit states: an abandoned correction
     # is FINAL. apply() therefore consults the abandonment of the operation it
     # binds - whether the record is in the store beside the family or in a legacy
     # family member - and refuses the exact retry instead of re-applying a
     # correction the operator closed. A fresh void under a new key is the way.
-    abandoned = [record for record in
-                 list((journal.get('abandons') or {}).values())
-                 + [entry for entry in journal['entries'].values()
-                    if entry['payload']['operation'] == 'abandon']
-                 if record['payload']['target_void'] == payload['operation_id']]
+    # kittrial-5bb.274 item 2: the ONE exception is an abandonment an older kit
+    # already superseded by re-opening the correction on a rollback. The void in
+    # effect wins there, so the exact retry reconciles with that later entry
+    # instead of being refused as abandoned.
+    superseded = set((state.get('superseded_abandons') or {}))
+    closers = list((journal.get('abandons') or {}).items())
+    closers += [(key, entry) for key, entry in journal['entries'].items()
+                if entry['payload']['operation'] == 'abandon']
+    abandoned = [record for key, record in closers
+                 if record['payload']['target_void'] == payload['operation_id']
+                 and key not in superseded]
     if abandoned:
         closed = abandoned[0]
         raise ValueError('Lifecycle correction operation ' + payload['operation_id'] + ' was abandoned by '
@@ -1092,28 +1207,13 @@ def apply(rows, actor, payload, run, project, operators=None, owners=None, enabl
             or temporary.exists() and not temporary.is_file()):
         raise ValueError('Lifecycle void publication path is not a regular host path; no native write attempted')
     _writable(directory)
-    if not found:
-        try:
-            comment = json.loads(run(['comments', 'add', binding['task'], body, '--json']))
-            # bd's create reply carries its pre-storage nanosecond clock; pinned
-            # Dolt persists the comment time at second precision. Bind the actual
-            # stored comment returned by a native read, not that transient reply.
-            created_id = str(comment['id'])
-            raw = run(['comments', binding['task'], '--json'])
-            if len(raw.encode('utf-8')) > MAX_FAMILY_BYTES:
-                raise ValueError('Native correction comment read exceeds its byte bound')
-            stored = record_json.loads(raw)
-            if not isinstance(stored, list):
-                raise ValueError('Native correction comment read is not a list')
-            stored = [c for c in stored if isinstance(c, dict) and str(c.get('id')) == created_id]
-            if (len(stored) != 1 or stored[0].get('author') != actor or stored[0].get('text') != body):
-                raise ValueError('Native correction comment cannot be bound after its write')
-            comment = stored[0]
-        except Exception as error:
-            raise ValueError('Lifecycle correction outcome is uncertain for operation ' + payload['operation_id']
-                             + '; reconcile the native comment before retry: ' + str(error)[:300]) from None
-    else:
+    if found:
         comment = found[0]
+    else:
+        # bd's create reply carries its pre-storage nanosecond clock; pinned Dolt
+        # persists the comment time at second precision. The shared guarded write
+        # binds the actual stored comment returned by a native read.
+        comment = _write_native_correction(run, actor, payload)
     try:
         entry = dict(schema_version=1, payload=payload, sha256=content_hash(payload),
                      comment_id=str(comment['id']), created_at=comment['created_at'])
@@ -1128,26 +1228,35 @@ def apply(rows, actor, payload, run, project, operators=None, owners=None, enabl
                 journal_sha256=entry['sha256'], reconciled=bool(found))
 
 
-def abandon(rows, actor, payload, project, operators=None, owners=None, enabled=False,
-            comment_id=None, recorded_at=None):
+def abandon(rows, actor, payload, run, project, operators=None, owners=None, enabled=False,
+            comment_id=None):
     """Close one unpaired native correction comment without recreating its words.
 
-    Host-only and audited. A listed operator names an existing correction comment
-    that has no journal entry (a cut before publication, or a void whose entry was
-    lost); this writes ONLY the host abandonment store that closes it
-    (:data:`ABANDON_FILE`, beside the family - never a family member, so a family
-    that holds an abandonment stays readable by the released F0 kit) and never
-    touches, deletes or re-writes the native comment. A correction whose comment
-    already has a host entry (in the family or the store) is refused, so an issued
-    void/retraction (in effect or retracted) is never a target. The record binds the
-    comment by native id and the abandoned operation id, so readers stop counting it
-    as incomplete and backups resume; ``context`` never turns it into a void reason,
-    and no abandonment record ever changes a lifecycle fact.
+    Host-only and audited. A listed operator (or its bound actor) names an existing
+    correction comment that has no host entry (a cut before publication, or a void
+    whose entry was lost). kittrial-5bb.274 item 1: the abandonment writes its OWN
+    native comment - the proof - through the SAME guarded native write as a void
+    (:func:`_write_native_correction`), whose payload names the abandoned comment
+    (``target_void`` and ``binding``), the operator, the reason and the evidence;
+    the native time is the comment's own. Then it writes the host record beside the
+    family (:data:`ABANDON_FILE`, never a family member, so a family that holds an
+    abandonment stays readable by the released F0 kit). The abandoned comment is
+    never touched, deleted or re-written.
+
+    ANY listed operator or its bound actor may abandon: the proof is the
+    abandonment's own comment, so the author of the cut need not still be listed
+    (the .271 rule). A correction whose comment already has a host entry (an issued
+    void or retraction, in effect or retracted) is refused. ``context`` proves the
+    record ONLY from that own comment, so a hand-added store record has no proof and
+    reads damaged; it never turns an abandonment into a void reason, and no
+    abandonment record ever changes a lifecycle fact.
 
     An abandonment is FINAL: the exact retry of the abandoned operation is refused
-    by :func:`apply`, and a fresh void under a new operation identity is the way to
-    void the event afterwards. The exact retry of the *abandonment* with the same
-    ``operation_id`` reconciles the already-published store record.
+    by :func:`apply` - unless an older kit already re-opened it on a rollback, where
+    the void in effect wins and the abandonment reads superseded (kittrial-5bb.274
+    item 2). A fresh void under a new operation identity is the way to void the
+    event otherwise. The exact retry of the *abandonment* with the same
+    ``operation_id`` reconciles the already-written native comment and store record.
     """
     from review_workflow import listed_operator_actor
     validate_payload(payload, allow_abandon=True)
@@ -1184,40 +1293,50 @@ def abandon(rows, actor, payload, project, operators=None, owners=None, enabled=
                 and original['operation_id'] == payload['target_void']
                 and original['binding'] == binding
                 and comment['task'] == binding['task']):
-            matches.append(comment)
+            matches.append((comment, original))
     if len(matches) != 1:
         raise ValueError('Lifecycle abandonment target is missing or ambiguous; name an incomplete native '
                          'correction comment that has no host entry')
-    comment = matches[0]
-    # kittrial-5bb.274 item 2: bind the abandonment to a native comment by the
-    # abandoning operator, as an issued void is bound to its own comment. The
-    # target cut comment is the only native artifact that proves the operator
-    # acted, so the operator who cut the correction is the one who abandons it.
-    # A different listed operator issues a fresh void under a new key instead.
-    if comment.get('author') != payload['actor']:
-        raise ValueError('Lifecycle abandonment requires a native comment by the abandoning operator; '
-                         'the target correction comment was authored by ' + str(comment.get('author'))
-                         + '. A different operator issues a fresh void under a new operation identity instead.')
-    for entry in list(journal['entries'].values()) + list((journal.get('abandons') or {}).values()):
-        if entry['comment_id'] == comment['id']:
+    comment, original = matches[0]
+    # kittrial-5bb.274 item 1: ANY listed operator or its bound actor may abandon.
+    # The cut's author need not still be listed: the abandonment is proved by the
+    # comment written below by the ABANDONING actor, not by the cut's author.
+    stored_entries = list(journal['entries'].values()) + list((journal.get('abandons') or {}).values())
+    for entry in stored_entries:
+        candidate = entry['payload']
+        if (candidate['operation'] in ('void', 'retract')
+                and str(entry['comment_id']) == str(comment['id'])):
             raise ValueError('That native correction comment already has a host entry; an issued void or '
                              'retraction is never abandoned')
-    if recorded_at is None:
-        recorded_at = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-    entry = dict(schema_version=1, payload=payload, sha256=content_hash(payload),
-                 comment_id=comment['id'], created_at=recorded_at)
-    validate_entry(entry, allow_abandon=True)
+        if (candidate['operation'] == 'abandon'
+                and candidate['target_void'] == original['operation_id']
+                and candidate['binding'] == binding):
+            raise ValueError('That native correction comment already has a host entry; an issued void or '
+                             'retraction is never abandoned')
+    # Bound the store BEFORE the native write: after it, a refusal would leave the
+    # native effect uncertain. The estimate is a conservative upper bound.
+    estimated = dict(schema_version=1, payload=payload, sha256=content_hash(payload),
+                     comment_id='x' * 300, created_at='x' * 100)
+    if len(entry_bytes(estimated)) > MAX_RECORD_BYTES:
+        raise ValueError('Lifecycle abandonment plus native binding exceeds the store record byte bound; '
+                         'no native write attempted')
     stored = journal.get('abandons') or {}
-    if len(stored) + 1 > MAX_RECORDS or journal['bytes'] + len(entry_bytes(entry)) > MAX_FAMILY_BYTES:
-        raise ValueError('Lifecycle abandonment store capacity is exhausted; no host record was written. '
+    if len(stored) + 1 > MAX_RECORDS or journal['bytes'] + len(entry_bytes(estimated)) > MAX_FAMILY_BYTES:
+        raise ValueError('Lifecycle abandonment store capacity is exhausted; no native write attempted. '
                          'An operator retains the store and uses a restore-capable kit with larger validated '
                          'bounds before adding abandonments.')
+    found = _find_native_correction(rows, actor, payload)
+    comment_record = found[0] if found else _write_native_correction(run, actor, payload)
     try:
+        entry = dict(schema_version=1, payload=payload, sha256=content_hash(payload),
+                     comment_id=str(comment_record['id']), created_at=comment_record['created_at'])
+        validate_entry(entry, allow_abandon=True)
         publish_abandon(project, entry)
     except (ValueError, OSError, KeyError, TypeError) as error:
-        raise ValueError('Lifecycle abandonment could not publish its host record for operation '
-                         + payload['operation_id'] + '; the native comment was not changed and the exact '
-                         'retry is safe: ' + str(error)[:300]) from None
+        raise ValueError('Lifecycle abandonment native effect may exist, but its host record is uncertain for '
+                         'operation ' + payload['operation_id']
+                         + '; retry the exact payload/actor to persist the entry: ' + str(error)[:300]) from None
     return dict(operation_id=payload['operation_id'], comment_id=entry['comment_id'],
+                target_comment_id=str(comment['id']),
                 event_id=binding['event_id'], task=binding['task'], operation='abandon',
-                journal_sha256=entry['sha256'], reconciled=False)
+                journal_sha256=entry['sha256'], reconciled=bool(found))

@@ -497,9 +497,10 @@ class NativeVoidTests(fixture.RealBdLabelAliasTests):
 
         The released kit reads the family (no ``lifecycle-void-journal-unreadable``)
         and honours an issued void, but it cannot see the abandonment store, so the
-        abandoned native comment stays unpaired there: an ``incomplete`` audit and a
-        refused backup. That is the exact limit docs/OPERATIONS.md states, and the
-        reason this kit writes the record BESIDE the family.
+        abandoned cut comment AND the abandonment's own native comment stay unpaired
+        there: an ``incomplete`` audit and a refused backup. That is the exact limit
+        docs/OPERATIONS.md states, and the reason this kit writes the record BESIDE
+        the family.
         """
         import admin
         import importlib.util
@@ -533,9 +534,14 @@ class NativeVoidTests(fixture.RealBdLabelAliasTests):
                 'Synthetic abandonment of the cut.', ['synthetic native test'],
                 'released-abandon-' + cut_task)
         self.assertIn(voids.ABANDON_LOST_ENTRY_RULE, printed.getvalue())
-        self.assertEqual(abandoned['comment_id'], str(comment['id']))
+        # kittrial-5bb.274 item 1: the abandonment writes its OWN native comment.
+        self.assertEqual(abandoned['target_comment_id'], str(comment['id']))
+        self.assertNotEqual(abandoned['comment_id'], str(comment['id']))
         rows = fresh.export_rows()
-        # Our kit pairs the comment through the store, so the project is complete
+        own = next(c for row in rows if row['id'] == cut_task for c in row.get('comments', [])
+                   if c['id'] == abandoned['comment_id'])
+        self.assertEqual(own['author'], 'op')
+        # Our kit pairs BOTH comments through the store, so the project is complete
         # and backable again; the family itself holds no abandon member.
         self.assertEqual(voids.audit(voids.snapshot(rows, fresh.project))['correction_status'], 'complete')
         self.assertNotIn('abandon', {e['payload']['operation']
@@ -552,7 +558,8 @@ class NativeVoidTests(fixture.RealBdLabelAliasTests):
         state = released.context(rows, released_journal)
         self.assertEqual(state['global_reason'], None)
         self.assertEqual(state['reasons'].get(issued_target['id']), 'voided')
-        self.assertEqual([c['id'] for c in state['incomplete']], [str(comment['id'])])
+        self.assertEqual({c['id'] for c in state['incomplete']},
+                         {str(comment['id']), str(abandoned['comment_id'])})
         with self.assertRaisesRegex(ValueError, 'native correction comments without their host entries'):
             released.backup_files(fresh.project, rows)
         self.assertEqual(next(r for r in rows if r['id'] == issued_target['id']), issued_target)
