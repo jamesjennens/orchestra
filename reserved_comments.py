@@ -22,6 +22,7 @@ from handoff import (
     parse_identity as parse_handoff_identity,
 )
 from lifecycle import PREFIX as LIFECYCLE_PREFIX
+from task_assignment import PREFIX as TASK_ASSIGNMENT_PREFIX
 from lifecycle_voids import PREFIX as LIFECYCLE_CORRECTION_PREFIX
 from requirements import ACCEPTANCE_FIELDS, SHA256_TEXT
 from recovery import PREFIX as VOID_PREFIX
@@ -212,6 +213,7 @@ COORDINATOR_DECISION_PREFIX = 'Kind: coordinator-decision-v1\n'
 LANE_STATE_PREFIX = 'Kind: lane-state-v1\n'
 
 RESERVED = (
+    (TASK_ASSIGNMENT_PREFIX, 'task assignment notice', 'the dedicated coordinate assignment operation'),
     (REVIEW_PREFIX, 'contribution/review record', 'review TASK --file payload.json'),
     (CHECKPOINT_PREFIX, 'task checkpoint', 'checkpoint TASK --file checkpoint.json'),
     (LIFECYCLE_PREFIX, 'lifecycle evidence record', 'lifecycle.py record --file event.json'),
@@ -251,6 +253,7 @@ PREFIXES = tuple(prefix for prefix, _, _ in RESERVED)
 # review item `smaller` b): otherwise a raw `Kind: capability-entry-v7` would be
 # writable and then hidden. A later writer of vN ships its own tolerant-reader step.
 _RECORD_KIND_RESERVATIONS = {
+    'task-assignment': ('task assignment notice', 'the dedicated coordinate assignment operation'),
     'lifecycle-event-correction': ('host lifecycle correction record',
                                   'admin.py lifecycle-event-void|lifecycle-event-retract on the coordination host'),
     'reference-entry': ('reference catalog entry', 'ref propose|revise'),

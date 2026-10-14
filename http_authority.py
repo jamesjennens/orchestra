@@ -2174,8 +2174,11 @@ def descriptor_actor_denial(request, authority_config, reserved):
 #: (``project_creation.SERVICE_ACTIONS``).
 BLOCK_CAPABILITIES = {
     'bd': {'create': CAP_TASKS,            # tasks.create
-           'update': CAP_TASKS},           # tasks.update, tasks.claim
+           'update': CAP_TASKS,            # tasks.update, tasks.claim
+           'comments': CAP_TASKS},         # tasks.comment; raw reserved guards still apply
     'checkpoint': CAP_CHECKPOINTS,         # checkpoints.add
+    'task-assign': CAP_COORDINATE,         # dedicated assignee-only guarded operation
+    'assignment-roster': CAP_COORDINATE,   # project-scoped existing assignment targets
     'coordinate': {'merge-check': CAP_READ, 'merge-acquire': CAP_COORDINATE,
                    'merge-release': CAP_COORDINATE, 'merge-create': CAP_PROJECT_ADMIN},
     'web-merge-slot': {'check': CAP_READ, 'acquire': CAP_COORDINATE,

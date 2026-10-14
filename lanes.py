@@ -292,12 +292,25 @@ def read(rows, actor, registry, args, now=None, operators=None, journal=None, sc
         revert_map, revert_problems = {}, {}
     names = registry_names(registry)
     groups = {}
+    notice_groups = {}
+    from task_assignment import notices as assignment_notices, parse_comment
     for row in rows:
         if not isinstance(row, dict) or not row.get('id') or row.get('malformed'):
             continue
         if row.get('issue_type') in ('event', 'gate') or is_merge_slot(row) or is_record_anchor(row):
             continue
+        project_name=journal.name if journal is not None else ''
+        involved=set()
+        for comment in row.get('comments') or []:
+            notice=parse_comment(comment,project=project_name,task=row['id'])
+            if notice:involved.update(x for x in (notice['from'],notice['to']) if x)
+        for who in involved:
+            block=assignment_notices(row,project_name,who)
+            if block['total']:
+                group=notice_groups.setdefault(who,{'items':[],'total':0})
+                group['items'].extend(block['items']);group['total']+=block['total']
         if row.get('status') == 'closed' or not row.get('assignee'):
+
             continue
         task = str(row['id'])
         holder = row['assignee']
@@ -365,6 +378,18 @@ def read(rows, actor, registry, args, now=None, operators=None, journal=None, sc
             'your_move_idle': False,
             'flag_tasks': {},
         })
+    existing={lane['actor'] for lane in lanes}
+    for holder in sorted(set(notice_groups)-existing):
+        lanes.append(dict(lane=names.get(holder,holder),actor=holder,idle=False,held=[],
+                          state=None,waiting_on=None,expect_by=None,inferred=False,state_since=None,
+                          state_age_seconds=None,last_write=None,last_write_age_seconds=None,
+                          waiting_too_long=False,expect_by_passed=False,your_move_idle=False,flag_tasks={}))
+    for lane in lanes:
+        holder_notices=notice_groups.get(lane['actor'])
+        if holder_notices:
+            kept=holder_notices['items'][:20]
+            lane['assignment_notices']={'items':kept,'total':holder_notices['total'],
+                                        'omitted':max(0,holder_notices['total']-len(kept))}
     if scope == 'own':
         lanes = [row for row in lanes if row['actor'] == actor]
     lanes.sort(key=lambda row: (0 if row['held'] else 1, 0 if row['flag_tasks'] else 1,

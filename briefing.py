@@ -858,7 +858,10 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
     # is carried only when ON; absence means false, including older endpoints.
     if not brief_review.get('approval_requires_other_party'):
         brief_review.pop('approval_requires_other_party',None)
-    result={**attention,'reference_drafts_matching':reference_drafts,'task':task,'title':clip(issue.get('title'),200),'owner':clip(issue.get('assignee') or 'unassigned',96),'status':issue.get('status'),
+    from task_assignment import notices as assignment_notices
+    notice_block=assignment_notices(issue,project,actor)
+    notice_records=assignment_notices(issue,project,None,limit=20)
+    result={**({'assignment_records':notice_records} if notice_records['total'] else {}),**({'assignment_notices':notice_block} if notice_block['total'] else {}),**attention,'reference_drafts_matching':reference_drafts,'task':task,'title':clip(issue.get('title'),200),'owner':clip(issue.get('assignee') or 'unassigned',96),'status':issue.get('status'),
             'activity_cursor':activity_cursor(data),'checkpoint':None if p is None else {'comment_id':str(c['id']),'author':clip(c.get('author'),96),'timestamp':c.get('created_at'),'source_commit':p['source_commit'],'branch':p['branch'],'incorporated_activity_cursor':p['activity_cursor'],
                 'newer_activity':stale,**({'taken_in_project':taken_in} if taken_in else {})},
             'newer':newer,
@@ -1449,6 +1452,7 @@ def format_brief(result):
            'Review/contribution: '+json.dumps(result['review'],ensure_ascii=False),
            'Intent: '+excerpt(result['intent']),'Acceptance: '+excerpt(result['acceptance']),
            'Current position: '+result['current_position'],'Next: '+result['next_action']]
+    lines.extend(item['message'] for item in (result.get('assignment_notices') or {}).get('items',[]))
     guidance=result.get('guidance')
     if guidance and guidance.get('present') and guidance.get('unbound'):
         # Unbound text has no version anyone may follow (kittrial-5bb.105); the warning line below says why.

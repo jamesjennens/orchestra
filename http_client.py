@@ -225,6 +225,23 @@ class Client:
     def get_project(self, project):
         return self.request('GET', '/v1/projects/%s' % quote(project, safe=''))
 
+    def assignment_roster(self, project, limit=100, cursor=None):
+        query={'limit':limit}
+        if cursor is not None:query['cursor']=cursor
+        return self.request('GET','/v1/projects/%s/assignment-roster' % quote(project,safe='') + '?' + urlencode(query))
+
+    def assign_task(self, project, task, expected_assignee, assignee, reason,
+                    *, allow_pending_review=False, allow_held_slot=False, key=None):
+        identity=key or new_idempotency_key()
+        payload=dict(expected_assignee=expected_assignee,assignee=assignee,reason=reason,
+                     allow_pending_review=allow_pending_review,allow_held_slot=allow_held_slot)
+        try:
+            return self.request('POST','/v1/projects/%s/tasks/%s/assign' %
+                                (quote(project,safe=''),quote(task,safe='')),payload,key=identity)
+        except OSError:
+            raise UncertainOutcome(0,'uncertain','Connection lost; reconcile the identical assignment',
+                                   None,None,identity) from None
+
     def merge_slot(self, project):
         return self.request('GET', '/v1/projects/%s/merge-slot' % quote(project, safe=''))
 
@@ -299,16 +316,24 @@ class Client:
                             % (quote(project, safe=''), quote(task, safe='')),
                             {'actor': actor}, key=key)
 
+    def add_comment(self, project, task, text, key=None):
+        """Append literal text under the authenticated actor; no author override."""
+        return self.request('POST', '/v1/projects/%s/tasks/%s/comments'
+                            % (quote(project, safe=''), quote(task, safe='')),
+                            {'text': text}, key=key)
+
     def add_checkpoint(self, project, task, *, previous, summary, open_items=None,
                        activity_cursor=None, actor=None, key=None, schema_version=1,
                        source_commit='', branch='', intent=None, acceptance=None,
-                       next_action=None, resolved=None):
+                       next_action=None, resolved=None, lane_state=None):
         """Append one canonical checkpoint; ``activity_cursor`` comes from history/brief."""
         body = {'schema_version': schema_version, 'previous': previous,
                 'activity_cursor': activity_cursor, 'source_commit': source_commit,
                 'branch': branch, 'intent': intent, 'acceptance': acceptance,
                 'summary': summary, 'next_action': next_action,
                 'open_items': open_items or [], 'resolved': resolved or [], 'actor': actor}
+        if lane_state is not None:
+            body['lane_state'] = lane_state
         return self.request('POST', '/v1/projects/%s/tasks/%s/checkpoints'
                             % (quote(project, safe=''), quote(task, safe='')),
                             body, key=key)
@@ -420,6 +445,23 @@ def _build_parser():
     slot.add_argument('--expected-holder')
     slot.add_argument('--reason')
     slot.add_argument('--idempotency-key', help='reuse exactly this key and request after an uncertain result')
+    roster = sub.add_parser('assignment-roster', help='page existing eligible project identities')
+    roster.add_argument('project')
+    roster.add_argument('--limit', type=int, default=100)
+    roster.add_argument('--cursor')
+    assignment = sub.add_parser('assign-task', help='coordinate an assignee-only change with a durable task notice')
+    assignment.add_argument('project')
+    assignment.add_argument('task')
+    expected = assignment.add_mutually_exclusive_group(required=True)
+    expected.add_argument('--expected-assignee')
+    expected.add_argument('--expected-unassigned', action='store_true')
+    target = assignment.add_mutually_exclusive_group(required=True)
+    target.add_argument('--assignee')
+    target.add_argument('--unassign', action='store_true')
+    assignment.add_argument('--reason', required=True)
+    assignment.add_argument('--allow-pending-review', action='store_true')
+    assignment.add_argument('--allow-held-slot', action='store_true')
+    assignment.add_argument('--idempotency-key', help='reuse exactly this key and request after an uncertain result')
     call = sub.add_parser('call', help='issue one raw JSON request')
     call.add_argument('method')
     call.add_argument('path')
@@ -453,6 +495,15 @@ def main(argv=None):
             return 0
         if args.command == 'whoami':
             print(json.dumps(client.whoami(), indent=2))
+            return 0
+        if args.command == 'assignment-roster':
+            print(json.dumps(client.assignment_roster(args.project,args.limit,args.cursor),indent=2))
+            return 0
+        if args.command == 'assign-task':
+            result=client.assign_task(args.project,args.task,args.expected_assignee,args.assignee,args.reason,
+                allow_pending_review=args.allow_pending_review,allow_held_slot=args.allow_held_slot,
+                key=args.idempotency_key)
+            print(json.dumps(result,indent=2))
             return 0
         if args.command == 'merge-slot':
             if args.operation == 'read':result = client.merge_slot(args.project)

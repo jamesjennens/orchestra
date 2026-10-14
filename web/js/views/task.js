@@ -190,7 +190,122 @@ export async function detail(ctx, { pid, tid }) {
     h('div', { class: 'toolbar' }, statusChip(t.status), reviewChip(review.state), priority(t.priority)),
     lifecycleStrip(brief.lifecycle),
     nextBanner,
-    h('div', { class: 'detail' }, h('div', { class: 'stack' }, editPanel, briefPanel, reviewPanel, historyPanel), side));
+    h('div', { class: 'detail' }, h('div', { class: 'stack' }, editPanel, owner && !project.archived ? assignmentForm(ctx, pid, tid, t) : null, brief.assignment_notices ? h('div', { class: 'banner info' }, brief.assignment_notices.items.map(item => h('p', { class: 'prose' }, item.message))) : null, briefPanel, reviewPanel, writer ? commentForm(ctx, pid, tid) : null, writer ? checkpointForm(ctx, pid, tid, brief) : null, historyPanel), side));
+}
+
+export function checkpointForm(ctx, pid, tid, initialBrief) {
+  let context = initialBrief;
+  let contextReadFailed = false;
+  const status = h('div', { class: 'banner crit', role: 'alert', hidden: true });
+  const carried = h('div', { class: 'stack' });
+  const added = h('div', { class: 'stack' });
+  let count = 0;
+  const template = initialBrief.checkpoint_template;
+  const fields = ['intent', 'acceptance', 'summary', 'next_action', 'source_commit', 'branch'];
+  const labels = ['Intent', 'Acceptance', 'Where it stands', 'Next action', 'Source commit', 'Branch'];
+  const form = h('form', { class: 'form', novalidate: true },
+    h('h3', { class: 'small' }, 'Record a checkpoint'), status,
+    h('p', { class: 'hint' }, 'Carry each unresolved item unchanged or explicitly resolve it with a reason and evidence. Saving records your position; it does not complete work.'),
+    ...fields.map((name, i) => field({ id: 'cp-' + name, label: labels[i],
+      type: i < 4 ? 'textarea' : 'text', rows: 3, required: i < 4,
+      value: template?.body?.[name] || '' })), carried, added,
+    h('button', { type: 'button', onclick: () => {
+      const n = count++;
+      added.append(h('fieldset', null, h('legend', null, 'New unresolved item'),
+        field({ id: `new-${n}-id`, label: 'Item ID', required: true }),
+        field({ id: `new-${n}-kind`, label: 'Kind', type: 'select', options: (template?.open_item?.kind || []).map(k => [k, k]) }),
+        field({ id: `new-${n}-text`, label: 'Unresolved work', type: 'textarea', required: true }),
+        field({ id: `new-${n}-source`, label: 'Source', required: true })));
+      ctx.setDirty(true);
+    } }, 'Add unresolved item'),
+    field({ id: 'cp-lane', label: 'Lane state', type: 'select', options: [
+      ['', 'Leave lane state unchanged'], ['working', 'Working'], ['waiting-on-coordinator', 'Waiting on coordinator'],
+      ['waiting-on-review', 'Waiting on review'], ['waiting-on-user', 'Waiting on user'], ['idle', 'Idle']] }),
+    field({ id: 'cp-waiting', label: 'Waiting on', hint: 'For a waiting state, name coordinator, reviewer, user, or an exact actor ID.' }),
+    field({ id: 'cp-expect', label: 'Expected by', hint: 'Optional time with timezone, for example 2026-10-14T12:00:00Z.' }),
+    h('div', { class: 'actions' }, h('button', { type: 'submit', class: 'primary' }, 'Save checkpoint'),
+      h('button', { type: 'button', onclick: async () => {
+        try { context = await ctx.api.brief(pid, tid); contextReadFailed = false; showContext(); }
+        catch (error) { contextReadFailed = true; save.disabled = true; status.replaceChildren(describe(error)); status.hidden = false; }
+      } }, 'Refresh checkpoint context')));
+  const save = form.querySelector('button[type=submit]');
+  function complete() {
+    const t = context.checkpoint_template;
+    return !contextReadFailed && t && t.carried_open_items !== null && Number.isInteger(t.carried_open_items)
+      && Array.isArray(t.body?.open_items) && t.body.open_items.length === t.carried_open_items
+      && t.body.previous === (context.checkpoint?.id ?? null)
+      && t.body.activity_cursor != null && Object.hasOwn(t.body, 'previous');
+  }
+  function showContext() {
+    carried.replaceChildren();
+    save.disabled = !complete();
+    if (!complete()) {
+      status.replaceChildren('The complete checkpoint context could not be read. Refresh it before saving; your text is kept.');
+      status.hidden = false; return;
+    }
+    status.hidden = true;
+    context.checkpoint_template.body.open_items.forEach((item, i) => carried.append(h('fieldset', null,
+      h('legend', null, item.id), h('p', { class: 'prose' }, item.text), h('p', { class: 'hint' }, 'Source: ', item.source),
+      field({ id: `carry-${i}`, label: 'Disposition', type: 'select', options: [['carry', 'Carry unchanged'], ['resolve', 'Resolve explicitly']] }),
+      field({ id: `why-${i}`, label: 'Resolution reason', type: 'textarea' }),
+      field({ id: `proof-${i}`, label: 'Resolution evidence' }))));
+  }
+  showContext();
+  form.addEventListener('input', () => ctx.setDirty(true));
+  form.addEventListener('submit', async event => {
+    event.preventDefault();
+    if (!complete()) return showContext();
+    const v = formValues(form);
+    const body = JSON.parse(JSON.stringify(context.checkpoint_template.body));
+    for (const name of fields) body[name] = v['cp-' + name];
+    body.open_items = []; body.resolved = [];
+    context.checkpoint_template.body.open_items.forEach((item, i) => {
+      if (v[`carry-${i}`] === 'resolve') body.resolved.push({ id: item.id, reason: v[`why-${i}`], evidence: v[`proof-${i}`] });
+      else body.open_items.push({ ...item });
+    });
+    for (let n = 0; n < count; n++) body.open_items.push({ id: v[`new-${n}-id`], kind: v[`new-${n}-kind`], text: v[`new-${n}-text`], source: v[`new-${n}-source`] });
+    if (v['cp-lane']) {
+      body.lane_state = { schema_version: 1, task: tid, state: v['cp-lane'] };
+      if (v['cp-waiting']) body.lane_state.waiting_on = v['cp-waiting'];
+      if (v['cp-expect']) body.lane_state.expect_by = v['cp-expect'];
+    }
+    status.hidden = true;
+    try {
+      await act(save, () => ctx.api.checkpoint(pid, tid, body), { success: 'Checkpoint recorded', onError: error => {
+        status.replaceChildren(describe(error), error.status === 409 ? ' Refresh the checkpoint context and reconcile before retrying. Your text is kept.' : ' Your text is kept.');
+        status.hidden = false; return true;
+      } });
+    } catch { return; }
+    if (status.hidden) { ctx.setDirty(false); ctx.render(); }
+  });
+  return h('section', { class: 'panel' }, h('div', { class: 'panel-body' }, form));
+}
+
+export function commentForm(ctx, pid, tid) {
+  const status = h('div', { class: 'banner crit', role: 'alert', hidden: true });
+  const form = h('form', { class: 'form', novalidate: true },
+    h('h3', { class: 'small' }, 'Add a comment'), status,
+    field({ id: 'comment-text', label: 'Comment', type: 'textarea', rows: 4, required: true,
+      hint: 'Stored as written under your identity. A comment does not complete or acknowledge work.' }),
+    h('button', { type: 'submit', class: 'primary' }, 'Post comment'));
+  form.addEventListener('input', () => ctx.setDirty(true));
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const text = formValues(form)['comment-text'];
+    if (!text.trim()) return setFieldError(form, 'comment-text', 'Enter a comment.');
+    setFieldError(form, 'comment-text', '');
+    status.hidden = true;
+    try {
+      await act(form.querySelector('button[type=submit]'), () => ctx.api.comment(pid, tid, text), {
+        success: 'Comment posted', onError: (error) => {
+          status.replaceChildren(describe(error)); status.hidden = false; return true;
+        }
+      });
+    } catch { return; }
+    // The input survives refused/unknown outcomes. The API keeps the exact retry key.
+    if (status.hidden) { ctx.setDirty(false); ctx.render(); }
+  });
+  return h('section', { class: 'panel' }, h('div', { class: 'panel-body' }, form));
 }
 
 // Review bodies carry the canonical fields (the contribution id being judged and the
@@ -379,4 +494,64 @@ function deliverForm(ctx, pid, tid, previous, openCount, review, delivered) {
   });
   details.append(h('summary', null, previous ? 'Deliver a revision' : 'Deliver your contribution'), form);
   return details;
+}
+
+
+export function assignmentForm(ctx, pid, tid, task) {
+  const form = h('form', { class: 'form', novalidate: true });
+  const feedback = h('p', { role: 'status', class: 'small muted' }, 'Load the current project roster to assign this task.');
+  const rosterButton = h('button', { type: 'button' }, 'Load assignment roster');
+  let complete = false;
+  let unknown = null;
+  const holder = field({ id: 'assignee', label: 'Assign to', type: 'select', options: [['', 'Unassigned']] });
+  const reason = field({ id: 'reason', label: 'Reason', type: 'textarea', rows: 3, required: true, maxlength: 1000 });
+  const reviewOverride = h('input', { id: 'allow_pending_review', type: 'checkbox' });
+  const slotOverride = h('input', { id: 'allow_held_slot', type: 'checkbox' });
+  const submit = h('button', { type: 'submit', class: 'primary', disabled: true }, 'Assign task');
+  form.append(rosterButton, holder, reason,
+    h('label', null, reviewOverride, ' Allow changing a holder with pending review; review items stay open'),
+    h('label', null, slotOverride, ' Allow changing a holder who holds this task’s merge slot; the slot stays held'),
+    feedback, submit);
+  rosterButton.addEventListener('click', async () => {
+    complete = false; submit.disabled = true; rosterButton.disabled = true;
+    try {
+      const actors = []; const seen = new Set(); let cursor = null;
+      do {
+        const page = await ctx.api.assignmentRoster(pid, { limit: 100, ...(cursor ? { cursor } : {}) });
+        if (!Array.isArray(page.items) || page.more && !page.next_cursor) throw new Error('The project roster is incomplete.');
+        actors.push(...page.items); cursor = page.next_cursor;
+        if (cursor && seen.has(cursor)) throw new Error('The project roster did not advance.');
+        if (cursor) seen.add(cursor);
+      } while (cursor);
+      const select = form.querySelector('select');
+      select.replaceChildren(h('option', { value: '' }, 'Unassigned'), ...actors.map(actor => h('option', { value: actor.actor }, `${actor.name} (${actor.actor})`)));
+      if (task.assignee && actors.some(actor => actor.actor === task.assignee)) select.value = task.assignee;
+      complete = true; feedback.textContent = 'Changing the assignee grants no access. Current eligibility and the holder are checked when you submit.';
+    } catch (error) { feedback.textContent = error.message; }
+    finally { rosterButton.disabled = false; submit.disabled = !complete; }
+  });
+  form.addEventListener('input', () => { ctx.setDirty(true); });
+  form.addEventListener('submit', async event => {
+    event.preventDefault(); if (!complete || submit.disabled) return;
+    const values = formValues(form);
+    const payload = unknown || { expected_assignee: task.assignee || null, assignee: values.assignee || null,
+      reason: values.reason, allow_pending_review: Boolean(reviewOverride.checked), allow_held_slot: Boolean(slotOverride.checked) };
+    if (!payload.reason.trim() || payload.reason.length > 1000) { feedback.textContent = 'Enter a reason of 1–1000 characters.'; return; }
+    submit.disabled = true;
+    try {
+      await ctx.api.assignTask(pid, tid, payload); unknown = null; ctx.setDirty(false);
+      Promise.resolve().then(() => ctx.render()).catch(error => { feedback.textContent = 'Assignment saved. Refresh failed: ' + error.message; });
+    } catch (error) {
+      feedback.textContent = error.message;
+      if (error.uncertain) {
+        unknown = payload; submit.textContent = 'Reconcile identical assignment';
+        for (const tag of ['input', 'textarea', 'select']) form.querySelectorAll(tag).forEach(input => { input.disabled = true; });
+        rosterButton.disabled = true;
+      } else {
+        unknown = null;
+        if (error.status === 409) { complete = false; feedback.textContent += ' Reload the task to compare the current holder; your reason is retained here.'; }
+      }
+    } finally { submit.disabled = !complete; }
+  });
+  return h('section', { class: 'panel' }, h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Assign task')), h('div', { class: 'panel-body' }, form));
 }

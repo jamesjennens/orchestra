@@ -3048,6 +3048,77 @@ line separately and unconfined.
   demote, remove or disable the previous sole owner. Review approval is owner-only;
   a contributor cannot approve, and a worker credential never can.
 
+## Contributor comments, assignment and checkpoint forms
+
+The task page offers a literal comment and the existing canonical checkpoint form
+to writers. Comments use `POST /v1/projects/{project}/tasks/{task}/comments` with
+exactly `{"text":"..."}`, under `tasks.write`. The authenticated principal supplies
+the native author. Text is limited to 65536 UTF-8 bytes; NUL and reserved structured
+record envelopes (including their future-version/BOM/CRLF spellings) are refused.
+The service transports literal text as an attachment. Audit records contain the task
+and byte count, rather than duplicating comment contents.
+
+Assignment uses its own canonical `task-assign` action and `coordinate` capability.
+A contributor's generic task update remains on `tasks.write`; the assignment form
+and `POST /v1/projects/{project}/tasks/{task}/assign` require coordinate authority.
+`GET /v1/projects/{project}/assignment-roster` pages existing eligible identities in
+that project with `limit` and an opaque `next_cursor`. It exposes actor, name and
+kind, without credentials or new access grants. Eligibility is checked again under
+the canonical project and live-authority locks when assignment takes effect.
+
+An assignment body carries exactly `expected_assignee`, `assignee`, `reason`,
+`allow_pending_review` and `allow_held_slot`. Unassigned means JSON `null`, not an
+empty or guessed identity. Both flags are explicit booleans. The reason is literal
+plain text, up to 1000 characters. The request requires an `Idempotency-Key`; reuse
+the same key and body after an uncertain result. The current assignee must match
+the expected one. Stale holders, disabled or removed identities, foreign project
+targets, unreadable state and missing authority refuse without an assignment effect.
+
+Only the assignee is updated. Assignment neither reopens the task nor claims it,
+releases a merge slot, completes review items or changes approval party rules.
+Changing a holder with an open contribution awaiting review or changes requested
+requires `allow_pending_review=true`. Changing the holder who holds the merge slot
+for this task separately requires `allow_held_slot=true`. Pending review items and
+the slot remain in their existing state when either override is used. A coordinator
+cannot approve their own party's work by assigning it to their own agent where
+`approval_by_another_party` is on.
+
+The same guarded operation appends a reserved `Kind: task-assignment-v1` native
+comment recording who assigned, from whom, to whom, server UTC time and the reason.
+Both holders see durable polling notices in the brief, `work --mine` and the lane
+board. Closed-task notices appear beside the work queue and do not add actionable
+tasks; the previous holder sees “This task was taken from you by NAME: reason” and
+the new holder sees “Assigned to you by NAME: reason”. Bounded reads report older
+omissions; complete native history remains available. Reading is not acknowledgement,
+and no push delivery is claimed. Older kits treat the new kind as an ordinary comment. A restore under a different
+project name preserves its original native text and project binding; it does not
+rebind old assignment notices to the restored project.
+
+The native update and comment are two tracker calls inside one guarded operation,
+not a database transaction across both calls. If the update may have committed but
+the notice or response fails, the operation remains uncertain. An exact retry never
+repeats the update or restores an old holder. Inspect the canonical row, history and
+operation journal before attempting a fresh assignment intent. A committed replay
+returns its original result without changing a later assignee, and still requires
+current caller authority.
+
+The Python client has `assignment_roster(project, limit, cursor)` and
+`assign_task(project, task, expected_assignee, assignee, reason, ...)`. Its named
+commands are `assignment-roster PROJECT` and `assign-task PROJECT TASK` with an
+explicit `--expected-assignee NAME` or `--expected-unassigned`, an explicit
+`--assignee NAME` or `--unassign`, `--reason`, and optional separately named override
+flags. Keep an explicit `--idempotency-key` to reconcile an uncertain operation.
+The browser freezes an uncertain assignment's payload and key for an identical retry;
+a stale-holder refusal retains the user's reason and asks them to reload the task.
+
+The checkpoint form carries every existing open item, its source, the current
+previous checkpoint and activity cursor from the canonical template. Resolving an
+item requires an explicit reason and evidence. Missing, incomplete or stale context
+blocks a changed save; an identical previously recorded checkpoint may reconcile
+without writing again. A refresh failure retains the user's inputs. Neither comments nor
+assignment notices infer checkpoint acknowledgements, activity digests or lifecycle
+facts.
+
 ## 11. Unresolved office decisions (owner, before rollout)
 
 1. Hostname, certificate operator and renewal process.
