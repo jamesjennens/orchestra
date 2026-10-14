@@ -56,7 +56,7 @@ class BrowserClientTests(AgentHarness):
             evidence=['waiting'],provenance='reported',trigger='Awaiting further evidence')),encoding='utf-8')
         output=io.StringIO()
         with contextlib.redirect_stdout(output):
-            result=module.main(['--base-url',self.base,'--token',self.token,'lifecycle',self.pid,self.tid,
+            result=module.main(['--base-url',self.base,'--token='+self.token,'lifecycle',self.pid,self.tid,
                 'fact','--dimension','implemented','--file',str(body),'--idempotency-key','copied-cli-fact-1'])
         self.assertEqual(result,0);self.assertEqual(json.loads(output.getvalue())['dimension'],'implemented')
         self.assertEqual(client.lifecycle(self.pid,self.tid)['facts']['implemented']['trigger'],'Awaiting further evidence')
