@@ -30,7 +30,132 @@ Use the named Python client methods `merge_slot`, `acquire_merge_slot`, `release
 
 For rollback, preserve the native project and existing sidecar together so the older kit continues to show the recorded web holder, and have a signed-in owner force-release that holder before rolling back or use the retained newer kit for the same recovery if the holder's identity no longer exists.
 
-This first delivery adds no lifecycle fact writer, integration action, host provenance mark, grant change, store family or rollout switch. The generic endpoint capability/project binding and second-process stale grant limitations retain their existing scope; the new slot path validates its own exact project and capability and uses the supported single service process.
+The first slot delivery used the existing context and journals. The lifecycle routes below add a separate host mark family and writer switch. The generic endpoint capability/project binding and second-process stale grant limitations retain their existing scope; the slot path validates its own exact project and capability and uses the supported single service process.
+
+## Task lifecycle scope and facts over HTTP
+
+`GET /v1/projects/{id}/tasks/{task}/lifecycle` requires project read permission and
+returns the current scope and token, six native facts with evidence and reasons,
+current contribution, standing independent approval, authenticated actor and write
+affordances. The task page shows these values and the reasons an action is unavailable.
+Every write requires current `coordinate` permission: a coordinator/owner session,
+superuser, or personal agent with an active project coordinator grant whose owner
+still holds the role. Worker credentials and ordinary contributor/viewer access
+cannot write these records. This requirement applies with the host author and
+coordinator settings OFF as well as ON.
+
+| Route | Closed request body | Confirmed result |
+| --- | --- | --- |
+| `POST .../lifecycle/scope` | `scope`, `expected_scope_token`, `evidence`, `provenance`, optional `note` | 201 |
+| `POST .../lifecycle/facts/{dimension}` | `scope`, `value`, `evidence`, `provenance`, optional `note`, `trigger` only for `pending` | 201 |
+
+The scope has exactly `source_commit`, `integration_commit`, `release_id` and
+`environment`. Use the GET token as `expected_scope_token`, or null when no scope
+exists. Facts must name the current scope. Dimensions are `implemented`, `tested`,
+`reviewed`, `integrated`, `deployed` and `live-verified`; values are `unknown`,
+`pending`, `passed`, `failed` and `not-applicable`. Evidence/provenance and optional
+note/trigger use the native lifecycle grammar. The service supplies attribution and
+operation identity; do not send `actor`, authority, route, capability or verification
+fields in the body. Scope compare-and-set controls never enter the native payload.
+
+All values of `reviewed` and `integrated` require the current contribution's
+standing independent approval, with no unresolved review requests. The approver
+must be a different party from both author and current assignee, the source must
+equal the full approved commit, and the caller must hold the merge slot for this
+task. These requirements are checked again under the project and configured
+authority locks before the effect. Recording a fact writes evidence; it does not
+merge code, deploy a release or perform a verification. Shared native policy
+refusals are shown as complete sentences on the page.
+
+An open native integration hold or a failed verifier attestation refuses every
+`reviewed` and `integrated` value and merge-slot acquisition, including exact
+retries through HTTP, backend result and endpoint receipt caches. The same native
+hold sentences identify the record and who can clear it, and the page disables
+those actions. Stored holds remain effective when `review_workflow_writes` is
+OFF; that setting governs writing `attest`, `hold` and `release-hold`, which stay
+host-only. The merge adapter forwards the configured setting to the native gate.
+Releasing an explicit hold, or superseding a failed attestation as described in
+[reviews](REVIEWS.md), restores eligibility subject to the ordinary source,
+approval, party and slot checks. An `unknown` attestation remains visible and
+does not itself hold a contribution.
+
+Every write needs an `Idempotency-Key`. After an ambiguous response, keep the exact
+body and key; the named client's `UncertainOutcome` retains the key. The browser
+stores lifecycle intents in actor-scoped session storage before sending, and offers
+an explicit identical retry after refresh/reload in that tab. It never retries
+automatically. A 409 conflict requires a fresh read before a changed request;
+an original ambiguous request still needs its original key/body to reconcile.
+Current coordinate permission is required even for a cached successful retry.
+Invalid closed fields/grammar return 422, authority denial 403 (an unreachable
+project remains 404), conflicting scope/source/approval/slot 409, and unavailable
+host state or uncertain outcome 503. A post-effect publication failure is uncertain.
+
+Copied `http_client.py` methods are `lifecycle`, `set_lifecycle_scope` and
+`record_lifecycle_fact`. The standard-library CLI is
+`http_client.py lifecycle PROJECT TASK read|scope|fact`; writes take `--file` with
+the HTTP JSON body, `--idempotency-key`, and `--dimension` for a fact. Reuse that
+file and key when reconciling an ambiguous request.
+
+### Passed integration marks and operator recovery
+
+The installation's `web_lifecycle_mark_writes` switch defaults OFF independently
+of `lifecycle_void_writes`. An operator inspects or changes it with
+`admin.py --root RUNTIME web_lifecycle_mark_writes status|on|off --actor OPERATOR`.
+Changes use the deployment lock and authority audit. Enable it only after backup
+and restore readiness. With it OFF, `integrated=passed` is refused before native
+effect with an operator remedy; scope and other authorized facts/values still work.
+Reads and absent legacy families create no mark directory.
+
+With it ON, the endpoint publishes one bounded host record after the native passed
+integration event. `projects/PROJECT/.web-lifecycle-marks/<sha256>.json` binds the
+exact project/task/event, payload, native author/time and trusted coordinate route.
+The shared historical recorder reader accepts a current listed operator or an
+exact valid host mark. A later grant/operator change or turning the writer OFF does
+not erase issued authority. Marks confer no other operator/write permission;
+ordinary exported JSON cannot manufacture them. Existing legacy native trust and
+lifecycle VOID corrections retain their meaning.
+
+The mark family is included in coordination backup, scheduled backup and project
+backup-copy, with a bounded `.web-lifecycle-marks-manifest.json`. Restore verifies
+the complete member set, hashes and restored native event bindings before clearing
+`.web-lifecycle-marks-restore.json`. Missing expected/damaged families or an
+interrupted restore retain explicit uncertainty. Preserve files and inspect the
+native event and guarded operation journal before repair; do not delete a marker
+to claim success. Exact restore retries can finish the same manifest. Legacy
+backups without marks confer no marked eligibility. `restore-new` always creates
+an unused, DIFFERENT project name. It preserves mark bytes as historical evidence,
+but **every such restore loses marked eligibility in the destination** because
+marks remain bound to the source project name. The command prints a loud warning;
+rc 0 means the data restore succeeded, not that marked authority survived.
+Lifecycle audit reports these integrations as questionable, and they cannot
+qualify later contribution bases through mark authority. Preserve the complete
+source backup and reconcile eligibility with an installation operator before
+continuing integrations. Re-granting current web access does not rebind old marks.
+A marks-free legacy sidecar restores no marks into its new destination; absence
+in that backup does not prove the source never had marks. The low-level restore
+refuses overwriting an existing family with a missing manifest, but that is not
+the CLI's new-destination recovery path.
+
+Mark directories are created with POSIX mode0700, files and restore markers with
+mode0600. Group- or world-writable directories/members are reported unreadable
+and confer no marked authority; preserve them for operator inspection before
+repairing ownership/permissions. Windows ACL behavior requires separate host
+validation; POSIX mode tests do not establish it.
+
+Host ownership and operator restore are the trust boundary, not authenticated
+origin. **Never use an older kit to back up or restore a project holding marks.**
+Its backup can exit successfully, omit the family, and replace the complete
+new-kit sidecar with a marks-free one; its restore refuses a sidecar containing
+these new paths. Before downgrade, stop writers and take and retain an immutable,
+complete new-kit native/sidecar/journal backup outside the older kit's backup
+location. Preserve that kit and its restore procedure. Older readers ignore marks
+and cannot use marked integrations as later bases. Restore using the mark-capable
+kit, heed the renamed-destination warning, and reconcile eligibility before
+resuming work.
+
+The disposable `InProcessBackend` supports scope and ordinary facts, but refuses
+all reviewed/integrated writes with an explicit host-backend limitation. It cannot
+issue production host marks or represent a native held merge slot.
 
 **Status:** runbook for the disposable `.19` implementation. It describes a
 deployment shape but does not authorize one. No office hostname, certificate,
@@ -1821,7 +1946,7 @@ things, and an installation that uses neither behaves as before.
 | Claim, deliver, checkpoint, review, recommend, propose | no | yes | yes | yes |
 | Approve a contribution, triage a proposal (`reviews.approve`) | no | no | yes | yes |
 | Record the owner's decision on a proposal (`decide`) | no | no | no | yes |
-| `coordinate` (web merge-slot acquire and release; lifecycle facts are a later delivery) | no | no | yes | yes |
+| `coordinate` (web merge-slot acquire/release and lifecycle scope/six facts) | no | no | yes | yes |
 | Members, worker credentials, archive, the audit, this grant (`project.admin`) | no | no | no | yes |
 
 An owner gives and takes the role on the Members panel (`PUT

@@ -55,7 +55,9 @@ from http_authority import (ALL_CAPABILITIES, CAP_ACCOUNTS_ADMIN, CAP_AGENTS, CA
                             JOURNAL_MAX_SKEW_SECONDS, JOURNAL_SUSPECT_SETTLE_SECONDS,
                             AuthorityDenied, authority_request, clock_advance,
                             clock_persist, clock_report, clock_state,
-                            clock_trusted, decide, file_lock)
+                            clock_trusted, decide, file_lock,
+                            actor_person as http_actor_person,
+                            actor_parties as full_actor_parties, namespace_holds)
 
 # Password verifier policy. n=2**14, r=8 needs ~16 MiB per hash; scrypt is the
 # memory-hard scheme available in the standard library without third-party wheels.
@@ -2322,10 +2324,7 @@ class Service:
         two unknown labels are the same person only when they are equal.
         """
         with self.store.lock:
-            agent = self.state['agents'].get(actor) if isinstance(actor, str) else None
-            if isinstance(agent, dict) and agent.get('owner'):
-                return agent['owner']
-        return actor
+            return http_actor_person(self.state, actor)
 
     def actor_parties(self, actor, project_id=None, full=False):
         """The accounts a task actor's work belongs to: its PARTY, as a set.
@@ -2348,23 +2347,12 @@ class Service:
         * anything else: the name itself. A writer that is no account, no agent and under no
           credential record (a name of the host route) is its own party.
         """
-        person = self.actor_person(actor)
         # ``full``: an agent that approves is judged by party whatever the setting says
         # (kittrial-5bb.209); a person's approval follows the setting.
-        if not (self.approval_by_another_party or full) or not isinstance(actor, str) or not actor:
-            return {person}
         with self.store.lock:
-            head = actor.split('/', 1)[0]
-            agent = self.state['agents'].get(head)
-            if isinstance(agent, dict) and agent.get('owner'):
-                return {agent['owner']}
-            if head in self.state['users']:
-                return {head}
-            issuers = {credential['user_id'] for credential in self.state['credentials'].values()
-                       if isinstance(credential, dict) and not credential.get('agent_id')
-                       and project_id is not None and credential.get('project_id') == project_id
-                       and self._holds(credential.get('actor'), actor)}
-            return issuers or {person}
+            if not (self.approval_by_another_party or full):
+                return {http_actor_person(self.state, actor)}
+            return full_actor_parties(self.state, actor, project_id)
 
     @staticmethod
     def _holds(namespace, name):
@@ -2378,11 +2366,7 @@ class Service:
         # not take the other spelling, and work under either spelling belongs to everyone who held it.
         # Without this, the first holder's credentials could be revoked and the other account issued the
         # lower-case name with no waiver, after which old work belonged to both and neither could approve.
-        if not (isinstance(namespace, str) and namespace and isinstance(name, str) and name):
-            return False
-        namespace = namespace.casefold()
-        name = name.casefold()
-        return name == namespace or name.startswith(namespace.rstrip('/') + '/')
+        return namespace_holds(namespace, name)
 
     def note_settings(self):
         """Record what the installation's settings are at this start; answers ``(was, is)``.

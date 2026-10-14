@@ -392,6 +392,44 @@ def deny(status, code, message, detail=None):
     return AuthorityDenied(status, code, message, detail)
 
 
+def actor_person(state, actor):
+    """The account behind an exact agent id, otherwise its attribution label."""
+    agent = state['agents'].get(actor) if isinstance(actor, str) else None
+    return agent['owner'] if isinstance(agent, dict) and agent.get('owner') else actor
+
+
+def namespace_holds(namespace, name):
+    """The existing folded worker namespace rule, shared across the seam."""
+    if not (isinstance(namespace, str) and namespace and isinstance(name, str) and name):
+        return False
+    namespace, name = namespace.casefold(), name.casefold()
+    return name == namespace or name.startswith(namespace.rstrip('/') + '/')
+
+
+def actor_parties(state, actor, project_id=None):
+    """Full attribution policy of an HTTP actor, including historical issuers.
+
+    Callers hold the service's state lock or the configured live-authority lock.
+    Grant/role/expiry changes do not rewrite whose work an old actor belongs to.
+    An ambiguous worker namespace belongs to every issuer; ambiguity can only
+    refuse more approvals. This is the same policy used by HTTP approval.
+    """
+    person = actor_person(state, actor)
+    if not isinstance(actor, str) or not actor:
+        return {person}
+    head = actor.split('/', 1)[0]
+    agent = state['agents'].get(head)
+    if isinstance(agent, dict) and agent.get('owner'):
+        return {agent['owner']}
+    if head in state['users']:
+        return {head}
+    issuers = {credential['user_id'] for credential in state['credentials'].values()
+               if isinstance(credential, dict) and not credential.get('agent_id')
+               and project_id is not None and credential.get('project_id') == project_id
+               and namespace_holds(credential.get('actor'), actor)}
+    return issuers or {person}
+
+
 def authority_request(principal, project_id, capability, *, now=None):
     """Build the durable-identity descriptor for one principal/capability decision."""
     return {'via': principal.via, 'user_id': principal.user_id,
@@ -919,7 +957,7 @@ class NativeRunner:
     """
 
     __slots__ = ('_dispatch', 'attempted_write', 'calls', 'wrote',
-                 'lifecycle_project', '_lifecycle_void_journal')
+                 'lifecycle_project', '_lifecycle_void_journal', '_web_lifecycle_mark_journal')
 
     def __init__(self, dispatch, project=None):
         self._dispatch = dispatch
@@ -931,6 +969,7 @@ class NativeRunner:
         self.wrote = False
         self.lifecycle_project = project
         self._lifecycle_void_journal = None
+        self._web_lifecycle_mark_journal = None
 
     def __call__(self, argv):
         self.calls += 1
@@ -2184,6 +2223,7 @@ BLOCK_CAPABILITIES = {
     'web-merge-slot': {'check': CAP_READ, 'acquire': CAP_COORDINATE,
                        'release': CAP_COORDINATE, 'force-release': CAP_PROJECT_ADMIN,
                        'create': CAP_PROJECT_ADMIN},
+    'web-lifecycle': {'read': CAP_READ, 'scope': CAP_COORDINATE, 'fact': CAP_COORDINATE},
     'review': {'approve': CAP_APPROVE,     # reviews.add, operation approve
                None: CAP_REVIEWS},         # reviews.add, every other operation
     'proposal': {'submit': CAP_PROPOSALS, 'revise': CAP_PROPOSALS,     # proposals.submit
@@ -2209,7 +2249,7 @@ def required_capability(request):
     args = request.get('args')
     if not isinstance(args, list) or not args or any(not isinstance(token, str) for token in args):
         return None
-    if action in ('coordinate', 'web-merge-slot'):
+    if action in ('coordinate', 'web-merge-slot', 'web-lifecycle'):
         if len(args) != 1:
             return None
         item = {'text': args[0]}
