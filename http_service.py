@@ -2735,6 +2735,7 @@ class EndpointBackend:
                                                     for entry in review['recommendation_keys']
                                                     if isinstance(entry, dict)]
                                                    if isinstance(review.get('recommendation_keys'), list) else None),
+                           'next_actor': review.get('next_actor') or 'unknown',
                            'revisions': priors + 1 if contribution else 0,
                            'warnings': review.get('warnings') or [],
                            # Additive (kittrial-5bb.52): the machine-readable
@@ -2748,6 +2749,7 @@ class EndpointBackend:
                 # What a checkpoint must carry to say which activity it has seen. It is in
                 # the canonical brief; without it here an agent could not write a first
                 # checkpoint from the brief alone (kittrial-5bb.113).
+                'next_action': data.get('next_action'),
                 'activity_cursor': data.get('activity_cursor'),
                 'warnings': data.get('warnings') or [],
                 # The canonical brief already bounds refs, authors and omissions;

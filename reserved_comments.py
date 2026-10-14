@@ -174,8 +174,8 @@ def comment_target(args):
 # docs/REFERENCE_CATALOG_DESIGN.md (.41), docs/REQUIREMENTS_GATHERING_DESIGN.md
 # (.58) and docs/CAPABILITY_INDEX_DESIGN.md (.60). No writer exists yet: the
 # prefixes are reserved first, so the later slices' records can never be forged
-# through the raw path and a rollback to this kit stays safe. Only v1 is reserved;
-# a v2 writer needs its own tolerant-reader step (.58 3.8).
+# through the raw path and a rollback to this kit stays safe. All numeric versions
+# are reserved below; a v2 writer still needs its tolerant-reader step (.58 3.8).
 REFERENCE_ENTRY_PREFIX = 'Kind: reference-entry-v1\n'
 # kittrial-5bb.98: a reference revision whose authority is an attestation (an
 # operational fact, not a repository or URL pointer) is version 2 of the entry record.
@@ -272,6 +272,13 @@ _RECORD_KIND_RESERVATIONS = {
     'coordinator-decision': ('coordinator decision',
                              'decisions record on the coordination host or in the web interface'),
 }
+# Reserve all versions of EVERY declared envelope, including kinds whose only
+# reader is currently v1. A rolled-back kit must not admit future structured text.
+for _prefix, _kind, _operation in RESERVED:
+    _versioned = re.fullmatch(r'Kind: ([a-z][a-z-]*?)(?:-v[0-9]+|\.)\n', _prefix)
+    if _versioned:
+        _RECORD_KIND_RESERVATIONS.setdefault(_versioned.group(1), (_kind, _operation))
+
 _RECORD_KIND_ANY_VERSION = re.compile(
     r'Kind: (%s)-v[0-9]+\n' % '|'.join(re.escape(kind) for kind in _RECORD_KIND_RESERVATIONS))
 

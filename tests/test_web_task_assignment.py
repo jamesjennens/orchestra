@@ -99,6 +99,117 @@ class NativeAssignmentTests(RulesHelpers,unittest.TestCase):
             self.assertNotIn(tid,[x['task'] for x in queue['items']])
             self.assertTrue(any(x['task']==tid for x in queue['assignment_notices']['items']))
 
+    def test_unassign_in_progress_with_checkpoint_keeps_the_claim_step_over_http(self):
+        self.test_unassign_in_progress_is_open_visible_and_claimable_over_http(with_checkpoint=True)
+
+    def test_unassign_in_progress_is_open_visible_and_claimable_over_http(self, with_checkpoint=False):
+        harness, owner = self.web(); old = harness.admin_user['id']
+        uid, contributor = self.member(harness, owner, 'unassign-claimant')
+        tid = self.task(assignee=old)
+        moved = self.r.bd('update', tid, '--status', 'in_progress', '--json')
+        self.assertEqual(moved.returncode, 0, moved.stderr)
+        if with_checkpoint:
+            base = '/v1/projects/pp/tasks/' + tid
+            prior = harness.request('GET', base + '/brief', token=owner)
+            self.assertEqual(prior.status, 200, prior.data)
+            body = dict(prior.data['checkpoint_template']['body'], intent='Finish this task',
+                        acceptance='Claim before continuing', summary='Former holder checkpoint',
+                        next_action='Former holder action kept as history')
+            saved = harness.request('POST', base + '/checkpoints', body, token=owner,
+                                    key='unassign-with-former-checkpoint')
+            self.assertEqual(saved.status, 201, saved.data)
+        result = harness.request('POST', '/v1/projects/pp/tasks/' + tid + '/assign',
+            self.assignment_body(old, None), token=owner, key='unassign-progress-claim')
+        self.assertEqual(result.status, 200, result.data)
+        row = next(x for x in self.rows() if x['id'] == tid)
+        self.assertFalse(row.get('assignee')); self.assertEqual(row['status'], 'open')
+        brief = harness.request('GET', '/v1/projects/pp/tasks/' + tid + '/brief', token=contributor)
+        self.assertEqual(brief.status, 200, brief.data)
+        self.assertEqual(brief.data['review']['next_actor'], 'anyone')
+        self.assertIn('Claim ' + tid + ' before starting work', brief.data['next_action'])
+        if with_checkpoint:
+            self.assertIn('Former holder action kept as history', brief.data['next_action'])
+            self.assertIn('STALE CHECKPOINT', brief.data['next_action'])
+        available = harness.request('GET', '/v1/projects/pp/tasks?status=open', token=contributor)
+        self.assertEqual(available.status, 200, available.data)
+        self.assertIn(tid, [item['id'] for item in available.data['items']])
+        queue = self.endpoint('work', 'ops', ['--claimable', '--json'])
+        self.assertEqual(queue['returncode'], 0, queue)
+        self.assertIn(tid, [item['task'] for item in json.loads(queue['stdout'])['items']])
+        claim = harness.request('POST', '/v1/projects/pp/tasks/' + tid + '/claim', {},
+                                token=contributor, key='claim-unassigned-progress')
+        self.assertEqual(claim.status, 200, claim.data)
+        row = next(x for x in self.rows() if x['id'] == tid)
+        self.assertEqual(row['assignee'], uid); self.assertEqual(row['status'], 'in_progress')
+
+    def test_unassign_pending_contribution_requires_flag_and_keeps_progress(self):
+        harness, owner = self.web()
+        for state in ('awaiting-review', 'changes-requested'):
+            tid = self.task(assignee='worker-old')
+            moved = self.r.bd('update', tid, '--status', 'in_progress', '--json')
+            self.assertEqual(moved.returncode, 0, moved.stderr)
+            made = self.contribute(tid, 'worker-old'); self.assertEqual(made['returncode'], 0, made)
+            contribution = json.loads(made['stdout'])['comment_id']
+            if state == 'changes-requested':
+                changed = self.post_review(tid, 'ops', dict(schema_version=1, operation='request-changes',
+                    operation_id='unassign-request-' + tid, task=tid, previous=contribution,
+                    contribution=contribution, items=[dict(id='unassign-keep-fix', text='Retain review item')]))
+                self.assertEqual(changed['returncode'], 0, changed)
+            body = self.assignment_body('worker-old', None); path = '/v1/projects/pp/tasks/' + tid + '/assign'
+            before = self.rows()
+            refused = harness.request('POST', path, body, token=owner, key='unassign-no-flag-' + tid)
+            self.assertEqual(refused.status, 409, refused.data); self.assertEqual(before, self.rows())
+            allowed = harness.request('POST', path, dict(body, allow_pending_review=True),
+                                       token=owner, key='unassign-with-flag-' + tid)
+            self.assertEqual(allowed.status, 200, allowed.data)
+            row = next(x for x in self.rows() if x['id'] == tid)
+            self.assertEqual(row['status'], 'in_progress'); self.assertFalse(row.get('assignee'))
+            from review_state import project
+            review = project(row, journal=self.project, operators=['ops'])
+            self.assertEqual(review['review_state'], state)
+            if state == 'changes-requested': self.assertEqual(review['pending_requests'][0]['item'], 'unassign-keep-fix')
+
+    def test_roster_read_completes_while_shared_project_and_authority_locks_are_held(self):
+        import fcntl, threading
+        from http_service import authority_request, CAP_COORDINATE
+        harness, token = self.web()
+        principal = harness.service.authenticate(token)
+        descriptor = authority_request(principal, 'pp', CAP_COORDINATE, now=harness.service._expiry_now())
+        harness.service.store.save()
+        done = threading.Event(); answer = {}; error = []
+        def read():
+            try:
+                answer.update(harness.backend._endpoint('assignment-roster', 'pp', harness.admin_user['id'],
+                    [json.dumps(dict(offset=0, limit=200))], authority=descriptor, require_authority=True))
+            except BaseException as caught: error.append(caught)
+            finally: done.set()
+        thread = threading.Thread(target=read, daemon=True)
+        with (self.project/'.coordination.lock').open('a') as project_lock, Path(str(harness.store.path)+'.lock').open('a') as authority_lock:
+            fcntl.flock(project_lock, fcntl.LOCK_SH); fcntl.flock(authority_lock, fcntl.LOCK_SH)
+            try:
+                thread.start(); concurrent = done.wait(8)
+            finally:
+                fcntl.flock(authority_lock, fcntl.LOCK_UN); fcntl.flock(project_lock, fcntl.LOCK_UN)
+        thread.join(20)
+        self.assertTrue(concurrent, 'Read queued behind a shared lock: it still requested an exclusive lock')
+        self.assertFalse(error, error); self.assertEqual(answer.get('returncode'), 0, answer)
+        self.assertTrue(json.loads(answer['stdout'])['items'])
+
+    def test_epic_assignment_changes_holder_and_preserves_native_type_and_status(self):
+        harness, owner = self.web(); old = harness.admin_user['id']
+        uid, _ = self.member(harness, owner, 'epic-assignee')
+        created = self.r.bd('create', 'Epic holder metadata', '--type', 'epic', '--assignee', old, '--json')
+        self.assertEqual(created.returncode, 0, created.stderr)
+        tid = json.loads(created.stdout)['id']; before = next(x for x in self.rows() if x['id'] == tid)
+        assigned = harness.request('POST', '/v1/projects/pp/tasks/' + tid + '/assign',
+            self.assignment_body(old, uid), token=owner, key='assign-native-epic')
+        self.assertEqual(assigned.status, 200, assigned.data)
+        row = next(x for x in self.rows() if x['id'] == tid)
+        self.assertEqual(row['assignee'], uid); self.assertEqual(row['issue_type'], 'epic')
+        self.assertEqual(row['status'], before['status'])
+        import work
+        self.assertFalse(work.claimable('epic', row['status'], None, None, 'none'))
+
     def assignment_body(self, old, new, **changes):
         return dict(dict(expected_assignee=old,assignee=new,reason='Native boundary test',
                          allow_pending_review=False,allow_held_slot=False),**changes)
@@ -377,6 +488,28 @@ class NativeAssignmentTests(RulesHelpers,unittest.TestCase):
         envelope=json.loads(old_read.stdout);self.assertEqual(0,envelope['returncode'],envelope)
         comments=json.loads(envelope['stdout']);self.assertTrue(any(c['text']==notice['text'] for c in comments))
         self.assertEqual(before,self.rows())
+        # The released kit can accept this newly reserved kind through raw SSH.
+        # Its canonical shape/author/hash do not establish a real row transition.
+        forged = task_assignment.make_notice(dict(schema_version=1,
+            operation_id='rollback-forged-notice', task=tid, expected_assignee=target,
+            assignee='forged-holder', reason='Forged on the older kit',
+            allow_pending_review=False, allow_held_slot=False), project='pp',
+            assigned_by='older-kit-forger', at='2026-10-14T23:05:00+00:00')
+        forgery = dict(project='pp', actor='older-kit-forger', action='bd',
+            args=['comments', 'add', tid, '@attachment:0', '--json'],
+            attachments={'0': {'flag': '--file', 'text': task_assignment.body(forged)}})
+        old_write = subprocess.run([sys.executable, str(old_kit/'endpoint.py'), '--root', str(self.root)],
+            input=json.dumps(forgery), env=admin.environment(self.root), capture_output=True, text=True, timeout=90)
+        self.assertEqual(old_write.returncode, 0, old_write.stderr)
+        envelope = json.loads(old_write.stdout); self.assertEqual(envelope['returncode'], 0, envelope)
+        current = next(x for x in self.rows() if x['id'] == tid)
+        forged_comment = next(c for c in current['comments'] if c['text'] == task_assignment.body(forged))
+        self.assertIsNotNone(task_assignment.parse_comment(forged_comment, project='pp', task=tid))
+        self.assertEqual(task_assignment.notices(current, 'pp', 'forged-holder')['total'], 0)
+        self.assertEqual(current['assignee'], target)
+        self.assertTrue(task_assignment.notices(current, 'pp', target)['items'])
+        before = self.rows()  # The older-kit forgery is retained as history, never a holder.
+        row = next(x for x in before if x['id'] == tid)
         backups=self.root/'backups';backups.mkdir(exist_ok=True)
         init=self.r.bd('backup','init',str(backups/'pp'));self.assertEqual(0,init.returncode,init.stderr)
         def command(script,*args):
@@ -391,6 +524,8 @@ class NativeAssignmentTests(RulesHelpers,unittest.TestCase):
         restored_notice=next(c for c in restored['comments'] if c['id']==notice['id'])
         self.assertEqual(notice,restored_notice)
         self.assertIsNone(task_assignment.parse_comment(restored_notice,project='assignmentcopy',task=tid))
+        self.assertEqual(task_assignment.notices(restored, 'assignmentcopy', old)['total'], 0)
+        self.assertEqual(task_assignment.notices(restored, 'assignmentcopy', target)['total'], 0)
         self.assertIsNotNone(task_assignment.parse_comment(restored_notice,project='pp',task=tid))
         self.assertEqual(before,self.rows())
 

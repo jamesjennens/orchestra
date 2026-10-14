@@ -48,7 +48,15 @@ class CommentTests(AgentHarness):
 
     def test_reserved_envelopes_and_variants_refused(self):
         token, pid, tid = self.fixture()
-        for prefix in ('task-checkpoint-v1', 'lifecycle-v1', 'contribution-review-v1', 'record-void-v1', 'task-assignment-v1'):
+        kinds = ('task-assignment', 'contribution-review', 'task-checkpoint', 'lifecycle',
+                 'lifecycle-event-correction', 'requirement-revision', 'requirement-acceptance',
+                 'requirement-owner-acceptance', 'requirement-owner-state', 'requirement-owner-state-reason',
+                 'task-handoff', 'task-handoff-complete', 'plan-registration', 'record-void',
+                 'integration-revert', 'review-recommendation', 'reference-entry', 'reference-acceptance',
+                 'requirement-proposal', 'proposal-disposition', 'contribution-settings',
+                 'capability-entry', 'capability-acceptance', 'capability-verification', 'capability-alias',
+                 'open-item', 'item-resolution', 'owner-answer', 'coordinator-decision', 'lane-state')
+        for prefix in [kind + '-v' + version for kind in kinds for version in ('1', '9', '999999999')]:
             for leading, newline in [('', '\n'), ('\ufeff', '\r\n')]:
                 result = self.post(token, pid, tid, {'text':leading+'Kind: '+prefix+newline+'{}'})
                 self.assertEqual(422, result.status, result.data)

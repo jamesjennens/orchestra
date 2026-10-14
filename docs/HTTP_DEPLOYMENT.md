@@ -3199,8 +3199,17 @@ the same key and body after an uncertain result. The current assignee must match
 the expected one. Stale holders, disabled or removed identities, foreign project
 targets, unreadable state and missing authority refuse without an assignment effect.
 
-Only the assignee is updated. Assignment neither reopens the task nor claims it,
-releases a merge slot, completes review items or changes approval party rules.
+Assignment changes the assignee. Unassigning an `in_progress` task with no
+contribution in flight also returns its native status to `open`. An undelivered
+ordinary task then appears in the available-work queue and another contributor
+can claim it. A task with delivered history retains the existing delivered-work
+claim guard; use assignment to name its next holder. With an in-flight contribution,
+unassignment retains its status and review items, and an awaiting-review or
+changes-requested contribution still requires the explicit displacement flag.
+Other assignments retain status: a closed task can be reassigned and stays closed;
+an epic may be assigned, but that does not make it claimable as an ordinary task.
+Assignment never claims the task, releases a merge slot, completes review items
+or changes approval party rules.
 Changing a holder with an open contribution awaiting review or changes requested
 requires `allow_pending_review=true`. Changing the holder who holds the merge slot
 for this task separately requires `allow_held_slot=true`. Pending review items and
@@ -3268,3 +3277,17 @@ facts.
 
 Until these are recorded, this service is a disposable local validation build,
 not an office deployment.
+
+
+### Assignment notices across rollback and restore
+
+The released older kit reads an assignment notice as an ordinary comment and can
+accept a lookalike record through its raw comment path. On re-upgrade, notices are
+shown only along a holder-change chain anchored in the task's current native
+assignee; a notice that disagrees with that row is ignored. A notice never becomes
+a second source of ownership. `restore-new` retains the native comments and current
+assignee but does not rebind their original project: previous holders lose the
+assignment notices in their work and lane views of the new project, while the
+original comments remain in task history. The assignment-roster read uses shared
+project and authority locks so concurrent readers do not queue behind an exclusive
+read lock; assignment effects retain their exclusive guards.

@@ -1437,7 +1437,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                                authority_config=authority_config,
                                require_authority=require_authority,runner=runner)
     if action in ('assignment-roster','task-assign'):
-        from http_authority import CAP_COORDINATE, file_lock, read_state, server_time
+        from http_authority import CAP_COORDINATE, read_state, server_time
         from task_assignment import AssignmentError, eligible_roster, standing_allowed, validate_request, apply as assignment_apply
         from sessions import read_registry
         args=request.get('args', [])
@@ -1491,10 +1491,11 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                                         operators=configured_operators(root),at=server_time())
                 return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':warning_text(warnings)}
             with (path/'.coordination.lock').open('a') as lock:
-                fcntl.flock(lock,fcntl.LOCK_EX)
+                fcntl.flock(lock,fcntl.LOCK_SH if action=='assignment-roster' else fcntl.LOCK_EX)
                 if action=='assignment-roster':
                     if authority_config is None:raise AssignmentError(403,'Verified coordinate authority is required in this project.')
-                    with file_lock(authority_config.lock):
+                    with Path(authority_config.lock).open('a') as authority_lock:
+                        fcntl.flock(authority_lock,fcntl.LOCK_SH)
                         assignment_authority();actors=roster();offset=page['offset'];limit=page['limit']
                         result={'schema_version':1,'items':actors[offset:offset+limit],'total':len(actors),
                                 'more':offset+limit<len(actors),'offset':offset,

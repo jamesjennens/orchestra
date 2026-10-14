@@ -348,7 +348,17 @@ def apply(payload, actor, run, project, *, eligible, operators=None, at):
     if not change['changed']:
         return dict(result, notice=None, comment_id=None)
     notice = make_notice(payload, project=Path(project).name, assigned_by=actor, at=at)
-    run(['update', payload['task'], '--assignee', payload['assignee'] or '', '--json'])
+    # Unassignment of ordinary unfinished work restores the native claim path.
+    # An in-flight contribution retains its status and explicit displacement flag.
+    in_flight = bool(review['contribution'] and review['review_state'] not in
+                     ('integrated', 'withdrawn', 'superseded'))
+    reopen = payload['assignee'] is None and row['status'] == 'in_progress' and not in_flight
+    update = ['update', payload['task'], '--assignee', payload['assignee'] or '']
+    if reopen:
+        update += ['--status', 'open']
+    run(update + ['--json'])
+    result.update(reopened=reopen, status_before=row['status'],
+                  status_after='open' if reopen else row['status'])
     comment = record_json.loads(run(['comments', 'add', payload['task'], body(notice), '--json']))
     if not isinstance(comment, dict) or not comment.get('id'):
         raise ValueError('Assignment notice result cannot be reconciled')
@@ -364,9 +374,14 @@ def notices(issue, project, actor, limit=5):
     if not isinstance(project,str) or not project:
         return {'items':[], 'total':0, 'omitted':0}
     found=[]
+    # Notices are an audit view, never an independent holder record. Anchor the
+    # newest connected chain in the native row; rollback-written off-chain notices
+    # cannot invent a current assignment or a displacement for another holder.
+    expected = issue.get('assignee') or None
     for comment in reversed(issue.get('comments') or []):
         notice=parse_comment(comment,project=project,task=issue.get('id'))
-        if notice is None:continue
+        if notice is None or notice['to'] != expected:continue
+        expected = notice['from']
         message=holder_message(notice,actor) if actor else None
         if message or actor is None:
             found.append(dict(comment_id=str(comment.get('id')),task=issue['id'],message=message,notice=notice))

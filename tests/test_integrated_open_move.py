@@ -11,7 +11,9 @@ class IntegratedOpenMoveTests(unittest.TestCase):
         move, sentence, actor = work.move_decision(
             'integrated', 'example-task', True, assignee='worker-a', closed=False)
         self.assertEqual((move, actor), ('you', 'assignee'))
-        self.assertIn('remaining', sentence)
+        self.assertIn('remaining scope if any', sentence)
+        self.assertIn('otherwise checkpoint that nothing remains for you', sentence)
+        self.assertIn('coordinator', sentence)
         self.assertIn('review example-task', sentence)
 
     def test_other_caller_does_not_become_the_assignee(self):

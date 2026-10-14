@@ -150,7 +150,8 @@ def _caller_move(state, task, owned, named_reviewer=False, pending_items=0, rede
     if state == 'integrated':
         # An integrated revision does not finish a task deliberately kept open.
         return 'you', ('This task stays open after its contribution was integrated. '
-                       'It is your work: read %s and continue its remaining scope.' % back)
+                       'Read %s; continue the task\'s remaining scope if any, otherwise checkpoint '
+                       'that nothing remains for you. Deployment or verification may be the coordinator\'s move.' % back)
     if state in (None, 'none'):
         return 'you', ('This is your work: no contribution has been delivered yet. Read %s '
                        'for its current state and deliver one.' % back)

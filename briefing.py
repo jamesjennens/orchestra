@@ -832,6 +832,9 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
     # after restore-new under another name an unchanged task reads current, which is true
     # of the copy, but the restore is still worth reconciling before trusting the
     # checkpoint's next action. Before kittrial-5bb.131 the STALE reading was that prompt.
+    if review.get('next_actor') == 'anyone':
+        claim_step = 'This task is open and unassigned. Claim %s before starting work.' % task
+        next_action = claim_step + (' ' + next_action if p is not None else '')
     taken_in=None if p is None else checkpoint_taken_in(p['activity_cursor'],project)
     if taken_in and not stale and review['review_state'] not in review_next:
         # A prefix, like OUTSTANDING DIRECTIONS, so neither hides the other.

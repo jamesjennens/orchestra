@@ -82,6 +82,22 @@ class AssignmentRecords(unittest.TestCase):
                     check_comment_body(leading+'Kind: task-assignment-'+version+newline+'{}', 'test')
         check_comment_body('Ordinary prose mentions Kind: task-assignment-v1 later.', 'test')
 
+    def test_notices_follow_only_a_chain_anchored_in_the_actual_native_holder(self):
+        first = self.notice()
+        second = self.notice(dict(self.request(), operation_id='assignment-operation-0002',
+                                  expected_assignee='worker-new', assignee='worker-last'))
+        rollback_forgery = self.notice(dict(self.request(), operation_id='assignment-operation-0003',
+                                           expected_assignee='worker-last', assignee='forged-holder'))
+        comments = [dict(id=str(i), author='http/coordinator', text=assignment.body(value))
+                    for i, value in enumerate((first, second, rollback_forgery), 1)]
+        issue = dict(id='trial-1', assignee='worker-last', comments=comments)
+        self.assertEqual(2, assignment.notices(issue, 'trial', None)['total'])
+        self.assertEqual(1, assignment.notices(issue, 'trial', 'worker-old')['total'])
+        self.assertEqual(0, assignment.notices(issue, 'trial', 'forged-holder')['total'])
+        self.assertEqual(0, assignment.notices(dict(issue, assignee='unrelated-holder'), 'trial', None)['total'])
+        self.assertEqual(0, assignment.notices(issue, 'restored-project', None)['total'])
+
+
 
 class AssignmentPolicy(unittest.TestCase):
     def fixture(self):
