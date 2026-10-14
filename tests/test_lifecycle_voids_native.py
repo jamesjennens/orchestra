@@ -528,7 +528,7 @@ class NativeVoidTests(fixture.RealBdLabelAliasTests):
         comment = next(c for row in rows if row['id'] == cut_task for c in row.get('comments', [])
                        if c['text'].startswith(voids.PREFIX))
         printed = io.StringIO()
-        with contextlib.redirect_stdout(printed):
+        with contextlib.redirect_stderr(printed):
             abandoned = admin.lifecycle_abandon_command(fresh.root, 'pp', comment['id'], 'op',
                 'Synthetic abandonment of the cut.', ['synthetic native test'],
                 'released-abandon-' + cut_task)
@@ -556,6 +556,36 @@ class NativeVoidTests(fixture.RealBdLabelAliasTests):
         with self.assertRaisesRegex(ValueError, 'native correction comments without their host entries'):
             released.backup_files(fresh.project, rows)
         self.assertEqual(next(r for r in rows if r['id'] == issued_target['id']), issued_target)
+
+
+class RequireKitCITests(unittest.TestCase):
+    """kittrial-5bb.274 item 7: the GITHUB_ACTIONS branch is run, not only read."""
+
+    def test_missing_kit_under_github_actions_fails_instead_of_skipping(self):
+        recorder = unittest.TestCase()
+        calls = []
+        recorder.fail = lambda message: calls.append(('fail', message))
+        recorder.skipTest = lambda message: calls.append(('skip', message))
+        with mock.patch.dict(os.environ, {'GITHUB_ACTIONS': 'true'}):
+            require_kit(recorder, None, 'released F0 kit', 'ORCHESTRA_F0_RELEASED_KIT')
+        self.assertEqual(calls[0][0], 'fail')
+        self.assertIn('CI must not skip this test', calls[0][1])
+        self.assertIn('ORCHESTRA_F0_RELEASED_KIT', calls[0][1])
+
+    def test_missing_kit_off_ci_skips_and_names_its_variable(self):
+        recorder = unittest.TestCase()
+        calls = []
+        recorder.fail = lambda message: calls.append(('fail', message))
+        recorder.skipTest = lambda message: calls.append(('skip', message))
+        environment = {key: value for key, value in os.environ.items() if key != 'GITHUB_ACTIONS'}
+        with mock.patch.dict(os.environ, environment, clear=True):
+            require_kit(recorder, None, 'released F0 kit', 'ORCHESTRA_F0_RELEASED_KIT')
+        self.assertEqual(calls[0][0], 'skip')
+        self.assertIn('ORCHESTRA_F0_RELEASED_KIT', calls[0][1])
+
+    def test_a_resolved_kit_is_returned_unchanged(self):
+        sentinel = object()
+        self.assertIs(require_kit(unittest.TestCase(), sentinel, 'released F0 kit'), sentinel)
 
 
 if __name__ == '__main__':

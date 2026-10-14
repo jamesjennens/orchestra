@@ -2,12 +2,14 @@
 import atexit
 import contextlib
 import copy
+import hashlib
 import importlib.util
 import io
 import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -188,6 +190,53 @@ class ReleasedKitTests(unittest.TestCase):
                          {'p-task.2': 'voided'})
         self.assertIn(voids.ABANDON_FILE, voids.backup_files(self.project, self.rows))
 
+    def test_the_released_kit_reopens_an_abandoned_correction_after_a_rollback(self):
+        """kittrial-5bb.274 item 4: run rollback step 3 and the released retry.
+
+        Step 3 of the documented rollback: the released kit restores an older,
+        pre-abandonment generation into an unused destination, and that
+        destination is rollback-clean. Then the released kit ACCEPTS the exact
+        retry of the correction this kit abandoned, so the "abandoned is final"
+        rule does not hold while the host runs 04ed25d.
+        """
+        base = self.released()
+        spec = importlib.util.spec_from_file_location('released_f0_lifecycle_voids_rollback',
+                                                      base / 'lifecycle_voids.py')
+        released = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(released)
+        # A complete generation that predates the cut comment.
+        voids.apply(self.rows, 'op', self.payload(), self.native_run, self.project,
+                    operators=['op'], enabled=True)
+        older_rows = copy.deepcopy(self.rows)
+        older = voids.backup_files(self.project, self.rows)
+        cut = self.payload('retract', 'rollback-cut', 'void-one')
+        with mock.patch.object(voids, 'publish', side_effect=OSError('synthetic cut')):
+            with self.assertRaisesRegex(ValueError, 'uncertain'):
+                voids.apply(self.rows, 'op', cut, self.native_run, self.project,
+                            operators=['op'], enabled=True)
+        comment = self.rows[0]['comments'][-1]
+        voids.abandon(self.rows, 'op', dict(schema_version=1, operation='abandon',
+                                            operation_id='rollback-abandon', actor='op',
+                                            reason='Operator closed the cut.',
+                                            evidence=['synthetic audit'], binding=cut['binding'],
+                                            target_void=cut['operation_id']),
+                      self.project, operators=['op'], enabled=True, comment_id=comment['id'],
+                      recorded_at='2026-10-05T00:00:00Z')
+        destination = self.project / 'unused'
+        destination.mkdir()
+        self.assertEqual(released.restore_files(destination, older, older_rows), True)
+        self.assertEqual(released.read_journal(destination)['invalid'], [])
+        self.assertFalse((destination / voids.ABANDON_FILE).exists())
+        self.assertEqual(released.context(older_rows, released.read_journal(destination))['incomplete'], [])
+        # Our kit refuses the exact retry; the released kit writes it.
+        with self.assertRaisesRegex(ValueError, r'abandoned .*final'):
+            voids.apply(self.rows, 'op', cut, self.native_run, self.project,
+                        operators=['op'], enabled=True)
+        answer = released.apply(self.rows, 'op', cut, self.native_run, destination,
+                                operators=['op'], enabled=True)
+        self.assertEqual((answer['operation'], answer['reconciled']), ('retract', True))
+        self.assertEqual(released.context(self.rows, released.read_journal(destination))['reasons'], {})
+
 
 class HostCorrectionTests(unittest.TestCase):
     def setUp(self):
@@ -294,12 +343,135 @@ class HostCorrectionTests(unittest.TestCase):
         self.assertEqual(set(restored['entries']), {'void-one'})
         self.assertEqual(set(restored['abandons']), {'abandon-two'})
 
+    def test_backup_manifest_binds_the_abandonment_store(self):
+        """kittrial-5bb.274 item 1: the store is hashed in the manifest."""
+        cut = self.cut()
+        comment = self.rows[0]['comments'][0]
+        voids.abandon(self.rows, 'op', self.abandon_payload(cut), self.project, operators=['op'],
+                      enabled=True, comment_id=comment['id'], recorded_at='2026-10-05T00:00:00Z')
+        files = voids.backup_files(self.project, self.rows)
+        manifest = files[voids.MANIFEST]
+        self.assertEqual(manifest['files'][voids.ABANDON_FILE],
+                         hashlib.sha256(voids.entry_bytes(files[voids.ABANDON_FILE])).hexdigest())
+        # The review rewrote one record's operator and reason, recomputed its own
+        # hash and restore-new accepted it (rev/in/s13.py); the manifest now binds it.
+        tampered = copy.deepcopy(files)
+        key = sorted(tampered[voids.ABANDON_FILE]['records'])[0]
+        record = tampered[voids.ABANDON_FILE]['records'][key]
+        record['payload']['actor'] = 'someone-else'
+        record['payload']['reason'] = 'rewritten in the backup'
+        record['sha256'] = content_hash(record['payload'])
+        destination = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: shutil.rmtree(destination, ignore_errors=True))
+        with self.assertRaisesRegex(ValueError, 'manifest member/hash/byte mismatch'):
+            voids.restore_files(destination, tampered, self.rows)
+        self.assertEqual(list(destination.iterdir()), [])
+        self.assertTrue(voids.restore_files(destination, files, self.rows))
+        self.assertEqual(set(voids.read_journal(destination)['abandons']), {'abandon-one'})
+
+    def test_store_record_without_a_native_operator_comment_is_flagged(self):
+        """kittrial-5bb.274 item 2: a hand-added record with any operator is named."""
+        cut = self.cut()
+        comment = self.rows[0]['comments'][0]
+        payload = self.abandon_payload(cut, actor='nobody')
+        entry = dict(schema_version=1, payload=payload, sha256=content_hash(payload),
+                     comment_id=comment['id'], created_at='2026-10-05T00:00:00Z')
+        voids.validate_entry(entry, allow_abandon=True)
+        (self.project / voids.ABANDON_FILE).write_text(json.dumps(
+            voids.abandon_document({payload['operation_id']: entry}), ensure_ascii=False, sort_keys=True))
+        os.chmod(self.project / voids.ABANDON_FILE, 0o600)   # item 6: isolate this flag
+        state = self.reading()
+        self.assertEqual(state['reasons'], {})
+        self.assertIn('no native comment by its operator', state['abandon_problems'][0])
+        page = voids.audit(voids.snapshot(self.rows, self.project), operators=['op'])
+        self.assertEqual(page['correction_status'], 'damaged')
+        self.assertEqual(page['unproved_abandonment_count'], 1)
+        item = next(c for c in page['corrections'] if c['operation'] == 'abandon')
+        self.assertFalse(item['native_operator_proof'])
+        self.assertEqual(item['classification_reason'], 'abandonment-without-native-operator-proof')
+        with self.assertRaisesRegex(ValueError, 'unproved or duplicate abandonment'):
+            voids.backup_files(self.project, self.rows)
+
+    def test_abandonment_of_a_journaled_comment_is_flagged_not_listed_twice(self):
+        """kittrial-5bb.274 item 2: a store record for a journaled comment is flagged."""
+        self.apply(self.payload())                      # void-one, comment id '1'
+        comment = self.rows[0]['comments'][0]
+        void_payload = self.payload()
+        payload = dict(schema_version=1, operation='abandon', operation_id='hand-on-void', actor='op',
+                       reason='typed into the file', evidence=['none'],
+                       binding=void_payload['binding'], target_void='void-one')
+        entry = dict(schema_version=1, payload=payload, sha256=content_hash(payload),
+                     comment_id=comment['id'], created_at='2026-10-05T00:00:00Z')
+        (self.project / voids.ABANDON_FILE).write_text(json.dumps(
+            voids.abandon_document({payload['operation_id']: entry}), ensure_ascii=False, sort_keys=True))
+        os.chmod(self.project / voids.ABANDON_FILE, 0o600)   # item 6: isolate this flag
+        state = self.reading()
+        self.assertTrue(any('already has a host entry' in problem for problem in state['abandon_problems']),
+                        state['abandon_problems'])
+        page = voids.audit(voids.snapshot(self.rows, self.project), operators=['op'])
+        self.assertEqual(page['duplicate_correction_count'], 1)
+        duplicate = next(c for c in page['corrections'] if c['operation_id'] == 'hand-on-void')
+        self.assertTrue(duplicate['duplicate_host_entry'])
+        self.assertEqual(duplicate['classification_reason'], 'abandonment-duplicates-a-journaled-comment')
+        with self.assertRaisesRegex(ValueError, 'unproved or duplicate abandonment'):
+            voids.backup_files(self.project, self.rows)
+
+    def test_abandon_refuses_an_operator_who_did_not_author_the_cut(self):
+        """kittrial-5bb.274 item 2: the abandonment is bound to the cut's native author."""
+        cut = self.cut()
+        comment = self.rows[0]['comments'][0]
+        other = self.abandon_payload(cut, key='abandon-other', actor='other')
+        with self.assertRaisesRegex(ValueError, 'native comment by the abandoning operator'):
+            voids.abandon(self.rows, 'other', other, self.project, operators=['op', 'other'],
+                          enabled=True, comment_id=comment['id'], recorded_at='2026-10-05T00:00:00Z')
+        self.assertEqual(voids.read_journal(self.project)['abandons'], {})
+
+    @unittest.skipUnless(os.name == 'posix', 'POSIX mode bits on the host store')
+    def test_abandonment_store_is_created_private_and_world_writable_is_flagged(self):
+        """kittrial-5bb.274 item 6: create 600; complain about group/world write."""
+        cut = self.cut()
+        comment = self.rows[0]['comments'][0]
+        voids.abandon(self.rows, 'op', self.abandon_payload(cut), self.project, operators=['op'],
+                      enabled=True, comment_id=comment['id'], recorded_at='2026-10-05T00:00:00Z')
+        store = self.project / voids.ABANDON_FILE
+        self.assertEqual(stat.S_IMODE(store.stat().st_mode), 0o600)
+        os.chmod(store, 0o666)
+        state = self.reading()
+        self.assertEqual(state['reasons'], {})
+        self.assertTrue(any('group- or world-writable' in problem
+                            for problem in state['abandon_problems']), state['abandon_problems'])
+        page = voids.audit(voids.snapshot(self.rows, self.project), operators=['op'])
+        self.assertEqual(page['correction_status'], 'damaged')
+        with self.assertRaisesRegex(ValueError, 'unreadable lifecycle abandonment store'):
+            voids.backup_files(self.project, self.rows)
+
+    def test_lifecycle_void_generation_command_prints_the_live_value_and_manifest_location(self):
+        """kittrial-5bb.274 item 5: the operator's comparison has a read."""
+        import admin
+        self.apply(self.payload())
+        exported = '\n'.join(json.dumps(row) for row in self.rows)
+        before = sorted(path.name for path in self.project.iterdir())
+        with mock.patch.object(admin, 'project_dir', return_value=self.project), \
+                mock.patch.object(admin, 'run_bd', return_value=exported) as native:
+            report = admin.lifecycle_void_generation_command(self.project, 'pp')
+        native.assert_called_once_with(self.project, 'pp', ['export', '--all'])
+        self.assertEqual(report['native_corrections_sha256'],
+                         voids.native_generation(self.rows))
+        self.assertEqual(report['manifest'], voids.MANIFEST)
+        self.assertEqual(report['backup_sidecar'], 'backups/pp.coordination.json')
+        self.assertIn('backups/pp.coordination.json', report['note'])
+        backup = voids.backup_files(self.project, self.rows)
+        self.assertEqual(report['native_corrections_sha256'],
+                         backup[voids.MANIFEST]['native_corrections_sha256'])
+        self.assertEqual(sorted(path.name for path in self.project.iterdir()), before)
+
     def test_abandonment_store_damage_reads_closed_never_changes_a_fact(self):
         cut = self.cut()
         comment = self.rows[0]['comments'][0]
         voids.abandon(self.rows, 'op', self.abandon_payload(cut), self.project, operators=['op'],
                       enabled=True, comment_id=comment['id'], recorded_at='2026-10-05T00:00:00Z')
         (self.project / voids.ABANDON_FILE).write_text('{"schema_version": 2, "records": {}}')
+        os.chmod(self.project / voids.ABANDON_FILE, 0o600)   # item 6: isolate the read problem
         state = self.reading()
         self.assertEqual(state['abandon_problems'], ['Invalid lifecycle abandonment store'])
         self.assertEqual([c['id'] for c in state['incomplete']], [comment['id']])
@@ -435,14 +607,15 @@ class HostCorrectionTests(unittest.TestCase):
         (self.project / '.beads').mkdir(exist_ok=True)
         (self.project / '.beads' / 'metadata.json').write_text('{}')
         exported = '\n'.join(json.dumps(row) for row in self.rows)
-        captured = io.StringIO()
+        captured_out = io.StringIO()
+        captured_err = io.StringIO()
         printed_at_write = []
 
         def check(*args, **options):
-            printed_at_write.append(voids.ABANDON_LOST_ENTRY_RULE in captured.getvalue())
+            printed_at_write.append(voids.ABANDON_LOST_ENTRY_RULE in captured_err.getvalue())
             return dict(operation='abandon', comment_id=comment['id'])
 
-        with contextlib.redirect_stdout(captured), \
+        with contextlib.redirect_stdout(captured_out), contextlib.redirect_stderr(captured_err), \
                 mock.patch.object(admin, 'project_dir', return_value=self.project), \
                 mock.patch.object(admin, 'operators', return_value=['op']), \
                 mock.patch.object(admin, 'run_bd', return_value=exported), \
@@ -457,12 +630,17 @@ class HostCorrectionTests(unittest.TestCase):
                                             'admin-abandon-one')
         self.assertTrue(writer.called)
         self.assertEqual(printed_at_write, [True])
-        self.assertIn(voids.ABANDON_LOST_ENTRY_RULE, captured.getvalue())
+        self.assertIn(voids.ABANDON_LOST_ENTRY_RULE, captured_err.getvalue())
+        # kittrial-5bb.274 item 3: stdout is exactly one JSON document (empty here,
+        # because the rule is on stderr before the write).
+        self.assertEqual(captured_out.getvalue(), '')
         self.assertIn('LOST', voids.ABANDON_LOST_ENTRY_RULE)
         operations = (Path(lifecycle.__file__).resolve().parent / 'docs' / 'OPERATIONS.md').read_text(
             encoding='utf-8')
         self.assertIn('restore that family from the backup', operations)
         self.assertIn('exact retry of an abandoned', operations)
+        self.assertIn('does NOT hold across this rollback', operations)
+        self.assertIn('lifecycle-void-generation', operations)
 
     @unittest.skipUnless(os.name == 'posix', 'the host abandon command takes the POSIX project lock')
     def test_admin_abandon_command_writes_host_evidence_without_recreating_the_comment(self):
@@ -480,7 +658,7 @@ class HostCorrectionTests(unittest.TestCase):
                                   return_value=contextlib.nullcontext()), \
                 mock.patch('review_workflow.operator_owners', return_value={}), \
                 mock.patch('review_workflow.listed_operator_actor', return_value=True), \
-                contextlib.redirect_stdout(io.StringIO()):
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             answer = admin.lifecycle_abandon_command(self.project, 'pp', comment['id'], 'op',
                                                      'Operator closed the cut.', ['synthetic audit'],
                                                      'admin-abandon-one')

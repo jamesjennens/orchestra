@@ -83,7 +83,12 @@ made the released reader report every lifecycle fact of every task unknown
 (`lifecycle-void-journal-unreadable`) and its family audit `damaged`, so no version
 of this kit writes one there. The store is part of this kit's coordination backup
 (and only when it holds a record), and a restore installs or removes it with the
-family, so the pairing round-trips. A damaged or unreadable store never changes a
+family, so the pairing round-trips. The backup manifest hashes the store's exact
+bytes as a member (the `.lifecycle-void-abandons.json` key in the manifest's
+`files`), so a sidecar whose store record was edited and rehashed no longer
+restores. The store is created mode `600`, and a group- or world-writable store is
+reported (`abandon_problems`, audit `damaged`) and stops the backup. A damaged or
+unreadable store never changes a
 lifecycle fact: it is reported (`abandon_problems`, audit `damaged`) and the
 abandoned comment reads `incomplete` again, so backups stay stopped until an
 operator repairs or re-runs the abandonment.
@@ -91,7 +96,9 @@ operator repairs or re-runs the abandonment.
 **Abandonment also closes a void whose journal entry was LOST**, not only a cut
 before publication: a void that was in effect and whose family member was then
 removed by hand leaves exactly the same unpaired native comment. The command
-therefore prints this sentence before it writes, every time:
+therefore prints this sentence before it writes, every time, on **stderr**, so the
+command's stdout stays exactly one JSON document (also when the abandonment is then
+refused):
 
 ```text
 Before abandoning, rule out a LOST journal entry rather than a cut: compare the newest complete
@@ -106,11 +113,24 @@ effect: list the family members the newest complete backup's
 `.lifecycle-voids-manifest.json` names (`files`), compare them with the live
 `.lifecycle-voids/` directory, and compare the manifest's
 `native_corrections_sha256` with the current export's native correction generation.
-A member the backup names but the live family does not have was LOST, not cut:
+The manifest is not a file of its own in the backup: it is the
+`.lifecycle-voids-manifest.json` entry inside `backups/PROJECT.coordination.json`,
+the coordination sidecar the backup writes next to the native backup. Print the
+live value it must equal with
+`admin.py lifecycle-void-generation PROJECT` (read-only; prints
+`native_corrections_sha256` and names the manifest and sidecar). The manifest also
+binds the abandonment store with a member hash, so a sidecar whose store record was
+edited refuses the restore. A member the backup names but the live family does not
+have was LOST, not cut:
 restore that complete backup, or its family, instead of abandoning. Only when no
 complete backup names a missing member, and the operator accepts that the correction
 never took effect, is abandonment the right tool. The who, when and why stay in the
-audit row, so the decision is never silent.
+audit row, so the decision is never silent. An abandonment is bound to a native
+comment by the abandoning operator: the operator who cut the correction comment is
+the one who abandons it (a different listed operator issues a fresh void under a new
+identity instead); a store record that lacks that native author, or that closes a
+comment which already has a host entry, is named in `abandon_problems`, makes the
+audit `damaged` and stops the backup.
 
 **An abandoned correction is final.** This is the one rule stated for the retry: an
 abandoned operation is never put into effect afterwards. The exact retry of an abandoned
@@ -1939,10 +1959,29 @@ Procedure before rolling a host back to 04ed25d, in order:
    destination from an older complete backup whose native generation predates the
    abandoned correction comment (the manifest's `native_corrections_sha256` must
    match the restored data). That destination then carries no abandonment and is
-   rollback-clean; it is a copy, not the live project.
+   rollback-clean; it is a copy, not the live project. This step is exercised by
+   `tests/test_lifecycle_voids.py` (`ReleasedKitTests`): the released kit's own
+   `restore_files` installs the older generation into an unused destination and the
+   destination reads rollback-clean. (Older backups are made with
+   `admin.py backup PROJECT`; the `.lifecycle-voids-manifest.json` it must match is
+   the entry of that name inside `backups/PROJECT.coordination.json`.)
 4. If a live project with abandonments must run on 04ed25d, accept that its backup
    and restore stay refused until the host is upgraded to a kit that reads the
    abandonment store. Roll **forward** to reconcile it; there is no override.
+
+**The "an abandoned correction is final" rule does NOT hold across this rollback.**
+04ed25d cannot see the abandonment store, so it reads the abandoned native comment
+as an ordinary incomplete correction and ACCEPTS the exact retry of an operation
+this kit abandoned (`lifecycle-event-void` with the abandoned operation id returns
+0 and writes a void that reads in-effect on the older kit). This is the one stated
+rule that a rollback loses: while the host runs 04ed25d, an abandoned correction can
+be put back into effect, and a later upgrade to this kit reads that new void record
+as in-effect beside the abandonment (the store still names the operation abandoned).
+Treat the rollback as a decision to re-open the abandoned corrections, or reconcile
+them before rolling back; do not roll back a project whose abandonments must stay
+final. The evidence is the retry run in `tests/test_lifecycle_voids.py`
+(`ReleasedKitTests.test_the_released_kit_reopens_an_abandoned_correction_after_a_rollback`),
+which loads the released kit's own `apply` beside this kit's refusal.
 
 Session registrations in `.sessions.json` are included in the coordination sidecar, alongside the private project onboarding entry point. Restore with a kit version supporting these records. Preserve original actor IDs for resumed workers; do not create a second live authority from a restored registry.
 

@@ -879,6 +879,27 @@ def lifecycle_audit_command(root, project, limit=50, offset=0):
     return report
 
 
+def lifecycle_void_generation_command(root, project):
+    """Host read-only: the live native correction generation to compare with a backup.
+
+    kittrial-5bb.274 item 5: the abandon rule tells the operator to compare the
+    newest complete backup's manifest ``native_corrections_sha256`` with the live
+    native correction generation before abandoning, and no command printed the
+    live value. This prints it, and says where the manifest lives: the
+    ``.lifecycle-voids-manifest.json`` entry inside
+    ``backups/PROJECT.coordination.json``. It reads once and writes nothing.
+    """
+    import lifecycle_voids as voids
+    rows = record_json.loads_rows(run_bd(root, project, ['export', '--all']))
+    return dict(project=project,
+                native_corrections_sha256=voids.native_generation(rows),
+                native_correction_count=len(voids.native_correction_comments(rows)),
+                manifest=voids.MANIFEST,
+                backup_sidecar='backups/' + project + '.coordination.json',
+                note='Compare native_corrections_sha256 with the manifest named above, which is the '
+                     + voids.MANIFEST + ' entry inside backups/' + project + '.coordination.json.')
+
+
 LIFECYCLE_VOID_WRITES_KEY = 'lifecycle_void_writes'
 LIFECYCLE_VOID_AUDIT_KEY = 'lifecycle_void_writes_audit'
 LIFECYCLE_VOID_AUDIT_MAX = 20
@@ -1057,8 +1078,10 @@ def lifecycle_abandon_command(root, project, comment_id, actor, reason, evidence
         payload = dict(schema_version=1, operation='abandon', operation_id=key, actor=actor,
                        reason=reason, evidence=evidence, binding=target['binding'],
                        target_void=target['target_void'])
-        # kittrial-5bb.271 item 3: say it before the write, every time.
-        print(voids.ABANDON_LOST_ENTRY_RULE)
+        # kittrial-5bb.274 item 3: say it before the write, every time, on stderr
+        # so the command's stdout stays exactly one JSON document (also when the
+        # abandonment is then refused).
+        print(voids.ABANDON_LOST_ENTRY_RULE, file=sys.stderr)
         return voids.abandon(rows, actor, payload, path, authority, owners, enabled,
                              comment_id=comment_id, recorded_at=utc_stamp())
 
@@ -9495,6 +9518,10 @@ def main():
     a.add_argument('project')
     a.add_argument('--limit',type=int,default=50)
     a.add_argument('--offset',type=int,default=0)
+    a=sub.add_parser('lifecycle-void-generation',help='read-only: print the live native correction generation '
+                     'and where the backup manifest that binds it lives (for the abandon comparison)',
+                     allow_abbrev=False)
+    a.add_argument('project')
     a=sub.add_parser('lifecycle_void_writes',help='read or flip the audited installation VOID writer gate (OFF by default)')
     a.add_argument('action',choices=['status','on','off'])
     a.add_argument('--actor',required=True)
@@ -10352,6 +10379,8 @@ def main():
         print(json.dumps(lifecycle_authors_command(root,args.project,args.limit)))
     elif args.command=='lifecycle-audit':
         print(json.dumps(lifecycle_audit_command(root,args.project,args.limit,args.offset)))
+    elif args.command=='lifecycle-void-generation':
+        print(json.dumps(lifecycle_void_generation_command(root,args.project)))
     elif args.command=='lifecycle_void_writes':
         print(json.dumps(lifecycle_void_switch(root,args.action,args.actor)))
     elif args.command in ('lifecycle-event-void','lifecycle-event-retract'):

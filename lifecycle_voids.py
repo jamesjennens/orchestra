@@ -300,6 +300,17 @@ def read_abandons(project):
         result['records'] = validate_abandons(record_json.loads(blob.decode('utf-8')))
     except (ValueError, OSError, UnicodeError) as error:
         result['problems'].append(str(error)[:300])
+    # kittrial-5bb.274 item 6: the store is created 0600 and a group- or
+    # world-writable one is reported, never silently trusted. POSIX only: on
+    # Windows the synthesized mode bits would flag every ordinary file.
+    if os.name == 'posix':
+        try:
+            mode = stat.S_IMODE(os.stat(path).st_mode)
+        except OSError:
+            mode = None
+        if mode is not None and mode & 0o022:
+            result['problems'].append(
+                'Lifecycle abandonment store is group- or world-writable (mode %04o)' % mode)
     return result
 
 
@@ -329,6 +340,10 @@ def publish_abandon(project, record):
     if len(entry_bytes(record)) > MAX_RECORD_BYTES or len(entry_bytes(document)) > MAX_FAMILY_BYTES:
         raise ValueError('Lifecycle abandonment store exceeds its byte bound')
     atomic(path, document)
+    # kittrial-5bb.274 item 6: the store is host-only audit evidence, so it is
+    # created 0600 and never left group- or world-writable.
+    if os.name == 'posix':
+        os.chmod(path, 0o600)
     return path
 
 
@@ -424,16 +439,23 @@ def backup_files(project, rows=None):
         raise ValueError('A lifecycle VOID backup requires its native snapshot')
     files = {DIRECTORY + '/' + entry['sha256'] + '.json': entry
              for entry in journal['entries'].values()}
+    store = abandon_document(abandons) if abandons else None
+    manifest_files = {name: hashlib.sha256(entry_bytes(record)).hexdigest()
+                      for name, record in files.items()}
+    # kittrial-5bb.274 item 1: the store is bound by the manifest exactly as a
+    # family member is, so a sidecar whose record was rewritten and rehashed
+    # cannot be restored (review 1013-271-r2, rev/in/s13.py).
+    if store is not None:
+        manifest_files[ABANDON_FILE] = hashlib.sha256(entry_bytes(store)).hexdigest()
     files[MANIFEST] = dict(schema_version=1, family=DIRECTORY, count=len(files),
                            bytes=sum(len(entry_bytes(record)) for record in files.values()),
-                           files={name: hashlib.sha256(entry_bytes(record)).hexdigest()
-                                  for name, record in files.items()},
+                           files=manifest_files,
                            native_corrections_sha256=native_generation(rows))
-    if abandons:
+    if store is not None:
         # The abandonment store is a sidecar, never a family member: the released
         # F0 kit reads this backup's family unchanged (it refuses the unknown
         # sidecar path on restore, which docs/OPERATIONS.md states exactly).
-        files[ABANDON_FILE] = abandon_document(abandons)
+        files[ABANDON_FILE] = store
     validate_backup(files, rows)
     return files
 
@@ -501,8 +523,13 @@ def validate_backup(files, rows=None):
             raise ValueError('Conflicting lifecycle VOID backup operation identity')
         entries[key] = entry
     total = sum(len(entry_bytes(record)) for record in members.values())
+    expected_hashes = {name: hashlib.sha256(entry_bytes(record)).hexdigest()
+                       for name, record in members.items()}
+    if store is not None:
+        # kittrial-5bb.274 item 1: the store's bytes are bound by the manifest.
+        expected_hashes[ABANDON_FILE] = hashlib.sha256(entry_bytes(store)).hexdigest()
     if (total > MAX_FAMILY_BYTES or manifest['bytes'] != total
-            or manifest['files'] != {name: hashlib.sha256(entry_bytes(record)).hexdigest() for name, record in members.items()}):
+            or manifest['files'] != expected_hashes):
         raise ValueError('Lifecycle VOID backup manifest member/hash/byte mismatch')
     retracted = set()
     from review_workflow import _recorded_at
@@ -524,6 +551,12 @@ def validate_backup(files, rows=None):
         state = context(rows, journal)
         if any(reason != 'voided' for reason in state['reasons'].values()):
             raise ValueError('Lifecycle VOID backup does not bind the native target/comment generation')
+        # kittrial-5bb.274 item 2: an abandonment without a native comment by its
+        # operator, or one that closes a comment which already has a host entry,
+        # is never silently accepted as closing the audit.
+        if state['abandon_problems']:
+            raise ValueError('Lifecycle VOID backup has an unproved or duplicate abandonment: '
+                             + state['abandon_problems'][0])
         if state['incomplete']:
             raise ValueError('Lifecycle VOID backup has native correction comments without their host entries')
     return journal
@@ -577,22 +610,26 @@ def restore_files(project, files, rows):
     # to overwrite automatically. Exact manifest members may repair a cut.
     if any(problem != 'lifecycle-void-restore-incomplete' for problem in old['invalid']):
         raise ValueError('Existing lifecycle VOID family is damaged; operator reconciliation required')
-    expected = set(files[MANIFEST]['files'])
-    for name in sorted(expected):
+    # The manifest's ``files`` now names the store too (kittrial-5bb.274 item 1),
+    # but the store is not a family member: install it below, with its own mode.
+    members = {name for name in files[MANIFEST]['files'] if name != ABANDON_FILE}
+    for name in sorted(members):
         target = project / name
         if target.is_symlink() or target.with_suffix('.tmp').is_symlink():
             raise ValueError('Lifecycle VOID restore member must not be a symlink')
-    for name in sorted(expected):
+    for name in sorted(members):
         atomic(project / name, files[name])
     for entry in old['entries'].values():
         name = DIRECTORY + '/' + entry['sha256'] + '.json'
-        if name not in expected:
+        if name not in members:
             (project / name).unlink()
     # The abandonment store is part of this generation: install the backup's
     # store, or remove a live one the backup does not carry, so a restore never
     # leaves more abandonment evidence than the backup proves.
     if ABANDON_FILE in files:
         atomic(store_path, files[ABANDON_FILE])
+        if os.name == 'posix':
+            os.chmod(store_path, 0o600)
     elif os.path.lexists(str(store_path)):
         store_path.unlink()
     # Read and compare every installed member before clearing uncertainty.
@@ -624,6 +661,11 @@ def context(rows, journal):
     valid = {}
     entry_reasons = {}
     task_reasons = {}
+    # kittrial-5bb.274 item 2: an abandonment is host-only evidence. A valid
+    # native binding alone does not prove that the listed operator acted, so a
+    # record whose operator is not the target correction comment's native author
+    # is flagged (never treated as proof, never used to re-decide a fact).
+    unproved = []
     for key, entry in entries.items():
         payload = entry['payload']; binding = payload['binding']; event_id = binding['event_id']
         abandon = payload['operation'] == 'abandon'
@@ -652,6 +694,8 @@ def context(rows, journal):
             if not abandon and (comment.get('author') != payload['actor']
                     or comment.get('created_at') != entry['created_at']):
                 raise ValueError('lifecycle-void-journal-mismatch')
+            if abandon and comment.get('author') != payload['actor']:
+                unproved.append(key)
             valid[key] = entry
         except (ValueError, TypeError, KeyError):
             reasons[event_id] = reason
@@ -685,11 +729,32 @@ def context(rows, journal):
         native_comments=[];invalid.append(str(error))
     bound_comments={(e['payload']['binding']['task'],e['comment_id']) for e in entries.values()}
     incomplete=[c for c in native_comments if (c['task'],c['id']) not in bound_comments]
+    # kittrial-5bb.274 item 2 (second half): today a store record for a comment
+    # that already has a journal entry makes the audit list the comment twice.
+    # Flag the abandonment instead of silently accepting the duplicate.
+    comment_keys = {}
+    for key, entry in entries.items():
+        comment_keys.setdefault(entry['comment_id'], []).append(key)
+    duplicates = sorted(
+        key for key, entry in entries.items()
+        if entry['payload']['operation'] == 'abandon'
+        and any(other != key and entries[other]['payload']['operation'] != 'abandon'
+                for other in comment_keys[entry['comment_id']]))
+    abandon_problems = list(journal.get('abandon_problems') or [])
+    for key in sorted(unproved):
+        abandon_problems.append(
+            ('Lifecycle abandonment %s has no native comment by its operator %s'
+             % (key, entries[key]['payload']['actor']))[:300])
+    for key in duplicates:
+        abandon_problems.append(
+            ('Lifecycle abandonment %s closes native comment %s that already has a host entry'
+             % (key, entries[key]['comment_id']))[:300])
     return dict(reasons=reasons, global_reason=UNKNOWN_JOURNAL if invalid else None,
                 entries=entries, invalid=invalid, retracted=retracted,
                 entry_reasons=entry_reasons,task_reasons=task_reasons,
                 native_comments=native_comments,incomplete=incomplete,
-                abandon_problems=list(journal.get('abandon_problems') or []))
+                unproved_abandons=sorted(unproved), duplicate_abandons=duplicates,
+                abandon_problems=abandon_problems)
 
 
 class Snapshot(list):
@@ -714,6 +779,10 @@ def correction_audit(correction):
     entries=correction.get('entries',{})
     retracted=correction.get('retracted',set())
     native={(c['task'],c['id']):c for c in correction.get('native_comments',[])}
+    # kittrial-5bb.274 item 2: name an abandonment that has no native comment by
+    # its own operator, and any abandonment that duplicates a journaled comment.
+    unproved=set(correction.get('unproved_abandons') or [])
+    duplicates=set(correction.get('duplicate_abandons') or [])
     result=[]
     for key,entry in entries.items():
         payload=entry['payload'];binding=payload['binding']
@@ -728,7 +797,13 @@ def correction_audit(correction):
                   target_void=payload['target_void'],comment_id=entry['comment_id'],status=status,
                   journaled=True,native_author=comment['author'] if comment else None,
                   native_time=comment['created_at'] if comment else None)
+        if payload['operation']=='abandon':
+            item['native_operator_proof']=(comment is not None
+                                           and comment['author']==payload['actor'])
+            item['duplicate_host_entry']=key in duplicates
         if problem:item['classification_reason']=problem
+        elif key in unproved:item['classification_reason']='abandonment-without-native-operator-proof'
+        elif key in duplicates:item['classification_reason']='abandonment-duplicates-a-journaled-comment'
         if key in retracted:
             item['retracted_by']=[k for k,e in entries.items() if e['payload']['operation']=='retract'
                                   and e['payload']['target_void']==key
@@ -866,6 +941,11 @@ def audit(rows, operators=None, owners=None, limit=50, offset=0):
                 incomplete_correction_count=sum(c['status']=='incomplete' for c in corrections),
                 damaged_correction_count=sum(c['status']=='damaged' for c in corrections),
                 abandoned_correction_count=sum(c['status']=='abandoned' for c in corrections),
+                unproved_abandonment_count=sum(
+                    1 for c in corrections if c['operation']=='abandon'
+                    and c.get('native_operator_proof') is False),
+                duplicate_correction_count=sum(
+                    1 for c in corrections if c.get('duplicate_host_entry')),
                 family_reason=correction.get('global_reason'),
                 family_problems=correction.get('invalid',[]),
                 abandon_problems=correction.get('abandon_problems',[]),
@@ -1083,7 +1163,8 @@ def abandon(rows, actor, payload, project, operators=None, owners=None, enabled=
     if journal['invalid']:
         raise ValueError('Lifecycle void journal cannot be read; operator repairs it before a write')
     if journal['abandon_problems']:
-        raise ValueError('Lifecycle abandonment store cannot be read; operator repairs it before a write')
+        raise ValueError('Lifecycle abandonment store cannot be read; operator repairs it before a write: '
+                         + journal['abandon_problems'][0])
     prior = (journal.get('abandons') or {}).get(payload['operation_id'])
     if prior is None:
         legacy = journal['entries'].get(payload['operation_id'])
@@ -1108,6 +1189,15 @@ def abandon(rows, actor, payload, project, operators=None, owners=None, enabled=
         raise ValueError('Lifecycle abandonment target is missing or ambiguous; name an incomplete native '
                          'correction comment that has no host entry')
     comment = matches[0]
+    # kittrial-5bb.274 item 2: bind the abandonment to a native comment by the
+    # abandoning operator, as an issued void is bound to its own comment. The
+    # target cut comment is the only native artifact that proves the operator
+    # acted, so the operator who cut the correction is the one who abandons it.
+    # A different listed operator issues a fresh void under a new key instead.
+    if comment.get('author') != payload['actor']:
+        raise ValueError('Lifecycle abandonment requires a native comment by the abandoning operator; '
+                         'the target correction comment was authored by ' + str(comment.get('author'))
+                         + '. A different operator issues a fresh void under a new operation identity instead.')
     for entry in list(journal['entries'].values()) + list((journal.get('abandons') or {}).values()):
         if entry['comment_id'] == comment['id']:
             raise ValueError('That native correction comment already has a host entry; an issued void or '
