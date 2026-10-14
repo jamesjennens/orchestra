@@ -60,25 +60,28 @@ def _extract_kit(root, commit, destination):
 
 _RELEASED_KIT = []
 _RELEASED_RESOLVED = []
+_KIT_DIRECTORIES = {}
 
 
-def resolve_released_f0_kit():
-    """A directory holding the released F0 kit (04ed25d), or None.
+def resolve_kit(commit):
+    """A directory holding the tracked tree at ``commit``, or None.
 
-    ``ORCHESTRA_F0_RELEASED_KIT`` names one explicitly. Otherwise the commit is
-    exported from this checkout's own history, so an ordinary CI checkout with
-    full history runs the released-kit reader test instead of skipping. None
-    means neither source is available and the caller decides (skip, or fail on
-    CI, exactly as the older-kit tests do).
+    ``ORCHESTRA_KIT_<7-char commit>`` names one explicitly (for a CI checkout
+    without full history). Otherwise the commit is exported from this checkout's
+    own history, so an ordinary CI checkout with full history runs the older-kit
+    test instead of skipping. None means neither source is available and the
+    caller decides (skip, or fail on CI, exactly as the older-kit tests do).
     """
-    if not _RELEASED_RESOLVED:
-        _RELEASED_KIT.append(_resolve_released_f0_kit())
-        _RELEASED_RESOLVED.append(True)
-    return _RELEASED_KIT[0]
+    commit = str(commit)
+    if commit not in _KIT_DIRECTORIES:
+        _KIT_DIRECTORIES[commit] = _resolve_kit(commit)
+    return _KIT_DIRECTORIES[commit]
 
 
-def _resolve_released_f0_kit():
-    configured = os.environ.get('ORCHESTRA_F0_RELEASED_KIT')
+def _resolve_kit(commit):
+    configured = os.environ.get('ORCHESTRA_KIT_' + str(commit)[:7].upper())
+    if not configured and str(commit) == RELEASED_F0_COMMIT:
+        configured = os.environ.get('ORCHESTRA_F0_RELEASED_KIT')
     if configured:
         return Path(configured)
     root = Path(lifecycle.__file__).resolve().parent
@@ -86,16 +89,24 @@ def _resolve_released_f0_kit():
         return None
     try:
         found = subprocess.run(['git', '-C', str(root), 'rev-parse', '--verify', '--quiet',
-                                RELEASED_F0_COMMIT + '^{commit}'],
+                                str(commit) + '^{commit}'],
                                capture_output=True, text=True, timeout=60)
-        if found.returncode or found.stdout.strip() != RELEASED_F0_COMMIT:
+        if found.returncode or found.stdout.strip() != str(commit):
             return None
-        destination = Path(tempfile.mkdtemp(prefix='orchestra-released-f0-kit-'))
+        destination = Path(tempfile.mkdtemp(prefix='orchestra-older-kit-'))
         atexit.register(shutil.rmtree, destination, ignore_errors=True)
-        _extract_kit(root, RELEASED_F0_COMMIT, destination)
+        _extract_kit(root, str(commit), destination)
         return destination
     except (OSError, subprocess.SubprocessError, tarfile.TarError):
         return None
+
+
+def resolve_released_f0_kit():
+    """A directory holding the released F0 kit (04ed25d), or None."""
+    if not _RELEASED_RESOLVED:
+        _RELEASED_KIT.append(resolve_kit(RELEASED_F0_COMMIT))
+        _RELEASED_RESOLVED.append(True)
+    return _RELEASED_KIT[0]
 
 
 class ReleasedKitTests(unittest.TestCase):
@@ -292,6 +303,114 @@ class ReleasedKitTests(unittest.TestCase):
         self.assertEqual(handrow['classification_reason'], 'abandonment-without-native-operator-proof')
 
 
+#: The release current at the time of the third review (kittrial-5bb.274 round 3):
+#: it KNOWS the abandonment store but not the one-native-comment-per-abandonment
+#: proof, so a project holding this kit's abandonment comments is not rollback-clean.
+REVIEWED_RELEASE_COMMIT = 'beca5d69bcc03965f9896412ec93aca0e2d664b5'
+#: The release at this revision's base (main when the revision was written). It is
+#: the reviewed release plus the web lifecycle work, so its lifecycle correction
+#: reader is the same one and it behaves the same way here.
+CURRENT_RELEASE_COMMIT = '987cd5026e3f3def2ed3dba577ee4a8a383e0214'
+
+
+class OlderReleaseRollbackTests(unittest.TestCase):
+    """Round 3 item 2(2): rollback to the release current at this revision's base.
+
+    beca5d6 (current at the review) and 987cd50 (current at this revision's base)
+    both read the abandonment store, but with the PRE-own-comment proof, so on a
+    project holding this kit's native abandonment comments they cannot pair the new
+    store records with their comments: the audit reads damaged and the backup is
+    refused. 04ed25d cannot see the store at all and reads both comments
+    incomplete (the separate ReleasedKitTests case). OPERATIONS.md documents every
+    case; these tests load each release from this checkout's history and RUN it.
+    """
+
+    def setUp(self):
+        self.scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(self.scratch.cleanup)
+        self.project = Path(self.scratch.name)
+        self.rows = rows()
+        self.native_writes = 0
+
+    def payload(self, operation='void', key='void-one', target=None, actor='op'):
+        return dict(schema_version=1, operation=operation, operation_id=key, actor=actor,
+                    reason='Operator reviewed the source evidence.', evidence=['synthetic review'],
+                    binding=voids.event_binding(self.rows[2]), target_void=target)
+
+    def native_run(self, argv):
+        if argv == ['comments', 'p-task', '--json']:
+            return json.dumps(self.rows[0]['comments'])
+        self.native_writes += 1
+        comment = dict(id=str(self.native_writes),
+                       author=json.loads(argv[3][len(voids.PREFIX):])['actor'],
+                       text=argv[3], created_at='2026-10-02T00:00:0' + str(self.native_writes) + 'Z')
+        self.rows[0]['comments'].append(comment)
+        return json.dumps(comment)
+
+    def abandoned_project(self):
+        """An issued void, a cut retraction and the NEW abandonment of that cut."""
+        voids.apply(self.rows, 'op', self.payload(), self.native_run, self.project,
+                    operators=['op'], enabled=True)
+        cut = self.payload('retract', 'retract-cut', 'void-one')
+        with mock.patch.object(voids, 'publish', side_effect=OSError('synthetic cut')):
+            with self.assertRaisesRegex(ValueError, 'uncertain'):
+                voids.apply(self.rows, 'op', cut, self.native_run, self.project,
+                            operators=['op'], enabled=True)
+        comment = self.rows[0]['comments'][-1]
+        voids.abandon(self.rows, 'op', dict(schema_version=1, operation='abandon',
+                                            operation_id='abandon-current', actor='op',
+                                            reason='Operator closed the cut.',
+                                            evidence=['synthetic audit'], binding=cut['binding'],
+                                            target_void=cut['operation_id']),
+                      self.native_run, self.project, operators=['op'], enabled=True,
+                      comment_id=comment['id'])
+        return comment
+
+    def older_kit(self, commit, name):
+        base = resolve_kit(commit)
+        if base is None:
+            message = ('no kit at ' + commit + ': run from a git checkout with history holding it, '
+                       'or set ORCHESTRA_KIT_' + commit[:7].upper())
+            if os.environ.get('GITHUB_ACTIONS'):
+                self.fail('CI must not skip this test: ' + message)
+            self.skipTest(message)
+        spec = importlib.util.spec_from_file_location(name, base / 'lifecycle_voids.py')
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return base, module
+
+    def assert_older_release_not_rollback_clean(self, commit, name):
+        comment = self.abandoned_project()
+        base, module = self.older_kit(commit, name)
+        journal = module.read_journal(self.project)
+        self.assertEqual(journal['invalid'], [])
+        self.assertEqual(set(journal['abandons']), {'abandon-current'})
+        state = module.context(self.rows, journal)
+        self.assertEqual(state['global_reason'], None)
+        # OBSERVED: the pre-own-comment reader cannot pair the new store record with
+        # its comment, so the abandonment reads damaged with no lifecycle fact
+        # silently restored (the void it re-opened is not honoured).
+        self.assertEqual(state['entry_reasons'], {'abandon-current': 'lifecycle-void-journal-mismatch'})
+        self.assertNotIn('voided', state['reasons'].values())
+        with self.assertRaisesRegex(ValueError, 'lifecycle VOID'):
+            module.backup_files(self.project, self.rows)
+        # The older kit's own CLI still READS the project: the family stays readable
+        # (no lifecycle-void-journal-unreadable) and the command exits 0.
+        exported = self.project / 'older-export.jsonl'
+        exported.write_text(''.join(json.dumps(row) + '\n' for row in self.rows))
+        result = subprocess.run([sys.executable, str(base / 'lifecycle.py'), 'list',
+                                 '--export', str(exported), '--journal', str(self.project)],
+                                capture_output=True, text=True, timeout=120)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn('lifecycle-void-journal-unreadable', result.stdout)
+
+    def test_the_reviewed_release_reads_the_audit_damaged_and_refuses_the_backup(self):
+        self.assert_older_release_not_rollback_clean(REVIEWED_RELEASE_COMMIT, 'reviewed_release_voids')
+
+    def test_the_current_release_reads_the_audit_damaged_and_refuses_the_backup(self):
+        self.assert_older_release_not_rollback_clean(CURRENT_RELEASE_COMMIT, 'current_release_voids')
+
+
 class HostCorrectionTests(unittest.TestCase):
     def setUp(self):
         self.scratch = tempfile.TemporaryDirectory()
@@ -347,6 +466,143 @@ class HostCorrectionTests(unittest.TestCase):
                              operators=options.pop('operators', ['op']),
                              enabled=options.pop('enabled', True),
                              comment_id=comment_id, **options)
+
+    def cut_abandonment(self, key='abandon-cut', actor='op', **options):
+        """A cut ABANDONMENT: its OWN native comment is written, its store record is not.
+
+        kittrial-5bb.274 round 3. Returns ``(cut, cut_comment, payload, own)`` where
+        ``own`` is the abandonment's own native comment that the audit must parse.
+        """
+        cut = self.cut()
+        comment = self.rows[0]['comments'][0]
+        payload = self.abandon_payload(cut, key=key, actor=actor)
+        with mock.patch.object(voids, 'publish_abandon', side_effect=OSError('synthetic cut')):
+            with self.assertRaisesRegex(ValueError, 'host record is uncertain'):
+                self.abandon(payload, comment['id'], **options)
+        own = self.rows[0]['comments'][-1]
+        self.assertEqual((own['author'], json.loads(own['text'][len(voids.PREFIX):])),
+                         (actor, payload))
+        return cut, comment, payload, own
+
+    def store(self, records):
+        """Write the abandonment store directly (the cut/typed/hand-added cases)."""
+        (self.project / voids.ABANDON_FILE).write_text(json.dumps(
+            voids.abandon_document(records), ensure_ascii=False, sort_keys=True))
+        if os.name == 'posix':
+            os.chmod(self.project / voids.ABANDON_FILE, 0o600)
+
+    def store_record(self, payload, comment_id, created_at, **overrides):
+        entry = dict(schema_version=1, payload=payload, sha256=content_hash(payload),
+                     comment_id=str(comment_id), created_at=created_at)
+        entry.update(overrides)
+        return entry
+
+    def audit_row(self, key):
+        page = voids.audit(voids.snapshot(self.rows, self.project), operators=['op'])
+        return page, next(c for c in page['corrections'] if c['operation_id'] == key)
+
+    def test_a_cut_abandonment_parses_and_names_its_exact_retry(self):
+        """Round 3 item 1: the orphan abandonment comment is named, not unclassifiable."""
+        cut, comment, payload, own = self.cut_abandonment()
+        self.assertEqual(self.native_writes, 2)
+        self.assertFalse((self.project / voids.ABANDON_FILE).exists())
+        state = self.reading()
+        self.assertEqual(state['reasons'], {})
+        self.assertEqual(state['abandon_problems'], [])
+        self.assertEqual({str(c['id']) for c in state['incomplete']},
+                         {str(comment['id']), str(own['id'])})
+        self.assertIn(str(own['id']), {str(k) for k in state['orphan_abandons']})
+        page, item = self.audit_row('abandon-cut')
+        self.assertEqual((page['correction_status'], page['incomplete_correction_count']),
+                         ('incomplete', 2))
+        self.assertEqual((item['status'], item['operation'], item['operator'],
+                          item['retry_operation_id'], item['retry_operator'],
+                          item['target_void'], item['target_comment_id'],
+                          item['classification_reason']),
+                         ('incomplete', 'abandon', 'op', 'abandon-cut', 'op',
+                          cut['operation_id'], comment['id'],
+                          'native-correction-without-host-entry'))
+        with self.assertRaisesRegex(ValueError, 'without their host entries'):
+            voids.backup_files(self.project, self.rows)
+
+    def test_the_exact_retry_of_a_cut_abandonment_completes_while_the_cut_is_open(self):
+        """Round 3 item 1: the exact retry writes the missing store record, reusing the comment."""
+        cut, comment, payload, own = self.cut_abandonment()
+        answer = self.abandon(payload, comment['id'])
+        self.assertTrue(answer['reconciled'])
+        self.assertEqual(answer['comment_id'], own['id'])
+        self.assertEqual(answer['target_comment_id'], comment['id'])
+        self.assertEqual(self.native_writes, 2)
+        state = self.reading()
+        self.assertEqual(state['incomplete'], [])
+        self.assertEqual(state['reasons'], {})
+        self.assertEqual(state['orphan_abandons'], {})
+        page, item = self.audit_row('abandon-cut')
+        self.assertEqual((page['correction_status'], item['status'], item['target_comment_id'],
+                          item['native_operator_proof']),
+                         ('complete', 'abandoned', comment['id'], True))
+        self.assertIn(voids.ABANDON_FILE, voids.backup_files(self.project, self.rows))
+
+    def test_a_cut_abandonment_whose_operator_left_reads_superseded(self):
+        """Round 3 item 1: a listed operator closes the same cut; the orphan reads superseded."""
+        cut, comment, payload, own = self.cut_abandonment(key='abandon-cut', actor='op2',
+                                                          operators=['op', 'op2'])
+        fresh = self.abandon_payload(cut, key='abandon-other', actor='op')
+        answer = self.abandon(fresh, comment['id'], operators=['op'])
+        self.assertEqual(answer['target_comment_id'], comment['id'])
+        self.assertEqual(self.rows[0]['comments'][-1]['author'], 'op')
+        state = self.reading()
+        self.assertEqual((state['reasons'], state['incomplete'], state['abandon_problems']),
+                         ({}, [], []))
+        page, orphan = self.audit_row('abandon-cut')
+        self.assertEqual((orphan['status'], orphan['superseded_by'], orphan['duplicate_host_entry'],
+                          orphan['target_comment_id'], orphan['retry_operation_id'],
+                          orphan['retry_operator']),
+                         ('superseded', 'abandon-other', True, comment['id'],
+                          'abandon-cut', 'op2'))
+        self.assertEqual((page['correction_status'], page['superseded_abandonment_count']),
+                         ('complete', 1))
+        self.assertIn(voids.ABANDON_FILE, voids.backup_files(self.project, self.rows))
+        # op2 re-listed: the exact retry reconciles with that later record instead of
+        # dead-ending in "already has a host entry".
+        retry = self.abandon(payload, comment['id'], operators=['op', 'op2'])
+        self.assertTrue(retry['reconciled'])
+        self.assertEqual((retry['comment_id'], retry['superseded_by']),
+                         (own['id'], 'abandon-other'))
+        self.assertEqual(set(voids.read_journal(self.project)['abandons']), {'abandon-other'})
+
+    def assert_the_proof_refuses(self, key='abandon-cut'):
+        state = self.reading()
+        self.assertEqual(state['reasons'], {})
+        self.assertEqual(state['unproved_abandons'], [key])
+        self.assertIn('no native comment by its operator', state['abandon_problems'][0])
+        page, item = self.audit_row(key)
+        self.assertEqual((page['correction_status'], item['status'],
+                          item['classification_reason']),
+                         ('damaged', 'damaged', 'abandonment-without-native-operator-proof'))
+        with self.assertRaisesRegex(ValueError, 'unproved or duplicate abandonment'):
+            voids.backup_files(self.project, self.rows)
+
+    def test_the_proof_compares_the_own_comments_author(self):
+        """Round 3 item 2(1): removing the author comparison must break this test."""
+        cut, comment, payload, own = self.cut_abandonment()
+        own['author'] = 'mallory'
+        self.store({payload['operation_id']: self.store_record(payload, own['id'], own['created_at'])})
+        self.assert_the_proof_refuses()
+
+    def test_the_proof_compares_the_own_comments_text(self):
+        """Round 3 item 2(1): removing the text comparison must break this test."""
+        cut, comment, payload, own = self.cut_abandonment()
+        own['text'] = own['text'].replace(payload['reason'], 'rewritten after the native write')
+        self.store({payload['operation_id']: self.store_record(payload, own['id'], own['created_at'])})
+        self.assert_the_proof_refuses()
+
+    def test_the_proof_compares_the_own_comments_native_time(self):
+        """Round 3 item 2(1): removing the native-time comparison must break this test."""
+        cut, comment, payload, own = self.cut_abandonment()
+        self.store({payload['operation_id']: self.store_record(payload, own['id'],
+                                                               '2020-01-01T00:00:00Z')})
+        self.assert_the_proof_refuses()
 
     def test_abandon_closes_an_incomplete_correction_without_touching_the_family(self):
         """Item 1: its OWN native comment proves it; the family stays schema-1."""
