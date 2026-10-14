@@ -83,6 +83,12 @@ class NativeAssignmentTests(RulesHelpers,unittest.TestCase):
         self.assertEqual(stable,self.rows())
         self.assertEqual(old,next(x for x in self.rows() if x['id']==tid)['assignee'])
 
+        blocked=self.r.bd('update',tid,'--status','blocked','--json');self.assertEqual(0,blocked.returncode,blocked.stderr)
+        assigned_blocked=harness.request('POST',path,dict(body,reason='Assign a blocked task without reopening'),token=owner,key='blocked-native-assignment-0001')
+        self.assertEqual(200,assigned_blocked.status,assigned_blocked.data)
+        row=next(x for x in self.rows() if x['id']==tid);self.assertEqual('blocked',row['status']);self.assertEqual(uid,row['assignee'])
+        returned=harness.request('POST',path,dict(secondbody,reason='Return blocked task'),token=owner,key='blocked-native-assignment-0002')
+        self.assertEqual(200,returned.status,returned.data)
         closed=self.r.bd('update',tid,'--status','closed','--json');self.assertEqual(0,closed.returncode,closed.stderr)
         reassigned=harness.request('POST',path,dict(body,reason='Closed metadata assignment'),token=owner,key='closed-native-assignment-0001')
         self.assertEqual(200,reassigned.status,reassigned.data)

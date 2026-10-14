@@ -156,7 +156,7 @@ def check_change(payload, row, review, slot, target_is_eligible):
     validate_request(payload)
     if (not isinstance(row, dict) or row.get('malformed') or
             row.get('id') != payload['task'] or 'assignee' not in row or
-            row.get('status') not in ('open', 'in_progress', 'closed')):
+            row.get('status') not in ('open', 'in_progress', 'blocked', 'closed')):
         raise AssignmentError(503, 'The addressed native task cannot be read completely; nothing was changed.')
     from reserved_comments import carries_record_label, is_record_anchor, MERGE_SLOT_LABEL
     labels = row.get('labels')
