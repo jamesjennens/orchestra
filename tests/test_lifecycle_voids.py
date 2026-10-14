@@ -391,8 +391,9 @@ class OlderReleaseRollbackTests(unittest.TestCase):
         # its comment, so the abandonment reads damaged with no lifecycle fact
         # silently restored (the void it re-opened is not honoured).
         self.assertEqual(state['entry_reasons'], {'abandon-current': 'lifecycle-void-journal-mismatch'})
-        self.assertNotIn('voided', state['reasons'].values())
-        with self.assertRaisesRegex(ValueError, 'lifecycle VOID'):
+        self.assertEqual(state['reasons'], {'p-task.2': 'lifecycle-void-journal-mismatch'})
+        self.assertEqual([str(c['id']) for c in state['incomplete']], [str(comment['id'])])
+        with self.assertRaisesRegex(ValueError, 'does not bind the native target/comment generation'):
             module.backup_files(self.project, self.rows)
         # The older kit's own CLI still READS the project: the family stays readable
         # (no lifecycle-void-journal-unreadable) and the command exits 0.
@@ -403,6 +404,13 @@ class OlderReleaseRollbackTests(unittest.TestCase):
                                 capture_output=True, text=True, timeout=120)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn('lifecycle-void-journal-unreadable', result.stdout)
+        # A void of ANOTHER event is still accepted: the family itself stays a
+        # schema-version-1 void/retract journal; only the new abandonment is
+        # unreadable to the older proof rule.
+        fresh = dict(self.payload('void', 'void-other'), binding=module.event_binding(self.rows[1]))
+        answer = module.apply(self.rows, 'op', fresh, self.native_run, self.project,
+                              operators=['op'], enabled=True)
+        self.assertEqual((answer['operation'], answer['reconciled']), ('void', False))
 
     def test_the_reviewed_release_reads_the_audit_damaged_and_refuses_the_backup(self):
         self.assert_older_release_not_rollback_clean(REVIEWED_RELEASE_COMMIT, 'reviewed_release_voids')

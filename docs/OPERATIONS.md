@@ -151,6 +151,35 @@ not still be listed). A store record that lacks that own native comment - a
 hand-added record, including one naming the true author of the cut - is named in
 `abandon_problems`, makes the audit `damaged` and stops the backup.
 
+**A cut ABANDONMENT is not a dead end.** The abandonment writes its own native
+comment BEFORE its store record, so the process can die in between: the comment
+exists, `.lifecycle-void-abandons.json` does not. That comment is host-guarded
+native evidence, so the audit PARSES it (it no longer reads
+`native-correction-payload-unclassifiable`) and lists it `incomplete` with the cut
+it names. While that cut is still open the row carries the exact retry:
+`retry_operation_id` (the abandonment's own operation identity) and
+`retry_operator` (its actor), plus `target_void`/`target_comment_id`. Complete it
+with the row's `reason` and `evidence` unchanged:
+
+```text
+python3 admin.py --root ROOT lifecycle-event-abandon PROJECT CUT_COMMENT_ID \
+  --actor RETRY_OPERATOR --reason "the row's reason" --evidence "the row's evidence" \
+  --operation-id RETRY_OPERATION_ID
+```
+
+which reuses the comment already on the tracker and writes the missing store
+record; the cut then reads `abandoned`, `correction_status` `complete`, and backups
+run again. **If the orphan's operator has left the operator list**, the exact retry
+cannot be authorized (it requires that actor); ANY listed operator instead abandons
+the SAME cut under a NEW operation identity, exactly as for an ordinary cut. That
+later proved record closes the cut, and the orphan's own comment then reads
+`superseded` by it (`superseded_by`, `duplicate_host_entry` true,
+`superseded_abandonment_count` counts it) - never `incomplete`, never damage - so
+the audit reads `complete` and backups resume. The re-listed original operator's own
+exact retry then reconciles with that later record (`superseded_by` in the answer)
+instead of failing with "already has a host entry". Nothing is ever deleted or
+re-written, and a pending orphan (cut still open) keeps the backup refused.
+
 **An abandoned correction is final.** This is the one rule stated for the retry: an
 abandoned operation is never put into effect afterwards. The exact retry of an abandoned
 void (or retraction) is refused, naming the abandoning operator and time,
@@ -2056,6 +2085,41 @@ above) and the backup keeps refusing. The evidence is the retry-and-return run i
 (`ReleasedKitTests.test_the_released_kit_reopens_an_abandoned_correction_after_a_rollback`,
 which loads the released kit's own `apply` beside this kit's refusal and then reads
 the live project with this kit).
+
+**Rollback to a release that KNOWS the abandonment store but not the own-comment proof
+(beca5d6, the release current at the second review, and 987cd50, the release at this
+revision's base).** Both releases read `.lifecycle-void-abandons.json`, but they pair an
+abandonment with the CUT comment it closes; this kit pairs it with the abandonment's OWN
+native comment. On a project that holds THIS kit's abandonment comments they therefore
+cannot pair the new store records with their comments. What an operator sees, exactly
+(each release was run for this revision, and `tests/test_lifecycle_voids.py`
+`OlderReleaseRollbackTests` runs them again from history):
+
+* the family still reads: `lifecycle-void-journal-unreadable` is NOT reported and
+  `lifecycle.py list --journal` exits 0;
+* `lifecycle-audit PROJECT` reads `correction_status` `damaged`: the abandonment row
+  reads `damaged` with `lifecycle-void-journal-mismatch`, and the cut comment it names
+  reads `incomplete` - the older reader cannot see that the new store record belongs to
+  that comment;
+* the event that abandonment names reads UNKNOWN with reason
+  `lifecycle-void-journal-mismatch`; events it does not name are unchanged;
+* `backup` REFUSES the project (`Lifecycle VOID backup does not bind the native
+  target/comment generation`);
+* a `lifecycle-event-void` of ANOTHER event is still accepted: the family itself is
+  still a schema-version-1 `void`/`retract` journal.
+
+This is the same class of limit as the 04ed25d case above, with different evidence:
+04ed25d cannot see the store at all, so it reads BOTH the cut comment and the
+abandonment's own comment as `incomplete` (`native-correction-without-host-entry`) and
+also refuses the backup. Neither release can be the rollback target for a project that
+holds this kit's abandonments.
+
+What to do: roll **forward** to this kit, where the same project reads `abandoned` with
+`correction_status` `complete` and the backup runs again. Do not delete the abandonment
+store, the abandonment's own comment, the cut comment or the family to make an older kit
+read clean: deleting the store re-reads the cut as `incomplete`, and deleting a comment
+destroys the evidence that the correction never took effect. A project with NO
+abandonment record is rollback-clean for all of 04ed25d, beca5d6 and 987cd50.
 
 Session registrations in `.sessions.json` are included in the coordination sidecar, alongside the private project onboarding entry point. Restore with a kit version supporting these records. Preserve original actor IDs for resumed workers; do not create a second live authority from a restored registry.
 
