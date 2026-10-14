@@ -19,6 +19,7 @@ if sys.version_info < (3, 10):
                      % (sys.version_info[0], sys.version_info[1], sys.version_info[2], sys.executable))
     sys.exit(2)
 import argparse
+import contextlib
 import fcntl
 import json
 import os
@@ -42,7 +43,7 @@ from reserved_comments import (carries_record_label, check_raw_request, comment_
                                is_merge_slot_id, shown_token, write_targets, MERGE_SLOT_LABEL, MERGE_SLOT_SUFFIX,
                                reserved_label_in_args, refuse_http_actor, status_change_targets, title_change_targets,
                                unresolved_bd_flags)
-from http_authority import AuthorityConfig, NativeRunner, CAP_APPROVE, CAP_PROJECT_ADMIN, verified_web_authority, block_mismatch_denial, required_capability, descriptor_actor_denial, http_actor_denial, journal_path, run_guarded, stamp_write
+from http_authority import AuthorityConfig, NativeRunner, CAP_APPROVE, CAP_PROJECT_ADMIN, verified_web_authority, block_mismatch_denial, required_capability, descriptor_actor_denial, http_actor_denial, is_mutating_invocation, journal_path, run_guarded, stamp_write
 
 #: One warning per line on stderr (kittrial-5bb.197 review request 01a12894, item 6):
 #: the configuration warnings and the native warnings are collected in one list, and
@@ -783,6 +784,22 @@ def coordinator_payload(args,request):
         raise ValueError('Invalid attachment: the flag on the attachment does not match the request')
     return item['text']
 
+@contextlib.contextmanager
+def held_coordination_lock(path,shared=False):
+    """Hold the project's ``.coordination.lock``, SHARED for a read and EXCLUSIVE for a write.
+
+    The endpoint used to take the lock EXCLUSIVELY for reads too, so every web page
+    request queued behind every other request in the project (kittrial-5bb.281). A
+    shared lock still excludes a writer and is excluded by one, so a read can never
+    observe a write half done - the invariant every read here was given the lock for;
+    it only lets two reads run at the same time. ``shared`` is decided by the action
+    and its arguments, never by the request body.
+    """
+    with (path/'.coordination.lock').open('a') as lock:
+        fcntl.flock(lock,fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
+        yield
+
+
 def execute(root,request,authority_config=None,require_authority=False,key_projects=None,key_principal=None):
     key_project_refusal(request,key_projects)
     # Rule 2: a key bound to a principal is refused the web-only actions here, before their
@@ -932,8 +949,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             # of kittrial-5bb.97). One that was already recorded (`reconciled`) wrote nothing.
             if action=='handoff' and len(args)==2 and isinstance(result,dict) and result.get('reconciled') is False:runner.wrote=True
             return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False,indent=2)+'\n','stderr':warning_text(run_warnings)}
-        with (path/'.coordination.lock').open('a') as lock:
-            fcntl.flock(lock,fcntl.LOCK_EX)
+        with held_coordination_lock(path,shared=(action=='work')):
             return guarded_write(root,request,journal_path(path),work_effect,
                                authority_config=authority_config,
                                require_authority=require_authority,runner=runner)
@@ -944,8 +960,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             stdout,warnings=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
             if warnings:run_warnings.append(warnings)
             return stdout
-        with (path/'.coordination.lock').open('a') as lock:
-            fcntl.flock(lock,fcntl.LOCK_EX)
+        with held_coordination_lock(path,shared=True):
             result=read_requirements(path,name,request.get('args',[]),run,configured_operators(root))
         return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
     if action=='owner-requirements':
@@ -1431,8 +1446,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                                                              independent_approval=rules['independent_approval'],
                                                              owners=owner_loader(path,'independent_approval')
                                                              if rules['independent_approval'] else None),'stderr':''.join(run_warnings)}
-        with (path/'.coordination.lock').open('a') as lock:
-            fcntl.flock(lock,fcntl.LOCK_EX)
+        with held_coordination_lock(path,shared=action in ('brief','history')):
             return guarded_write(root,request,journal_path(path),briefing_effect,
                                authority_config=authority_config,
                                require_authority=require_authority,runner=runner)
@@ -1501,8 +1515,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                                                mark_writes=enabled,operators=operators,owners=owners)
                 return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n',
                         'stderr':warning_text(run_warnings)}
-            with (path/'.coordination.lock').open('a') as lock:
-                fcntl.flock(lock,fcntl.LOCK_EX)
+            with held_coordination_lock(path,shared=(operation=='read')):
                 if operation=='read':
                     if authority_config is None:
                         raise web_lifecycle.LifecycleError(403,'Configured web authority required for lifecycle reads')
@@ -1563,8 +1576,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                                   owners=owner_loader(path,'independent_approval'),
                                   review_writes=configured_review_writes(root,warnings=run_warnings))
                 return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':warning_text(run_warnings)}
-            with (path/'.coordination.lock').open('a') as lock:
-                fcntl.flock(lock,fcntl.LOCK_EX)
+            with held_coordination_lock(path,shared=(operation=='check')):
                 if operation=='check':
                     if authority_config is None:raise SlotError(403,'Verified web authority required for the merge-slot read')
                     with file_lock(authority_config.lock):
@@ -1720,8 +1732,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                 dest=Path(tmp)/f'{i}.txt';dest.write_text(item['text'],encoding='utf-8')
                 final.extend([item['flag'],str(dest)])
             else: final.append(a)
-        with (path/'.coordination.lock').open('a') as lock:
-            fcntl.flock(lock,fcntl.LOCK_EX)
+        with held_coordination_lock(path,shared=not is_mutating_invocation(args)):
             # First the rows the write names (an existing id given to create, a write that names
             # none, the merge slot); then the guards that read what those rows carry.
             from review_workflow import listed_operator_actor, operator_owners

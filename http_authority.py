@@ -2354,7 +2354,18 @@ def run_guarded(request, journal_path, effect, authority_config=None,
 
     trusted = authority_config is not None
     lock_path = authority_config.lock if authority_config is not None else None
-    context = file_lock(lock_path) if lock_path else _no_lock()
+    operation_id = request.get('operation_id')
+    # The authority lock guards the live-authority store: a descriptor's verdict, an
+    # operation identity's reservation and an identity check all read or write it. A
+    # request with none of those is a pure canonical read - the web service sends an
+    # HTTP read with no descriptor and no operation identity - and never touches the
+    # store. Taking the lock for it anyway put every read of the installation behind
+    # one lock, on top of the project's own (kittrial-5bb.281). It authorizes nothing,
+    # so skipping it weakens no authority check; every request that validates
+    # authority, reserves an identity or runs an identity check still takes it.
+    needs_authority_lock = lock_path is not None and bool(
+        authority is not None or operation_id or account_identity or identity_check is not None)
+    context = file_lock(lock_path) if needs_authority_lock else _no_lock()
     with context:
         if trusted and authority is not None:
             descriptor = {key: value for key, value in authority.items()
@@ -2370,7 +2381,6 @@ def run_guarded(request, journal_path, effect, authority_config=None,
                 identity_check()
             except ValueError as denied:
                 return _envelope(2, stderr=str(denied) + '\n')
-        operation_id = request.get('operation_id')
         journal = (OperationJournal(journal_path, **(journal_options or {}))
                    if operation_id else None)
         # The principal half of the identity comes from the request descriptor only
