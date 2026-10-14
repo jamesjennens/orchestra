@@ -55,7 +55,8 @@ another actor. A missing/unrecoverable principal binding requires the
 operator's normal identity reconciliation before retry.
 
 When the original actor cannot be restored, or the operator decides not to complete
-the cut, a currently listed operator closes it **without the original words**:
+the cut, ANY currently listed operator (or its bound principal's actor) closes it
+**without the original words**:
 
 ```sh
 python3 admin.py --root ROOT lifecycle-event-abandon PROJECT COMMENT_ID --actor OPERATOR \
@@ -67,13 +68,31 @@ incomplete (its `corrections[].comment_id`). The kit reads that retained comment
 the exact binding and abandoned operation id, so the reason, evidence and key do not
 have to be reproduced. The command is applicable ONLY to a correction comment that
 has no journal entry: a void or retraction that already has a host entry (in effect
-or retracted) is refused, and `lifecycle_void_writes` must be ON. It is audited with
-who (the operator), when (the abandonment time) and why (the reason), writes only
-the host record, and never changes or deletes native data: the abandoned comment
-stays in place and `lifecycle-audit` lists it with status `abandoned` (counted by
-`abandoned_correction_count`). Backups resume once every native correction comment
-is bound. The exact retry of the *abandonment* with the same operation id reconciles;
-a reused id naming different content refuses.
+or retracted) is refused, and `lifecycle_void_writes` must be ON.
+
+**An abandonment writes its OWN native comment.** The abandoning actor writes one
+`Kind: lifecycle-event-correction-v1` comment through the same guarded native write
+a void uses, and its payload names the abandoned comment (`target_void` and
+`binding`), the operator, the reason and the evidence; the native comment time is
+the abandonment time. Then the host record is written BESIDE the family
+(`.lifecycle-void-abandons.json`). The abandoned comment is never changed or
+deleted: it stays in place, and `lifecycle-audit` lists a row with status
+`abandoned` (counted by `abandoned_correction_count`) whose `comment_id` is the
+abandonment's OWN comment, whose `target_comment_id` is the abandoned comment, and
+whose `native_operator_proof` is true only from that own comment. Backups resume
+once every native correction comment is bound. The exact retry of the *abandonment*
+with the same operation id reconciles the same native comment and record; a reused
+id naming different content refuses.
+
+**Any listed operator may abandon, and the author of the cut need not still be
+listed.** The proof is the abandonment's own comment, so the operator who abandons
+does not have to be the operator who cut the correction (kittrial-5bb.274 item 1).
+That is what closes a cut whose author has left the operator list - a dead end
+before this rule, because another operator was refused by the native-author check
+and the departed author by the list. A **hand-added** store record - one with no
+abandonment comment of its own by its operator, including one that names the true
+author of the cut - is never proof: it is named in `abandon_problems`, the audit
+reads `damaged` and the backup stays stopped until an operator reconciles it.
 
 **The abandonment record is written BESIDE the family, never in it.** It lives in
 `.lifecycle-void-abandons.json` in the project directory; `.lifecycle-voids/` keeps
@@ -83,7 +102,12 @@ made the released reader report every lifecycle fact of every task unknown
 (`lifecycle-void-journal-unreadable`) and its family audit `damaged`, so no version
 of this kit writes one there. The store is part of this kit's coordination backup
 (and only when it holds a record), and a restore installs or removes it with the
-family, so the pairing round-trips. A damaged or unreadable store never changes a
+family, so the pairing round-trips. The backup manifest hashes the store's exact
+bytes as a member (the `.lifecycle-void-abandons.json` key in the manifest's
+`files`), so a sidecar whose store record was edited and rehashed no longer
+restores. The store is created mode `600`, and a group- or world-writable store is
+reported (`abandon_problems`, audit `damaged`) and stops the backup. A damaged or
+unreadable store never changes a
 lifecycle fact: it is reported (`abandon_problems`, audit `damaged`) and the
 abandoned comment reads `incomplete` again, so backups stay stopped until an
 operator repairs or re-runs the abandonment.
@@ -91,7 +115,9 @@ operator repairs or re-runs the abandonment.
 **Abandonment also closes a void whose journal entry was LOST**, not only a cut
 before publication: a void that was in effect and whose family member was then
 removed by hand leaves exactly the same unpaired native comment. The command
-therefore prints this sentence before it writes, every time:
+therefore prints this sentence before it writes, every time, on **stderr**, so the
+command's stdout stays exactly one JSON document (also when the abandonment is then
+refused):
 
 ```text
 Before abandoning, rule out a LOST journal entry rather than a cut: compare the newest complete
@@ -106,11 +132,53 @@ effect: list the family members the newest complete backup's
 `.lifecycle-voids-manifest.json` names (`files`), compare them with the live
 `.lifecycle-voids/` directory, and compare the manifest's
 `native_corrections_sha256` with the current export's native correction generation.
-A member the backup names but the live family does not have was LOST, not cut:
+The manifest is not a file of its own in the backup: it is the
+`.lifecycle-voids-manifest.json` entry inside `backups/PROJECT.coordination.json`,
+the coordination sidecar the backup writes next to the native backup. Print the
+live value it must equal with
+`admin.py lifecycle-void-generation PROJECT` (read-only; prints
+`native_corrections_sha256` and names the manifest and sidecar). The manifest also
+binds the abandonment store with a member hash, so a sidecar whose store record was
+edited refuses the restore. A member the backup names but the live family does not
+have was LOST, not cut:
 restore that complete backup, or its family, instead of abandoning. Only when no
 complete backup names a missing member, and the operator accepts that the correction
 never took effect, is abandonment the right tool. The who, when and why stay in the
-audit row, so the decision is never silent.
+abandonment's own native comment and in the audit row, so the decision is never
+silent. An abandonment is proved ONLY by that own native comment, authored by the
+abandoning operator (any listed operator, or its bound actor - the cut's author need
+not still be listed). A store record that lacks that own native comment - a
+hand-added record, including one naming the true author of the cut - is named in
+`abandon_problems`, makes the audit `damaged` and stops the backup.
+
+**A cut ABANDONMENT is not a dead end.** The abandonment writes its own native
+comment BEFORE its store record, so the process can die in between: the comment
+exists, `.lifecycle-void-abandons.json` does not. That comment is host-guarded
+native evidence, so the audit PARSES it (it no longer reads
+`native-correction-payload-unclassifiable`) and lists it `incomplete` with the cut
+it names. While that cut is still open the row carries the exact retry:
+`retry_operation_id` (the abandonment's own operation identity) and
+`retry_operator` (its actor), plus `target_void`/`target_comment_id`. Complete it
+with the row's `reason` and `evidence` unchanged:
+
+```text
+python3 admin.py --root ROOT lifecycle-event-abandon PROJECT CUT_COMMENT_ID \
+  --actor RETRY_OPERATOR --reason "the row's reason" --evidence "the row's evidence" \
+  --operation-id RETRY_OPERATION_ID
+```
+
+which reuses the comment already on the tracker and writes the missing store
+record; the cut then reads `abandoned`, `correction_status` `complete`, and backups
+run again. **If the orphan's operator has left the operator list**, the exact retry
+cannot be authorized (it requires that actor); ANY listed operator instead abandons
+the SAME cut under a NEW operation identity, exactly as for an ordinary cut. That
+later proved record closes the cut, and the orphan's own comment then reads
+`superseded` by it (`superseded_by`, `duplicate_host_entry` true,
+`superseded_abandonment_count` counts it) - never `incomplete`, never damage - so
+the audit reads `complete` and backups resume. The re-listed original operator's own
+exact retry then reconciles with that later record (`superseded_by` in the answer)
+instead of failing with "already has a host entry". Nothing is ever deleted or
+re-written, and a pending orphan (cut still open) keeps the backup refused.
 
 **An abandoned correction is final.** This is the one rule stated for the retry: an
 abandoned operation is never put into effect afterwards. The exact retry of an abandoned
@@ -122,6 +190,17 @@ comment itself is never paired. Two writers racing - the abandonment and the exa
 retry - serialize on the project lock, and exactly one of them wins: whichever writes
 first, the other is refused by name (the retry as abandoned, the abandonment as
 "already has a host entry").
+
+**One defined exception: an older kit re-opens an abandoned correction on a
+rollback.** The released F0 kit (04ed25d) cannot see the abandonment store, so it
+accepts the exact retry (see the rollback section below). When this kit reads the
+project again it does NOT treat that as damage: the void in effect wins, the
+abandonment row reads `superseded` and names the later host entry in `superseded_by`,
+the audit reads `complete` (`superseded_abandonment_count` counts it,
+`duplicate_host_entry` is true) and backups run. That reading is told apart from a
+hand-added duplicate by the proof above: only a PROVED abandonment - one with its own
+native comment by its operator - can be superseded, while a record with no such
+comment stays `damaged`.
 
 If another VOID key is now in effect, a current operator first records its linked
 retraction with a fresh key/reason/evidence, then retries the incomplete operation
@@ -1939,10 +2018,10 @@ backup of such a project works. Once an abandonment record exists, 04ed25d:
   `lifecycle-void-journal-unreadable` and do not call the family `damaged`; an
   issued void is still honoured, and a void or retraction of another event is still
   accepted;
-* reports the abandoned native correction comment as `incomplete`
-  (`native-correction-without-host-entry`), because it cannot know the abandonment
-  store, and an offline read of that comment's export names its event
-  `lifecycle-corrections-not-consulted`;
+* reports BOTH the abandoned native correction comment and the abandonment's OWN
+  native comment as `incomplete` (`native-correction-without-host-entry`), because it
+  cannot know the abandonment store, and an offline read of that export names their
+  events `lifecycle-corrections-not-consulted`;
 * **cannot back up or restore that project**: `backup` refuses it (its own rule that
   a native correction comment must have a host family entry), and `restore-new` of a
   backup that carries the abandonment store is refused as an invalid coordination
@@ -1953,9 +2032,9 @@ Procedure before rolling a host back to 04ed25d, in order:
 
 1. `lifecycle-audit PROJECT` on the running kit: if `abandoned_correction_count` is
    not 0 for a project, that project is not rollback-clean. Do not delete
-   `.lifecycle-void-abandons.json`, the abandoned native comment or the family to
-   make it look clean: deleting the store re-reads as `incomplete` and deleting the
-   comment destroys evidence.
+   `.lifecycle-void-abandons.json`, the abandoned native comment, the abandonment's
+   own native comment or the family to make it look clean: deleting the store
+   re-reads as `incomplete` and deleting a comment destroys evidence.
 2. Take a complete backup with the *current* kit for every project you intend to
    roll back, and keep a copy of the abandonment store and the family outside the
    runtime. The rolled-back kit cannot take that backup itself afterwards.
@@ -1963,10 +2042,84 @@ Procedure before rolling a host back to 04ed25d, in order:
    destination from an older complete backup whose native generation predates the
    abandoned correction comment (the manifest's `native_corrections_sha256` must
    match the restored data). That destination then carries no abandonment and is
-   rollback-clean; it is a copy, not the live project.
+   rollback-clean; it is a copy, not the live project. This step is exercised by
+   `tests/test_lifecycle_voids.py` (`ReleasedKitTests`): the released kit's own
+   `restore_files` installs the older generation into an unused destination and the
+   destination reads rollback-clean. (Older backups are made with
+   `admin.py backup PROJECT`; the `.lifecycle-voids-manifest.json` it must match is
+   the entry of that name inside `backups/PROJECT.coordination.json`.)
 4. If a live project with abandonments must run on 04ed25d, accept that its backup
    and restore stay refused until the host is upgraded to a kit that reads the
    abandonment store. Roll **forward** to reconcile it; there is no override.
+
+**The "an abandoned correction is final" rule does NOT hold across this rollback.**
+04ed25d cannot see the abandonment store, so it reads the abandoned native comment
+as an ordinary incomplete correction and ACCEPTS the exact retry of an operation
+this kit abandoned (`lifecycle-event-void` with the abandoned operation id returns
+0 and writes a void that reads in-effect on the older kit). This is the one stated
+rule that a rollback loses: while the host runs 04ed25d, an abandoned correction can
+be put back into effect. Treat the rollback as a decision to re-open the abandoned
+corrections, or reconcile them before rolling back; do not roll back a project whose
+abandonments must stay final.
+
+**What an operator sees after coming back up to this kit.** Upgrade (roll forward)
+and read the project again. No repair command and no deletion is needed, because the
+case is defined and non-damaged:
+
+* the re-opened correction's void reads `in-effect` and its event reason is `voided`;
+  the void in effect wins;
+* the abandonment row reads `superseded` and names the later host entry that
+  re-opened it in `superseded_by` (`duplicate_host_entry` is true and
+  `superseded_abandonment_count` counts it);
+* `correction_status` reads `complete` with `incomplete_correction_count` 0, and
+  `backup` succeeds again; the exact retry of the re-opened operation now reconciles
+  with the entry already in effect instead of being refused as abandoned;
+* retracting the re-opened void does not clear this reading - the abandonment stays
+  `superseded` by the host entry - and needs the normal `lifecycle-event-retract`
+  with a fresh key.
+
+A **hand-added duplicate** of the abandonment is told apart here: it has no
+abandonment comment of its own by its operator, so it stays `damaged` (the proof rule
+above) and the backup keeps refusing. The evidence is the retry-and-return run in
+`tests/test_lifecycle_voids.py`
+(`ReleasedKitTests.test_the_released_kit_reopens_an_abandoned_correction_after_a_rollback`,
+which loads the released kit's own `apply` beside this kit's refusal and then reads
+the live project with this kit).
+
+**Rollback to a release that KNOWS the abandonment store but not the own-comment proof
+(beca5d6, the release current at the second review, and 987cd50, the release at this
+revision's base).** Both releases read `.lifecycle-void-abandons.json`, but they pair an
+abandonment with the CUT comment it closes; this kit pairs it with the abandonment's OWN
+native comment. On a project that holds THIS kit's abandonment comments they therefore
+cannot pair the new store records with their comments. What an operator sees, exactly
+(each release was run for this revision, and `tests/test_lifecycle_voids.py`
+`OlderReleaseRollbackTests` runs them again from history):
+
+* the family still reads: `lifecycle-void-journal-unreadable` is NOT reported and
+  `lifecycle.py list --journal` exits 0;
+* `lifecycle-audit PROJECT` reads `correction_status` `damaged`: the abandonment row
+  reads `damaged` with `lifecycle-void-journal-mismatch`, and the cut comment it names
+  reads `incomplete` - the older reader cannot see that the new store record belongs to
+  that comment;
+* the event that abandonment names reads UNKNOWN with reason
+  `lifecycle-void-journal-mismatch`; events it does not name are unchanged;
+* `backup` REFUSES the project (`Lifecycle VOID backup does not bind the native
+  target/comment generation`);
+* a `lifecycle-event-void` of ANOTHER event is still accepted: the family itself is
+  still a schema-version-1 `void`/`retract` journal.
+
+This is the same class of limit as the 04ed25d case above, with different evidence:
+04ed25d cannot see the store at all, so it reads BOTH the cut comment and the
+abandonment's own comment as `incomplete` (`native-correction-without-host-entry`) and
+also refuses the backup. Neither release can be the rollback target for a project that
+holds this kit's abandonments.
+
+What to do: roll **forward** to this kit, where the same project reads `abandoned` with
+`correction_status` `complete` and the backup runs again. Do not delete the abandonment
+store, the abandonment's own comment, the cut comment or the family to make an older kit
+read clean: deleting the store re-reads the cut as `incomplete`, and deleting a comment
+destroys the evidence that the correction never took effect. A project with NO
+abandonment record is rollback-clean for all of 04ed25d, beca5d6 and 987cd50.
 
 Session registrations in `.sessions.json` are included in the coordination sidecar, alongside the private project onboarding entry point. Restore with a kit version supporting these records. Preserve original actor IDs for resumed workers; do not create a second live authority from a restored registry.
 
