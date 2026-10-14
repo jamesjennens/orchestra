@@ -2361,8 +2361,21 @@ class EndpointBackend:
         continuation cursor to a snapshot digest. Accumulating exact-size canonical
         pages keeps the HTTP offset slice correct for any page size (the previous
         ``--limit offset+limit`` form was rejected for every page above 20).
+
+        A canonical continuation cursor already points AT the first entry the previous
+        page did not return, so the entries collected from it begin at the absolute
+        ``offset`` the cursor carries: the page is the FIRST ``limit`` of them. Slicing
+        them with the absolute offset again dropped a whole page (kittrial-5bb.273: a
+        five-comment task at ``limit=2`` returned entries 1-2 and then entry 5 only,
+        never 3 and 4).
+
+        A long comment is several consecutive entries: they share ``entry_id`` and carry
+        ``body_offset`` (the fragment's character offset in the whole body) and
+        ``continued`` (more of the same body follows). The canonical page boundary can
+        fall at a different character than a whole read does; concatenating the fragments
+        in page order reconstructs the body exactly, whatever page size a walk uses.
         """
-        needed = offset + limit
+        needed = limit if canonical else offset + limit
         collected = []
         cursor = canonical
         total = 0
@@ -2387,8 +2400,8 @@ class EndpointBackend:
             cursor = reply.get('next_cursor')
             if cursor is None:
                 break
-        return {'items': collected[offset:offset + limit], 'total': total,
-                'canonical_cursor': cursor, 'activity_cursor': activity}
+        return {'items': (collected[:limit] if canonical else collected[offset:offset + limit]),
+                'total': total, 'canonical_cursor': cursor, 'activity_cursor': activity}
 
     def list_feedback(self, project_id, limit, offset):
         raise not_implemented('Canonical backend has no feedback read yet: %s'
@@ -7172,6 +7185,16 @@ class ApiHandler(BaseHTTPRequestHandler):
     #: Every field a recommendation may carry over HTTP (``task_id`` is set by the route).
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/history')
     def tasks_history(self, ctx):
+        """The task's history, oldest first, in exact cursor-bound pages.
+
+        Every page is exact for any ``limit``: a page continued from ``next_cursor``
+        resumes at the first entry the previous page did not return, and ``total`` counts
+        the logical entries. A long comment arrives as SEVERAL consecutive entries: they
+        share ``entry_id`` and carry ``body_offset`` (where the fragment starts in the
+        whole body) and ``continued`` (true when more of the same body follows).
+        Concatenating them in page order reconstructs the body, so a page boundary may
+        split a comment without losing text (kittrial-5bb.273).
+        """
         self._project(ctx, CAP_READ)
         self._refuse_record_anchor(self.backend.get_task(ctx.params['pid'], ctx.params['tid']))
         limit, state = self._page(ctx, ctx.query)
