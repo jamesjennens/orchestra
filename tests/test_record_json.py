@@ -212,7 +212,7 @@ class NoUnguardedParseTests(unittest.TestCase):
         'handoff.py': (15, 'bd output and the request, receipt and recovery files the kit writes'),
         'http_auth.py': (3, "the service's own store"),
         'http_authority.py': (3, "the service's own store and journal"),
-        'http_client.py': (2, "the service's answer, and a body typed on the caller's own machine"),
+        'http_client.py': (3, "the service's answer, a body typed on the caller's own machine, and a lifecycle file after its standalone 64-level/size/duplicate-field guard"),
         'http_service.py': (6, "the endpoint's answer to the service, and host configuration; since kittrial-5bb.169 the "
                                "answer is parsed in _parse_native only when record_json.nesting has counted it within "
                                "ROW_NESTING_MAX (one call), each row of a deeper answer in _row under the same count (one "
@@ -297,8 +297,8 @@ class NoUnguardedParseTests(unittest.TestCase):
             # acceptance command, which the caller transports as a file attachment. It is
             # the caller's text, so it is parsed through the guard.
             # kittrial-5bb.221 revision 2 moved tracker_actors' export rows to
-            # record_json.loads_rows (the row bound); the web merge-slot payload adds a fifth guarded parse.
-            'briefing.py': 3, 'coordination.py': 3, 'endpoint.py': 5, 'export_requirements.py': 1, 'feedback.py': 3, 'guidance.py': 3,
+            # record_json.loads_rows (the row bound); the web merge-slot payload adds a fifth guarded parse; lifecycle adds a sixth.
+            'briefing.py': 3, 'coordination.py': 3, 'endpoint.py': 6, 'export_requirements.py': 1, 'feedback.py': 3, 'guidance.py': 3,
             # Requirements request bodies use the guard and reject duplicate fields.
             # lane_state.py reads the body of a reserved Kind: lane-state-v1 record comment
             # (kittrial-5bb.263): any actor's comments can carry one, so it is parsed through
@@ -310,6 +310,8 @@ class NoUnguardedParseTests(unittest.TestCase):
             # The simple owner adapter guards bd's decision-create receipt too.
             'requirement_http.py': 2,
             'web_merge_slot.py': 4,
+            # Lifecycle host entry and restore identity are bounded untrusted text.
+            'web_lifecycle_marks.py': 2,
             # F0: bounded host entries/restore marker and native correction/comment
             # bodies use the guard; none is trusted merely because it parses. The
             # abandonment target lookup (kittrial-5bb.271) adds one more: the retained

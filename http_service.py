@@ -448,7 +448,7 @@ class InProcessBackend:
     ROUTES = ('tasks.create', 'tasks.update', 'tasks.claim', 'checkpoints.add',
               'reviews.add', 'feedback.add', 'projects.create', 'projects.archive',
               'members.set', 'members.remove', 'credentials.issue', 'credentials.revoke',
-              'proposals.submit', 'proposals.dispose')
+              'proposals.submit', 'proposals.dispose', 'lifecycle.scope', 'lifecycle.fact')
     # Contributed requirement proposals are native records behind the canonical endpoint;
     # this service-local backend has no store for them (the routes answer 501).
     PROPOSALS = False
@@ -519,7 +519,8 @@ class InProcessBackend:
                 reason = self.actor_standing(project_id, [namespace]).get(namespace)
                 if reason is not None:
                     raise forbidden(actor_names.refusal(namespace, reason))
-            result = self._dispatch(route, principal, project_id, payload)
+            result = (self._lifecycle_write(route, principal, project_id, payload, result_key)
+                      if route.startswith('lifecycle.') else self._dispatch(route, principal, project_id, payload))
             from http_authority import server_time
             WRITTEN.at = server_time(self.service._now())
             if result_key is not None:
@@ -531,6 +532,86 @@ class InProcessBackend:
         return result
 
     # -- canonical operations --------------------------------------------------
+    def lifecycle_read(self, principal, project_id, task_id):
+        import lifecycle
+        from requirements import content_hash
+        with self.service.store.lock:
+            self.service.check_authority(principal, project_id, CAP_READ)
+            task = self._task(project_id, task_id)
+            memory = task.get('web_lifecycle') or {}
+            scope = memory.get('scope')
+            token = content_hash(scope) if scope is not None else None
+            facts = {d: dict(value='unknown', event_id=None, evidence=[], provenance=None)
+                     for d in lifecycle.DIMENSIONS}
+            facts.update((memory.get('scopes', {}).get(token) or {}).get('facts') or {})
+            contributions = self.state.get('contributions', {}).get(task_id, [])
+            contribution = next((r for r in reversed(contributions) if r.get('kind') == 'contribution'), None)
+            try:
+                self.service.check_authority(principal, project_id, CAP_COORDINATE)
+                coordinate = True
+            except HttpError:
+                coordinate = False
+            ordinary_reason = None if coordinate and scope is not None else (
+                'Set a lifecycle scope first' if coordinate else 'Current coordinate permission is required')
+            affordances = {d: dict(allowed=ordinary_reason is None, reason=ordinary_reason)
+                           for d in lifecycle.DIMENSIONS}
+            for d in ('reviewed', 'integrated'):
+                affordances[d] = dict(allowed=False, reason=ordinary_reason or
+                                     'The disposable backend has no host merge slot')
+            affordances['integrated']['passed'] = dict(allowed=False,
+                reason='The disposable backend has no host integration mark writer')
+            return dict(task=task_id, scope=scope, scope_token=token, facts=facts,
+                        contribution=contribution, standing_approval=None,
+                        approval_reason='Use the host backend to record reviewed or integrated facts',
+                        scope_write=dict(allowed=coordinate, reason=None if coordinate else
+                                         'Current coordinate permission is required'),
+                        affordances=affordances, mark_writer_enabled=False)
+
+    def _lifecycle_write(self, route, principal, project_id, payload, operation_id):
+        import web_lifecycle
+        from requirements import content_hash
+        self.service.check_authority(principal, project_id, CAP_COORDINATE)
+        task = self._task(project_id, payload['task_id'])
+        operation = route.split('.', 1)[1]
+        body = {key: payload[key] for key in web_lifecycle.FIELDS[operation] | web_lifecycle.OPTIONAL[operation]
+                if key in payload}
+        body.update(operation=operation, task=payload['task_id'])
+        actor = payload['actor']
+        try:
+            _, native = web_lifecycle.validate(body, actor, operation_id)
+        except web_lifecycle.LifecycleError as error:
+            raise invalid(str(error)) from None
+        memory = task.get('web_lifecycle') or dict(scope=None, scopes={})
+        scope = memory['scope']
+        token = content_hash(scope) if scope is not None else None
+        if operation == 'scope' and payload['expected_scope_token'] != token:
+            raise conflict('Lifecycle scope changed; read it again before writing')
+        if operation == 'fact' and scope != payload['scope']:
+            raise conflict('Lifecycle scope changed; use the current scope')
+        if native['dimension'] in ('reviewed', 'integrated'):
+            # This validation backend has no host slot or mark family. It cannot
+            # simulate an integration that production would refuse or attest it.
+            failure = HttpError(503, 'unavailable', 'Reviewed and integrated facts require the host backend, '
+                                'its current approved contribution and task-held merge slot')
+            failure.nothing_done = True
+            raise failure
+        token = content_hash(native['scope'])
+        record = memory['scopes'].setdefault(token, dict(scope=native['scope'], facts={}))
+        event_id = 'lif_' + operation_id
+        if operation == 'scope':
+            memory['scope'] = native['scope']
+        else:
+            fact = dict(value=native['value'], event_id=event_id, evidence=native['evidence'],
+                        provenance=native['provenance'])
+            for key in ('note', 'trigger'):
+                if key in native:fact[key] = native[key]
+            record['facts'][native['dimension']] = fact
+        task['web_lifecycle'] = memory
+        task['version'] += 1
+        self._event(project_id, task['id'], route, principal, actor)
+        return dict(event_id=event_id, task=task['id'], dimension=native['dimension'], value=native['value'],
+                    operation_id=operation_id, actor=actor, scope_token=token)
+
     def _dispatch(self, route, principal, project_id, payload):
         handler = {
             'tasks.create': self._task_create,
@@ -1462,6 +1543,19 @@ class EndpointBackend:
                                                      now=self.service._expiry_now()),
                          require_authority=True)
 
+    def lifecycle_read(self, principal, project_id, task_id):
+        return self._run('web-lifecycle', project_id, self._actor(principal),
+                         [json.dumps(dict(operation='read', task=task_id))],
+                         authority=authority_request(principal, project_id, CAP_READ,
+                                                     now=self.service._expiry_now()),
+                         require_authority=True)
+
+    def lifecycle_replay_guard(self, principal, project_id, task_id, dimension):
+        state = self.lifecycle_read(principal, project_id, task_id)
+        sentence = (state.get('hold_refusals') or {}).get(dimension)
+        if sentence:
+            raise conflict(sentence)
+
     # -- transport -------------------------------------------------------------
     # A project's tasks live in a canonical Beads project that only an operator creates on
     # the host (admin.py add-project), so the HTTP route only REGISTERS an existing one
@@ -1641,6 +1735,13 @@ class EndpointBackend:
             error = HttpError(status, 'conflict' if status == 409 else 'invalid' if status == 422 else
                               'forbidden' if status == 403 else 'unavailable',
                               (reply.get('stderr') or 'Merge slot cannot be read').strip())
+            error.nothing_done = True
+            raise error
+        if action == 'web-lifecycle' and isinstance(reply, dict) and reply.get('lifecycle_status'):
+            status = reply['lifecycle_status']
+            error = HttpError(status, {403: 'forbidden', 404: 'not_found', 409: 'conflict',
+                                      422: 'invalid'}.get(status, 'unavailable'),
+                              (reply.get('stderr') or 'Lifecycle state cannot be read').strip())
             error.nothing_done = True
             raise error
         # Without a descriptor the service only reads (every write it sends carries one).
@@ -1926,15 +2027,20 @@ class EndpointBackend:
             raise not_implemented('Canonical backend cannot perform %s: %s'
                                   % (route, self.UNRESOLVED[route]))
         result_key = self._result_key(principal, project_id, route, key, target) if key else None
+        cached = None
         with self.service.store.lock:
             if authorize is not None:
                 authorize()
             if result_key is not None and self.service.has_result(result_key):
-                # The endpoint is not asked: the time is the one kept with the stored result,
-                # and none where none was kept (a result stored before the time was kept).
-                # Never the service's clock, which is the time of the retry (kittrial-5bb.97).
-                WRITTEN.at = self.service.result_written_at(result_key) or False
-                return self.service.result_get(result_key)
+                cached = (self.service.result_get(result_key), self.service.result_written_at(result_key))
+        if cached is not None:
+            if route == 'lifecycle.fact' and payload.get('dimension') in ('reviewed','integrated'):
+                self.lifecycle_replay_guard(principal, project_id, payload['task_id'], payload['dimension'])
+            elif route == 'merge-slot.acquire':
+                self.lifecycle_replay_guard(principal, project_id, payload['task_id'], 'merge-acquire')
+            # Keep the original time and response after the current native hold check.
+            WRITTEN.at = cached[1] or False
+            return cached[0]
         # The row rule for a credential issued before it is settled ONCE, here, before the
         # write is sent: the credential then carries the outcome and no later write reads
         # the tracker (kittrial-5bb.188 item 5).
@@ -2035,6 +2141,13 @@ class EndpointBackend:
         require — including ``schema_version`` and ``operation_id`` — and no
         operation-inappropriate nulls.
         """
+        if route.startswith('lifecycle.'):
+            import web_lifecycle
+            operation = route.split('.', 1)[1]
+            fields = {key: payload[key] for key in web_lifecycle.FIELDS[operation] | web_lifecycle.OPTIONAL[operation]
+                      if key in payload}
+            fields.update(operation=operation, task=payload['task_id'])
+            return 'web-lifecycle', project_id, [json.dumps(fields)], {}
         if route.startswith('merge-slot.'):
             operation = route.split('.', 1)[1]
             fields = {'operation': operation}
@@ -3852,7 +3965,7 @@ class ApiHandler(BaseHTTPRequestHandler):
     def _mutate(self, ctx, route_name, project_id, fn, *, capability, allow_self_user=None,
                 status=200, idempotent=True, replay_status=None, serialize=True,
                 canonical=False, reason=None, refused_reason=None,
-                audit_success=True, state_saved=None, audit_metadata=None):
+                audit_success=True, state_saved=None, audit_metadata=None, replay_check=None):
         """Run one authorized, idempotent mutation.
 
         ``capability`` names the authority the route needs. The idempotency key is
@@ -3877,6 +3990,9 @@ class ApiHandler(BaseHTTPRequestHandler):
                 ctx.principal, project_id, idem_route, key, ctx.body_hash,
                 canonical=canonical and serialize is False)
             if kind == 'replay':
+                if replay_check is not None:
+                    ctx.authorize()
+                    replay_check()
                 # An exact retry must not re-deliver a one-time secret; the caller
                 # marks that with replay_status (200 metadata-only for issue routes).
                 # The header carries the time of the write, as kept with the stored answer.
@@ -4997,6 +5113,81 @@ class ApiHandler(BaseHTTPRequestHandler):
         return self._mutate(ctx, 'projects.confirm', None, confirm, capability=CAP_ACCOUNTS_ADMIN,
                             reason='confirm ' + project_id)
 
+    def _lifecycle_backend(self):
+        if not hasattr(self.backend, 'lifecycle_read'):
+            raise not_implemented('Lifecycle facts are unavailable on this server')
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/lifecycle')
+    def lifecycle_get(self, ctx):
+        self._project(ctx, CAP_READ)
+        self._lifecycle_backend()
+        result = self.backend.lifecycle_read(ctx.principal, ctx.params['pid'], ctx.params['tid'])
+        result['current_actor'] = self.service.bind_actor(ctx.principal, None)
+        return 200, result
+
+    def _lifecycle_write(self, ctx, operation):
+        import web_lifecycle
+        # _mutate can replay a completed HTTP receipt before invoking its
+        # callback. Even that read of an old success requires today's authority.
+        self._project(ctx, CAP_COORDINATE)
+        metadata = {}
+        fields = web_lifecycle.FIELDS[operation] - {'task', 'dimension'}
+        optional = web_lifecycle.OPTIONAL[operation]
+        route_name = 'lifecycle.' + operation
+        def write():
+            self._lifecycle_backend()
+            if ctx.idempotency_key is None:
+                raise invalid('Send an Idempotency-Key and reuse it with the identical request after an uncertain outcome')
+            payload = dict(ctx.payload or {})
+            refuse_unknown_fields(payload, fields | optional, 'Lifecycle ' + operation)
+            if set(payload) - optional != fields:
+                raise invalid('Supply exactly ' + ', '.join(sorted(fields)))
+            actor = self.service.bind_actor(ctx.principal, None)
+            checked = dict(payload, operation=operation, task=ctx.params['tid'])
+            if operation == 'fact':checked['dimension'] = ctx.params['dimension']
+            try:
+                web_lifecycle.validate(checked, actor, 'http-validation')
+            except web_lifecycle.LifecycleError as error:
+                raise invalid(str(error)) from None
+            payload.update(task_id=ctx.params['tid'], actor=actor)
+            if operation == 'fact':payload['dimension'] = ctx.params['dimension']
+            result = self.backend.invoke(route_name, ctx.principal, ctx.params['pid'], payload,
+                                         ctx.idempotency_key, target=ctx.route_target,
+                                         authorize=ctx.authorize, capability=CAP_COORDINATE)
+            metadata.update({key: result.get(key) for key in
+                             ('operation_id', 'actor', 'task', 'dimension', 'value', 'event_id',
+                              'scope_token', 'mark_sha256')})
+            with self.service.store.lock:
+                existing = any(event.get('action') == route_name
+                               and event.get('project_id') == ctx.params['pid']
+                               and event.get('operation_id') == result['operation_id']
+                               and event.get('outcome') == 'committed'
+                               for event in self.service.state['audit'])
+                if not existing:
+                    event = self.service.audit(ctx.request_id, ctx.principal, route_name, 'committed',
+                                               project_id=ctx.params['pid'])
+                    event.update(metadata)
+                try:
+                    self.service.store.save()
+                except (OSError, TimeoutError):
+                    raise UncertainOutcome() from None
+            return result, result
+        def replay_check():
+            if (operation == 'fact' and ctx.params['dimension'] in ('reviewed','integrated')
+                    and hasattr(self.backend, 'lifecycle_replay_guard')):
+                self.backend.lifecycle_replay_guard(ctx.principal, ctx.params['pid'],
+                    ctx.params['tid'], ctx.params['dimension'])
+        return self._mutate(ctx, route_name, ctx.params['pid'], write, capability=CAP_COORDINATE,
+                            status=201, serialize=False, canonical=True, audit_success=False, replay_check=replay_check)
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/lifecycle/scope')
+    def lifecycle_scope(self, ctx):
+        return self._lifecycle_write(ctx, 'scope')
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/lifecycle/facts/(?P<dimension>[a-z-]+)')
+    def lifecycle_fact(self, ctx):
+        return self._lifecycle_write(ctx, 'fact')
+
     def _merge_slot_backend(self):
         if not hasattr(self.backend, 'merge_slot_read'):
             raise not_implemented('Merge-slot coordination is unavailable on this server')
@@ -5071,9 +5262,13 @@ class ApiHandler(BaseHTTPRequestHandler):
         # Persist the audit before the HTTP receipt. A lost canonical response
         # reconciles through the existing guarded receipt, with its original
         # before/after holder metadata, without releasing a later holder.
+        def replay_check():
+            if operation == 'acquire' and hasattr(self.backend, 'lifecycle_replay_guard'):
+                self.backend.lifecycle_replay_guard(ctx.principal, ctx.params['pid'],
+                    ctx.payload['task_id'], 'merge-acquire')
         return self._mutate(ctx, 'merge-slot.' + operation, ctx.params['pid'], write,
                             capability=capability, serialize=False, canonical=True,
-                            audit_success=False)
+                            audit_success=False, replay_check=replay_check)
 
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/merge-slot/acquire')
     def merge_slot_acquire(self, ctx):
