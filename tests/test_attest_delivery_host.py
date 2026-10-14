@@ -195,6 +195,60 @@ class DocumentedCommandTests(AttestDeliveryCase):
         self.assertEqual(state['attestation']['author'], VERIFIER)
         self.assertEqual(state['attestation']['sha256'], digest)
 
+    def test_a_large_real_bundle_is_verified_across_hash_blocks(self):
+        # kittrial-5bb.272 item 2c, the check no review ran: a real bundle well past one
+        # hash block (BUNDLE_BLOCK_BYTES is 1 MiB). Random content does not compress, so
+        # the bundle really spans several blocks, and the observation must still count and
+        # hash exactly what is on disk - counted here independently, block by block.
+        repo = self.root / 'src-large'
+        repo.mkdir()
+        self.git('init', '-q', cwd=repo)
+        self.git('config', 'user.email', 't@example.invalid', cwd=repo)
+        self.git('config', 'user.name', 'Test', cwd=repo)
+        (repo / 'blob.bin').write_bytes(os.urandom(6 * 1024 * 1024 + 4096))
+        self.git('add', 'blob.bin', cwd=repo)
+        self.git('commit', '-q', '-m', 'large', cwd=repo)
+        sha = self.git('rev-parse', 'HEAD', cwd=repo).strip()
+        branch = self.git('rev-parse', '--abbrev-ref', 'HEAD', cwd=repo).strip()
+        bundle = self.root / 'large.bundle'
+        self.git('bundle', 'create', str(bundle), branch, cwd=repo)
+        digest = hashlib.sha256()
+        size = 0
+        with bundle.open('rb') as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+                digest.update(chunk)
+                size += len(chunk)
+        self.assertGreaterEqual(size, 3 * w.BUNDLE_BLOCK_BYTES)   # the block path is the only path
+        self.contribute(sha, digest.hexdigest())
+        result = json.loads(self.attest(bundle=bundle))
+        self.assertEqual((result['observation']['bytes'], result['observation']['sha256']),
+                         (size, digest.hexdigest()))
+        self.assertEqual(result['observation']['heads'][0]['commit'], sha)
+        self.assertEqual(w.project(self.issue)['verification'], 'verified')
+
+    def test_an_account_id_on_the_verifiers_list_authorizes_only_itself(self):
+        # kittrial-5bb.272 item 2b, the check no review ran: an ACCOUNT id (usr_..., the
+        # web world's shape) on the deployment verifiers list grants nothing to any real
+        # actor - the list is read as exact actor names - and the web route refuses
+        # attest whatever the list holds (tests/test_review_host_only_web.py). The host
+        # command run UNDER the account id is that listed name, so it records - with an
+        # author that is inert on both routes. That is the finding, pinned.
+        bundle, sha = self.make_bundle()
+        digest = hashlib.sha256(bundle.read_bytes()).hexdigest()
+        self.configure(operators=[OPERATOR], verifiers=['usr_4f7c1d'])
+        self.contribute(sha, digest)
+        before = len(self.issue['comments'])
+        # A real actor is NOT the listed name: the account id authorizes nobody else.
+        with self.assertRaisesRegex(ValueError, 'only a listed verifier or a listed operator'):
+            self.attest(actor=VERIFIER, bundle=bundle)
+        self.assertEqual(len(self.issue['comments']), before)
+        # The account id itself is the one listed name; the host command records under it.
+        result = json.loads(self.attest(actor='usr_4f7c1d', bundle=bundle))
+        self.assertEqual(result['observation']['sha256'], digest)
+        state = w.project(self.issue)
+        self.assertEqual((state['verification'], state['attestation']['author']),
+                         ('verified', 'usr_4f7c1d'))
+
     def test_a_wrong_checksum_cannot_be_recorded_as_verified(self):
         bundle, sha = self.make_bundle()
         digest = hashlib.sha256(bundle.read_bytes()).hexdigest()

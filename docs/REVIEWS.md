@@ -639,9 +639,18 @@ and the release names exactly one open hold:
   listed operator can release it. A hold on a revision that is NOT approved does not take that
   revision out of review: a revision still awaiting review stays in the reviewers' queue with
   the hold shown beside it, and a revision whose author still has open requested changes reads
-  `changes-requested` (the author still owes the changes) with the hold shown too. Every
+  `changes-requested` (the author still owes the changes) with the hold shown too. So
+  `work --state held` lists APPROVED-and-held contributions only (kittrial-5bb.272): a held
+  revision that is not approved is found under `--state awaiting-review` (or
+  `--state changes-requested`) with its hold shown beside it, not under `held`. Every
   refusal driven by the hold - merge-acquire, a `reviewed`/`integrated` fact, the release
   selection, or a release that names the task - says what is wrong AND who can release it.
+* **A closed task that is held is not active work** (kittrial-5bb.272, the coordinator's
+  resolution at integration, following the closed-queue rule): closing a task whose
+  contribution is held removes it from every active work queue, `--state held` included,
+  exactly as closure removes review and integration invitations. The hold record stays in
+  history and `review TASK` still reports `held`; releasing the hold and the closure are
+  separate acts, and reopening the task shows the hold again in the active queue.
 * **Approve while held is accepted, and the state stays `held`.** An approval recorded while a
   hold is open does not clear the hold and does not make the contribution integration-ready;
   the effective state stays `held` until a `release-hold` clears it.

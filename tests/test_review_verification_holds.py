@@ -513,6 +513,69 @@ class IntegrationHoldTests(Harness):
         # The author still owes OPEN requested changes, so with any the move is theirs.
         self.assertEqual(review_state.next_actor('held', AUTHOR, pending_items=1), 'assignee')
 
+    def test_state_held_lists_approved_and_held_only(self):
+        # kittrial-5bb.272 item 3: `work --state held` finds the approved-and-held
+        # revision; a held revision that is NOT approved stays under the state it really
+        # shows - awaiting-review here - with the hold beside it, never under `held`.
+        approved = self.approved()
+        self.send(self.hold(approved))
+
+        def plant(target, payload, author=AUTHOR):
+            cid = str(len(target['comments']) + 1)
+            target['comments'].append(dict(id=cid, text=w.PREFIX + w.canonical_bytes(payload).decode(),
+                                           author=author, created_at='2026-09-16T00:00:00Z'))
+            return cid
+
+        # A second task whose current contribution is held while still AWAITING review.
+        second = row(task='task-2')
+        self.rows.append(second)
+        awaiting = plant(second, dict(schema_version=1, operation='contribute', operation_id='op-c2',
+                                      task='task-2', previous=None, repository='ssh://git.example/project',
+                                      commit=COMMIT_2, base_commit=BASE,
+                                      delivery=dict(kind='remote', remote='ssh://git.example/project',
+                                                    branch='contrib/y'),
+                                      summary='Second task', supersedes=None))
+        plant(second, dict(schema_version=1, operation='hold', operation_id='op-h2', task='task-2',
+                           previous=awaiting, contribution=awaiting, reason='Held early, still in review'),
+              author=OPERATOR)
+        self.assertEqual(w.project(second)['review_state'], 'awaiting-review')
+
+        held_rows = work.queue(self.rows, AUTHOR, ['--state', 'held'])['items']
+        self.assertEqual([item['task'] for item in held_rows], [TASK])          # only the approved one
+        self.assertTrue(held_rows[0]['holds'])
+        awaiting_rows = work.queue(self.rows, AUTHOR, ['--state', 'awaiting-review'])['items']
+        # The held-not-approved revision is found under awaiting-review, hold beside it.
+        self.assertEqual([item['task'] for item in awaiting_rows], ['task-2'])
+        self.assertIn('Integration hold', awaiting_rows[0]['next'])
+
+    def test_a_closed_task_that_is_held_is_not_active_work(self):
+        # kittrial-5bb.272 item 4, the coordinator's resolution at integration: closure
+        # removes the held task from every active queue (`--state held` included); the
+        # hold record stays in history and `review` still reports it.
+        contribution = self.approved()
+        self.send(self.hold(contribution))
+        self.assertEqual(w.project(self.issue)['review_state'], 'held')
+        self.issue['status'] = 'closed'
+        self.assertEqual(work.queue(self.rows, AUTHOR, ['--state', 'held'])['items'], [])
+        self.assertEqual(work.queue(self.rows, AUTHOR, ['--mine'])['items'], [])
+        self.assertEqual(work.queue(self.rows, REVIEWER, [])['items'], [])
+        # The record stays: the review read still says held.
+        self.assertEqual(w.project(self.issue)['review_state'], 'held')
+
+    def test_lifecycle_reads_the_chain_through_the_shared_projection(self):
+        # kittrial-5bb.272 item 5: lifecycle.review_chain_state projects with
+        # records(row, None) - no operator voids, no journal - the same shared
+        # projection review/brief/work use; ignoring voids can only add a hold, never
+        # clear one, so the lifecycle held read cannot miss a stored hold.
+        from review_workflow import records, projection, integration_hold_sentence
+        contribution = self.approved()
+        self.send(self.hold(contribution))
+        state = lifecycle.review_chain_state(self.issue)
+        self.assertEqual(state, projection(records(self.issue, None)))
+        self.assertTrue(integration_hold_sentence(state))
+        self.assertEqual(lifecycle.held_issue_sentence(self.issue),
+                         integration_hold_sentence(projection(records(self.issue, None))))
+
     def test_a_hold_survives_an_exact_retry(self):
         contribution = self.approved()
         payload = self.hold(contribution)
