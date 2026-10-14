@@ -15,8 +15,10 @@ complete bounded intake pass across
 every page of changes-requested, awaiting-review, awaiting-integration,
 legacy-review-ready and error work, plus new coordinator-owned activity. Read each
 relevant review record and newer history for the exact delivered commit. A failed,
-partial or inaccessible read is unknown coverage, never an empty queue. Route
-project feedback to the documented feedback stream; on older services without it,
+partial or inaccessible read is unknown coverage, never an empty queue. Orchestra
+feedback is about Orchestra itself - the tools, the process and the coordination - not
+about this project's own work, which goes into tasks, comments and requirements. Route
+it to the documented feedback stream; on older services without it,
 obtain an agreed interim parent/job target rather than using an unrelated task.
 Use the documented activity export/cursors and history; do not treat issue
 updated_at as a complete activity cursor.
