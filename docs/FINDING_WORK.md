@@ -41,7 +41,10 @@ Blocked and in-progress tasks carry `newer_activity`: whether another actor wrot
 activity its last checkpoint did not incorporate. No checkpoint or uncertain history
 stays unknown. Read the linked task brief before acting: its `newer` summary gives
 bounded entry references, counts and coverage. Read the task's history for the full
-comments: `GET /v1/projects/PROJECT/tasks/TASK/history`. Reading acknowledges nothing.
+comments: `GET /v1/projects/PROJECT/tasks/TASK/history`. Page it with `next_cursor`; a
+long comment is several consecutive entries that share `entry_id` and carry `body_offset`
+and `continued`, so concatenate them in page order to recover the whole body. Reading
+acknowledges nothing.
 This is the current-attention read (kittrial-5bb.114); it does not wait for activity or
 deliver a wake notification (the separate kittrial-5bb.207).
 
