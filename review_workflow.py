@@ -2328,7 +2328,7 @@ def require_integrated_follow_on(payload, state, ordered, rows, task, assignee=N
 #: kittrial-5bb.155; the parts are named so that :data:`BASE_REFUSAL` is built from them.
 BASE_RULE = ('Contribution base_commit must be the prior integration commit %s, or an integration commit '
              'this project recorded after it (a passed integrated fact on any task, recorded by a listed '
-             'operator, not reverted)%s. '
+             'operator or carrying a valid host-issued web coordinate mark, not reverted)%s. '
              '%s is not accepted: %s')
 BASE_NEWEST = '; the newest such commit is %s'
 BASE_NONE_YET = '; none is recorded yet'

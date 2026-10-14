@@ -49,10 +49,10 @@ class RestoreTests(unittest.TestCase):
 
     def test_member_cut_retries_same_manifest_and_cannot_be_replaced_by_legacy_restore(self):
         atomic = coordination.atomic
-        def cut(path, value):
+        def cut(path, value, **options):
             if path.parent.name == marks.DIRECTORY:
                 raise OSError('synthetic member cut')
-            return atomic(path, value)
+            return atomic(path, value, **options)
         with patch.object(coordination, 'atomic', side_effect=cut), self.assertRaises(OSError):
             marks.restore_files(self.destination, self.files, self.rows)
         before = self.destination.joinpath(marks.RESTORE_MARKER).read_bytes()

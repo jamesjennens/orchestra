@@ -138,6 +138,8 @@ def _regular_bytes(path):
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_RECORD_BYTES:
             raise ValueError('Web lifecycle mark is not a bounded regular file')
+        if os.name != 'nt' and stat.S_IMODE(info.st_mode) & 0o022:
+            raise ValueError('Web lifecycle mark member is group- or world-writable')
         with os.fdopen(fd, 'rb', closefd=False) as stream:
             data = stream.read(MAX_RECORD_BYTES + 1)
         if len(data) > MAX_RECORD_BYTES:
@@ -161,6 +163,8 @@ def read_journal(project):
     try:
         if path.is_symlink() or not path.is_dir():
             raise ValueError('Web lifecycle mark family is not a real directory')
+        if os.name != 'nt' and stat.S_IMODE(path.stat().st_mode) & 0o022:
+            raise ValueError('Web lifecycle mark family is group- or world-writable')
         names = []
         with os.scandir(path) as entries:
             for entry in entries:
@@ -225,9 +229,9 @@ def issue(project, project_name, row, authority, *, enabled=False):
             or journal['bytes'] + len(entry_bytes(entry)) > MAX_FAMILY_BYTES):
         raise ValueError('Web lifecycle mark family exceeds its admission bounds')
     directory = Path(project) / DIRECTORY
-    directory.mkdir(exist_ok=True)
+    directory.mkdir(mode=0o700, exist_ok=True)
     from coordination import atomic
-    atomic(directory / (entry['sha256'] + '.json'), entry)
+    atomic(directory / (entry['sha256'] + '.json'), entry, mode=0o600)
     if os.name != 'nt':
         # The file was fsynced by atomic; make both the rename and first family
         # creation durable on the deployment platform before issuing a receipt.
@@ -309,7 +313,7 @@ def restore_files(project, files, rows):
             # Native restore may already have happened; silence would expose a
             # previous family's members as though they belonged to this backup.
             atomic(marker, dict(schema_version=1, missing_mark_manifest=True,
-                                native_sha256=content_hash({'rows': list(rows)})))
+                                native_sha256=content_hash({'rows': list(rows)})), mode=0o600)
             raise ValueError('Backup has no web lifecycle mark manifest but this destination has a family; '
                              'preserve it and reconcile a complete mark-capable backup. Restore is incomplete.')
         return False
@@ -318,9 +322,9 @@ def restore_files(project, files, rows):
         raise ValueError('Another web lifecycle mark restore is incomplete; reconcile its exact manifest first')
     if directory.exists() and not directory.is_dir():
         raise ValueError('Web lifecycle mark restore directory is not a directory')
-    atomic(marker, identity)
+    atomic(marker, identity, mode=0o600)
     validate_backup(files, rows)
-    directory.mkdir(exist_ok=True)
+    directory.mkdir(mode=0o700, exist_ok=True)
     old = read_journal(root)
     if any(problem != 'web-lifecycle-mark-restore-incomplete' for problem in old['invalid']):
         raise ValueError('Existing web lifecycle mark family is damaged; operator reconciliation required')
@@ -329,7 +333,7 @@ def restore_files(project, files, rows):
         target = root / name
         if target.is_symlink() or target.with_suffix('.tmp').is_symlink():
             raise ValueError('Web lifecycle mark restore member must not be a symlink')
-        atomic(target, files[name])
+        atomic(target, files[name], mode=0o600)
     for entry in old['entries'].values():
         name = DIRECTORY + '/' + entry['sha256'] + '.json'
         if name not in expected:

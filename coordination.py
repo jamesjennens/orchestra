@@ -29,9 +29,16 @@ REQUIRED_SECTIONS = {'decision': ('Decision', 'Rationale', 'Alternatives Conside
 RELEASABLE = ('failed', 'released')
 
 
-def atomic(path, data):
+def atomic(path, data, *, mode=None):
     tmp=path.with_suffix('.tmp')
-    with tmp.open('w',encoding='utf-8') as stream:
+    if mode is None:
+        stream=tmp.open('w',encoding='utf-8')
+    else:
+        # A private family creates its temporary file privately from the first byte.
+        # An existing temp path is evidence of a cut, never followed or overwritten.
+        fd=os.open(tmp,os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,'O_NOFOLLOW',0),mode)
+        stream=os.fdopen(fd,'w',encoding='utf-8')
+    with stream:
         json.dump(data,stream,ensure_ascii=False,sort_keys=True)
         stream.flush();os.fsync(stream.fileno())
     os.replace(tmp,path)

@@ -124,6 +124,17 @@ class AdapterTests(unittest.TestCase):
         result = web.read(TASK, 'op', self.native_run, self.project, parties=self.parties)
         self.assertNotIn('trigger', result['facts']['tested']);self.assertNotIn('note', result['facts']['tested'])
 
+    def test_author_party_is_refused_after_assignment_to_unrelated_holder(self):
+        # The assignee branch cannot conceal removal of the AUTHOR party check.
+        author=self.rows[0]['comments'][0]['author']
+        self.rows[0]['assignee']='unrelated-current-holder'
+        self.parties=lambda name: {'authors-account'} if name in (author,REVIEWER) else {name}
+        with self.assertRaises(web.LifecycleError) as raised:
+            web.approved_source(self.rows[0],self.scope,owners={},project=self.project,parties=self.parties)
+        self.assertEqual(raised.exception.status,409)
+        self.assertIn('another party than the author',str(raised.exception))
+        self.assertEqual(self.writes,0)
+
     def test_historical_worker_issuer_matches_approver_party(self):
         self.scope_first()
         author = self.rows[0]['comments'][0]['author']

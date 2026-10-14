@@ -122,12 +122,36 @@ the complete member set, hashes and restored native event bindings before cleari
 interrupted restore retain explicit uncertainty. Preserve files and inspect the
 native event and guarded operation journal before repair; do not delete a marker
 to claim success. Exact restore retries can finish the same manifest. Legacy
-backups without marks confer no marked eligibility; restoring them over an
-existing family cannot silently discard its authority. A foreign project copy
-retains original bindings and gains no marked eligibility in the destination.
+backups without marks confer no marked eligibility. `restore-new` always creates
+an unused, DIFFERENT project name. It preserves mark bytes as historical evidence,
+but **every such restore loses marked eligibility in the destination** because
+marks remain bound to the source project name. The command prints a loud warning;
+rc 0 means the data restore succeeded, not that marked authority survived.
+Lifecycle audit reports these integrations as questionable, and they cannot
+qualify later contribution bases through mark authority. Preserve the complete
+source backup and reconcile eligibility with an installation operator before
+continuing integrations. Re-granting current web access does not rebind old marks.
+A marks-free legacy sidecar restores no marks into its new destination; absence
+in that backup does not prove the source never had marks. The low-level restore
+refuses overwriting an existing family with a missing manifest, but that is not
+the CLI's new-destination recovery path.
+
+Mark directories are created with POSIX mode0700, files and restore markers with
+mode0600. Group- or world-writable directories/members are reported unreadable
+and confer no marked authority; preserve them for operator inspection before
+repairing ownership/permissions. Windows ACL behavior requires separate host
+validation; POSIX mode tests do not establish it.
+
 Host ownership and operator restore are the trust boundary, not authenticated
-origin. Older kits ignore this family and cannot use marked integrations as later
-bases: take and preserve a final complete new-kit backup before downgrade.
+origin. **Never use an older kit to back up or restore a project holding marks.**
+Its backup can exit successfully, omit the family, and replace the complete
+new-kit sidecar with a marks-free one; its restore refuses a sidecar containing
+these new paths. Before downgrade, stop writers and take and retain an immutable,
+complete new-kit native/sidecar/journal backup outside the older kit's backup
+location. Preserve that kit and its restore procedure. Older readers ignore marks
+and cannot use marked integrations as later bases. Restore using the mark-capable
+kit, heed the renamed-destination warning, and reconcile eligibility before
+resuming work.
 
 The disposable `InProcessBackend` supports scope and ordinary facts, but refuses
 all reviewed/integrated writes with an explicit host-backend limitation. It cannot

@@ -3,9 +3,11 @@ import copy
 from pathlib import Path
 import sys
 import unittest
+from unittest.mock import patch
 
 sys.path[:0] = [str(Path(__file__).resolve().parents[1]), str(Path(__file__).resolve().parent)]
 from test_http_agents import AgentHarness
+from http_service import ApiHandler
 
 
 class LifecycleHttpTests(AgentHarness):
@@ -43,6 +45,20 @@ class LifecycleHttpTests(AgentHarness):
         result = self.post('/scope', self.scope_body(), 'scope')
         self.assertEqual(result.status, 201, result.data)
         return result
+
+    def test_route_gate_rejects_read_only_caller_even_if_later_mutation_gate_is_permissive(self):
+        user=self.create_account(self.admin,'route-reader','route-reader-password-1')
+        self.assertEqual(self.request('PUT','/v1/projects/%s/members/%s'%(self.project,user),
+                                     {'role':'viewer'},token=self.admin).status,200)
+        viewer=self.login('route-reader','route-reader-password-1')[0]
+        # Isolate the route's first guard from the independent later guard. The
+        # real HTTP authentication/project check still runs; no effect is invoked.
+        with patch.object(ApiHandler,'_mutate',return_value=(201,{'unexpected':'route admitted'})) as later:
+            response=self.post('/scope',self.scope_body(),'route-only-scope',viewer)
+            self.assertEqual(response.status,403,response.data)
+            response=self.post('/facts/tested',self.fact_body(),'route-only-fact',viewer)
+            self.assertEqual(response.status,403,response.data)
+            later.assert_not_called()
 
     def test_scope_facts_current_token_cas_and_scoped_history(self):
         before = self.state()

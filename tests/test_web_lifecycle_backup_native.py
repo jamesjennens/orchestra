@@ -79,6 +79,8 @@ class NativeMarkBackupTests(RulesHelpers,unittest.TestCase):
         self.assertTrue((copy_path/'pp').is_dir())
         restored=self.command('restore-new','pp','markforeign')
         self.assertEqual(restored.returncode,0,restored.stdout+restored.stderr)
+        self.assertIn('DO NOT confer marked integration eligibility',restored.stderr)
+        self.assertIn('cannot qualify later contribution bases',restored.stderr)
         destination=self.root/'projects'/'markforeign'
         restored_rows=[json.loads(line) for line in fixture.admin.run_bd(self.root,'markforeign',['export','--all']).splitlines() if line.strip()]
         restored_event=next(row for row in restored_rows if row['id']==event['id'])

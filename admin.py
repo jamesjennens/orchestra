@@ -861,6 +861,10 @@ def lifecycle_authors_command(root,project,limit=None):
     report=lifecycle.lifecycle_authors_report(rows,operators(root),owners=owners,limit=limit)
     report['project']=project
     report['setting']={'lifecycle_authors':coordinator_rule(root,'lifecycle_authors')}
+    report['preview_scope']='host-lifecycle-authors-only'
+    report['preview_note']=('allowed and would_be_refused preview only the host lifecycle_authors rule. '
+                            'They do not judge live web coordinate authority or historical web integration marks; '
+                            'use lifecycle-audit for recorded mark eligibility. The web route does not apply this host rule.')
     return report
 
 
@@ -1056,6 +1060,65 @@ def lifecycle_correction_command(root, project, operation, target, actor, reason
         payload = dict(schema_version=1, operation=operation, operation_id=key, actor=actor,
                        reason=reason, evidence=evidence, binding=binding, target_void=target_void)
         return voids.apply(rows, actor, payload, run, path, authority, owners, enabled)
+
+
+def lifecycle_abandon_command(root, project, comment_id, actor, reason, evidence,
+                              operation_id=None):
+    """Host-only closing of one incomplete correction, without its original words.
+
+    The operator names the native correction comment the audit lists as
+    incomplete; the kit reads that comment's retained payload for the exact
+    binding and abandoned operation id, so the reason, evidence and key do not
+    have to be reproduced. Nothing native is written or deleted, the abandoned
+    comment stays in place and the audit lists it as ``abandoned``. A comment
+    that already has a host entry is refused (an issued void is never abandoned).
+    The record is written to the abandonment store BESIDE the family, so a family
+    that holds an abandonment stays readable by the released F0 kit. Before the
+    write the command prints the rule that an abandonment also closes a void whose
+    entry was LOST, so the operator rules that out first (kittrial-5bb.271 item 3).
+    An abandonment is final: apply() refuses the exact retry of the abandoned
+    operation, and a fresh void under a new key is the way to void the event.
+    """
+    import fcntl
+    import lifecycle_voids as voids
+    from recovery import identity
+    from review_workflow import operator_owners, listed_operator_actor
+    identity(actor, 'Invalid actor identity')
+    voids._identity(str(comment_id), 'native correction comment identity')
+    key = operation_id or ('lifecycle-abandon-' + secrets.token_hex(16))
+    voids._identity(key, 'operation identity')
+    voids._text(reason, 'reason', 1000)
+    if not isinstance(evidence, list) or not 1 <= len(evidence) <= 20:
+        raise ValueError('Evidence needs one to twenty nonblank pointers')
+    for pointer in evidence:
+        voids._text(pointer, 'evidence')
+    path = project_dir(root, project)
+    if not (path / '.beads/metadata.json').is_file():
+        raise ValueError('Unknown/uninitialized project')
+    if (path / '.coordination.lock').is_symlink():
+        raise ValueError('Coordination lock must not be a symlink')
+    with (path / '.coordination.lock').open('a') as lock, deployment_config_lock(root):
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        authority = operators(root, strict=True)
+        owners = operator_owners(path)
+        if not listed_operator_actor(actor, authority, owners):
+            raise ValueError('Lifecycle abandonment requires a currently listed operator or its bound actor')
+        enabled = lifecycle_void_writes(root)
+        if not enabled:
+            raise ValueError('lifecycle_void_writes is off; nothing was changed')
+        def run(argv):
+            return run_bd(root, project, ['--actor', actor, *argv])
+        rows = record_json.loads_rows(run(['export', '--all']))
+        target = voids.incomplete_correction(rows, comment_id)
+        if target is None:
+            raise ValueError('Lifecycle abandonment target is missing or its correction payload is unreadable')
+        payload = dict(schema_version=1, operation='abandon', operation_id=key, actor=actor,
+                       reason=reason, evidence=evidence, binding=target['binding'],
+                       target_void=target['target_void'])
+        # kittrial-5bb.271 item 3: say it before the write, every time.
+        print(voids.ABANDON_LOST_ENTRY_RULE)
+        return voids.abandon(rows, actor, payload, path, authority, owners, enabled,
+                             comment_id=comment_id, recorded_at=utc_stamp())
 
 
 #: The key of the installation setting that accepts bound keys only, and the key of its short
@@ -4025,7 +4088,7 @@ def validate_coordination_files(files):
     for name,record in files.items():
         quarantine = isinstance(name,str) and re.fullmatch(r'\.feedback\.jsonl\.(?:[a-f0-9]{16}|[a-f0-9]{64})\.incomplete',name)
         journal = isinstance(name,str) and re.fullmatch(r'(?:\.coordination-requests|\.handoffs|\.handoff-requests|\.handoff-recoveries|\.requirement-requests|\.requirement-owner-requests|\.requirement-backfills|\.integration-reverts|\.lifecycle-voids|\.web-lifecycle-marks|\.reference-requests|\.proposal-requests|\.capability-requests|\.open-item-requests|\.owner-answers)/[a-f0-9]{64}\.json',name)
-        if name not in ('.merge-context.json','ONBOARDING.md','GUIDANCE.md','.guidance.json','.guidance-clear.json','.sessions.json','.feedback.jsonl','.requirements-governance.json','.requirements-governance-source.json','.lifecycle-voids-manifest.json','.web-lifecycle-marks-manifest.json') and not quarantine and not journal:raise ValueError('Invalid coordination backup path')
+        if name not in ('.merge-context.json','ONBOARDING.md','GUIDANCE.md','.guidance.json','.guidance-clear.json','.sessions.json','.feedback.jsonl','.requirements-governance.json','.requirements-governance-source.json','.lifecycle-voids-manifest.json','.web-lifecycle-marks-manifest.json','.lifecycle-void-abandons.json') and not quarantine and not journal:raise ValueError('Invalid coordination backup path')
         if not isinstance(record,dict):raise ValueError('Invalid coordination record')
         if name=='.sessions.json':
             from sessions import validate
@@ -6258,7 +6321,7 @@ def restore_coordination(root,source,destination,restore_operators=False,restore
     import web_lifecycle_marks as marks
     restore_web_lifecycle_mark_family(root,destination,files)
     for name,record in files.items():
-        if name in (voids.MANIFEST,marks.MANIFEST) or name.startswith((voids.DIRECTORY+'/',marks.DIRECTORY+'/')):
+        if name in (voids.MANIFEST,marks.MANIFEST,voids.ABANDON_FILE) or name.startswith((voids.DIRECTORY+'/',marks.DIRECTORY+'/')):
             continue
         target=project_dir(root,destination)/name
         target.parent.mkdir(exist_ok=True)
@@ -9528,6 +9591,13 @@ def main():
         a.add_argument('--actor',required=True);a.add_argument('--reason',required=True)
         a.add_argument('--evidence',required=True,action='append')
         a.add_argument('--operation-id',default=None,help='retain the returned identity for an exact retry after uncertainty')
+    a=sub.add_parser('lifecycle-event-abandon',help='host-only: close one native correction comment that has NO host '
+                     'entry (a cut before publication), without its original words; nothing native is written or '
+                     'deleted and an issued void is never a target',allow_abbrev=False)
+    a.add_argument('project');a.add_argument('comment_id',help='the native correction comment the audit lists as incomplete')
+    a.add_argument('--actor',required=True);a.add_argument('--reason',required=True)
+    a.add_argument('--evidence',required=True,action='append')
+    a.add_argument('--operation-id',default=None,help='retain the returned identity for an exact retry after uncertainty')
     a=sub.add_parser('capability-verify',help='record verified capability checks (operator allowlist or verifiers list)')
     a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('authorized-keys',help='print the confined contributor and unrestricted operator authorized_keys lines for one public key')
@@ -10378,6 +10448,9 @@ def main():
         target=args.event if operation=='void' else args.void_operation
         print(json.dumps(lifecycle_correction_command(root,args.project,operation,target,args.actor,
                          args.reason,args.evidence,args.operation_id)))
+    elif args.command=='lifecycle-event-abandon':
+        print(json.dumps(lifecycle_abandon_command(root,args.project,args.comment_id,args.actor,
+                         args.reason,args.evidence,args.operation_id)))
     elif args.command=='authorized-keys':
         authorized_keys(root,args.key_file,args.role,args.python,args.comment,args.project,args.principal)
     elif args.command=='authorized-keys-list':
@@ -10693,6 +10766,18 @@ def finish_restore(root,args,snapshot,step=None):
     # the merge-slot step below fails, so the notice must say what was not compared and not
     # re-granted, and it can only say that knowing this (kittrial-5bb.240 F1).
     args.sidecar_restored=sidecar
+    import web_lifecycle_marks as marks
+    mark_family=marks.read_journal(project_dir(root,args.destination))
+    if mark_family['entries']:
+        print('WARNING: restored web integration marks retain their original project binding. '
+              'restore-new requires a different project name: these marks DO NOT confer marked '
+              'integration eligibility in this destination. Historical marked integrations are '
+              'questionable here and cannot qualify later contribution bases on mark authority. '
+              'Preserve the complete original backup and ask an installation operator to reconcile '
+              'eligibility before continuing integrations.',file=sys.stderr)
+    else:
+        print('This backup restored no web integration mark family: no marked eligibility was restored. '
+              'An older kit may omit this family; absence here does not prove it was absent at the source.')
     restored=restore_journal(snapshot,
                              project_dir(root,args.destination)/JOURNAL_STORE_NAME)
     args.journal_restored=restored is not None

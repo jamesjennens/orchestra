@@ -41,6 +41,28 @@ class MarkFamilyTests(unittest.TestCase):
         self.assertFalse(marks.recorder_eligible(self.event, 'p', []))
         self.assertEqual(list(self.root.iterdir()), [])
 
+    @unittest.skipIf(os.name == 'nt', 'POSIX modes are not Windows ACLs')
+    def test_private_creation_and_writable_family_refusal(self):
+        before_umask=os.umask(0o002)
+        try:
+            self.issue()
+        finally:
+            os.umask(before_umask)
+        directory=self.root / marks.DIRECTORY
+        member=next(directory.iterdir())
+        self.assertEqual(directory.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(member.stat().st_mode & 0o777, 0o600)
+        member.chmod(0o620)
+        report=marks.read_journal(self.root)
+        self.assertTrue(any('group- or world-writable' in e for e in report['invalid']))
+        self.assertFalse(marks.recorder_eligible(self.event,'p',[],{},report))
+        with self.assertRaises(ValueError): marks.backup_files(self.root,self.rows)
+        member.chmod(0o600)
+        directory.chmod(0o702)
+        report=marks.read_journal(self.root)
+        self.assertTrue(any('group- or world-writable' in e for e in report['invalid']))
+        self.assertFalse(marks.recorder_eligible(self.event,'p',[],{},report))
+
     def test_issued_mark_survives_operator_replacement_and_exact_retry(self):
         entry = self.issue()
         before = {f.name: f.read_bytes() for f in (self.root / marks.DIRECTORY).iterdir()}
