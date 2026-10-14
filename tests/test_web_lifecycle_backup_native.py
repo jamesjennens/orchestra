@@ -112,6 +112,37 @@ class NativeMarkBackupTests(RulesHelpers,unittest.TestCase):
         self.assertEqual(legacy.returncode,0,legacy.stderr)
         legacy_result=json.loads(legacy.stdout)
         self.assertIsNone(legacy_result[1]);self.assertEqual(legacy_result[0][scope['integration_commit']][0],'unlisted')
+        # Keep the complete newer pair outside the older kit's backup destination.
+        def previous_command(*args):
+            return subprocess.run([sys.executable,'-B',str(previous/'admin.py'),'--root',str(self.root),*args],
+                                  cwd=previous,env=fixture.admin.environment(self.root),
+                                  capture_output=True,text=True,timeout=180)
+        old_restore=previous_command('restore-new','pp','oldmarkrefused')
+        self.assertNotEqual(old_restore.returncode,0,old_restore.stdout+old_restore.stderr)
+        self.assertIn('Invalid coordination backup path',old_restore.stderr)
+        self.assertFalse((self.root/'projects'/'oldmarkrefused').exists())
+        old_backup=previous_command('backup','pp')
+        self.assertEqual(old_backup.returncode,0,old_backup.stdout+old_backup.stderr)
+        omitted=json.loads((backups/'pp.coordination.json').read_text())
+        self.assertNotIn(marks.MANIFEST,omitted['files'])
+        self.assertFalse(any(name.startswith(marks.DIRECTORY+'/') for name in omitted['files']))
+        preserved=json.loads((copy_path/'pp.coordination.json').read_text())
+        self.assertEqual(preserved['files'],pair['files'])
+        legacy_restore=self.command('restore-new','pp','marklegacy')
+        self.assertEqual(legacy_restore.returncode,0,legacy_restore.stdout+legacy_restore.stderr)
+        self.assertIn('no web integration mark family',legacy_restore.stdout)
+        self.assertIn('does not prove it was absent at the source',legacy_restore.stdout)
+        legacy_project=self.root/'projects'/'marklegacy'
+        legacy_marks=marks.read_journal(legacy_project)
+        self.assertFalse(legacy_marks['present'])
+        self.assertFalse(marks.recorder_eligible(event,'marklegacy',[],{},legacy_marks))
+        output=os.environ.get('ORCHESTRA_LIFECYCLE_TEST_EXPORTS')
+        if output:
+            audit=Path(output);audit.mkdir(parents=True,exist_ok=True)
+            for label,result in [('previous-mark-restore-refusal',old_restore),('previous-mark-backup-omission',old_backup),('current-legacy-mark-restore',legacy_restore)]:
+                (audit/(label+'.json')).write_text(json.dumps(dict(returncode=result.returncode,stdout=result.stdout,stderr=result.stderr),indent=2))
+            (audit/'previous-marks-free-sidecar.json').write_text(json.dumps(omitted,indent=2))
+            (audit/'preserved-new-kit-sidecar.json').write_text(json.dumps(preserved,indent=2))
         output=os.environ.get('ORCHESTRA_LIFECYCLE_TEST_EXPORTS')
         if output:
             path=Path(output)
