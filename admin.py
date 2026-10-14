@@ -10409,6 +10409,15 @@ def main():
         current=stored_verifiers(cfg)
         if args.action=='list':
             authority_change_list_arguments(args,'verifiers')
+            # The same warning the operator allowlist gives (kittrial-5bb.70): a name of
+            # that shape added by hand, or by an older kit, is a misconfiguration.
+            from http_authority import http_shaped_names
+            shaped=http_shaped_names(current)
+            if shaped:
+                print('Warning: the verifier list holds %s, which has the shape of an HTTP account or agent '
+                      'id. Such an id attests nothing (the web route refuses attest whatever this list '
+                      'holds, and the host command under it records an inert author); remove it with: '
+                      'admin.py verifiers remove NAME --confirm-revoke'%', '.join(shaped),file=sys.stderr)
             print(json.dumps({'verifiers':current}));return
         # Config is the single authority source, exactly as for `operators`.
         verifiers(root, strict=True)
@@ -10420,6 +10429,17 @@ def main():
         operator,reason,notice=authority_change_arguments(args,'verifiers',
                                                           authority_change_listed_operators(cfg))
         if args.action=='add':
+            # An HTTP account or agent id is never a verifier either (kittrial-5bb.272
+            # review item 2): the rule the operator allowlist has had since
+            # kittrial-5bb.70. The web route refuses attest whatever this list holds,
+            # so such an id authorizes nobody there, and on the host it only lets the
+            # command record under an inert name - a misconfiguration that must not be
+            # written silently.
+            from http_authority import http_actor_id
+            if http_actor_id(actor) is not None:
+                raise ValueError('%s has the shape of an HTTP account or agent id; such an id is never added to the '
+                                 'verifier list. Name the actor that observes the deliveries instead (a session '
+                                 'actor or a person principal), not a web account id'%actor)
             changes=actor not in current
             if changes:current.append(actor)
         else:

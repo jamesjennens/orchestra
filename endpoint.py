@@ -1468,7 +1468,11 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                     from lifecycle import read_event_rows, require_unheld_fact
                     rows=read_event_rows(runner)
                     issue=next((row for row in rows if row.get('id')==body['task']),None)
-                    try:require_unheld_fact(issue,payload['dimension'],body['task'])
+                    # The same operators and project journal the canonical readers use
+                    # (kittrial-5bb.272 review item 1): a voided release-hold reads held
+                    # here too, never None where the caller has them.
+                    try:require_unheld_fact(issue,payload['dimension'],body['task'],
+                                            operators=configured_operators(root),journal=path)
                     except ValueError as error:
                         denied_status.append(409)
                         raise web_lifecycle.LifecycleError(409,str(error)) from None

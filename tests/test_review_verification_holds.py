@@ -563,18 +563,67 @@ class IntegrationHoldTests(Harness):
         self.assertEqual(w.project(self.issue)['review_state'], 'held')
 
     def test_lifecycle_reads_the_chain_through_the_shared_projection(self):
-        # kittrial-5bb.272 item 5: lifecycle.review_chain_state projects with
-        # records(row, None) - no operator voids, no journal - the same shared
-        # projection review/brief/work use; ignoring voids can only add a hold, never
-        # clear one, so the lifecycle held read cannot miss a stored hold.
-        from review_workflow import records, projection, integration_hold_sentence
+        # kittrial-5bb.272 item 5, corrected by review item 1 (r2): the lifecycle read
+        # projects through the SAME operator voids and revert journal as review, brief
+        # and work - project(row, operators, journal) - so the two reads cannot disagree
+        # about a hold.
+        import lifecycle
+        from review_workflow import project, integration_hold_sentence
         contribution = self.approved()
         self.send(self.hold(contribution))
-        state = lifecycle.review_chain_state(self.issue)
-        self.assertEqual(state, projection(records(self.issue, None)))
+        state = lifecycle.review_chain_state(self.issue, (OPERATOR,), None)
+        self.assertEqual(state, project(self.issue, (OPERATOR,), None))
         self.assertTrue(integration_hold_sentence(state))
-        self.assertEqual(lifecycle.held_issue_sentence(self.issue),
-                         integration_hold_sentence(projection(records(self.issue, None))))
+        self.assertEqual(lifecycle.held_issue_sentence(self.issue, (OPERATOR,), None),
+                         integration_hold_sentence(project(self.issue, (OPERATOR,), None)))
+
+    def test_a_voided_release_hold_reads_held_again_in_the_lifecycle_facts(self):
+        # kittrial-5bb.272 review item 1, the reviewer's scenario: a release-hold the
+        # surviving chain no longer links IS voidable, and with the void applied the
+        # canonical readers read the hold back in force. The first revision's lifecycle
+        # read ignored voids, so it read the forked chain as unparseable and answered
+        # None - no hold sentence, no refusal. Now it projects through the same voids
+        # and the held task is refused.
+        import lifecycle
+        import recovery
+        from requirements import canonical_bytes
+        from review_workflow import integration_hold_sentence
+        contribution = self.approved()
+        hold_receipt = self.send(self.hold(contribution))
+        release_receipt = self.send(self.release_hold(contribution, hold_receipt['comment_id']))
+        self.assertEqual(w.project(self.issue)['review_state'], 'awaiting-integration')
+        # A repair revision whose previous names the HOLD, not the release-hold: the
+        # chain now has two children of the hold and is unreadable until an operator
+        # reconciles it - exactly the state the dangling-record sentence tells a worker
+        # to repair with a revision or an operator to void.
+        self.stored(dict(schema_version=1, operation='contribute', operation_id='op-fork',
+                         task=TASK, previous=hold_receipt['comment_id'], supersedes=contribution,
+                         repository='ssh://git.example/project', commit=COMMIT_2, base_commit=BASE,
+                         delivery=dict(kind='bundle', path='reviewer:/deliveries/rev-2.bundle',
+                                       sha256=SHA_2),
+                         summary='A repair revision recorded at the hold'))
+        # Without the void the fork is unreadable, and the FIRST revision's read
+        # (records(row, None)) answered None for it: no hold seen, nothing refused.
+        self.assertIsNone(lifecycle.review_chain_state(self.issue))
+        self.assertEqual(lifecycle.held_tasks(self.rows), {})
+        # The operator voids the unlinked release-hold, preserving its exact bytes; the
+        # void is planted as the host command writes it (recovery's own prefix, the
+        # operator as the native author).
+        target = next(comment for comment in self.issue['comments']
+                      if comment['id'] == release_receipt['comment_id'])
+        void = dict(schema_version=1, operation='void-record', operation_id='void-release-1', task=TASK,
+                    target=release_receipt['comment_id'], target_kind='contribution-review',
+                    target_sha256=recovery.digest(target['text']),
+                    original=target['text'], reason='Reconciling the forked repair',
+                    disposition='void', operator=OPERATOR)
+        self.issue['comments'].append(dict(id='void-1', text=recovery.PREFIX + canonical_bytes(void).decode(),
+                                           author=OPERATOR, created_at='2026-09-16T00:00:00Z'))
+        # The lifecycle read now projects through the same voids as review/brief/work:
+        # the chain is readable again, the hold is back in force, and the task is held.
+        state = lifecycle.review_chain_state(self.issue, (OPERATOR,), None)
+        self.assertIsNotNone(state)
+        self.assertTrue(integration_hold_sentence(state))
+        self.assertIn(TASK, lifecycle.held_tasks(self.rows, (OPERATOR,), None))
 
     def test_a_hold_survives_an_exact_retry(self):
         contribution = self.approved()

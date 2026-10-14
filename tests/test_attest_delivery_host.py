@@ -226,28 +226,36 @@ class DocumentedCommandTests(AttestDeliveryCase):
         self.assertEqual(result['observation']['heads'][0]['commit'], sha)
         self.assertEqual(w.project(self.issue)['verification'], 'verified')
 
-    def test_an_account_id_on_the_verifiers_list_authorizes_only_itself(self):
-        # kittrial-5bb.272 item 2b, the check no review ran: an ACCOUNT id (usr_..., the
-        # web world's shape) on the deployment verifiers list grants nothing to any real
-        # actor - the list is read as exact actor names - and the web route refuses
-        # attest whatever the list holds (tests/test_review_host_only_web.py). The host
-        # command run UNDER the account id is that listed name, so it records - with an
-        # author that is inert on both routes. That is the finding, pinned.
+    def test_an_account_id_is_refused_by_the_verifiers_list_write(self):
+        # kittrial-5bb.272 review item 2: pinning an account id on the verifiers list
+        # as accepted behavior kept a misconfiguration silent. The operator allowlist
+        # has refused these since kittrial-5bb.70; the verifier list refuses them too
+        # now. The read path stays exact-match (a hand-planted id authorizes only
+        # itself), but the write never creates that state.
         bundle, sha = self.make_bundle()
         digest = hashlib.sha256(bundle.read_bytes()).hexdigest()
-        self.configure(operators=[OPERATOR], verifiers=['usr_4f7c1d'])
         self.contribute(sha, digest)
-        before = len(self.issue['comments'])
-        # A real actor is NOT the listed name: the account id authorizes nobody else.
+        deployment = self.root / 'deployment.private.json'
+        before = deployment.read_text(encoding='utf-8')
+        # An exact account id (usr_ + 16 hex, the web service's own shape): refused.
+        with self.assertRaisesRegex(ValueError, 'shape of an HTTP account or agent id'):
+            self.cli('verifiers', 'add', 'usr_4f7c1d2e3a4b5c6d', '--actor', OPERATOR,
+                     '--reason', 'a mistaken listing')
+        self.assertEqual(deployment.read_text(encoding='utf-8'), before)
+        # An agent label of an account id is refused before that: the identity rule
+        # admits no slash, so it never reaches the list write at all.
+        with self.assertRaisesRegex(ValueError, 'Invalid verifier identity|shape of an HTTP account or agent id'):
+            self.cli('verifiers', 'add', 'usr_4f7c1d2e3a4b5c6d/heron', '--actor', OPERATOR,
+                     '--reason', 'a mistaken listing')
+        self.assertEqual(deployment.read_text(encoding='utf-8'), before)
+        # A near miss is an ordinary name: 15 digits, or not hex at all.
+        self.cli('verifiers', 'add', 'usr_fred', '--actor', OPERATOR, '--reason', 'a person named fred')
+        self.assertIn('usr_fred', json.loads(deployment.read_text(encoding='utf-8'))['verifiers'])
+        # And the read half the reviewer kept: a hand-planted exact id still authorizes
+        # only itself - a real actor is refused - so removing it is the only fix.
+        self.configure(operators=[OPERATOR], verifiers=['usr_4f7c1d2e3a4b5c6d'])
         with self.assertRaisesRegex(ValueError, 'only a listed verifier or a listed operator'):
             self.attest(actor=VERIFIER, bundle=bundle)
-        self.assertEqual(len(self.issue['comments']), before)
-        # The account id itself is the one listed name; the host command records under it.
-        result = json.loads(self.attest(actor='usr_4f7c1d', bundle=bundle))
-        self.assertEqual(result['observation']['sha256'], digest)
-        state = w.project(self.issue)
-        self.assertEqual((state['verification'], state['attestation']['author']),
-                         ('verified', 'usr_4f7c1d'))
 
     def test_a_wrong_checksum_cannot_be_recorded_as_verified(self):
         bundle, sha = self.make_bundle()
