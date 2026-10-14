@@ -4878,7 +4878,7 @@ class FollowOnBaseRefusalOverHttpCase(EndpointCase):
         self.assertEqual(422, refused.status, refused.data)
         sentence = (
             'Contribution base_commit must be the prior integration commit %s, or an integration commit this project '
-            'recorded after it (a passed integrated fact on any task, recorded by a listed operator, not reverted); none '
+            'recorded after it (a passed integrated fact on any task, recorded by a listed operator or carrying a valid host-issued web coordinate mark, not reverted); none '
             'is recorded yet. %s is not accepted: it was recorded as an integration commit by "old-coordinator", who is '
             'not a listed operator of this installation. Integrations must be recorded by a listed operator for a later '
             'base to count: an operator adds the recorder (admin.py operators add) or records the integration'
