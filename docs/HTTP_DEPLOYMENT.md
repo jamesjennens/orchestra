@@ -1282,7 +1282,7 @@ export ORCHESTRA_HTTP_URL=https://<HOSTNAME>
 export ORCHESTRA_PASSWORD='...'          # read from the environment, never an argv
 python3 http_client.py login --username <USERNAME>
 # the client prints the session token to stdout; keep it out of shell history/logs
-python3 http_client.py --token "$TOKEN" call GET /v1/projects
+python3 http_client.py --token="$TOKEN" call GET /v1/projects
 ```
 
 A project owner or superuser issues a project-scoped credential once; the secret
