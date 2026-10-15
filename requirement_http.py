@@ -258,6 +258,10 @@ def release_creation(project_path, context, body, run, runner):
     """Retain an audited terminal receipt, then close the original uncertain intent."""
     from http_authority import OperationJournal, journal_path, stamp_write
     operation = body['original_operation_id']
+    if (project_path / JOURNAL).is_symlink():
+        # The same sentence the GET already gives: this is host repair, not a
+        # failed creation recovery.
+        raise ValueError('Owner recovery receipts need host operator repair')
     path = core.receipt_path(core.journal_dir(project_path, JOURNAL),
                              content_hash({'operation_id': operation}), 'requirement')
     journal = OperationJournal(journal_path(project_path)); entry = journal.lookup(operation)

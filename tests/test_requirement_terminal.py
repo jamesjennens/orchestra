@@ -609,5 +609,33 @@ class TerminalTests(unittest.TestCase):
             terminal.write_window(time.time(), endpoint_timeout=terminal.MAX_WRITE_DEADLINE)
 
 
+    def test_symlinked_terminal_receipt_names_the_receipt_not_its_path(self):
+        item = self.accepted()
+        self.native.fail_comment_prefix = owner.STATE_PREFIX
+        with self.assertRaises(ValueError):
+            self.act(item)
+        path = terminal.receipt_path(self.path, 'terminal-first')
+        saved = terminal.read_receipt(path)
+        target = self.path / 'elsewhere.json'
+        target.write_bytes(path.read_bytes())
+        path.unlink()
+        try:
+            path.symlink_to(target)
+        except (OSError, NotImplementedError):
+            target.unlink()
+            self.skipTest('symlink creation is not permitted in this environment')
+        fields = dict(original_operation_id='terminal-first',
+                      expected_receipt_sha256=terminal.receipt_sha256(saved))
+        for action in ('finish', 'abandon'):
+            body = dict(fields)
+            if action == 'abandon':
+                body['reason'] = 'No state was written.'
+            with self.assertRaisesRegex(ValueError, 'the requirement receipt') as caught:
+                http.apply(self.path, self.context, action, body, 'symlink-' + action,
+                           self.native, item['id'])
+            self.assertNotIn('.json', str(caught.exception))
+            self.assertNotIn(str(self.path), str(caught.exception))
+
+
 if __name__ == '__main__':
     unittest.main()

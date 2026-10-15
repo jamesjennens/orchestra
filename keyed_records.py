@@ -327,8 +327,8 @@ def journal_dir(project, name):
 def receipt_path(journal, identity, noun):
     receipt = journal / (identity + '.json')
     if receipt.is_symlink():
-        raise ValueError('Refusing %s receipt %s: it is a symlink; no native write was attempted.'
-                         % (noun, receipt.name))
+        raise ValueError('Refusing the %s receipt: it is a symlink; no native write was attempted.'
+                         % noun)
     return receipt
 
 
