@@ -3428,6 +3428,14 @@ def _canonical_payload(stdout):
     raise uncertain('Canonical command returned unparsable data; outcome may be unknown')
 
 
+#: The label prefix ``requirement_http.py`` puts on the owner's "Accept requirement"
+#: decision row (``owner-requirement-decision:<content hash>``, created with
+#: ``--type decision`` when the signed-in owner accepts a requirement's exact content
+#: in simple mode). ``next_action`` points that row at the Requirements page it is
+#: resolved from (kittrial-5bb.277 third review).
+REQUIREMENT_DECISION_LABEL = 'owner-requirement-decision:'
+
+
 def next_action(task):
     """Who acts next on a task, derived only from its status, assignee and review state."""
     state = task.get('review_state')
@@ -3452,6 +3460,31 @@ def next_action(task):
         return {'who': 'owner', 'text': 'Needs operator attention'}
     if task.get('assignee'):
         return {'who': 'assignee', 'text': 'Deliver a contribution'}
+    # The last offer is a claim, so it follows the same claimability predicate the
+    # queue, the agent attention list and the claim route use (kittrial-5bb.277 review
+    # item 2). A requirement record, an epic, a decision or another row the queue never
+    # offers says what it is for instead of inviting a claim the route refuses with 409.
+    from work import claimable, requirement_record
+    if not claimable(task.get('issue_type'), task.get('status'), task.get('assignee'),
+                     task.get('contribution_id'), state, labels=task.get('labels')):
+        if requirement_record(task.get('labels')):
+            return {'who': 'owner',
+                    'text': "Requirement record: edit it on the project's Requirements page"}
+        if str(task.get('issue_type') or 'task') == 'epic':
+            return {'who': 'owner', 'text': 'This is an epic, not a unit of work: work its tasks'}
+        if any(isinstance(label, str) and label.startswith(REQUIREMENT_DECISION_LABEL)
+               for label in (task.get('labels') or ())):
+            # The owner's "Accept requirement" row is a decision record made from the
+            # project's Requirements page. Name where it is resolved instead of only
+            # saying what it is not (kittrial-5bb.277 third review). The sentence is
+            # deliberately about the row and its page, not about who acted: the label
+            # alone does not evidence an actor, and a real-bd test writes a decoy
+            # decision row carrying it (tests/test_requirement_owner_real_bd.py).
+            return {'who': 'owner',
+                    'text': "Requirement decision: resolve it on the project's Requirements page"}
+        if str(task.get('issue_type') or 'task') == 'decision':
+            return {'who': 'owner', 'text': 'This is a decision record, not a unit of work'}
+        return {'who': 'owner', 'text': 'This row is not offered as claimable work'}
     return {'who': 'anyone', 'text': 'Claim this task'}
 
 
@@ -4253,11 +4286,25 @@ class ApiHandler(BaseHTTPRequestHandler):
         return body
 
     def _task_view(self, task, names):
-        """A task row plus presentation fields (assignee name, next action). Additive."""
+        """A task row plus presentation fields (assignee name, next action, requirement
+        marker and claimability). Additive: every field a route already returned stays.
+
+        The requirement marker and the claimability answer come from the same two
+        predicates the work queue, the agent attention list and the claim route use
+        (``work.requirement_record`` / ``work.claimable``), so a reader that sees the
+        tasks list cannot disagree with the queue about what is claimable work
+        (kittrial-5bb.277). The list route feeds its rows through here, so a web Tasks
+        page can mark a requirement record plainly instead of offering it as a task.
+        """
+        from work import claimable, requirement_record
         view = dict(task)
         assignee = view.get('assignee')
         view['assignee_name'] = names.get(assignee, assignee) if assignee else None
         view['next_action'] = next_action(view)
+        view['requirement_record'] = requirement_record(view.get('labels'))
+        view['claimable'] = claimable(view.get('issue_type'), view.get('status'), assignee,
+                                      view.get('contribution_id'), view.get('review_state'),
+                                      labels=view.get('labels'))
         return view
 
     def _task_views(self, tasks, project_id=None):
@@ -6653,6 +6700,33 @@ class ApiHandler(BaseHTTPRequestHandler):
                 raise conflict(merge_slot_sentence(row.get('id')))
             raise not_found('Task not found')
 
+    @staticmethod
+    def _refuse_requirement_record(row):
+        """A requirement record is a readable, visible row, never claimable work
+        (kittrial-5bb.277): it is NOT a record anchor and is NOT hidden (kittrial-5bb.276
+        needs a claimed requirement visible and releasable), so the claim route says what
+        it is and where it is edited and accepted rather than answering 404.
+
+        What is refused here is this route's claim, and only that: an explicit host claim
+        by a coordinator through the endpoint (`bd update ID --claim`) still works, and
+        live projects rely on it (kittrial-5bb.92 review item 1). That fact is kept in
+        ``docs/REQUIREMENTS.md`` and deliberately **not** in this sentence (kittrial-5bb.277
+        review item 3): the caller who reads a refusal is usually an agent, and naming the
+        host command here would hand it the exact way around the refusal. The sentence
+        names the Requirements page instead.
+        """
+        if not isinstance(row, dict):
+            return
+        from work import REQUIREMENT_RECORD_LABELS, requirement_record
+        if not requirement_record(row.get('labels')):
+            return
+        label = next((name for name in row.get('labels') or ()
+                      if name in REQUIREMENT_RECORD_LABELS), 'requirement')
+        raise conflict('This is a %s record, not a unit of work, so it cannot be claimed. '
+                       'It is not offered as claimable work here: edit it on the project\'s Requirements '
+                       'page (or requirement_records.py draft|revise), and an operator accepts it with '
+                       'admin.py requirement-apply.' % label)
+
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/references')
     def references_list(self, ctx):
         """The reference catalog (.41 slice 1), read-only at CAP_READ.
@@ -7365,6 +7439,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         refuse_unknown_fields(payload, self.TASK_CLAIM_FIELDS, 'A task claim')
         task = self.backend.get_task(ctx.params['pid'], ctx.params['tid'])
         self._refuse_record_anchor(task, write=True)
+        # A requirement record is readable and visible, but never claimable work
+        # (kittrial-5bb.277). Refused here so no agent takes one as a task.
+        self._refuse_requirement_record(task)
         payload['task_id'] = ctx.params['tid']
         actor = self.service.bind_actor(ctx.principal, payload.pop('actor', None))
         payload['actor'] = actor

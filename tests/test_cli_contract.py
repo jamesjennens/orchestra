@@ -57,6 +57,9 @@ ITEM_FIELDS = {
     'next_actor', 'work_state', 'reconciliation_needed', 'reconciliation_reasons', 'claimable',
     # Additive superseding-redelivery fact (kittrial-5bb.253 item 1).
     'redelivered',
+    # Additive requirement-record marker (kittrial-5bb.277): the row stays visible
+    # but is never claimable work.
+    'requirement_record',
 }
 BRIEF_FIELDS = {
     'task', 'title', 'owner', 'status', 'activity_cursor', 'checkpoint', 'intent',

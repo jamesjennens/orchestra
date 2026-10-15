@@ -46,7 +46,11 @@ export async function detail(ctx, { pid, tid }) {
   const reload = () => ctx.render();
 
   const actions = [];
-  if (writer && !t.assignee && t.status !== 'closed') {
+  // Claim only what the server calls claimable (kittrial-5bb.277 review item 2): a
+  // requirement record, an epic, a decision or the "Accept requirement" row arrives with
+  // claimable false, and the claim route refuses it with 409. `!== false` keeps the
+  // button for a server that does not send the field yet.
+  if (writer && !t.assignee && t.status !== 'closed' && t.claimable !== false) {
     actions.push(h('button', { type: 'button', class: 'primary', onclick: async (e) => {
       try { await act(e.currentTarget, () => ctx.api.claim(pid, tid), { success: 'You have claimed this task' }); } catch (error) { if (error.status === 409) reload(); return; }
       reload();

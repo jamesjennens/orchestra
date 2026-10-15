@@ -29,12 +29,13 @@ class Element extends Node {
   }
   setAttribute(key, value) { this.attributes[key] = String(value); }
   getAttribute(key) { return key in this.attributes ? this.attributes[key] : null; }
+  removeAttribute(key) { delete this.attributes[key]; }
   addEventListener(type, handler) { (this.listeners[type] = this.listeners[type] || []).push(handler); }
   async dispatch(type) {
     const event = { type, target: this, preventDefault() {} };
     for (const handler of this.listeners[type] || []) await handler(event);
   }
-  append(...children) { for (const c of children) this.appendChild(typeof c === 'string' ? new Text(c) : c); }
+  append(...children) { for (const c of children) { if (c === null || c === undefined || c === false) continue; this.appendChild(typeof c === 'string' ? new Text(c) : c); } }
   replaceChildren(...children) { this.childNodes = []; this.append(...children); }
   focus() {}
   all(test, out = []) {

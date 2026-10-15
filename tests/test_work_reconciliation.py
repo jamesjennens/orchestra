@@ -507,6 +507,43 @@ class ClaimableViewTests(unittest.TestCase):
         self.assertEqual([row['task'] for row in page['items']], ['plain-open'])
         self.assertIsNone(page['next_offset'])
 
+    def requirement_rows(self):
+        """Two open, unassigned, undelivered requirement records (kittrial-5bb.277)."""
+        base = rows()[0]
+        def make(task_id, labels):
+            row = copy.deepcopy(base)
+            row.update(id=task_id, title=task_id, comments=[], status='open', assignee=None,
+                       labels=list(labels))
+            return row
+        return [make('requirement-open', ['requirement', 'requirement:draft']),
+                make('brd-section-open', ['brd-section', 'requirement:draft'])]
+
+    def test_the_predicate_excludes_requirement_records(self):
+        # A requirement record is never ordinary claimable work, whatever the status,
+        # assignee or contribution (kittrial-5bb.277).
+        for labels in (['requirement'], ['brd-section'], ['requirement', 'requirement:draft']):
+            self.assertFalse(work.claimable('task', 'open', None, None, 'none', labels=labels),
+                             labels)
+        self.assertFalse(work.claimable('task', 'closed', 'alice/session', 'delivery',
+                                        'awaiting-review', labels=['requirement']))
+        # The helper tolerates a missing or malformed label list, and an ordinary label.
+        self.assertFalse(work.requirement_record(None))
+        self.assertFalse(work.requirement_record(['requirement:draft']))
+        self.assertFalse(work.requirement_record('requirement'))
+        self.assertTrue(work.requirement_record(['requirement:draft', 'requirement']))
+        self.assertTrue(work.claimable('task', 'open', None, None, 'none', labels=None))
+
+    def test_a_requirement_record_is_never_claimable_and_is_marked_on_the_row(self):
+        data = self.mixed_rows() + self.requirement_rows()
+        page = work.queue(data, 'alice/session', ['--claimable'])
+        self.assertEqual([row['task'] for row in page['items']], ['plain-open'])
+        rows_by_task = {row['task']: row
+                        for row in work.queue(data, 'alice/session', ['--limit', '100'])['items']}
+        for task in ('requirement-open', 'brd-section-open'):
+            self.assertFalse(rows_by_task[task]['claimable'], task)
+            self.assertTrue(rows_by_task[task]['requirement_record'], task)
+        self.assertFalse(rows_by_task['plain-open']['requirement_record'])
+
 
 class ReadyDropsInternalRecordsTests(unittest.TestCase):
     """kittrial-5bb.290: `ready` agrees with `work --claimable` on internal records."""
@@ -604,11 +641,13 @@ class ClaimableHttpTests(AgentHarness):
         self.blair_agent = self.agent_secret(self.blair_token, name='Merlin', projects=[self.project])
         self.tasks = '/v1/projects/%s/tasks' % self.project
 
-    def new(self, title, issue_type=None):
+    def new(self, title, issue_type=None, labels=None):
         made = self.request('POST', self.tasks, {'title': title}, token=self.alex_token)
         self.assertEqual(201, made.status, made.data)
         if issue_type:
             self.backend.state['tasks'][made.data['id']]['issue_type'] = issue_type
+        if labels:
+            self.backend.state['tasks'][made.data['id']]['labels'] = list(labels)
         return made.data['id']
 
     def next_actions(self, secret):
@@ -628,6 +667,30 @@ class ClaimableHttpTests(AgentHarness):
         self.assertEqual(data['attention']['counts']['claimable'], 1)
         offered = [action['task'] for action in data['next_actions']]
         self.assertEqual(offered, [plain])
+
+    def test_a_requirement_record_is_not_offered_as_claimable(self):
+        # kittrial-5bb.277: a requirement record is visible, but never claimable work.
+        plain = self.new('plain')
+        self.new('a requirement', labels=['requirement', 'requirement:draft'])
+        self.new('a BRD section', labels=['brd-section', 'requirement:draft'])
+        data = self.next_actions(self.alex_agent[1])
+        self.assertEqual(data['attention']['counts']['claimable'], 1)
+        self.assertEqual([action['task'] for action in data['next_actions']], [plain])
+
+    def test_claiming_a_requirement_record_is_refused_with_the_sentence(self):
+        task = self.new('a requirement', labels=['requirement', 'requirement:draft'])
+        refused = self.claim(self.alex_agent[1], task)
+        self.assertEqual(409, refused.status, refused.data)
+        message = refused.data['error']['message']
+        self.assertIn('requirement record', message)
+        self.assertIn('not a unit of work, so it cannot be claimed', message)
+        self.assertIn('requirement_records.py draft|revise', message)
+        self.assertIn('admin.py requirement-apply', message)
+        # A BRD section is the same kind of record, and names its own label.
+        section = self.new('a BRD section', labels=['brd-section', 'requirement:draft'])
+        other = self.claim(self.alex_agent[1], section)
+        self.assertEqual(409, other.status, other.data)
+        self.assertIn('brd-section record', other.data['error']['message'])
 
     def test_a_refused_claim_falls_through_to_the_next_candidate(self):
         first = self.new('first')

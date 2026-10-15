@@ -125,7 +125,7 @@ Before withdrawal or supersession of a pending edit, accept the pending edit fir
 | Consumer | Terminal requirement behavior |
 | --- | --- |
 | Requirements list, detail and generated BRD | Retain accepted content and history; display status separately. `nonterminal_ids` excludes terminal and unknown records but includes never-accepted drafts, pending edits and narrative sections; it is not an accepted-requirements selector. The BRD groups terminal records separately. |
-| Work and brief | Native requirement tasks stay visible with their status labels. A terminal transition neither closes work nor changes checkpoints, blockers or lifecycle facts. |
+| Work and brief | Native requirement tasks stay visible with their status labels, and are never ordinary claimable work (kittrial-5bb.277). A terminal transition neither closes work nor changes checkpoints, blockers or lifecycle facts. |
 | Proposal list, detail, brief and traceability | Exact old content remains readable with terminal or unknown state and a sentence. These states are never presented as draft. New incorporation into any of them is refused; unrelated proposals remain readable. |
 | Capability links | An explicit historical revision remains linkable. A link without a revision requires a currently active record. |
 | Offline export and publication | Explicit historical selections retain their manifest bytes and acceptance even while current status is unknown. Provenance includes the validated state/reason pair and governance lineage when provable, otherwise an unknown-state sentence; terminal status does not delete historical content. |
@@ -203,6 +203,73 @@ governance sidecar remain governed. A creation started before this release also
 remains governed when resumed; only a durable new creation intent opts into simple
 mode. Restore preserves source governance and acceptance hashes and records the
 destination lineage for decisions made after restoring under a new name.
+
+## Requirement records are not claimable work
+
+A requirement record or BRD section is a native task row: `requirement_records.py`
+creates it with `--type task` and the controlled type label `requirement` or
+`brd-section` (`KIND_TYPE_LABEL`). It stays a visible row in the task list and the
+work queue, but it is **never ordinary claimable work** (kittrial-5bb.277). One rule,
+`work.claimable`, excludes it whatever its status, assignee or contribution, so
+`work --claimable`, the HTTP agent attention/`next` list, the HTTP tasks-list route,
+the claim fall-through candidates and the owner-facing prompt never offer it. The
+queue row and every row of `GET /v1/projects/{pid}/tasks` carry
+`requirement_record: true` and `claimable: false`, so a reader can mark one plainly;
+the web Tasks page leaves requirement rows out of its default view and offers a
+"Show requirements" filter, and marks one that is shown as a requirement with a link
+to the project's Requirements page. The HTTP claim route refuses one with 409: it
+names the label, says it is not a unit of work, and points at the project's
+Requirements page, `requirement_records.py draft|revise` and
+`admin.py requirement-apply`.
+
+A row's `next_action` follows that same `claimable` predicate: the last sentence,
+the claim offer, is only produced for a row the queue would offer, so an ordinary
+open unassigned task still reads "Claim this task" while a requirement record, an
+epic, a **decision** row (including the owner's `Accept requirement` row, which now
+points at the project's Requirements page) and a **gate** or job row no longer do
+(kittrial-5bb.277 third review, item 2). The web task page offers its Claim button
+on the same condition, so the page and the sentence cannot disagree.
+
+What the HTTP claim route refuses is its own claim, and only that. An **explicit host
+claim by a coordinator still works**: the endpoint (`bd update ID --claim`, the SSH
+and `client.py` path) deliberately keeps taking a requirement row, and `bd ready`
+still lists them, because live projects claim, close and reassign requirement records
+through it (kittrial-5bb.92 review item 1). The rule above keeps a requirement out of
+the *offered* work — the queue, the agent `next` list and the web claim — while an
+operator or coordinator who means to hold the row can still do so. This fact is kept
+here and deliberately **not** in the 409 sentence (kittrial-5bb.277 review item 3): the
+refusal answers the caller who was just turned away, usually an agent, and naming the
+host command there would hand it the exact way around the refusal. The sentence names
+the project's Requirements page instead.
+
+A requirement record is deliberately **not** a record anchor: unlike references and
+proposals it is never hidden, so a requirement already claimed by an agent still
+shows as claimed and can be released (kittrial-5bb.276); only claimability changes.
+
+Accepting a requirement changes the controlled state label `requirement:draft` ->
+`requirement:accepted` and writes the owner's acceptance record. It does **not** by
+itself remove the row from the task list or the work queue: the never-claimable rule
+above is what keeps a requirement out of the worker queue, whether it is a draft or
+accepted.
+
+Accepting is operator-only on the host (`admin.py requirement-apply`). A web route
+for the signed-in project owner already exists: `POST
+/v1/projects/{pid}/requirements/{rid}/accept` (`http_service.py`
+`requirements_accept` -> `_requirements_write(ctx, 'accept')`), with the mode switch
+`GET|PUT /v1/projects/{pid}/requirements/governance`. Verified in the code: the
+route requires the `project.admin` capability *and* a signed-in owner session
+(`_requirements_owner` refuses an agent, a worker credential or a non-owner member
+with "Requirements editing needs the signed-in project owner"); the body carries
+`expected_revision` and `expected_sha256`; the write is identified by the
+`Idempotency-Key` header; and the requirement_http owner adapter accepts only in
+**simple** mode (`governance ... != 'simple'` raises "Owner requirements context is
+stale or unavailable"), so a governed project still accepts through
+`admin.py requirement-apply`. So no new web route is needed for the owner: the route
+exists and `web/js/views/owner_requirements.js` already renders the Accept button,
+posting `{expected_revision, expected_sha256}` taken from the record it is showing.
+What acceptance still requires is a signed-in owner session with `project.admin`
+(never an agent, a worker credential or an unauthenticated request) and, on a
+governed project, the host operator command instead.
 
 ## Validate and publish a draft
 
