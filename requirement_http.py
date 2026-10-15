@@ -791,10 +791,26 @@ def read(project_path, project, args, run, operators=None):
                 if row['id'] in pending:
                     raise ValueError('Requirement transition is pending; finish or abandon it on the requirements page')
             except (ValueError, TypeError, KeyError):
-                status = 'unknown'
-                state_error = ('Requirement transition receipt is damaged; ask the host operator to reconcile it' if row['id'] in pending_error
-                               else 'Requirement transition is pending; finish or abandon it on the requirements page' if row['id'] in pending
-                               else 'Requirement status cannot be verified; ask the project owner to reconcile it')
+                # A late native decision that no longer binds the latest revision
+                # is still the decision; once its receipt is resolved (or while
+                # it is not the pending one) the requirement reads terminal.
+                # An ambiguous, incomplete or still-pending pair stays unknown
+                # and points at its recovery command.
+                state = reason = None
+                if row['id'] not in pending and row['id'] not in pending_error:
+                    try:
+                        landed = owner_records.landed_pair(row)
+                        if landed is not None:
+                            governance.validate_evidence(project_path, project, landed[0])
+                            state, reason = landed
+                            status = state['state']
+                    except (ValueError, TypeError, KeyError):
+                        state = reason = None
+                if state is None:
+                    status = 'unknown'
+                    state_error = ('Requirement transition receipt is damaged; ask the host operator to reconcile it' if row['id'] in pending_error
+                                   else 'Requirement transition is pending; finish or abandon it on the requirements page' if row['id'] in pending
+                                   else 'Requirement status cannot be verified; ask the project owner to reconcile it')
             pending_draft = latest if latest['acceptance_state'] == 'draft' else None
             items.append({'id': row['id'], 'kind': kind, 'current': latest,
                           'accepted': accepted, 'pending_draft': pending_draft,

@@ -48,13 +48,24 @@ def abandonment_wait(saved):
 
 
 def state_written(saved, row):
+    """Whether the native decision landed, whatever happened to the record since.
+
+    A later edit (so the state no longer binds the latest revision) or a second
+    surviving state must not read as "no state was written": the write landed,
+    and the transition stays finishable or voidable.
+    """
     if row is None:
         return False
     try:
         state, _ = owner.state_ledger(row, allow_partial=True)
     except (ValueError, TypeError, KeyError):
+        state = None
+    if state == saved['owner_state']:
+        return True
+    try:
+        return owner.landed_state(row, saved['owner_state'])
+    except (ValueError, TypeError, KeyError):
         return False
-    return state == saved['owner_state']
 
 
 def effective_pending(saved, row=None):
@@ -157,19 +168,51 @@ def checked_current(project_path, context, row, body):
     return record
 
 
+def landed_current(project_path, context, row, body):
+    """The accepted revision a landed native decision binds, whatever came later.
+
+    A finish recovery reads the recorded decision's own revision instead of
+    requiring today's content to match it: the native write already happened,
+    and a later edit must not make it unreachable. The bound revision must
+    still be a valid accepted revision with its acceptance evidence.
+    """
+    if row is None or records.existing_kind(row) != 'requirement':
+        raise ValueError('Select a readable requirement in this project')
+    record = records.existing_revisions(row).get(body['expected_revision'])
+    if record is None or record['sha256'] != body['expected_sha256']:
+        raise ValueError('Requirement changed; reload before trying again')
+    if record['acceptance_state'] != 'accepted' or not records.resolved_acceptance(row, record):
+        raise ValueError('Select a currently accepted requirement with no pending draft; accept the pending edit first')
+    for evidence in owner.existing_acceptances(row).values():
+        governance.validate_evidence(project_path, context.project, evidence)
+    return record
+
+
 def apply(project_path, context, action, body, operation, run, task,
-          finished_by=None, recovery_operation_id=None, completion_reason='', completion_via='owner'):
+          finished_by=None, recovery_operation_id=None, completion_reason='', completion_via='owner',
+          late=False):
     identifier(task); identifier(operation)
     rows = records.read_rows(run)
     row = records.find(rows, task)
-    record = checked_current(project_path, context, row, body)
-    state, reason = owner.state_ledger(row, allow_partial=True)
-    if state is not None:
-        governance.validate_evidence(project_path, context.project, state)
+    if late:
+        record = landed_current(project_path, context, row, body)
+    else:
+        record = checked_current(project_path, context, row, body)
     path = receipt_path(project_path, operation)
     if path.is_symlink() or path.exists() and not path.is_file():
         raise ValueError('Unusable owner terminal receipt; ask the host operator to reconcile it')
     prior = read_receipt(path) if path.exists() else None
+    if late:
+        # The receipt is the durable proof of the late decision; its state must
+        # be the one that actually landed.
+        if prior is None or not owner.landed_state(row, prior['owner_state']):
+            raise ValueError('The recorded terminal state is not present; reload before trying again')
+        state = prior['owner_state']
+        reason = owner.landed_reason(row, state)
+    else:
+        state, reason = owner.state_ledger(row, allow_partial=True)
+    if state is not None:
+        governance.validate_evidence(project_path, context.project, state)
     digest = identity(context, action, task, body)
     if prior and prior['sha256'] != digest:
         raise ValueError('This operation was used for different requirement content')
@@ -224,9 +267,14 @@ def apply(project_path, context, action, body, operation, run, task,
     # Never complete solely from a successful write answer. Read back the pair,
     # attribution and immutable revision before projecting labels or completing.
     confirmed = records.find(records.read_rows(run), task)
-    checked_current(project_path, context, confirmed, body)
-    if owner.state_ledger(confirmed) != (evidence, explanation):
-        raise ValueError('Requirement terminal evidence was not confirmed; keep the original request')
+    if late:
+        if (not owner.landed_state(confirmed, evidence)
+                or owner.landed_reason(confirmed, evidence) != explanation):
+            raise ValueError('Requirement terminal evidence was not confirmed; keep the original request')
+    else:
+        checked_current(project_path, context, confirmed, body)
+        if owner.state_ledger(confirmed) != (evidence, explanation):
+            raise ValueError('Requirement terminal evidence was not confirmed; keep the original request')
     label = 'requirement:' + evidence['state']
     if label not in (confirmed.get('labels') or []):
         run(['update', task, '--add-label', label, '--json'])
@@ -355,10 +403,18 @@ def recover(project_path, context, action, task, body, run, recovery_operation_i
             if argv[:2] == ['comments', 'add']:
                 argv = [*argv, '--actor', saved['actor']]
             return run(argv)
+        # A strict ledger binds the latest accepted revision. When the state
+        # landed but a later edit moved the record on (or a second state
+        # survives), finish must still record the decision that was written.
+        try:
+            owner.state_ledger(row, allow_partial=True)
+            late = False
+        except (ValueError, TypeError, KeyError):
+            late = True
         return apply(project_path, original, saved['operation'], saved['request'],
                      body['original_operation_id'], attributed, task,
                      finished_by=context.account_id, recovery_operation_id=recovery_operation_id,
-                     completion_reason=body.get('reason', ''), completion_via=completion_via)
+                     completion_reason=body.get('reason', ''), completion_via=completion_via, late=late)
     if written:
         raise ValueError('A terminal state was already written; finish this transition instead of abandoning')
     wait = abandonment_wait(saved)
@@ -397,23 +453,48 @@ def projection(project_path, project, rows, run):
                     expected_receipt_sha256=receipt_sha256(saved), state=saved['owner_state'],
                     reason=saved['owner_state_reason'], can_finish=False, can_abandon=False,
                     message='A requirement transition is pending. Finish or abandon it.')
-        try:
-            original_body = saved['request']
-            from requirement_http import OwnerContext
-            context = OwnerContext(project, saved['actor'], governance.current(project_path, project))
-            checked_current(project_path, context, row, original_body)
-            state, reason = owner.state_ledger(row, allow_partial=True)
-            if state is not None and (state != saved['owner_state'] or reason is not None and reason != saved['owner_state_reason']):
-                raise ValueError('Requirement state conflicts with its transition receipt; ask the host operator')
+        original_body = saved['request']
+        from requirement_http import OwnerContext
+        context = OwnerContext(project, saved['actor'], governance.current(project_path, project))
+        landed = state_written(saved, row)
+        if landed:
+            state = saved['owner_state']
+            reason = owner.landed_reason(row, state)
+        else:
             try:
-                item['can_abandon'] = absence(row, rows, run, native_ids, native_error)
-                item['abandon_unavailable'] = abandonment_wait(saved)
-                if item['abandon_unavailable']:
+                state, reason = owner.state_ledger(row, allow_partial=True)
+            except (ValueError, TypeError, KeyError):
+                state = reason = None
+        # Native absence and the saved deadline alone decide abandon. A changed
+        # requirement or an unverifiable finish must not hide an abandon the
+        # server would still accept (N3), and a written state never offers the
+        # retry time for a button that cannot become available (N2).
+        try:
+            if landed:
+                item['can_abandon'] = False
+                item['abandon_unavailable'] = 'A state was written. Finish this recorded transition.'
+            elif absence(row, rows, run, native_ids, native_error):
+                item['can_abandon'] = True
+                wait = abandonment_wait(saved)
+                if wait:
                     item['can_abandon'] = False
-                elif not item['can_abandon']:
-                    item['abandon_unavailable'] = 'A state was written. Finish this recorded transition.'
-            except (ValueError, OSError, TypeError, KeyError):
-                item['abandon_unavailable'] = 'Native absence cannot be proved; reload or ask the host operator.'
+                    item['abandon_unavailable'] = wait
+            else:
+                item['can_abandon'] = False
+                item['abandon_unavailable'] = 'A state was written. Finish this recorded transition.'
+        except (ValueError, OSError, TypeError, KeyError):
+            item['can_abandon'] = False
+            item['abandon_unavailable'] = 'Native absence cannot be proved; reload or ask the host operator.'
+        try:
+            if landed:
+                # The decision landed; its own bound revision is finished even
+                # when the requirement was edited after the release.
+                landed_current(project_path, context, row, original_body)
+            else:
+                checked_current(project_path, context, row, original_body)
+                state, reason = owner.state_ledger(row, allow_partial=True)
+                if state is not None and (state != saved['owner_state'] or reason is not None and reason != saved['owner_state_reason']):
+                    raise ValueError('Requirement state conflicts with its transition receipt; ask the host operator')
             successor = original_body.get('successor')
             if successor:
                 target = records.find(rows, successor['id'])

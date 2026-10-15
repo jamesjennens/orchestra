@@ -221,3 +221,66 @@ def state_ledger(row, allow_partial=False):
     elif (any(reason[key] != evidence[key] for key in ('project', 'id', 'account_id', 'at', 'operation_id'))):
         raise ValueError('Requirement state reason conflicts with its state evidence')
     return evidence, reason
+
+
+def recorded_states(row):
+    """Every validated, author-bound owner terminal record on a row, by its hash.
+
+    `state_ledger` is the strict reader: one state bound to the unchanged latest
+    accepted revision, with no orphan reason. This reader exists for the
+    recovery boundary, where a native write can land after a later edit or
+    beside a second state and must still be recognizable as landed. Impersonated
+    or malformed bytes are ignored here; callers that need strictness keep using
+    `state_ledger`.
+    """
+    states, reasons = {}, {}
+    for comment in row.get('comments') or []:
+        if not isinstance(comment, dict):
+            continue
+        text = comment.get('text')
+        if not isinstance(text, str):
+            continue
+        if text.startswith(STATE_PREFIX):
+            record = parse(text, state=True)
+            if record is not None and comment.get('author') == record['account_id']:
+                states.setdefault(record['sha256'], record)
+        elif text.startswith(REASON_PREFIX):
+            record = parse_reason(text)
+            if record is not None and comment.get('author') == record['account_id']:
+                reasons.setdefault(record['state_sha256'], record)
+    return states, reasons
+
+
+def landed_state(row, state):
+    """True when this exact state evidence is recorded natively, whatever else is.
+
+    The write landing is a fact independent of a later edit or a second
+    conflicting state, so a release receipt can still recognize and finish it.
+    """
+    states, _ = recorded_states(row)
+    return states.get(state['sha256']) == state
+
+
+def landed_reason(row, state):
+    """The recorded reason for a landed state, or None when it never landed."""
+    _, reasons = recorded_states(row)
+    return reasons.get(state['sha256'])
+
+
+def landed_pair(row):
+    """One complete validated terminal pair, ignoring latest-revision binding.
+
+    A late native write that landed before a later edit is still the decision.
+    Ambiguity - two states, an orphan or missing reason, a conflicting binding -
+    yields None so the reader stays unknown and points at the recovery command.
+    """
+    states, reasons = recorded_states(row)
+    if len(states) != 1:
+        return None
+    evidence = next(iter(states.values()))
+    reason = reasons.get(evidence['sha256'])
+    if reason is None or set(reasons) - {evidence['sha256']}:
+        return None
+    if any(reason[key] != evidence[key] for key in ('project', 'id', 'account_id', 'at', 'operation_id')):
+        return None
+    return evidence, reason
