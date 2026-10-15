@@ -189,7 +189,21 @@ def _pem_kind(path):
     return None
 
 
-def certificate_preflight(settings):
+def certificate_path(value, root):
+    """The certificate or key file a setting names, as the WEB CHILD will open it.
+
+    A relative path is relative to the runtime root, because the child is spawned with
+    ``cwd=root``; resolving it any other way makes the supervisor check one file while the child
+    serves another (kittrial-5bb.168 review 1). The supervisor hands the child this absolute path
+    so both read the same file.
+    """
+    path = Path(value).expanduser()
+    if path.is_absolute():
+        return str(path)
+    return os.path.normpath(os.path.join(str(root), str(path)))
+
+
+def certificate_preflight(settings, root):
     """Load the certificate and key before anything is started (kittrial-5bb.168 item 1).
 
     The pair used to be loaded only inside the web child, so the supervisor said only "A
@@ -197,10 +211,15 @@ def certificate_preflight(settings):
     be unusable raises one sentence that names the file and what is wrong: the caller prints it
     and starts nothing. The pair is loaded with an empty password, so an encrypted key is
     refused here instead of asking the terminal for a passphrase. No key text is ever printed.
+
+    Returns the ``(cert, key)`` the child must be given - the files that were checked, with a
+    relative ``cert``/``key`` resolved against ``root`` - or ``None`` when no certificate is
+    configured.
     """
     cert, key = settings.get('cert'), settings.get('key')
     if not cert:
-        return
+        return None
+    cert, key = certificate_path(cert, root), certificate_path(key, root)
     for name, path in (('certificate', cert), ('key', key)):
         state = _readable_file(path)
         if state == 'missing':
@@ -236,6 +255,7 @@ def certificate_preflight(settings):
     except OSError:
         raise ValueError('The certificate file %s and the key file %s cannot be loaded: a passphrase, or a form '
                          'of PEM this service cannot use' % (cert, key)) from None
+    return cert, key
 
 
 def certificate_window(path):
@@ -621,7 +641,11 @@ def run(root, logs, config, port, stop_seconds):
     # Before anything is started (kittrial-5bb.168 item 1): an unusable certificate or key is one
     # sentence naming the file, not a child's traceback and "A supervised child exited". The
     # warnings of item 4 are printed here too, at every start, and refuse nothing.
-    certificate_preflight(settings)
+    checked = certificate_preflight(settings, root)
+    if checked:
+        # The pair that was CHECKED is the pair the child is given, with a relative path resolved
+        # against the runtime root the child is spawned in (kittrial-5bb.168 review 1).
+        settings = dict(settings, cert=checked[0], key=checked[1])
     for line in start_warnings(settings):
         print(line, file=sys.stderr, flush=True)
     logs = Path(logs).expanduser().resolve()

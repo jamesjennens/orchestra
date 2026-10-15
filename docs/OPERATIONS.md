@@ -2785,13 +2785,23 @@ conservative direction and both are easy to mistake for a fault:
   with a self-signed certificate must not force, and an office behind a reverse
   proxy may not want. An operator who wants it sets
   `"strict_transport_security": true` in the private office service JSON; it is
-  then sent on HTTPS answers only. See the runbook for the setting and the
-  reason.
+  then sent on HTTPS answers only, and it is **never sent at all** unless the
+  setting is on. A browser that has seen the header remembers the host for its
+  `max-age` (a year for the value sent here) after the setting is turned off
+  again, and while it is on a certificate error on that host cannot be clicked
+  through, so turn it on once the host name and certificate are settled. See the
+  runbook for the setting and the reasons.
 - A fresh runtime's `health` (and `tools/office_verify.py`) **exits 1 with
   `backup=unknown`** until the first backup completes. That is the intended
   reading, not a distinct exit code: run `backup --all`, then ask again. The
   line carries a bounded `reason=...` naming why a precondition is missing,
   including when another service holds the web port.
+- **Restart the web service after installing a new release, before verifying
+  it**: a still-running older child answers the port with its own build id, so
+  `health` and `tools/office_verify.py` from the new release read `web=down`
+  with a reason naming the older build id. That is the install's normal state
+  between installing and restarting, not a fault and not a reason to change the
+  port.
 
 Edit `templates/beads-backup.service` for the installation paths, then copy it and `templates/beads-backup.timer` into the service account's `~/.config/systemd/user/`. Its `ExecStart` uses `backup --all`, so the one timer covers every project initialized in that runtime, including projects added later, and every run writes the `backup-status.json` record described above. Enable with `systemctl --user daemon-reload` and `systemctl --user enable --now beads-backup.timer`. Check `systemctl --user list-timers`, the service journal, and `backup-status --require-complete`; lingering must already be enabled for unattended operation. The timer performs same-host backup only. Configure off-machine copying, its completeness gate and retention separately; the timer does not copy anything off the host. These templates do not replace an existing team's backup schedule, and an existing installation that already runs a long-sync wrapper for this runtime keeps it. Once this kit's native step is deployed, that wrapper's monkeypatched `run_bd` and its `--timeout` ceiling are dead code: `admin.py backup` performs the native step itself through the Dolt SQL client (bounded by the 30-minute ceiling), and the wrapper's `dolt-backup-state.json` marker is no longer written or read by the kit.
 

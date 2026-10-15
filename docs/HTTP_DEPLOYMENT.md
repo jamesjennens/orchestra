@@ -2575,7 +2575,7 @@ sudo -u <SERVICE_USER> python3 -c "import sqlite3,sys; print(sqlite3.connect(sys
 # a project, including its operation store, is restored into a NEW project name:
 sudo -u <SERVICE_USER> python3 admin.py --root <RUNTIME_ROOT> restore-new <PROJECT> <NEW_PROJECT>
 sudo systemctl start orchestra-http
-curl -fsS http://127.0.0.1:8443/healthz          # {"status":"ok","service":"orchestra-office","version":"...","build_id":"..."}
+curl -fsS http://127.0.0.1:8443/healthz          # {"service":"orchestra-office","version":"...","build_id":"...","status":"ok"}
 ```
 
 `restore-new` validates the operation-store snapshot first (read-only open,

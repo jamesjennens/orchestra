@@ -11,6 +11,7 @@ import io
 import shutil
 import socket
 import ssl
+import subprocess
 import sys
 import tempfile
 import threading
@@ -165,6 +166,29 @@ class PortTakenTests(unittest.TestCase):
             status = http_service.main(['--state', str(Path(self.tmp) / 'state.json'), '--backend', 'inprocess',
                                         '--cert', '/c.pem', '--key', '/k.pem', '--port', '0'])
         self.assertEqual(status, http_service.EXIT_CERTIFICATE_UNUSABLE)
+        self.assertIn('the certificate or key cannot be used', said.getvalue())
+        self.assertEqual(len(said.getvalue().splitlines()), 1)
+
+    @unittest.skipUnless(shutil.which('openssl'), 'openssl is not installed; the pair is made with it')
+    def test_an_encrypted_key_is_one_line_when_http_service_is_started_directly(self):
+        """kittrial-5bb.168 review item 2.1: started directly (the systemd route), an encrypted key
+        used to prompt ``Enter PEM pass phrase:`` and then die in a traceback. ``load_cert_chain`` is
+        called with an empty password, so it fails at once and the one-line arm above names it."""
+        openssl = shutil.which('openssl')
+        cert = str(Path(self.tmp) / 'cert.pem')
+        plain = str(Path(self.tmp) / 'plain.key')
+        subprocess.check_call([openssl, 'req', '-x509', '-newkey', 'rsa:2048', '-keyout', plain, '-out', cert,
+                               '-days', '30', '-nodes', '-subj', '/CN=localhost'],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        encrypted = str(Path(self.tmp) / 'encrypted.key')
+        subprocess.check_call([openssl, 'rsa', '-in', plain, '-aes256', '-passout', 'pass:secret', '-out', encrypted],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        said, out = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stderr(said), contextlib.redirect_stdout(out):
+            status = http_service.main(['--state', str(Path(self.tmp) / 'state.json'), '--backend', 'inprocess',
+                                        '--cert', cert, '--key', encrypted, '--port', '0'])
+        self.assertEqual(status, http_service.EXIT_CERTIFICATE_UNUSABLE)
+        self.assertNotIn('Enter PEM pass phrase', said.getvalue() + out.getvalue())
         self.assertIn('the certificate or key cannot be used', said.getvalue())
         self.assertEqual(len(said.getvalue().splitlines()), 1)
 

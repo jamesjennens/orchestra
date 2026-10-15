@@ -8163,7 +8163,11 @@ def create_server(service, backend, *, host='127.0.0.1', port=0, trusted_proxies
         # Before anything is bound: a certificate or key that cannot be used stops the start.
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.minimum_version = ssl.TLSVersion.TLSv1_2
-        context.load_cert_chain(certfile, keyfile)
+        # An empty password, never None: with an encrypted key and no password OpenSSL asks the
+        # TERMINAL for a passphrase ("Enter PEM pass phrase:"), which a service started by
+        # systemd or the supervisor must never do. With '' it fails at once, and the one-line
+        # arm below names it (kittrial-5bb.168 review item 2.1).
+        context.load_cert_chain(certfile, keyfile, password='')
         # What the handshake actually presents, for GET /v1/service/certificate
         # (kittrial-5bb.203 review 01a12488, items 1 and 2): one in-memory handshake against this
         # very context, so the route can never answer with anything but the certificate a client
@@ -8413,8 +8417,9 @@ def main(argv=None):
                   file=sys.stderr, flush=True)
             return EXIT_PORT_TAKEN
         if isinstance(failed, ssl.SSLError) or (args.cert and isinstance(failed, FileNotFoundError)):
-            print('orchestra-http: the certificate or key cannot be used: %s, so the web service did not start. '
-                  'The office supervisor names the file and what is wrong before it starts anything.'
+            print('orchestra-http: the certificate or key cannot be used: %s (a key with a passphrase cannot be '
+                  'used here, because this service never asks for one), so the web service did not start. The '
+                  'office supervisor names the file and what is wrong before it starts anything.'
                   % failure_said(failed), file=sys.stderr, flush=True)
             return EXIT_CERTIFICATE_UNUSABLE
         if args.port < 1024 and failed.errno in (errno.EACCES, errno.EPERM):

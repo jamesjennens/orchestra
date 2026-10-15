@@ -271,7 +271,7 @@ class CertificateTests(unittest.TestCase):
 
     def preflight(self, cert, key):
         with self.assertRaises(ValueError) as caught:
-            office.certificate_preflight({'cert': cert, 'key': key})
+            office.certificate_preflight({'cert': cert, 'key': key}, self.base)
         return str(caught.exception)
 
     @unittest.skipUnless(OPENSSL, 'openssl is not installed; the pairs are made with it')
@@ -330,7 +330,27 @@ class CertificateTests(unittest.TestCase):
     @unittest.skipUnless(OPENSSL, 'openssl is not installed; the pairs are made with it')
     def test_a_good_pair_passes_and_leaves_nothing_behind(self):
         cert, key = self_signed(self.tmp.name)
-        office.certificate_preflight({'cert': cert, 'key': key})     # no exception
+        office.certificate_preflight({'cert': cert, 'key': key}, self.tmp.name)     # no exception
+
+    @unittest.skipUnless(OPENSSL, 'openssl is not installed; the self-signed pair is made with it')
+    def test_a_relative_path_is_resolved_against_the_runtime_root(self):
+        """kittrial-5bb.168 review item 1: the child is spawned with cwd=root, so a relative cert/key
+        is resolved there. The pair the supervisor CHECKS is the pair the child is given, so a
+        relative path that worked before this task is not refused, and there is no second file the
+        child could serve instead."""
+        cert, key = self_signed(str(self.base))
+        settings = {'cert': Path(cert).name, 'key': Path(key).name}
+        resolved = office.certificate_preflight(settings, self.base)     # no exception, absolute pair
+        self.assertEqual((resolved[0], resolved[1]), (cert, key))
+        command = office.web_command(dict(settings, cert=resolved[0], key=resolved[1]), self.base, 10000,
+                                     '/usr/bin/python3', self.base/'office_service.py')
+        self.assertIn(cert, command)
+        self.assertIn(key, command)
+        # A relative path with no such file in the runtime root is still refused, naming the path the
+        # child would have opened (the absolute one under the root).
+        with self.assertRaises(ValueError) as caught:
+            office.certificate_preflight({'cert': 'no-such.pem', 'key': 'no-such.key'}, self.base)
+        self.assertIn(str(self.base/'no-such.pem'), str(caught.exception))
 
     def test_a_directory_or_a_fifo_is_refused_without_being_opened(self):
         """A FIFO would block ``open`` forever: it is refused as not a regular file."""

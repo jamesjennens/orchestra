@@ -406,6 +406,13 @@ none of the settings below behaves as it always did.
   `http` or `https` URL with a host, are refused before anything starts, each
   with a sentence naming the setting. `strict_transport_security` must be
   `true` or `false` (see below).
+- **A relative `cert` or `key` is relative to the runtime root**, because the
+  web service is started with the runtime root as its working directory. The
+  supervisor resolves the pair against that root, checks the files the child
+  will actually serve, and hands the child their absolute paths, so a relative
+  path cannot make the supervisor check one file while the child serves another
+  (kittrial-5bb.168 review 1). Absolute paths are the safer habit, and what the
+  install scripts write.
 - Which ports are open, and to whom, is the host's firewall and the network's
   business. The service listens where it is told; it does not restrict who may
   connect beyond its own log-in.
@@ -458,17 +465,30 @@ certificate's dates are read with the interpreter's own certificate decoder,
 and when this interpreter has none the expiry warning is skipped and the start
 says so, rather than guessing.
 
-**Strict-Transport-Security is off by default.** After the first visit over
-HTTPS the service sends no `Strict-Transport-Security` header, so a browser is
-not pinned to HTTPS for the host. That is deliberate: the common first install
-uses a self-signed certificate, and pinning a browser to a certificate the
-office has not yet trusted, or fighting a proxy that terminates TLS in front
-of the service, is the operator's decision, not the default. Set
+**Strict-Transport-Security is off by default, and is never sent unless it is
+asked for.** The service sends no `Strict-Transport-Security` header at all
+until the setting below is turned on, so a browser that has only ever seen the
+default is not pinned to HTTPS for the host. That is deliberate: the common
+first install uses a self-signed certificate, and pinning a browser to a
+certificate the office has not yet trusted, or fighting a proxy that terminates
+TLS in front of the service, is the operator's decision, not the default. Set
 `"strict_transport_security": true` in the private office JSON to send
 `Strict-Transport-Security: max-age=31536000` on **HTTPS answers only**; a
-plain HTTP listener never sends it. Turn it back off if the service later
-moves behind a proxy that would pass the header to a client that cannot use
-HTTPS.
+plain HTTP listener never sends it. Two things follow, and both are reasons to
+turn it on late rather than early (kittrial-5bb.168 review item 2.3):
+
+- a browser that has seen the header keeps the host HTTPS-only for its
+  `max-age` - a year for the value sent here - **after** the setting is turned
+  off again, until that time has passed or the browser's stored state is
+  cleared;
+- while it is on, a certificate error on that host (a self-signed certificate
+  the browser does not trust yet) **cannot be clicked through** to a
+  "continue anyway" page, because the browser refuses to talk to the host in
+  plain HTTP to show it.
+
+Turn it on once the host name and the certificate are settled; turn it off only
+if the service moves behind a proxy that would pass the header to a client that
+cannot use HTTPS, and expect the browsers that already saw it to remember.
 
 **What does not work over plain HTTP at a host name or address.** Browsers give
 some features only to a secure context (HTTPS, or `localhost`):
@@ -512,6 +532,18 @@ completes, so `backup=unknown` and **`health` exits 1** (and
 a fault: run a backup (`backup --all`) and ask again. The exit status is not a
 distinct code for this case; the line's `backup=unknown` and the reason are what
 say which precondition is missing.
+
+**After installing a new release, restart the service before verifying it**
+(kittrial-5bb.168 review item 2.2). `health` and `tools/office_verify.py` from
+the new release ask the port and require the `/healthz` mark of the release they
+came from. A web child that is still the OLD release running from the same
+runtime - the usual state between installing and restarting - answers the port
+with the mark of its own build id, so the new release reads `web=down` and its
+reason says another Orchestra service holds the port, naming the older build id
+it found. That is not a fault in the new release and not a reason to change the
+port: restart the service (`systemctl restart orchestra-http`, or the
+supervisor's stop and start) and ask again, and the line reads `web=up` against
+the new build id.
 
 `health --config <PRIVATE_OFFICE_JSON>` reads the configuration named; a
 configuration file that is missing, unreadable, refused or not JSON is one line

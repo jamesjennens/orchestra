@@ -265,11 +265,15 @@ class CertificateFileShapesCase(unittest.TestCase):
     def test_the_certificate_file_is_read_once_only(self):
         # A mutant that builds a second context from the file survives without this (N3):
         # create_server loads the chain once; service_certificate_pem must not read the file again.
+        # The empty password is passed through as well: it is what stops an encrypted key asking the
+        # terminal for a passphrase (kittrial-5bb.168 review item 2.1).
         original = ssl.SSLContext.load_cert_chain
         calls = []
-        def counting(self, certfile=None, keyfile=None):
+        passwords = []
+        def counting(self, certfile=None, keyfile=None, password=None):
             calls.append(certfile)
-            return original(self, certfile, keyfile)
+            passwords.append(password)
+            return original(self, certfile, keyfile, password=password)
         self.addCleanup(setattr, ssl.SSLContext, 'load_cert_chain', original)
         ssl.SSLContext.load_cert_chain = counting
         state = unique_dir('vscode-once-')
@@ -282,6 +286,7 @@ class CertificateFileShapesCase(unittest.TestCase):
                               certfile=str(self.leaf), keyfile=str(self.leaf_key))
         self.addCleanup(httpd.server_close)
         self.assertEqual([str(self.leaf)], calls, 'the --cert file must be read once, by the TLS loader')
+        self.assertEqual([''], passwords, 'the loader is given an empty password, never None')
         self.assertEqual(der_of(self.leaf_pem), der_of(httpd.tls_certificate_pem))
 
     def test_a_context_with_no_certificate_can_produce_no_leaf(self):

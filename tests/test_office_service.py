@@ -401,12 +401,16 @@ if os.environ.get('BD_DISABLE_METRICS') != '1':
         self.assertIsNone(proc.poll())
 
     def test_run_prints_the_warnings_after_the_preflight_and_before_the_database(self):
-        """Item 4: the warnings are wired into run() at the start, after the pair is checked."""
+        """Item 4: the warnings are wired into run() at the start, after the pair is checked. The
+        pre-flight resolves a relative path against the runtime root and hands the child the pair it
+        checked (kittrial-5bb.168 review item 1)."""
         import inspect
         import office_service
         source = inspect.getsource(office_service.run)
-        self.assertLess(source.index('certificate_preflight(settings)'), source.index('start_warnings(settings)'))
+        self.assertLess(source.index('certificate_preflight(settings, root)'), source.index('start_warnings(settings)'))
         self.assertLess(source.index('start_warnings(settings)'), source.index("_spawn([root/'bin/dolt'"))
+        self.assertLess(source.index('certificate_preflight(settings, root)'), source.index('web_command('))
+        self.assertIn("settings = dict(settings, cert=checked[0], key=checked[1])", source)
 
     @unittest.skipUnless(OPENSSL, 'openssl is not installed; the self-signed pair is made with it')
     def test_the_key_mode_warning_is_printed_at_every_start(self):
