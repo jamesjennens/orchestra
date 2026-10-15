@@ -248,6 +248,30 @@ class TerminalHttpTests(EndpointCase):
         self.assertNotIn(first['id'],brd.data['nonterminal_ids']); self.assertIn(second['id'],brd.data['nonterminal_ids'])
         self.assertEqual(self.request('GET',self.base+'/requirements/'+second['id'],token=token).data['supersedes'][0]['id'],first['id'])
 
+    def test_members_read_the_transition_state_without_its_recovery_handles(self):
+        item=self.accepted(); self.backend.native.fail_comment_prefix=owner.REASON_PREFIX
+        failed=self.transition(item); self.assertEqual(failed.status,503)
+        self.backend.native.fail_comment_prefix=None
+        pending=self.pending_transition(item)
+        self.assertTrue(pending['operation_id']); self.assertTrue(pending['expected_receipt_sha256'])
+        admin=self.admin_token(); viewer_id=self.create_account(admin,'viewer','viewer-password-1')
+        token=self.login('viewer','viewer-password-1')[0]
+        self.assertEqual(self.request('PUT',self.base+'/members/'+viewer_id,{'role':'viewer'},token=admin).status,200)
+        for route in (self.base+'/requirements', self.base+'/requirements/'+item['id']):
+            shown=self.request('GET',route,token=token)
+            self.assertEqual(shown.status,200,shown.data)
+            text=json.dumps(shown.data)
+            self.assertNotIn(pending['operation_id'],text)
+            self.assertNotIn(pending['expected_receipt_sha256'],text)
+            self.assertNotIn('expected_receipt_sha256',text)
+            self.assertNotIn('can_finish',text)
+            self.assertNotIn('finish or abandon it on the requirements page',text)
+        detail=self.request('GET',self.base+'/requirements/'+item['id'],token=token).data
+        self.assertEqual(detail['requirement_state'],'unknown')
+        self.assertEqual(detail['pending_transition']['state']['state'],'withdrawn')
+        self.assertIn('ask a project owner',detail['pending_transition']['message'])
+        self.assertEqual(self.pending_transition(item)['operation_id'],pending['operation_id'])
+
     def test_closed_fields_state_content_cas_and_draft_refuse_before_effect(self):
         item=self.accepted(); initial=copy.deepcopy(self.backend.native.rows)
         before=len(self.backend.native.writes())

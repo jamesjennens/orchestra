@@ -6539,6 +6539,52 @@ class ApiHandler(BaseHTTPRequestHandler):
                 or self.service.state.get('memberships',{}).get(pid,{}).get(ctx.principal.user_id)!='owner'):
             raise forbidden('Requirements editing needs the signed-in project owner')
 
+    def _requirements_state_only(self, ctx, result):
+        """A member who cannot finish the transition reads the state, not its handles.
+
+        A current owner still receives the exact operation id and receipt hash its
+        finish/abandon route needs; contributors and viewers receive the state,
+        reason and a sentence naming who can act.
+        """
+        pid=ctx.params['pid']
+        owner=(ctx.principal.via=='session' and not ctx.principal.agent_id
+               and self.service.state.get('memberships',{}).get(pid,{}).get(ctx.principal.user_id)=='owner')
+        if owner:
+            return result
+        def without_operation(record):
+            return {name:value for name,value in record.items() if name!='operation_id'} \
+                if isinstance(record,dict) else record
+        items=result.get('items',[result]) if isinstance(result,dict) else []
+        for item in items:
+            if not isinstance(item,dict):
+                continue
+            for name in ('state','reason'):
+                if isinstance(item.get(name),dict):
+                    item[name]=without_operation(item[name])
+            if isinstance(item.get('state_history'),list):
+                item['state_history']=[without_operation(state) for state in item['state_history']]
+            if isinstance(item.get('state_message'),str) and 'finish or abandon' in item['state_message']:
+                item['state_message']='A requirement transition is pending; ask a project owner to finish or abandon it.'
+            pending=item.get('pending_transition')
+            if isinstance(pending,dict):
+                item['pending_transition']={'id':pending.get('id'),
+                    'state':without_operation(pending.get('state')),
+                    'reason':without_operation(pending.get('reason')),
+                    'message':'A requirement transition is pending; ask a project owner to finish or abandon it.'}
+            if isinstance(item.get('completion'),dict):
+                item['completion']={name:value for name,value in item['completion'].items()
+                                    if name not in ('operation_id','pending_receipt_sha256')}
+        recoveries=result.get('terminal_recoveries') if isinstance(result,dict) else None
+        if isinstance(recoveries,dict):
+            recoveries['items']=[{'id':entry.get('id'),'state':without_operation(entry.get('state')),
+                'reason':without_operation(entry.get('reason')),
+                'message':'A requirement transition is pending; ask a project owner to finish or abandon it.'}
+                for entry in recoveries.get('items',[]) if isinstance(entry,dict)]
+            recoveries['damaged']=[{'id':entry.get('id'),'message':entry.get('message')}
+                for entry in recoveries.get('damaged',[]) if isinstance(entry,dict)]
+            recoveries.pop('completions',None)
+        return result
+
     def _requirements_names(self, result):
         items=result.get('items', [result])
         accounts = [(item.get('state') or {}).get('account_id') for item in items]
@@ -6626,6 +6672,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         self._requirements_backend(); self._project(ctx,CAP_READ)
         result=dict(self.backend.requirements_read(ctx.params['pid'],['list']))
         result['items']=[self._requirement_author(ctx,item) for item in result.get('items',[])]
+        result=self._requirements_state_only(ctx,result)
         self._requirements_names(result)
         result['can_edit']=(ctx.principal.via=='session' and not ctx.principal.agent_id
                             and self.service.state.get('memberships',{}).get(ctx.params['pid'],{}).get(ctx.principal.user_id)=='owner')
@@ -6640,6 +6687,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         self._requirements_backend(); self._project(ctx,CAP_READ)
         result=dict(self.backend.requirements_read(ctx.params['pid'],['get',ctx.params['rid']]))
         result=self._requirement_author(ctx,result)
+        result=self._requirements_state_only(ctx,result)
         self._requirements_names(result)
         result['governance']=self.backend.requirements_read(ctx.params['pid'],['governance'])
         result['can_edit']=(ctx.principal.via=='session' and not ctx.principal.agent_id
@@ -6697,6 +6745,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         self._requirements_backend(); self._project(ctx,CAP_READ)
         result=self.backend.requirements_read(ctx.params['pid'],['brd'])
         result['items']=[self._requirement_author(ctx,item) for item in result.get('items',[])]
+        result=self._requirements_state_only(ctx,result)
         self._requirements_names(result)
         return 200,result
 
