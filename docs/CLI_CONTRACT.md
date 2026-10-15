@@ -67,11 +67,12 @@ Every request is one JSON object on stdin; every response is one JSON object on 
     with a payload (a request, an acceptance, a decline), `checkpoint`, the lifecycle,
     coordinate and requirement actions, the keyed records (`ref`, `capability`,
     `proposal`), `session register`, `session resume` and `session run start`,
-    `heartbeat` and `end`, `guidance ack`, and `feedback` (add and correct);
+    `heartbeat` and `end`, `guidance ack`, and `feedback` (add and correct) on the
+    Orchestra feedback stream;
   - **a request that is already recorded carries none.** Where the kit recognises its
     own record (the same `operation_id` in a lifecycle fact, a review record, a handoff,
-    a session registration, an acknowledgement, a feedback entry), the second answer
-    says so (`reconciled`, or the record it found) and writes nothing, so it has no
+    a session registration, an acknowledgement, an Orchestra feedback entry), the second
+    answer says so (`reconciled`, or the record it found) and writes nothing, so it has no
     time of its own. The time of the first answer is the time of the write; keep it, or
     read the record's own `created_at`;
   - a request that is sent again with a transport operation identity (the HTTP
@@ -1452,13 +1453,15 @@ No proposal text ever appears in an error message.
   - `supersedes`: optional, the key of an earlier proposal, which must exist.
   - The command writes `id`, `key`, `origin`, `created_at` and `sha256`. The key is
     `p-` plus the first 12 hex digits of `sha256(operation_id)`.
-- **`submit --from-feedback ENTRY_ID --file`** promotes one feedback entry
-  (`feedback list` shows the ids). The proposal records
+- **`submit --from-feedback ENTRY_ID --file`** promotes one Orchestra feedback entry
+  (`feedback list` shows the ids). Orchestra feedback is about Orchestra itself - the
+  tools, the process and the coordination - not about this project's own work, which
+  goes into tasks, comments and requirements. The proposal records
   `origin: {type: "feedback", entry_id, digest}`, where `digest` is the SHA-256 of the
   entry. `text` may be omitted from the payload: it is then the entry body, which
-  must fit 4,000 characters. The feedback journal is read, never changed. Refused,
-  before any write: an unknown entry, an entry a later correction supersedes (promote
-  the correction), and a journal that does not validate.
+  must fit 4,000 characters. The Orchestra feedback journal is read, never changed.
+  Refused, before any write: an unknown entry, an entry a later correction supersedes
+  (promote the correction), and a journal that does not validate.
 - **`revise --file`** writes the next revision of your own proposal. It adds `key`,
   the next `revision` and `expected_sha256` (the hash of the revision it replaces) to
   the content fields. It is allowed only while the proposal is `submitted` or

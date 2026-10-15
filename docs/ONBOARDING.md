@@ -91,7 +91,7 @@ python orchestra-client.py --config client.local.json --project PROJECT --actor 
 ```
 
 Only if the harness and project explicitly permit a loop, after delivery check
-every REPLACE_INTERVAL_MINUTES minutes for review feedback on your own tasks first,
+every REPLACE_INTERVAL_MINUTES minutes for review requests on your own tasks first,
 then check `ready --json` for one next unheld task. Continue when a task is
 available; do not stop just because the previous task was delivered. Stop at
 REPLACE_DEADLINE or, after checking both sources, when you have no actionable open

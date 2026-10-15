@@ -40,7 +40,7 @@ python orchestra-client.py --config client.local.json --project PROJECT --actor 
 ```
 
 Only an explicitly loop-capable and authorized harness may, after delivery, check
-every N minutes for review feedback on the actor's own tasks first, then check
+every N minutes for review requests on the actor's own tasks first, then check
 `ready --json` for one next unheld task. Continue when one is available; do not
 stop just because the previous task was delivered. Stop at the configured deadline
 or, after checking both sources, when there is no actionable open or pending-review

@@ -93,7 +93,7 @@ export async function start(root, options = {}) {
             link('/p/' + pid + '/reviews', 'Reviews'),
             ctx.features.requirements ? link('/p/' + pid + '/requirements', 'Requirements') : null,
             ctx.features.records ? link('/p/' + pid + '/decisions', 'Decisions') : null,
-            link('/p/' + pid + '/feedback', 'Feedback'),
+            link('/p/' + pid + '/feedback', 'Orchestra feedback'),
             link('/p/' + pid + '/settings', 'Members & settings'),
             ['owner', 'superuser'].includes(current.role) ? link('/p/' + pid + '/setup', 'Set up') : null,
             link('/p/' + pid + '/how', 'How work is found'),

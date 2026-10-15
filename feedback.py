@@ -1,4 +1,4 @@
-"""Private, append-only project feedback with cursor paging and idempotent writes."""
+"""Private, append-only Orchestra feedback with cursor paging and idempotent writes."""
 import argparse
 import base64
 import binascii

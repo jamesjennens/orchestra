@@ -322,6 +322,16 @@ class ContractDocumentationTests(unittest.TestCase):
         self.assertIn('never', text)
         self.assertIn('stderr', text)
 
+    def test_the_feedback_entries_name_the_orchestra_feedback_stream(self):
+        # The stream is about Orchestra itself; the project's own work goes into tasks,
+        # comments and requirements (kittrial-5bb.279).
+        text = ' '.join((KIT / 'docs' / 'CLI_CONTRACT.md').read_text(encoding='utf-8').split())
+        self.assertIn('the Orchestra feedback stream', text)
+        self.assertIn('promotes one Orchestra feedback entry', text)
+        self.assertIn('The Orchestra feedback journal is read, never changed.', text)
+        self.assertIn('Orchestra feedback is about Orchestra itself - the tools, the process and the coordination - '
+                      "not about this project's own work, which goes into tasks, comments and requirements.", text)
+
 
 class NativeFailureBoundaryTests(unittest.TestCase):
     """A nonzero native exit echoes a bounded, redacted label, never a payload."""

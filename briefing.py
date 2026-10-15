@@ -753,7 +753,7 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
     bounded_priors=[{key:c[key] for key in ('comment_id','commit','relation','timestamp','integration')}
                     for c in priors[-PRIOR_BRIEF_LIMIT:]]
     review_next={'changes-requested':'Address the outstanding review requests for the current contribution; read review '+task+'.',
-                 'awaiting-review':'Reviewer: retrieve and verify the current contribution, then record review feedback or approval.',
+                 'awaiting-review':'Reviewer: retrieve and verify the current contribution, then record a review request or approval.',
                  'awaiting-integration':'Authorized integrator: integrate the approved contribution and record scoped integration evidence.',
                  'held':'The contribution is held; read review '+task+' for the record.',
                  'integrated':'Integration is recorded for this contribution; follow the project release/deployment workflow and scoped lifecycle evidence.',
