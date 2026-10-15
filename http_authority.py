@@ -627,8 +627,15 @@ _LOCAL = threading.local()
 
 
 @contextmanager
-def file_lock(path, timeout=60.0, poll=0.02):
-    """Cross-process exclusive lock on ``path`` (``fcntl`` or ``msvcrt``).
+def file_lock(path, timeout=60.0, poll=0.02, shared=False):
+    """Cross-process lock on ``path`` (``fcntl`` or ``msvcrt``).
+
+    Exclusive by default. ``shared=True`` takes the lock SHARED so two reads can
+    hold it at once and a writer is still excluded (kittrial-5bb.291 item 5: the
+    roster read needs the same 60 s bound as the exclusive wait, not an unlimited
+    shared wait and not an exclusive lock). On Windows ``msvcrt.locking`` has no
+    shared lock, so ``shared=True`` there takes the exclusive lock and this is
+    stated rather than pretended.
 
     Re-entrant *per thread* so nested persistence calls in one mutation cannot
     deadlock against themselves, while a second process (the canonical endpoint)
@@ -652,10 +659,13 @@ def file_lock(path, timeout=60.0, poll=0.02):
                 handle.seek(0)
                 if os.name == 'nt':
                     import msvcrt
+                    # msvcrt.locking is exclusive-only; a shared hold is the
+                    # exclusive lock on Windows (stated, not pretended).
                     msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
                 else:
                     import fcntl
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.flock(handle.fileno(),
+                                (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB)
                 break
             except OSError:
                 if time.monotonic() >= deadline:

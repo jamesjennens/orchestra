@@ -1559,11 +1559,12 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             with held_coordination_lock(path,shared=coordination_lock_shared(request,action,args)):
                 if action=='assignment-roster':
                     if authority_config is None:raise AssignmentError(403,'Verified coordinate authority is required in this project.')
-                    # Same 60 s bound as the exclusive file_lock every other authority
-                    # lock site uses (kittrial-5bb.291 item 5): the shared wait used to
-                    # have no limit at all.
+                    # SHARED and bounded: two roster reads can hold it at once and a
+                    # writer is still excluded, with the same 60 s limit as the
+                    # exclusive wait (kittrial-5bb.291 item 5). The old flock(LOCK_SH)
+                    # was shared but waited forever.
                     from http_authority import file_lock
-                    with file_lock(authority_config.lock):
+                    with file_lock(authority_config.lock, shared=True):
                         assignment_authority();actors=roster();offset=page['offset'];limit=page['limit']
                         result={'schema_version':1,'items':actors[offset:offset+limit],'total':len(actors),
                                 'more':offset+limit<len(actors),'offset':offset,
