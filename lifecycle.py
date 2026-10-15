@@ -20,6 +20,8 @@ from requirements import canonical_bytes, content_hash, load_json
 DIMENSIONS = ('implemented','tested','reviewed','integrated','deployed','live-verified')
 VALUES = ('unknown','pending','passed','failed','not-applicable')
 SCOPE_KEYS = {'source_commit','integration_commit','release_id','environment'}
+#: The fields in the order every operator-facing refusal names them.
+SCOPE_ORDER = ('source_commit','integration_commit','release_id','environment')
 PREFIX = 'Kind: lifecycle-v1\n'
 # Operational effect state, deliberately outside the six lifecycle facts. A
 # release can be deployed and switched on while a known defect stops it working;
@@ -1384,6 +1386,141 @@ def read_event_rows(run):
                          % error) from None
 
 
+def _row_belongs_to(row,task):
+    """Is ``row`` one of ``task``'s OWN records: its native row or one of its events?
+
+    A bounded read also carries the named defect task's row(s) and whatever the
+    operation-id substring matched, and a full export carries every task. Only a
+    row whose id IS the task, or whose parent-child dependency names it, is
+    evidence about THIS task's view (kittrial-5bb.289 item 4b).
+    """
+    if not isinstance(row,dict):
+        return False
+    if row.get('id')==task:
+        return True
+    return any(isinstance(dep,dict) and dep.get('type')=='parent-child'
+               and dep.get('depends_on_id')==task for dep in row.get('dependencies') or [])
+
+
+def _recorded_stamps(row):
+    """The times one row carries: its own ``created_at`` and its own comments'."""
+    stamp=row.get('created_at')
+    if isinstance(stamp,str) and stamp.strip():
+        yield stamp
+    for comment in row.get('comments') or []:
+        if not isinstance(comment,dict):
+            continue
+        stamp=comment.get('created_at')
+        if isinstance(stamp,str) and stamp.strip():
+            yield stamp
+
+
+def newest_record_time(rows,task=None):
+    """The newest ``created_at`` among the records a comparison was made from.
+
+    An operator reads this as "the view this write was judged against knows
+    records up to T": a scope written after T cannot be in that view, which is
+    how a lagging export or a later scope write becomes visible instead of
+    hiding behind one fixed sentence (kittrial-5bb.289 item 1). ``None`` when no
+    row carries a time; the caller prints it as unknown rather than inventing one.
+
+    Given ``task``, only that task's OWN row, its own events and their comments
+    count. A row that merely matched the operation-id substring, or the named
+    defect task, records another task's work and must not become this task's view
+    time (kittrial-5bb.289 item 4b).
+    """
+    stamps=[]
+    for row in rows:
+        if not isinstance(row,dict):
+            continue
+        if task is not None and not _row_belongs_to(row,task):
+            continue
+        stamps.extend(_recorded_stamps(row))
+    # Native RFC3339 UTC stamps in one format sort as text; the newest is last.
+    return max(stamps) if stamps else None
+
+
+def scope_fields(scope):
+    """One line naming a scope's exact four fields, for an operator-facing refusal.
+
+    Each value is JSON-escaped, so a free-text ``release_id`` or ``environment``
+    cannot forge a second line or smuggle a control character into the refusal.
+    ``None`` (no trusted current scope) is named as such, never rendered as an
+    empty object an operator could mistake for a real scope.
+    """
+    if not isinstance(scope,dict):
+        return 'none recorded'
+    return '{'+', '.join('%s: %s'%(key,json.dumps(scope.get(key),ensure_ascii=False))
+                         for key in SCOPE_ORDER)+'}'
+
+
+def _native_array_rows(run,argv,what):
+    """One bounded native read, decoded as a JSON array; a failure is labelled."""
+    try:
+        text=run(argv)
+        return record_json.loads_array_rows(text or '[]')
+    except (ValueError,OSError,RecursionError,subprocess.SubprocessError) as error:
+        raise ValueError('%s cannot be read: %s' % (what,error)) from None
+
+
+def read_task_rows(run,task,operation_id=None,defect_task=None):
+    """A LIVE bounded view of one task: its row, its own events and its receipts.
+
+    A single-fact write compares against this instead of a full ``export --all``
+    (kittrial-5bb.289 item 2): one ``show`` of the task (with comments, so a host
+    correction that binds one of its events is consulted), one ``list --parent``
+    of its child events, one ``show`` of the named defect task when there is one,
+    and one ``list --desc-contains`` of the events that carry this operation id
+    (any task, so the reuse and void guards still see a conflicting receipt). The
+    cost follows the task, not the project.
+
+    A runner that cannot answer these reads raises; it is never silently given a
+    weaker check. ``apply_native`` decides which runners may take this path.
+    """
+    rows=[]
+    # The child events first: a runner that cannot serve this read fails here with
+    # its own labelled error rather than being mistaken for a missing task.
+    rows.extend(_native_array_rows(
+        run,['list','--all','--parent',task,'--limit','0','--json'],
+        "the lifecycle events of %s"%task))
+    # One show per task: a missing defect task must not hide the task's own row
+    # (the two absences are refused separately by ``_apply_fact``).
+    for name in dict.fromkeys([task] if defect_task in (None,task) else [task,defect_task]):
+        try:
+            rows.extend(_native_array_rows(
+                run,['show',name,'--json','--include-comments'],'the task row %s'%name))
+        except ValueError:
+            # bd answers a ``show`` of an unknown id with a failure (measured,
+            # kittrial-5bb.185). The row is simply absent then and the caller
+            # refuses with its unknown-task sentence; no weaker check runs.
+            pass
+    if operation_id:
+        rows.extend(_native_array_rows(
+            run,['list','--all','--desc-contains',operation_id,'--limit','0','--json'],
+            'the receipts of operation %s'%operation_id))
+    seen=set();unique=[]
+    for row in rows:
+        if not isinstance(row,dict):
+            continue
+        identity=row.get('id')
+        if isinstance(identity,str):
+            if identity in seen:
+                continue
+            seen.add(identity)
+        unique.append(row)
+    return unique
+
+
+def read_task_view(run,task,operation_id=None,defect_task=None):
+    """The bounded live view in the shape the readers take (one task's rows)."""
+    rows=read_task_rows(run,task,operation_id=operation_id,defect_task=defect_task)
+    try:
+        return host_snapshot(record_json.classify(rows,run,types=['event']), run=run)
+    except (ValueError,OSError,subprocess.SubprocessError) as error:
+        raise ValueError('The lifecycle view of %s cannot be read: %s; a fresh view is needed '
+                         'before recording facts'%(task,error)) from None
+
+
 def _apply_fact(payload,actor,rows,run,current_scope,op_index,issues,recorded=None):
     """One native fact write against an already-read export (``rows``).
 
@@ -1427,7 +1564,16 @@ def _apply_fact(payload,actor,rows,run,current_scope,op_index,issues,recorded=No
             raise ValueError('unknown defect_task: '+payload['defect_task'])
     if payload['dimension']!='lifecycle-scope' and current_scope!=payload['scope']:
         if recorded is None or content_hash(payload['scope']) not in recorded:
-            raise ValueError('set matching lifecycle scope before recording facts')
+            # Name what was compared and how old the view is (kittrial-5bb.289
+            # item 1). Without the two scopes and the newest record time an
+            # operator cannot tell a lagging view from a scope that moved, and a
+            # fact stays unrecorded behind one fixed sentence.
+            seen=newest_record_time(rows,payload['task'])
+            raise ValueError(
+                'set matching lifecycle scope before recording facts: the task\'s current scope is '
+                +scope_fields(current_scope)+', the payload names '+scope_fields(payload['scope'])
+                +', and the newest record in the view compared is '+(seen if seen else 'unknown')
+                +'; re-read the current scope and retry with it')
     dim,value=payload['dimension'],payload['value']
     if dim+':'+value in (issue.get('labels') or []):
         intermediate='pending' if value!='pending' else 'unknown'
@@ -1900,7 +2046,18 @@ def apply_native(payload, actor, run, operators=None, journal=None, lifecycle_au
                              lifecycle_authors=lifecycle_authors,owners=owners)
     validate_payload(payload)
     if payload['actor']!=actor:raise ValueError('payload actor must match request actor')
-    rows=read_event_rows(run)
+    if getattr(run,'bounded_task_reads',False):
+        # The endpoint's host runner can answer a bounded per-task read, so a
+        # one-fact write compares against the task's LIVE rows instead of paying
+        # for `export --all` (kittrial-5bb.289 item 2). The rows are the ones
+        # `project_facts` needs, so an up-to-date view yields the same current
+        # scope the export yields, and a real mismatch is still refused. A bare
+        # callable - an offline tool or a synthetic test double - cannot answer
+        # the bounded reads and keeps the full export's answer.
+        rows=read_task_view(run,payload['task'],operation_id=payload['operation_id'],
+                            defect_task=payload.get('defect_task'))
+    else:
+        rows=read_event_rows(run)
     issues={row['id']:row for row in rows if row.get('issue_type')!='event' and not row.get('malformed')}
     state=next((r for r in project_facts(rows) if r['id']==payload['task']),None)
     current_scope=state['scope'] if state else None

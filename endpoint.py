@@ -1593,7 +1593,9 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             stdout,warnings=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
             if warnings:run_warnings.append(warnings)
             return stdout
-        runner=NativeRunner(lifecycle_run,project=path)
+        # The web lifecycle write compares a fact against the task's LIVE bounded
+        # rows rather than a full export (kittrial-5bb.289 item 2).
+        runner=NativeRunner(lifecycle_run,project=path,bounded_task_reads=True)
         denied_status=[]
         try:
             if not isinstance(args,list) or len(args)!=1 or not isinstance(args[0],str):
@@ -1740,7 +1742,9 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             stdout,warnings=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
             if warnings:run_warnings.append(warnings)
             return stdout
-        runner=NativeRunner(run, project=path)
+        # The canonical lifecycle write compares a fact against the task's LIVE
+        # bounded rows rather than a full export (kittrial-5bb.289 item 2).
+        runner=NativeRunner(run, project=path, bounded_task_reads=True)
         # Slices 6 and 7 (kittrial-5bb.197): the three rules are read once, from the
         # installation's own file, and an installation that configures nothing reads
         # them all as OFF. A malformed value reads as OFF with a warning, as
