@@ -295,15 +295,21 @@ class OrderTests(Members):
         self.assertIn('The reply lists its own tasks first: changes requested, then a task blocked by its last checkpoint, '
                       'then a task in progress.', text)
         self.assertIn('the same reply lists the tasks it could claim, after its own', text)
+        # Changes requested on a delivery is a review request; the word "feedback" belongs to
+        # the Orchestra feedback stream, a different thing (kittrial-5bb.279).
+        self.assertIn('review requests', text)
+        self.assertNotIn('review feedback', text)
         guide = (KIT / 'web' / 'js' / 'agentSetup.js').read_text(encoding='utf-8')
+        self.assertNotIn('review feedback', guide)
         self.assertIn("export const RUN_ORDER = ['guidance', 'own-tasks', 'ready-list', 'held', 'checkpoint'];", guide)
-        said = ['The reply lists your own tasks first: review feedback to address, then a task you left blocked, then one in '
+        said = ['The reply lists your own tasks first: review requests to address, then a task you left blocked, then one in '
                 'progress. Act on the first.', '3. Only when none of your own tasks needs action: the tasks the same reply says you '
                 'could claim. Claim exactly one that nobody holds']
         self.assertLess(guide.index(said[0]), guide.index(said[1]))
         agent = onboarding.member_document(KIT, 'poll-prompt-agent')['prompt']
-        self.assertIn('Your own tasks come first in the reply: review feedback, then a task you left blocked, then one in '
+        self.assertIn('Your own tasks come first in the reply: review requests, then a task you left blocked, then one in '
                       'progress.', agent)
+        self.assertNotIn('review feedback', agent)
         # The words of the three texts for the three own kinds, in the order of the kinds the route gives.
         kinds = [kind for kind, _ in [(action['kind'], action['task']) for action in
                                       self.check(*self.own_and_free())['next_actions']]]

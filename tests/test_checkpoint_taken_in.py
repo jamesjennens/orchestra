@@ -90,7 +90,7 @@ class TakenInNextActionTests(unittest.TestCase):
         with patch.object(work, 'workflow', side_effect=awaiting_review):
             read = b.brief(taken_in(PROJECT), HERE, TASK)
         self.assertEqual(read['next_action'], 'Reviewer: retrieve and verify the current contribution, '
-                                              'then record review feedback or approval.')
+                                              'then record a review request or approval.')
         # It is still said where the checkpoint was taken.
         self.assertEqual(read['checkpoint']['taken_in_project'], PROJECT)
 

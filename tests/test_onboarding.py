@@ -131,3 +131,13 @@ class OnboardingTests(unittest.TestCase):
         self.assertIn('"root": '+json.dumps(str(self.root)),text)
         self.assertIn('--project example --actor ACTOR -- onboard',text)
         self.assertNotIn('beads-team',text)
+
+
+class OnboardingDocumentWordingTests(unittest.TestCase):
+    """The kit's ONBOARDING.md says changes requested on a delivery is a review request, not
+    feedback: the word "feedback" belongs to the Orchestra feedback stream (kittrial-5bb.279)."""
+
+    def test_changes_requested_are_named_review_requests(self):
+        text = (Path(__file__).resolve().parents[1] / 'docs' / 'ONBOARDING.md').read_text(encoding='utf-8')
+        self.assertIn('review requests on your own tasks', text)
+        self.assertNotIn('review feedback', text)

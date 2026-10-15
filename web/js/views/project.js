@@ -173,6 +173,10 @@ export async function reviews(ctx, { pid }) {
     }));
 }
 
+// One sentence, said on the page and again before the form: whose feedback this is
+// (kittrial-5bb.279). The project's own work goes into tasks, comments and requirements.
+const FEEDBACK_LEDE = "Orchestra feedback is about Orchestra itself - the tools, the process and the coordination - not about this project's own work, which goes into tasks, comments and requirements.";
+
 export async function feedback(ctx, { pid }) {
   const project = await load(ctx, pid);
   const list = h('div', { class: 'panel' });
@@ -210,10 +214,10 @@ export async function feedback(ctx, { pid }) {
     const saved = await act(form.querySelector('button'), () => ctx.api.addFeedback(pid, { text }), { success: 'Feedback submitted' });
     if (saved) { form.reset(); draw(); }
   });
-  if (canWrite(project) && !project.archived) adding.replaceChildren(h('section', { class: 'panel' }, h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Add feedback')), h('div', { class: 'panel-body' }, form)));
+  if (canWrite(project) && !project.archived) adding.replaceChildren(h('section', { class: 'panel' }, h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Add feedback')), h('div', { class: 'panel-body' }, h('p', { class: 'small muted' }, FEEDBACK_LEDE), form)));
   draw();
   return h('div', { class: 'stack' },
-    pageHead({ crumbs: crumbs(ctx, project, 'Feedback'), title: 'Feedback', lede: 'Reading feedback does not resolve it. Open items stay open until someone triages them.' }),
+    pageHead({ crumbs: crumbs(ctx, project, 'Orchestra feedback'), title: 'Orchestra feedback', lede: FEEDBACK_LEDE }),
     adding,
     list);
 }

@@ -29,7 +29,7 @@ and tells the agent what applies.
 ### 2. Its own tasks
 
 Those assigned to it and those it claimed. On them, before anything else: **review
-feedback** (changes requested on something it delivered) and **newer comments** since
+requests** (changes requested on something it delivered) and **newer comments** since
 its last checkpoint.
 
 **Worker over SSH:** resume with its saved actor, then `work --mine`; for one task
@@ -151,7 +151,7 @@ tasks (`work --mine`, `brief TASK --json`). For an agent with a web credential i
 flagged on both blocked and in-progress tasks in the next-action reply, and the linked
 brief carries the newer summary (see step 2 above). The agent reads the full history
 to learn what the comments say. A delivered task follows its review state; request
-changes on its contribution for review feedback.
+changes on its contribution as a review request.
 
 Without a checkpoint, an in-progress task's `newer_activity` and its brief's `newer`
 are `null`: there is no known boundary against which to flag a comment. The
@@ -160,8 +160,8 @@ checkpoint; do not treat the missing flag as proof that the comment was read.
 
 **In the web interface today: no.** The task page shows the task's history. Writing a
 comment over the web is not there yet (planned: kittrial-5bb.211). A review that
-requests changes on a delivered contribution IS there, and reaches the worker as
-feedback, first in its order.
+requests changes on a delivered contribution IS there, and reaches the worker as a
+review request, first in its order.
 
 **The command today,** with the client: `comments add TASK --file note.md --json`
 

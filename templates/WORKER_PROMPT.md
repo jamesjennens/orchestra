@@ -156,7 +156,7 @@ After delivery, use only the mode authorized for this worker:
 
 - **Loop-capable harness:** only if the harness and project explicitly allow it,
   after delivery check every `REPLACE_INTERVAL_MINUTES` minutes. Inspect your own
-  work for actionable review feedback first; if none needs action, inspect `ready`
+  work for actionable review requests first; if none needs action, inspect `ready`
   and atomically claim one next unheld task. Continue when a task is available;
   do not stop merely because the previous task was delivered. Stop at
   `REPLACE_DEADLINE`, or after checking both sources when you have no actionable
@@ -179,7 +179,9 @@ notes file, never into a prompt. docs finding-work says where a worker looks for
 work and where it does not.
 
 Use server docs workflow, worker-guide, sessions, reviews, briefings and operations.
-Route feedback through the current project feedback stream or an explicitly agreed
+Orchestra feedback is about Orchestra itself - the tools, the process and the
+coordination - not about this project's own work, which goes into tasks, comments and
+requirements. Route it through the current feedback stream or an explicitly agreed
 interim parent/job target on older services; keep private feedback out of public
 files.
 ```

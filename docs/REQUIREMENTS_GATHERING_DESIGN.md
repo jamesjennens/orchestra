@@ -263,7 +263,7 @@ The owner's words (2026-09-30):
 
 Today a person who has a requirement has exactly two routes, and neither fits.
 They can open a task, which claims work and assigns an owner before anyone has
-decided the requirement is real; or they can write project feedback
+decided the requirement is real; or they can write Orchestra feedback
 (`feedback.py`, the local `.feedback.jsonl` stream), which is intentionally
 lightweight, untriaged and unattributed by design. There is no record that says
 "this person proposed this requirement, a coordinator reviewed it, and here is

@@ -4,13 +4,15 @@ For compact per-task reads, use [briefings and checkpoints](BRIEFINGS.md): `brie
 
 These examples use synthetic project `example`, task `example-task` and actor `alex/session1`. Substitute existing project/task IDs, real evidence and your own explicit actor. Run Python commands from the kit directory; keep configuration, payloads, exports and cursors outside committed source. The server must run a kit version supporting the `lifecycle` and `coordinate` actions.
 
-## Private project feedback
+## Orchestra feedback
 
-Feedback is a project-scoped append-only stream, separate from task claims and native
-issue comments. It is stored in the coordination runtime as `.feedback.jsonl`, is not
-included in generated Git views or source exports, and is retained by the native
-backup/restore pair. Use an explicit operation ID so an uncertain write can be
-reconciled safely:
+Orchestra feedback is about Orchestra itself - the tools, the process and the
+coordination - not about this project's own work, which goes into tasks, comments and
+requirements. The stream is project-scoped and append-only, separate from task claims
+and native issue comments. It is stored in the coordination runtime as
+`.feedback.jsonl`, is not included in generated Git views or source exports, and is
+retained by the native backup/restore pair. Use an explicit operation ID so an
+uncertain write can be reconciled safely:
 
 ```json
 {
