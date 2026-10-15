@@ -3380,6 +3380,19 @@ def next_action(task):
         return {'who': 'owner', 'text': 'Needs operator attention'}
     if task.get('assignee'):
         return {'who': 'assignee', 'text': 'Deliver a contribution'}
+    # The last offer is a claim, so it follows the same claimability predicate the
+    # queue, the agent attention list and the claim route use (kittrial-5bb.277 review
+    # item 2). A requirement record, an epic, a decision or another row the queue never
+    # offers says what it is for instead of inviting a claim the route refuses with 409.
+    from work import claimable, requirement_record
+    if not claimable(task.get('issue_type'), task.get('status'), task.get('assignee'),
+                     task.get('contribution_id'), state, labels=task.get('labels')):
+        if requirement_record(task.get('labels')):
+            return {'who': 'owner',
+                    'text': "Requirement record: edit it on the project's Requirements page"}
+        if str(task.get('issue_type') or 'task') == 'epic':
+            return {'who': 'owner', 'text': 'This is an epic, not a unit of work: work its tasks'}
+        return {'who': 'owner', 'text': 'This row is not offered as claimable work'}
     return {'who': 'anyone', 'text': 'Claim this task'}
 
 
@@ -6518,9 +6531,11 @@ class ApiHandler(BaseHTTPRequestHandler):
 
         What is refused here is this route's claim, and only that: an explicit host claim
         by a coordinator through the endpoint (`bd update ID --claim`) still works, and
-        live projects rely on it (kittrial-5bb.92 review item 1). The sentence says so, so
-        a person who needs the row claimed learns the way that is left instead of reading
-        the refusal as "nothing can claim this".
+        live projects rely on it (kittrial-5bb.92 review item 1). That fact is kept in
+        ``docs/REQUIREMENTS.md`` and deliberately **not** in this sentence (kittrial-5bb.277
+        review item 3): the caller who reads a refusal is usually an agent, and naming the
+        host command here would hand it the exact way around the refusal. The sentence
+        names the Requirements page instead.
         """
         if not isinstance(row, dict):
             return
@@ -6532,8 +6547,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         raise conflict('This is a %s record, not a unit of work, so it cannot be claimed. '
                        'It is not offered as claimable work here: edit it on the project\'s Requirements '
                        'page (or requirement_records.py draft|revise), and an operator accepts it with '
-                       'admin.py requirement-apply. A coordinator can still claim it explicitly on the '
-                       'host through the endpoint (bd update ID --claim).' % label)
+                       'admin.py requirement-apply.' % label)
 
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/references')
     def references_list(self, ctx):

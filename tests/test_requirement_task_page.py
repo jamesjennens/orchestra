@@ -53,6 +53,30 @@ class RequirementTasksPageTests(unittest.TestCase):
         # The ordinary task is never marked as a requirement.
         self.assertEqual(0, seen['ordinaryMarked'])
 
+    def test_the_task_page_does_not_offer_a_claim_on_a_row_the_server_calls_unclaimable(self):
+        node = shutil.which('node')
+        if not node:
+            self.skipTest('node is not installed')
+        import test_http_web
+        done = test_http_web.run_node_module(self, node, 'await import(process.argv[1])',
+                                             (KIT / 'tests' / 'web_requirement_task_claim.mjs').as_uri(),
+                                             (KIT / 'tests' / 'web_dom_shim.mjs').as_uri(),
+                                             (KIT / 'web' / 'js' / 'api.js').as_uri(),
+                                             (KIT / 'web' / 'js' / 'views' / 'task.js').as_uri())
+        self.assertEqual(0, done.returncode, done.stderr[-3000:])
+        seen = json.loads(done.stdout.strip().splitlines()[-1])
+
+        # Review item 2, the last part: a row the server calls not claimable gets no claim
+        # button, and the banner points at the Requirements page instead of inviting a
+        # claim the route would refuse with 409.
+        self.assertEqual(0, seen['requirementClaims'])
+        self.assertIn('Requirement record: edit it', seen['requirementText'])
+        self.assertIn("project's Requirements page", seen['requirementText'])
+        # Edit stays: a requirement record is still editable from its own task page.
+        self.assertEqual(1, seen['requirementEdits'])
+        # An ordinary unclaimed task keeps its claim button.
+        self.assertEqual(1, seen['ordinaryClaims'])
+
 
 if __name__ == '__main__':
     unittest.main()

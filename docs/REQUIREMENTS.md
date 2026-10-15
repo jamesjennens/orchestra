@@ -217,8 +217,11 @@ and `client.py` path) deliberately keeps taking a requirement row, and `bd ready
 still lists them, because live projects claim, close and reassign requirement records
 through it (kittrial-5bb.92 review item 1). The rule above keeps a requirement out of
 the *offered* work — the queue, the agent `next` list and the web claim — while an
-operator or coordinator who means to hold the row can still do so. The refusal
-sentence says so, so it is not read as "nothing can claim this".
+operator or coordinator who means to hold the row can still do so. This fact is kept
+here and deliberately **not** in the 409 sentence (kittrial-5bb.277 review item 3): the
+refusal answers the caller who was just turned away, usually an agent, and naming the
+host command there would hand it the exact way around the refusal. The sentence names
+the project's Requirements page instead.
 
 A requirement record is deliberately **not** a record anchor: unlike references and
 proposals it is never hidden, so a requirement already claimed by an agent still

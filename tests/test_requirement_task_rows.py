@@ -78,10 +78,12 @@ class TasksListMarkerTests(AgentHarness):
         self.assertIs(False, rows[other]['requirement_record'])
         self.assertIs(True, rows[other]['claimable'])
 
-    def test_the_claim_refusal_names_the_requirements_page_and_the_host_claim_that_stays(self):
-        # Review item 3, part 2: the sentence names the web Requirements page too, and
-        # says the one claim that still works (an explicit host claim by a coordinator),
-        # so it is not read as "nothing can claim this" (kittrial-5bb.92 review item 1).
+    def test_the_claim_refusal_names_the_requirements_page_and_not_the_host_claim(self):
+        # Review item 3: the sentence names the web Requirements page and the tools that
+        # edit and accept one. It deliberately does NOT name the explicit host claim
+        # (`bd update ID --claim`): that fact stays in docs/REQUIREMENTS.md, because the
+        # caller who reads a refusal is usually an agent and the sentence would hand it
+        # the exact command that goes around the refusal.
         task = self.new('a requirement')
         self.label(task, 'requirement', 'requirement:draft')
         refused = self.request('POST', '%s/%s/claim' % (self.tasks, task), {}, token=self.alex_token)
@@ -92,7 +94,41 @@ class TasksListMarkerTests(AgentHarness):
         self.assertIn('Requirements page', message)
         self.assertIn('requirement_records.py draft|revise', message)
         self.assertIn('admin.py requirement-apply', message)
-        self.assertIn('bd update ID --claim', message)
+        self.assertNotIn('bd update ID --claim', message)
+        self.assertNotIn('coordinator can still claim', message)
+
+    def test_a_requirement_rows_next_action_is_not_a_claim(self):
+        # Review item 2, the last part: next_action follows the same claimability
+        # predicate as the queue and the claim route, so a requirement row is never told
+        # "Claim this task" -- the sentence a reader would follow into the 409.
+        task = self.new('a requirement')
+        self.label(task, 'requirement', 'requirement:draft')
+        listed = self.rows()[task]
+        self.assertIs(False, listed['claimable'])
+        self.assertEqual('owner', listed['next_action']['who'])
+        self.assertNotIn('Claim this task', listed['next_action']['text'])
+        self.assertIn("project's Requirements page", listed['next_action']['text'])
+        # The row's own route carries the same sentence.
+        self.assertEqual(listed['next_action'], self.row(task)['next_action'])
+        # An ordinary unclaimed task is still offered as a claim.
+        plain = self.new('plain')
+        self.assertEqual({'who': 'anyone', 'text': 'Claim this task'},
+                         self.rows()[plain]['next_action'])
+
+    def test_the_epic_and_a_decision_row_are_not_offered_as_a_claim_either(self):
+        # The same fix covers the other rows with claimable false (review item 2): the
+        # epic and the "Accept requirement" row, which is a `decision`-type row.
+        from http_service import next_action
+        epic = {'id': 'e1', 'issue_type': 'epic', 'status': 'open', 'assignee': None,
+                'review_state': 'none', 'labels': []}
+        self.assertEqual('owner', next_action(epic)['who'])
+        self.assertNotIn('Claim', next_action(epic)['text'])
+        accept = {'id': 'd1', 'issue_type': 'decision', 'status': 'open', 'assignee': None,
+                  'review_state': 'none', 'labels': ['owner-requirement-decision:x']}
+        self.assertNotIn('Claim this task', next_action(accept)['text'])
+        ordinary = {'id': 'o1', 'issue_type': 'task', 'status': 'open', 'assignee': None,
+                    'review_state': 'none', 'labels': []}
+        self.assertEqual({'who': 'anyone', 'text': 'Claim this task'}, next_action(ordinary))
 
 
 class CanonicalTasksListMarkerTests(EndpointCase):

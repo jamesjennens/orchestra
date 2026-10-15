@@ -100,11 +100,12 @@ export async function overview(ctx, { pid }) {
       : null;
     // Rows left out of the default view (kittrial-5bb.277): say how many and how to see
     // them, so an empty list is never mistaken for a project with no work. Said only for
-    // the unfiltered view: a person who filtered for a state asked for that answer.
+    // the unfiltered view: a person who filtered for a state asked for that answer. The
+    // count covers the rows the current page fetched, not the whole project.
     const leftOut = !state.requirements && hiddenRequirements && !state.q && !state.review
       ? h('p', { class: 'small muted', role: 'note' }, hiddenRequirements === 1
-        ? '1 requirement record is not shown here. Turn on “Show requirements” to see it.'
-        : hiddenRequirements + ' requirement records are not shown here. Turn on “Show requirements” to see them.')
+        ? '1 requirement record is not shown here. Turn on “Show requirements” to see it. The count covers the rows on this page.'
+        : hiddenRequirements + ' requirement records are not shown here. Turn on “Show requirements” to see them. The count covers the rows on this page.')
       : null;
     tableHost.replaceChildren(
       ...(unreadable ? [unreadable] : []),
