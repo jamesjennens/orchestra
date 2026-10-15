@@ -1963,9 +1963,12 @@ console.log(JSON.stringify({
         self.assertIn('GetFolderPath', result['psRewriteWithCert'])
         self.assertIn('-replace', result['psRewriteWithCert'])
         self.assertIn('ssl-no-revoke', result['psRewriteWithCert'])
-        # kittrial-5bb.275 rev3: the cacert fragment must use double-quoted PowerShell strings
-        # and backtick escapes. A single-quoted '/...' fragment never terminates.
+        # kittrial-5bb.275 rev3/rev4: double-quoted PowerShell strings with backtick escapes
+        # only. The string must CLOSE after the escaped quote: "cacert = `" is a parse error
+        # (the `" is inside the string); it must be "cacert = `"" + (...).
         self.assertIn('`"', result['psRewriteWithCert'])
+        self.assertIn('cacert = `""', result['psRewriteWithCert'])
+        self.assertNotIn('cacert = `" +', result['psRewriteWithCert'])
         self.assertNotIn("+ '/.", result['psRewriteWithCert'])
         self.assertNotIn("+ \\'/", result['psRewriteWithCert'])
         self.assertIn('cacert = $HOME/', result['posixRewriteWithCert'])
@@ -1998,8 +2001,10 @@ console.log(JSON.stringify({
   pattern: /grep -vE/.test(command.posix),
   psExpands: command.powershell.includes("GetFolderPath('UserProfile')")
     && command.powershell.includes("-replace"),
-  // kittrial-5bb.275 rev3: double-quoted PowerShell strings with backtick escapes only.
+  // kittrial-5bb.275 rev3/rev4: double-quoted PowerShell strings with backtick escapes only;
+  // the string must CLOSE after the escaped quote ("cacert = `"" + ...).
   psBacktickQuote: command.powershell.includes('`"'),
+  psStringCloses: command.powershell.includes('cacert = `""'),
   psNoSingleQuotedSlash: !command.powershell.includes("+ '/.") && !command.powershell.includes("+ \\'/"),
   posixExpandsHome: command.posix.includes('cacert = $HOME/'),
 }));
@@ -2010,6 +2015,7 @@ console.log(JSON.stringify({
         self.assertTrue(result['pattern'])
         self.assertTrue(result['psExpands'])
         self.assertTrue(result['psBacktickQuote'])
+        self.assertTrue(result['psStringCloses'])
         self.assertTrue(result['psNoSingleQuotedSlash'])
         self.assertTrue(result['posixExpandsHome'])
         self.assertIn('ssl-no-revoke', result['powershell'])

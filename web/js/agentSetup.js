@@ -146,7 +146,9 @@ export function credentialFileCommand(file, comments, { certFile = null, hasCert
   const psParts = comments.map((line) => '"' + powershellLiteral(line) + '`r`n"');
   if (hasCertificate && certFile) {
     // Emits: "cacert = `"" + ([Environment]::GetFolderPath('UserProfile') -replace '\\','/') + "/NAME.crt`"`r`n"
-    psParts.push('"cacert = `" + ([Environment]::GetFolderPath(\'UserProfile\') -replace \'\\\\\',\'/\') + "/'
+    // The string must CLOSE after the escaped quote: `" is the quote character inside the
+    // string, then " ends it (kittrial-5bb.275 rev4, one character).
+    psParts.push('"cacert = `"" + ([Environment]::GetFolderPath(\'UserProfile\') -replace \'\\\\\',\'/\') + "/'
       + certFile.name + '`"`r`n"');
     psParts.push('"ssl-no-revoke`r`n"');
   }
