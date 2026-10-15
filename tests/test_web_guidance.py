@@ -190,6 +190,21 @@ class AdapterTests(unittest.TestCase):
         self.set();self.state['projects'][PROJECT]['archived']=True;self.save();self.assertEqual(self.call(self.request('read'))['authority_status'],409)
         self.state['projects'][PROJECT]['archived']=False;self.state['memberships'][PROJECT].pop(CONTRIBUTOR);self.save();self.assertEqual(self.call(self.request('read',CONTRIBUTOR))['authority_status'],404)
 
+    def test_reads_use_common_authority_lock_and_keep_closed_operation_validation(self):
+        self.set()
+        before = self.files()
+        for operation in web.READ_OPERATIONS:
+            fields = {'offset': 0, 'limit': 20} if operation == 'status' else {}
+            request = self.request(operation, **fields)
+            self.assertEqual(web.request_operation(request), operation)
+            with patch.object(auth, 'file_lock', wraps=auth.file_lock) as common_lock:
+                self.data(request)
+            common_lock.assert_called_once_with(self.config.lock)
+        self.assertEqual(self.files(), before)
+        for request in ({'args': []}, {'args': ['{"operation":"read"}'],
+                                      'attachments': {'text': {'text': 'not accepted', 'flag': '--file'}}}):
+            with self.assertRaises(ValueError): web.request_operation(request)
+
     def test_closed_attachment_and_pagination_shapes(self):
         for attachments in ([],{'text':{'flag':'--file','text':'x'},'extra':{}},{'text':{'flag':'--file','text':'x','path':'/tmp/no'}}):
             with self.subTest(attachments=attachments),self.assertRaises(ValueError):web.validate(dict(operation='set'),attachments)
@@ -211,6 +226,20 @@ class EndpointTests(EndpointHarness):
         return dict(project=PROJECT, actor=actor, action='web-guidance',
                     args=[json.dumps(dict(operation=operation,**fields))],
                     attachments={},operation_id=key)
+
+    def test_guidance_reads_obey_common_project_policy_at_the_dispatcher(self):
+        for operation in web.READ_OPERATIONS:
+            fields = {'offset': 0, 'limit': 20} if operation == 'status' else {}
+            for shared in (False, True):
+                request = self.request(operation, **fields)
+                with self.subTest(operation=operation, shared=shared), \
+                        patch.object(endpoint, 'coordination_lock_shared', return_value=shared) as policy, \
+                        patch.object(endpoint, 'held_coordination_lock', wraps=endpoint.held_coordination_lock) as held:
+                    reply = self.web(request, session_block(OWNER, web.CAPABILITIES[operation]))
+                self.assertEqual(reply['returncode'], 0, reply)
+                self.assertEqual(policy.call_count, 1)
+                self.assertEqual(policy.call_args.args[1:], ('web-guidance', request['args'], operation))
+                self.assertEqual(held.call_args.kwargs, {'shared': shared})
 
     def test_ack_set_and_clear_still_wait_for_shared_project_readers(self):
         import concurrent.futures

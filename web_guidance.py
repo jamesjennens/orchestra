@@ -3,9 +3,7 @@
 The endpoint holds the project lock. Reads and guarded writes also hold the live
 HTTP authority lock. No body-supplied actor or host path reaches the writers.
 """
-from contextlib import contextmanager
 import json
-import os
 from pathlib import Path
 import re
 
@@ -48,28 +46,13 @@ def validate(body, attachments=None):
     return operation
 
 
-def read_request(request):
-    """Validate the closed envelope before choosing a project lock mode."""
+def request_operation(request):
+    """Validate the closed envelope before the common endpoint lock decision."""
     args = request.get('args')
     if not isinstance(args, list) or len(args) != 1 or not isinstance(args[0], str):
         raise ValueError('Supply one canonical guidance JSON body')
     import record_json
-    return validate(record_json.loads(args[0]), request.get('attachments')) in READ_OPERATIONS
-
-
-@contextmanager
-def _authority_read_lock(path):
-    """Share POSIX authority reads; retain the existing Windows lock fallback."""
-    if os.name == 'nt':
-        with authority.file_lock(path):
-            yield
-        return
-    import fcntl
-    target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    with target.open('a') as lock:
-        fcntl.flock(lock, fcntl.LOCK_SH)
-        yield
+    return validate(record_json.loads(args[0]), request.get('attachments'))
 
 
 def require_authority(request, authority_config, capability, project):
@@ -185,7 +168,7 @@ def _web_action(path, project, request, authority_config, operators=None):
     if operation in READ_OPERATIONS:
         if authority_config is None:
             authorize()
-        with _authority_read_lock(authority_config.lock):
+        with authority.file_lock(authority_config.lock):
             state = authorize()
             if operation == 'read':
                 result = guidance.read(path, ['get'], request['actor'], operators)

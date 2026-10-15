@@ -799,6 +799,10 @@ def coordinator_payload(args,request):
 def _read_only_always(args,operation):
     return True
 
+def _web_guidance_read_only(args,operation):
+    from web_guidance import READ_OPERATIONS
+    return operation in READ_OPERATIONS
+
 READ_ONLY_ACTIONS={
     'brief':_read_only_always,
     'history':_read_only_always,
@@ -807,6 +811,7 @@ READ_ONLY_ACTIONS={
     'bd':lambda args,operation:not is_mutating_invocation(args),
     'web-lifecycle':lambda args,operation:operation=='read',
     'web-merge-slot':lambda args,operation:operation=='check',
+    'web-guidance':_web_guidance_read_only,
 }
 
 def coordination_lock_shared(request,action=None,args=None,operation=None):
@@ -1067,15 +1072,15 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
         from admin import project_setup_status
         return {'returncode':0,'stdout':json.dumps(project_setup_status(root,name))+'\n','stderr':''}
     if action=='web-guidance':
-        from web_guidance import read_request, web_action
-        reading=read_request(request)
-        with (path/'.coordination.lock').open('a') as lock:
-            fcntl.flock(lock,fcntl.LOCK_SH if reading else fcntl.LOCK_EX)
+        from web_guidance import request_operation, web_action
+        args=request.get('args',[])
+        operation=request_operation(request)
+        with held_coordination_lock(path,shared=coordination_lock_shared(request,action,args,operation)):
             return web_action(path,name,request,authority_config,configured_operators(root))
     if action=='guidance':
         # The standing guidance channel (kittrial-5bb.99 slice 1, revised). The
-        # endpoint is read-only except for the caller's own acknowledgement: the only
-        # guidance writer is the operator host command `admin.py set-guidance`, and
+        # host/SSH guidance action is read-only except for the caller's acknowledgement.
+        # Authenticated web writes use the distinct service-only action above, and
         # this allowlist refuses every other subcommand, so adding a write route here
         # cannot pass unnoticed (review `tests`: the test enumerates the accepted
         # subcommands and fails on any not in the read+ack set). `ack` names the
@@ -1090,7 +1095,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
         if subcommand not in ('get','version','ack','status'):
             raise ValueError('Unknown guidance action %r: the endpoint can only read guidance (get, version), '
                              'acknowledge the version the caller read (ack), or, for an operator, read status. '
-                             'The only writer is the operator host command admin.py set-guidance.'%subcommand)
+                             'Host writes use admin.py set-guidance; authenticated web writes use the separate web service action.'%subcommand)
         if subcommand=='ack':
             version=_guidance_ack_version(args[1:])
             with (path/'.coordination.lock').open('a') as lock:

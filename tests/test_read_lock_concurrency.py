@@ -169,7 +169,9 @@ WRITE_ACTIONS = ('checkpoint', 'review', 'handoff', 'coordinate', 'lifecycle', '
 #: The actions that are read-only always.
 READ_ACTIONS = ('brief', 'history', 'requirements', 'work')
 #: The actions whose shared/exclusive choice is the payload operation.
-READ_OPERATIONS = (('web-lifecycle', 'read'), ('web-merge-slot', 'check'))
+READ_OPERATIONS = (('web-lifecycle', 'read'), ('web-merge-slot', 'check')) + tuple(
+    ('web-guidance', operation) for operation in
+    ('read', 'status', 'onboarding', 'onboarding-edit', 'coordinate-check'))
 
 
 @POSIX
@@ -197,6 +199,15 @@ class ReadOnlyActionTableTests(unittest.TestCase):
             with self.subTest(action=action):
                 self.assertTrue(shared({'actor': 'a'}, action, args=[], operation=operation))
                 self.assertFalse(shared({'actor': 'a'}, action, args=[], operation='apply'))
+
+    def test_guidance_read_identities_and_all_guidance_writes_are_exclusive(self):
+        for operation in ('read', 'status', 'onboarding', 'onboarding-edit', 'coordinate-check'):
+            self.assertFalse(endpoint.coordination_lock_shared(
+                {'actor': 'a', 'operation_id': 'op-guidance-0001'}, 'web-guidance',
+                args=[], operation=operation))
+        for operation in ('ack', 'set', 'clear', None, 'unknown'):
+            self.assertFalse(endpoint.coordination_lock_shared(
+                {'actor': 'a'}, 'web-guidance', args=[], operation=operation))
 
     def test_an_operation_identity_is_exclusive(self):
         # Review item 2(2): the identity reservation must be serialized as on main.

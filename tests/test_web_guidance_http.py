@@ -231,7 +231,7 @@ class NativeGuidanceHttpTests(RulesHelpers, unittest.TestCase):
             self.assertNotIn('synthetic/private', json.dumps(reply.data))
             self.assertNotIn('PermissionError', json.dumps(reply.data))
 
-    def test_actual_endpoint_reads_share_project_and_authority_locks(self):
+    def test_actual_endpoint_reads_use_common_shared_project_locks(self):
         import concurrent.futures
         import fcntl
         self.set_guidance()
@@ -257,22 +257,19 @@ class NativeGuidanceHttpTests(RulesHelpers, unittest.TestCase):
         for args, kwargs in calls:
             with self.subTest(operation=json.loads(args[3][0])['operation']):
                 project_lock = (self.project / '.coordination.lock').open('a')
-                authority_lock = Path(str(self.h.service.store.path) + '.lock').open('a')
                 pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                 try:
                     fcntl.flock(project_lock, fcntl.LOCK_SH)
-                    fcntl.flock(authority_lock, fcntl.LOCK_SH)
                     future = pool.submit(original, *args, **kwargs)
                     try:
                         reply = future.result(timeout=5)
                     except concurrent.futures.TimeoutError:
                         reply = None
                 finally:
-                    fcntl.flock(authority_lock, fcntl.LOCK_UN)
                     fcntl.flock(project_lock, fcntl.LOCK_UN)
-                    authority_lock.close(); project_lock.close()
+                    project_lock.close()
                     pool.shutdown(wait=True)
-                self.assertIsNotNone(reply, 'Canonical read queued behind a shared project or authority reader')
+                self.assertIsNotNone(reply, 'Canonical read queued behind a shared project reader')
                 self.assertEqual(reply['returncode'], 0, reply)
         self.assertEqual(before, self.docs())
         self.assertEqual(before_rows, self.rows())
