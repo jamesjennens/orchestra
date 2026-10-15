@@ -2861,7 +2861,7 @@ class EndpointBackend:
                                                                now=self.service._expiry_now()),
                                    require_authority=True, route='guidance.' + operation)
         except HttpError as error:
-            if not writing and error.status == 503:
+            if not writing and error.status == 503 and error.code == 'uncertain':
                 refused = HttpError(503, 'unavailable', 'Guidance or onboarding could not be read. Nothing was changed; try again shortly.')
                 refused.nothing_done = True
                 raise refused from None

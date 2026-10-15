@@ -395,14 +395,20 @@ class BlockMatchesRequestTests(EndpointHarness):
                 self.assertIsNone(http_authority.block_mismatch_denial(
                     {'project': OTHER_PROJECT, 'actor': OWNER, 'action': action, 'args': [],
                      'authority': session_block(OWNER, 'read')}, self.config))
-        with self.assertRaises(ValueError) as refused:
-            self.web({'project': OTHER_PROJECT, 'actor': OWNER, 'action': 'set-onboarding', 'args': ['clear'],
-                      'operation_id': 'onboarding-1'}, session_block(OWNER, 'project.admin'))
-        self.assertIn('set-onboarding needs a descriptor for this project', str(refused.exception))
-        with self.assertRaises(ValueError) as refused:
-            self.web({'project': PROJECT, 'actor': OWNER, 'action': 'set-onboarding', 'args': ['clear'],
-                      'operation_id': 'onboarding-2'}, session_block(OWNER, 'reviews.approve'))
-        self.assertIn('set-onboarding needs a session descriptor for project.admin', str(refused.exception))
+        # The verified guidance/onboarding slice changes this action to live
+        # coordinate authority and the stable canonical refusal envelope. The
+        # action still checks its own exact project/capability before effects.
+        for project, block in [
+                (OTHER_PROJECT, session_block(OWNER, 'coordinate')),
+                (PROJECT, session_block(OWNER, 'reviews.approve')),
+                (PROJECT, session_block(OWNER, 'project.admin'))]:
+            with self.subTest(project=project, capability=block['capability']):
+                answer = self.web({'project': project, 'actor': OWNER,
+                                   'action': 'set-onboarding', 'args': ['clear'],
+                                   'operation_id': 'onboarding-forged'}, block)
+                self.assertRefused(answer)
+                self.assertIn('this project and operation capability', answer['stderr'])
+                self.assertFalse((self.root / 'projects' / project / '.http-operations.sqlite3').exists())
         self.assertEqual([], self.tracker.calls)
 
     def test_the_host_route_ignores_a_block_as_before(self):
