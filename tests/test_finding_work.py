@@ -130,9 +130,11 @@ class ServedTextTests(unittest.TestCase):
 
     def test_every_command_in_the_ssh_prompt_is_one_the_client_takes(self):
         prompt = onboarding.member_document(KIT, 'poll-prompt')['prompt']
-        client = (KIT / 'client.py').read_text(encoding='utf-8')
-        listed = re.search(r"elif args\[:1\] in \((.*?)\):action=args\.pop\(0\)", client)
-        actions = set(re.findall(r"\['([a-z]+)'\]", listed.group(1)))
+        # The actions come from the client's own table (kittrial-5bb.283 review item 2): the old
+        # regex matched the dispatch line and broke on a refactor that kept the behaviour. The
+        # endpoint's native subset is still read from its source, which imports fcntl on POSIX only.
+        import client
+        actions = set(client.CLIENT_ACTIONS)
         endpoint = (KIT / 'endpoint.py').read_text(encoding='utf-8')
         passed_on = set(re.findall(r"'([a-z]+)'", re.search(r"^ALLOWED=\{(.*?)\}", endpoint, re.M).group(1)))
         # Extract command slots from the actual prose, including parenthesized
