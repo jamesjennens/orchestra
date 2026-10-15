@@ -103,7 +103,8 @@ def claimable_work(item, state):
     attention list and the claim fall-through use. A row built without it (a direct
     library caller) is put through that same rule here rather than through a second
     open-and-unclaimed test, so an epic, a decision, a gate, a job, a task LABELLED
-    ``decision``, a delivered task or a held task is never offered as claimable work.
+    ``decision``, a requirement record (the ``requirement``/``brd-section`` label,
+    kittrial-5bb.277), a delivered task or a held task is never offered as claimable work.
     """
     declared = item.get('claimable')
     if isinstance(declared, bool):

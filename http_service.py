@@ -6495,6 +6495,23 @@ class ApiHandler(BaseHTTPRequestHandler):
                 raise conflict(merge_slot_sentence(row.get('id')))
             raise not_found('Task not found')
 
+    @staticmethod
+    def _refuse_requirement_record(row):
+        """A requirement record is a readable, visible row, never claimable work
+        (kittrial-5bb.277): it is NOT a record anchor and is NOT hidden (kittrial-5bb.276
+        needs a claimed requirement visible and releasable), so the claim route says what
+        it is and where it is edited and accepted rather than answering 404."""
+        if not isinstance(row, dict):
+            return
+        from work import REQUIREMENT_RECORD_LABELS, requirement_record
+        if not requirement_record(row.get('labels')):
+            return
+        label = next((name for name in row.get('labels') or ()
+                      if name in REQUIREMENT_RECORD_LABELS), 'requirement')
+        raise conflict('This is a %s record, not a unit of work, so it cannot be claimed. '
+                       'Edit it with requirement_records.py draft|revise; an operator accepts it '
+                       'with admin.py requirement-apply.' % label)
+
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/references')
     def references_list(self, ctx):
         """The reference catalog (.41 slice 1), read-only at CAP_READ.
@@ -7145,6 +7162,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         refuse_unknown_fields(payload, self.TASK_CLAIM_FIELDS, 'A task claim')
         task = self.backend.get_task(ctx.params['pid'], ctx.params['tid'])
         self._refuse_record_anchor(task, write=True)
+        # A requirement record is readable and visible, but never claimable work
+        # (kittrial-5bb.277). Refused here so no agent takes one as a task.
+        self._refuse_requirement_record(task)
         payload['task_id'] = ctx.params['tid']
         actor = self.service.bind_actor(ctx.principal, payload.pop('actor', None))
         payload['actor'] = actor

@@ -22,6 +22,29 @@ CLAIMABLE_EXCLUDED_TYPES = ('epic','decision','gate','job','event','merge-slot')
 #: ordinary claimable work, so the label joins the type exclusion (review item 4).
 DECISION_LABEL = 'decision'
 
+#: A task carrying one of these LABELS is a requirement RECORD (kittrial-5bb.277):
+#: requirement_records.py creates it with `--type task` and the controlled type label
+#: `requirement` or `brd-section` (requirement_http.py reads the BRD sections), so
+#: neither the type nor the record-anchor check kept it out of the worker queue and a
+#: new agent claimed many of them. A requirement record is a readable, visible row
+#: that a person edits and an operator accepts -- never a unit of work -- so it is
+#: never ordinary claimable work, whatever its status, assignee or contribution.
+#: It is deliberately NOT added to reserved_comments.RECORD_ANCHOR_FAMILIES: it must
+#: stay a visible row (kittrial-5bb.276 needs a claimed one visible and releasable).
+REQUIREMENT_RECORD_LABELS = ('requirement', 'brd-section')
+
+
+def requirement_record(labels):
+    """True when any label marks a requirement record (kittrial-5bb.277).
+
+    Tolerant of None and of non-string entries: a malformed label list must never
+    make a requirement row look like claimable work, and must never fail the queue.
+    """
+    if not isinstance(labels, (list, tuple)):
+        return False
+    return any(isinstance(label, str) and label in REQUIREMENT_RECORD_LABELS
+               for label in labels)
+
 
 def claimable(issue_type, status, assignee, contribution_id, review_state, record_anchor=False, labels=None):
     """One bounded interpretation of claimable work (kittrial-5bb.6 deliverable b).
@@ -32,13 +55,17 @@ def claimable(issue_type, status, assignee, contribution_id, review_state, recor
     fall-through and by the owner-facing prompt, so none of them can disagree. A row
     is claimable when it is OPEN, unassigned, has no contribution (delivered work
     never looks unclaimed), its review state is none, and it is neither a record
-    anchor nor an epic, decision, gate or job -- by TYPE or by the `decision` LABEL.
+    anchor nor an epic, decision, gate or job -- by TYPE, or by the `decision` LABEL,
+    or a requirement record by the `requirement`/`brd-section` LABEL (kittrial-5bb.277),
+    which is never claimable whatever its status, assignee or contribution.
     """
     if str(issue_type or 'task') in CLAIMABLE_EXCLUDED_TYPES:
         return False
     if record_anchor:
         return False
     if DECISION_LABEL in (labels or ()):
+        return False
+    if requirement_record(labels):
         return False
     if status!='open':
         return False
@@ -395,11 +422,14 @@ def help_payload(action='work'):
                            'lifecycle-scope commit or disagreeing integration facts) and clear nothing. '
                            'items[].claimable is the bounded claimability answer (open, unassigned, no '
                            'contribution, and not an epic, decision, gate or job by type or by the '
-                           '`decision` label, nor a record anchor); `--claimable` lists only those rows. '
+                           '`decision` label, nor a requirement record carrying the `requirement` or '
+                           '`brd-section` label, nor a record anchor); `--claimable` lists only those '
+                           'rows. items[].requirement_record says whether the row IS such a requirement '
+                           'record: it stays visible, but is never claimable work (kittrial-5bb.277). '
                            'Advisory: claimability is not a reservation.',
             'item_fields': ['task', 'title', 'owner', 'status', 'review_state', 'whose_move', 'next',
                             'next_actor', 'work_state', 'reconciliation_needed', 'reconciliation_reasons',
-                            'claimable', 'redelivered',
+                            'claimable', 'requirement_record', 'redelivered',
                             'contribution_id',
                             'commit', 'pending_review_items', 'pending_change_requests', 'open_items',
                             'blocking_items', 'checkpoint_at', 'newer_activity', 'checkpoint_wait',
@@ -507,7 +537,8 @@ def help_options(action):
                                                         'hold still shows its own awaiting-review/changes-requested state, '
                                                         'with the hold shown on the row'},
             {'flag': '--claimable', 'description': 'bounded claimable-work view: open, unassigned, no contribution, '
-                                                   'excluding epics, decisions, gates, jobs, tasks labelled decision '
+                                                   'excluding epics, decisions, gates, jobs, tasks labelled decision, '
+                                                   'requirement records (the requirement/brd-section labels) '
                                                    'and record anchors'},
             {'flag': '--limit N', 'description': 'page size %d..%d (default 20)' % (WORK_LIMIT_MIN, WORK_LIMIT_MAX)},
             {'flag': '--offset N', 'description': 'page offset >= %d (default 0)' % WORK_OFFSET_MIN},
@@ -718,7 +749,7 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
                           'whose_move':'unknown','next':UNKNOWN_MOVE_TEXT,
                           # A malformed row is never claimable and carries no next-action actor
                           # beyond the operator who must repair it (kittrial-5bb.6).
-                          'claimable':False,'work_state':'error','next_actor':'operator',
+                          'claimable':False,'requirement_record':False,'work_state':'error','next_actor':'operator',
                           # A malformed row has no validated contribution, so it is never
                           # a redelivery (kittrial-5bb.264 item 2).
                           'redelivered':False,
@@ -910,6 +941,10 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
                       'reconciliation_needed':bool(review.get('reconciliation_needed')),
                       'reconciliation_reasons':review.get('reconciliation_reasons') or [],
                       'claimable':row_claimable,
+                      # Additive (kittrial-5bb.277): whether this row IS a requirement record,
+                      # from the same labels, so the Tasks page and work list can mark it plainly.
+                      # It stays a visible row; only claimability (above) changes.
+                      'requirement_record':requirement_record(row.get('labels')),
                       # Additive (kittrial-5bb.253 item 1): the same fact the sentence above
                       # used, carried on the row so the HTTP agent builders can hand it to
                       # the one helper instead of re-deriving it without it.
