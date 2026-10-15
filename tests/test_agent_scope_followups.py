@@ -615,7 +615,10 @@ client.getresponse()
         self.assertFalse(set(seen['first']) & set(seen['second']))
         self.assertEqual(seen['first'], seen['back'])
         self.assertEqual(set(ids[1:]), set(seen['filteredFirst'] + seen['filteredSecond']))
-        self.assertTrue(all('limit=2' in path for path in seen['reads']))
+        agent_reads = [path for path in seen['reads'] if path.startswith('/v1/agents?')]
+        self.assertEqual(['/v1/accounts'], [path for path in seen['reads'] if path not in agent_reads])
+        self.assertTrue(agent_reads)
+        self.assertTrue(all('limit=2' in path for path in agent_reads))
         self.assertTrue(any('unconfirmed=true' in path and 'cursor=' in path for path in seen['reads']))
         filtered = [path for path in seen['reads'] if 'unconfirmed=true' in path]
         self.assertNotIn('cursor=', filtered[0])

@@ -664,7 +664,7 @@ class ProjectOwnerAgentTests(AgentHarness):
 
     #: The only fields a project owner may receive about an agent in their project.
     SAFE_FIELDS = {'id', 'name', 'owner', 'owner_display_name', 'actor', 'enabled',
-                   'last_seen_at', 'coordinator'}
+                   'last_seen_at', 'coordinator', 'credentials'}
 
     def setUp(self):
         super().setUp()
@@ -691,6 +691,8 @@ class ProjectOwnerAgentTests(AgentHarness):
 
     def assert_safe_view(self, agent):
         self.assertEqual(self.SAFE_FIELDS, set(agent))
+        for row in agent['credentials']:
+            self.assertEqual({'id', 'expires_at', 'working', 'revoked', 'expires_soon'}, set(row))
         self.assertNotIn('working_directory', agent)
         # "hidden" is still a disclosure that a path exists.
         self.assertNotIn('working_directory_hidden', agent)
@@ -1852,14 +1854,14 @@ class AgentsPageTests(RenewalScopeTests):
         self.assertEqual(first['Kestrel']['boxes'], {'read': [True, False], 'tasks': [False, False], 'checkpoints': [False, False],
                                                      'reviews': [False, False], 'feedback': [False, False], 'proposals': [False, False]})
         self.assertEqual([(row['working'], row['differs'], row['buttons'], 'Expired' in row['text']) for row in first['Kestrel']['rows']],
-                         [('false', 'false', [], True), ('true', 'false', ['Revoke'], False)])
+                         [('false', 'false', [], True), ('true', 'false', ['Extend existing credential', 'Revoke'], False)])
         self.assertEqual((first['Wren']['scopes'], first['Wren']['source'], first['Wren']['differ'], first['Wren']['summary']),
                          ('unknown', 'unknown', '2', 'What it may do (choose)'))
         self.assertIn('Nothing says what this agent may do.', first['Wren']['line'])
         self.assertIn('Its working credentials do not all allow the same.', first['Wren']['line'])
         self.assertNotIn('fixed', first['Wren']['line'])                           # nobody is blamed
         self.assertEqual(sorted((row['differs'], row['buttons'], 'allows read' in row['text']) for row in first['Wren']['rows']),
-                         [('true', ['Revoke'], False), ('true', ['Revoke'], True)])
+                         [('true', ['Extend existing credential', 'Revoke'], False), ('true', ['Extend existing credential', 'Revoke'], True)])
         self.assertEqual((first['Lone']['scopes'], first['Lone']['differ']), ('unknown', None))
         self.assertEqual({row['working'] for row in first['Lone']['rows']}, {'false'})
         self.assertEqual({tuple(row['buttons']) for row in first['Lone']['rows']}, {()})

@@ -57,7 +57,7 @@ from http_auth import (AGENT_SECRET_ENV, agent_secret_file, CAP_ACCOUNTS_ADMIN, 
                        CAP_TASKS, RESULT_RETENTION_SECONDS, HttpError, Service, Store,
                        address_group, authority_request, busy, conflict, forbidden, invalid, not_found,
                        not_implemented, now_iso, request_hash, unauthenticated,
-                       uncertain, unsupported)
+                       uncertain, unsupported, validate_agent_credential_days)
 from version import report as version_report
 
 KIT_VERSION = '0.1.0'
@@ -4207,7 +4207,7 @@ class ApiHandler(BaseHTTPRequestHandler):
     MEMBER_FIELDS = ('role',)
     CREDENTIAL_ISSUE_FIELDS = ('label', 'scopes', 'actor', 'allow_actor', 'allow_actor_reason')
     AGENT_CREATE_FIELDS = ('name', 'tool', 'working_directory', 'machine', 'notes',
-                           'projects', 'scopes')
+                           'projects', 'scopes', 'owner')
     AGENT_UPDATE_FIELDS = ('name', 'tool', 'working_directory', 'machine', 'notes',
                            'projects', 'enabled')
     AGENT_CREDENTIAL_FIELDS = ('label', 'scopes')
@@ -4636,6 +4636,10 @@ class ApiHandler(BaseHTTPRequestHandler):
                 'project_create': (
                     'create' if getattr(self.backend, 'PROJECT_CREATE', 'create') == 'create' else
                     'register' if principal.superuser and principal.via != 'credential' else 'operator-only')}
+        if principal.credential_id:
+            credential = self.service.state['credentials'].get(principal.credential_id)
+            if credential and credential.get('agent_id'):
+                body['credential_expiry'] = self.service.agent_credential_expiry_view(credential)
         # Additive (kittrial-5bb.118 part 2): whether this account may create a project
         # on the host from here, with its limit and how many it has. Only where the
         # backend has a host.
@@ -5749,18 +5753,23 @@ class ApiHandler(BaseHTTPRequestHandler):
             # caller cannot see keeps the service's own 404, exactly as the same body
             # without the unknown field does. Only then is a field the route does not
             # take refused, not dropped (kittrial-5bb.183 item 2).
-            self._require_grantable(ctx.principal, payload.get('projects'), ())
-            self.service.check_agent_grant(ctx.principal, payload.get('projects'))
+            owner = self.service.agent_creation_owner(ctx.principal, payload.get('owner', ctx.principal.user_id))
+            self._require_grantable(ctx.principal, payload.get('projects'), (), owner_id=owner)
+            self.service.check_agent_grant(ctx.principal, payload.get('projects'), owner_id=owner)
             refuse_unknown_fields(payload, self.AGENT_CREATE_FIELDS, 'An agent creation')
             result = self.service.create_agent(
                 ctx.principal, name=payload.get('name'), tool=payload.get('tool'),
                 working_directory=payload.get('working_directory'),
                 machine=payload.get('machine'), notes=payload.get('notes'),
                 projects=payload.get('projects'), scopes=payload.get('scopes'),
-                request_id=ctx.request_id)
+                request_id=ctx.request_id, owner=owner)
             return result, _redact_agent_secret(result)
+        def replay_check():
+            owner = self.service.agent_creation_owner(ctx.principal, payload.get('owner', ctx.principal.user_id))
+            self._require_grantable(ctx.principal, payload.get('projects'), (), owner_id=owner)
+            self.service.check_agent_grant(ctx.principal, payload.get('projects'), owner_id=owner)
         return self._mutate(ctx, 'agents.create', None, create, status=201,
-                            capability=CAP_AGENTS, replay_status=200)
+                            capability=CAP_AGENTS, replay_status=200, replay_check=replay_check)
 
     def _agent_items(self, principal, agents=None):
         items = []
@@ -5924,7 +5933,35 @@ class ApiHandler(BaseHTTPRequestHandler):
             return result, result
         return self._mutate_agent_credential(ctx, 'agents.credentials.revoke', revoke, status=204)
 
-    def _mutate_agent_credential(self, ctx, operation, fn, **options):
+    @route('POST', r'/v1/agents/(?P<aid>' + ID + r')/credentials/'
+                  r'(?P<cid>' + ID + r')/extend')
+    def agents_credential_extend(self, ctx):
+        return self._extend_agent_credential(ctx)
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/agents/(?P<aid>' + ID + r')/credentials/'
+                  r'(?P<cid>' + ID + r')/extend')
+    def project_agent_credential_extend(self, ctx):
+        return self._extend_agent_credential(ctx, ctx.params['pid'])
+
+    def _extend_agent_credential(self, ctx, project_id=None):
+        def check():
+            agent, _ = self.service.agent_extension_target(
+                ctx.principal, ctx.params['aid'], ctx.params['cid'], project_id)
+            for pid in ([project_id] if project_id is not None else agent.get('projects') or []):
+                self._require_usable(pid)
+            refuse_unknown_fields(dict(ctx.payload or {}), (), 'An agent credential extension')
+        def extend():
+            check()
+            result = self.service.extend_agent_credential(
+                ctx.principal, ctx.params['aid'], ctx.params['cid'], project_id=project_id,
+                request_id=ctx.request_id)
+            return result, result
+        return self._mutate_agent_credential(
+            ctx, 'agents.credentials.extend', extend, project_id=project_id,
+            capability=CAP_AGENTS if project_id is None else CAP_PROJECT_ADMIN, replay_check=check)
+
+    def _mutate_agent_credential(self, ctx, operation, fn, *, project_id=None,
+                                 capability=CAP_AGENTS, **options):
         """Save the credential and its route audit in one atomic JSON replacement.
 
         Issuance rolls back before a successful state save. Revocation stays effective
@@ -5934,7 +5971,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         with self.service.store.lock:
             agent = self.service.state['agents'].get(ctx.params['aid'])
             if not isinstance(agent, dict):
-                return self._mutate(ctx, operation, None, fn, capability=CAP_AGENTS, **options)
+                return self._mutate(ctx, operation, project_id, fn, capability=capability, **options)
             saved = [False]
             with self.service._agent_credential_transaction(
                     agent, rollback=operation != 'agents.credentials.revoke') as mark_saved:
@@ -5942,13 +5979,13 @@ class ApiHandler(BaseHTTPRequestHandler):
                     mark_saved()
                     saved[0] = True
                 try:
-                    return self._mutate(ctx, operation, None, fn, capability=CAP_AGENTS,
+                    return self._mutate(ctx, operation, project_id, fn, capability=capability,
                                         audit_success=False, state_saved=state_saved, **options)
                 except HttpError:
                     raise  # _mutate already releases a refused reservation and audits it
                 except Exception:
                     if not saved[0] and ctx.idempotency_key is not None:
-                        digest = self.service._idempotency_key(ctx.principal, None,
+                        digest = self.service._idempotency_key(ctx.principal, project_id,
                             '%s %s' % (operation, ctx.route_target), ctx.idempotency_key)
                         self.service.idempotency_release(digest)
                     raise
@@ -8583,6 +8620,8 @@ def main(argv=None):
                         help='log-ins one client address may have in flight at once, of the %d in all '
                              '(default %d; 1 to %d)' % (Service.LOGINS_AT_ONCE, Service.LOGINS_PER_ADDRESS,
                                                         Service.LOGINS_AT_ONCE))
+    parser.add_argument('--agent-credential-days', type=int, default=30, metavar='DAYS',
+                        help='future agent credential lifetime: 1 to 366 whole days (default 30; office may choose 90)')
     parser.add_argument('--approval-by-another-party', action='store_true',
                         help='nobody approves (or recommends) work of their own party: an account, its agents '
                              'and the worker credentials it issued. Off unless given')
@@ -8603,6 +8642,10 @@ def main(argv=None):
     web.add_argument('--no-web', action='store_true',
                      help='serve only the JSON API; do not serve the browser interface')
     args = parser.parse_args(argv)
+    try:
+        validate_agent_credential_days(args.agent_credential_days)
+    except ValueError as error:
+        parser.error(str(error))
 
     if args.list_unconfirmed_projects:
         # Read-only: the state document is read as JSON, without opening the store (which
@@ -8674,7 +8717,8 @@ def main(argv=None):
     trusted = list(args.trusted_proxy)
     if args.trust_proxy and 'localhost' not in trusted:
         trusted.append('localhost')
-    service = Service(store, public_url=args.public_url, approval_by_another_party=args.approval_by_another_party)
+    service = Service(store, public_url=args.public_url, approval_by_another_party=args.approval_by_another_party,
+                      agent_credential_days=args.agent_credential_days)
     service.LOGINS_PER_ADDRESS = args.logins_per_address
     backend = build_backend(service, args)
     for line in operator_allowlist_warnings(args.root if args.backend == 'endpoint' else None):

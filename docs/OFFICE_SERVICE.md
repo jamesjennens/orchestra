@@ -776,3 +776,14 @@ SIGKILL/restart outcome, disposable restore/export comparison, install/rollback
 round trip, and any skipped check with its reason. The coordinator reviews this
 record and the support runbook before a production release. Contact and
 escalation names belong in the private support ticket.
+
+## Agent credential lifetime configuration
+
+The kit-side service JSON accepts `"agent_credential_days": 90` (a whole number from
+1 through 366); omission retains30 days. It is passed as `--agent-credential-days`.
+The external office `orc.sh` must translate the named `orc.conf` line
+`AGENT_CREDENTIAL_DAYS=90` to this JSON key. That wrapper is maintained outside this
+kit by the coordinator; this contribution does not change it. Upgrade the kit before
+adding the key: an older `office_service.py` refuses an unknown setting. 90 is the
+office choice, not a special value in the implementation. Existing credentials are
+not rewritten when configuration changes.

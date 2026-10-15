@@ -4,6 +4,7 @@ import { queuePanel, detailPanel, proposeForm, myStrip } from './proposals.js';
 import { setupHint } from './setup.js';
 import { mergeSlotPanel } from './merge_slot.js';
 import { coordinationPanel } from './coordination.js';
+import { expiryLine, extensionButton } from '../credentialLifetime.js';
 
 const PAGE = 10;
 export const canWrite = (p) => ['owner', 'coordinator', 'contributor', 'superuser'].includes(p.role);
@@ -325,7 +326,7 @@ export async function settings(ctx, { pid }) {
       h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Agents in this project ', h('span', { class: 'nav-count' }, rows.length)),
         h('span', { class: 'small muted hide-narrow' }, 'A coordinating agent may approve other accounts’ work here; never its own account’s')),
       rows.length ? h('div', { class: 'table-wrap' }, h('table', null,
-        h('thead', null, h('tr', null, h('th', { scope: 'col' }, 'Agent'), h('th', { scope: 'col' }, 'Account'), h('th', { scope: 'col' }, 'Coordinator'), h('th', { scope: 'col' }, h('span', { class: 'visually-hidden' }, 'Actions')))),
+        h('thead', null, h('tr', null, h('th', { scope: 'col' }, 'Agent'), h('th', { scope: 'col' }, 'Account'), h('th', { scope: 'col' }, 'Coordinator'), h('th', { scope: 'col' }, 'Agent credentials'), h('th', { scope: 'col' }, h('span', { class: 'visually-hidden' }, 'Actions')))),
         h('tbody', null, rows.map((a) => {
           const grant = a.coordinator;
           const change = async (e, call, done) => {
@@ -339,6 +340,10 @@ export async function settings(ctx, { pid }) {
               [h('span', { class: 'chip ' + (grant.effective ? 'ok' : 'plain') }, grant.effective ? 'Coordinates' : 'Granted, no effect'),
                 h('div', { class: 'sub' }, 'by ', grant.granted_by_display_name || grant.granted_by, ' ', time(grant.granted_at),
                   grant.effective ? null : (NO_EFFECT[grant.no_effect_because] || NO_EFFECT['account-role']))]),
+            h('td', null, (a.credentials || []).map((c) => h('div', { class: 'stack', 'data-credential': c.id },
+              h('code', { class: 'small' }, c.id), expiryLine(c),
+              !project.archived && a.enabled && c.working ? extensionButton(a, c,
+                () => ctx.api.extendProjectAgentCredential(pid, a.id, c.id), drawAgents) : null))),
             h('td', null, project.archived ? null : grant ?
               h('button', { type: 'button', class: 'danger', 'aria-label': 'Remove the coordinator grant from ' + a.name,
                 onclick: (e) => change(e, () => ctx.api.revokeCoordinator(pid, a.id), `${a.name} no longer coordinates`) }, 'Remove grant') :

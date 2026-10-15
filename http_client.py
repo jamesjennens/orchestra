@@ -349,6 +349,18 @@ class Client:
         return self.request('DELETE', '/v1/projects/%s/members/%s'
                             % (quote(project, safe=''), quote(user_id, safe='')), key=key)
 
+    # -- personal agents -------------------------------------------------------
+    def create_agent(self, name, *, owner=None, key=None, **fields):
+        body = dict(fields, name=name)
+        if owner is not None:
+            body['owner'] = owner
+        return self.request('POST', '/v1/agents', body, key=key)
+
+    def extend_agent_credential(self, agent_id, credential_id, *, project=None, key=None):
+        stem = '/v1/agents' if project is None else '/v1/projects/%s/agents' % quote(project, safe='')
+        return self.request('POST', '%s/%s/credentials/%s/extend' %
+                            (stem, quote(agent_id, safe=''), quote(credential_id, safe='')), {}, key=key)
+
     # -- worker credentials ----------------------------------------------------
     def issue_credential(self, project, label=None, scopes=None, actor=None, key=None):
         return self.request('POST', '/v1/projects/%s/worker-credentials' % quote(project, safe=''),
