@@ -283,6 +283,34 @@ class Client:
             raise UncertainOutcome(0,'uncertain','Connection lost; reconcile the identical assignment',
                                    None,None,identity) from None
 
+    def guidance(self, project):
+        return self.request('GET', '/v1/projects/%s/guidance' % quote(project, safe=''))
+
+    def guidance_status(self, project, offset=0, limit=50):
+        return self.request('GET', '/v1/projects/%s/guidance/status?%s'
+                            % (quote(project, safe=''), urlencode(dict(offset=offset, limit=limit))))
+
+    def member_onboarding(self, project):
+        return self.request('GET', '/v1/projects/%s/onboarding/read' % quote(project, safe=''))
+
+    def _write_guidance(self, project, method, suffix, body, key):
+        identity = key or new_idempotency_key()
+        try:
+            return self.request(method, '/v1/projects/%s/guidance%s' % (quote(project, safe=''), suffix),
+                                body, key=identity)
+        except OSError:
+            raise UncertainOutcome(0, 'uncertain', 'Connection lost; reconcile the identical guidance request',
+                                   None, None, identity) from None
+
+    def acknowledge_guidance(self, project, version, key=None):
+        return self._write_guidance(project, 'POST', '/ack', {'version': version}, key)
+
+    def set_guidance(self, project, text, key=None):
+        return self._write_guidance(project, 'PUT', '', {'text': text}, key)
+
+    def clear_guidance(self, project, key=None):
+        return self._write_guidance(project, 'DELETE', '', {}, key)
+
     def merge_slot(self, project):
         return self.request('GET', '/v1/projects/%s/merge-slot' % quote(project, safe=''))
 

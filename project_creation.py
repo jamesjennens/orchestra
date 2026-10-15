@@ -886,7 +886,7 @@ def registrable(root, name):
 #: started with the service's authority arguments AND the request carries a
 #: live-authority descriptor that passes for exactly the capability named here.
 SERVICE_ACTIONS = {'create-project': 'project.host-create', 'project-creations': 'accounts.admin',
-                   'set-onboarding': 'project.admin', 'owner-requirements': 'project.admin',
+                   'set-onboarding': 'coordinate', 'owner-requirements': 'project.admin',
                    'creation-standing': 'project.host-create'}
 CREATION_JOURNAL = 'operations.sqlite3'
 

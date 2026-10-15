@@ -878,17 +878,24 @@ class OnboardingTests(Case):
         self.assertEqual(200, self.put('Owner text.').status)
         self.assertEqual(self.request('GET', self.url, token=self.olive).data['source'], 'web')
 
-    def test_guidance_cannot_be_set_through_this_or_any_web_route(self):
-        self.assertEqual(404, self.request('PUT', '/v1/projects/alpha/guidance', {'text': 'x'}, token=self.olive).status)
+    def test_onboarding_does_not_set_guidance_and_the_explicit_coordinate_route_does(self):
         self.put('Owner text.')
-        self.assertFalse((self.canonical_root / 'alpha' / 'GUIDANCE.md').exists())
+        guidance_file = self.canonical_root / 'alpha' / 'GUIDANCE.md'
+        self.assertFalse(guidance_file.exists())
+        made = self.request('PUT', '/v1/projects/alpha/guidance', {'text': 'Explicit guidance'}, token=self.olive)
+        self.assertEqual(made.status, 200, made.data)
+        read = self.request('GET', '/v1/projects/alpha/guidance', token=self.olive)
+        self.assertEqual(read.status, 200, read.data)
+        self.assertEqual(read.data['set_by'], self.ids['olive'])
+        self.assertEqual(read.data['text'], 'Explicit guidance')
+        self.assertFalse(read.data['acknowledged'])
 
     def test_the_endpoint_action_is_for_the_web_service_and_this_project_only(self):
         principal = self.service.authenticate(self.olive)
 
         def call(authority=True, **changes):
             descriptor = http_service.authority_request(principal, changes.pop('for_project', 'alpha'),
-                                                        changes.pop('capability', 'project.admin'),
+                                                        changes.pop('capability', http_service.CAP_COORDINATE),
                                                         now=self.service._expiry_now())
             request = dict({'project': 'alpha', 'actor': self.ids['olive'], 'action': 'set-onboarding',
                             'args': ['set'], 'attachments': {'text': {'flag': '--file', 'text': 'x'}},
@@ -910,8 +917,7 @@ class OnboardingTests(Case):
         # A descriptor that is good for ANOTHER project of the same owner does not write to this one.
         self.assertEqual(201, self.create(self.olive, 'beta').status)
         crossed = call(for_project='beta')
-        self.assertEqual(crossed['returncode'], 2, crossed)
-        self.assertIn('set-onboarding needs a descriptor for this project', crossed['stderr'])
+        self.assertEqual((crossed['returncode'], crossed['authority_status']), (126, 403), crossed)
         self.assertFalse(self.file.exists())
         self.assertEqual(call()['returncode'], 0)
         self.assertTrue(self.file.exists())

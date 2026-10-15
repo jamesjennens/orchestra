@@ -577,7 +577,7 @@ def reserved_actors(root,path,rows=False,own=()):
 #: ``host-coordination`` and ``host-projects`` are reads for the web interface (kittrial-5bb.198,
 #: host_reads.py): the operator list, the project's session names and the runtime's projects,
 #: which a bound key is not told.
-SERVICE_ONLY_ACTIONS=('create-project','project-creations','creation-standing','web-merge-slot','web-lifecycle',
+SERVICE_ONLY_ACTIONS=('create-project','project-creations','creation-standing','web-merge-slot','web-lifecycle','web-guidance',
                       'host-coordination','host-projects','assignment-roster','task-assign')
 
 def key_project_refusal(request,key_projects):
@@ -855,7 +855,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             raise ValueError('%s is available only to the web service'%answered)
     # Slot requests bind the block before project, tracker, or authority reads.
     # The shared table is the sole endpoint action/operation capability mapping.
-    if request.get('action') in ('coordinate','web-merge-slot','web-lifecycle','task-assign','assignment-roster'):
+    if request.get('action') in ('coordinate','web-merge-slot','web-lifecycle','web-guidance','task-assign','assignment-roster'):
         denied=block_mismatch_denial(request,authority_config)
         if denied is not None:return denied
     # Two actions exist only for the web service and name no existing project
@@ -1066,6 +1066,12 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
         if request.get('args',[]) not in ([],None):raise ValueError('Use setup-status without arguments')
         from admin import project_setup_status
         return {'returncode':0,'stdout':json.dumps(project_setup_status(root,name))+'\n','stderr':''}
+    if action=='web-guidance':
+        from web_guidance import read_request, web_action
+        reading=read_request(request)
+        with (path/'.coordination.lock').open('a') as lock:
+            fcntl.flock(lock,fcntl.LOCK_SH if reading else fcntl.LOCK_EX)
+            return web_action(path,name,request,authority_config,configured_operators(root))
     if action=='guidance':
         # The standing guidance channel (kittrial-5bb.99 slice 1, revised). The
         # endpoint is read-only except for the caller's own acknowledgement: the only
