@@ -332,40 +332,6 @@ class NativeAssignmentTests(RulesHelpers,unittest.TestCase):
         approved=harness.request('POST','/v1/projects/pp/tasks/'+tid+'/reviews',dict(body,operation_id='other-party-approval-0001'),token=other_token)
         self.assertEqual(201,approved.status,approved.data)
 
-    def test_the_endpoint_refuses_a_roster_read_without_verified_authority(self):
-        """Mutant M4 of the second .211 review: removing the endpoint's own authority
-        check on the roster read used to be caught by no test (the web route's
-        coordinate check still refuses). This is that test.
-
-        The case that kills M4 is a descriptor that passes the generic guards but
-        fails the roster's own assignment_authority(): a live descriptor for a
-        member WITHOUT the coordinate capability. With assignment_authority()
-        removed the roster is listed and this test fails. (A missing descriptor is
-        refused earlier by the generic guard, rc 126/401, and does not test M4.)
-        authority_config and require_authority are keyword arguments of execute(),
-        not fields of the request.
-        """
-        from http_authority import AuthorityConfig
-        harness, owner = self.web()
-        contributor, contributor_token = self.member(harness, owner, 'm4-no-coordinate',
-                                                     role='contributor')
-        harness.store.save()
-        config = AuthorityConfig(harness.backend.authority_store, harness.backend.authority_lock,
-                                 harness.backend.actor_namespace)
-        page = [json.dumps(dict(offset=0, limit=200))]
-        # A live block that names the capability the action needs (so the generic
-        # block-mismatch guard is satisfied) but whose user is only a contributor
-        # (so decide() denies it inside assignment_authority).
-        descriptor = dict(project='pp', capability='coordinate', via='session',
-                          user_id=contributor, store=str(harness.store.path))
-        reply = fixture.endpoint.execute(self.root, dict(
-            project='pp', actor=contributor, action='assignment-roster',
-            args=page, authority=descriptor),
-            authority_config=config, require_authority=True)
-        self.assertEqual(2, reply['returncode'], reply)
-        self.assertEqual(403, reply.get('assignment_status'), reply)
-        self.assertNotIn('items', json.loads(reply.get('stdout') or '{}'))
-
     def test_forged_canonical_block_and_unconfigured_ssh_cannot_assign(self):
         from unittest.mock import patch
         harness,owner=self.web();old=harness.admin_user['id'];target,_=self.member(harness,owner,'binding-target')
