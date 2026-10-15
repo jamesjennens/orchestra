@@ -421,7 +421,7 @@ function secretSteps(payload, secretValue, { withSecret, hasCertificate = false 
     hasCertificate ? h('li', null, 'Save the service’s certificate FIRST (the “Save certificate” button above), as ', h('code', { class: 'path' }, payload.certificateFile.windows), ' (macOS/Linux ', h('code', { class: 'path' }, payload.certificateFile.posix), '). Every curl below needs that file.') : null,
     h('li', null, 'Open Notepad (on macOS or Linux, a text editor).'),
     h('li', null, copyLine(withSecret ? 'Paste this (it contains the secret):' : 'Paste this, with your secret in place of <your secret>:', bodyWindows,
-      { ariaLabel: withSecret ? 'Copy the credential file text with the secret' : 'Copy the credential file template', what: 'Credential file text', note: hasCertificate ? 'Windows curl.exe also needs ssl-no-revoke (kept by the set-up rewrite).' : null })),
+      { ariaLabel: withSecret ? 'Copy the credential file text with the secret' : 'Copy the credential file template', what: 'Credential file text', note: hasCertificate ? 'Type your own full path in place of <your-name> (PowerShell: echo $env:USERPROFILE; macOS/Linux: echo $HOME). The set-up rewrite writes the real expanded path for you.' : null })),
     bodyPosix ? h('li', null, copyLine('On macOS or Linux the body is this instead:', bodyPosix,
       { ariaLabel: 'Copy the macOS/Linux credential file text', what: 'Credential file text' })) : null,
     h('li', null,

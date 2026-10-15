@@ -832,7 +832,7 @@ class TheDialogAndThePageCase(unittest.TestCase):
 
     def test_the_settings_never_hold_the_secret_and_the_rewrite_never_prints_it(self):
         setup = SETUP_JS.read_text(encoding='utf-8')
-        rewrite = re.search(r'export function credentialFileCommand\(file, comments\) \{.*?\n\}', setup, re.S).group(0)
+        rewrite = re.search(r'export function credentialFileCommand\(file, comments.*?\n\}', setup, re.S).group(0)
         self.assertIn('grep -vE', rewrite)
         self.assertIn('chmod 600', rewrite)
         self.assertIn('Regex]::Replace', rewrite)

@@ -1877,6 +1877,12 @@ console.log(JSON.stringify({
   bodyWindows: m.credentialFileBody('S3', m.certificateFile('Kestrel'), { windows: true, hasCertificate: true }),
   bodyPosix: m.credentialFileBody('S3', m.certificateFile('Kestrel'), { windows: false, hasCertificate: true }),
   bodyPlaceholder: m.credentialFileBody(null, m.certificateFile('Kestrel'), { windows: true, hasCertificate: true }),
+  psRewriteWithCert: m.credentialFileCommand(m.secretFile('Kestrel'),
+    m.credentialCommentLines('https://office.example.invalid:7443', 'AB:CD'),
+    { certFile: m.certificateFile('Kestrel'), hasCertificate: true }).powershell,
+  posixRewriteWithCert: m.credentialFileCommand(m.secretFile('Kestrel'),
+    m.credentialCommentLines('https://office.example.invalid:7443', 'AB:CD'),
+    { certFile: m.certificateFile('Kestrel'), hasCertificate: true }).posix,
   testHasCacert: /--cacert/.test(m.testCommands(p).posix + m.testCommands(p).powershell),
   guideWithCert: m.agentGuide(p, { hasCertificate: true }),
   guideWithCertIsKOnly: m.agentGuide(p, { hasCertificate: true }).includes('curl -fsS -K')
@@ -1933,66 +1939,98 @@ console.log(JSON.stringify({
                           'windows': '%USERPROFILE%\\.orchestra-agent-kestrel-agent-of-olive.crt',
                           'powershell': '$env:USERPROFILE\\.orchestra-agent-kestrel-agent-of-olive.crt',
                           'posix': '~/.orchestra-agent-kestrel-agent-of-olive.crt'}, result['certFile'])
-        # kittrial-5bb.275: the built credential-file text carries the curl options that make
-        # every curl -K work with the service's own certificate. Windows curl.exe gets
-        # ssl-no-revoke and a quoted forward-slash cacert path; POSIX gets cacert = ~/.…crt.
-        # Without a certificate the body stays the single header line. Commands stay -K only.
+        # kittrial-5bb.275 rev2: the Notepad body shows a full path the person types
+        # (curl does not expand %USERPROFILE% or ~ in a config file); the rewrite writes the
+        # real expanded path. Commands stay -K only.
         self.assertEqual('header = "Authorization: Bearer S3"\n', result['bodyNone'])
         self.assertEqual(
-            'cacert = "%USERPROFILE%/.orchestra-agent-kestrel.crt"\n'
+            'cacert = "C:/Users/<your-name>/.orchestra-agent-kestrel.crt"\n'
             'ssl-no-revoke\n'
             'header = "Authorization: Bearer S3"\n',
             result['bodyWindows'])
         self.assertEqual(
-            'cacert = ~/.orchestra-agent-kestrel.crt\n'
+            'cacert = /home/<your-name>/.orchestra-agent-kestrel.crt\n'
             'header = "Authorization: Bearer S3"\n',
             result['bodyPosix'])
         self.assertIn('header = "Authorization: Bearer <your secret>"', result['bodyPlaceholder'])
         self.assertIn('ssl-no-revoke', result['bodyPlaceholder'])
+        self.assertIn('<your-name>', result['bodyPlaceholder'])
         self.assertFalse(result['testHasCacert'])
         self.assertTrue(result['guideWithCertIsKOnly'])
         self.assertIn('cacert', result['guideWithCert'])
         self.assertIn('ssl-no-revoke', result['guideWithCert'])
-        # The comment-line rewrite keeps those lines (its strip pattern is comment-only).
-        self.assertNotIn('ssl-no-revoke', result['rewrite'])  # not written by the rewrite
-        self.assertNotIn('cacert', result['rewrite'])
+        # The rewrite WRITES the curl options with the real expanded path.
+        self.assertIn('GetFolderPath', result['psRewriteWithCert'])
+        self.assertIn('-replace', result['psRewriteWithCert'])
+        self.assertIn('ssl-no-revoke', result['psRewriteWithCert'])
+        self.assertIn('cacert = $HOME/', result['posixRewriteWithCert'])
+        self.assertIn('ssl-no-revoke', result['posixRewriteWithCert'])  # stripped if present
+        self.assertNotIn('<your-name>', result['posixRewriteWithCert'])
+        self.assertNotIn('%USERPROFILE%', result['posixRewriteWithCert'])
+        self.assertNotIn('cacert = $HOME/', result['rewrite'])  # no cert: no curl option written
+        self.assertNotIn('GetFolderPath', result['rewrite'])
 
-    def test_the_comment_rewrite_keeps_the_curl_options(self):
-        # kittrial-5bb.275: running the rewrite after the person saved the certificate must
-        # not drop cacert / ssl-no-revoke. The strip pattern matches only `# server ...` lines.
+    def test_the_rewrite_writes_the_expanded_cacert_path(self):
+        # kittrial-5bb.275 rev2: curl does not expand %USERPROFILE% or ~ inside a config file.
+        # The rewrite command must write the REAL path on the person's machine. Run the POSIX
+        # rewrite's output and read the file it produces.
         node = shutil.which('node')
         if not node:
             self.skipTest('node is not installed; the static checks above still apply')
         script = r"""
 const m = await import(process.argv[1]);
 const file = m.secretFile('Kestrel');
-const body = m.credentialFileBody('S3', m.certificateFile('Kestrel'), { windows: false, hasCertificate: true });
-const command = m.credentialFileCommand(file, m.credentialCommentLines('https://office.example.invalid:7443', 'AB:CD'));
-console.log(JSON.stringify({ body, posix: command.posix, pattern: /grep -vE/.test(command.posix) }));
+const cert = m.certificateFile('Kestrel');
+const command = m.credentialFileCommand(file,
+  m.credentialCommentLines('https://office.example.invalid:7443', 'AB:CD'),
+  { certFile: cert, hasCertificate: true });
+const bodyNone = m.credentialFileBody('S3', cert, { hasCertificate: false });
+const bodyWin = m.credentialFileBody('S3', cert, { windows: true, hasCertificate: true });
+const bodyPos = m.credentialFileBody('S3', cert, { windows: false, hasCertificate: true });
+console.log(JSON.stringify({
+  posix: command.posix, powershell: command.powershell,
+  bodyNone, bodyWin, bodyPos,
+  pattern: /grep -vE/.test(command.posix),
+  psExpands: command.powershell.includes("GetFolderPath('UserProfile')")
+    && command.powershell.includes("-replace"),
+  posixExpandsHome: command.posix.includes('cacert = $HOME/'),
+}));
 """
         out = run_node_module(self, node, script, self.SETUP_JS.as_uri())
         self.assertEqual(0, out.returncode, out.stderr)
         result = json.loads(out.stdout)
-        body = result['body']
-        self.assertIn('cacert = ~/.orchestra-agent-kestrel.crt', body)
-        self.assertNotIn('ssl-no-revoke', body)  # POSIX body has no ssl-no-revoke
-        # The rewrite's grep -vE pattern is the comment-only one: `# server ...`.
         self.assertTrue(result['pattern'])
-        self.assertIn("'^#[[:space:]]*server", result['posix'])
-        self.assertNotIn('cacert', result['posix'])
-        self.assertNotIn('ssl-no-revoke', result['posix'])
-        # Prove it on a real file: run the rewrite's grep rule against a body that holds
-        # the curl options, and confirm they survive. (Not subprocess.run: that spelling
-        # is reserved for run_node_module's single bound.)
+        self.assertTrue(result['psExpands'])
+        self.assertTrue(result['posixExpandsHome'])
+        self.assertIn('ssl-no-revoke', result['powershell'])
+        # Notepad bodies: the person types their own full path; no %USERPROFILE% or ~.
+        self.assertIn('C:/Users/<your-name>/.orchestra-agent-kestrel.crt', result['bodyWin'])
+        self.assertNotIn('%USERPROFILE%', result['bodyWin'])
+        self.assertIn('/home/<your-name>/.orchestra-agent-kestrel.crt', result['bodyPos'])
+        self.assertNotIn('~', result['bodyPos'])
+        # Run the POSIX rewrite for real: $HOME must be expanded by the shell, and the
+        # header line must survive. (Not subprocess.run: reserved for run_node_module.)
         with tempfile.TemporaryDirectory() as tmp:
-            cred = Path(tmp) / '.orchestra-agent-kestrel.curlrc'
-            cred.write_text(body, encoding='utf-8')
-            kept = subprocess.check_output(
-                ['grep', '-vE', r'^#[[:space:]]*server([[:space:]]+certificate[[:space:]]+sha256)?[[:space:]]*=',
-                 str(cred)],
-                text=True)
-            self.assertIn('cacert = ~/.orchestra-agent-kestrel.crt', kept)
-            self.assertIn('header = "Authorization: Bearer S3"', kept)
+            home = Path(tmp)
+            cred = home / '.orchestra-agent-kestrel.curlrc'
+            cred.write_text('header = "Authorization: Bearer S3"\n', encoding='utf-8')
+            cred.chmod(0o644)  # rewrite must make it 600
+            env = dict(os.environ, HOME=str(home))
+            subprocess.check_output(['bash', '-c', result['posix']], env=env, text=True)
+            written = cred.read_text(encoding='utf-8')
+            self.assertIn('# server = https://office.example.invalid:7443', written)
+            self.assertIn('# server certificate sha256 = AB:CD', written)
+            self.assertIn('cacert = %s/.orchestra-agent-kestrel.crt' % home, written)
+            self.assertIn('header = "Authorization: Bearer S3"', written)
+            self.assertNotIn('$HOME', written)  # expanded, not literal
+            self.assertNotIn('<your-name>', written)
+            self.assertEqual(0o600, cred.stat().st_mode & 0o777)
+            # Running it a second time replaces the managed lines, not a second copy.
+            subprocess.check_output(['bash', '-c', result['posix']], env=env, text=True)
+            again = cred.read_text(encoding='utf-8')
+            self.assertEqual(1, again.count('cacert ='))
+            self.assertEqual(1, again.count('# server ='))
+            self.assertEqual(1, again.count('header ='))
 
 
 
