@@ -2099,6 +2099,65 @@ class ReleaseCostEstimateTests(unittest.TestCase):
         self.assertLessEqual(report['expected_seconds'], lifecycle.RELEASE_CLIENT_TIMEOUT_SECONDS)
         self.assertFalse(any('client timeout' in warning for warning in report.get('warnings', [])))
 
+    def test_the_reservation_shrinks_only_the_first_group(self):
+        # kittrial-5bb.159 review item 1: the negative (supersede/scope) writes ride
+        # only the FIRST group, so only that group is sized from the reduced budget;
+        # every later group keeps the full-budget size. Before this fix the one
+        # reduced size was applied to every group.
+        page = [{'task': 'trial-%02d' % index} for index in range(45)]
+        groups = lifecycle.release_default_groups(page, [], False, {}, 30)
+        self.assertEqual([len(group) for group in groups], [20, 25],
+                         'the first group pays the 30 reserved writes, the later groups do not')
+        self.assertEqual(lifecycle.release_default_groups(page, [], False, {}, 0),
+                         lifecycle._chunks(page, lifecycle.release_default_chunk(page, [], False, {})),
+                         'with no reserved writes the groups are exactly the plain derived chunks')
+
+    def test_a_reserved_count_above_the_whole_budget_still_yields_a_group_of_one(self):
+        # kittrial-5bb.159 review item 3: the floor is one target, never zero, even
+        # when the reserved writes alone pass the whole budget.
+        page = [{'task': 'trial-a'}, {'task': 'trial-b'}]
+        reserved = lifecycle.RELEASE_GROUP_WRITE_BUDGET * 4 + 7
+        self.assertEqual(lifecycle.release_default_chunk(page, [], False, {}, reserved=reserved), 1)
+        groups = lifecycle.release_default_groups(page, [], False, {}, reserved)
+        self.assertEqual(len(groups[0]), 1)
+        self.assertEqual(sum(len(group) for group in groups), len(page))
+
+    def test_the_group_is_sized_from_the_worst_target_not_the_cheapest(self):
+        # kittrial-5bb.159 review item 3: release_page_writes_per_target takes the
+        # MAXIMUM, so a page mixing a plain target with an already-labelled one is
+        # sized from the labelled target, not from the cheapest one on the page.
+        page = [{'task': 'trial-a'}, {'task': 'trial-b'}]
+        labels = {'trial-a': [], 'trial-b': ['deployed:passed', 'live:live']}
+        self.assertEqual(lifecycle.release_target_native_writes('trial-a', set(), False, labels), 3)
+        self.assertEqual(lifecycle.release_target_native_writes('trial-b', set(), False, labels), 5)
+        self.assertEqual(lifecycle.release_page_writes_per_target(page, [], False, labels), 5)
+        self.assertEqual(lifecycle.release_default_chunk(page, [], False, labels),
+                         lifecycle.RELEASE_GROUP_WRITE_BUDGET // 5)
+
+    def test_an_empty_page_keeps_the_plain_default_group(self):
+        # kittrial-5bb.159 review item 3: an empty page derives the historical
+        # default group, not one.
+        self.assertEqual(lifecycle.release_default_chunk([], [], False, {}),
+                         lifecycle.RELEASE_CHUNK_DEFAULT)
+        self.assertEqual(lifecycle.release_default_groups([], [], False, {}, 0), [])
+        self.assertEqual(lifecycle.release_page_writes_per_target([], [], False, {}), 0)
+
+    def test_the_smaller_default_notice_is_not_shown_for_an_explicit_group(self):
+        # kittrial-5bb.159 review item 3: the derivation notice explains a group the
+        # KIT picked; an explicit --chunk-size is the caller's choice and must not
+        # draw it, even when the explicit size is below the historical default.
+        tasks = tuple('trial-%02d' % index for index in range(25))
+        store = self.second_environment(tasks)
+        client = types.ModuleType('client')
+        client.request = lambda *args, **kwargs: {'returncode': 0, 'stdout': '{}', 'stderr': ''}
+        with scratch() as root:
+            argv = self.staging_argv(root, store, '--dry-run', '--chunk-size', '10')
+            report = json.loads(ReleaseCommandTests.run_cli(self, argv, client))
+        self.assertEqual(report['chunk_size'], 10)
+        self.assertFalse(any('native bd process' in warning for warning in report['warnings']),
+                         'the smaller-default notice belongs to a derived size only: %r'
+                         % (report.get('warnings'),))
+
 
 class RollbackSemanticsTests(unittest.TestCase):
     """An explicit rollback leaves every reader saying what is live (rev2 item 2)."""
@@ -2464,7 +2523,10 @@ class RollbackCommandTests(ReleaseCommandTests):
     def test_a_rollbacks_supersede_writes_are_counted_in_the_estimate(self):
         # Kills "the supersede writes of a rollback are not counted" (.119 rev2 C7):
         # the negative facts ride the first group, so the printed page estimate and
-        # `planned_writes` must include them.
+        # `planned_writes` must include them. A task-level supersede is ONE process and
+        # a scope-level one is TWO (its target value is rewritten through pending
+        # first), so the count is len(supersede) + 2*len(supersede_scopes)
+        # (kittrial-5bb.159 review item 2).
         store = (NativeStore(tasks=('trial-a', 'trial-b'))
                  .seed('trial-a')
                  .seed('trial-b', integration=MERGE_B, source=SOURCE_B))
@@ -2477,7 +2539,7 @@ class RollbackCommandTests(ReleaseCommandTests):
         with scratch() as root:
             argv = self.rollback_fixture(root, store) + ['--rollback', '--dry-run']
             report = json.loads(self.run_cli(argv, client))
-        negatives = len(report['superseded']) + len(report['superseded_scopes'])
+        negatives = len(report['superseded']) + 2 * len(report['superseded_scopes'])
         self.assertGreater(negatives, 0, 'this rollback both drops and moves past tasks')
         positive = lifecycle.release_planned_writes(report['targets'], report['verify_only'], False)
         self.assertEqual(report['planned_writes'], positive + negatives)
@@ -2491,8 +2553,9 @@ class RollbackCommandTests(ReleaseCommandTests):
     def test_a_rollback_report_is_an_upper_count_of_the_re_lived_targets(self):
         # kittrial-5bb.139 review item 3: the page-level estimate assumes three facts
         # per re-lived target, but a rollback target may already be at the release
-        # scope and already live there, so the endpoint writes fewer. The report is
-        # documented as a conservative UPPER count for a rollback; this pins the
+        # scope and already live there, so the endpoint writes fewer. The page-level
+        # planned-fact count is a conservative UPPER count (only the FIRST group's
+        # total is a LOWER one, once the negative writes ride it); this pins the
         # direction on a rollback whose targets are already at the release scope.
         store = (NativeStore(tasks=('trial-a', 'trial-b', 'trial-c'))
                  .seed('trial-a')
@@ -2524,3 +2587,86 @@ class RollbackCommandTests(ReleaseCommandTests):
             report['planned_state_changes'], actual,
             'a re-lived target already at the release scope and already live there costs '
             'fewer native processes than the page-level estimate assumes')
+
+    def rollback_with_dropped(self, carried, dropped):
+        """A store whose r-1 release carries ``carried`` and whose r-3 adds ``dropped``.
+
+        Every dropped task is live in production at r-3, so the rollback to r-1 writes
+        both its task-level supersede and the scope-level receipt for its r-3 scope:
+        three native processes per dropped task (kittrial-5bb.159 review item 2).
+        """
+        store = NativeStore(tasks=tuple(carried) + tuple(dropped))
+        for task in carried:
+            store.seed(task)
+        for task in dropped:
+            store.seed(task, integration=MERGE_B, source=SOURCE_B)
+        store.record(release_payload([target(task) for task in carried],
+                                     operation='release-r1', release='r-1',
+                                     scope={'source_commit': '', 'integration_commit': RELEASE_COMMIT,
+                                            'release_id': 'r-1', 'environment': 'production'}))
+        store.record(release_payload([target(task) for task in carried]
+                                     + [target(task, integration=MERGE_B, source=SOURCE_B)
+                                        for task in dropped],
+                                     operation='release-r3', release='r-3',
+                                     scope={'source_commit': '', 'integration_commit': RELEASE_2,
+                                            'release_id': 'r-3', 'environment': 'production'}))
+        return store
+
+    def test_the_reservation_shrinks_only_the_first_group_of_a_rollback(self):
+        # kittrial-5bb.159 review items 1 and 3: the planner must pass the negative
+        # write count to release_default_groups (the call site), so only the FIRST
+        # group shrinks and the later groups keep the plain derived size. 45 dropped
+        # tasks reserve 3 processes each, which is 135.
+        carried = ['carry-%02d' % index for index in range(40)]
+        dropped = ['drop-%02d' % index for index in range(45)]
+        store = self.rollback_with_dropped(carried, dropped)
+        client = types.ModuleType('client')
+        client.request = lambda *args, **kwargs: {'returncode': 0, 'stdout': '{}', 'stderr': ''}
+        with scratch() as root:
+            argv = self.rollback_fixture(root, store) + ['--rollback', '--dry-run']
+            report = json.loads(self.run_cli(argv, client))
+        self.assertEqual(report['superseded'], dropped)
+        self.assertEqual(len(report['superseded_scopes']), len(dropped))
+        self.assertEqual(report['chunks'], [1, 18, 18, 3],
+                         'only the first group pays the reservation; later groups keep '
+                         'the plain derived size')
+
+    def test_the_negative_writes_alone_passing_the_budget_say_the_request_cannot_be_split(self):
+        # kittrial-5bb.159 review items 1 and 3: 45 dropped tasks reserve 135 native
+        # processes, so no group size can bring the first request inside the budget
+        # (the floor is one target). The notice must say that, naming the count and
+        # the estimate, instead of advising a smaller --chunk-size.
+        store = self.rollback_with_dropped(['carry-00'],
+                                           ['drop-%02d' % index for index in range(45)])
+        client = types.ModuleType('client')
+        client.request = lambda *args, **kwargs: {'returncode': 0, 'stdout': '{}', 'stderr': ''}
+        with scratch() as root:
+            argv = self.rollback_fixture(root, store) + ['--rollback', '--dry-run']
+            report = json.loads(self.run_cli(argv, client))
+        self.assertEqual(report['planned_state_changes'], 5 + 135,
+                         'a carried re-lived target costs five processes and each dropped '
+                         'task costs three')
+        notice = next((warning for warning in report['warnings']
+                       if 'supersede/scope writes alone' in warning), None)
+        self.assertIsNotNone(notice, 'the unsplittable first request must be named: %r'
+                             % (report.get('warnings'),))
+        self.assertIn('135', notice)
+        self.assertIn('%s s' % lifecycle.release_group_estimate(135), notice)
+        self.assertNotIn('lower --chunk-size', notice)
+
+    def test_an_explicit_chunk_keeps_the_lower_chunk_size_warning(self):
+        # kittrial-5bb.159 review item 1: the plain "cannot be split" sentence belongs
+        # to the kit's own derived default; an explicit --chunk-size keeps the current
+        # timeout warning, because that size is the caller's choice.
+        store = self.rollback_with_dropped(['carry-00'],
+                                           ['drop-%02d' % index for index in range(45)])
+        client = types.ModuleType('client')
+        client.request = lambda *args, **kwargs: {'returncode': 0, 'stdout': '{}', 'stderr': ''}
+        with scratch() as root:
+            argv = (self.rollback_fixture(root, store)
+                    + ['--rollback', '--dry-run', '--chunk-size', '25'])
+            report = json.loads(self.run_cli(argv, client))
+        self.assertEqual(report['chunk_size'], 25)
+        self.assertTrue(any('lower --chunk-size' in warning for warning in report['warnings']))
+        self.assertFalse(any('supersede/scope writes alone' in warning
+                             for warning in report['warnings']))
