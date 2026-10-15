@@ -1386,22 +1386,56 @@ def read_event_rows(run):
                          % error) from None
 
 
-def newest_record_time(rows):
-    """The newest ``created_at`` among the rows a comparison was made from.
+def _row_belongs_to(row,task):
+    """Is ``row`` one of ``task``'s OWN records: its native row or one of its events?
+
+    A bounded read also carries the named defect task's row(s) and whatever the
+    operation-id substring matched, and a full export carries every task. Only a
+    row whose id IS the task, or whose parent-child dependency names it, is
+    evidence about THIS task's view (kittrial-5bb.289 item 4b).
+    """
+    if not isinstance(row,dict):
+        return False
+    if row.get('id')==task:
+        return True
+    return any(isinstance(dep,dict) and dep.get('type')=='parent-child'
+               and dep.get('depends_on_id')==task for dep in row.get('dependencies') or [])
+
+
+def _recorded_stamps(row):
+    """The times one row carries: its own ``created_at`` and its own comments'."""
+    stamp=row.get('created_at')
+    if isinstance(stamp,str) and stamp.strip():
+        yield stamp
+    for comment in row.get('comments') or []:
+        if not isinstance(comment,dict):
+            continue
+        stamp=comment.get('created_at')
+        if isinstance(stamp,str) and stamp.strip():
+            yield stamp
+
+
+def newest_record_time(rows,task=None):
+    """The newest ``created_at`` among the records a comparison was made from.
 
     An operator reads this as "the view this write was judged against knows
     records up to T": a scope written after T cannot be in that view, which is
     how a lagging export or a later scope write becomes visible instead of
     hiding behind one fixed sentence (kittrial-5bb.289 item 1). ``None`` when no
     row carries a time; the caller prints it as unknown rather than inventing one.
+
+    Given ``task``, only that task's OWN row, its own events and their comments
+    count. A row that merely matched the operation-id substring, or the named
+    defect task, records another task's work and must not become this task's view
+    time (kittrial-5bb.289 item 4b).
     """
     stamps=[]
     for row in rows:
         if not isinstance(row,dict):
             continue
-        stamp=row.get('created_at')
-        if isinstance(stamp,str) and stamp.strip():
-            stamps.append(stamp)
+        if task is not None and not _row_belongs_to(row,task):
+            continue
+        stamps.extend(_recorded_stamps(row))
     # Native RFC3339 UTC stamps in one format sort as text; the newest is last.
     return max(stamps) if stamps else None
 
@@ -1534,7 +1568,7 @@ def _apply_fact(payload,actor,rows,run,current_scope,op_index,issues,recorded=No
             # item 1). Without the two scopes and the newest record time an
             # operator cannot tell a lagging view from a scope that moved, and a
             # fact stays unrecorded behind one fixed sentence.
-            seen=newest_record_time(rows)
+            seen=newest_record_time(rows,payload['task'])
             raise ValueError(
                 'set matching lifecycle scope before recording facts: the task\'s current scope is '
                 +scope_fields(current_scope)+', the payload names '+scope_fields(payload['scope'])

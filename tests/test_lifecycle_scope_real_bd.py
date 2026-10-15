@@ -7,9 +7,13 @@ serves for a one-fact write (kittrial-5bb.289 item 2) - the path no synthetic
 double can prove - and the refusal sentence that names both scopes and the view's
 newest record (item 1).
 
-DELIVERED WITHOUT A RUN: bd and dolt are not on the worker host's PATH, so every
-test here skipped there (``no pinned native bd (set ORCHESTRA_BD_BIN)``). Run it
-where a pinned bd 1.2.2 and dolt 2.2.0 are available.
+DELIVERED WITHOUT A RUN ON THIS HOST: bd and dolt are not on the worker host's
+PATH, so every test here skipped there (``no pinned native bd (set
+ORCHESTRA_BD_BIN)``). The reviewer ran it on their own host against a pinned bd and
+it failed at the refused send: in-process ``endpoint.execute`` RAISES the refusal as
+a ``ValueError``; only the CLI's ``main()`` wraps it in a returncode envelope. The
+refused send is wrapped in ``assertRaises`` now. Fixing a red test is not a run:
+still run this module where a pinned bd 1.2.2 and dolt 2.2.0 are available.
 """
 import json
 import subprocess
@@ -75,10 +79,12 @@ class LiveScopeRealBdTests(fixture.RealBdLabelAliasTests):
             return real(argv, **kwargs)
 
         with mock.patch.object(endpoint.subprocess, 'run', traced):
-            refused = self.send(self.fact(task, 'tested', 'passed', older, 'live-tested-old'))
+            with self.assertRaises(ValueError) as caught:
+                self.send(self.fact(task, 'tested', 'passed', older, 'live-tested-old'))
         self.assertEqual(exports, [], 'a one-fact write must not pay for a full export')
-        self.assertNotEqual(refused['returncode'], 0, refused)
-        message = (refused.get('stderr') or '') + (refused.get('stdout') or '')
+        # In-process endpoint.execute RAISES the refusal; only the CLI's main() turns
+        # it into a returncode envelope. Assert on the sentence, not on an envelope.
+        message = str(caught.exception)
         self.assertIn('set matching lifecycle scope before recording facts', message)
         self.assertIn('synthetic-new-release', message, 'the refusal must name the compared scope')
         self.assertIn('production', message, 'the refusal must name the compared scope')
