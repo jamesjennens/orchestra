@@ -91,16 +91,42 @@ counts. Events and corrections share bounded pages: retain every page through
 `next_offset`, the complete totals, and correction status/reasons. Do not treat
 one page, an omitted count or a current assignee as a complete historical audit.
 
-**Acceptance evidence before a correction campaign:** attach a dated, read-only
-production audit to the document contribution, outside this generic repository.
-Bind its exact kit source, native snapshot, protected correction/mark context,
-operator/owner-list reading, page completeness and raw evidence hashes. Break
-questionable records down by each reason and unclassifiable records by cause;
-separate unknown payload/time, unreadable review history, ambiguous review time,
-unavailable historical assignment and native events outside the lifecycle
-namespace. Give both overlapping reason counts and deduplicated event totals.
-Retain original counts beside the revised classifications below. No production
-count, audit completion or authorization to issue a VOID is asserted by this note.
+### Production audit (pending)
+
+The read-only production audit is **omitted from this docs-only revision** under
+review direction. It remains a coordinator-owned open item and is a gate before
+any VOID campaign or correction write. An operator, or a lane the owner explicitly
+approves for this production read, runs it and attaches the dated report outside
+this generic repository. No VOID or correction is written until that report is
+attached and accepted. If the owner later approves the audit here, its evidence
+can be attached as an addendum; the documentation review need not wait for it.
+
+The report must bind the exact kit source, frozen native snapshot, protected
+correction/mark context, operator/owner-list reading, complete pagination and raw
+evidence hashes. It must report:
+
+- Questionable events by each reason, including recorder neither historical
+  assignee nor eligible operator/issued mark, and reviewed/integrated facts
+  without proved standing independent approval.
+- Unclassifiable events by cause: unknown payload/time, unreadable review history,
+  ambiguous review time, unavailable historical assignment and native events
+  outside the lifecycle namespace. Reconstruct assignee **at recording time**
+  from native history where available; otherwise give the unknown cause and keep
+  today's assignee separate.
+- Both overlapping reason/cause counts and deduplicated event totals, with original
+  counts beside revised classifications. Recognise complete kit-intermediate
+  pairs exactly as specified below: list the pairs separately, exclude only those
+  intermediate rows from questionable/unclassifiable totals, and independently
+  audit the following payload fact. Retain unpaired/ambiguous cases as unknown.
+- Per-category triage and expected action, deduplicated confirmed-wrong events,
+  expected VOIDs, current correction-family usage, byte demand and worst-case
+  retraction/recovery demand. Apply the table and lifetime budget below; stop
+  before a forecast exceeds 250 retained family records pending a separately
+  validated capacity/batch change. An unknown demand is not zero.
+
+No production count, completed audit, accepted report or correction authorization
+is asserted by this revision. Document acceptance does not waive this audit gate
+or the separate authorization and verified plan required for implementation.
 
 ### Kit intermediate events are listed separately
 
@@ -506,7 +532,9 @@ Each step can be reviewed and released without the later ones. Existing A-D
 mechanisms are source observations; the new audit classifications and release
 diagnostics above remain design requirements, not claimed product fixes. This
 revision must be delivered as a **docs-only structured contribution** with the
-read-only production breakdown, seven-item response and exact immutable evidence.
+seven-item response, exact immutable evidence and the explicit pending-audit
+omission above. The production breakdown is attached and accepted before any
+VOID campaign or correction write, rather than required in this document revision.
 Document acceptance is separate from implementation planning. The known
 unreadable-hold-chain P1 remains separately owned and is not implemented here. Any new audit/reader diagnostic, E/F or
 assignment-origin implementation requires its own separately verified plan, compatibility
