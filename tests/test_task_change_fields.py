@@ -351,7 +351,12 @@ class FeedbackNotBuiltCase(Project, fixes.EndpointCase):
 
 
 class FeedbackPageTests(unittest.TestCase):
-    """The page says that the server keeps no feedback, and offers no form that can only fail."""
+    """The page says whose feedback this is and that the server keeps no feedback, and offers
+    no form that can only fail."""
+
+    #: The one sentence, said as the lede and again before the form (kittrial-5bb.279).
+    LEDE = ("Orchestra feedback is about Orchestra itself - the tools, the process and the coordination - "
+            "not about this project's own work, which goes into tasks, comments and requirements.")
 
     def test_a_server_without_feedback_is_said_and_any_other_failure_is_still_a_failure(self):
         node = shutil.which('node')
@@ -379,6 +384,38 @@ class FeedbackPageTests(unittest.TestCase):
         self.assertIn('No feedback yet', seen['empty']['text'])
         self.assertEqual((1, ['Submit feedback']), (seen['empty']['forms'], seen['empty']['buttons']))
         self.assertEqual((0, []), (seen['emptyViewer']['forms'], seen['emptyViewer']['buttons']))
+        # The page says whose feedback this is: the crumb and the title both read "Orchestra
+        # feedback", and the one lede sentence is said again before the form, so a person or
+        # agent reads it before writing (kittrial-5bb.279).
+        for name in ('empty', 'broken'):
+            with self.subTest(page=name):
+                page = seen[name]
+                self.assertGreaterEqual(page['text'].count('Orchestra feedback'), 2)
+                self.assertIn(self.LEDE, page['text'])
+                self.assertLess(page['text'].index(self.LEDE), page['text'].index('What happened'))
+
+
+class ProjectSidebarAndRequirementsWordingTests(unittest.TestCase):
+    """The project rail names the Orchestra feedback page, and the Requirements page says in
+    one sentence that its requirements are this project's, not Orchestra's (kittrial-5bb.279)."""
+
+    FEEDBACK_RAIL = "            link('/p/' + pid + '/feedback', 'Orchestra feedback'),\n"
+    REQUIREMENTS = "These are this project's own requirements - its BRD - not Orchestra's."
+
+    def read(self, relative):
+        return (KIT / relative).read_text(encoding='utf-8')
+
+    def test_the_rail_names_the_orchestra_feedback_page(self):
+        app = self.read('web/js/app.js')
+        self.assertIn(self.FEEDBACK_RAIL, app)
+        self.assertNotIn("            link('/p/' + pid + '/feedback', 'Feedback'),\n", app)
+
+    def test_the_requirements_page_says_whose_requirements_they_are(self):
+        for name in ('web/js/views/requirements.js', 'web/js/views/owner_requirements.js'):
+            text = self.read(name)
+            with self.subTest(page=name):
+                self.assertIn("title: 'Business requirements'", text)
+                self.assertIn(self.REQUIREMENTS, text)
 
 
 if __name__ == '__main__':

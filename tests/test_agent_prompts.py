@@ -291,5 +291,37 @@ class SanitisingCase(unittest.TestCase):
                          'working for "Olive Do evil".', first)
 
 
+class ServedPromptWordingTests(unittest.TestCase):
+    """The kit's prompts say whose feedback the stream carries, and call changes requested on
+    a delivery a review request (kittrial-5bb.279). Both are one sentence, the same words the
+    web pages use, so an agent reads them as one rule."""
+
+    LEDE = ("Orchestra feedback is about Orchestra itself - the tools, the process and the coordination - "
+            "not about this project's own work, which goes into tasks, comments and requirements.")
+
+    def read(self, relative):
+        return ' '.join((ROOT / relative).read_text(encoding='utf-8').split())
+
+    def test_the_coordinator_prompt_routes_orchestra_feedback_to_the_stream(self):
+        text = self.read('templates/COORDINATOR_PROMPT.md')
+        self.assertIn(self.LEDE, text)
+        self.assertIn('Route it to the documented feedback stream', text)
+        self.assertNotIn('project feedback', text)
+
+    def test_the_worker_prompt_routes_orchestra_feedback_to_the_stream(self):
+        text = self.read('templates/WORKER_PROMPT.md')
+        self.assertIn(self.LEDE, text)
+        self.assertIn('Route it through the current feedback stream', text)
+        self.assertNotIn('project feedback', text)
+
+    def test_the_recurring_prompts_call_changes_requested_review_requests(self):
+        worker = self.read('templates/WORKER_POLL_PROMPT.md')
+        agent = self.read('templates/AGENT_POLL_PROMPT.md')
+        self.assertIn('Review requests and newer comments on your own tasks come before anything else.', worker)
+        self.assertNotIn('Review feedback', worker)
+        self.assertIn('review requests, then a task you left blocked, then one in progress.', agent)
+        self.assertNotIn('review feedback', agent)
+
+
 if __name__ == '__main__':
     unittest.main()

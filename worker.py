@@ -60,7 +60,7 @@ Worker setup:
   dependency (.36); if it is missing or unclear, ask the coordinator instead of
   guessing.
 - Only when the harness explicitly permits a loop, after delivery check every N
-  minutes for review feedback on your tasks with the client `work --mine` action
+  minutes for review requests on your tasks with the client `work --mine` action
   first, then check `ready --json` for one next unheld task. Continue if one is
   available; do not stop just because the previous task was delivered. Stop at the
   deadline or, after checking both sources, when you have no actionable open or

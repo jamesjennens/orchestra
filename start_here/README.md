@@ -221,7 +221,7 @@ Keep the task open while awaiting review unless its acceptance explicitly says
 otherwise.
 
 After delivery, a loop-capable harness may continue only when the project and
-harness explicitly permit it: at the configured interval, check review feedback on
+harness explicitly permit it: at the configured interval, check review requests on
 your own tasks with the installed client's `work --mine` action first, then check
 `ready --json` for one next unheld task. Continue when a task is available; do not
 stop just because the previous task was delivered. Stop at the deadline or, after
@@ -261,9 +261,11 @@ This does **not** disable certificate verification. If the backend is unavailabl
 the verified connection still fails, use the organization's approved proxy/CA setup
 or ask its administrator. Never set `http.sslVerify=false` or bypass host-key checks.
 
-## Project feedback
+## Orchestra feedback
 
-Use the project feedback stream documented by server-served `docs operations`
+Orchestra feedback is about Orchestra itself - the tools, the process and the
+coordination - not about this project's own work, which goes into tasks, comments and
+requirements. Use the feedback stream documented by server-served `docs operations`
 (`feedback add --file` and `feedback list`) when the installed service supports it.
 If an older service lacks that action, ask the coordinator for an explicitly agreed
 interim parent/job target; do not attach feedback to an unrelated child or claim a

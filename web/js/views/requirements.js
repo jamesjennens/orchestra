@@ -72,7 +72,7 @@ export async function brd(ctx, { pid }) {
 
   return h('div', { class: 'stack' },
     pageHead({ crumbs: crumbs(ctx, project, [{ label: 'Requirements' }]), title: 'Business requirements',
-      lede: 'The current baseline, published from the project’s requirement records. This page is a reading view; requirements change through recorded revisions and owner decisions, not by editing text here.' }),
+      lede: "These are this project's own requirements - its BRD - not Orchestra's. The current baseline, published from the project’s requirement records. This page is a reading view; requirements change through recorded revisions and owner decisions, not by editing text here." }),
     b.state !== 'accepted' ? h('div', { class: 'banner' }, h('strong', null, 'Not an accepted baseline. '), 'This is a draft for review. Treat criteria as proposals until an owner records acceptance.') : null,
     baselineCard, narrative, table);
 }

@@ -190,7 +190,7 @@ export async function brd(ctx, { pid }, project, data) {
     }
   }
   return h('div', { class: 'stack' }, pageHead({ title: 'Business requirements',
-    lede: 'The current document, generated from the project’s requirement records.' }),
+    lede: "These are this project's own requirements - its BRD - not Orchestra's. The current document, generated from the project’s requirement records." }),
   h('div', { class: 'actions' }, mode, modeMessage),
   (data.governance.warnings || []).map((warning) => h('p', { class: 'banner', role: 'status' }, warning.message)),
   !simple ? h('p', { class: 'banner' }, 'This project uses governed requirements.') : null,
