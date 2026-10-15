@@ -2038,10 +2038,12 @@ def release_planned_native_writes(page,verify_only,live_verified,labels):
 
     ``release_planned_writes`` counts the planned FACTS; this counts the processes
     they become, which is what ``expected_seconds`` is priced in. It is an UPPER
-    count for a rollback or a ``--live-verified`` roll-forward: a re-lived target
-    may already be at the release scope and already live there, so the endpoint
-    writes fewer facts than a page-level estimate assumes (kittrial-5bb.139 review
-    item 3).
+    count for a ``--live-verified`` roll-forward: a re-lived target may already be
+    at the release scope and already live there, so the endpoint writes fewer facts
+    than a page-level estimate assumes (kittrial-5bb.139 review item 3). For the
+    FIRST group of a rollback it is a LOWER count instead, because the negative
+    (supersede and scope) writes ride that request on top of these planned facts
+    and the caller adds them separately (kittrial-5bb.159 review item 2).
     """
     verifying=set(verify_only)
     return sum(release_target_native_writes(item['task'],verifying,live_verified,labels)
@@ -2072,13 +2074,36 @@ def release_default_chunk(page,verify_only,live_verified,labels=None,reserved=0)
     RELEASE_CHUNK_DEFAULT group (75 writes); a release to a further environment of
     already-labelled tasks pays five per target and a ``--live-verified`` one six or
     seven, so those use a smaller group instead of telling the operator to lower a
-    size the kit itself picked. ``reserved`` is the negative (supersede) write count
-    that rides the FIRST group, so it is paid out of the same budget.
+    size the kit itself picked. ``reserved`` is the negative (supersede and scope)
+    write count that rides the FIRST group; ``release_default_groups`` is what the
+    planner calls, so only the first group pays it (kittrial-5bb.159 review item 1).
     """
     if not page:return RELEASE_CHUNK_DEFAULT
     per_target=release_page_writes_per_target(page,verify_only,live_verified,labels or {})
     available=RELEASE_GROUP_WRITE_BUDGET-reserved
     return max(1,min(RELEASE_CHUNK_DEFAULT,available//per_target))
+
+
+def release_default_groups(page,verify_only,live_verified,labels,reserved):
+    """The kit's own default groups, the FIRST one paying the reserved writes.
+
+    ``reserved`` is the negative (supersede and scope) write count that rides only
+    the FIRST request, so only the first group is sized out of the budget left
+    after it; every later group is sized out of the FULL budget again. Sizing every
+    group from the reduced budget turned a large rollback into one-target groups
+    all the way down (kittrial-5bb.159 review item 1). Each group is clamped to
+    RELEASE_CHUNK_DEFAULT and to one target at the floor. With ``reserved == 0``
+    this returns exactly
+    ``_chunks(page, release_default_chunk(page, verify_only, live_verified, labels))``.
+    """
+    if not page:return []
+    first=release_default_chunk(page,verify_only,live_verified,labels,reserved=reserved)
+    later=release_default_chunk(page,verify_only,live_verified,labels)
+    groups=[];index=0
+    while index<len(page):
+        size=max(1,first if not groups else later)
+        groups.append(page[index:index+size]);index+=size
+    return groups
 
 
 def release_group_estimate(writes):
@@ -2298,9 +2323,12 @@ def main():
             page_verify_only=sorted(set(verify_only)&{item['task'] for item in page})
             # The negative facts (task-level supersede and per-scope supersede) ride
             # only the FIRST group of the FIRST page, so they are counted in that
-            # page's estimate and paid out of that page's write budget.
+            # page's estimate and paid out of that page's write budget. A scope-level
+            # supersede costs TWO processes, not one: its target value is rewritten
+            # through `pending` first, so 45 dropped tasks is 135 processes, not the
+            # 90 a one-process-per-receipt count assumed (kittrial-5bb.159 item 2).
             negatives_here=bool(supersede or supersede_scopes) and (not a.page_size or a.page==1)
-            negative_writes=(len(supersede)+len(supersede_scopes)) if negatives_here else 0
+            negative_writes=(len(supersede)+2*len(supersede_scopes)) if negatives_here else 0
             # The native label state from the same export: `_apply_fact` pays an
             # extra process for a fact the task already carries, so the estimate and
             # the derived group size count processes, not planned facts
@@ -2309,11 +2337,21 @@ def main():
                     if row.get('issue_type')!='event' and isinstance(row.get('id'),str)}
             explicit_chunk=a.chunk_size is not None
             per_target=release_page_writes_per_target(page,page_verify_only,data['live_verified'],labels)
-            chunk_size=(a.chunk_size if explicit_chunk
-                        else release_default_chunk(page,page_verify_only,data['live_verified'],labels,
-                                                   reserved=negative_writes))
-            chunk_size=max(1,min(int(chunk_size),RELEASE_TARGETS_MAX))
-            chunks=_chunks(page,chunk_size)
+            if explicit_chunk:
+                # An explicit --chunk-size is the caller's choice: one size for the
+                # whole page, still clamped to the wire bound.
+                chunk_size=max(1,min(int(a.chunk_size),RELEASE_TARGETS_MAX))
+                chunks=_chunks(page,chunk_size)
+            else:
+                # The kit's own default: only the FIRST group pays the reserved
+                # negative writes, so only it is sized from the reduced budget and
+                # every later group keeps the plain derived size (kittrial-5bb.159
+                # review item 1).
+                chunk_size=max(1,min(release_default_chunk(page,page_verify_only,
+                                                           data['live_verified'],labels),
+                                     RELEASE_TARGETS_MAX))
+                chunks=release_default_groups(page,page_verify_only,data['live_verified'],
+                                              labels,negative_writes)
             # The kit derives its own default group from the native-write budget, so
             # it no longer warns the operator to lower a size the kit picked; say why
             # the group is smaller than the historical default when it is
@@ -2331,10 +2369,25 @@ def main():
                         +(negative_writes if index==0 else 0))
                 group_estimates.append(release_group_estimate(writes))
             if max(group_estimates or [0.0])>RELEASE_CLIENT_TIMEOUT_SECONDS:
-                warnings.append('expected_seconds estimates %s s for one group of %d target(s), above the '
-                                'client timeout of %s s; lower --chunk-size so no single request can time '
-                                'out (kittrial-5bb.119 review item 3)'
-                                %(max(group_estimates),chunk_size,RELEASE_CLIENT_TIMEOUT_SECONDS))
+                if not explicit_chunk and negative_writes>RELEASE_GROUP_WRITE_BUDGET:
+                    # The reserved writes alone pass the budget, so no group size can
+                    # bring the first request inside the timeout: a group of one
+                    # target is the floor and this request cannot be split below it.
+                    # Advising a smaller --chunk-size here would be advice the
+                    # operator cannot follow (kittrial-5bb.159 review item 1).
+                    warnings.append('the supersede/scope writes alone are %d native bd process(es) '
+                                    '(%s s), above the client write budget of %d (%s s); the first '
+                                    'request carries them on top of its targets and cannot be split '
+                                    'below one target, so it will exceed the client timeout '
+                                    '(kittrial-5bb.159 review item 1)'
+                                    %(negative_writes,release_group_estimate(negative_writes),
+                                      RELEASE_GROUP_WRITE_BUDGET,
+                                      release_group_estimate(RELEASE_GROUP_WRITE_BUDGET)))
+                else:
+                    warnings.append('expected_seconds estimates %s s for one group of %d target(s), above the '
+                                    'client timeout of %s s; lower --chunk-size so no single request can time '
+                                    'out (kittrial-5bb.119 review item 3)'
+                                    %(max(group_estimates),chunk_size,RELEASE_CLIENT_TIMEOUT_SECONDS))
             # The supersede list rides the first group payload, so a rollback or a
             # hotfix deploy that drops tasks is one logical operation beside the rest
             # of the release. The field is only present when it is non-empty, so a
@@ -2362,11 +2415,14 @@ def main():
                     'chunks':[len(chunk) for chunk in chunks],'total_chunks':len(chunks),
                     'chunk_size':chunk_size,
                     # `planned_writes` and `planned_state_changes` are exact for a
-                    # plain release, but an UPPER count for a rollback or a
-                    # --live-verified roll-forward: a re-lived target may already be
-                    # at the release scope and already live there, so the endpoint
-                    # writes fewer facts than this page-level estimate assumes. The
-                    # error is on the safe side (kittrial-5bb.139 review item 3).
+                    # plain release, and an UPPER count for a --live-verified
+                    # roll-forward: a re-lived target may already be at the release
+                    # scope and already live there, so the endpoint writes fewer
+                    # facts than this page-level estimate assumes. For a rollback the
+                    # page-level planned-fact part is still an upper count, but the
+                    # FIRST group's total is a LOWER one: the negative writes added
+                    # here ride that one request on top of the planned facts
+                    # (kittrial-5bb.139 review item 3; kittrial-5bb.159 review item 2).
                     'planned_writes':release_planned_writes(page,page_verify_only,data['live_verified'])
                                      +negative_writes,
                     'planned_state_changes':
