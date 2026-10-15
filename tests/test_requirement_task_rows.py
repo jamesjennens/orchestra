@@ -125,7 +125,21 @@ class TasksListMarkerTests(AgentHarness):
         self.assertNotIn('Claim', next_action(epic)['text'])
         accept = {'id': 'd1', 'issue_type': 'decision', 'status': 'open', 'assignee': None,
                   'review_state': 'none', 'labels': ['owner-requirement-decision:x']}
-        self.assertNotIn('Claim this task', next_action(accept)['text'])
+        accept_action = next_action(accept)
+        self.assertEqual('owner', accept_action['who'])
+        self.assertNotIn('Claim this task', accept_action['text'])
+        # Third review, item 2: the "Accept requirement" row said only what it is NOT.
+        # It now says what it is and points at the page it is resolved from, the same
+        # page a requirement row points at.
+        self.assertIn('Requirement decision', accept_action['text'])
+        self.assertIn("project's Requirements page", accept_action['text'])
+        # A decision row that is not a requirement acceptance still gets a sentence
+        # about what the row is, never the claim sentence.
+        other = {'id': 'd2', 'issue_type': 'decision', 'status': 'open', 'assignee': None,
+                 'review_state': 'none', 'labels': []}
+        self.assertEqual('owner', next_action(other)['who'])
+        self.assertNotIn('Claim this task', next_action(other)['text'])
+        self.assertIn('decision record', next_action(other)['text'])
         ordinary = {'id': 'o1', 'issue_type': 'task', 'status': 'open', 'assignee': None,
                     'review_state': 'none', 'labels': []}
         self.assertEqual({'who': 'anyone', 'text': 'Claim this task'}, next_action(ordinary))

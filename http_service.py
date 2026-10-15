@@ -3356,6 +3356,14 @@ def _canonical_payload(stdout):
     raise uncertain('Canonical command returned unparsable data; outcome may be unknown')
 
 
+#: The label prefix ``requirement_http.py`` puts on the owner's "Accept requirement"
+#: decision row (``owner-requirement-decision:<content hash>``, created with
+#: ``--type decision`` when the signed-in owner accepts a requirement's exact content
+#: in simple mode). ``next_action`` points that row at the Requirements page it is
+#: resolved from (kittrial-5bb.277 third review).
+REQUIREMENT_DECISION_LABEL = 'owner-requirement-decision:'
+
+
 def next_action(task):
     """Who acts next on a task, derived only from its status, assignee and review state."""
     state = task.get('review_state')
@@ -3392,6 +3400,18 @@ def next_action(task):
                     'text': "Requirement record: edit it on the project's Requirements page"}
         if str(task.get('issue_type') or 'task') == 'epic':
             return {'who': 'owner', 'text': 'This is an epic, not a unit of work: work its tasks'}
+        if any(isinstance(label, str) and label.startswith(REQUIREMENT_DECISION_LABEL)
+               for label in (task.get('labels') or ())):
+            # The owner's "Accept requirement" row is a decision record made from the
+            # project's Requirements page. Name where it is resolved instead of only
+            # saying what it is not (kittrial-5bb.277 third review). The sentence is
+            # deliberately about the row and its page, not about who acted: the label
+            # alone does not evidence an actor, and a real-bd test writes a decoy
+            # decision row carrying it (tests/test_requirement_owner_real_bd.py).
+            return {'who': 'owner',
+                    'text': "Requirement decision: resolve it on the project's Requirements page"}
+        if str(task.get('issue_type') or 'task') == 'decision':
+            return {'who': 'owner', 'text': 'This is a decision record, not a unit of work'}
         return {'who': 'owner', 'text': 'This row is not offered as claimable work'}
     return {'who': 'anyone', 'text': 'Claim this task'}
 

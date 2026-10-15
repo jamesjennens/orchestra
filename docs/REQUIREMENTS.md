@@ -211,6 +211,14 @@ names the label, says it is not a unit of work, and points at the project's
 Requirements page, `requirement_records.py draft|revise` and
 `admin.py requirement-apply`.
 
+A row's `next_action` follows that same `claimable` predicate: the last sentence,
+the claim offer, is only produced for a row the queue would offer, so an ordinary
+open unassigned task still reads "Claim this task" while a requirement record, an
+epic, a **decision** row (including the owner's `Accept requirement` row, which now
+points at the project's Requirements page) and a **gate** or job row no longer do
+(kittrial-5bb.277 third review, item 2). The web task page offers its Claim button
+on the same condition, so the page and the sentence cannot disagree.
+
 What the HTTP claim route refuses is its own claim, and only that. An **explicit host
 claim by a coordinator still works**: the endpoint (`bd update ID --claim`, the SSH
 and `client.py` path) deliberately keeps taking a requirement row, and `bd ready`

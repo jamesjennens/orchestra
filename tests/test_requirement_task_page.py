@@ -32,8 +32,13 @@ class RequirementTasksPageTests(unittest.TestCase):
 
         # The default view: the ordinary task is there, the requirement row is not, and
         # the page says one was left out rather than reading as if there were no work.
-        self.assertIn('An ordinary task', seen['defaultRows'])
-        self.assertNotIn('A requirement record', seen['defaultRows'])
+        # Each element of `defaultRows` is ONE ROW'S WHOLE TEXT (title + id + status +
+        # next action), so the title is matched as a substring of a row, never as a list
+        # element: the list-membership form could never pass and was the assertion that
+        # failed CI on all four jobs (kittrial-5bb.277 third review, item 2).
+        default_rows = seen['defaultRows']
+        self.assertTrue(any('An ordinary task' in row for row in default_rows), default_rows)
+        self.assertFalse(any('A requirement record' in row for row in default_rows), default_rows)
         self.assertFalse(seen['defaultHasRequirement'])
         self.assertEqual(1, len(seen['defaultLeftOutNote']))
         self.assertIn('1 requirement record is not shown here', seen['defaultLeftOutNote'][0])
