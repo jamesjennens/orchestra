@@ -402,6 +402,7 @@ def fingerprint(body):
     return 'SHA256:' + base64.b64encode(hashlib.sha256(base64.b64decode(body)).digest()).decode().rstrip('=')
 
 
+@unittest.skipIf(os.name == 'nt', 'the authorized-keys listing is a POSIX-host feature and its fixtures write\n             the temporary folder as the key line\'s --root and wrapper paths, which key-line text judges as POSIX\n             sshd syntax (posixpath does not read C:/ or D:\\ as absolute). kittrial-5bb.269 r2: line_path() let\n             this class run on Windows and CI went red (run 38727896986, 12 tests); a skipped test where the\n             feature cannot run is right, a red job is not. The POSIX runs are unchanged.')
 class ListingTests(unittest.TestCase):
     """kittrial-5bb.269 item 7: the fixtures write the key line as POSIX text through
     ``line_path`` (a POSIX-looking root and wrapper path IN THE LINE, with the real files
