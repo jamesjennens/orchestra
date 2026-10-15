@@ -267,6 +267,8 @@ export function createApi(transport) {
     // (kittrial-5bb.208). The page sends a list only from "What it may do" on the agent's card.
     issueAgentCredential: (aid, scopes) => mutate('POST', `/v1/agents/${aid}/credentials`, scopes ? { label: 'web: new secret', scopes } : { label: 'web: new secret' }),
     revokeAgentCredential: (aid, cid) => mutate('POST', `/v1/agents/${aid}/credentials/${cid}/revoke`, {}),
+    extendAgentCredential: (aid, cid) => mutate('POST', `/v1/agents/${aid}/credentials/${cid}/extend`, {}),
+    extendProjectAgentCredential: (pid, aid, cid) => mutate('POST', `/v1/projects/${pid}/agents/${aid}/credentials/${cid}/extend`, {}),
     // requirement proposals (identity is the session's; the submitter is never sent)
     proposals: (pid, params) => call('GET', `/v1/projects/${pid}/proposals`, { params }),
     proposal: (pid, key) => call('GET', `/v1/projects/${pid}/proposals/${key}`, { params: { history: 50 } }),

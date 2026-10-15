@@ -4,6 +4,7 @@
 import { h, time, toast, copyText, copyButton, confirmDialog } from '../dom.js';
 import { pageHead, empty, field, setFieldError, formValues, act, errorState } from '../ui.js';
 import * as setupText from '../agentSetup.js';
+import { expiryLine, extensionButton } from '../credentialLifetime.js';
 
 export const ATTENTION = {
   feedback: ['Has feedback to act on', 'warn'],
@@ -113,6 +114,9 @@ export function agentCard(ctx, raw, { compact = false } = {}) {
         h('span', { class: 'small prompt' }, resumePrompt(agent)),
         h('button', { type: 'button', class: 'ghost', 'aria-label': 'Copy the resume prompt', onclick: () => copy(resumePrompt(agent), 'Resume prompt') }, 'Copy')),
       compact ? null : h('p', { class: 'small muted resume-hint' }, 'Needs .orchestra/agent.json in the folder; use Set up folder first.')),
+    raw.created_by && raw.created_by !== raw.owner ? h('p', { class: 'small muted', 'data-created-by': raw.created_by },
+      'Created by ', raw.created_by_display_name || raw.created_by, '. That superuser saw the first secret. Issue a new secret if this matters to you.') : null,
+    credentialsOf(raw).some((c) => c.expires_soon && works(c)) ? h('div', { class: 'banner warn', role: 'status' }, 'A credential expires within seven days. Extend it under What it may do; its existing secret keeps working.') : null,
     compact ? null : scopesLine(raw),
     manages(ctx, raw) ? h('div', { class: 'copy-row' },
       h('button', { type: 'button', 'aria-label': 'Set up the folder for ' + agent.display_name, onclick: (event) => reopenSetup(ctx, raw.id, event.currentTarget) }, 'Set up folder')) : null,
@@ -197,6 +201,9 @@ export async function list(ctx) {
         h('span', null, c.label || c.id, ' ', h('span', { class: 'small muted' }, 'issued ', time(c.created_at), ' · allows ', scopeNames(c.scopes))),
         working ? (other.includes(c) ? h('span', { class: 'chip warn' }, known ? 'Allows something else' : 'Differs') : h('span', { class: 'chip ok' }, 'Works')) :
           h('span', { class: 'chip plain' }, c.revoked ? 'Revoked' : 'Expired'));
+      row.append(expiryLine(c));
+      if (working && agent.enabled !== false) row.append(extensionButton(
+        agent, c, () => ctx.api.extendAgentCredential(agent.id, c.id), load));
       if (working && agent.enabled !== false) row.append(h('button', { type: 'button', class: 'danger', 'aria-label': 'Revoke credential ' + (c.label || c.id), onclick: async (event) => {
         if (!(await confirmDialog({ title: 'Revoke this credential?', body: 'Anything still using its secret stops working immediately.', confirmLabel: 'Revoke', danger: true }))) return;
         try { await act(event.currentTarget, () => ctx.api.revokeAgentCredential(agent.id, c.id), { success: 'Credential revoked' }); } catch { return; }
@@ -243,7 +250,17 @@ export async function list(ctx) {
     return ctx.projects.filter((p) => !p.archived && ['owner', 'coordinator', 'contributor', 'superuser'].includes(p.role));
   }
   const projects = grantable();
+  let accounts = [];
+  let accountError = null;
+  if (ctx.me && ctx.me.superuser) {
+    try { accounts = (await ctx.api.accounts()).items.filter((u) => !u.disabled); } catch (error) { accountError = error; }
+  }
+  const ownerField = ctx.me && ctx.me.superuser ? field({ id: 'a-owner', type: 'select', label: 'Account that owns this agent', value: ctx.me.id,
+    options: accounts.length ? accounts.map((u) => [u.id, (u.display_name || u.username || u.id) + (u.id === ctx.me.id ? ' (you)' : '')]) : [[ctx.me.id, 'Your account']],
+    hint: 'A superuser may create for another account. You see its first secret; that account can issue a new one. Projects must be available to that account.' }) : null;
   const form = h('form', { class: 'form', novalidate: true },
+    ownerField,
+    accountError ? h('p', { class: 'banner', role: 'status' }, 'Could not load other accounts. Reload this page to choose another account; your draft stays here until creation succeeds.') : null,
     h('div', { class: 'form-row' },
       field({ id: 'a-name', label: 'Agent name', hint: 'How colleagues will see it, e.g. “Kestrel”.', required: true, maxlength: 40 }),
       field({ id: 'a-tool', label: 'Runs in', value: 'GitHub Copilot in VS Code' })),
@@ -251,7 +268,7 @@ export async function list(ctx) {
     h('fieldset', { class: 'checks' }, h('legend', null, 'Projects it can work on'),
       projects.length ? projects.map((p) => h('label', { class: 'check', for: 'ap-' + p.id }, h('input', { type: 'checkbox', id: 'ap-' + p.id, name: 'project', value: p.id }), p.name)) :
         h('p', { class: 'small muted' }, 'You need contributor access to a project first.'),
-      h('p', { class: 'small muted' }, 'It works as a contributor and can never do more than you can in that project.')),
+      h('p', { class: 'small muted' }, 'It works as a contributor and can never do more than its owning account can in that project.')),
     h('div', null, h('button', { type: 'submit', class: 'primary' }, 'Add agent')));
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
@@ -262,7 +279,7 @@ export async function list(ctx) {
     const chosen = [...form.querySelectorAll('input[name=project]:checked')].map((i) => i.value);
     // A name whose secret file would clash with another of your agents (409), or an
     // invalid name (422), is explained next to the name field in the server's words.
-    const created = await act(form.querySelector('button[type=submit]'), () => ctx.api.createAgent({ name, tool: v['a-tool'].trim(), working_directory: v['a-dir'].trim(), projects: chosen }), {
+    const created = await act(form.querySelector('button[type=submit]'), () => ctx.api.createAgent({ name, tool: v['a-tool'].trim(), working_directory: v['a-dir'].trim(), projects: chosen, ...(ownerField ? { owner: v['a-owner'] } : {}) }), {
       success: 'Agent added',
       onError: (e) => { if (e.status === 409 || e.status === 422) { setFieldError(form, 'a-name', e.message); return true; } return false; },
     }).catch(() => null);
