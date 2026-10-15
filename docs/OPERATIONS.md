@@ -501,7 +501,9 @@ and prints, for every line: its number, the key's type, fingerprint (as `ssh-key
 prints it) and comment, and its `kind`: `unrestricted` (no `command=`: the account's
 shell, outside every rule of the kit), `confined` (the kit's forced command, any project),
 `bound` (with its `projects`), `other-command` (a `command=` that is not the kit's
-wrapper; said, not judged) or `unreadable`. For the kit's lines it also prints `other_kit`
+wrapper; said, not judged), `over-long` (a `command=` longer than
+`AUTHORIZED_KEY_COMMAND_MAX` characters, whose tokens this listing did not read: it is
+served as printed) or `unreadable`. For the kit's lines it also prints `other_kit`
 (the wrapper or the endpoint the line names is not the installed kit's file: after an
 upgrade of an office installation, a line that names `releases/<ID>` keeps running that
 release), `names_release` (it is the installed kit today but names its release folder, so
@@ -717,10 +719,14 @@ program (a shell included: `/bin/sh -s WRAPPER ...` runs what stdin says, on and
 listed as refused although that program still runs. The interpreter's NAME is otherwise not
 judged: the preview trusts the first word to be the interpreter the kit printed. The command must need no shell at all
 (a whitelist of plain ASCII characters: letters, digits, `-_.+/=,:` and space - a tab or a
-non-ASCII letter is shell), name the wrapper by an absolute path of at most 512 bytes, carry
-an absolute `--root` serving this root, and the whole `command=` is at most
-`AUTHORIZED_KEY_COMMAND_MAX` (8192) bytes - judged at that length before any token work,
-because Python 3.10's `shlex` is quadratic in one long word. Group one means **not
+non-ASCII letter is shell), name the wrapper by an absolute path of at most 512 characters,
+carry an absolute `--root` serving this root, and the whole `command=` is at most
+`AUTHORIZED_KEY_COMMAND_MAX` (8192) characters - judged at that length before any token work,
+because Python 3.10's `shlex` is quadratic in one long word. Neither this kit nor the wrapper
+bounds how many `--project` flags a line may carry, so a line the kit printed with very many
+projects can be longer than that bound: it is read as `over-long` (group two), its tokens are
+not read, and the wrapper serves it as printed - it is neither refused nor cut off unnamed.
+Group one means **not
 served once on**, not served today: a wrapper file that is not executable, a relative
 `--endpoint` or an ill-formed project name serve nothing now and are still group one, said
 as refused for another reason - and a BOUND line refused for one of those reasons is group
@@ -729,8 +735,10 @@ does not exist is served exactly as a bound line and is in no group. Parsing as 
 the ordinary group-one case; refused-before-the-setting is the other.
 **may be refused** - every OTHER line that has a `command=` at all:
 any other wrapper or root, shell syntax (`cd KIT && ...`, `2>/dev/null`, `; true`, `&`, `#`, a
-glob, an assignment, `/bin/sh -c`, quotes), a relative or `$HOME` path, and lines that run
-another program - not decided here, with whether the wrapper file names the setting said as a
+glob, an assignment, `/bin/sh -c`, quotes), a relative or `$HOME` path, a `command=` longer
+than `AUTHORIZED_KEY_COMMAND_MAX` characters (whose tokens the listing did not read - an
+`over-long` line), and lines that run another program - not decided here, with whether the
+wrapper file names the setting said as a
 HINT (the kit opens the file first and judges the open descriptor - a fifo is opened
 non-blocking and never read, a symlink is not followed - and reads up to 64 KiB of it, one
 listing per command, so once per file per `status` and per `on`; a word in a file is a hint,

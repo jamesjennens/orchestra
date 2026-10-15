@@ -1170,9 +1170,12 @@ WOULD_BE_REFUSED_NAMED_MAX=20
 #: The file is the account's, but it is read on every `status`/`on`; a huge one must not be
 #: read whole, and the report says when the tail was not inspected.
 AUTHORIZED_KEYS_MAX_BYTES=1024*1024
-#: The most command= text a key line may carry and still be judged (kittrial-5bb.265 r2):
-#: no printed line comes near it, and Python 3.10's shlex is quadratic in one long word,
-#: so an over-long command is group two at the length alone, before any token work.
+#: The most command= text a key line may carry and still be judged (kittrial-5bb.265 r2), in
+#: characters: a longer command is group two at the length alone, before any token work,
+#: because Python 3.10's shlex is quadratic in one long word. There is NO bound - in this kit
+#: or in the wrapper - on how many --project flags a line may carry, so a line the kit printed
+#: with very many projects goes past this bound and reads as `over-long`: this listing did not
+#: read its tokens, while the wrapper still serves the line as printed (kittrial-5bb.269 item 6).
 AUTHORIZED_KEY_COMMAND_MAX=8192
 #: The most of one audit field (`actor`, `at`) a warning prints (kittrial-5bb.196 review,
 #: item 6): a hand-edited entry must not put escape sequences or 200 kB on the terminal.
@@ -6906,8 +6909,9 @@ def key_line(line,root,kit):
 
     Read only. ``kind`` is ``bound`` (this kit's forced command with projects), ``confined``
     (the forced command with none: any project), ``unrestricted`` (no command: the account's
-    shell), ``other-command`` (a command that is not the kit's wrapper; said, not judged) or
-    ``unreadable``.
+    shell), ``other-command`` (a command that is not the kit's wrapper; said, not judged),
+    ``over-long`` (a ``command=`` longer than ``AUTHORIZED_KEY_COMMAND_MAX`` characters, whose
+    tokens were not read at all; the wrapper serves it as printed) or ``unreadable``.
     """
     import shlex
     text=line.strip()
@@ -6941,10 +6945,13 @@ def key_line(line,root,kit):
     # kittrial-5bb.265 r2 item 2: a bound on the RAW COMMAND TEXT, before shlex - Python
     # 3.10's shlex.split is quadratic in one long word (400,000 characters: 5.8 s alone),
     # so a 1 MB line of 200,000 path components cost ~40 s before any of the kit's own
-    # code ran. No line the kit prints comes near this bound; a longer command is group
-    # two at once (it cannot be the printed shape), and no token work happens on it.
+    # code ran. A longer command is group two at once and no token work happens on it.
+    # kittrial-5bb.269 item 4: it has its OWN kind, not `other-command` - a line the kit
+    # printed with very many projects IS this kit's wrapper, and this kit and the wrapper put
+    # no bound on how many --project flags a line may carry, so such a line is served as
+    # printed; the listing only did not read its tokens (item 6).
     if len(command) > AUTHORIZED_KEY_COMMAND_MAX:
-        entry['kind']='other-command'                    # group two: not the printed shape
+        entry['kind']='over-long'                        # group two: not judged at all
         entry['needs_shell'] = False
         entry['relative_path'] = True
         entry['foreign_invocation'] = True
@@ -7130,8 +7137,10 @@ def authorized_keys_listing(root,file=None):
                or entry.get('project_repeated')
                # kittrial-5bb.218 finding 1: the lines OUTSIDE every rule of the kit belong
                # beside the stale-kit lines - an operator who reads only attention must see
-               # them too, or the stale lines are all that is seen.
-               or entry['kind'] in ('unrestricted','other-command')
+               # them too, or the stale lines are all that is seen. kittrial-5bb.269 item 4:
+               # an `over-long` line is here too - its tokens were not read, so it may be
+               # another program OR this kit's wrapper, and it must not pass unseen.
+               or entry['kind'] in ('unrestricted','other-command','over-long')
                or entry.get('other_root')
                or (entry['kind'] in ('bound','confined') and not entry['confined_options'])]
     # The installation setting that accepts bound keys only (kittrial-5bb.196, slice 4). While
@@ -7222,7 +7231,7 @@ def authorized_keys_listing(root,file=None):
         the wrapper checks the form of a project name, not whether the project exists, so a
         WELL-FORMED unknown project (removed, or not yet created) serves exactly as a bound
         line and is in no group: unknown_projects holds both kinds, and only the ill-formed
-        kind refuses before the setting. The form is [a-z][a-z9]{1,23}-shaped lowercase,
+        kind refuses before the setting. The form is [a-z][a-z0-9]{1,23}-shaped lowercase,
         matching the wrapper's own check.
         """
         import re as _re
@@ -7251,7 +7260,7 @@ def authorized_keys_listing(root,file=None):
     # cut off unnamed. Only a line with no command= is outside the groups.
     decided={entry['line'] for entry in lines if _setting_decided(entry)}
     may_be_refused=sorted({entry['line'] for entry in lines
-                           if ('wrapper' in entry or entry.get('kind')=='other-command')
+                           if ('wrapper' in entry or entry.get('kind') in ('other-command','over-long'))
                            and entry['line'] not in decided})
     would_be_refused_total=len(would_be_refused)
     would_be_refused=would_be_refused[:WOULD_BE_REFUSED_NAMED_MAX]
@@ -7264,6 +7273,14 @@ def authorized_keys_listing(root,file=None):
                    for number in may_be_refused if by_line[number].get('wrapper')}
     refused_for_another_reason=[number for number in would_be_refused
                                 if _refused_before_the_setting(by_line[number])]
+    # kittrial-5bb.269 items 1 and 2: the refused set has TWO causes, and each sentence names
+    # only the lines of the cause it states. `lacks` is the ordinary group-one line that names
+    # no project or no principal; `refused_for_another_reason` is a line the wrapper refuses
+    # before it ever reads the setting (a relative --endpoint, an ill-formed project name, a
+    # binding named twice, an unknown argument). A BOUND line with a relative --endpoint lacks
+    # neither, and an ordinary unbound line is not refused for another reason. A line beyond
+    # the named cap has no cause read here, so `more_text` counts the sentence's tail.
+    lacks=[number for number in would_be_refused if number not in refused_for_another_reason]
     refused=would_be_refused if setting else []
     attention=sorted(set(attention+refused))
     notes=['unrestricted: the key has this account\'s shell and is outside every rule of the kit, on every project.',
@@ -7297,6 +7314,7 @@ def authorized_keys_listing(root,file=None):
         reasons=[]
         unrestricted=[e['line'] for e in lines if e['kind']=='unrestricted']
         other_command=[e['line'] for e in lines if e['kind']=='other-command']
+        over_long=[e['line'] for e in lines if e['kind']=='over-long']
         no_restrict=[e['line'] for e in lines
                      if e['kind'] in ('bound','confined') and not e['confined_options']]
         other_root=[e['line'] for e in lines if e.get('other_root')]
@@ -7308,6 +7326,15 @@ def authorized_keys_listing(root,file=None):
             reasons.append('%s: a command that is another program or a shell, not this kit\'s wrapper - '
                            'outside every rule of this kit (judged by what runs, not by its '
                            'text).'%_named(other_command))
+        if over_long:
+            # kittrial-5bb.269 items 4 and 6: this is NOT "another program" - the tokens were
+            # not read, so it may be this kit's wrapper with a very long project list, which
+            # the wrapper serves as printed. Nothing bounds the number of --project flags.
+            reasons.append('%s: a command longer than %d characters, so this listing did not read its '
+                           'tokens (no shell is run and no --project path is judged here); the wrapper serves '
+                           'it as printed. Neither this kit nor the wrapper bounds how many --project flags '
+                           'a line may carry, so a line the kit printed with very many projects can be this '
+                           'long and still be served.'%(_named(over_long), AUTHORIZED_KEY_COMMAND_MAX))
         if no_restrict:
             reasons.append('%s: this kit\'s command WITHOUT restrict or the no-forwarding options - '
                            'port forwarding and a pty stay open to that key, which is what the kit '
@@ -7323,25 +7350,36 @@ def authorized_keys_listing(root,file=None):
         return _may_sentence_for(numbers, more)
     more_text=' and %d more'%would_be_refused_more if would_be_refused_more else ''
     if setting:
-        cause=('that lacks a project or a principal' if refused == [n for n in refused
-                if not _refused_before_the_setting(by_line.get(n, {}))]
-               else 'that the wrapper refuses for another reason' if refused
-               else 'that lacks a project or a principal')
+        # Each cause is stated with ITS OWN line numbers (kittrial-5bb.269 item 2): an
+        # ordinary unbound line must not be named as refused "for another reason" just
+        # because some other line is, and a bound line refused for another reason must not
+        # be named as lacking a project or a principal.
+        said=[text for numbers,text in
+              ((lacks,'%s that lack%s a project or a principal'
+                      %(_named(lacks),'s' if len(lacks)==1 else '')),
+               (refused_for_another_reason,'%s that the wrapper refuses for another reason'
+                      %_named(refused_for_another_reason))) if numbers]
         notes.append('bound_keys_only: this installation accepts bound keys only, so the forced command refuses '
-                     'a line of this kit and this root %s%s. Print each such '
-                     'line again with authorized-keys --project ... --principal ... and replace it. %s.'
-                     %(cause,
-                       ' (%s%s)'%(_named(refused),more_text) if refused else ' (no line here is such a line)',
+                     '%s%s. Print each such line again with authorized-keys --project ... --principal ... and '
+                     'replace it. %s.'
+                     %(' and '.join(said) if said else 'no line of this kit and this root',
+                       more_text if said else '',
                        _may_sentence(may_be_refused, may_be_refused_more)))
     else:
         # The preview before `on` (kittrial-5bb.196 review, item 4c): with the setting off nothing
         # is refused, but the operator must see what turning it on would cut off, all at once.
+        # Only the lines that LACK a project or a principal are named in this sentence; a line
+        # the wrapper refuses for another reason is named by the sentence below, with its own
+        # numbers (kittrial-5bb.269 item 1: a bound line with a relative --endpoint lacks
+        # neither, so this sentence must not claim it does).
+        lacking=('%s that lack%s a project or a principal'%(_named(lacks),
+                                                            's' if len(lacks)==1 else '')) if lacks \
+                else 'no line of this kit and this root that lacks a project or a principal'
         notes.append('would_be_refused: the setting is off, so nothing is refused today; `admin.py '
-                     'bound-keys-only on --actor OPERATOR` would refuse the line(s) of this kit and this root '
-                     'that lack a project or a principal%s. Print each such line again with authorized-keys '
-                     '--project ... --principal ... and replace it before turning the setting on. %s.'
-                     %(' (%s%s)'%(_named(would_be_refused),more_text) if would_be_refused
-                       else ' (no line here is such a line)',
+                     'bound-keys-only on --actor OPERATOR` would refuse %s%s. Print each such line again with '
+                     'authorized-keys --project ... --principal ... and replace it before turning the setting '
+                     'on. %s.'
+                     %(lacking, more_text if lacks else '',
                        _may_sentence(may_be_refused, may_be_refused_more)))
     if refused_for_another_reason:
         # Named because `on` would still not serve them, but the SETTING is not the reason: the
