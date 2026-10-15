@@ -19,6 +19,7 @@ if sys.version_info < (3, 10):
                      % (sys.version_info[0], sys.version_info[1], sys.version_info[2], sys.executable))
     sys.exit(2)
 import argparse
+import difflib
 import fcntl
 import json
 import os
@@ -1663,7 +1664,10 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
     if action!='bd':raise ValueError('Unknown action')
     args=request.get('args',[])
     if not isinstance(args,list) or not args or any(not isinstance(a,str) or '\0' in a for a in args):raise ValueError('Expected argument list')
-    if args[0] not in ALLOWED:raise ValueError('Command is outside the contributor interface; use admin.py for setup/maintenance')
+    if args[0] not in ALLOWED:
+        # Refused as always - only the ANSWER changed (kittrial-5bb.283): the old one pointed a
+        # worker at the installation operator's own host tool and gave it no commands at all.
+        outside_contributor_interface(args[0])
     if args[:2]==['comments','list']:
         # The native tool answers this with its whole usage text (kittrial-5bb.97).
         raise ValueError('There is no `comments list`. Use `comments TASK` to list the comments of a task, and '
@@ -1777,6 +1781,123 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             return guarded_write(root,request,journal_path(path),bd_effect,
                                authority_config=authority_config,
                                require_authority=require_authority,runner=runner)
+
+# --- the commands a contributor may run (kittrial-5bb.283) --------------------------------
+# This is a COPY of the table in client.py, kept byte-for-byte equal by tests/test_endpoint_help.py:
+# a worker is handed client.py on its own, so that file cannot import this module, and this module
+# runs on the office host and must not import the client. `help` does not normally reach here - the
+# client answers it without the server - so this copy is what an older client and a direct caller
+# get. The refusal below used to point a worker at the installation operator's own host tool.
+
+#: The commands a contributor may run, one line each (kittrial-5bb.283): ``client.py help`` prints
+#: this, an unknown command is answered with it, and this module's refusal repeats it. The header
+#: above says why the table is copied here rather than imported.
+CONTRIBUTOR_COMMANDS = (
+    ('brief TASK', 'the compact read of one task: its state, its newer activity, its checkpoint'),
+    ('history TASK', "the task's comments and review records, newest first"),
+    ('checkpoint TASK --file FILE', 'record where you are on a task, for the next run'),
+    ('work', 'the tasks whose move is yours, and the ones you may claim'),
+    ('ready', 'the tasks nobody holds that you may claim'),
+    ('session register|resume|end', 'the actor session the endpoint keeps for you'),
+    ('review TASK --file FILE', 'contribute a delivery, answer review items, or record a review'),
+    ('handoff ...', 'hand a task to another actor, and read what the endpoint reconciled'),
+    ('guidance get|ack', 'the worker guidance in force, and the acknowledgement of a version'),
+    ('onboard', 'what a new worker is told about this project'),
+    ('docs NAME', 'a kit document; read `docs start` and `docs worker-guide` first'),
+    ('feedback add|list|correct', 'Orchestra feedback - about Orchestra itself, not about the project'),
+    ('requirement ...', 'requirement records (the project owns these)'),
+    ('requirements ...', 'requirement reads and owner answers'),
+    ('ref ...', 'reference records'),
+    ('capability ...', 'capability records: find, get, list, propose, revise, verify'),
+    ('proposal ...', 'proposal records and their review'),
+    ('coordinator ...', 'the coordinator reads for this project'),
+    ('refresh', 'refresh the cached export the reads are answered from'),
+    ('view [NAME]', 'render one of the project views'),
+    ('list', 'the tasks of the project'),
+    ('show TASK', 'one task as the tracker holds it'),
+    ('search TEXT', 'the tasks matching a search'),
+    ('count', 'how many tasks match'),
+    ('create ...', 'create a task'),
+    ('update TASK ...', 'change a task'),
+    ('close TASK', 'close a task'),
+    ('reopen TASK', 'reopen a closed task'),
+    ('comments TASK', 'the comments of a task'),
+    ('comments add TASK --file FILE', 'add a comment'),
+    ('dep ...', 'the dependencies of a task'),
+    ('state ...', 'the state events of a task'),
+    ('lint', 'check the tracker for problems'),
+)
+
+#: The two documents a new worker should read, named in every answer this module gives (the task
+#: says both by name: kittrial-5bb.283).
+DOCS_TO_READ_FIRST = ('docs start', 'docs worker-guide')
+
+#: The sentence every answer about a command outside the contributor interface carries: the refusal
+#: used to point a worker at the installation operator's own host tool (kittrial-5bb.283).
+ADMIN_TOOL_NOTE = 'admin.py is for the installation operator on the server, not for workers'
+
+#: What someone typing a name that is nearly a command probably meant. The two the task names, and
+#: the spellings seen in the field; anything else falls back to difflib.
+NEAREST_COMMANDS = {'briefing': 'brief TASK', 'workerguide': 'docs worker-guide',
+                    'worker-guide': 'docs worker-guide', 'workersguide': 'docs worker-guide'}
+
+#: The actions the client dispatches itself; every other name in the table above is passed to the
+#: endpoint. The dispatch in main() is written in terms of this tuple, and a test holds every one of
+#: its names to a line of the table, so the help cannot fall behind the commands (kittrial-5bb.283).
+CLIENT_ACTIONS = ('brief','history','checkpoint','onboard','docs','session','handoff','review','work',
+                  'feedback','requirement','requirements','ref','capability','proposal','guidance',
+                  'coordinator')
+
+
+def contributor_command_names():
+    """The first word of every command in the table: what a contributor may type."""
+    return tuple(dict.fromkeys(usage.split()[0] for usage, _text in CONTRIBUTOR_COMMANDS))
+
+
+def nearest_contributor_command(name):
+    """The command ``name`` probably meant, or ``None`` (kittrial-5bb.283).
+
+    The names people actually mistype are answered from the table above; anything else is matched
+    against the command names, so a near miss still gets an answer rather than silence.
+    """
+    if name in NEAREST_COMMANDS:
+        return NEAREST_COMMANDS[name]
+    close = difflib.get_close_matches(name, sorted(contributor_command_names()), n=1, cutoff=0.6)
+    return close[0] if close else None
+
+
+def contributor_help_text(unknown=None):
+    """The answer a contributor gets: the commands it may run, and the two documents to read.
+
+    ``unknown`` is the command someone typed that is not one of them; the answer then names the
+    nearest command when there is one, and always says where admin.py belongs (kittrial-5bb.283).
+    """
+    lines = []
+    if unknown is None:
+        lines.append('The commands a contributor may run, one line each:')
+    else:
+        lines.append('%r is outside the contributor interface. The commands a contributor may run, '
+                     'one line each:' % unknown)
+    lines += ['  %s - %s' % (usage, text) for usage, text in CONTRIBUTOR_COMMANDS]
+    lines.append('')
+    lines.append('Read %s and %s first.' % DOCS_TO_READ_FIRST)
+    if unknown is not None:
+        nearest = nearest_contributor_command(unknown)
+        if nearest is not None:
+            lines.append('Did you mean `%s`?' % nearest)
+    lines.append(ADMIN_TOOL_NOTE + '.')
+    return '\n'.join(lines)
+
+
+def outside_contributor_interface(name):
+    """Refuse ``name`` with the commands a contributor may run (kittrial-5bb.283).
+
+    One place so the answer cannot drift from the table above, and so the refusal is what a test
+    can call without a runtime: the caller is still refused - the endpoint refuses everything
+    outside the contributor interface - it is only told what it may run instead.
+    """
+    raise ValueError(contributor_help_text(None if name in ('help', '-h', '--help') else name))
+
 
 def main():
     # No prefix matching: the wrapper passes these flags exactly, and an abbreviation must
