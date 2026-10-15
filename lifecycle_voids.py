@@ -891,8 +891,26 @@ def snapshot(rows, project=None, journal=None):
     return Snapshot(rows, context(rows, journal))
 
 
-def correction_audit(correction):
-    """Every host record and unpaired native correction, without conferring authority."""
+def operator_listed(operator, operators):
+    """Whether a correction row's operator is on the configured operator list (kittrial-5bb.282).
+
+    ``False`` when the list is known and the operator is not on it - the reviewer's case: a native
+    abandonment comment written straight to bd by someone who is not a listed operator closes
+    nothing, and once a proved record closes the cut it reads ``superseded`` with that operator, so
+    the audit must say that the operator is not one this installation lists. ``None`` when the
+    caller passed no list: unknown is not a claim about the person.
+    """
+    if operators is None or operator is None:
+        return None
+    return operator in set(operators)
+
+
+def correction_audit(correction, operators=None):
+    """Every host record and unpaired native correction, without conferring authority.
+
+    ``operators`` is the installation's configured operator list, used only to answer
+    ``operator_listed`` on each row; a caller that does not pass it reads ``None`` there.
+    """
     entries=correction.get('entries',{})
     retracted=correction.get('retracted',set())
     native={(c['task'],c['id']):c for c in correction.get('native_comments',[])}
@@ -922,7 +940,8 @@ def correction_audit(correction):
                   created_at=entry['created_at'],reason=payload['reason'],evidence=payload['evidence'],
                   target_void=payload['target_void'],comment_id=entry['comment_id'],status=status,
                   journaled=True,native_author=comment['author'] if comment else None,
-                  native_time=comment['created_at'] if comment else None)
+                  native_time=comment['created_at'] if comment else None,
+                  operator_listed=operator_listed(payload['actor'],operators))
         if payload['operation']=='abandon':
             item['native_operator_proof']=(comment is not None
                                            and comment['author']==payload['actor']
@@ -954,7 +973,8 @@ def correction_audit(correction):
                   comment_id=comment['id'],status='incomplete',journaled=False,
                   native_author=comment['author'],native_time=comment['created_at'],
                   classification_reason='native-correction-without-host-entry' if payload else
-                                        'native-correction-payload-unclassifiable')
+                                        'native-correction-payload-unclassifiable',
+                  operator_listed=operator_listed(payload['actor'] if payload else None,operators))
         # kittrial-5bb.274 round 3: an orphan (cut) abandonment comment now parses,
         # so its row names the exact retry - the operation identity and actor of the
         # abandonment whose store write never happened - and the cut comment it
@@ -990,7 +1010,8 @@ def correction_audit(correction):
                            native_operator_proof=True,target_comment_id=orphan['target'],
                            duplicate_host_entry=True,superseded_by=orphan['superseded_by'],
                            retry_operation_id=payload['operation_id'],retry_operator=payload['actor'],
-                           classification_reason=None))
+                           classification_reason=None,
+                           operator_listed=operator_listed(payload['actor'],operators)))
     return sorted(result,key=lambda x:(str(x['created_at'] or ''),str(x['task'] or ''),
                                        str(x['operation_id'] or ''),str(x['comment_id'])))
 
@@ -1018,7 +1039,7 @@ def audit(rows, operators=None, owners=None, limit=50, offset=0):
     unclassifiable = sum(1 for row in native_events if row.get('id') not in classified)
     ordered = sorted(events, key=lambda e: (e['task'], e['dimension'],
                      e['order'] if e['order'] is not None else -1, e['id']))
-    corrections=correction_audit(correction)
+    corrections=correction_audit(correction,operators)
     page_total=max(len(ordered),len(corrections))
     if offset > page_total:
         raise ValueError('Lifecycle audit offset exceeds its total')
