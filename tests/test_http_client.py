@@ -3,6 +3,8 @@
 They run the real service on loopback and drive it only through :class:`http_client.Client`,
 including the uncertain-write reconciliation path and the plaintext refusal.
 """
+import contextlib
+import io
 import os
 import secrets
 import shutil
@@ -10,10 +12,12 @@ import sys
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+import http_client
 from http_auth import Service, Store
 from http_client import Client, HttpApiError, UncertainOutcome, new_idempotency_key
 from http_service import InProcessBackend, create_server
@@ -134,6 +138,77 @@ class ClientCase(unittest.TestCase):
         reconciled = client.create_task(project, 'flaky', key=key)
         self.assertEqual(1, client.list_tasks(project)['total'])
         self.assertEqual(reconciled['id'], client.list_tasks(project)['items'][0]['id'])
+
+
+DASH_TOKEN = '-abc.def_-ghi--jkl'
+
+
+class CLICredentialArgumentTests(unittest.TestCase):
+    """A bearer credential may begin with '-' (kittrial-5bb.296).
+
+    argparse reads a *separate* '-abc...' argument as an option, which is how CI run
+    38765801091 failed with "argument --token: expected one argument" when a URL-safe
+    random token happened to begin with '-'.  The credential therefore travels as
+    --flag=VALUE, and that spelling is pinned here for both credential flags.
+    """
+
+    def parser(self):
+        return http_client._build_parser()
+
+    def help_text(self, *command):
+        """The help argparse prints for the parser (or a subcommand), as data."""
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            with self.assertRaises(SystemExit):
+                self.parser().parse_args(list(command) + ['--help'])
+        return out.getvalue()
+
+    def test_help_says_the_equals_form_is_accepted(self):
+        self.assertIn('--token=VALUE', self.help_text())
+        self.assertIn('--credential=VALUE', self.help_text('call'))
+
+    def test_a_token_beginning_with_a_dash_is_one_argument(self):
+        args = self.parser().parse_args(
+            ['--base-url', 'http://127.0.0.1:1', '--token=' + DASH_TOKEN, 'whoami'])
+        self.assertEqual(DASH_TOKEN, args.token)
+
+    def test_a_credential_beginning_with_a_dash_is_one_argument(self):
+        args = self.parser().parse_args(
+            ['--base-url', 'http://127.0.0.1:1', 'call', 'GET', '/v1/projects',
+             '--credential=' + DASH_TOKEN])
+        self.assertEqual(DASH_TOKEN, args.credential)
+
+    def test_the_separate_argument_form_reads_the_dash_as_an_option(self):
+        """The flaky failure: ('--token', token) when token begins with '-'."""
+        with contextlib.redirect_stderr(io.StringIO()) as stderr:
+            with self.assertRaises(SystemExit):
+                self.parser().parse_args(
+                    ['--base-url', 'http://127.0.0.1:1', '--token', DASH_TOKEN, 'whoami'])
+        self.assertIn('expected one argument', stderr.getvalue())
+
+    def test_main_passes_a_dash_leading_token_to_the_client(self):
+        made = []
+
+        class RecordingClient:
+            def __init__(self, base_url, **kwargs):
+                self.base_url = base_url
+                self.token = None
+                made.append(self)
+
+            def whoami(self):
+                return {'via': 'session'}
+
+        with mock.patch.object(http_client, 'Client', RecordingClient), \
+                contextlib.redirect_stdout(io.StringIO()):
+            code = http_client.main(['--base-url', 'http://127.0.0.1:1',
+                                     '--token=' + DASH_TOKEN, 'whoami'])
+        self.assertEqual(0, code)
+        self.assertEqual(DASH_TOKEN, made[0].token)
+
+    def test_a_generated_idempotency_key_can_never_start_with_a_dash(self):
+        # The other random value the CLI documents after a flag already carries a
+        # safe prefix, so the two-argument form is safe for it too.
+        for _ in range(2000):
+            self.assertFalse(new_idempotency_key().startswith('-'))
 
 
 if __name__ == '__main__':
