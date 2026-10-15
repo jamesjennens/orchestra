@@ -604,6 +604,9 @@ def apply(project_path, context, action, body, operation_id, run, task=None):
 
 def web_action(root, project_path, project, request, authority_config, runner, guarded_write):
     """Keep receipt failure details inside every creation recovery route."""
+    if request.get('args') == ['baseline']:
+        from requirement_baseline_http import web_action as baseline_action
+        return baseline_action(root, project_path, project, request, authority_config, runner, guarded_write)
     recovery = request.get('args') in (['recoveries'], ['release'])
     try:
         answer = _web_action(root, project_path, project, request, authority_config, runner, guarded_write)
@@ -746,6 +749,9 @@ def _web_action(root, project_path, project, request, authority_config, runner, 
 
 def read(project_path, project, args, run, operators=None):
     """One read-only native snapshot; current content and exact historical refs."""
+    if isinstance(args, list) and args[:1] in (['baselines'], ['baseline'], ['export'], ['changes']):
+        from requirement_baseline_http import read as baseline_read
+        return baseline_read(project_path, project, args, run, operators)
     if args == ['governance']:
         return governance.read_state(project_path, project)
     if args == ['snapshot']:

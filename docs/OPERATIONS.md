@@ -3007,3 +3007,42 @@ python tests/integration.py --config client.local.json --project testone --other
 ```
 
 This restarts the configured server and creates synthetic records. Run it only on a disposable deployment, never a live team server. It checks two independent SSH clients, concurrent claims/comments, project separation, rendered corrections, restart and backup restoration.
+
+
+## Requirements baseline backup and restore boundary
+
+Named snapshots live in `.requirements-baselines/NAME/` as immutable canonical
+`snapshot.json`, `BRD.md` and `receipt.json`. `current.json` binds the last installed
+name and receipt hash; a restore's `source.json` binds unchanged source history
+to the destination. Source snapshot/receipt/Markdown bytes are never renamed
+inside their contents. A later destination cut is new history. The normal explicit
+coordination sidecar backup includes every complete named snapshot and validates
+all file hashes, exact references, governance history and current-pointer binding.
+
+An unfinished `.pending-*` cut or missing current-pointer write **stops backup**;
+the operator must first finish the exact original owner request or reconcile the
+uncertainty. No backup silently drops a staged capture. Reads list healthy named
+baselines independently, and report damaged names and current-pointer failures.
+Do not replace damaged files with today's requirements or edit their hashes.
+Restore a verified complete generation instead.
+
+Restoration validates the entire family before its first write, holds the project
+lock while installing it, and creates `.requirements-baselines-restore.json`
+before writing baseline files. All baseline reads, exports, comparisons, cuts and
+backups refuse while that marker exists. Retry the **same verified restore to the
+same destination** to finish it; do not delete the marker. The marker binds the
+exact incoming file hashes. Different input or different existing immutable files
+refuses. A fresh restore destination is required for conflicting history. Named
+files are installed before source binding and current pointer; the marker is
+removed only after every written file is read back byte-for-byte. Baseline paths
+and files refuse symlinks, reparse points and special files.
+
+A project which has never attempted a terminal requirement change or cut a
+baseline creates no new-family sidecar and retains the previous release's restore
+compatibility. **After the first baseline cut, backups from this kit are forward
+only:** a previous kit refuses the new backup paths. Restore with this kit or a
+later compatible reader. To roll back to an older kit, use a verified backup from
+before the first new-family write. Do not use an older kit to take backups of a
+project with baselines: that kit does not enumerate this family and cannot preserve
+it. Keep the compatible kit and complete sidecar/native backup together. This
+feature does not authorize deployment or restoration of a live project.

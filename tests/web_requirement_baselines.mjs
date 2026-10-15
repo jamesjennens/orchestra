@@ -1,0 +1,117 @@
+// Shipped API/panel against real disposable HTTP; DOM and tab storage are modeled.
+import './web_dom_shim.mjs';
+import { Element } from './web_dom_shim.mjs';
+import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+const [apiUrl, panelUrl, viewUrl, base, pid, ownerToken, viewerToken, requirementId] = process.argv.slice(2);
+const { createApi, ApiError } = await import(apiUrl);
+const { baselinePanel } = await import(panelUrl);
+const view = await import(viewUrl);
+const storage = new Map();
+globalThis.sessionStorage = { getItem: k => storage.get(k) ?? null, setItem: (k, v) => storage.set(k, v), removeItem: k => storage.delete(k) };
+let posted = 0;
+const transport = token => async (method, path, headers, body) => {
+  if (method === 'POST' && path.endsWith('/requirements/baselines')) posted++;
+  const response = await fetch(base + path, { method, headers: { ...headers, Authorization: 'Bearer ' + token }, body });
+  return { status: response.status, data: response.status === 204 ? null : await response.json() };
+};
+const context = api => ({ api, href: p => '#' + p, go() {}, setDirty() {} });
+const owner = context(createApi(transport(ownerToken))), viewer = context(createApi(transport(viewerToken)));
+const until = async (test) => {
+  for (let i = 0; i < 500; i++) { if (test()) return; await new Promise(resolve => setTimeout(resolve, 10)); }
+  assert.fail('Panel did not reach the expected bounded state');
+};
+let panel = baselinePanel(owner, pid, true);
+assert.ok(panel.textContent.includes('Loading baselines...'));
+assert.equal(panel.querySelector('select').disabled, true);
+await until(() => panel.textContent.includes('No baselines yet.'));
+assert.equal(panel.querySelector('select').querySelectorAll('option').length, 1);
+const form = panel.querySelector('form');
+form.querySelector('#baseline-name').value = 'Snapshot-1';
+form.querySelectorAll('input').find(input => input.attributes.type === 'checkbox').checked = false;
+await form.dispatch('submit'); assert.equal(posted, 0);
+form.querySelectorAll('input').find(input => input.attributes.type === 'checkbox').checked = true;
+await form.dispatch('submit');
+assert.ok(panel.textContent.includes('Baseline cut.'));
+assert.equal(panel.querySelector('select').querySelectorAll('option').length, 2);
+assert.ok(panel.textContent.includes('last cut'));
+assert.ok(panel.textContent.includes('Pending wording stays unaccepted'));
+const button = text => panel.querySelectorAll('button').find(b => b.textContent === text);
+panel.querySelector('select').value = 'snapshot-1'; await panel.querySelector('select').dispatch('change');
+await button('Export Markdown').dispatch('click');
+assert.ok(panel.textContent.includes('Pending - not accepted'));
+assert.ok(panel.textContent.includes('&lt;script&gt;'));
+assert.equal(panel.querySelectorAll('script').length, 0);
+let savedBlob, downloaded;
+const originalCreate = URL.createObjectURL, originalRevoke = URL.revokeObjectURL;
+URL.createObjectURL = blob => { savedBlob = blob; return 'blob:verified-document'; };
+URL.revokeObjectURL = () => {};
+Element.prototype.click = function () { downloaded = { href: this.attributes.href, filename: this.attributes.download }; };
+await button('Save BRD-snapshot-1.md').dispatch('click');
+assert.deepEqual(downloaded, { href: 'blob:verified-document', filename: 'BRD-snapshot-1.md' });
+const exact = await owner.api.exportBrd(pid, 'snapshot-1');
+assert.equal(await savedBlob.text(), exact.markdown);
+assert.equal(createHash('sha256').update(Buffer.from(await savedBlob.arrayBuffer())).digest('hex'), exact.sha256);
+URL.createObjectURL = originalCreate; URL.revokeObjectURL = originalRevoke;
+await button('Changes since baseline').dispatch('click');
+assert.ok(panel.textContent.includes('No changes since this baseline.'));
+const item = await owner.api.requirement(pid, requirementId);
+await owner.api.reviseRequirement(pid, requirementId, { expected_revision: item.current.revision,
+  expected_sha256: item.current.sha256, description: 'Later unaccepted wording' });
+await button('Changes since baseline').dispatch('click');
+assert.ok(panel.textContent.includes('edited: ' + requirementId));
+assert.ok(panel.textContent.includes('pending: ' + requirementId));
+assert.ok(panel.textContent.includes(item.current.sha256));
+form.querySelector('#baseline-name').value = 'Snapshot-2';
+form.querySelectorAll('input').find(input => input.attributes.type === 'checkbox').checked = true;
+await form.dispatch('submit');
+assert.equal(panel.querySelector('select').querySelectorAll('option').length, 3);
+let member = baselinePanel(viewer, pid, false);
+await until(() => member.textContent.includes('2 of 64'));
+assert.equal(member.querySelectorAll('form').length, 0);
+assert.equal(member.querySelectorAll('button').some(b => b.textContent === 'Cut baseline'), false);
+member.querySelector('select').value = 'snapshot-1';
+await member.querySelectorAll('button').find(b => b.textContent === 'Export Markdown').dispatch('click');
+assert.ok(member.textContent.includes('Pending - not accepted'));
+// A lost response keeps its exact account/name/key across a new API instance.
+let lose = true;
+const underlying = transport(ownerToken);
+const broken = createApi(async (...args) => {
+  const result = await underlying(...args);
+  if (lose && args[0] === 'POST' && args[1].endsWith('/requirements/baselines')) { lose = false; throw new Error('response lost after commit'); }
+  return result;
+});
+await assert.rejects(broken.cutBaseline(pid, { name: 'Lost-answer' }), error => error.uncertain);
+const replacement = createApi(transport(ownerToken));
+const pending = await replacement.pendingBaselineCuts(pid);
+assert.deepEqual(pending.map(item => item.name), ['lost-answer']);
+const before = await replacement.baselines(pid);
+await pending[0].retry();
+assert.equal((await replacement.baselines(pid)).total, before.total);
+assert.deepEqual(await replacement.pendingBaselineCuts(pid), []);
+assert.deepEqual(await viewer.api.pendingBaselineCuts(pid), []);
+const callsBefore = posted;
+const key = [...storage.keys()].find(k => k.startsWith('orchestra-baseline-retries-v1:'));
+const old = storage.get(key); storage.set(key, '{broken');
+await assert.rejects(replacement.cutBaseline(pid, { name: 'Storage-fault' }), error => error.code === 'baseline_retry_storage');
+assert.equal(posted, callsBefore); storage.set(key, old);
+// Independent panel read errors keep the generated document and edit form usable.
+const failing = context({ ...owner.api, baselines: async () => { throw new ApiError(503, 'read', 'Baseline listing unavailable'); } });
+const page = await view.brd(failing, { pid }, {}, await owner.api.requirements(pid));
+await until(() => page.textContent.includes('Baselines could not be read.'));
+assert.ok(page.textContent.includes('Later unaccepted wording'));
+assert.ok(page.querySelector('#requirement-text'));
+let release;
+const loading = baselinePanel(context({ ...viewer.api, baselines: () => new Promise(resolve => { release = resolve; }) }), pid, false);
+assert.ok(loading.textContent.includes('Loading baselines...'));
+assert.equal(loading.querySelectorAll('button').find(b => b.textContent === 'Export Markdown').disabled, true);
+release(await viewer.api.baselines(pid));
+await until(() => loading.querySelector('select').disabled === false);
+const failedExport = baselinePanel(context({ ...viewer.api, exportBrd: async () => { throw new ApiError(422, 'read', 'Chosen baseline cannot be verified'); } }), pid, false);
+await until(() => failedExport.querySelector('select').disabled === false);
+await failedExport.querySelectorAll('button').find(b => b.textContent === 'Export Markdown').dispatch('click');
+assert.ok(failedExport.textContent.includes('Chosen baseline cannot be verified'));
+assert.equal(failedExport.querySelectorAll('pre').length, 0);
+console.log(JSON.stringify({ emptyOneMultiple: true, viewerReadOnly: true, pendingUnaccepted: true,
+  exactDownloadBytes: true, exactComparisonRefs: true, lostResponseReloadRetry: true,
+  actorScopedKeys: true, storageFaultNoWrite: true, loadingAndFailure: true, documentStillUsable: true }));
