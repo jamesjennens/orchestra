@@ -957,9 +957,10 @@ class NativeRunner:
     """
 
     __slots__ = ('_dispatch', 'attempted_write', 'calls', 'wrote',
-                 'lifecycle_project', '_lifecycle_void_journal', '_web_lifecycle_mark_journal')
+                 'lifecycle_project', 'bounded_task_reads',
+                 '_lifecycle_void_journal', '_web_lifecycle_mark_journal')
 
-    def __init__(self, dispatch, project=None):
+    def __init__(self, dispatch, project=None, bounded_task_reads=False):
         self._dispatch = dispatch
         self.attempted_write = False
         self.calls = 0
@@ -968,6 +969,12 @@ class NativeRunner:
         #: (kittrial-5bb.97). It says nothing about refusals, which `attempted_write` decides.
         self.wrote = False
         self.lifecycle_project = project
+        #: Whether this runner is the pinned ``bin/bd`` host boundary and can answer
+        #: the bounded per-task reads a one-fact lifecycle write uses instead of a
+        #: full `export --all` (kittrial-5bb.289 item 2). The lifecycle routes set
+        #: it; a runner built anywhere else (or a bare callable) leaves it false and
+        #: keeps the full export's answer.
+        self.bounded_task_reads = bounded_task_reads
         self._lifecycle_void_journal = None
         self._web_lifecycle_mark_journal = None
 

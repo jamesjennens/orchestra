@@ -36,6 +36,8 @@ RELEASE_COMMIT = '5' * 40
 RELEASE_1 = '6' * 40
 RELEASE_2 = '7' * 40
 PREVIOUS_RELEASE = '8' * 40
+#: The one native record time the synthetic store writes (NativeStore.run).
+NEWEST_RECORD_TIME = '2026-10-01T10:00:00Z'
 OLD_FIELDS = {'schema_version', 'operation_id', 'task', 'dimension', 'value', 'scope',
               'evidence', 'provenance', 'actor'}
 
@@ -130,6 +132,23 @@ def released(store, task, release, environment, integration, source=SOURCE_A, li
     return scope_value
 
 
+class BoundedRunner:
+    """The endpoint host runner's bounded-read capability over a NativeStore.
+
+    It carries the one attribute ``apply_native`` reads to decide whether a
+    single-fact write may compare against the task's LIVE rows instead of a full
+    ``export --all`` (kittrial-5bb.289 item 2).
+    """
+
+    bounded_task_reads = True
+
+    def __init__(self, store):
+        self.store = store
+
+    def __call__(self, args):
+        return self.store.run(args)
+
+
 class NativeStore:
     """Many tasks; simulates export, native label/event writes, and lost responses."""
     def __init__(self, tasks=('trial-a', 'trial-b', 'trial-c')):
@@ -142,6 +161,25 @@ class NativeStore:
         self.calls.append(args[:])
         if args == ['export', '--all']:
             return ''.join(json.dumps(row) + '\n' for row in self.rows)
+        # The bounded per-task reads the endpoint's host runner serves for a
+        # one-fact write (kittrial-5bb.289 item 2), modelled on bd's own answers.
+        if args[:1] == ['show'] and args[-2:] == ['--json', '--include-comments']:
+            wanted = [token for token in args[1:-2] if not token.startswith('--')]
+            found = [row for row in self.rows if row.get('id') in wanted]
+            if not found:
+                # As bd 1.2.2 answers a show of a row it cannot find (measured,
+                # kittrial-5bb.185): a failed read, not an empty array.
+                raise ValueError('no issues found matching the provided IDs: ' + ','.join(wanted))
+            return json.dumps(found)
+        if args[:2] == ['list', '--all']:
+            if '--parent' in args:
+                parent = args[args.index('--parent') + 1]
+                return json.dumps([row for row in self.rows
+                                   if any(dep.get('type') == 'parent-child'
+                                          and dep.get('depends_on_id') == parent
+                                          for dep in row.get('dependencies') or [])])
+            token = args[args.index('--desc-contains') + 1]
+            return json.dumps([row for row in self.rows if token in json.dumps(row)])
         assert args[0] == 'set-state', args
         task = args[1]
         dimension, value = args[2].split('=', 1)
@@ -168,6 +206,14 @@ class NativeStore:
 
     def record(self, p):
         return apply_native(p, ACTOR, self.run)
+
+    def record_live(self, p):
+        """``record`` through a runner that serves the bounded per-task reads.
+
+        This is the path the endpoint takes for a one-fact write (kittrial-5bb.289
+        item 2): no full ``export --all`` is paid for.
+        """
+        return apply_native(p, ACTOR, BoundedRunner(self))
 
     def record_honest(self, p):
         """``record`` that also keeps the native events it writes (reconciliation).
@@ -2440,6 +2486,95 @@ class SingleFactScopeTests(unittest.TestCase):
         store.record(payload('trial-a', 'integrated', operation='integrated-newer', scope_value=newer))
         with self.assertRaisesRegex(ValueError, 'set matching lifecycle scope'):
             store.record(payload('trial-a', 'tested', operation='tested-older', scope_value=older))
+
+    def test_a_single_fact_under_an_older_scope_names_both_scopes_and_the_view_time(self):
+        # Reproduces feedback-b79d264a8d9b237168e35face04360d1 at the level this host
+        # can build: the refusal used to be one fixed sentence, so an operator could
+        # not see which scope the write was judged against or how old the view was
+        # (kittrial-5bb.289 item 1). It must now name the CURRENT scope, the scope the
+        # payload sent, and the newest record the comparison could see.
+        store = NativeStore(tasks=('trial-a',)).seed('trial-a')
+        older = scope(source=SOURCE_A, integration=MERGE_A, release='release-a', environment='staging')
+        newer = scope(source=SOURCE_B, integration=MERGE_B, release='release-b', environment='production')
+        store.record(payload('trial-a', 'lifecycle-scope', operation='scope-newer', scope_value=newer))
+        with self.assertRaisesRegex(ValueError, 'set matching lifecycle scope') as caught:
+            store.record(payload('trial-a', 'tested', operation='tested-older', scope_value=older))
+        message = str(caught.exception)
+        for value in newer.values():
+            self.assertIn(value, message, 'the refusal must name the scope it compared against')
+        for value in older.values():
+            self.assertIn(value, message, 'the refusal must name the scope the payload sent')
+        self.assertIn(NEWEST_RECORD_TIME, message, "the refusal must name the view's newest record")
+        self.assertNotIn('\n', message, 'the refusal stays one operator-facing line')
+
+    def test_the_live_scope_read_agrees_with_the_export_for_a_current_view(self):
+        # Item 2: the bounded live read must give the SAME answer as the full
+        # export for an up-to-date view, or the check would have been weakened.
+        store = NativeStore(tasks=('trial-a',)).seed('trial-a')
+        live = lifecycle.read_task_view(store.run, 'trial-a')
+        live_scope = next(state['scope'] for state in lifecycle.project_facts(live)
+                          if state['id'] == 'trial-a')
+        self.assertEqual(live_scope, store.facts('trial-a')['scope'])
+        self.assertEqual(live_scope, scope())
+
+    def test_a_one_fact_write_reads_the_task_live_and_never_exports_all(self):
+        # A one-fact write must not pay for `--all` (item 2).
+        store = NativeStore(tasks=('trial-a',)).seed('trial-a')
+        store.calls = []
+        result = store.record_live(payload('trial-a', 'tested', operation='live-tested'))
+        self.assertTrue(result.get('changed'))
+        verbs = [call[0] for call in store.calls]
+        self.assertNotIn('export', verbs, 'a one-fact write must not pay for a full export')
+        self.assertIn('show', verbs)
+        self.assertIn('list', verbs)
+        self.assertEqual(store.facts('trial-a')['facts']['tested']['value'], 'passed')
+
+    def test_the_live_read_still_refuses_a_real_mismatch(self):
+        # Without weakening the check: a payload scope that is not the live
+        # current scope is refused, and nothing is written.
+        store = NativeStore(tasks=('trial-a',)).seed('trial-a')
+        older = scope(source=SOURCE_A, integration=MERGE_A, release='release-a', environment='staging')
+        newer = scope(source=SOURCE_B, integration=MERGE_B, release='release-b', environment='production')
+        store.record_live(payload('trial-a', 'lifecycle-scope', operation='scope-newer', scope_value=newer))
+        before = json.dumps(store.rows)
+        store.calls = []
+        with self.assertRaisesRegex(ValueError, 'set matching lifecycle scope') as caught:
+            store.record_live(payload('trial-a', 'tested', operation='tested-older', scope_value=older))
+        self.assertIn('release-b', str(caught.exception))
+        self.assertIn('release-a', str(caught.exception))
+        self.assertEqual(json.dumps(store.rows), before)
+        self.assertNotIn('export', [call[0] for call in store.calls])
+
+    def test_the_live_read_still_sees_an_operation_receipt_from_another_task(self):
+        # The one bounded read beyond the task's own rows keeps the reuse guard:
+        # an operation id already used on another task is still refused.
+        store = NativeStore(tasks=('trial-a', 'trial-b')).seed('trial-a').seed('trial-b')
+        store.record_live(payload('trial-a', 'tested', operation='shared-op'))
+        before = json.dumps(store.rows)
+        with self.assertRaisesRegex(ValueError, 'operation ID already used for different content'):
+            store.record_live(payload('trial-b', 'tested', operation='shared-op'))
+        self.assertEqual(json.dumps(store.rows), before)
+
+    def test_the_endpoint_host_runner_selects_the_bounded_read(self):
+        # The production route builds a NativeRunner that advertises the bounded
+        # read (endpoint.py); carrying the capability is what selects it.
+        from http_authority import NativeRunner
+        store = NativeStore(tasks=('trial-a',)).seed('trial-a')
+        runner = NativeRunner(store.run, bounded_task_reads=True)
+        store.calls = []
+        apply_native(payload('trial-a', 'tested', operation='host-live'), ACTOR, runner)
+        self.assertNotIn('export', [call[0] for call in store.calls])
+        self.assertGreater(runner.calls, 0)
+
+    def test_the_live_read_refuses_an_unknown_task_without_weakening_the_check(self):
+        # bd fails a `show` of an unknown id; the bounded read must still refuse
+        # with the unknown-task sentence and write nothing.
+        store = NativeStore(tasks=('trial-a',))
+        before = json.dumps(store.rows)
+        with self.assertRaisesRegex(ValueError, 'unknown lifecycle task'):
+            store.record_live(payload('missing-task', 'tested', operation='live-missing'))
+        self.assertEqual(json.dumps(store.rows), before)
+        self.assertNotIn('set-state', [call[0] for call in store.calls])
 
     def test_the_release_operation_may_still_write_under_an_older_scope(self):
         # The documented relaxation: only a release operation (a verify-only target
