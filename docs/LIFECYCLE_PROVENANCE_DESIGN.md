@@ -1,7 +1,8 @@
 # Lifecycle fact trust, audit and historical correction
 
-Status: **reworked design for document review; no new implementation or rollout authorization**.
-This replaces the rejected PR105/6051571 proposal. The inspected baseline is
+Status: **revised design for structured document review; no new implementation or rollout authorization**.
+This incorporates the seven changes from the accept-with-changes document review.
+The inspected baseline is
 `15b2ad0a10b204c11612dfa1d153efdb92813b44` (15 October 2026). Code citations below
 refer to that exact tree, not the older review's f929787 line numbers.
 
@@ -84,18 +85,80 @@ reported as unknown evidence, not converted into fabricated historical authority
 
 The current read-only command is
 `admin.py --root ROOT lifecycle-audit PROJECT --limit 50 --offset 0`.
-It lists event IDs and native dates, current assignee/operator relationship,
-standing approval evidence where recoverable, and project-wide questionable and
-unclassifiable totals. Events and corrections share a bounded page; `page_total`,
-`next_offset`, omitted counts, `correction_status` and correction rows distinguish
-complete, retracted, incomplete and abandoned history. No production audit or
-production count was taken for this document revision.
+It lists native event IDs/dates, current assignee/operator relationship, approval
+at recording where recoverable, and project-wide questionable/unclassifiable
+counts. Events and corrections share bounded pages: retain every page through
+`next_offset`, the complete totals, and correction status/reasons. Do not treat
+one page, an omitted count or a current assignee as a complete historical audit.
 
-The operator investigates a candidate using its payload actor/native recorder,
-native time, assignee and review history, contribution/approval records and Git.
-The present registry is not proof of ownership years ago. The operator can keep
-a fact, obtain more evidence, or void one named event with an explicit reason and
-evidence pointer. Good legacy facts require no per-fact migration.
+**Acceptance evidence before a correction campaign:** attach a dated, read-only
+production audit to the document contribution, outside this generic repository.
+Bind its exact kit source, native snapshot, protected correction/mark context,
+operator/owner-list reading, page completeness and raw evidence hashes. Break
+questionable records down by each reason and unclassifiable records by cause;
+separate unknown payload/time, unreadable review history, ambiguous review time,
+unavailable historical assignment and native events outside the lifecycle
+namespace. Give both overlapping reason counts and deduplicated event totals.
+Retain original counts beside the revised classifications below. No production
+count, audit completion or authorization to issue a VOID is asserted by this note.
+
+### Kit intermediate events are listed separately
+
+`lifecycle._apply_fact` writes a payload-less native transition before repeating
+a fact whose label already has the desired value (`lifecycle.py:1387,1433`). Its
+reason is exactly:
+
+```text
+Lifecycle update in progress; retry the same operation if interrupted.
+```
+
+The current audit counts that transition as unclassifiable/questionable
+(`lifecycle_voids.py:1098,1132`). That can inflate a campaign estimate with the
+kit's own release rewrites. The revised audit must recognise **only a complete
+pair**: that exact reason, the same task and dimension, the same native author,
+and the immediately following canonical payload event of that operation. Native
+ordering must be unique and known; the intermediate value must be `pending`
+(or `unknown` when repeating `pending`). Bind both event IDs and the following
+operation ID. A reason match alone, an interrupted/unpaired transition, another
+author/dimension, an intervening event or ambiguous ordering/time does not qualify.
+Where native history supplies the previous value it must agree with the repeated
+value. Keep uncertain matches in an explicit unpaired/unknown cause.
+
+List matched pairs as `kit-intermediate`, but exclude those intermediate rows
+from the unclassifiable and questionable totals. Independently audit the following
+payload fact, including its recorder, approval, correction and scope. This is an
+audit classification, not positive fact authority or a historical exemption:
+an exempt operator or the trusted service-account shell can reproduce a native
+pattern. Retain the raw rows so the classification is reviewable. Nothing changes
+ordinary lifecycle reading or makes an interrupted final fact successful.
+
+### Triage and the lifetime correction budget
+
+| Audit category | Expected action | Expected VOID demand |
+| --- | --- | --- |
+| Recorder is neither assignee **at recording time** nor an eligible operator/issued mark | Check native assignment history, the applicable dimension and authority evidence. A current different assignee alone proves no mistake. Keep an explainable legacy event; seek evidence for an unknown one. | Zero automatic. One VOID per distinct event actually judged incorrect, not per warning. |
+| `reviewed`/`integrated` without proved standing independent approval | Inspect the contribution, approval/assignee snapshot and event ordering. Separate absent approval from unreadable or same-time evidence. | Zero until judged; one per incorrect event if correction is needed. |
+| Payload-less raw event or unusable payload/time | First distinguish a matched kit intermediate, ordinary non-lifecycle native event, genuine legacy event, interrupted write and malformed evidence. Reconcile uncertainty rather than fabricate a payload. | Zero for an ordinary unrelated event; zero automatic for an unknown one; one per judged incorrect lifecycle event. |
+| Complete kit-intermediate pair | List the pair and inspect its following payload through the normal audit. | Zero for the intermediate; the following fact has its own assessment. |
+
+Before any campaign, attach the per-category candidate counts, deduplicated
+confirmed-wrong events, expected VOIDs, existing family usage and worst-case
+retraction demand. Overlapping categories never consume two VOIDs for one event.
+An unknown count is not zero and is not permission to void a whole category.
+The initial document/audit delivery authorizes **zero production corrections**;
+operators still judge and authorize each campaign from its evidence.
+
+The current family admits **1,000 lifetime records / 4 MiB**, at most 24,000 bytes
+per record (`lifecycle_voids.py:30`); retractions also consume records and the
+writer reserves room to retract outstanding VOIDs. Budget existing records plus
+planned VOIDs and possible retractions, as well as bytes and any recovery records.
+**Stop before a campaign whose forecast exceeds 250 retained family records**
+(including existing records and retractions). Do not approach the 1,000 bound by
+issuing a few hundred unplanned corrections. First obtain a separately accepted
+batched-correction format or a validated larger bound, ship its complete readers,
+backup and restore to every holding/restoring installation, and name its measured
+rollback row. Only then resume under a new campaign budget. Never prune members,
+retractions, native events or correction comments to recover capacity.
 
 ### Current correction contract
 
@@ -143,7 +206,13 @@ recovery contract. Capacity exhaustion refuses before effects; it is not license
 to delete old authority or silently prune a family. No production capacity
 estimate is claimed.
 
-## 4. One reader context and explicit unknown reasons
+## 4. Shared correction context and three reader overlays
+
+The endpoint read holds the project lock shared for the whole request (.281).
+An endpoint/host correction writer holding the same lock exclusively cannot land
+between the protected family read and the native read of that request. Offline
+exports and direct shell edits need their stated snapshot/host-access limits;
+the lock is not a claim of confinement against the service-account shell.
 
 `lifecycle.host_snapshot` attaches protected family context once per native
 snapshot (`lifecycle.py:1948`). `Snapshot` metadata is outside untrusted native
@@ -159,6 +228,57 @@ VOID journal can make the affected snapshot unknown; readers must carry the
 bounded reason, not silently fall back to an earlier pass. The operation index
 also excludes blocked operations, so an unqualified matching operation ID is
 not answered as a successful reconciliation.
+
+### Overlay matrix: shared inputs do not mean identical policy
+
+| Consumer | A. VOID/correction context | B. Recorder eligibility | C. Holds, attestations, operator reverts |
+| --- | --- | --- | --- |
+| Scoped/project facts, enabled/live, historical evidence, brief/work/lanes/render | Consult the shared protected context; preserve event position and unknown reason. | Do not generally rejudge a consistent legacy fact against today's recorder list. | Review fields are projected alongside lifecycle values; a hold does not rewrite an old passed fact. |
+| Follow-on base gate (`review_workflow.recorded_integrations`) | Consult corrections and reject an unusable integration. | Apply current listed operator/bound actor OR the exact issued web mark. | Apply the current contribution/revert projection; no reverted base becomes admissible. |
+| Lifecycle author/event audit | Consult corrections while retaining raw attribution and causes. | Report current operator/issued-mark eligibility separately, and historical assignee evidence or unknown. | Report review/approval and correction/revert evidence; warnings are audit leads, not authorization. |
+| Review/integration projection (`review`, review fields of brief/work) | Consult lifecycle corrections where deriving integration. | Its lifecycle integration field keeps the ordinary legacy reading; it is not a duplicate of the follow-on recorder gate. | Apply the same effective review chain, review-record voids and operator-revert journal. Open holds and positively failed verifier attestations block integration readiness. |
+| Release/deployment selection, dry runs and write preconditions | A voided or uncertain lifecycle target is unavailable. | Do not silently add the follow-on-only recorder test to every historical release fact. | Consult holds, failed attestations and operator reverts; skip each blocked or unreadable target with a bounded reason. |
+| HTTP/browser and offline consumers | Carry the server/host correction result, or disclose that corrections were not consulted. | Carry the relevant upstream consumer's eligibility decision and reason; no browser inference. | Show the relevant hold/attestation/revert result and why a target is skipped; offline limits remain explicit. |
+
+The divergence is intentional: a consistent old integration whose recorder is
+no longer a current eligible operator and has no issued mark can still read
+`passed` in project facts, brief and work, yet be refused as a **follow-on base**.
+The base decision must name recorder ineligibility in its reason; it must not
+claim that the historical fact was voided or that an operator removal deleted it.
+Every new reader declares its row and which overlays it applies. The detailed
+inventory below remains the source map; it is not a claim of one universal trust
+predicate.
+
+### Holds, failed attestations and negative corrections
+
+These are independent constraints, not interchangeable ways of clearing a fact:
+
+- An issued lifecycle VOID retains its event position and yields the applicable
+  unknown reason; a linked lifecycle retraction changes only that correction.
+- An open review hold blocks integration/release readiness until an explicit,
+  authorized `release-hold` for that hold. A failed verifier attestation blocks
+  readiness until a later eligible attestation changes the verdict. Neither a
+  lifecycle pass nor a new contribution silently clears these constraints.
+- An effective operator integration revert invalidates that integration as a
+  base/release target. Correct it through its audited retraction route; releasing
+  a hold does not undo a revert or a lifecycle VOID.
+- Apply all required constraints before offering a target. A cleared hold cannot
+  reinstate a voided fact, and a trusted lifecycle fact cannot override an active
+  hold, failed attestation or revert. Review-record voids are governed by their
+  own chain-link/authority rules; a hold is cleared by `release-hold`, not by a
+  general promise that a void can erase any chain record. See
+  [review holds and attestations](REVIEWS.md).
+
+**Known defect at this baseline, separately owned for correction:**
+`review_chain_state` returns `None` on a chain it cannot parse and `held_tasks`
+treats that as no hold (`lifecycle.py:977,1009`); release selection can therefore
+offer an unreadable target (`lifecycle.py:1119,1723`). This note does not claim the
+code is fail-closed or implement its P1 fix. The required rule is: **an unreadable
+review chain on a target is skipped with a reason**, distinct from a readable
+chain with no hold or a task with no review chain. Release selection and every
+write precondition must use that result; show the task/chain and reconciliation
+advice rather than silently reporting unheld. The coordinator tracks that defect
+separately. It is an acceptance gate for any later reader change in this design.
 
 ### Consumer inventory at the pinned base
 
@@ -191,8 +311,8 @@ not answered as a successful reconciliation.
 The appendix lists every direct call to the enumerated lifecycle readers found
 in production top-level Python and the strict development endpoint at this base.
 It is a mechanical cross-check; the indirect HTTP/browser/release consumers above
-were also inspected. Adding a reader requires the same context and reason
-contract, not merely inclusion in a grep result.
+were also inspected. Adding a reader requires the shared correction context, an explicit overlay row
+and the associated reason contract, not merely inclusion in a grep result.
 
 ### Values and surfaces
 
@@ -246,21 +366,57 @@ into the VOID contract.
 
 ### Assignment decision from .254 group7
 
-`lifecycle_authors` trusts the current assignee for implemented/tested/scope;
-assignment itself has no new restriction. An authorized raw task update can
-change the assignee under the existing task/claim rules. A worker taking itself
-as assignee can therefore gain those author facts, as it could by a legitimate
-claim. It does not gain reviewed/integrated or bypass independent approval.
-The source of the assignee is not an authenticated historical authority proof.
+The endpoint permits a contributor to make itself assignee of **another task**
+through raw `bd update --assignee` or `--claim`. The lifecycle/record-anchor guards
+do not restrict that assignment field. Consequently the current-assignee clause
+of `lifecycle_authors` rests on an unrestricted field: a worker can obtain the
+implemented/tested/scope author role by taking assignment, as by claiming a task.
+That does not confer reviewed/integrated authority or bypass independent approval.
+This is the group7 decision, not an added assignment restriction.
 
-Readers should be able to distinguish current assignee from evidence of who
-assigned when making an attribution audit. Today the native history is evidence
-to inspect, subject to the SSH attribution limit; a current assignee alone cannot
-answer who assigned years ago. If a future assignment-origin record is proposed,
-it needs a separate accepted scope, a legacy `unknown` case and rollout/restore
-rules. This document neither restricts assignment nor treats missing assignment
-provenance as invalidating historical implemented/tested facts. The corresponding
-current-assignee warning is already in OPERATIONS.md:880.
+Who may change an assignee remains explicit: contributors retain those native
+routes; coordinators also have the web assign/unassign route in .211 (source
+`ee2f15e774cd515fd8cb04438fd6c906e19e1ea4`). That web route is additional controlled
+coordination, not a restriction of the SSH contributor routes. It is not yet in
+the pinned base15 tree; verify its integration in the intended next release
+before describing that release as carrying it. A designated reviewer/coordinator
+alone does not gain a new right to rewrite historical assignment in this note.
+
+The audit must report **assignee at recording time**, reconstructed from native
+assignment history where available, plus who assigned and the history/time basis.
+Otherwise report `unknown` with its cause. Keep today's assignee in a separate
+field. The questionable rule for an assignee-authorized fact uses the historical
+assignee, not today's; unknown historical assignment is an explicit evidence gap,
+never fabricated from the present task. Historical SSH authors remain attributed
+names, not authenticated people. Do not demote ordinary legacy lifecycle reads
+merely because this audit lacks assignment history.
+
+Any future protected assignment-origin record needs a separate accepted scope,
+legacy-unknown behavior, gate and complete rollout/restore/rollback row. This
+document introduces none. See the current-assignee warning in
+[coordinator rules](OPERATIONS.md#the-coordinator-rules-who-may-write-which-fact-and-who-may-approve).
+
+### Revocation is different for the two VOID families
+
+Issued **lifecycle-event VOIDs** survive removal of their issuing operator;
+new issuance/retry needs current authority. **Review-chain record voids and
+operator integration reverts/retractions** are read against the current operator
+list: removal stops their effect and re-adding restores it. A removed revert
+issuer can therefore restore an integration; removing a retraction issuer can
+reapply the revert. Do not generalize the lifecycle VOID contract to those
+families. See [operator revocation](REVIEWS.md#reverting-integrated-work) and
+[operator list changes](OPERATIONS.md#the-operator-and-verifier-list-changes-are-audited).
+
+Review voids decide which holds/releases remain in the effective chain. Removing
+an operator can bring a previously released hold back into force, or restore a
+release-hold and make the task unheld; re-adding can reverse that again. **Decision:
+release selection must flag a hold/release decision whose decisive review void
+was revoked.** Name the hold/release/void, the removed recorder and the effective
+current result in a bounded warning/reason. Apply the current-list contract to
+the verdict; the warning grants no authority and clears no blocker. If the chain
+cannot be established, skip the target under the unreadable-chain rule above.
+Preserve all records and the list-change audit. This diagnostic requirement is
+part of the design; the pinned base does not yet claim that release warning.
 
 ## 6. Backup, restore and rollback
 
@@ -278,19 +434,33 @@ and event bindings. Copying a foreign project mark grants no destination
 eligibility. Host ownership and an operator-authorized supported restore are the
 boundary; no undefined lineage ID or cross-installation signature is claimed.
 
-Older serving kits may ignore a family; their backup allowlist may omit it, and
-pre-family restore validators may refuse unknown members. Before downgrade, stop
-new family writes, take and preserve the final complete backup with the new kit,
-and explicitly decide whether the older reader's weaker reading is acceptable.
-Turning issuance OFF does not retract existing corrections or marks. Retraction
-is a new audited operation, not deleting a host file. Returning to the new kit
-requires its complete native-plus-sidecar backup; never strip attribution to
-force an old restore.
+### Release-specific rollback matrix
 
-**Rollback limit:** once a new-family writer is enabled and a backup includes its
-members, restore that backup only with a kit that validates every included family;
-an older serving kit may ignore those decisions and its own backup can omit them,
-so retain the last complete new-kit backup before going back.
+The rollback target is the **current approved compatible kit**, not any kit that
+can start. At this inspection that is `15b2ad0a10b204c11612dfa1d153efdb92813b44`
+(release `orchestra-15b2ad0-20261015a`). The coordinator names `1015b` as the next
+target; bind its actual commit/release manifest and prove the rows below before
+claiming that target is available. A release name or today's date is not that
+proof. The authoritative operational matrix and recovery procedures are in
+[VOID/abandonment rollback](OPERATIONS.md#backups).
+
+| Reader/release | Actual reading and backup/restore boundary | Rollback decision |
+| --- | --- | --- |
+| Before F0 | Can ignore the lifecycle VOID family and show an original fact again; old backup can omit it and old restore may refuse the new paths. | Not a compatible target for active corrections. Keep a complete new-kit native-plus-sidecar backup; never strip a family to force restore. |
+| F0 `04ed25d`, no abandonment | Reads schema-v1 VOID/retract unchanged and can back up that family. | Rollback-clean for this family while no abandonment exists; other new families still need their own rows. |
+| F0 `04ed25d`, with abandonment | Reads lifecycle facts/issued VOIDs, but calls both the abandoned cut and its own abandonment comment incomplete. Backup refuses; restore rejects a backup containing the abandonment-store path. It can reopen an abandoned operation by exact retry. | Not rollback-clean. An older complete generation before those comments can restore into an unused destination; otherwise roll forward. Returning to the current kit makes a reopened VOID in-effect and its abandonment superseded, not damaged. |
+| `beca5d6` / `987cd50`, own-comment abandonment | Know the store but pair it with the cut comment, so the new own-comment proof mismatches: audit damaged/incomplete, the named event unknown, backup refused. Unrelated events/family writes retain their documented reading. | Not a target for this abandonment generation. Roll forward without deleting store, cut, own comment or family. With no abandonment, the documented family compatibility remains. |
+| Current `15b2ad0` / confirmed successor `1015b` | Understands own-comment proof, cut-abandonment recovery and reopened/superseded history; validates complete family/native generation before backup/restore. | Use this compatible generation as the target. Test the exact successor artifact before updating the target pin. A writer OFF does not remove stored evidence or make an older target clean. |
+| Web integration marks | Current restore into a differently named project retains evidence bytes but does **not** preserve marked recorder eligibility; old kit can omit the mark family. | Keep the complete source backup and reconcile destination eligibility with a compatible kit. Re-granting web access is not rebinding old marks. See [mark recovery](OPERATIONS.md#web-integration-marks-restore-and-rollback). |
+| Holds/attestations/new review operations | A reader predating their closed review shapes can reject a chain. The baseline release-selection unreadable-chain defect above must not be mistaken for safe rollback behavior. | The target must understand those shapes and skip unreadable targets with a reason; reconcile through authorized review operations, never hand-edit history. |
+
+Turning a writer OFF stops future issuance only. It does not retract corrections,
+erase marks, clear holds or remove an abandonment. Preserve the final complete
+backup with a kit that validates every included family, and use its supported
+restore into an unused destination. Every later E/F step or assignment-origin
+writer must add a measured row naming its exact old/new reader, backup, restore,
+first-write boundary and rollback target **before release**. Never prune history
+or weaken a refusal to make a downgrade look clean.
 
 ## 7. Alternatives and the optional future boundary
 
@@ -298,7 +468,7 @@ so retain the last complete new-kit backup before going back.
 | --- | --- |
 | No general provenance store: D1 + write rules + audit/VOID | Chosen minimum. Protects current contributor writes and repairs judged bad history without migrating every good event or adding per-fact cost. Does not prove the dedicated route for every old consistent row. Already represented in this base. |
 | Present operator list at read time | Already part of base admissibility, extended by issued web marks. Simple and bounded, but list changes alter eligibility of unmarked old integration recorders. It is not a general historical decision snapshot. |
-| Host-frozen legacy inventory | If a later strict policy needs a grandfather boundary, freeze exact event IDs plus payload/native hashes once under operator control. Backdated timestamps alone cannot enter it. It can also freeze a forgery, so requires audit/operator judgment and a separately accepted bounded storage/restore contract. Not implemented here. |
+| Host-frozen legacy inventory | If a later strict policy needs a grandfather boundary, freeze exact event IDs plus payload/native hashes once under operator control. Backdated timestamps alone cannot enter it. It can also freeze a forgery, so requires explicit audit sign-off and operator judgment and a separately accepted bounded storage/restore contract. Not implemented here. |
 | Host-owned per-write records | Retain as an optional later design, only for an identified need not met by web marks. Host ownership binds an exact issued operation; it does not prove authorization if permissive rules allowed the write. No default writer. |
 | In-payload mark or unkeyed hash | Closed payload validators and rollback reject a new field; a copied hash is not authority. Reject on those properties, not on the now-closed contributor raw-write hole. |
 | Existing HTTP operation journal | Bounded retry receipts are not permanent fact authority and are not opened for every lifecycle operation. Extending retention/coverage is a new storage contract, not free reuse. |
@@ -326,16 +496,20 @@ No such strict feature is authorized by accepting this note alone.
 | Step | Scope, default and compatibility gate | One-sentence rollback limit |
 | --- | --- | --- |
 | A. Raw namespace/write rules | Existing D1 guard and independently configured write rules; legacy reads stay as recorded. | An older kit may reopen the contributor raw-write hole; preserve protected history and keep the new kit for guarded writes. |
-| B. Read-only audit | Existing bounded audit; no project store or switch enablement from a read. | Reverting the audit removes diagnostics, not native facts or authority. |
-| C. Negative corrections | Reader/backup/restore support first; `lifecycle_void_writes` OFF by default; first actual correction creates its family. | An older reader may ignore corrections and an older backup may omit them; preserve a complete new-kit backup, and retract intentionally rather than delete files. |
+| B. Read-only audit | Existing bounded audit plus separately reviewed intermediate/historical-assignee diagnostics; dated production breakdown and triage budget before any campaign; no store from a read. | Reverting diagnostics changes no fact; preserve its report and keep the compatible correction reader. |
+| C. Negative corrections | Existing writer gate OFF by default; compatible readers/restorers first; forecast at most 250 retained records before a separate capacity decision. | Use the exact release matrix in section 6; OFF does not make an abandonment-bearing project compatible with 04ed25d/beca5d6/987cd50. |
 | D. Web integration marks | Existing verified descriptor and bounded family; independent `web_lifecycle_mark_writes` OFF by default; all holding/restoring installations compatible first. | Older kits may lose historical web eligibility and omit marks from backup; turn future issuance OFF and retain the final complete new-kit backup. |
 | E. Optional general positive provenance | Separate need/accepted design, independently gated writer OFF, exact event binding, bounded format and compatible restore before any write; no implementation in this revision. | The first included new-family backup requires a supporting restore reader; older serving/backup behavior must be measured before enabling. |
 | F. Optional strict reader | Separate accepted policy, separate OFF switch and complete preview/grandfather decision; never triggered by the three write rules. | Turn only the strict-read switch OFF to regain legacy reading; keep stored evidence and write protections. |
 
-Each step can be reviewed and released without the later ones. Current A-D are
-source observations, not new claims of rollout state. Remaining document review
-must judge this reconciliation and the assignment question. Any new E/F or
-assignment-origin implementation requires its own accepted plan, compatibility
+Each step can be reviewed and released without the later ones. Existing A-D
+mechanisms are source observations; the new audit classifications and release
+diagnostics above remain design requirements, not claimed product fixes. This
+revision must be delivered as a **docs-only structured contribution** with the
+read-only production breakdown, seven-item response and exact immutable evidence.
+Document acceptance is separate from implementation planning. The known
+unreadable-hold-chain P1 remains separately owned and is not implemented here. Any new audit/reader diagnostic, E/F or
+assignment-origin implementation requires its own separately verified plan, compatibility
 proofs, mutation tests, actual-reader/backup tests and rollout authorization.
 
 Do not build a prepare/complete protocol, decision snapshots, cryptographic
