@@ -2221,6 +2221,9 @@ BLOCK_CAPABILITIES = {
                        'release': CAP_COORDINATE, 'force-release': CAP_PROJECT_ADMIN,
                        'create': CAP_PROJECT_ADMIN},
     'web-lifecycle': {'read': CAP_READ, 'scope': CAP_COORDINATE, 'fact': CAP_COORDINATE},
+    'web-guidance': {'read': CAP_READ, 'ack': CAP_READ, 'onboarding': CAP_READ,
+                     'set': CAP_COORDINATE, 'clear': CAP_COORDINATE, 'status': CAP_COORDINATE,
+                     'coordinate-check': CAP_COORDINATE, 'onboarding-edit': CAP_COORDINATE},
     'review': {'approve': CAP_APPROVE,     # reviews.add, operation approve
                None: CAP_REVIEWS},         # reviews.add, every other operation
     'proposal': {'submit': CAP_PROPOSALS, 'revise': CAP_PROPOSALS,     # proposals.submit
@@ -2246,7 +2249,7 @@ def required_capability(request):
     args = request.get('args')
     if not isinstance(args, list) or not args or any(not isinstance(token, str) for token in args):
         return None
-    if action in ('coordinate', 'web-merge-slot', 'web-lifecycle'):
+    if action in ('coordinate', 'web-merge-slot', 'web-lifecycle', 'web-guidance'):
         if len(args) != 1:
             return None
         item = {'text': args[0]}
