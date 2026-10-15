@@ -207,6 +207,68 @@ class NativeBaselineTests(fixture.RealBdLabelAliasTests):
             self.assertIn(first['id'], changes.data['groups']['pending']); self.assertEqual(changes.data['groups']['accepted'], [])
             record('native-saved-capture-recovery-and-exact-comparison', passed=True)
 
+            # Actual native selected rows without a canonical revision refuse;
+            # removing only that label makes the unrelated task harmless.
+            orphan = self.bd('create', 'Unverified selected requirement', '--type', 'task', '--labels', 'requirement', '--json')
+            self.assertEqual(orphan.returncode, 0, orphan.stderr); orphan_id = json.loads(orphan.stdout)['id']
+            total = baselines.list_baselines(self.project, 'pp')['total']
+            bad = harness.request('POST', collection, {'name': 'unverified'}, token=token, key='native-baseline-unverified')
+            self.assertEqual(bad.status, 422, bad.data)
+            self.assertEqual(baselines.list_baselines(self.project, 'pp')['total'], total)
+            cleared = self.bd('update', orphan_id, '--remove-label', 'requirement', '--json')
+            self.assertEqual(cleared.returncode, 0, cleared.stderr)
+            healthy = harness.request('POST', collection, {'name': 'unrelated'}, token=token, key='native-baseline-unrelated')
+            self.assertEqual(healthy.status, 201, healthy.data)
+            record('actual-native-selected-unverified-versus-unrelated', passed=True)
+
+            # Native export and filtered membership probes remain real bd. At
+            # one explicit I/O boundary replace a single exported row with an
+            # unreadable shape to measure selected-versus-unrelated isolation.
+            bd_source = self.bd_path.read_text(encoding='utf-8')
+            before_corruption = self.rows()
+            export_wrapper = ('if "export" in args and p.with_name("corrupt-one-export-id").exists():\n'
+                ' target=p.with_name("corrupt-one-export-id").read_text().strip()\n'
+                ' done=subprocess.run([str(real),*args],capture_output=True,text=True)\n'
+                ' sys.stderr.write(done.stderr)\n'
+                ' if done.returncode: sys.stdout.write(done.stdout); sys.exit(done.returncode)\n'
+                ' for line in done.stdout.split("\\n"):\n'
+                '  if line.strip():\n'
+                '   row=json.loads(line)\n'
+                '   print(json.dumps({"id":row["id"],"malformed":True}) if row["id"]==target else line)\n'
+                ' sys.exit(0)\n')
+            self.bd_path.write_text(bd_source.replace('os.execv(str(real),[str(real),*args])', export_wrapper + 'os.execv(str(real),[str(real),*args])'), encoding='utf-8')
+            export_marker = self.bd_path.with_name('corrupt-one-export-id')
+            try:
+                export_marker.write_text(orphan_id, encoding='utf-8')
+                isolated = harness.request('POST', collection, {'name': 'isolated'}, token=token, key='native-baseline-isolated')
+                self.assertEqual(isolated.status, 201, isolated.data)
+                export_marker.write_text(first['id'], encoding='utf-8')
+                selected_bad = harness.request('POST', collection, {'name': 'corrupt-selected'}, token=token, key='native-baseline-selected-corrupt')
+                self.assertEqual(selected_bad.status, 422, selected_bad.data)
+                self.assertFalse((self.project / baselines.DIRECTORY / 'corrupt-selected').exists())
+            finally:
+                export_marker.unlink(missing_ok=True)
+                self.bd_path.write_text(bd_source, encoding='utf-8')
+            self.assertEqual(self.rows(), before_corruption)
+            record('one-corrupt-native-export-row-boundary', passed=True, native_database_unchanged=True)
+
+            node = shutil.which('node')
+            if not node:
+                with self.subTest(probe='native browser'):
+                    self.skipTest('Node.js is required for the actual pinned-native browser proof')
+            else:
+                from test_http_web import run_node_module
+                done = run_node_module(self, node, 'await import(process.argv[1])',
+                    (KIT / 'tests/web_requirement_baseline_native.mjs').as_uri(), (KIT / 'web/js/api.js').as_uri(),
+                    (KIT / 'web/js/views/requirement_baselines.js').as_uri(), 'http://127.0.0.1:' + str(harness.port),
+                    'pp', token, viewer, first['id'])
+                if output:
+                    (output / 'native-node.stdout').write_text(done.stdout, encoding='utf-8')
+                    (output / 'native-node.stderr').write_text(done.stderr, encoding='utf-8')
+                self.assertEqual(done.returncode, 0, done.stderr)
+                record('actual-node-through-pinned-native-http', **json.loads(done.stdout))
+
+
             # New-family backup requires a compatible reader; the old restore
             # refuses its unknown paths. Current restore preserves named bytes.
             cli(KIT, 'backup', 'pp')

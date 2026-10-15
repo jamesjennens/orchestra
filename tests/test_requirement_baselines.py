@@ -218,6 +218,48 @@ class StoreTests(unittest.TestCase):
             store.get(self.path, 'alpha', 'review-1')
         self.assertEqual(secret.read_text(), 'untouched')
 
+    def test_root_directory_symlink_refuses_reads_and_cuts_without_touching_target(self):
+        outside = self.parent / 'outside'; outside.mkdir(); (outside / 'sentinel').write_text('untouched')
+        base = self.path / store.DIRECTORY
+        try:
+            base.symlink_to(outside, target_is_directory=True)
+        except OSError as error:
+            self.skipTest('Creating directory symlinks is unavailable: ' + type(error).__name__)
+        calls = list(self.native.calls)
+        for read in (lambda: store.list_baselines(self.path, 'alpha'),
+                     lambda: store.current(self.path, 'alpha'),
+                     lambda: store.get(self.path, 'alpha', 'review-1'),
+                     lambda: store.backup_files(self.path, 'alpha'), lambda: self.cut()):
+            with self.assertRaisesRegex(ValueError, 'cannot be verified'):
+                read()
+        self.assertEqual(self.native.calls, calls)
+        self.assertEqual({path.name: path.read_bytes() for path in outside.iterdir()}, {'sentinel': b'untouched'})
+
+    def test_selected_directory_symlink_refuses_before_any_target_file_is_opened(self):
+        outside = self.parent / 'outside'; outside.mkdir(); (outside / 'sentinel').write_text('untouched')
+        base = self.path / store.DIRECTORY; base.mkdir()
+        try:
+            (base / 'review-1').symlink_to(outside, target_is_directory=True)
+        except OSError as error:
+            self.skipTest('Creating directory symlinks is unavailable: ' + type(error).__name__)
+        with patch.object(store, '_read', side_effect=AssertionError('A selected symlink target must never be read')):
+            with self.assertRaisesRegex(ValueError, 'cannot be verified'):
+                store.get(self.path, 'alpha', 'review-1')
+        self.assertEqual((outside / 'sentinel').read_text(), 'untouched')
+
+    def test_file_replacement_between_lstat_and_open_refuses_the_new_descriptor(self):
+        self.cut(); selected = self.path / store.DIRECTORY / 'review-1' / 'snapshot.json'
+        replacement = self.parent / 'replacement.dat'; replacement.write_bytes(b'competing file')
+        real_open = store.os.open; switched = []
+        def replace_then_open(path, flags, *args, **kwargs):
+            if Path(path) == selected and not switched:
+                os.replace(replacement, selected); switched.append(True)
+            return real_open(path, flags, *args, **kwargs)
+        with patch.object(store.os, 'open', replace_then_open), self.assertRaisesRegex(ValueError, 'cannot be verified'):
+            store._read(selected, 1024)
+        self.assertEqual(switched, [True])
+        self.assertEqual(selected.read_bytes(), b'competing file')
+
     @unittest.skipUnless(hasattr(os, 'mkfifo'), 'FIFOs require POSIX; actual Linux proof remains required')
     def test_selected_fifo_refuses_without_waiting_for_a_writer(self):
         self.cut(); selected = self.path / store.DIRECTORY / 'review-1' / 'BRD.md'; selected.unlink()
