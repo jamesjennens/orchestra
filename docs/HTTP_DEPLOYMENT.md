@@ -1661,6 +1661,9 @@ leaving the SSH path alone. No decision is built here beyond the service-only ru
 agent can write its first one from the brief alone.
 - `activity_cursor`: the cursor a checkpoint must carry. It is the same value the
   history route returns. (With `--backend inprocess` it is null and not needed.)
+- `next_action` and `review.next_actor` for every task (kittrial-5bb.291 item 3): the
+  same next-action sentence and caller-neutral role the work queue already carries, so
+  a reader of the brief alone knows whose move it is without a second read.
 - `checkpoint_template`: the record to send, for this task at this moment.
   - `send_to` and `method`: where it goes.
   - `body`: every field, with `previous` and `activity_cursor` already filled, the four
@@ -3202,7 +3205,9 @@ targets, unreadable state and missing authority refuse without an assignment eff
 Assignment changes the assignee. Unassigning an `in_progress` task with no
 contribution in flight also returns its native status to `open`. An undelivered
 ordinary task then appears in the available-work queue and another contributor
-can claim it. A task with delivered history retains the existing delivered-work
+can claim it. Unassigning a `blocked` task leaves it blocked: it has no holder and
+is not claimable (kittrial-5bb.291 item 4), so it stays out of the available-work
+queue until somebody reopens it. A task with delivered history retains the existing delivered-work
 claim guard; use assignment to name its next holder. With an in-flight contribution,
 unassignment retains its status and review items, and an awaiting-review or
 changes-requested contribution still requires the explicit displacement flag.

@@ -332,6 +332,28 @@ class NativeAssignmentTests(RulesHelpers,unittest.TestCase):
         approved=harness.request('POST','/v1/projects/pp/tasks/'+tid+'/reviews',dict(body,operation_id='other-party-approval-0001'),token=other_token)
         self.assertEqual(201,approved.status,approved.data)
 
+    def test_the_endpoint_refuses_a_roster_read_without_verified_authority(self):
+        """Mutant M4 of the second .211 review: removing the endpoint's own authority
+        check on the roster read used to be caught by no test (the web route's
+        coordinate check still refuses). This is that test: the endpoint alone, with
+        a missing or forged authority, must refuse before it lists anyone."""
+        harness, owner = self.web()
+        page = [json.dumps(dict(offset=0, limit=200))]
+        # No authority descriptor at all: the endpoint's own check refuses.
+        reply = fixture.endpoint.execute(self.root, dict(
+            project='pp', actor=harness.admin_user['id'], action='assignment-roster',
+            args=page, require_authority=True))
+        self.assertEqual(2, reply['returncode'], reply)
+        self.assertEqual(403, reply.get('assignment_status'), reply)
+        # A forged capability/project binding is refused the same way.
+        forged = dict(project='pp', capability='tasks.write', via='session',
+                      user_id=harness.admin_user['id'], store=str(harness.store.path))
+        reply = fixture.endpoint.execute(self.root, dict(
+            project='pp', actor=harness.admin_user['id'], action='assignment-roster',
+            args=page, require_authority=True, authority=forged))
+        self.assertEqual(2, reply['returncode'], reply)
+        self.assertEqual(403, reply.get('assignment_status'), reply)
+
     def test_forged_canonical_block_and_unconfigured_ssh_cannot_assign(self):
         from unittest.mock import patch
         harness,owner=self.web();old=harness.admin_user['id'];target,_=self.member(harness,owner,'binding-target')
