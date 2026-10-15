@@ -1978,6 +1978,8 @@ console.log(JSON.stringify({
         self.assertNotIn('cacert = $HOME/', result['rewrite'])  # no cert: no curl option written
         self.assertNotIn('GetFolderPath', result['rewrite'])
 
+    @unittest.skipIf(os.name == 'nt', 'the POSIX rewrite command runs in a POSIX shell; '
+                     'Windows runs the PowerShell command, pinned by its own test')
     def test_the_rewrite_writes_the_expanded_cacert_path(self):
         # kittrial-5bb.275 rev2: curl does not expand %USERPROFILE% or ~ inside a config file.
         # The rewrite command must write the REAL path on the person's machine. Run the POSIX
