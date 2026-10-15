@@ -1421,9 +1421,11 @@ class GuidanceAdminTests(unittest.TestCase):
 
     @unittest.skipIf(sys.platform == 'win32', 'admin.py host commands take the POSIX lock')
     def test_a_repair_whose_audit_write_fails_succeeds_and_says_so(self):
-        # kittrial-5bb.125: the warning path, forced for real. The audit is written through
-        # .guidance-repair.tmp (coordination.atomic); a directory there makes that write
-        # fail with an OSError after the record was already repaired, and only that write.
+        # kittrial-5bb.125: the warning path. The audit is written through
+        # coordination.atomic, which since kittrial-5bb.281 uses a UNIQUE temporary per
+        # writer, so a directory at the old fixed .guidance-repair.tmp no longer blocks
+        # it. The audit write's own OSError is injected instead, and only that write's:
+        # the record write and the guidance text still go through the real atomic.
         (self.root / 'deployment.private.json').write_text(
             json.dumps({'operators': ['operator-1']}), encoding='utf-8')
         self.run_admin(['set-guidance', 'example', '--actor', 'operator-1', '--file', str(self.document)])
@@ -1432,9 +1434,13 @@ class GuidanceAdminTests(unittest.TestCase):
         (self.project / '.guidance.json').write_text(json.dumps(meta), encoding='utf-8')
         with self.assertRaises(ValueError):
             guidance.validate_meta(guidance.read_meta(self.project))
-        blocker = self.project / '.guidance-repair.tmp'
-        blocker.mkdir()
-        stdout, _ = self.run_admin(['set-guidance', 'example', '--actor', 'operator-1', '--file', str(self.document)])
+        real = guidance.atomic
+        def cut(target, value, **options):
+            if Path(target).name == guidance.REPAIR_NAME:
+                raise OSError('synthetic audit write failure')
+            return real(target, value, **options)
+        with patch.object(guidance, 'atomic', side_effect=cut):
+            stdout, _ = self.run_admin(['set-guidance', 'example', '--actor', 'operator-1', '--file', str(self.document)])
         self.assertIn('Project guidance repaired', stdout)
         self.assertIn('The guidance record was repaired, but the repair audit .guidance-repair.json could not be '
                       'written, so readers show the original setter without the repair.', stdout)
@@ -1444,7 +1450,6 @@ class GuidanceAdminTests(unittest.TestCase):
         guidance.validate_meta(guidance.read_meta(self.project))     # the record is repaired
         self.assertFalse((self.project / guidance.REPAIR_NAME).exists())
         self.assertNotIn('repaired_by', guidance.state(self.project, 'worker-1'))
-        self.assertTrue(blocker.is_dir())
         self.assertNotIn(str(self.root), stdout)
 
     @unittest.skipIf(sys.platform == 'win32', 'admin.py host commands take the POSIX lock')
