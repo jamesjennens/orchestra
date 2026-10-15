@@ -594,11 +594,25 @@ class PrintedCoordinatorLineTests(unittest.TestCase):
     """The client reaches the action by name, so a coordinator never hand-crafts JSON."""
 
     def test_the_client_dispatches_the_coordinator_action(self):
-        import client
-        source = (KIT/'client.py').read_text(encoding='utf-8')
-        marker = "args[:1] in (['brief']"
-        line = next(line for line in source.splitlines() if marker in line)
-        self.assertIn("['coordinator']", line)
+        """The action reaches the endpoint by name (kittrial-5bb.283 review item 2).
+
+        Read from the client's own table, not from a source line: the old test matched the dispatch
+        text and broke on a refactor that kept the behaviour. This asserts the table, and that
+        ``main()`` really sends the action by name.
+        """
+        self.assertIn('coordinator', client.CLIENT_ACTIONS)
+        self.assertIn('coordinator', client.contributor_command_names())
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory)/'config.json'
+            config.write_text('{}', encoding='utf-8')
+            with mock.patch.object(sys, 'argv', ['client.py', '--config', str(config), '--project', 'example',
+                                                 '--actor', 'alice/session', '--', 'coordinator', 'status']), \
+                    mock.patch.object(client, 'request',
+                                      return_value={'stdout': '', 'stderr': '', 'returncode': 0}) as request, \
+                    mock.patch.object(sys, 'stdout', mock.MagicMock()):
+                self.assertEqual(client.main(), 0)
+        positional = request.call_args.args
+        self.assertEqual(positional[4], 'coordinator', positional)
 
 
 @POSIX

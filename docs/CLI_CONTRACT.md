@@ -210,6 +210,26 @@ as JSON on stdout, exactly as the usage line and option list say. The `checkpoin
 usage line is `checkpoint TASK --file checkpoint.json [--json]`. Help is data, not a
 `SystemExit`, so it survives the endpoint envelope.
 
+### `help`: the commands a contributor may run
+
+`client.py help` (and `client.py --help`) prints every command a contributor may run,
+one line each, and names `docs start` and `docs worker-guide` as the two documents to
+read first. The client answers it itself, without the endpoint, so a worker that cannot
+reach the office still gets it; so does a client invoked with no command.
+
+A command outside the contributor interface is answered the same way, not with a nudge
+towards the operator's tool: the answer carries the list, `Did you mean ...?` when the
+name is close to one of them (`briefing` -> `brief TASK`, `workerguide` ->
+`docs worker-guide`), and the sentence **`admin.py is for the installation operator on
+the server, not for workers`**. A current client answers that without the endpoint; an
+older client or a direct caller gets the same answer from the endpoint, which still
+refuses everything outside the contributor interface (its `ALLOWED` native commands are
+unchanged).
+
+`feedback` in that list is **Orchestra feedback** - about Orchestra itself, not about the
+project, whose own work goes into tasks, comments and requirements. Changes requested on
+a delivery are a *review request*, never "feedback".
+
 ## `work`: list/queue shape
 
 `work` returns:

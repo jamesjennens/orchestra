@@ -16,6 +16,7 @@ if sys.version_info < (3, 10):
                      % (sys.version_info[0], sys.version_info[1], sys.version_info[2], sys.executable))
     sys.exit(2)
 import argparse
+import difflib
 import hashlib
 import json
 import re
@@ -522,8 +523,111 @@ def _capability_check(args,config,project,actor,out):
     return _emit(0,json.dumps(payload,ensure_ascii=True,indent=2)+'\n',
                  ''.join('warning: %s\n' % warning for warning in warnings),out)
 
+#: The commands a contributor may run, one line each (kittrial-5bb.283): ``client.py help`` prints
+#: this, an unknown command is answered with it, and the endpoint's refusal repeats it. The same
+#: table lives in endpoint.py - a worker is handed this file on its own, so it must not import a
+#: server-side module - and tests/test_endpoint_help.py keeps the two copies equal.
+CONTRIBUTOR_COMMANDS = (
+    ('brief TASK', 'the compact read of one task: its state, its newer activity, its checkpoint'),
+    ('history TASK', "the task's comments and review records, newest first"),
+    ('checkpoint TASK --file FILE', 'record where you are on a task, for the next run'),
+    ('work', 'the tasks whose move is yours, and the ones you may claim'),
+    ('ready', 'the tasks nobody holds that you may claim'),
+    ('session register|resume|end', 'the actor session the endpoint keeps for you'),
+    ('review TASK --file FILE', 'contribute a delivery, answer review items, or record a review'),
+    ('handoff ...', 'hand a task to another actor, and read what the endpoint reconciled'),
+    ('guidance get|ack', 'the worker guidance in force, and the acknowledgement of a version'),
+    ('onboard', 'what a new worker is told about this project'),
+    ('docs NAME', 'a kit document; read `docs start` and `docs worker-guide` first'),
+    ('feedback add|list|correct', 'Orchestra feedback - about Orchestra itself, not about the project'),
+    ('requirement ...', 'requirement records (the project owns these)'),
+    ('requirements ...', 'requirement reads and owner answers'),
+    ('ref ...', 'reference records'),
+    ('capability ...', 'capability records: find, get, list, propose, revise, verify'),
+    ('proposal ...', 'proposal records and their review'),
+    ('coordinator ...', 'the coordinator reads for this project'),
+    ('refresh', 'refresh the cached export the reads are answered from'),
+    ('view [NAME]', 'render one of the project views'),
+    ('list', 'the tasks of the project'),
+    ('show TASK', 'one task as the tracker holds it'),
+    ('search TEXT', 'the tasks matching a search'),
+    ('count', 'how many tasks match'),
+    ('create ...', 'create a task'),
+    ('update TASK ...', 'change a task'),
+    ('close TASK', 'close a task'),
+    ('reopen TASK', 'reopen a closed task'),
+    ('comments TASK', 'the comments of a task'),
+    ('comments add TASK --file FILE', 'add a comment'),
+    ('dep ...', 'the dependencies of a task'),
+    ('state ...', 'the state events of a task'),
+    ('lint', 'check the tracker for problems'),
+)
+
+#: The two documents a new worker should read, named in every answer this module gives (the task
+#: says both by name: kittrial-5bb.283).
+DOCS_TO_READ_FIRST = ('docs start', 'docs worker-guide')
+
+#: The sentence every answer about a command outside the contributor interface carries: the refusal
+#: used to point a worker at the installation operator's own host tool (kittrial-5bb.283).
+ADMIN_TOOL_NOTE = 'admin.py is for the installation operator on the server, not for workers'
+
+#: What someone typing a name that is nearly a command probably meant. The two the task names, and
+#: the spellings seen in the field; anything else falls back to difflib.
+NEAREST_COMMANDS = {'briefing': 'brief TASK', 'workerguide': 'docs worker-guide',
+                    'worker-guide': 'docs worker-guide', 'workersguide': 'docs worker-guide'}
+
+#: The actions the client dispatches itself; every other name in the table above is passed to the
+#: endpoint. The dispatch in main() is written in terms of this tuple, and a test holds every one of
+#: its names to a line of the table, so the help cannot fall behind the commands (kittrial-5bb.283).
+CLIENT_ACTIONS = ('brief','history','checkpoint','onboard','docs','session','handoff','review','work',
+                  'feedback','requirement','requirements','ref','capability','proposal','guidance',
+                  'coordinator')
+
+
+def contributor_command_names():
+    """The first word of every command in the table: what a contributor may type."""
+    return tuple(dict.fromkeys(usage.split()[0] for usage, _text in CONTRIBUTOR_COMMANDS))
+
+
+def nearest_contributor_command(name):
+    """The command ``name`` probably meant, or ``None`` (kittrial-5bb.283).
+
+    The names people actually mistype are answered from the table above; anything else is matched
+    against the command names, so a near miss still gets an answer rather than silence.
+    """
+    if name in NEAREST_COMMANDS:
+        return NEAREST_COMMANDS[name]
+    close = difflib.get_close_matches(name, sorted(contributor_command_names()), n=1, cutoff=0.6)
+    return close[0] if close else None
+
+
+def contributor_help_text(unknown=None):
+    """The answer a contributor gets: the commands it may run, and the two documents to read.
+
+    ``unknown`` is the command someone typed that is not one of them; the answer then names the
+    nearest command when there is one, and always says where admin.py belongs (kittrial-5bb.283).
+    """
+    lines = []
+    if unknown is None:
+        lines.append('The commands a contributor may run, one line each:')
+    else:
+        lines.append('%r is outside the contributor interface. The commands a contributor may run, '
+                     'one line each:' % unknown)
+    lines += ['  %s - %s' % (usage, text) for usage, text in CONTRIBUTOR_COMMANDS]
+    lines.append('')
+    lines.append('Read %s and %s first.' % DOCS_TO_READ_FIRST)
+    if unknown is not None:
+        nearest = nearest_contributor_command(unknown)
+        if nearest is not None:
+            lines.append('Did you mean `%s`?' % nearest)
+    lines.append(ADMIN_TOOL_NOTE + '.')
+    return '\n'.join(lines)
+
+
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--version',action='store_true')
+    p=argparse.ArgumentParser(epilog=contributor_help_text(),
+                              formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument('--version',action='store_true')
     p.add_argument('--config');p.add_argument('--project');p.add_argument('--actor')
     p.add_argument('--out',help='write the command result to this path as UTF-8 instead of stdout')
     p.add_argument('args',nargs=argparse.REMAINDER);a=p.parse_args()
@@ -531,6 +635,12 @@ def main():
         print(line(report(Path(__file__).resolve().parent, "client")))
         return 0
     args=a.args[1:] if a.args[:1]==['--'] else a.args
+    # help is a contributor command, answered HERE and never sent to the endpoint
+    # (kittrial-5bb.283): a worker asking for help must not need a server, and the endpoint's own
+    # refusal is what this replaces. No command at all answers the same way.
+    if not args or args[:1]==['help']:
+        print(contributor_help_text())
+        return 0
     if args[:1]==['capability'] and not (len(args)>1 and args[1] in CAPABILITY_ENDPOINT):
         if len(args)>1 and args[1]=='lookup' and a.config and a.project:
             return _capability_lookup(args[2:],json.loads(Path(a.config).read_text()),a.project,a.actor,a.out)
@@ -542,11 +652,18 @@ def main():
         return _capability(args[1:],a.out)
     if not a.config or not a.project:
         p.error('the following arguments are required: --config, --project')
+    # A command outside the contributor interface is answered, not refused with a pointer at the
+    # operator's tool: the endpoint refuses it too, and this is the same answer without the round
+    # trip (kittrial-5bb.283). Every name a contributor may type is in the table, including the
+    # native subset the client passes through.
+    if args[0] not in contributor_command_names():
+        print(server_text(contributor_help_text(args[0])), file=sys.stderr)
+        return 1
     action='bd';path=None
     if args[:1]==['refresh']:action='refresh';args=[]
     elif args[:1]==['view']:
         action='view';path=args[1] if len(args)>1 else 'CURRENT.md';args=[]
-    elif args[:1] in (['brief'],['history'],['checkpoint'],['onboard'],['docs'],['session'],['handoff'],['review'],['work'],['feedback'],['requirement'],['requirements'],['ref'],['capability'],['proposal'],['guidance'],['coordinator']):action=args.pop(0)
+    elif args[0] in CLIENT_ACTIONS:action=args.pop(0)
     result=request(json.loads(Path(a.config).read_text()),a.project,a.actor,args,action,path)
     output = result['stdout']
     # The server's time of a write that was carried out (kittrial-5bb.97): one line on standard
