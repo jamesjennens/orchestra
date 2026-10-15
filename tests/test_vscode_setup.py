@@ -763,7 +763,9 @@ class TheDialogAndThePageCase(unittest.TestCase):
     """Static checks of what the page offers, where node may not be installed at all."""
 
     def test_the_guide_says_what_the_credential_file_holds(self):
-        # After set-up step 6 it holds three lines (two comments and the header line), not one (N4).
+        # After set-up step 6 without its own certificate it holds three lines (two comments
+        # and the header line), not one (N4). With a certificate it holds the curl options too
+        # (kittrial-5bb.275).
         setup = SETUP_JS.read_text(encoding='utf-8')
         self.assertIn('It holds three lines: two comment lines (the server address and the certificate '
                       'fingerprint) and then ${headerLine()}.', setup)
