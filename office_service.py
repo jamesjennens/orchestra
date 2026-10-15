@@ -24,13 +24,16 @@ import re
 import signal
 import socket
 import ssl
+import stat
 import subprocess
 import sys
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 from urllib.request import urlopen
 
 import admin
+import record_json
 from version import report
 
 
@@ -49,32 +52,76 @@ def private_root(raw):
 #: given, on any address. ``plain-http-on-network``: no certificate, on an address other
 #: hosts can reach; only with the explicit setting below, and with a warning at every start.
 LOOPBACK_HOSTS = ('127.0.0.1', '::1', 'localhost')
-WILDCARD_HOSTS = ('0.0.0.0', '::')
+#: A lone ``0`` is the system's ``0.0.0.0`` (kittrial-5bb.168 item 5): it binds every address just
+#: as the long forms do, so it needs ``public_url`` too.
+WILDCARD_HOSTS = ('0.0.0.0', '0', '::')
 HOST = re.compile(r'[A-Za-z0-9:]([A-Za-z0-9.:-]{0,251}[A-Za-z0-9:])?')
+#: A host with a port written into it: ``name:1234``, or a bracketed IPv6 literal with a port. A
+#: bare IPv6 literal (``::``, ``fd00::5``) has two or more colons and no port, so it does not match.
+PORT_IN_HOST = re.compile(r'^(?:\[[^\]]+\]|[^:]+):[0-9]{1,5}$')
 PLAINTEXT_SETTING = 'allow_plaintext_on_network'
+#: Off by default (kittrial-5bb.168 item 6): turning it on asks every browser that reached the
+#: service over HTTPS to use HTTPS only for this host, which a self-signed first install must not
+#: force, and a proxy in front already may. The operator's word turns it on for HTTPS responses.
+HSTS_SETTING = 'strict_transport_security'
 PLAINTEXT_WARNING = ('WARNING: serving plain HTTP on %s:%d. Passwords and session cookies cross the network '
                      'unencrypted. Use cert and key for HTTPS.')
 
 
 def service_config(path):
-    config = json.loads(Path(path).read_text(encoding='utf-8'))
+    # The file itself is named for every way reading it can fail (kittrial-5bb.168 item 3): a
+    # plain JSON error named neither the file nor that the file was the problem.
+    try:
+        text = Path(path).read_text(encoding='utf-8')
+    except OSError as error:
+        raise ValueError('Cannot read office service configuration %s: %s'
+                         % (path, error.strerror or error)) from None
+    try:
+        config = json.loads(text)
+    except ValueError:
+        raise ValueError('Office service configuration %s is not JSON: give valid JSON, or the path of the '
+                         'configuration file' % path) from None
+    if not isinstance(config, dict):
+        raise ValueError('Office service configuration %s must be a JSON object, not %s'
+                         % (path, type(config).__name__))
     if config.get('schema_version') != 1:
         raise ValueError('Office service configuration must have schema_version 1')
     allowed = {'schema_version', 'http_host', 'http_state', 'cert', 'key',
                'trusted_proxies', 'public_url', 'endpoint_timeout', 'connections_per_address', 'logins_per_address',
-               'approval_by_another_party', PLAINTEXT_SETTING}
+               'approval_by_another_party', PLAINTEXT_SETTING, HSTS_SETTING}
     if set(config) - allowed:
         raise ValueError('Unknown office service setting: ' + ', '.join(sorted(set(config)-allowed)))
+    for setting in ('cert', 'key'):
+        value = config.get(setting)
+        if value is not None and not isinstance(value, str):
+            raise ValueError('%s must be the path of a file, as a string, not %s'
+                             % (setting, type(value).__name__))
     if bool(config.get('cert')) != bool(config.get('key')):
         raise ValueError('cert and key must be supplied together')
     host = config.get('http_host', '127.0.0.1')
     if not isinstance(host, str) or not HOST.fullmatch(host):
         raise ValueError('http_host must be a host name or an address')
+    if PORT_IN_HOST.fullmatch(host):
+        raise ValueError('http_host must not carry a port: give the address alone and the port in --port (got %s)' % host)
+    public_url = config.get('public_url')
+    if public_url is not None:
+        # urlsplit itself refuses a port that is not a number; either way the setting is named.
+        try:
+            named = urlsplit(public_url) if isinstance(public_url, str) else None
+            scheme, hostname = (named.scheme, named.hostname) if named is not None else (None, None)
+            if named is not None:
+                named.port                                  # raises when the port is not a number
+        except ValueError:
+            scheme, hostname = None, None
+        if scheme not in ('http', 'https') or not hostname:
+            raise ValueError('public_url must be an http or https URL with a host (got %r)' % (public_url,))
     if not isinstance(config.get('approval_by_another_party', False), bool):
         raise ValueError('approval_by_another_party must be true or false')
     plain = config.get(PLAINTEXT_SETTING, False)
     if not isinstance(plain, bool):
         raise ValueError(PLAINTEXT_SETTING + ' must be true or false')
+    if not isinstance(config.get(HSTS_SETTING, False), bool):
+        raise ValueError(HSTS_SETTING + ' must be true or false')
     # Loopback stays the default. Off loopback the listener needs a certificate, or the
     # operator's explicit word that plain HTTP on the network is meant.
     if plain and host in LOOPBACK_HOSTS:
@@ -102,6 +149,176 @@ def service_config(path):
                 raise ValueError('%s must be a whole number from 1 to %d: how many of the %d %s'
                                  % (setting, total, total, of_what))
     return config
+
+
+#: The PEM markers that say what a file is without decoding it.
+_PEM_CERTIFICATE = '-----BEGIN CERTIFICATE-----'
+_PEM_KEYS = ('-----BEGIN PRIVATE KEY-----', '-----BEGIN RSA PRIVATE KEY-----',
+             '-----BEGIN EC PRIVATE KEY-----', '-----BEGIN ENCRYPTED PRIVATE KEY-----')
+
+
+def _readable_file(path):
+    """Why ``path`` cannot be read, or None: 'missing', 'directory', 'notafile' or 'unreadable'."""
+    try:
+        if not os.path.exists(path):
+            return 'missing'
+        if os.path.isdir(path):
+            return 'directory'
+        # A FIFO, device or socket is opened before it is read, which can block a start forever.
+        if not stat.S_ISREG(os.stat(path).st_mode):
+            return 'notafile'
+        with open(path, 'rb') as stream:
+            stream.read(1)
+    except OSError:
+        return 'unreadable'
+    return None
+
+
+def _pem_kind(path):
+    """'certificate', 'key', 'encrypted-key' or None, from the first bytes of the file only."""
+    try:
+        with open(path, 'r', encoding='utf-8', errors='replace') as stream:
+            head = stream.read(4096)
+    except OSError:
+        return None
+    if '-----BEGIN ENCRYPTED PRIVATE KEY-----' in head or 'Proc-Type: 4,ENCRYPTED' in head:
+        return 'encrypted-key'
+    if _PEM_CERTIFICATE in head:
+        return 'certificate'
+    if any(marker in head for marker in _PEM_KEYS):
+        return 'key'
+    return None
+
+
+def certificate_path(value, root):
+    """The certificate or key file a setting names, as the WEB CHILD will open it.
+
+    A relative path is relative to the runtime root, because the child is spawned with
+    ``cwd=root``; resolving it any other way makes the supervisor check one file while the child
+    serves another (kittrial-5bb.168 review 1). The supervisor hands the child this absolute path
+    so both read the same file.
+    """
+    path = Path(value).expanduser()
+    if path.is_absolute():
+        return str(path)
+    return os.path.normpath(os.path.join(str(root), str(path)))
+
+
+def certificate_preflight(settings, root):
+    """Load the certificate and key before anything is started (kittrial-5bb.168 item 1).
+
+    The pair used to be loaded only inside the web child, so the supervisor said only "A
+    supervised child exited" and ``http.log`` ended in a traceback. Here every way the pair can
+    be unusable raises one sentence that names the file and what is wrong: the caller prints it
+    and starts nothing. The pair is loaded with an empty password, so an encrypted key is
+    refused here instead of asking the terminal for a passphrase. No key text is ever printed.
+
+    Returns the ``(cert, key)`` the child must be given - the files that were checked, with a
+    relative ``cert``/``key`` resolved against ``root`` - or ``None`` when no certificate is
+    configured.
+    """
+    cert, key = settings.get('cert'), settings.get('key')
+    if not cert:
+        return None
+    cert, key = certificate_path(cert, root), certificate_path(key, root)
+    for name, path in (('certificate', cert), ('key', key)):
+        state = _readable_file(path)
+        if state == 'missing':
+            raise ValueError('The %s file %s does not exist. Give the path of the file that was installed'
+                             % (name, path))
+        if state == 'directory':
+            raise ValueError('The %s file %s is a directory, not a file' % (name, path))
+        if state == 'notafile':
+            raise ValueError('The %s file %s is not a regular file' % (name, path))
+        if state == 'unreadable':
+            raise ValueError('The %s file %s cannot be read (permission denied). Make it readable by the '
+                             'service account' % (name, path))
+    cert_kind, key_kind = _pem_kind(cert), _pem_kind(key)
+    if cert_kind in ('key', 'encrypted-key') and key_kind == 'certificate':
+        raise ValueError('The certificate file %s and the key file %s look swapped: give the certificate in cert '
+                         'and the private key in key' % (cert, key))
+    if cert_kind != 'certificate':
+        raise ValueError('The certificate file %s is not a PEM certificate: it must hold a %s block'
+                         % (cert, _PEM_CERTIFICATE))
+    if key_kind == 'encrypted-key':
+        raise ValueError('The key file %s needs a passphrase, and the office service cannot ask for one. Give an '
+                         'unencrypted key (openssl rsa -in %s -out <unencrypted.key>)' % (key, key))
+    if key_kind != 'key':
+        raise ValueError('The key file %s is not a PEM private key: it must hold a PRIVATE KEY block' % key)
+    try:
+        ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER).load_cert_chain(cert, key, password='')
+    except ssl.SSLError as failed:
+        if getattr(failed, 'errno', None) == 116 or 'KEY_VALUES_MISMATCH' in str(failed):
+            raise ValueError('The key file %s does not match the certificate file %s: they are not a pair'
+                             % (key, cert)) from None
+        raise ValueError('The certificate file %s and the key file %s are each PEM, but not a pair this service '
+                         'can serve' % (cert, key)) from None
+    except OSError:
+        raise ValueError('The certificate file %s and the key file %s cannot be loaded: a passphrase, or a form '
+                         'of PEM this service cannot use' % (cert, key)) from None
+    return cert, key
+
+
+def certificate_window(path):
+    """(notBefore, notAfter) as epoch seconds, or None when this interpreter cannot read them.
+
+    ``ssl._ssl._test_decode_cert`` is the decoder CPython itself uses to fill ``getpeercert()``;
+    when this interpreter lacks it, ``cryptography`` is tried; when neither is available the
+    caller says the warning is skipped rather than guessing the dates.
+    """
+    decoder = getattr(getattr(ssl, '_ssl', None), '_test_decode_cert', None)
+    if decoder is not None:
+        try:
+            decoded = decoder(str(path))
+            return (ssl.cert_time_to_seconds(decoded['notBefore']),
+                    ssl.cert_time_to_seconds(decoded['notAfter']))
+        except (OSError, ValueError, KeyError, ssl.SSLError):
+            return None
+    try:
+        from datetime import timezone
+        from cryptography import x509
+        with open(path, 'rb') as stream:
+            parsed = x509.load_pem_x509_certificate(stream.read())
+        return (int(parsed.not_valid_before.replace(tzinfo=timezone.utc).timestamp()),
+                int(parsed.not_valid_after.replace(tzinfo=timezone.utc).timestamp()))
+    except (ImportError, OSError, ValueError, AttributeError):
+        return None
+
+
+def start_warnings(settings):
+    """The warning lines a start prints: a shared-readable key, and an out-of-date certificate.
+
+    The key's mode is a WARNING, not a refusal (kittrial-5bb.168 item 4): a first install can have
+    a root-owned key readable by the service account's group, and refusing would break it. The
+    reason is in docs/OFFICE_SERVICE.md. An expired or not-yet-valid certificate is a WARNING too;
+    when the interpreter cannot read the certificate's validity the warning is skipped and that
+    is said, rather than guessing.
+    """
+    lines = []
+    key = settings.get('key')
+    if key:
+        try:
+            mode = os.stat(key).st_mode & 0o777
+        except OSError:
+            mode = None
+        if mode is not None and mode & 0o077:
+            lines.append('WARNING: the key file %s is readable by %s (mode %04o). A first install may have a '
+                         'root-owned key readable by the service account group; tighten it with chmod 600 %s.'
+                         % (key, 'everyone' if mode & 0o007 else 'the group', mode, key))
+    cert = settings.get('cert')
+    if cert:
+        window = certificate_window(cert)
+        now = time.time()
+        if window is None:
+            lines.append('NOTE: the validity of the certificate %s cannot be read on this interpreter, so no '
+                         'expiry warning is given.' % cert)
+        elif window[1] < now:
+            lines.append('WARNING: the certificate %s expired on %s. Replace it before it is used further.'
+                         % (cert, time.strftime('%Y-%m-%d', time.gmtime(window[1]))))
+        elif window[0] > now:
+            lines.append('WARNING: the certificate %s is not valid until %s.'
+                         % (cert, time.strftime('%Y-%m-%d', time.gmtime(window[0]))))
+    return lines
 
 
 def _after_fork():
@@ -281,7 +498,7 @@ def listener(settings, port):
     secure = bool(settings.get('cert'))
     shape = 'https' if secure else ('loopback' if host in LOOPBACK_HOSTS else 'plain-http-on-network')
     # A wildcard is asked on loopback; any other address is asked as it is bound.
-    asked = {'0.0.0.0': '127.0.0.1', '::': '::1'}.get(host, host)
+    asked = {'0.0.0.0': '127.0.0.1', '0': '127.0.0.1', '::': '::1'}.get(host, host)
     bracket = lambda name: '[%s]' % name if ':' in name else name
     scheme = 'https' if secure else 'http'
     return {'shape': shape, 'host': host, 'port': port,
@@ -292,15 +509,23 @@ def listener(settings, port):
                 None if host in LOOPBACK_HOSTS else '%s://%s:%d' % (scheme, bracket(host), port))}
 
 
-def health(root, port, settings=None):
-    version = report(Path(__file__).resolve().parent)['version']
-    db = _database_ready(root)
-    served = listener(settings, port)
+def _bounded(value, limit=160):
+    """One line, short enough for the health line, whatever the probe said."""
+    return ' '.join(str(value).split())[:limit]
+
+
+def _web_probe(served, expected):
+    """Whether the listener answers as this service, and why not when it does not.
+
+    ``/healthz`` carries this service's own mark (kittrial-5bb.168 item 8): its name, version and
+    build id. A plain web server, or another Orchestra service, answering 200 on the port does not
+    carry it, and reads ``web=down`` with the reason. The returned reason is bounded.
+    """
     try:
         if served['probe'].startswith('https:'):
             # The service asking its own listener whether it answers, on this host. The
             # certificate is not verified here: a self-signed one must work, and this
-            # probe sends nothing and trusts nothing it reads beyond "200".
+            # probe sends nothing and trusts nothing it reads beyond the mark.
             context = ssl.create_default_context()
             context.check_hostname = False
             context.verify_mode = ssl.CERT_NONE
@@ -308,21 +533,54 @@ def health(root, port, settings=None):
         else:
             response = urlopen(served['probe'], timeout=2)
         with response:
-            web = response.status == 200
-    except (OSError, ValueError):
-        web = False
+            status = response.status
+            raw = response.read(2000) if status == 200 else b''
+        if status != 200:
+            return False, 'the health address answered HTTP %s, not 200' % status
+        try:
+            # Through the kit's guard, not bare json.loads: the answer can come from WHATEVER
+            # holds the port (that is what the mark below is for), and a deeply nested one must
+            # read as "not this service" rather than raising RecursionError (kittrial-5bb.168
+            # review item 2). A NestingError IS a ValueError, as caught here.
+            mark = record_json.loads(raw.decode('utf-8', 'replace')) if raw else {}
+        except ValueError:
+            mark = None
+        if isinstance(mark, dict) and mark.get('service') == 'orchestra-office':
+            if (mark.get('version'), mark.get('build_id')) == expected:
+                return True, ''
+            return False, ('another Orchestra service holds the port (it reports version=%s build_id=%s)'
+                           % (_bounded(mark.get('version'), 40), _bounded(mark.get('build_id'), 40)))
+        return False, 'another program holds the port; its /healthz answer is not this service\'s'
+    except (OSError, ValueError) as failed:
+        return False, _bounded(getattr(failed, 'reason', None) or failed)
+
+
+def health(root, port, settings=None):
+    info = report(Path(__file__).resolve().parent)
+    db = _database_ready(root)
+    served = listener(settings, port)
+    web, web_reason = _web_probe(served, (info['version'], info['build_id']))
+    backup_reason = ''
     try:
         status = admin.read_backup_status(root)
         backup = status['status']
         if admin.require_complete_problems(root, status):
             backup = 'incomplete'
         backup_time = status.get('generated_at', 'unknown')
-    except (OSError, ValueError, KeyError):
+    except (OSError, ValueError, KeyError) as failed:
         backup, backup_time = 'unknown', 'unknown'
+        backup_reason = _bounded(failed)
+    line = ('version=%s db=%s web=%s backup=%s backup_at=%s' %
+            (info['version'], 'up' if db else 'down', 'up' if web else 'down', backup, backup_time))
+    reasons = []
+    if not web and web_reason:
+        reasons.append('web: %s' % web_reason)
+    if backup == 'unknown' and backup_reason:
+        reasons.append('backup: %s' % backup_reason)
+    if reasons:
+        line += ' reason=' + '; '.join(reasons)
     ok = db and web and backup == 'complete'
-    return ('version=%s db=%s web=%s backup=%s backup_at=%s' %
-            (version, 'up' if db else 'down', 'up' if web else 'down',
-             backup, backup_time)), 0 if ok else 1
+    return line, 0 if ok else 1
 
 
 def web_command(settings, root, port, release_python, release_script):
@@ -345,18 +603,35 @@ def web_command(settings, root, port, release_python, release_script):
         command.extend(['--logins-per-address', settings['logins_per_address']])
     if settings.get('approval_by_another_party') is True:
         command.append('--approval-by-another-party')
+    if settings.get(HSTS_SETTING) is True:
+        command.append('--strict-transport-security')
     return command
 
 
-#: The web service's exit status when its port is taken (``http_service.EXIT_PORT_TAKEN``).
+#: The web service's exit statuses for a start that failed (``http_service.EXIT_*``). The
+#: supervisor says each of them in one line, instead of "A supervised child exited"
+#: (kittrial-5bb.168 follow-up: every other start failure is one line too).
 WEB_PORT_TAKEN = 4
+WEB_ADDRESS_UNAVAILABLE = 5
+WEB_PORT_NOT_PERMITTED = 6
+WEB_CERTIFICATE_UNUSABLE = 7
 
 
 def child_exit_reason(web_status, settings, port):
-    """What the supervisor says when a child has exited; the port being taken is said as that."""
+    """What the supervisor says when a child has exited; each start failure is one sentence."""
+    host = settings.get('http_host', '127.0.0.1')
     if web_status == WEB_PORT_TAKEN:
-        return ('The web service did not start: port %d on %s is taken (something else is listening on it). '
-                'Stop that, or run the service with another --port.' % (port, settings.get('http_host', '127.0.0.1')))
+        return ('The web service did not start: port %d on %s is taken (something else holds it). '
+                'Stop that, or run the service with another --port.' % (port, host))
+    if web_status == WEB_ADDRESS_UNAVAILABLE:
+        return ('The web service did not start: %s is not an address of this host, or its name does not resolve. '
+                'Give an address of the host, or a name that resolves to one.' % host)
+    if web_status == WEB_PORT_NOT_PERMITTED:
+        return ('The web service did not start: port %d cannot be bound without privilege (a port below 1024 needs '
+                'it). Use a port from 1024 to 65535.' % port)
+    if web_status == WEB_CERTIFICATE_UNUSABLE:
+        return ('The web service did not start: the certificate or key cannot be used. The line above it in '
+                'http.log names the file and what is wrong.')
     return 'A supervised child exited; inspect service logs'
 
 
@@ -368,6 +643,16 @@ def run(root, logs, config, port, stop_seconds):
     if not (root/'server.json').is_file() or not (root/'deployment.private.json').is_file():
         raise ValueError('Prepare this runtime before starting it')
     settings = service_config(config)
+    # Before anything is started (kittrial-5bb.168 item 1): an unusable certificate or key is one
+    # sentence naming the file, not a child's traceback and "A supervised child exited". The
+    # warnings of item 4 are printed here too, at every start, and refuse nothing.
+    checked = certificate_preflight(settings, root)
+    if checked:
+        # The pair that was CHECKED is the pair the child is given, with a relative path resolved
+        # against the runtime root the child is spawned in (kittrial-5bb.168 review 1).
+        settings = dict(settings, cert=checked[0], key=checked[1])
+    for line in start_warnings(settings):
+        print(line, file=sys.stderr, flush=True)
     logs = Path(logs).expanduser().resolve()
     log_directory(logs)
     lock_fd = os.open(root/'office-service.lock', os.O_CREAT | os.O_RDWR, 0o600)

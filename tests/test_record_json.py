@@ -313,6 +313,12 @@ class NoUnguardedParseTests(unittest.TestCase):
             # guards both its native task reply and its reserved notice body.
             'task_assignment.py': 2,
             'web_merge_slot.py': 4,
+            # office_service.py (kittrial-5bb.168 review item 2) reads the /healthz answer of
+            # whatever holds the port through the guard, not bare json.loads: the mark check
+            # exists because that answer may come from another program, and a deeply nested one
+            # must read as "not this service" rather than raising RecursionError. The answer is
+            # cut to 2000 bytes first.
+            'office_service.py': 1,
             # Lifecycle host entry and restore identity are bounded untrusted text.
             'web_lifecycle_marks.py': 2,
             # F0: bounded host entries/restore marker and native correction/comment

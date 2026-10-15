@@ -34,6 +34,7 @@ import os
 import record_json
 import re
 import secrets
+import socket
 import ssl
 import sys
 import threading
@@ -57,10 +58,30 @@ from http_auth import (AGENT_SECRET_ENV, agent_secret_file, CAP_ACCOUNTS_ADMIN, 
                        address_group, authority_request, busy, conflict, forbidden, invalid, not_found,
                        not_implemented, now_iso, request_hash, unauthenticated,
                        uncertain, unsupported)
+from version import report as version_report
 
 KIT_VERSION = '0.1.0'
 #: Where the installed kit is: the documents this service shows are read from it.
 KIT_DIRECTORY = Path(__file__).resolve().parent
+#: The mark ``/healthz`` carries so a probe can tell this service from whatever else answers on
+#: the port (kittrial-5bb.168 item 8): its name, version and build id. Read once, then reused.
+_SERVICE_IDENTITY = None
+#: The header an operator turns on with ``--strict-transport-security`` (the private setting
+#: ``strict_transport_security``). Off by default (kittrial-5bb.168 item 6): a self-signed first
+#: install must not pin a browser to HTTPS for the host, and an office may sit behind a proxy.
+HSTS_HEADER = 'max-age=31536000'
+
+
+def service_identity():
+    """What only this service says on ``/healthz``: its name, version and build id."""
+    global _SERVICE_IDENTITY
+    if _SERVICE_IDENTITY is None:
+        info = version_report(KIT_DIRECTORY)
+        _SERVICE_IDENTITY = {'service': 'orchestra-office',
+                             'version': info['version'], 'build_id': info['build_id']}
+    return dict(_SERVICE_IDENTITY)
+
+
 MAX_BODY_BYTES = 262144
 MAX_ATTACHMENTS = 8
 MAX_ATTACHMENT_BYTES = 65536
@@ -3539,6 +3560,9 @@ class ApiHandler(BaseHTTPRequestHandler):
     read_cache_lock = None
     trusted_proxies = ()
     max_body = MAX_BODY_BYTES
+    #: Send ``Strict-Transport-Security`` on HTTPS answers (kittrial-5bb.168 item 6). False
+    #: unless the operator's setting turns it on.
+    hsts = False
     protocol_version = 'HTTP/1.1'
     server_version = 'OrchestraHTTP/' + KIT_VERSION
     sys_version = ''
@@ -3939,6 +3963,11 @@ class ApiHandler(BaseHTTPRequestHandler):
         except Exception:
             pass
 
+    def _send_hsts(self):
+        """``Strict-Transport-Security``, only on an HTTPS answer and only when it is turned on."""
+        if getattr(self, 'hsts', False) and getattr(self.server, 'tls_context', None) is not None:
+            self.send_header('Strict-Transport-Security', HSTS_HEADER)
+
     def _send_json(self, status, body):
         # 204/304 are bodyless by definition; sending a body would desynchronize an
         # HTTP/1.1 keep-alive connection.
@@ -3951,6 +3980,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.send_header('Cache-Control', 'no-store')
         self.send_header('X-Content-Type-Options', 'nosniff')
         self.send_header('Referrer-Policy', 'no-referrer')
+        self._send_hsts()
         self.send_header('X-Request-Id', getattr(self, '_current_request_id', '') or '')
         if getattr(self, '_written_at', None):
             # Set only for the answer of a write that was carried out; _dispatch clears it for the next request.
@@ -4001,6 +4031,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.send_header('Referrer-Policy', 'no-referrer')
         self.send_header('X-Frame-Options', 'DENY')
         self.send_header('Cross-Origin-Opener-Policy', 'same-origin')
+        self._send_hsts()
         self.send_header('X-Request-Id', getattr(self, '_current_request_id', '') or '')
         self.end_headers()
         if status == 200 and self.command != 'HEAD':
@@ -7776,7 +7807,9 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     @route('GET', r'/healthz', anonymous=True, csrf=False)
     def healthz(self, ctx):
-        return 200, {'status': 'ok'}
+        # The mark is what the office service's health reads to tell this service from another
+        # server answering 200 on the port (kittrial-5bb.168 item 8).
+        return 200, dict(service_identity(), status='ok')
 
     @route('GET', r'/v1/service/certificate', anonymous=True, csrf=False)
     def service_certificate(self, ctx):
@@ -7814,13 +7847,14 @@ class ApiHandler(BaseHTTPRequestHandler):
 
 
 def build_handler(service, backend, *, trusted_proxies=(), max_body=MAX_BODY_BYTES,
-                  web_root=DEFAULT_WEB_ROOT):
+                  web_root=DEFAULT_WEB_ROOT, hsts=False):
     return type('ConfiguredApiHandler', (ApiHandler,), {
         'service': service, 'backend': backend,
         'web_root': str(web_root) if web_root is not None else None,
         'read_cache': {}, 'read_cache_lock': threading.Lock(),
         'trusted_proxies': tuple(trusted_proxies or ()),
         'max_body': max_body,
+        'hsts': bool(hsts),
     })
 
 
@@ -7830,9 +7864,33 @@ def build_handler(service, backend, *, trusted_proxies=(), max_body=MAX_BODY_BYT
 SOCKET_GONE = frozenset({errno.EBADF, errno.ENOTSOCK, errno.ENOTCONN, errno.ECONNRESET, errno.ECONNABORTED, errno.EPIPE})
 #: How the error of a connection whose set-up failed for a reason of the server's own begins.
 SETUP_FAILED = 'connection set-up failed: '
-#: The exit status of ``main`` when the port to listen on is taken. The office supervisor
-#: reads it to say so in one line (``office_service.WEB_PORT_TAKEN`` is the same number).
+#: The exit statuses of ``main`` for a start that failed, one reason each. The office supervisor
+#: reads them to say each in one line (``office_service.WEB_*`` are the same numbers), instead of
+#: "A supervised child exited" (kittrial-5bb.168 follow-up).
 EXIT_PORT_TAKEN = 4
+EXIT_ADDRESS_UNAVAILABLE = 5
+EXIT_PORT_NOT_PERMITTED = 6
+EXIT_CERTIFICATE_UNUSABLE = 7
+
+
+def failure_said(error):
+    """The OS's own words for a failed start, one line and bounded, never a traceback."""
+    return (getattr(error, 'strerror', None) or str(error) or type(error).__name__)[:200]
+
+
+def key_needs_a_passphrase(keyfile):
+    """Whether the key file holds an ENCRYPTED PEM block, so the refusal can say so.
+
+    Read only to WORD the one-line refusal: an encrypted PKCS#8 key carries ``BEGIN ENCRYPTED
+    PRIVATE KEY`` and a legacy one ``Proc-Type: 4,ENCRYPTED``, both in the first block. Nothing
+    from the file is printed, and a file that cannot be read is not this case - the loader's own
+    error is what the refusal reports (kittrial-5bb.168 review item 3).
+    """
+    try:
+        with open(keyfile, 'rb') as stream:
+            return b'ENCRYPTED' in stream.read(4096)
+    except OSError:
+        return False
 
 #: How long a client may take over each thing the service waits for from it: completing the
 #: TLS handshake, sending a request (its line and headers; then its body), and taking a
@@ -8246,7 +8304,7 @@ def service_certificate_pem(context):
 def create_server(service, backend, *, host='127.0.0.1', port=0, trusted_proxies=(),
                   max_body=MAX_BODY_BYTES, certfile=None, keyfile=None,
                   allow_plaintext_non_loopback=False, web_root=DEFAULT_WEB_ROOT,
-                  client_seconds=None, connection_limit=None, address_limit=None):
+                  client_seconds=None, connection_limit=None, address_limit=None, hsts=False):
     """Bind the service. Refuse a non-loopback plaintext listener unless explicitly allowed."""
     loopback = host in LOOPBACK
     if not loopback and certfile is None and not allow_plaintext_non_loopback:
@@ -8258,7 +8316,11 @@ def create_server(service, backend, *, host='127.0.0.1', port=0, trusted_proxies
         # Before anything is bound: a certificate or key that cannot be used stops the start.
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.minimum_version = ssl.TLSVersion.TLSv1_2
-        context.load_cert_chain(certfile, keyfile)
+        # An empty password, never None: with an encrypted key and no password OpenSSL asks the
+        # TERMINAL for a passphrase ("Enter PEM pass phrase:"), which a service started by
+        # systemd or the supervisor must never do. With '' it fails at once, and the one-line
+        # arm below names it (kittrial-5bb.168 review item 2.1).
+        context.load_cert_chain(certfile, keyfile, password='')
         # What the handshake actually presents, for GET /v1/service/certificate
         # (kittrial-5bb.203 review 01a12488, items 1 and 2): one in-memory handshake against this
         # very context, so the route can never answer with anything but the certificate a client
@@ -8272,7 +8334,8 @@ def create_server(service, backend, *, host='127.0.0.1', port=0, trusted_proxies
     httpd = server_class((host, port), build_handler(service, backend,
                                                      trusted_proxies=trusted_proxies,
                                                      max_body=max_body,
-                                                     web_root=web_root))
+                                                     web_root=web_root,
+                                                     hsts=hsts))
     # The TLS context is the connection's (ApiHandler.setup): the listening socket stays plain.
     httpd.tls_context = context
     # The public certificate this listener serves, for GET /v1/service/certificate: None when the
@@ -8395,6 +8458,9 @@ def main(argv=None):
     parser.add_argument('--approval-by-another-party', action='store_true',
                         help='nobody approves (or recommends) work of their own party: an account, its agents '
                              'and the worker credentials it issued. Off unless given')
+    parser.add_argument('--strict-transport-security', action='store_true',
+                        help='send Strict-Transport-Security on HTTPS answers only. Off unless given: a '
+                             'self-signed first install must not pin a browser to HTTPS for the host')
     parser.add_argument('--public-url',
                         help='canonical base URL of this service, used only to render '
                              'copyable agent setup/resume snippets (e.g. https://host)')
@@ -8491,17 +8557,46 @@ def main(argv=None):
                               certfile=args.cert, keyfile=args.key,
                               allow_plaintext_non_loopback=args.allow_plaintext_on_network,
                               web_root=None if args.no_web else args.web_root,
-                              address_limit=args.connections_per_address)
+                              address_limit=args.connections_per_address,
+                              hsts=args.strict_transport_security)
     except OSError as failed:
         # On Windows a port another program holds for itself alone is refused as "access", not "in use".
-        if failed.errno != errno.EADDRINUSE and getattr(failed, 'winerror', None) != 10013:
-            raise
-        # One line and a status of its own, not a traceback: the commonest reason a service
-        # does not start, and the operator must be able to read it.
-        print('orchestra-http: port %d on %s is taken: something else is listening on it, so the web service did '
-              'not start. Stop that, or start this service on another port.' % (args.port, args.host),
-              file=sys.stderr, flush=True)
-        return EXIT_PORT_TAKEN
+        if failed.errno == errno.EADDRINUSE or getattr(failed, 'winerror', None) == 10013:
+            # One line and a status of its own, not a traceback: the commonest reason a service
+            # does not start, and the operator must be able to read it. A socket bound but not
+            # listening holds the port too, so the line says "holds", not "is listening".
+            print('orchestra-http: port %d on %s is taken: something else holds it, so the web service did '
+                  'not start. Stop that, or start this service on another port.' % (args.port, args.host),
+                  file=sys.stderr, flush=True)
+            return EXIT_PORT_TAKEN
+        if isinstance(failed, ssl.SSLError) or (args.cert and isinstance(failed, FileNotFoundError)):
+            # Only when the key really is an encrypted one: the hint read as the cause for every
+            # certificate failure, a missing file and a mismatched pair included (kittrial-5bb.168
+            # review item 3).
+            hint = (' A key with a passphrase cannot be used here, because this service never asks for one.'
+                    if key_needs_a_passphrase(args.key) else '')
+            print('orchestra-http: the certificate or key cannot be used: %s, so the web service did not start.%s '
+                  'The office supervisor names the file and what is wrong before it starts anything.'
+                  % (failure_said(failed), hint), file=sys.stderr, flush=True)
+            return EXIT_CERTIFICATE_UNUSABLE
+        if args.port < 1024 and failed.errno in (errno.EACCES, errno.EPERM):
+            print('orchestra-http: port %d cannot be bound: %s. A port below 1024 needs privilege; use a port '
+                  'from 1024 to 65535.' % (args.port, failure_said(failed)), file=sys.stderr, flush=True)
+            return EXIT_PORT_NOT_PERMITTED
+        if args.cert and isinstance(failed, PermissionError):
+            print('orchestra-http: the certificate or key cannot be read: %s, so the web service did not start.'
+                  % failure_said(failed), file=sys.stderr, flush=True)
+            return EXIT_CERTIFICATE_UNUSABLE
+        if isinstance(failed, socket.gaierror) or failed.errno in (errno.EADDRNOTAVAIL, errno.EAFNOSUPPORT):
+            print('orchestra-http: the address %s cannot be used: %s, so the web service did not start. Give an '
+                  'address of this host, or a name that resolves to one.' % (args.host, failure_said(failed)),
+                  file=sys.stderr, flush=True)
+            return EXIT_ADDRESS_UNAVAILABLE
+        if failed.errno in (errno.EACCES, errno.EPERM):
+            print('orchestra-http: port %d cannot be bound: %s, so the web service did not start.'
+                  % (args.port, failure_said(failed)), file=sys.stderr, flush=True)
+            return EXIT_PORT_NOT_PERMITTED
+        raise
     # Said once the service has its port: a start that failed says its one line and has
     # started nothing, so it has changed no setting either.
     for line in settings_lines(service):

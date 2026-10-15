@@ -8,7 +8,9 @@ import contextlib
 import http.client
 import io
 import json
+import os
 import shutil
+import socket
 import ssl
 import subprocess
 import sys
@@ -103,6 +105,79 @@ class ConfigurationTests(unittest.TestCase):
         self.assertIn('cert and key must be supplied together', self.refused(http_host='10.1.2.3', cert='/c'))
         self.assertIn('Unknown office service setting: allow_plaintext', self.refused(allow_plaintext=True))
 
+    def test_a_bad_configuration_file_is_named_in_the_refusal(self):
+        """kittrial-5bb.168 item 3: service_config names the file for every way reading it fails."""
+        missing = Path(self.tmp.name)/'missing.json'
+        with self.assertRaises(ValueError) as caught:
+            office.service_config(missing)
+        self.assertIn(str(missing), str(caught.exception))
+        self.file.write_text('{not json', encoding='utf-8')
+        with self.assertRaises(ValueError) as caught:
+            office.service_config(self.file)
+        self.assertIn(str(self.file), str(caught.exception))
+        self.assertIn('is not JSON', str(caught.exception))
+        directory = Path(self.tmp.name)/'a-directory'
+        directory.mkdir()
+        with self.assertRaises(ValueError) as caught:
+            office.service_config(directory)
+        self.assertIn(str(directory), str(caught.exception))
+        dangling = Path(self.tmp.name)/'dangling.json'
+        dangling.symlink_to(Path(self.tmp.name)/'gone.json')
+        with self.assertRaises(ValueError) as caught:
+            office.service_config(dangling)
+        self.assertIn(str(dangling), str(caught.exception))
+        unreadable = Path(self.tmp.name)/'unreadable.json'
+        unreadable.write_text('{}', encoding='utf-8')
+        os.chmod(unreadable, 0)
+        self.addCleanup(os.chmod, unreadable, 0o600)
+        with self.assertRaises(ValueError) as caught:
+            office.service_config(unreadable)
+        self.assertIn(str(unreadable), str(caught.exception))
+
+    def test_a_host_with_a_port_is_refused_and_ipv6_literals_are_not(self):
+        for host in ('127.0.0.1:8443', 'office.example.invalid:443', '0.0.0.0:10000'):
+            with self.subTest(host=host):
+                self.assertIn('must not carry a port', self.refused(http_host=host, cert='/c', key='/k'))
+        # A bare IPv6 literal has colons but no port, and stays accepted.
+        self.assertEqual(self.config(http_host='fd00::5', cert='/c', key='/k')['http_host'], 'fd00::5')
+        self.assertEqual(self.config(http_host='::', cert='/c', key='/k', public_url='https://o:10000')['http_host'], '::')
+        self.assertEqual(self.config(http_host='::1')['http_host'], '::1')
+
+    def test_cert_key_and_public_url_types_are_refused(self):
+        for setting, value in (('cert', 7), ('cert', ['/c']), ('cert', True), ('key', 7), ('key', {'path': '/k'})):
+            with self.subTest(setting=setting, value=value):
+                settings = {'http_host': '10.1.2.3', 'cert': '/c', 'key': '/k'}
+                settings[setting] = value
+                self.assertIn('%s must be the path of a file' % setting, self.refused(**settings))
+        for value in ('ftp://x', 'https:///no-host', 'office.example.invalid', '/just/a/path', '', 'http://',
+                      'https://office:notaport', 7, ['u']):
+            with self.subTest(public_url=value):
+                self.assertIn('public_url must be an http or https URL with a host',
+                              self.refused(cert='/c', key='/k', public_url=value))
+        for value in ('https://office.example.invalid:8443', 'http://[::1]:8000', 'http://localhost'):
+            with self.subTest(public_url=value):
+                self.assertEqual(self.config(cert='/c', key='/k', public_url=value)['public_url'], value)
+
+    def test_a_lone_zero_is_the_wildcard(self):
+        """kittrial-5bb.168 item 5: 0 is the system's 0.0.0.0, so it needs a public_url too."""
+        self.assertIn('listens on every address', self.refused(http_host='0', cert='/c', key='/k'))
+        settings = self.config(http_host='0', cert='/c', key='/k', public_url='https://office:10000')
+        self.assertEqual(settings['http_host'], '0')
+        self.assertEqual(office.listener(settings, 10000)['probe'], 'https://127.0.0.1:10000/healthz')
+        self.assertEqual(office.listener({'http_host': '0', 'allow_plaintext_on_network': True,
+                                          'public_url': 'http://office:10000'}, 10000)['shape'], 'plain-http-on-network')
+
+    def test_strict_transport_security_is_off_unless_the_setting_says_so(self):
+        """kittrial-5bb.168 item 6: the header has a setting; nothing is sent by default."""
+        script, root = Path('/release/kit/office_service.py'), Path('/runtime')
+        self.assertNotIn('--strict-transport-security',
+                         office.web_command({}, root, 10000, '/release/python', script))
+        settings = self.config(strict_transport_security=True)
+        self.assertTrue(settings['strict_transport_security'])
+        self.assertIn('--strict-transport-security',
+                      office.web_command(settings, root, 10000, '/release/python', script))
+        self.assertEqual(self.refused(strict_transport_security='yes'), 'strict_transport_security must be true or false')
+
     def test_the_three_shapes(self):
         tls = {'http_host': '10.1.2.3', 'cert': '/c', 'key': '/k'}
         self.assertEqual(office.listener(tls, 10000), {'shape': 'https', 'host': '10.1.2.3', 'port': 10000,
@@ -147,6 +222,185 @@ class ConfigurationTests(unittest.TestCase):
         self.assertIn('--allow-plaintext-on-network', plain)
         self.assertEqual(value(command(public_url='https://orchestra.example.invalid'), '--public-url'),
                          'https://orchestra.example.invalid')
+
+
+@unittest.skipUnless(LINUX and socket.has_ipv6, 'an IPv6 listener needs Linux and this host IPv6')
+class IPv6Tests(unittest.TestCase):
+    """kittrial-5bb.168 item 2: an IPv6 host starts and answers; the docs offer only what is served."""
+
+    def serve(self, host):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        service = Service(Store(Path(tmp)/'state.json'))
+        httpd = http_service.create_server(service, http_service.InProcessBackend(service), host=host, port=0,
+                                           web_root=None, allow_plaintext_non_loopback=(host == '::'))
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(lambda: (httpd.shutdown(), httpd.server_close(), thread.join(timeout=5)))
+        return httpd
+
+    def test_a_loopback_and_a_wildcard_ipv6_listener_start_and_answer(self):
+        for host, asked in (('::1', '::1'), ('::', '::1')):
+            with self.subTest(host=host):
+                httpd = self.serve(host)
+                self.assertEqual(httpd.socket.family, socket.AF_INET6)
+                port = httpd.server_address[1]
+                connection = http.client.HTTPConnection(asked, port, timeout=5)
+                connection.request('GET', '/healthz')
+                response = connection.getresponse()
+                body = json.loads(response.read())
+                connection.close()
+                self.assertEqual(response.status, 200, body)
+                self.assertEqual(body['service'], 'orchestra-office')
+
+    def test_the_listener_probe_brackets_an_ipv6_address(self):
+        self.assertEqual(office.listener({'http_host': '::1'}, 10000)['probe'], 'http://[::1]:10000/healthz')
+        self.assertEqual(office.listener({'http_host': '::', 'cert': '/c', 'key': '/k',
+                                          'public_url': 'https://o:1'}, 10000)['probe'],
+                         'https://[::1]:10000/healthz')
+
+
+@unittest.skipUnless(LINUX, 'the office supervisor is for Linux')
+class CertificateTests(unittest.TestCase):
+    """kittrial-5bb.168 item 1: an unusable pair is one sentence naming the file, before anything starts."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+
+    def preflight(self, cert, key):
+        with self.assertRaises(ValueError) as caught:
+            office.certificate_preflight({'cert': cert, 'key': key}, self.base)
+        return str(caught.exception)
+
+    @unittest.skipUnless(OPENSSL, 'openssl is not installed; the pairs are made with it')
+    def test_each_way_the_pair_can_be_unusable_names_the_file(self):
+        first, second = self.base/'first', self.base/'second'
+        first.mkdir()
+        second.mkdir()
+        cert, key = self_signed(str(first))
+        other_cert, other_key = self_signed(str(second), 'other.example.invalid')
+        garbage = self.base/'garbage.txt'
+        garbage.write_text('this is not a PEM file\n', encoding='utf-8')
+        encrypted = self.base/'encrypted.key'
+        subprocess.check_call([OPENSSL, 'rsa', '-in', key, '-aes256', '-passout', 'pass:secret', '-out', str(encrypted)],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        unreadable = self.base/'unreadable.key'
+        unreadable.write_text(Path(key).read_text(encoding='utf-8'), encoding='utf-8')
+        os.chmod(unreadable, 0)
+        self.addCleanup(os.chmod, unreadable, 0o600)
+
+        said = self.preflight(str(self.base/'missing.crt'), key)
+        self.assertIn(str(self.base/'missing.crt'), said)
+        self.assertIn('does not exist', said)
+        said = self.preflight(cert, str(self.base/'missing.key'))
+        self.assertIn(str(self.base/'missing.key'), said)
+        said = self.preflight(str(garbage), key)
+        self.assertIn(str(garbage), said)
+        self.assertIn('not a PEM certificate', said)
+        said = self.preflight(cert, str(garbage))
+        self.assertIn(str(garbage), said)
+        self.assertIn('not a PEM private key', said)
+        said = self.preflight(cert, str(unreadable))
+        self.assertIn(str(unreadable), said)
+        self.assertIn('cannot be read', said)
+        said = self.preflight(cert, str(encrypted))
+        self.assertIn(str(encrypted), said)
+        self.assertIn('needs a passphrase', said)
+        said = self.preflight(other_cert, key)
+        self.assertIn(str(key), said)
+        self.assertIn(str(other_cert), said)
+        self.assertIn('does not match', said)
+        said = self.preflight(key, cert)
+        self.assertIn(str(key), said)
+        self.assertIn(str(cert), said)
+        self.assertIn('look swapped', said)
+
+    @unittest.skipUnless(OPENSSL, 'openssl is not installed; the pairs are made with it')
+    def test_no_sentence_carries_key_text(self):
+        cert, key = self_signed(self.tmp.name)
+        body = [line for line in Path(key).read_text(encoding='utf-8').splitlines()
+                if line and not line.startswith('-----')][0]
+        said = self.preflight(cert, str(self.base/'missing.key'))
+        self.assertNotIn(body, said)
+        said = self.preflight(key, cert)
+        self.assertNotIn(body, said)
+
+    @unittest.skipUnless(OPENSSL, 'openssl is not installed; the pairs are made with it')
+    def test_a_good_pair_passes_and_leaves_nothing_behind(self):
+        cert, key = self_signed(self.tmp.name)
+        office.certificate_preflight({'cert': cert, 'key': key}, self.tmp.name)     # no exception
+
+    @unittest.skipUnless(OPENSSL, 'openssl is not installed; the self-signed pair is made with it')
+    def test_a_relative_path_is_resolved_against_the_runtime_root(self):
+        """kittrial-5bb.168 review item 1: the child is spawned with cwd=root, so a relative cert/key
+        is resolved there. The pair the supervisor CHECKS is the pair the child is given, so a
+        relative path that worked before this task is not refused, and there is no second file the
+        child could serve instead."""
+        cert, key = self_signed(str(self.base))
+        settings = {'cert': Path(cert).name, 'key': Path(key).name}
+        resolved = office.certificate_preflight(settings, self.base)     # no exception, absolute pair
+        self.assertEqual((resolved[0], resolved[1]), (cert, key))
+        command = office.web_command(dict(settings, cert=resolved[0], key=resolved[1]), self.base, 10000,
+                                     '/usr/bin/python3', self.base/'office_service.py')
+        self.assertIn(cert, command)
+        self.assertIn(key, command)
+        # A relative path with no such file in the runtime root is still refused, naming the path the
+        # child would have opened (the absolute one under the root).
+        with self.assertRaises(ValueError) as caught:
+            office.certificate_preflight({'cert': 'no-such.pem', 'key': 'no-such.key'}, self.base)
+        self.assertIn(str(self.base/'no-such.pem'), str(caught.exception))
+
+    def test_a_directory_or_a_fifo_is_refused_without_being_opened(self):
+        """A FIFO would block ``open`` forever: it is refused as not a regular file."""
+        directory = self.base/'a-directory'
+        directory.mkdir()
+        said = self.preflight(str(directory), str(self.base/'k'))
+        self.assertIn(str(directory), said)
+        self.assertIn('directory', said)
+        fifo = self.base/'a-fifo'
+        os.mkfifo(fifo)
+        said = self.preflight(str(fifo), str(self.base/'k'))
+        self.assertIn(str(fifo), said)
+        self.assertIn('not a regular file', said)
+
+    def test_the_key_mode_and_the_certificate_window_are_warnings_not_refusals(self):
+        key = self.base/'shared.key'
+        key.write_text('not a key at all\n', encoding='utf-8')
+        os.chmod(key, 0o640)
+        cert = self.base/'not-a-cert.pem'
+        cert.write_text('not a certificate\n', encoding='utf-8')
+        lines = office.start_warnings({'cert': str(cert), 'key': str(key)})
+        self.assertTrue(any('readable by the group' in line for line in lines), lines)
+        self.assertTrue(any('cannot be read on this interpreter' in line for line in lines), lines)
+        os.chmod(key, 0o600)
+        os.chmod(key, 0o604)
+        self.assertTrue(any('readable by everyone' in line
+                            for line in office.start_warnings({'key': str(key)})), lines)
+
+    def test_an_expired_and_a_not_yet_valid_certificate_each_get_a_warning(self):
+        cert = self.base/'cert.pem'
+        cert.write_text('placeholder\n', encoding='utf-8')
+        now = 1_800_000_000
+        with mock.patch.object(office, 'certificate_window', return_value=(now - 100, now - 1)), \
+                mock.patch.object(office.time, 'time', return_value=float(now)):
+            lines = office.start_warnings({'cert': str(cert)})
+        self.assertTrue(any('expired on' in line for line in lines), lines)
+        with mock.patch.object(office, 'certificate_window', return_value=(now + 1, now + 100)), \
+                mock.patch.object(office.time, 'time', return_value=float(now)):
+            lines = office.start_warnings({'cert': str(cert)})
+        self.assertTrue(any('is not valid until' in line for line in lines), lines)
+        with mock.patch.object(office, 'certificate_window', return_value=None):
+            lines = office.start_warnings({'cert': str(cert)})
+        self.assertTrue(any('no expiry warning is given' in line for line in lines), lines)
+
+    @unittest.skipUnless(OPENSSL, 'openssl is not installed; the certificate is made with it')
+    def test_a_real_certificate_window_is_read(self):
+        cert, _ = self_signed(self.tmp.name)
+        window = office.certificate_window(cert)
+        self.assertIsNotNone(window)
+        self.assertLess(window[0], window[1])
 
 
 class WebServiceFlagTests(unittest.TestCase):
@@ -277,6 +531,29 @@ class NetworkShapeTests(unittest.TestCase):
         with self.assertRaises((http.client.HTTPException, OSError)):
             self.call(http.client.HTTPConnection('127.0.0.1', port, timeout=5), 'GET', '/healthz')
 
+    @unittest.skipUnless(OPENSSL, 'openssl is not installed; the self-signed certificate is made with it')
+    def test_strict_transport_security_is_on_https_answers_only_and_only_when_asked(self):
+        """kittrial-5bb.168 item 6: off by default, sent only where the operator asked and only over HTTPS."""
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+        cert, key = self_signed(directory)
+        trusting = ssl.create_default_context(cafile=cert)
+
+        def header(port, secure):
+            connection = (http.client.HTTPSConnection('127.0.0.1', port, timeout=15, context=trusting) if secure
+                          else http.client.HTTPConnection('127.0.0.1', port, timeout=15))
+            status, headers, body = self.call(connection, 'GET', '/healthz')
+            self.assertEqual(status, 200, body)
+            return headers.get('Strict-Transport-Security')
+
+        asked = self.serve(public_url='https://office.example.invalid:10000', certfile=cert, keyfile=key, hsts=True)
+        self.assertEqual(header(asked, True), http_service.HSTS_HEADER)
+        default = self.serve(public_url='https://office.example.invalid:10000', certfile=cert, keyfile=key)
+        self.assertIsNone(header(default, True))
+        plain = self.serve(public_url='http://office.example.invalid:10000',
+                           allow_plaintext_non_loopback=True, hsts=True)
+        self.assertIsNone(header(plain, False))
+
 
 @unittest.skipUnless(LINUX, 'Linux supervisor only')
 class HealthTests(unittest.TestCase):
@@ -299,6 +576,14 @@ class HealthTests(unittest.TestCase):
     def web(self, port, settings):
         line, code = office.health(self.root, port, settings)
         return 'web=up' in line, code
+
+    def runtime(self):
+        """A bare runtime directory, for the tests that do not need a serving listener."""
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        self.root = Path(tmp)/'runtime'
+        self.root.mkdir()
+        return self.root
 
     def test_loopback_as_before(self):
         port = self.serve()
@@ -368,6 +653,122 @@ class HealthTests(unittest.TestCase):
                 contextlib.redirect_stdout(printed):
             office_verify.main(['--install-root', str(install), '--root', str(self.root), '--port', str(port)])
         self.assertEqual(json.loads(printed.getvalue())['listener']['shape'], 'loopback')
+
+    def install(self):
+        """A fake installed release whose provenance matches a mocked ``report``."""
+        install = self.root/'install'
+        (install/'releases'/'r1'/'kit').mkdir(parents=True)
+        (install/'current').symlink_to('releases/r1')
+        (install/'releases'/'r1'/'manifest.json').write_text(
+            json.dumps({'build_id': 'r1', 'source_commit': 'c' * 40}))
+        return install
+
+    @staticmethod
+    def free_port():
+        with socket.socket() as sock:
+            sock.bind(('127.0.0.1', 0))
+            return sock.getsockname()[1]
+
+    @unittest.skipUnless(OPENSSL, 'openssl is not installed; the self-signed certificate is made with it')
+    def test_health_in_main_obeys_the_config(self):
+        """kittrial-5bb.168 item 7: main() asks the listener --config describes, not loopback."""
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+        cert, key = self_signed(directory)
+        port = self.serve(host='0.0.0.0', certfile=cert, keyfile=key)
+        config = self.root/'office.json'
+        config.write_text(json.dumps({'schema_version': 1, 'http_host': '0.0.0.0', 'cert': cert, 'key': key,
+                                      'public_url': 'https://office.example.invalid:10000'}), encoding='utf-8')
+        printed = io.StringIO()
+        with contextlib.redirect_stdout(printed):
+            code = office.main(['health', '--root', str(self.root), '--port', str(port), '--config', str(config)])
+        self.assertEqual(code, 1)                                     # no database and no backup in this test
+        self.assertIn('web=up', printed.getvalue())
+        printed = io.StringIO()
+        with contextlib.redirect_stdout(printed):
+            office.main(['health', '--root', str(self.root), '--port', str(port)])
+        self.assertIn('web=down', printed.getvalue())
+
+    def test_a_bad_config_in_both_tools_is_one_line_naming_the_file(self):
+        """kittrial-5bb.168 item 3: health and office_verify name the file and exit 1, never a traceback."""
+        bad = self.runtime()/'bad.json'
+        bad.write_text('{not json', encoding='utf-8')
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = office.main(['health', '--root', str(self.root), '--port', '1', '--config', str(bad)])
+        self.assertEqual(code, 1)
+        self.assertEqual(len(err.getvalue().splitlines()), 1, err.getvalue())
+        self.assertIn(str(bad), err.getvalue())
+
+        import office_verify
+        install = self.install()
+        err = io.StringIO()
+        with mock.patch.object(office_verify, 'report', return_value={'source_commit': 'c' * 40, 'build_id': 'r1',
+                                                                      'version': '0'}), \
+                contextlib.redirect_stderr(err):
+            code = office_verify.main(['--install-root', str(install), '--root', str(self.root), '--port', '1',
+                                       '--config', str(bad)])
+        self.assertEqual(code, 1)
+        self.assertEqual(len(err.getvalue().splitlines()), 1, err.getvalue())
+        self.assertIn(str(bad), err.getvalue())
+        for missing in (self.root/'gone.json', self.root):
+            with self.subTest(path=missing):
+                err = io.StringIO()
+                with mock.patch.object(office_verify, 'report', return_value={'source_commit': 'c' * 40,
+                                                                              'build_id': 'r1', 'version': '0'}), \
+                        contextlib.redirect_stderr(err):
+                    code = office_verify.main(['--install-root', str(install), '--root', str(self.root), '--port',
+                                               '1', '--config', str(missing)])
+                self.assertEqual(code, 1)
+                self.assertEqual(len(err.getvalue().splitlines()), 1, err.getvalue())
+                self.assertIn(str(missing), err.getvalue())
+
+    def test_health_reads_another_server_answering_two_hundred_as_down(self):
+        """kittrial-5bb.168 item 8: /healthz carries this service's mark, so another answer is down."""
+        import http.server
+
+        class Plain(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(b'{"status": "ok"}\n')
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Plain)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(lambda: (server.shutdown(), server.server_close(), thread.join(timeout=5)))
+        line, code = office.health(self.runtime(), server.server_address[1], None)
+        self.assertEqual(code, 1)
+        self.assertIn('web=down', line)
+        self.assertIn("another program holds the port", line)
+
+    def test_health_reads_another_orchestra_service_as_down(self):
+        port = self.serve()
+        other = {'service': 'orchestra-office', 'version': '9.9.9', 'build_id': 'not-this-one'}
+        with mock.patch.object(http_service, '_SERVICE_IDENTITY', other):
+            line, code = office.health(self.root, port, None)
+        self.assertEqual(code, 1)
+        self.assertIn('web=down', line)
+        self.assertIn('another Orchestra service holds the port', line)
+        self.assertIn('not-this-one', line)
+        self.assertIn('reason=web:', line)
+
+    def test_health_gives_a_bounded_reason_for_web_down_and_backup_unknown(self):
+        """kittrial-5bb.168 item 8: the health line says why, in one bounded line."""
+        line, code = office.health(self.runtime(), self.free_port(), None)
+        self.assertEqual(code, 1)
+        self.assertIn('web=down', line)
+        self.assertIn('backup=unknown', line)
+        self.assertIn('reason=web:', line)
+        self.assertIn('backup:', line.split('reason=', 1)[1])
+        self.assertEqual(len(line.splitlines()), 1)
+        self.assertLess(len(line), 700)
+        # A fresh runtime's exit 1 while the first backup is unknown is documented (docs/OFFICE_SERVICE.md).
+        self.assertEqual(code, 1)
 
 
 if __name__ == '__main__':
