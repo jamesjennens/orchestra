@@ -6285,12 +6285,12 @@ def restore_web_lifecycle_mark_family(root,destination,files):
 
 
 def restore_requirement_baseline_family(root,destination,files):
-    import fcntl
     from requirement_baselines import restore_files, PREFIX, DIRECTORY, RESTORE_MARKER
     path=project_dir(root,destination)
     if (not any(name.startswith(PREFIX) for name in files)
             and not os.path.lexists(path/DIRECTORY) and not os.path.lexists(path/RESTORE_MARKER)):
         return False
+    import fcntl
     if (path/'.coordination.lock').is_symlink():
         raise ValueError('Coordination restore lock must not be a symlink')
     with (path/'.coordination.lock').open('a') as lock:
