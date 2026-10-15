@@ -12,7 +12,12 @@ function workTable(ctx, rows, { showProject = true, emptyTitle, emptyBody }) {
     h('tbody', null, rows.map((t) => {
       const href = ctx.href(`/p/${t.project_id}/t/${t.id}`);
       return h('tr', { class: 'row-link', onclick: (e) => { if (e.target.tagName !== 'A') ctx.go(`/p/${t.project_id}/t/${t.id}`); } },
-        h('td', null, h('a', { class: 'title', href }, t.title), h('div', { class: 'sub' }, t.priority != null ? [priority(t.priority), ' · '] : null, h('span', { class: 'mono' }, t.id))),
+        h('td', null,
+          // A requirement record is not claimable work: marked plainly wherever a row is
+          // shown, with the way to the page it is edited on (kittrial-5bb.277).
+          t.requirement_record ? h('span', { class: 'chip', title: 'A requirement record, not claimable work' }, 'Requirement') : null,
+          h('a', { class: 'title', href }, t.title), h('div', { class: 'sub' }, t.priority != null ? [priority(t.priority), ' · '] : null, h('span', { class: 'mono' }, t.id),
+            t.requirement_record ? [' · ', h('a', { href: ctx.href(`/p/${t.project_id}/requirements`) }, 'Edit on Requirements')] : null)),
         showProject ? h('td', { class: 'hide-narrow' }, t.project_name || '') : null,
         h('td', null, t.review_state && t.review_state !== 'none' ? reviewChip(t.review_state) : statusChip(t.status)),
         h('td', null, t.next_action ? t.next_action.text : h('span', { class: 'muted' }, '—'),

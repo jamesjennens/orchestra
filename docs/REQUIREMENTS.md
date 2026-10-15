@@ -200,11 +200,26 @@ creates it with `--type task` and the controlled type label `requirement` or
 `brd-section` (`KIND_TYPE_LABEL`). It stays a visible row in the task list and the
 work queue, but it is **never ordinary claimable work** (kittrial-5bb.277). One rule,
 `work.claimable`, excludes it whatever its status, assignee or contribution, so
-`work --claimable`, the HTTP agent attention/`next` list, the claim fall-through
-candidates and the owner-facing prompt never offer it. The queue row carries
-`requirement_record: true` so a reader can mark it plainly. The HTTP claim route
-refuses one with 409: it names the label, says it is not a unit of work, and points
-at `requirement_records.py draft|revise` and `admin.py requirement-apply`.
+`work --claimable`, the HTTP agent attention/`next` list, the HTTP tasks-list route,
+the claim fall-through candidates and the owner-facing prompt never offer it. The
+queue row and every row of `GET /v1/projects/{pid}/tasks` carry
+`requirement_record: true` and `claimable: false`, so a reader can mark one plainly;
+the web Tasks page leaves requirement rows out of its default view and offers a
+"Show requirements" filter, and marks one that is shown as a requirement with a link
+to the project's Requirements page. The HTTP claim route refuses one with 409: it
+names the label, says it is not a unit of work, and points at the project's
+Requirements page, `requirement_records.py draft|revise` and
+`admin.py requirement-apply`.
+
+What the HTTP claim route refuses is its own claim, and only that. An **explicit host
+claim by a coordinator still works**: the endpoint (`bd update ID --claim`, the SSH
+and `client.py` path) deliberately keeps taking a requirement row, and `bd ready`
+still lists them, because live projects claim, close and reassign requirement records
+through it (kittrial-5bb.92 review item 1). The rule above keeps a requirement out of
+the *offered* work — the queue, the agent `next` list and the web claim — while an
+operator or coordinator who means to hold the row can still do so. The refusal
+sentence says so, so it is not read as "nothing can claim this".
+
 A requirement record is deliberately **not** a record anchor: unlike references and
 proposals it is never hidden, so a requirement already claimed by an agent still
 shows as claimed and can be released (kittrial-5bb.276); only claimability changes.
