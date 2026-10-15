@@ -508,6 +508,68 @@ class ClaimableViewTests(unittest.TestCase):
         self.assertIsNone(page['next_offset'])
 
 
+class ReadyDropsInternalRecordsTests(unittest.TestCase):
+    """kittrial-5bb.290: `ready` agrees with `work --claimable` on internal records."""
+
+    def slot_row(self, **more):
+        row = {'id': 'pp-merge-slot', 'title': 'merge slot', 'status': 'open', 'assignee': None,
+               'labels': ['gt:slot'], 'issue_type': 'task', 'comments': []}
+        row.update(more)
+        return row
+
+    def anchor_row(self, **more):
+        # A reference record anchor: the record label AND a v1 record comment.
+        row = {'id': 'pp-ref-1', 'title': 'reference record', 'status': 'closed', 'assignee': None,
+               'labels': ['reference'], 'issue_type': 'task',
+               'comments': [{'id': 'c1', 'text': 'Kind: reference-entry-v1\nkey: k\n'}]}
+        row.update(more)
+        return row
+
+    def test_the_merge_slot_is_dropped(self):
+        rows = [self.slot_row(), {'id': 'pp-t1', 'title': 'T', 'status': 'open', 'assignee': None,
+                                  'labels': [], 'comments': []}]
+        shown = work.drop_internal_from_ready(rows)
+        self.assertEqual([r['id'] for r in shown], ['pp-t1'])
+
+    def test_a_record_anchor_is_dropped(self):
+        rows = [self.anchor_row(), {'id': 'pp-t1', 'title': 'T', 'status': 'open', 'assignee': None,
+                                    'labels': [], 'comments': []}]
+        shown = work.drop_internal_from_ready(rows)
+        self.assertEqual([r['id'] for r in shown], ['pp-t1'])
+
+    def test_a_labelled_row_without_comments_is_marked_not_offered_as_claimable(self):
+        # Label alone is not anchor proof (a project may use `reference` as an ordinary
+        # label), but without comments it cannot prove it is NOT an anchor: mark it so a
+        # client can filter without knowing ids, and never call it claimable.
+        rows = [{'id': 'pp-ref-2', 'title': 'maybe', 'status': 'open', 'assignee': None,
+                 'labels': ['reference'], 'comments': None}]
+        shown = work.drop_internal_from_ready(rows)
+        self.assertEqual([r['id'] for r in shown], ['pp-ref-2'])
+        self.assertTrue(shown[0].get('internal'))
+        self.assertIs(shown[0].get('claimable'), False)
+
+    def test_a_requirement_record_stays_visible(self):
+        # kittrial-5bb.277: requirement records are never claimable work but stay a
+        # visible row; they are not record anchors, so ready still lists them.
+        rows = [{'id': 'pp-req-1', 'title': 'requirement', 'status': 'open', 'assignee': None,
+                 'labels': ['requirement'], 'comments': []}]
+        shown = work.drop_internal_from_ready(rows)
+        self.assertEqual([r['id'] for r in shown], ['pp-req-1'])
+        self.assertFalse(shown[0].get('internal'))
+
+    def test_an_ordinary_open_task_passes_unchanged(self):
+        row = {'id': 'pp-t1', 'title': 'T', 'status': 'open', 'assignee': None,
+               'labels': [], 'comments': []}
+        shown = work.drop_internal_from_ready([row])
+        self.assertEqual(shown, [row])
+
+    def test_ready_agrees_with_claimable_on_the_slot(self):
+        slot = self.slot_row()
+        self.assertFalse(work.claimable(slot.get('issue_type'), slot['status'], slot.get('assignee'),
+                                        None, 'none', record_anchor=False, labels=slot.get('labels')))
+        self.assertEqual(work.drop_internal_from_ready([slot]), [])
+
+
 class QueueItemClaimableCompatTests(unittest.TestCase):
     """An endpoint that does not state `claimable` keeps the older reading."""
 

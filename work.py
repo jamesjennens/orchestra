@@ -16,11 +16,52 @@ WORK_OFFSET_MIN = 0
 #: than a unit of work. `event`, `merge-slot` and the record anchors below are
 #: already excluded from the queue for other reasons and stay excluded here.
 CLAIMABLE_EXCLUDED_TYPES = ('epic','decision','gate','job','event','merge-slot')
+# gt:slot marks a project's merge slot (coordination.MERGE_SLOT_LABEL); the type of
+# that row is `task`, so the label is what keeps it out of claimable work and out of
+# `ready` (kittrial-5bb.290).
+MERGE_SLOT_LABEL = 'gt:slot'
 
 #: A task carrying this LABEL is a decision even when its type is `task`
 #: (reference_records.py:480 reads the label as the decision marker). It is never
 #: ordinary claimable work, so the label joins the type exclusion (review item 4).
 DECISION_LABEL = 'decision'
+
+
+def drop_internal_from_ready(rows):
+    """The rows `ready` may offer as work: merge slots and record anchors gone.
+
+    kittrial-5bb.290: a lane applying the usual claim rule to `ready --json` found
+    the project's merge slot (P0, label gt:slot) as the only ready row -- every
+    contributor write to it is refused by design, and claiming it would jam the
+    project's one slot. `work --claimable` already excludes merge slots and record
+    anchors; `ready` must agree. A row is dropped when it IS a merge slot (the
+    exact id / gt:slot label) or a record anchor (label + v1 record comment).
+    A row that carries a record type label but was read WITHOUT comments cannot
+    prove it is not an anchor, so it is marked `internal`/`claimable: false`
+    rather than offered -- a client can filter on the field without knowing ids.
+    Requirement records (`requirement`/`brd-section`) stay visible (kittrial-5bb.277):
+    they are not record anchors and not claimable work, but they are real rows.
+    """
+    from reserved_comments import carries_record_label, hide_records, is_record_anchor
+    from coordination import is_merge_slot
+    if not isinstance(rows, list):
+        return rows
+    shown = []
+    for row in rows:
+        if not isinstance(row, dict):
+            shown.append(row)
+            continue
+        if is_merge_slot(row):
+            continue
+        if is_record_anchor(row):
+            continue
+        if carries_record_label(row) and not isinstance(row.get('comments'), list):
+            # Label alone is not anchor proof, but without comments it is not
+            # disproof either: mark rather than offer (kittrial-5bb.290).
+            shown.append(dict(row, internal=True, claimable=False))
+            continue
+        shown.append(row)
+    return shown
 
 
 def claimable(issue_type, status, assignee, contribution_id, review_state, record_anchor=False, labels=None):
@@ -39,6 +80,11 @@ def claimable(issue_type, status, assignee, contribution_id, review_state, recor
     if record_anchor:
         return False
     if DECISION_LABEL in (labels or ()):
+        return False
+    # The project's merge slot is an internal record (kittrial-5bb.290): on real bd it
+    # is a row of type task with the label gt:slot, so the type alone never excluded
+    # it. `ready` drops it (drop_internal_from_ready); the predicate must agree.
+    if MERGE_SLOT_LABEL in (labels or ()):
         return False
     if status!='open':
         return False

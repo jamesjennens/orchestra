@@ -125,7 +125,9 @@ class FakeBd:
             return _Proc(0, json.dumps([{'id': OTHER, 'status': 'in_progress', 'assignee': 'mallory'}]))
         if command and command[0] == 'ready':
             self.reads.append(command)
-            return _Proc(0, json.dumps([{'id': OTHER, 'status': 'open'}]))
+            # kittrial-5bb.290: ready lists the visible rows (not the hidden
+            # ephemeral/gate ones), so a test can put a merge slot among them.
+            return _Proc(0, json.dumps(list(self.rows)))
         self.writes.append(command)
         return _Proc(0, json.dumps({'ok': True}))
 
@@ -179,6 +181,18 @@ class EndpointTests(unittest.TestCase):
                 self.bd.writes, self.bd.reads = [], []
                 self.assertEqual(self.run_bd(args)['returncode'], 0, args)
                 self.assertEqual(self.bd.writes, [], args)
+
+    def test_ready_json_leaves_the_merge_slot_out(self):
+        """kittrial-5bb.290: ready agrees with work --claimable on the merge slot."""
+        slot = {'id': 'pp-merge-slot', 'title': 'merge slot', 'status': 'open',
+                'assignee': None, 'labels': ['gt:slot'], 'comments': []}
+        ordinary = {'id': OTHER, 'title': 'T', 'status': 'open', 'assignee': None,
+                    'labels': [], 'comments': []}
+        self.bd.rows = [slot, ordinary]
+        answer = self.run_bd(['ready', '--json'])
+        self.assertEqual(answer['returncode'], 0)
+        rows = json.loads(answer['stdout'])
+        self.assertEqual([r['id'] for r in rows], [OTHER])
 
     # 2. Hidden row classes: ephemeral and gate rows.
 
