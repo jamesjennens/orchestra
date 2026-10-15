@@ -385,11 +385,16 @@ none of the settings below behaves as it always did.
 | **Plain HTTP on an open port** | `"http_host": "<ADDRESS>", "allow_plaintext_on_network": true` | `http://<ADDRESS>:<PORT>` | never for long: a stopgap on a network you trust, until a certificate is made. |
 
 - `http_host` is the address the service binds: an address of the host, or its
-  name. `0.0.0.0` (or `::`) binds every address; the service then cannot name
-  itself, so `public_url` must be set to the address people use. Otherwise
-  `public_url` defaults to `https://<ADDRESS>:<PORT>` (or `http://...` for
-  plain HTTP); it is what agent prompts and set-up texts carry, so it must be
-  an address the agents' machines can reach.
+  name. `0.0.0.0`, `::` and a lone `0` (the system's short form of `0.0.0.0`)
+  bind every address; the service then cannot name itself, so `public_url` must
+  be set to the address people use. An IPv6 address is written as the literal
+  (`::1`, `::`, `fd00::5`); a URL of one is bracketed (`http://[::1]:8443`). A
+  bare IPv6 literal is served; an address is not offered here that the host
+  does not have. Otherwise `public_url` defaults to
+  `https://<ADDRESS>:<PORT>` (or `http://...` for plain HTTP); it is what agent
+  prompts and set-up texts carry, so it must be an address the agents'
+  machines can reach. `http_host` must not carry a port: give the address alone
+  and the port in `--port`.
 - An address other than loopback without `cert` and `key` is refused, unless
   the file says `"allow_plaintext_on_network": true`. The refusal names the
   setting. With it the service starts and prints, at every start, on standard
@@ -397,6 +402,10 @@ none of the settings below behaves as it always did.
   Passwords and session cookies cross the network unencrypted. Use cert and
   key for HTTPS.` The setting together with loopback, or together with a
   certificate, is refused: it would do nothing there.
+- A `cert` or `key` that is not a string, and a `public_url` that is not an
+  `http` or `https` URL with a host, are refused before anything starts, each
+  with a sentence naming the setting. `strict_transport_security` must be
+  `true` or `false` (see below).
 - Which ports are open, and to whom, is the host's firewall and the network's
   business. The service listens where it is told; it does not restrict who may
   connect beyond its own log-in.
@@ -423,6 +432,44 @@ right server. A client such as `curl`, or an agent's tool, must be given the
 certificate file (`curl --cacert <CERT.pem>`) or it refuses the connection, as
 it should. Replace the certificate before it expires (`-days`), then restart.
 
+**Before anything starts, the pair is checked.** The supervisor loads the
+certificate and key itself, before it starts the database or the web service.
+A file that is missing, unreadable or not PEM, a key that needs a passphrase,
+a pair that does not match, and the two files given the wrong way round are
+each refused with **one sentence naming the file and what is wrong**, and
+nothing is started or left running. No key text is ever printed or logged.
+
+**Every other start failure is one line too.** A port that something else holds
+(a socket bound but not listening holds it just as a listener does), an address
+that is not on the host or a name that does not resolve, a port below 1024 that
+needs privilege, and a certificate or key the web service cannot use: each is
+one sentence on standard error and a line in `http.log`, before or instead of
+`A supervised child exited`, and the supervisor exits 1. The taken-port
+sentence says "something else holds it".
+
+**Two warnings at every start.** A certificate that has expired (or is not yet
+valid) and a key file readable by the group or by everyone each get one warning
+line. Neither is a refusal: a first install can have a root-owned key readable
+by the service account's group, and the install must still start. The reason
+the key mode is only a warning: the service account often is not the account
+that created the key, so `chmod 600` may be the installer's step, not a reason
+to refuse service. Tighten it when you can (`chmod 600 <KEY.pem>`); the
+certificate's dates are read with the interpreter's own certificate decoder,
+and when this interpreter has none the expiry warning is skipped and the start
+says so, rather than guessing.
+
+**Strict-Transport-Security is off by default.** After the first visit over
+HTTPS the service sends no `Strict-Transport-Security` header, so a browser is
+not pinned to HTTPS for the host. That is deliberate: the common first install
+uses a self-signed certificate, and pinning a browser to a certificate the
+office has not yet trusted, or fighting a proxy that terminates TLS in front
+of the service, is the operator's decision, not the default. Set
+`"strict_transport_security": true` in the private office JSON to send
+`Strict-Transport-Security: max-age=31536000` on **HTTPS answers only**; a
+plain HTTP listener never sends it. Turn it back off if the service later
+moves behind a proxy that would pass the header to a client that cannot use
+HTTPS.
+
 **What does not work over plain HTTP at a host name or address.** Browsers give
 some features only to a secure context (HTTPS, or `localhost`):
 
@@ -446,6 +493,30 @@ answers, and a self-signed certificate must not make it read as down. Without
 `--config` they ask `http://127.0.0.1:<PORT>`, which is right for the loopback
 shape only. The verification record's `listener` says which shape is in use
 (`loopback`, `https` or `plain-http-on-network`), the host and the public URL.
+
+**Health reads the service's own mark, and says why when it does not.** The
+health line is `version=... db=... web=... backup=... backup_at=...`, with a
+bounded `reason=...` when the web listener does not answer as this service or
+when the backup status is unknown; `tools/office_verify.py` returns the same
+line, so it reports the same reason. The web service's `/healthz` answer carries
+its name, version and build id, so a *different* server — a plain web server, or
+another Orchestra service — answering `200` on the port does not read as
+`web=up`: `health` reads `web=down` and the reason names which of the two it is
+(an Orchestra service is named with the version and build id it reported).
+Likewise a runtime whose web service did not start because another Orchestra
+service holds the port reads `web=down`, not `web=up`.
+
+A fresh runtime has no `backups/backup-status.json` until the first backup
+completes, so `backup=unknown` and **`health` exits 1** (and
+`tools/office_verify.py` exits 1) until then. That is the intended reading, not
+a fault: run a backup (`backup --all`) and ask again. The exit status is not a
+distinct code for this case; the line's `backup=unknown` and the reason are what
+say which precondition is missing.
+
+`health --config <PRIVATE_OFFICE_JSON>` reads the configuration named; a
+configuration file that is missing, unreadable, refused or not JSON is one line
+naming the file and an exit status of 1, in `health` and in
+`tools/office_verify.py` alike, never a traceback.
 
 **Connections that say nothing.** On an open port anybody who can reach it can
 open a connection and send nothing: a port scanner, a browser's spare

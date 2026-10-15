@@ -57,7 +57,14 @@ def main(argv=None):
     if (provenance['source_commit'] != manifest.get('source_commit') or
             provenance['build_id'] != manifest.get('build_id')):
         raise SystemExit('Installed release provenance does not match the manifest')
-    settings = office_service.service_config(args.config) if args.config else None
+    # A bad --config is one line naming the file and exit 1, never a traceback
+    # (kittrial-5bb.168 item 3): service_config names the file for a missing, unreadable,
+    # refused (a directory, a dangling symlink) or not-JSON file.
+    try:
+        settings = office_service.service_config(args.config) if args.config else None
+    except (OSError, ValueError, RuntimeError) as error:
+        print('office-verify: %s' % error, file=sys.stderr)
+        return 1
     served = office_service.listener(settings, args.port)
     line, code = office_service.health(office_service.private_root(args.root), args.port, settings)
     record = {'schema_version': 1, 'release': manifest['build_id'],

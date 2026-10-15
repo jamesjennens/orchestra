@@ -1,16 +1,29 @@
 """Disposable Linux checks for the foreground office supervisor."""
 import json
 import os
+import shutil
 import signal
 import socket
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
 from unittest import mock
+
+OPENSSL = shutil.which('openssl')
+
+
+def self_signed(directory, name='office.example.invalid'):
+    """A self-signed certificate and key, made the way the docs tell the operator to make one."""
+    cert, key = Path(directory)/'office.crt', Path(directory)/'office.key'
+    subprocess.check_call([OPENSSL, 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '2',
+                           '-keyout', str(key), '-out', str(cert), '-subj', '/CN=' + name],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return str(cert), str(key)
 
 
 @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux supervisor only')
@@ -83,6 +96,15 @@ else:
                 return
             time.sleep(.1)
         self.fail('Timed out waiting for service state')
+
+    @staticmethod
+    def first_stderr_line(proc, timeout=10):
+        """One line from the supervisor's stderr, or None: never blocks the test on a missing line."""
+        box = {}
+        reader = threading.Thread(target=lambda: box.update(line=proc.stderr.readline()), daemon=True)
+        reader.start()
+        reader.join(timeout)
+        return box.get('line')
 
     def port_up(self, port):
         try:
@@ -354,6 +376,71 @@ if os.environ.get('BD_DISABLE_METRICS') != '1':
         self.wait_for(lambda: (self.logs/'dolt.log').exists())
         proc.terminate()
         self.assertEqual(proc.wait(timeout=7), 0)
+
+    # -- kittrial-5bb.168: the start failures, the warnings, the network warning -----------------
+
+    def test_a_bad_certificate_is_one_sentence_before_anything_starts(self):
+        """Item 1: the pair is loaded before anything is spawned; nothing is left behind."""
+        import office_service
+        missing_cert = self.base/'gone.crt'
+        self.config.write_text(json.dumps({'schema_version': 1, 'cert': str(missing_cert),
+                                           'key': str(self.base/'gone.key')}), encoding='utf-8')
+        with self.assertRaises(ValueError) as caught:
+            office_service.run(self.root, self.logs, self.config, self.web_port, 5)
+        said = str(caught.exception)
+        self.assertIn(str(missing_cert), said)
+        self.assertIn('does not exist', said)
+        self.assertFalse(self.logs.exists(), 'the refused start created a log directory')
+        self.assertFalse((self.root/'db.pid').exists(), 'the database was started')
+
+    @unittest.skipUnless(OPENSSL, 'openssl is not installed; the self-signed pair is made with it')
+    def test_a_good_pair_still_starts_and_serves(self):
+        cert, key = self_signed(self.base)
+        self.config.write_text(json.dumps({'schema_version': 1, 'cert': cert, 'key': key}), encoding='utf-8')
+        proc = self.start()
+        self.assertIsNone(proc.poll())
+
+    def test_run_prints_the_warnings_after_the_preflight_and_before_the_database(self):
+        """Item 4: the warnings are wired into run() at the start, after the pair is checked."""
+        import inspect
+        import office_service
+        source = inspect.getsource(office_service.run)
+        self.assertLess(source.index('certificate_preflight(settings)'), source.index('start_warnings(settings)'))
+        self.assertLess(source.index('start_warnings(settings)'), source.index("_spawn([root/'bin/dolt'"))
+
+    @unittest.skipUnless(OPENSSL, 'openssl is not installed; the self-signed pair is made with it')
+    def test_the_key_mode_warning_is_printed_at_every_start(self):
+        """Item 4: a group- or world-readable key warns at start; it is not refused."""
+        cert, key = self_signed(self.base)
+        os.chmod(key, 0o644)
+        self.config.write_text(json.dumps({'schema_version': 1, 'cert': cert, 'key': key}), encoding='utf-8')
+        proc = self.start()
+        said = self.first_stderr_line(proc)
+        self.assertIn('WARNING: the key file %s is readable by everyone' % key, said)
+        self.assertIn('chmod 600', said)
+
+    def test_the_plain_http_on_network_warning_names_the_address_and_port(self):
+        """Item 7: the supervisor's warning is printed at start and names the address and port."""
+        self.config.write_text(json.dumps({'schema_version': 1, 'http_host': '0.0.0.0',
+                                           'allow_plaintext_on_network': True,
+                                           'public_url': 'http://office.example.invalid:%d' % self.web_port}),
+                               encoding='utf-8')
+        proc = self.start()
+        said = self.first_stderr_line(proc)
+        self.assertIn('WARNING: serving plain HTTP on 0.0.0.0:%d' % self.web_port, said)
+        self.assertIn('Use cert and key for HTTPS.', said)
+
+    def test_the_runbook_documents_the_exit_status_and_the_header_default(self):
+        """Items 6 and 8: the decisions are written where the operator reads them."""
+        runbook = (self.script.parent/'docs'/'OFFICE_SERVICE.md').read_text(encoding='utf-8')
+        operations = (self.script.parent/'docs'/'OPERATIONS.md').read_text(encoding='utf-8')
+        self.assertIn('strict_transport_security', runbook)
+        self.assertIn('Strict-Transport-Security', runbook)
+        self.assertIn('backup=unknown', runbook)                # the fresh runtime's health until a backup
+        self.assertIn('exits 1', runbook)
+        self.assertIn('strict_transport_security', operations)
+        self.assertIn('Strict-Transport-Security', operations)
+        self.assertIn('exits 1 with', operations)
 
 
 if __name__ == '__main__':

@@ -10,6 +10,7 @@ import errno
 import io
 import shutil
 import socket
+import ssl
 import sys
 import tempfile
 import threading
@@ -82,7 +83,7 @@ class PortTakenTests(unittest.TestCase):
         with contextlib.redirect_stderr(said), contextlib.redirect_stdout(printed):
             status = http_service.main(['--state', str(Path(self.tmp) / 'state.json'), '--backend', 'inprocess', '--port', str(self.port)])
         self.assertEqual((status, http_service.EXIT_PORT_TAKEN), (4, 4))
-        self.assertEqual(said.getvalue(), 'orchestra-http: port %d on 127.0.0.1 is taken: something else is listening on it, so the '
+        self.assertEqual(said.getvalue(), 'orchestra-http: port %d on 127.0.0.1 is taken: something else holds it, so the '
                          'web service did not start. Stop that, or start this service on another port.\n' % self.port)
         self.assertNotIn('listening on', printed.getvalue())
 
@@ -98,23 +99,100 @@ class PortTakenTests(unittest.TestCase):
             status = http_service.main(['--state', str(Path(self.tmp) / 'state.json'), '--backend', 'inprocess',
                                         '--port', str(held.getsockname()[1])])
         self.assertEqual(status, 4)
-        self.assertIn('is taken: something else is listening on it', said.getvalue())
+        self.assertIn('is taken: something else holds it', said.getvalue())
+        self.assertEqual(len(said.getvalue().splitlines()), 1)
+
+    def test_a_windows_exclusive_refusal_counts_as_taken_where_it_cannot_be_run(self):
+        """A mocked winerror 10013 is "taken" on every platform (three mutants survived on Linux).
+
+        On Windows an excluded port range and a port one program holds alone are both refused as
+        "access" (10013) with no listener, so the arm must treat it as taken wherever it runs.
+        """
+        refused = OSError(errno.EACCES, 'access is denied')
+        refused.winerror = 10013
+        said, printed = io.StringIO(), io.StringIO()
+        with mock.patch.object(http_service, 'create_server', side_effect=refused), \
+                contextlib.redirect_stderr(said), contextlib.redirect_stdout(printed):
+            status = http_service.main(['--state', str(Path(self.tmp) / 'state.json'), '--backend', 'inprocess',
+                                        '--port', '4321'])
+        self.assertEqual(status, http_service.EXIT_PORT_TAKEN)
+        self.assertEqual(said.getvalue(), 'orchestra-http: port 4321 on 127.0.0.1 is taken: something else holds it, '
+                         'so the web service did not start. Stop that, or start this service on another port.\n')
+
+    def test_a_plain_eacces_is_not_a_taken_port(self):
+        """A plain EACCES is a port that cannot be bound, never "taken" (a mocked winerror-less arm)."""
+        refused = OSError(errno.EACCES, 'permission denied')
+        said = io.StringIO()
+        with mock.patch.object(http_service, 'create_server', side_effect=refused), \
+                contextlib.redirect_stderr(said), contextlib.redirect_stdout(io.StringIO()):
+            status = http_service.main(['--state', str(Path(self.tmp) / 'state.json'), '--backend', 'inprocess',
+                                        '--port', '4321'])
+        self.assertNotEqual(status, http_service.EXIT_PORT_TAKEN)
+        self.assertEqual(status, http_service.EXIT_PORT_NOT_PERMITTED)
+        self.assertIn('port 4321 cannot be bound', said.getvalue())
+        self.assertNotIn('is taken', said.getvalue())
+
+    def test_a_port_below_1024_is_one_line_not_a_traceback(self):
+        refused = PermissionError(errno.EACCES, 'permission denied')
+        said = io.StringIO()
+        with mock.patch.object(http_service, 'create_server', side_effect=refused), \
+                contextlib.redirect_stderr(said), contextlib.redirect_stdout(io.StringIO()):
+            status = http_service.main(['--state', str(Path(self.tmp) / 'state.json'), '--backend', 'inprocess',
+                                        '--port', '80'])
+        self.assertEqual(status, http_service.EXIT_PORT_NOT_PERMITTED)
+        self.assertIn('port 80 cannot be bound', said.getvalue())
+        self.assertIn('below 1024 needs privilege', said.getvalue())
+        self.assertEqual(len(said.getvalue().splitlines()), 1)
+
+    def test_an_address_that_is_not_on_the_host_is_one_line_not_a_traceback(self):
+        for refused in (OSError(errno.EADDRNOTAVAIL, 'Cannot assign requested address'),
+                        socket.gaierror(-2, 'Name or service not known')):
+            with self.subTest(refused=refused):
+                said = io.StringIO()
+                with mock.patch.object(http_service, 'create_server', side_effect=refused), \
+                        contextlib.redirect_stderr(said), contextlib.redirect_stdout(io.StringIO()):
+                    status = http_service.main(['--state', str(Path(self.tmp) / 'state.json'), '--backend',
+                                                'inprocess', '--host', 'no.such.host.invalid', '--port', '4321'])
+                self.assertEqual(status, http_service.EXIT_ADDRESS_UNAVAILABLE)
+                self.assertIn('the address no.such.host.invalid cannot be used', said.getvalue())
+                self.assertEqual(len(said.getvalue().splitlines()), 1)
+
+    def test_an_unusable_certificate_is_one_line_not_a_traceback(self):
+        refused = ssl.SSLError(1, '[SSL] PEM lib (_ssl.c:3851)')
+        said = io.StringIO()
+        with mock.patch.object(http_service, 'create_server', side_effect=refused), \
+                contextlib.redirect_stderr(said), contextlib.redirect_stdout(io.StringIO()):
+            status = http_service.main(['--state', str(Path(self.tmp) / 'state.json'), '--backend', 'inprocess',
+                                        '--cert', '/c.pem', '--key', '/k.pem', '--port', '0'])
+        self.assertEqual(status, http_service.EXIT_CERTIFICATE_UNUSABLE)
+        self.assertIn('the certificate or key cannot be used', said.getvalue())
         self.assertEqual(len(said.getvalue().splitlines()), 1)
 
     def test_another_failure_to_start_is_reported_as_it_was(self):
-        with mock.patch.object(http_service, 'create_server', side_effect=OSError(errno.EADDRNOTAVAIL, 'Cannot assign requested address')), \
+        """A failure that is none of the named ones still propagates, exactly as before."""
+        with mock.patch.object(http_service, 'create_server', side_effect=OSError(errno.EIO, 'I/O error')), \
                 contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
             with self.assertRaises(OSError) as raised:
                 http_service.main(['--state', str(Path(self.tmp) / 'state.json'), '--backend', 'inprocess', '--port', '0'])
-        self.assertEqual(raised.exception.errno, errno.EADDRNOTAVAIL)
+        self.assertEqual(raised.exception.errno, errno.EIO)
 
     @unittest.skipUnless(LINUX, 'the office service is for Linux')
     def test_the_supervisor_says_which_port_and_any_other_exit_is_what_it_was(self):
         self.assertEqual(office_service.WEB_PORT_TAKEN, http_service.EXIT_PORT_TAKEN)
+        self.assertEqual(office_service.WEB_ADDRESS_UNAVAILABLE, http_service.EXIT_ADDRESS_UNAVAILABLE)
+        self.assertEqual(office_service.WEB_PORT_NOT_PERMITTED, http_service.EXIT_PORT_NOT_PERMITTED)
+        self.assertEqual(office_service.WEB_CERTIFICATE_UNUSABLE, http_service.EXIT_CERTIFICATE_UNUSABLE)
         self.assertEqual(office_service.child_exit_reason(4, {}, 8443),
-                         'The web service did not start: port 8443 on 127.0.0.1 is taken (something else is listening on it). '
+                         'The web service did not start: port 8443 on 127.0.0.1 is taken (something else holds it). '
                          'Stop that, or run the service with another --port.')
         self.assertIn('port 9000 on 10.1.2.3 is taken', office_service.child_exit_reason(4, {'http_host': '10.1.2.3'}, 9000))
+        self.assertEqual(office_service.child_exit_reason(5, {'http_host': '10.1.2.3'}, 8443),
+                         'The web service did not start: 10.1.2.3 is not an address of this host, or its name does '
+                         'not resolve. Give an address of the host, or a name that resolves to one.')
+        self.assertIn('port 8443 cannot be bound without privilege',
+                      office_service.child_exit_reason(6, {}, 8443))
+        self.assertIn('the certificate or key cannot be used',
+                      office_service.child_exit_reason(7, {}, 8443))
         for status in (None, 0, 1, 2, -9):
             self.assertEqual(office_service.child_exit_reason(status, {}, 8443), 'A supervised child exited; inspect service logs')
 

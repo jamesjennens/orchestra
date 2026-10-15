@@ -22,7 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from http_auth import Service, Store
-from http_service import MAX_BODY_BYTES, InProcessBackend, create_server
+from http_service import MAX_BODY_BYTES, InProcessBackend, create_server, service_identity
 
 TMP_ROOT = Path(os.environ.get('ORCHESTRA_TEST_TMP', str(ROOT / '.runtime' / 'test-tmp')))
 ADMIN = 'root-admin'
@@ -150,7 +150,12 @@ class HttpContractCase(ServerHarness):
     def test_healthz_is_anonymous_and_no_store(self):
         response = self.request('GET', '/healthz')
         self.assertEqual(200, response.status)
-        self.assertEqual({'status': 'ok'}, response.data)
+        # The mark only this service says (kittrial-5bb.168 item 8): a probe can tell it from
+        # another server answering 200 on the port.
+        self.assertEqual({'status': 'ok', **service_identity()}, response.data)
+        self.assertEqual('orchestra-office', response.data['service'])
+        self.assertTrue(response.data['version'])
+        self.assertTrue(response.data['build_id'])
         self.assertEqual('no-store', response.headers.get('cache-control'))
         self.assertEqual('nosniff', response.headers.get('x-content-type-options'))
         self.assertTrue(response.headers.get('x-request-id'))
