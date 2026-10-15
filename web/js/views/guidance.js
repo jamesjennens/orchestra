@@ -79,7 +79,7 @@ export function guidancePanel(ctx, project) {
       guidanceRead.replaceChildren(h('div', null, h('h3', null, 'Current guidance'),
         value.warning ? h('p', { role: 'alert' }, value.warning) : null,
         value.next_action ? h('p', null, value.next_action) : null,
-        readable ? h('div', null, h('p', null, 'Set by ' + value.set_by + ' at ' + value.set_at),
+        readable ? h('div', null, h('p', null, 'Set by ' + value.set_by + ' via ' + (value.set_via || 'unknown legacy route') + ' at ' + value.set_at),
           h('p', null, 'Version: ' + value.version), h('pre', null, value.text),
           h('p', null, value.acknowledged ? 'You acknowledged this version.' : 'You have not acknowledged this version.'),
           !value.acknowledged && !project.archived

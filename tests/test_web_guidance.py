@@ -127,6 +127,28 @@ class AdapterTests(unittest.TestCase):
         request['actor']='worker-lane';request['args']=[json.dumps(dict(operation='clear'))];request['authority']['capability']=auth.CAP_COORDINATE
         self.assertEqual(self.call(request).get('authority_status'),403)
 
+    def test_worker_without_distinct_actor_cannot_acknowledge_for_issuer(self):
+        made = self.set()
+        for actor in (None, OWNER):
+            with self.subTest(actor=actor):
+                credential = dict(id='worker', user_id=OWNER, project_id=PROJECT,
+                                  revoked=False, expires_at=time.time()+3600, scopes=['tasks'])
+                if actor is not None:
+                    credential['actor'] = actor
+                self.state['credentials']['worker'] = credential
+                self.save()
+                request = self.request('ack', OWNER, 'issuer-ack-'+str(actor), version=made['version'])
+                request['authority'] = dict(via='credential', user_id=OWNER, credential_id='worker',
+                                            session_hash=None, project=PROJECT, capability=auth.CAP_READ)
+                before = {p.name: p.read_bytes() for p in self.project.iterdir() if p.is_file()}
+                denied = self.call(request)
+                self.assertEqual(denied.get('authority_status'), 403, denied)
+                self.assertIn('distinct worker actor', denied['stderr'])
+                self.assertEqual(before, {p.name: p.read_bytes() for p in self.project.iterdir() if p.is_file()})
+                self.assertFalse(guidance.read(self.project, ['get'], OWNER)['acknowledged'])
+        # An authenticated human still acknowledges their own read explicitly.
+        self.assertTrue(self.data(self.request('ack', OWNER, 'human-ack', version=made['version']))['acknowledged'])
+
     def test_completed_replay_reauthorizes_and_conflicting_body_refuses(self):
         self.set();before=self.files();request=self.request('set',OWNER,'set-1');request['attachments']={'text':dict(flag='--file',text='Different')}
         self.assertEqual(self.call(request)['returncode'],2);self.assertEqual(before,self.files())

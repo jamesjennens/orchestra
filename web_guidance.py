@@ -171,7 +171,16 @@ def _web_action(path, project, request, authority_config, operators=None):
     capability = CAPABILITIES[operation]
 
     def authorize():
-        return require_authority(request, authority_config, capability, project)
+        state = require_authority(request, authority_config, capability, project)
+        descriptor = request['authority']
+        if operation == 'ack' and descriptor.get('via') == 'credential':
+            credential = (state.get('credentials') or {}).get(descriptor.get('credential_id')) or {}
+            if (not credential.get('agent_id')
+                    and (not credential.get('actor') or credential['actor'] == credential.get('user_id'))):
+                raise authority.deny(403, 'forbidden',
+                                     'Acknowledging guidance needs a distinct worker actor; '
+                                     'this credential would acknowledge for its issuer')
+        return state
 
     if operation in READ_OPERATIONS:
         if authority_config is None:
@@ -210,7 +219,7 @@ def _web_action(path, project, request, authority_config, operators=None):
         actor = request['actor']
         if operation == 'set':
             result = guidance.write_guidance(path, request['attachments']['text']['text'], actor,
-                                             before_write=tracker.before_write)
+                                             before_write=tracker.before_write, set_via='web')
         elif operation == 'ack':
             result = guidance.acknowledge(path, actor, body['version'], before_write=tracker.before_write)
         else:

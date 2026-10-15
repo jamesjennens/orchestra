@@ -77,12 +77,15 @@ class NativeGuidanceHttpTests(RulesHelpers, unittest.TestCase):
                        for name in ('GUIDANCE.md', '.guidance.json', 'ONBOARDING.md')}
         source_rows = self.rows()
         records = []
-        def command(kit, *words):
+        def command(kit, *words, expected=0):
             argv = [sys.executable, '-B', str(kit / 'admin.py'), '--root', str(self.root), *words]
             reply = subprocess.run(argv, env=fixture.admin.environment(self.root),
                                    capture_output=True, text=True, timeout=180)
             records.append(dict(argv=argv, returncode=reply.returncode, stdout=reply.stdout, stderr=reply.stderr))
-            self.assertEqual(reply.returncode, 0, reply.stdout + reply.stderr)
+            if expected == 0:
+                self.assertEqual(reply.returncode, 0, reply.stdout + reply.stderr)
+            else:
+                self.assertNotEqual(reply.returncode, 0, reply.stdout + reply.stderr)
             return reply
         backups = self.root / 'backups'; backups.mkdir(exist_ok=True)
         initialized = self.r.bd('backup', 'init', str(backups / 'pp'))
@@ -93,9 +96,25 @@ class NativeGuidanceHttpTests(RulesHelpers, unittest.TestCase):
         self.assertTrue((backups / 'pp').is_dir())
         fixture.admin.validate_coordination_files(sidecar['files'])
         self.assertEqual(sidecar['files']['.guidance.json']['set_by'], uid)
+        self.assertEqual(sidecar['files']['.guidance.json']['set_via'], 'web')
         self.assertIn(viewer, sidecar['files']['.guidance.json']['acknowledged'])
         destination = 'guidanceprevious' if previous else 'guidancecurrent'
         reader = previous or KIT
+        if previous:
+            # New generations carry set_via. The actual old strict validator must
+            # refuse, not silently drop attribution or claim a compatible restore.
+            refused = command(reader, 'restore-new', 'pp', destination, expected=1)
+            self.assertIn('set_via', refused.stdout + refused.stderr)
+            self.assertFalse((self.root / 'projects' / destination).exists())
+            self.assertEqual(self.rows(), source_rows)
+            self.assertEqual({name: (self.project / name).read_bytes() for name in before_docs}, before_docs)
+            export = os.environ.get('ORCHESTRA_GUIDANCE_TEST_EXPORTS')
+            if export:
+                directory = Path(export); directory.mkdir(parents=True, exist_ok=True)
+                (directory / 'backup-restore-released-refusal.json').write_text(json.dumps(
+                    dict(commands=records, sidecar=sidecar, source_rows=source_rows,
+                         restored=False, source_documents_unchanged=True), indent=2))
+            return
         command(reader, 'restore-new', 'pp', destination)
         target = self.root / 'projects' / destination
         for name, content in before_docs.items():
@@ -134,7 +153,7 @@ class NativeGuidanceHttpTests(RulesHelpers, unittest.TestCase):
     def test_actual_native_backup_restore_keeps_web_guidance_ack_and_onboarding(self):
         self._backup_restore_guidance()
 
-    def test_released_kit_restores_and_reads_web_guidance_and_ack(self):
+    def test_released_kit_refuses_route_metadata_restore_without_source_effect(self):
         import os
         previous = os.environ.get('ORCHESTRA_GUIDANCE_PREVIOUS_KIT')
         if not previous:
@@ -350,6 +369,32 @@ class NativeGuidanceHttpTests(RulesHelpers, unittest.TestCase):
             self.assertEqual(observed, [operation], 'Must reach current canonical guard after the HTTP authority check')
             self.assertEqual(denied.status, 403, denied.data); self.assertEqual(before, self.docs())
 
+    def test_worker_without_distinct_actor_cannot_ack_as_issuer_over_http(self):
+        uid, owner = self.person('legacy-worker-owner', 'owner')
+        made = self.set_guidance()
+        before_rows = self.rows()
+        for label, actor in [('absent', None), ('issuer', uid)]:
+            issued = self.call('POST', '/worker-credentials', {'scopes': ['tasks'], 'label': label}, token=owner)
+            self.assertEqual(issued.status, 201, issued.data)
+            credential = issued.data['credential']; token = credential['secret']
+            # Existing stores can contain the historical issuer fallback even if a
+            # current issuance route rejects account-shaped actor names.
+            self.h.service.state['credentials'][credential['id']]['actor'] = actor
+            self.h.service.store.save()
+            self.assertEqual(self.call('GET', '/guidance', token=token).status, 200)
+            before = self.docs()
+            for _ in range(2):
+                refused = self.call('POST', '/guidance/ack', {'version': made['version']},
+                                    token=token, key='issuer-ack-' + label)
+                self.assertEqual(refused.status, 403, refused.data)
+                self.assertEqual(self.docs(), before)
+            self.assertNotIn(uid, guidance.read_meta(self.project)['acknowledged'])
+        self.assertEqual(self.rows(), before_rows)
+        control = self.call('POST', '/guidance/ack', {'version': made['version']},
+                            token=owner, key='real-owner-ack')
+        self.assertEqual(control.status, 200, control.data)
+        self.assertIn(uid, guidance.read_meta(self.project)['acknowledged'])
+
     def test_worker_namespace_foreign_anonymous_removed_and_unbound(self):
         uid, owner = self.person('worker-owner', 'owner')
         worker = self.call('POST', '/worker-credentials', {'scopes': ['tasks'], 'label': 'guidance worker', 'actor': 'guidance-worker'}, token=owner)
@@ -416,6 +461,7 @@ class NativeGuidanceHttpTests(RulesHelpers, unittest.TestCase):
         view = json.loads(done.stdout.strip().splitlines()[-1])
         self.assertEqual(view['initialWrites'], 0); self.assertTrue(view['draftsRetained']); self.assertTrue(view['escaped'])
         self.assertIn('Operator entry <script>literal</script>', view['initial'])
+        self.assertIn(' via web at ', view['initial'])
         self.assertIn('outcome is unknown', view['uncertain'])
         self.assertIn('You acknowledged this version', view['afterRetry']); self.assertTrue(view['state']['acknowledged'])
         self.assertEqual(len(view['ackCalls']), 2)
