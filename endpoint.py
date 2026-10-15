@@ -577,7 +577,7 @@ def reserved_actors(root,path,rows=False,own=()):
 #: host_reads.py): the operator list, the project's session names and the runtime's projects,
 #: which a bound key is not told.
 SERVICE_ONLY_ACTIONS=('create-project','project-creations','creation-standing','web-merge-slot','web-lifecycle',
-                      'host-coordination','host-projects')
+                      'host-coordination','host-projects','assignment-roster','task-assign')
 
 def key_project_refusal(request,key_projects):
     """Refuse, for a key bound to projects, a request that is not for one of them.
@@ -854,7 +854,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             raise ValueError('%s is available only to the web service'%answered)
     # Slot requests bind the block before project, tracker, or authority reads.
     # The shared table is the sole endpoint action/operation capability mapping.
-    if request.get('action') in ('coordinate','web-merge-slot','web-lifecycle'):
+    if request.get('action') in ('coordinate','web-merge-slot','web-lifecycle','task-assign','assignment-roster'):
         denied=block_mismatch_denial(request,authority_config)
         if denied is not None:return denied
     # Two actions exist only for the web service and name no existing project
@@ -1491,6 +1491,83 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             return guarded_write(root,request,journal_path(path),briefing_effect,
                                authority_config=authority_config,
                                require_authority=require_authority,runner=runner)
+    if action in ('assignment-roster','task-assign'):
+        from http_authority import CAP_COORDINATE, read_state, server_time
+        from task_assignment import AssignmentError, eligible_roster, standing_allowed, validate_request, apply as assignment_apply
+        from sessions import read_registry
+        args=request.get('args', [])
+        try:
+            payload=None
+            if action=='assignment-roster':
+                if not isinstance(args,list) or len(args)>1:
+                    raise AssignmentError(422,'Assignment roster takes one optional page request.')
+                page=record_json.loads(args[0]) if args else {'offset':0,'limit':200}
+                if (not isinstance(page,dict) or set(page)!={'offset','limit'}
+                        or type(page['offset']) is not int or page['offset']<0
+                        or type(page['limit']) is not int or not 1<=page['limit']<=200):
+                    raise AssignmentError(422,'Assignment roster requires a nonnegative offset and limit 1-200.')
+            else:
+                if not isinstance(args,list) or len(args)!=1 or not isinstance(args[0],str):
+                    raise AssignmentError(422,'Assignment takes one closed JSON request.')
+                payload=record_json.loads(args[0])
+                validate_request(payload)
+                if not request.get('operation_id') or payload['operation_id']!=request['operation_id']:
+                    raise AssignmentError(422,'Assignment requires the same stable operation identity in its envelope and body.')
+            def assignment_authority():
+                if not verified_web_authority(request,authority_config,CAP_COORDINATE,name):
+                    raise AssignmentError(403,'Verified coordinate authority is required in this project.')
+                for denied in (http_actor_denial(request,authority_config),
+                               descriptor_actor_denial(request,authority_config,
+                                   lambda rows=False,own=():reserved_actors(root,path,rows,own))):
+                    if denied is not None:
+                        raise AssignmentError(503 if denied.get('fault') else denied.get('authority_status',403),
+                                              'Current assignment caller standing cannot be verified.')
+            def roster():
+                state=read_state(authority_config.store)
+                try:registry=read_registry(path)
+                except ValueError:raise AssignmentError(503,'The project session roster cannot be read.') from None
+                def worker_allowed(target,credential_id,credential):
+                    target_request={'project':name,'actor':target,'authority':{
+                        'via':'credential','user_id':credential.get('user_id'),
+                        'credential_id':credential_id,'project':name,'capability':'tasks.write'}}
+                    return standing_allowed(descriptor_actor_denial(target_request,authority_config,
+                                           lambda rows=False,own=():reserved_actors(root,path,rows,own)))
+                return eligible_roster(state,name,registry,now=(request.get('authority') or {}).get('now'),
+                                       worker_actor_allowed=worker_allowed)
+            warnings=[]
+            def assignment_run(argv):
+                stdout,said=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
+                if said:warnings.append(said)
+                return stdout
+            runner=NativeRunner(assignment_run,project=path)
+            def effect():
+                actors={item['actor'] for item in roster()}
+                result=assignment_apply(payload,actor,runner,path,eligible=lambda target:target in actors,
+                                        operators=configured_operators(root),at=server_time())
+                return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':warning_text(warnings)}
+            with (path/'.coordination.lock').open('a') as lock:
+                fcntl.flock(lock,fcntl.LOCK_SH if action=='assignment-roster' else fcntl.LOCK_EX)
+                if action=='assignment-roster':
+                    if authority_config is None:raise AssignmentError(403,'Verified coordinate authority is required in this project.')
+                    with Path(authority_config.lock).open('a') as authority_lock:
+                        fcntl.flock(authority_lock,fcntl.LOCK_SH)
+                        assignment_authority();actors=roster();offset=page['offset'];limit=page['limit']
+                        result={'schema_version':1,'items':actors[offset:offset+limit],'total':len(actors),
+                                'more':offset+limit<len(actors),'offset':offset,
+                                'note':'Existing project identities only. Assignment grants no access; target eligibility is checked again at the effect.'}
+                        return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''}
+                status=[]
+                def checked_authority():
+                    try:assignment_authority()
+                    except AssignmentError as error:status.append(error.status);raise
+                answer=guarded_write(root,request,journal_path(path),effect,authority_config=authority_config,
+                                     require_authority=True,runner=runner,identity_check=checked_authority)
+                if status and answer.get('returncode')==2:answer['assignment_status']=status[-1]
+                return answer
+        except AssignmentError as error:
+            return {'returncode':2,'stdout':'','stderr':str(error)+'\n','assignment_status':error.status}
+        except ValueError as error:
+            return {'returncode':2,'stdout':'','stderr':str(error)+'\n','assignment_status':422}
     if action=='web-lifecycle':
         from http_authority import (CAP_READ, CAP_COORDINATE, AuthorityDenied,
                                     actor_parties, decide, file_lock, read_state)

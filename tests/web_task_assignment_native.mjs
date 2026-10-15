@@ -1,0 +1,20 @@
+import assert from 'node:assert/strict';
+const [shim,apiUrl,viewUrl,base,pid,token,tid,old,target]=process.argv.slice(2);
+await import(shim);const {createApi}=await import(apiUrl);const {assignmentForm}=await import(viewUrl);
+const requests=[];const api=createApi(async(method,path,headers,body)=>{
+ const response=await fetch(base+path,{method,headers:{...headers,Authorization:'Bearer '+token},body});
+ if(method==='POST')requests.push({headers,body,status:response.status});
+ return {status:response.status,data:await response.json()};
+});
+let renders=0;const ctx={api,setDirty(){},async render(){renders++;}};
+const section=assignmentForm(ctx,pid,tid,{assignee:old});document.body.append(section);
+const form=section.querySelector('form');const load=section.querySelectorAll('button').find(x=>x.textContent==='Load assignment roster');
+await load.dispatch('click');const submit=form.querySelector('button[type=submit]');assert.equal(submit.disabled,false);
+form.querySelector('select').value=target;const reason='<img src=x onerror=alert(1)>\nLiteral native reason';form.querySelector('#reason').value=reason;
+await form.dispatch('submit');assert.match(section.textContent,/Reconcile identical assignment/);assert.equal(form.querySelector('#reason').disabled,true);
+await form.dispatch('submit');await new Promise(resolve=>setTimeout(resolve,20));
+assert.equal(requests.length,2);assert.deepEqual(requests.map(x=>x.status),[503,200]);
+const sameKey=requests[0].headers['Idempotency-Key']===requests[1].headers['Idempotency-Key'];
+const sameBody=requests[0].body===requests[1].body;const literal=JSON.parse(requests[0].body).reason===reason;
+assert.ok(sameKey&&sameBody&&literal);assert.equal(renders,1);
+console.log(JSON.stringify({sameKey,sameBody,literal,renders,native:true,realHttp:true}));

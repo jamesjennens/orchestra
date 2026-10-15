@@ -35,7 +35,6 @@ class EndpointRefusalTests(harness.EndpointHarness):
         for action, args in (('unknown-future-action', []), ('work', []),
                              ('lifecycle', ['{}']), ('bd', ['close', harness.TASK]),
                              ('bd', ['reopen', harness.TASK]),
-                             ('bd', ['comments', 'add', harness.TASK, 'remark']),
                              ('bd', ['dep', 'add', harness.TASK, 'pp-other']),
                              ('coordinate', [json.dumps({'operation': 'create-child'})]),
                              ('coordinate', [json.dumps({'operation': 'future-operation'})]),

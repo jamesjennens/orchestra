@@ -244,7 +244,7 @@ class NoUnguardedParseTests(unittest.TestCase):
         'worker_gate.py': (1, "the endpoint's answer, on the caller's machine"),
     }
     # Files that parse text somebody else wrote, and have no bare json.loads at all.
-    GUARDED_ONLY = ('capability_records.py', 'capability_verification.py', 'feedback.py', 'guidance.py', 'keyed_entries.py', 'recovery.py', 'reserved_comments.py')
+    GUARDED_ONLY = ('capability_records.py', 'capability_verification.py', 'feedback.py', 'guidance.py', 'keyed_entries.py', 'recovery.py', 'reserved_comments.py', 'task_assignment.py')
 
     def bare(self, path):
         return len(re.findall(r'(?<![A-Za-z_.])json\.loads\(', path.read_text(encoding='utf-8')))
@@ -298,7 +298,7 @@ class NoUnguardedParseTests(unittest.TestCase):
             # the caller's text, so it is parsed through the guard.
             # kittrial-5bb.221 revision 2 moved tracker_actors' export rows to
             # record_json.loads_rows (the row bound); the web merge-slot payload adds a fifth guarded parse; lifecycle adds a sixth.
-            'briefing.py': 3, 'coordination.py': 3, 'endpoint.py': 6, 'export_requirements.py': 1, 'feedback.py': 3, 'guidance.py': 3,
+            'briefing.py': 3, 'coordination.py': 3, 'endpoint.py': 8, 'export_requirements.py': 1, 'feedback.py': 3, 'guidance.py': 3,
             # Requirements request bodies use the guard and reject duplicate fields.
             # lane_state.py reads the body of a reserved Kind: lane-state-v1 record comment
             # (kittrial-5bb.263): any actor's comments can carry one, so it is parsed through
@@ -309,6 +309,9 @@ class NoUnguardedParseTests(unittest.TestCase):
             'handoff.py': 1, 'http_authority.py': 1, 'http_service.py': 3, 'lane_state.py': 1, 'lifecycle.py': 2, 'recovery.py': 1, 'requirements.py': 1, 'requirement_records.py': 1, 'reserved_comments.py': 1,
             # The simple owner adapter guards bd's decision-create receipt too.
             'requirement_http.py': 2,
+            # Assignment adds closed roster/request payloads at the endpoint and
+            # guards both its native task reply and its reserved notice body.
+            'task_assignment.py': 2,
             'web_merge_slot.py': 4,
             # Lifecycle host entry and restore identity are bounded untrusted text.
             'web_lifecycle_marks.py': 2,

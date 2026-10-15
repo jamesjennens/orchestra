@@ -88,7 +88,7 @@ def _caller_move(state, task, owned, named_reviewer=False, pending_items=0, rede
                  way_back=None):
     """`(whose_move, next)`: the caller-relative half of the one whose-move decision.
 
-    Byte-identical to main (kittrial-5bb.249): derived only from the review state the
+    Derived only from the review state the
     item already shows plus the facts the row already carries. No title, no comment
     and no actor is read as a claim about intent. The additive
     ``reconciliation-needed`` work state is NOT a review state, so there is no branch
@@ -147,6 +147,11 @@ def _caller_move(state, task, owned, named_reviewer=False, pending_items=0, rede
         return 'you', ('This is your work now: %d outstanding review %s on a final contribution. '
                        'Read %s and deliver a new contribution that answers each item.'
                        % (items, plural, back))
+    if state == 'integrated':
+        # An integrated revision does not finish a task deliberately kept open.
+        return 'you', ('This task stays open after its contribution was integrated. '
+                       'Read %s; continue the task\'s remaining scope if any, otherwise checkpoint '
+                       'that nothing remains for you. Deployment or verification may be the coordinator\'s move.' % back)
     if state in (None, 'none'):
         return 'you', ('This is your work: no contribution has been delivered yet. Read %s '
                        'for its current state and deliver one.' % back)
@@ -760,12 +765,15 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
         # shared projection found recorded evidence that must be reconciled, else the
         # effective review state. `review_state` itself is unchanged.
         work_state=review.get('work_state',state)
+        from task_assignment import notices as assignment_notices
+        notices=assignment_notices(row,journal.name if journal is not None else '',actor)
         if owner is not None and row.get('assignee')!=owner:
+
             # A first-class review request (kittrial-5bb.94 item 4) puts the task in
             # the NAMED reviewer's queue even though they are not its assignee.
             named=[request for request in (review.get('pending_review_requests') or [])
                    if author_key(request.get('reviewer'))==author_key(owner)]
-            if not named:continue
+            if not named and not (a.mine and notices['total']):continue
         # The caller's own named review requests, so a row that is in the queue only
         # because they were named says so (kittrial-5bb.94 item 4). Computed for the
         # CALLING actor, not the --owner filter.
@@ -897,7 +905,8 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
             hold_sentence=integration_hold_sentence(review)
             if hold_sentence and hold_sentence not in move_text:
                 move_text=move_text+' Integration hold: '+hold_sentence+'.'
-        items.append({'open_items':open_items,'blocking_items':blocking_items,
+        items.append({**({'assignment_notices':notices} if notices['total'] else {}),
+                      'open_items':open_items,'blocking_items':blocking_items,
                       'checkpoint_at':checkpoint_at,'newer_activity':newer_activity,
                       'pending_change_requests':pending_change_requests[:PENDING_REQUEST_IDS_MAX],
                       'task':row['id'],'title':str(row.get('title',''))[:200],'owner':row.get('assignee'),'status':row.get('status'),'review_state':state,
@@ -994,6 +1003,22 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
         coverage+=' %d unparseable issue row(s).'%unparseable_count
     result={'owner':owner,'total':len(items),'items':items[a.offset:a.offset+a.limit],'next_offset':a.offset+a.limit if a.offset+a.limit<len(items) else None,
             'coverage':coverage}
+    # A closed task stays out of the actionable queue. Its durable assignment
+    # notice still reaches both holders as bounded metadata beside that queue.
+    if a.mine and journal is not None:
+        from task_assignment import notices as assignment_notices
+        closed_notices=[];closed_notice_total=0
+        for row in rows:
+            if (not isinstance(row,dict) or row.get('malformed') or row.get('status')!='closed'
+                    or row.get('issue_type') in ('event','gate') or is_merge_slot(row) or is_record_anchor(row)):
+                continue
+            block=assignment_notices(row,journal.name,actor)
+            closed_notices.extend(block['items']);closed_notice_total+=block['total']
+        if closed_notice_total:
+            kept=closed_notices[:20]
+            result['assignment_notices']={'items':kept,'total':closed_notice_total,
+                'omitted':max(0,closed_notice_total-len(kept)),
+                'coverage':'Closed-task notices only; no task is reopened or offered for action. Read brief/history for omitted notices.'}
     # .1 adds the remaining checkpoint attention fields for the displayed page only; this is
     # separate from the review/handoff/HTTP queue fields and parses only displayed tasks.
     for item in result['items']:

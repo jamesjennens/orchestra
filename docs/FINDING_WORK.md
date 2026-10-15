@@ -187,3 +187,13 @@ credential. The agent's first set-up is the Agents page: it writes
 
 The page "How work is found" shows each with a copy button, with the server address and
 the project filled in where the page knows them. None of them contains a secret.
+
+
+## An integrated contribution on a task that stays open
+
+An integrated contribution does not close the task. If it remains open with an
+assignee, the work and lane views name that assignee as the next actor: continue
+the task's remaining scope if any, otherwise checkpoint that nothing remains for
+you. Deployment or verification may still be the coordinator's move; integration
+alone does not require the assignee to invent more implementation work. A closed
+task remains history, and an unassigned integrated task does not invent a holder.

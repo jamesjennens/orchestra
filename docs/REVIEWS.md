@@ -776,3 +776,13 @@ The structured protocol is an append-only native comment chain with previous-com
 For example, if review returns contribution.comment_id = record-A, contribution.commit = <Git SHA>, and latest_comment_id = record-B, submit contribution = record-A and previous = record-B. Do not put the Git SHA in either comment-ID field.
 
 Handoff acceptance binds the complete disposition (including kind and supersedes) before transfer. The `.handoff-recoveries` journal is included in coordination backups and validated on restore. Interrupted completion keeps the original disposition ID on the accepted request. Older incomplete recovery identities fail closed and require explicit operator reconciliation; they are not silently promoted to exact retry evidence.
+
+
+## An integrated contribution on a task that stays open
+
+An integrated contribution does not close the task. If it remains open with an
+assignee, the work and lane views name that assignee as the next actor: continue
+the task's remaining scope if any, otherwise checkpoint that nothing remains for
+you. Deployment or verification may still be the coordinator's move; integration
+alone does not require the assignee to invent more implementation work. A closed
+task remains history, and an unassigned integrated task does not invent a holder.

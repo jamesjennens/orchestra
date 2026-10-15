@@ -91,9 +91,9 @@ class NextActorUnitTests(unittest.TestCase):
         self.assertEqual(review_state.next_actor('awaiting-review', 'alice/session'), 'reviewer')
         self.assertEqual(review_state.next_actor('legacy-review-ready', None), 'reviewer')
         self.assertEqual(review_state.next_actor('awaiting-integration', 'alice/session'), 'coordinator')
-        # Integrated work: main's whose_move says the move cannot be told, so no mover is
-        # named here either (review item 2; the 15-row disagreement of revision 1).
-        self.assertEqual(review_state.next_actor('integrated', 'alice/session'), 'unknown')
+        # Open integrated work leaves the remaining scope with its assignee.
+        self.assertEqual(review_state.next_actor('integrated', 'alice/session'), 'assignee')
+        self.assertEqual(review_state.next_actor('integrated', None), 'unknown')
         self.assertEqual(review_state.next_actor('error', 'alice/session'), 'operator')
         self.assertEqual(review_state.next_actor('reconciliation-needed', 'alice/session'), 'operator')
         self.assertEqual(review_state.next_actor('none', 'alice/session'), 'assignee')
@@ -122,7 +122,7 @@ class NextActorUnitTests(unittest.TestCase):
         self.assertEqual(review_state.next_actor('awaiting-review', 'alice/session',
                                                  pending_items=0, claimable=False), 'reviewer')
         self.assertEqual(review_state.next_actor('integrated', 'alice/session',
-                                                 pending_items=0, claimable=False), 'unknown')
+                                                 pending_items=0, claimable=False), 'assignee')
 
     def test_a_closed_settled_task_has_no_next_actor_but_active_review_does(self):
         self.assertEqual(review_state.next_actor('integrated', 'alice/session', closed=True), 'none')
@@ -151,13 +151,13 @@ class SharedNextActorTests(unittest.TestCase):
         # The assignee field is still exactly the assignee and is untouched by the new field.
         self.assertEqual(item['owner'], 'alice/session')
 
-    def test_integrated_work_names_no_mover_and_free_work_anyone(self):
+    def test_open_integrated_work_names_assignee_and_free_work_anyone(self):
         store = shared.reviewed()
         review, brief, item = surfaces(store.rows)
-        # Integrated work: whose_move is `unknown` to the holder, so next_actor is too
-        # (review item 2; this was the 15-row `coordinator` disagreement).
+        # Integration of one revision leaves open remaining work with the holder.
+        self.assertEqual(item['whose_move'], 'you')
         self.assertEqual([review['next_actor'], brief['review']['next_actor'],
-                          item['next_actor']], ['unknown'] * 3)
+                          item['next_actor']], ['assignee'] * 3)
         free = rows()
         free[0].update(assignee=None, status='open', comments=[])
         review, brief, item = surfaces(free)
@@ -250,10 +250,9 @@ class ReconciliationTests(unittest.TestCase):
         self.assertNotIn('reconciliation_reasons', brief)
         self.assertTrue(any(w.startswith('Integration fact disagreement') for w in item['integration_warnings']))
         # Item 2 (next-actor-from-work-state): the role follows the REVIEW state the row
-        # shows, never the reconciliation `work_state`. This row is `integrated`, whose
-        # move cannot be told, so its role is `unknown` and not the `operator` that the
-        # reconciliation-needed STATE token maps to.
-        self.assertEqual([review['next_actor'], item['next_actor']], ['unknown'] * 2)
+        # shows, never the reconciliation `work_state`. The open integrated task's
+        # assignee still owns its remaining work; the mismatch remains visible.
+        self.assertEqual([review['next_actor'], item['next_actor']], ['assignee'] * 2)
 
     def test_a_lagging_lifecycle_scope_names_both_commits(self):
         store = self.lagging()

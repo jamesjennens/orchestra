@@ -92,7 +92,7 @@ class BoundEndpointTests(unittest.TestCase):
         for known in ('session', 'handoff', 'review', 'work', 'set-onboarding', 'onboard', 'docs', 'actor-standing',
                       'setup-status', 'guidance', 'anchors', 'ref', 'capability', 'proposal', 'brief', 'history',
                       'checkpoint', 'lifecycle', 'coordinate', 'requirement', 'view', 'refresh', 'bd', 'feedback',
-                      'create-project', 'project-creations', 'creation-standing', 'host-coordination', 'host-projects', 'web-lifecycle'):
+                      'create-project', 'project-creations', 'creation-standing', 'host-coordination', 'host-projects', 'web-lifecycle', 'assignment-roster', 'task-assign'):
             self.assertIn(known, actions)
 
     def test_every_action_is_refused_for_another_project(self):
@@ -125,10 +125,10 @@ class BoundEndpointTests(unittest.TestCase):
                 self.refused(request)
 
     def test_the_web_only_actions_are_refused_before_their_name_is_looked_at(self):
-        self.assertEqual(sorted(endpoint.SERVICE_ONLY_ACTIONS), ['create-project', 'creation-standing', 'host-coordination',
-                                                                 'host-projects', 'project-creations', 'web-lifecycle', 'web-merge-slot'])
+        self.assertEqual(sorted(endpoint.SERVICE_ONLY_ACTIONS), ['assignment-roster', 'create-project', 'creation-standing', 'host-coordination',
+                                                                 'host-projects', 'project-creations', 'task-assign', 'web-lifecycle', 'web-merge-slot'])
         for action in ('create-project', 'project-creations', 'creation-standing', 'web-merge-slot',
-                       'host-coordination', 'host-projects', 'web-lifecycle'):
+                       'host-coordination', 'host-projects', 'web-lifecycle', 'assignment-roster', 'task-assign'):
             for project in ('alpha', 'beta', 'Not A Name', None):
                 with self.subTest(action=action, project=project):
                     self.refused({'project': project, 'actor': 'a', 'action': action},

@@ -176,6 +176,8 @@ export function createApi(transport) {
       return result;
     },
     hasCsrf: () => Boolean(csrf),
+    assignmentRoster: (pid, params) => call('GET', `/v1/projects/${encodeURIComponent(pid)}/assignment-roster`, { params }),
+    assignTask: (pid, tid, body) => mutate('POST', `/v1/projects/${encodeURIComponent(pid)}/tasks/${encodeURIComponent(tid)}/assign`, body),
     async logout() { try { await call('DELETE', '/v1/sessions/current'); } finally {
       csrf = null;
       if (lifecycleActor) { try { sessionStorage.removeItem(lifecycleStorageKey()); } catch {} }
@@ -245,6 +247,8 @@ export function createApi(transport) {
     createTask: (pid, body) => mutate('POST', `/v1/projects/${pid}/tasks`, body),
     updateTask: (pid, tid, body) => mutate('PATCH', `/v1/projects/${pid}/tasks/${tid}`, body),
     claim: (pid, tid) => mutate('POST', `/v1/projects/${pid}/tasks/${tid}/claim`, {}),
+    comment: (pid, tid, text) => mutate('POST', `/v1/projects/${pid}/tasks/${tid}/comments`, { text }),
+    checkpoint: (pid, tid, body) => mutate('POST', `/v1/projects/${pid}/tasks/${tid}/checkpoints`, body),
     review: (pid, tid, body) => mutate('POST', `/v1/projects/${pid}/tasks/${tid}/reviews`, body),
     queue: (pid, params) => call('GET', `/v1/projects/${pid}/queue`, { params }),
     myWork: () => call('GET', '/v1/me/work'),

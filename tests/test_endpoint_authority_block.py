@@ -303,6 +303,7 @@ class BlockMatchesRequestTests(EndpointHarness):
              'checkpoints.write', 'briefing'),
             ('claim', lambda: self.payload_request('bd', ['update', TASK, '--claim', '--json']), 'tasks.write', None),
             ('task create', lambda: self.payload_request('bd', ['create', 'A title', '--json']), 'tasks.write', None),
+            ('task comment', lambda: self.payload_request('bd', ['comments', 'add', TASK, 'Literal contributor remark']), 'tasks.write', None),
             ('proposal submit', proposal('submit'), 'proposals.write', 'proposal_records'),
             ('proposal revise', proposal('revise'), 'proposals.write', 'proposal_records'),
             ('proposal triage', proposal('review'), 'reviews.approve', 'proposal_records'),
@@ -315,7 +316,7 @@ class BlockMatchesRequestTests(EndpointHarness):
                 self.assertEqual(needed, http_authority.required_capability(build()))
         # Not in the table: reads, and actions the web service sends no block for.
         for action, args in (('review', [TASK]), ('proposal', ['get', 'k']), ('proposal', ['list']), ('work', []),
-                             ('handoff', [TASK, '@attachment:0']), ('bd', ['comments', 'add', TASK, 'text']),
+                             ('handoff', [TASK, '@attachment:0']), ('bd', ['dep', 'add', TASK, 'pp-other']),
                              ('bd', ['close', TASK]), ('lifecycle', ['{}']), ('coordinate', ['{}']), ('ref', ['propose']),
                              ('capability', ['propose']), ('feedback', ['add']), ('session', ['show']),
                              ('guidance', ['ack']), ('owner-requirements', ['accept']), ('set-onboarding', ['set'])):
@@ -356,7 +357,7 @@ class BlockMatchesRequestTests(EndpointHarness):
                     self.assertEqual(0, done.get('returncode'), done)
                     if library is None:                               # bd itself: the stub tracker was written to
                         self.assertEqual(1, len([command for _, command in self.tracker.writes
-                                                 if command[:1] in (['update'], ['create'])]), self.tracker.calls)
+                                                 if command[:1] in (['update'], ['create'], ['comments'])]), self.tracker.calls)
                     else:
                         self.assertEqual([library], self.reached)
 
@@ -413,9 +414,9 @@ class BlockMatchesRequestTests(EndpointHarness):
         self.assertEqual((0, ['work']), (done['returncode'], self.reached))
 
     def test_an_operation_the_table_does_not_know_is_refused_when_a_block_is_present(self):
-        # A raw comment has no web route. A block must never let a service mistake
-        # cross into the host-only write, even if its capability is otherwise valid.
-        comment = lambda project=PROJECT: self.payload_request('bd', ['comments', 'add', TASK, 'A plain remark'], project=project)
+        # Dependencies still have no web mutation route. An otherwise valid block
+        # must not let a service mistake reach a host-only dependency effect.
+        comment = lambda project=PROJECT: self.payload_request('bd', ['dep', 'add', TASK, 'pp-other'], project=project)
         refused = self.web(comment(OTHER_PROJECT), session_block(OWNER, 'tasks.write'))
         self.assertEqual((126, self.WRONG_PROJECT + '; nothing was changed\n'), (refused['returncode'], refused['stderr']))
         self.assertEqual([], self.tracker.calls)
@@ -427,6 +428,25 @@ class BlockMatchesRequestTests(EndpointHarness):
                 self.assertEqual([], self.tracker.calls)
                 self.assertIn('table does not allow this action or operation', refused['stderr'])
 
+
+    def test_contributor_comments_require_a_current_matching_tasks_block(self):
+        request = dict(self.payload_request('bd', ['comments', 'add', TASK, 'Literal contributor remark']),
+                       actor=CONTRIBUTOR)
+        refused = self.web(request, session_block(CONTRIBUTOR, 'read'))
+        self.assertRefused(refused)
+        self.assertIn('capability this request needs (tasks.write)', refused['stderr'])
+        self.assertEqual([], self.tracker.calls)
+        self.assertFalse(http_authority.journal_path(self.root / 'projects' / PROJECT).exists())
+        refused = self.web(request, session_block(CONTRIBUTOR, 'tasks.write', project=OTHER_PROJECT))
+        self.assertRefused(refused)
+        self.assertEqual([], self.tracker.calls)
+        done = self.web(request, session_block(CONTRIBUTOR, 'tasks.write'))
+        self.assertEqual(0, done['returncode'], done)
+        writes = [(actor, command) for actor, command in self.tracker.calls
+                  if command[:2] == ['comments', 'add']]
+        self.assertEqual(1, len(writes))
+        self.assertEqual(CONTRIBUTOR, writes[0][0])
+        self.assertEqual('Literal contributor remark', self.tracker.row['comments'][-1]['text'])
 
 if __name__ == '__main__':
     unittest.main()

@@ -445,7 +445,7 @@ class InProcessBackend:
     response can be reconciled without duplicating a record.
     """
 
-    ROUTES = ('tasks.create', 'tasks.update', 'tasks.claim', 'checkpoints.add',
+    ROUTES = ('tasks.create', 'tasks.update', 'tasks.claim', 'tasks.comment', 'checkpoints.add',
               'reviews.add', 'feedback.add', 'projects.create', 'projects.archive',
               'members.set', 'members.remove', 'credentials.issue', 'credentials.revoke',
               'proposals.submit', 'proposals.dispose', 'lifecycle.scope', 'lifecycle.fact')
@@ -617,6 +617,7 @@ class InProcessBackend:
             'tasks.create': self._task_create,
             'tasks.update': self._task_update,
             'tasks.claim': self._task_claim,
+            'tasks.comment': self._task_comment,
             'checkpoints.add': self._checkpoint_add,
             'reviews.add': self._review_add,
             'feedback.add': self._feedback_add,
@@ -710,6 +711,17 @@ class InProcessBackend:
         self._event(project_id, task['id'], 'task-claimed', principal, task['assignee'])
         return dict(task)
 
+    def _task_comment(self, principal, project_id, payload):
+        task = self._task(project_id, payload['task_id'])
+        # The disposable backend uses the task's existing native-shaped comments.
+        record = dict(id='comment_' + secrets.token_hex(8), issue_id=task['id'],
+                      author=principal.actor, text=payload['text'],
+                      created_at=now_iso(self.service._now()))
+        task.setdefault('comments', []).append(record)
+        self._event(project_id, task['id'], 'comment', principal)
+        self.state['events'][-1]['detail'] = record['text']
+        return record
+
     def _checkpoint_add(self, principal, project_id, payload):
         task = self._task(project_id, payload.get('task_id'))
         checkpoints = self.state.setdefault('checkpoints', {}).setdefault(task['id'], [])
@@ -731,6 +743,14 @@ class InProcessBackend:
                   'actor': payload.get('actor') or principal.actor,
                   'open_items': open_items,
                   'created_at': now_iso(self.service._now())}
+        if 'lane_state' in payload:
+            import lane_state
+            declared = dict(payload['lane_state']) if isinstance(payload['lane_state'], dict) else payload['lane_state']
+            try:
+                lane_state.validate(declared, task['id'])
+            except ValueError as error:
+                raise invalid(str(error)) from None
+            record['lane_state'] = dict(declared, checkpoint=record['id'])
         checkpoints.append(record)
         task['version'] += 1
         self._event(project_id, task['id'], 'checkpoint-added', principal, record['actor'])
@@ -1478,7 +1498,7 @@ class EndpointBackend:
     flight is surfaced as an uncertain outcome, never as success.
     """
 
-    ROUTES = InProcessBackend.ROUTES + ('merge-slot.acquire', 'merge-slot.release',
+    ROUTES = InProcessBackend.ROUTES + ('tasks.assign', 'merge-slot.acquire', 'merge-slot.release',
                                       'merge-slot.force-release', 'merge-slot.create')
     #: Routes with no canonical command yet, and why. Fails closed rather than
     #: pretending the service store is canonical.
@@ -1535,6 +1555,13 @@ class EndpointBackend:
         the canonical workflow's assignee check holds.
         """
         return principal.actor or principal.user_id
+
+    def assignment_roster(self, principal, project_id, offset=0, limit=200):
+        return self._run('assignment-roster', project_id, self._actor(principal),
+                         [json.dumps(dict(offset=offset,limit=limit))],
+                         authority=authority_request(principal, project_id, CAP_COORDINATE,
+                                                     now=self.service._expiry_now()),
+                         require_authority=True)
 
     def merge_slot_read(self, principal, project_id):
         return self._run('web-merge-slot', project_id, self._actor(principal),
@@ -1730,6 +1757,14 @@ class EndpointBackend:
         reply = self._endpoint(action, project, actor, args, attachments,
                                operation_id=operation_id, authority=authority,
                                require_authority=require_authority, route=route, extra=extra)
+        if (action in ('assignment-roster','task-assign') and isinstance(reply, dict)
+                and reply.get('returncode') == 2 and reply.get('assignment_status') in (403, 404, 409, 422, 503)):
+            status = reply['assignment_status']
+            error = HttpError(status, 'unavailable' if status == 503 else 'forbidden' if status == 403
+                              else 'not_found' if status == 404 else 'conflict' if status == 409 else 'invalid',
+                              (reply.get('stderr') or 'Assignment roster cannot be read').strip())
+            error.nothing_done = True
+            raise error
         if action == 'web-merge-slot' and isinstance(reply, dict) and reply.get('merge_slot_status'):
             status = reply['merge_slot_status']
             error = HttpError(status, 'conflict' if status == 409 else 'invalid' if status == 422 else
@@ -2130,7 +2165,7 @@ class EndpointBackend:
     }
     CHECKPOINT_FIELDS = ('schema_version', 'previous', 'activity_cursor', 'source_commit',
                          'branch', 'intent', 'acceptance', 'summary', 'next_action',
-                         'open_items', 'resolved')
+                         'open_items', 'resolved', 'lane_state')
 
     def _command(self, route, principal, project_id, payload, operation_id=None):
         """Build the canonical action and argv for one authorized mutation.
@@ -2141,6 +2176,11 @@ class EndpointBackend:
         require — including ``schema_version`` and ``operation_id`` — and no
         operation-inappropriate nulls.
         """
+        if route == 'tasks.assign':
+            from task_assignment import REQUEST_FIELDS
+            fields={k:payload[k] for k in REQUEST_FIELDS if k not in ('operation_id','task','schema_version')}
+            fields.update(schema_version=1,operation_id=operation_id,task=payload['task_id'])
+            return 'task-assign', project_id, [json.dumps(fields,ensure_ascii=False)], {}
         if route.startswith('lifecycle.'):
             import web_lifecycle
             operation = route.split('.', 1)[1]
@@ -2149,6 +2189,7 @@ class EndpointBackend:
             fields.update(operation=operation, task=payload['task_id'])
             return 'web-lifecycle', project_id, [json.dumps(fields)], {}
         if route.startswith('merge-slot.'):
+
             operation = route.split('.', 1)[1]
             fields = {'operation': operation}
             if operation == 'acquire':fields.update(task=payload['task_id'], target=payload['target'])
@@ -2218,6 +2259,11 @@ class EndpointBackend:
             # of status and assignee this sent before took the task from whoever held it and
             # reopened a closed one.
             return 'bd', project_id, ['update', str(task_id), '--claim', '--json'], {}
+        if route == 'tasks.comment':
+            # Literal text, including leading flags and attachment-like strings.
+            return ('bd', project_id,
+                    ['comments', 'add', str(task_id), '@attachment:0', '--json'],
+                    {'0': {'flag': '--file', 'text': payload['text']}})
         if route == 'checkpoints.add':
             # A field left out is sent as left out: the canonical validator names it with
             # every other problem of the record, where refusing it here hid the rest
@@ -2588,6 +2634,8 @@ class EndpointBackend:
                           'author': point.get('author'), 'summary': data.get('current_position'),
                           'next_action': data.get('next_action'),
                           'branch': point.get('branch'), 'source_commit': point.get('source_commit'),
+                          'intent': (data.get('intent') or {}).get('text'),
+                          'acceptance': (data.get('acceptance') or {}).get('text'),
                           'newer_activity': point.get('newer_activity'),
                           'open_items': [{'id': item.get('id'), 'kind': item.get('kind'),
                                           'text': item.get('text'), 'source': item.get('source')}
@@ -2655,7 +2703,8 @@ class EndpointBackend:
                 lifecycle[dimension]['reason']=fact['reason']
                 lifecycle[dimension]['note']=fact['reason']
         dependencies = (data.get('dependencies') or {}).get('items') or []
-        return {'task': task, 'checkpoint': checkpoint, 'carry_open_items': carry,
+        return {**({'assignment_records':data['assignment_records']} if data.get('assignment_records') else {}),
+                'task': task, 'checkpoint': checkpoint, 'carry_open_items': carry,
                 'review': {'state': review.get('review_state') or 'none',
                            'waiting_for_approval':review.get('waiting_for_approval'),
                            'approval_requires_other_party':bool(review.get('approval_requires_other_party')),
@@ -2686,6 +2735,7 @@ class EndpointBackend:
                                                     for entry in review['recommendation_keys']
                                                     if isinstance(entry, dict)]
                                                    if isinstance(review.get('recommendation_keys'), list) else None),
+                           'next_actor': review.get('next_actor') or 'unknown',
                            'revisions': priors + 1 if contribution else 0,
                            'warnings': review.get('warnings') or [],
                            # Additive (kittrial-5bb.52): the machine-readable
@@ -2699,6 +2749,7 @@ class EndpointBackend:
                 # What a checkpoint must carry to say which activity it has seen. It is in
                 # the canonical brief; without it here an agent could not write a first
                 # checkpoint from the brief alone (kittrial-5bb.113).
+                'next_action': data.get('next_action'),
                 'activity_cursor': data.get('activity_cursor'),
                 'warnings': data.get('warnings') or [],
                 # The canonical brief already bounds refs, authors and omissions;
@@ -6389,6 +6440,82 @@ class ApiHandler(BaseHTTPRequestHandler):
         return self._mutate(ctx, 'tasks.update', ctx.params['pid'], update,
                             capability=CAP_TASKS, serialize=False, canonical=True)
 
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/assignment-roster')
+    def task_assignment_roster(self, ctx):
+        self._project(ctx,CAP_COORDINATE)
+        if not hasattr(self.backend,'assignment_roster'):
+            raise not_implemented('Canonical assignment roster is unavailable on this server')
+        refuse_unknown_fields(ctx.query,('limit','cursor'),'Assignment roster query')
+        limit,state=self._page(ctx,ctx.query)
+        result=self.backend.assignment_roster(ctx.principal,ctx.params['pid'],state['o'],limit)
+        result['next_cursor']=(make_cursor(ctx.principal,ctx.params['pid'],ctx.query,state['o']+limit)
+                               if result['more'] else None)
+        return 200,result
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/assign')
+    def task_assign(self,ctx):
+        self._project(ctx,CAP_COORDINATE)
+        if 'tasks.assign' not in self.backend.ROUTES:
+            raise not_implemented('Canonical task assignment is unavailable on this server')
+        if ctx.idempotency_key is None:
+            raise invalid('Send an Idempotency-Key and reuse it with the identical assignment after an uncertain outcome')
+        payload=dict(ctx.payload or {})
+        fields=('expected_assignee','assignee','reason','allow_pending_review','allow_held_slot')
+        refuse_unknown_fields(payload,fields,'Task assignment')
+        from task_assignment import validate_request
+        try:
+            validate_request(dict(payload,schema_version=1,operation_id='http-validation',task=ctx.params['tid']))
+        except ValueError as error:
+            raise invalid(str(error)) from None
+        payload['task_id']=ctx.params['tid']
+        def assign():
+            result=self.backend.invoke('tasks.assign',ctx.principal,ctx.params['pid'],payload,
+                                       ctx.idempotency_key,target=ctx.route_target,
+                                       authorize=ctx.authorize,capability=CAP_COORDINATE)
+            return result,result
+        return self._mutate(ctx,'tasks.assign',ctx.params['pid'],assign,capability=CAP_COORDINATE,
+                            serialize=False,canonical=True,audit_metadata={'task':ctx.params['tid']})
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/comments')
+    def tasks_comment(self, ctx):
+        self._project(ctx, CAP_TASKS)
+        payload = dict(ctx.payload or {})
+        refuse_unknown_fields(payload, ('text',), 'A task comment')
+        text = payload.get('text')
+        if not isinstance(text, str) or not text.strip():
+            raise invalid('A task comment must be nonempty text of at most 65536 UTF-8 bytes')
+        try:
+            text_bytes = len(text.encode('utf-8'))
+        except UnicodeEncodeError:
+            raise invalid('A task comment must be valid UTF-8 text') from None
+        if text_bytes > MAX_ATTACHMENT_BYTES:
+            raise invalid('A task comment must be nonempty text of at most 65536 UTF-8 bytes')
+        if '\x00' in text:
+            raise invalid('A task comment cannot contain NUL')
+        tid, pid = ctx.params['tid'], ctx.params['pid']
+        self._refuse_record_anchor(self.backend.get_task(pid, tid), write=True)
+        from reserved_comments import check_comment_body
+        try:
+            check_comment_body(text, 'attachment', actor=ctx.principal.actor, task=tid)
+        except ValueError as error:
+            raise invalid(str(error)) from None
+        payload['task_id'] = tid
+
+        def comment():
+            result = self.backend.invoke('tasks.comment', ctx.principal, pid, payload,
+                                         ctx.idempotency_key, target=ctx.route_target,
+                                         authorize=ctx.authorize, capability=CAP_TASKS)
+            if isinstance(result, list) and len(result) == 1:
+                result = result[0]
+            # Do not invent identity or time, or echo an arbitrary backend object.
+            if not isinstance(result, dict) or not result.get('id') or result.get('text') != text:
+                raise UncertainOutcome()
+            public = {'comment': {k: result[k] for k in ('id', 'issue_id', 'author', 'text', 'created_at') if k in result}}
+            return public, public
+        return self._mutate(ctx, 'tasks.comment', pid, comment, status=201,
+                            capability=CAP_TASKS, serialize=False, canonical=True,
+                            audit_metadata={'task': tid, 'text_bytes': text_bytes})
+
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/tasks')
     def tasks_list(self, ctx):
         self._project(ctx, CAP_READ)
@@ -7018,6 +7145,15 @@ class ApiHandler(BaseHTTPRequestHandler):
         # The backend reads as the service; explain the wait to THIS caller.
         from work import approval_wait, APPROVAL_WAIT
         caller=ctx.principal.actor or ctx.principal.user_id
+        from task_assignment import holder_message
+        records=brief.pop('assignment_records',None)
+        if records:
+            items=[]
+            for entry in records.get('items',[]):
+                message=holder_message(entry['notice'],caller)
+                if message:items.append(dict(entry,message=message))
+            if items:brief['assignment_notices']={'items':items,'omitted':records.get('omitted',0),
+                                                'complete':records.get('omitted',0)==0}
         assignee=brief['task'].get('assignee')
         author=(contribution or {}).get('author')
         required=bool(review.get('approval_requires_other_party') or self.service.approval_by_another_party)
@@ -7108,8 +7244,10 @@ class ApiHandler(BaseHTTPRequestHandler):
             'send_to': base + '/checkpoints', 'method': 'POST',
             'body': {'schema_version': 1, 'previous': current.get('id'),
                      'activity_cursor': brief.get('activity_cursor'),
-                     'intent': '', 'acceptance': '', 'summary': '', 'next_action': '',
-                     'source_commit': '', 'branch': '', 'open_items': carried, 'resolved': []},
+                     'intent': current.get('intent') or '', 'acceptance': current.get('acceptance') or '',
+                     'summary': '', 'next_action': '',
+                     'source_commit': current.get('source_commit') or '',
+                     'branch': current.get('branch') or '', 'open_items': carried, 'resolved': []},
             'carried_open_items': len(carried),
             'required': ['intent', 'acceptance', 'summary', 'next_action'],
             'optional': {'source_commit': 'the commit the work is at; leave out when there is none',
