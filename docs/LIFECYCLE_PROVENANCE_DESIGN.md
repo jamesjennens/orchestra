@@ -3,7 +3,7 @@
 Status: **revised design for structured document review; no new implementation or rollout authorization**.
 This incorporates the seven changes from the accept-with-changes document review.
 The inspected baseline is
-`15b2ad0a10b204c11612dfa1d153efdb92813b44` (15 October 2026). Code citations below
+`3a3cf318ce22f450803696acde07e9a6cda6f003` (release `orchestra-3a3cf31-20261015c`, 15 October 2026). Code citations below
 refer to that exact tree, not the older review's f929787 line numbers.
 
 The baseline already contains delivery1's contributor raw-write guard, the
@@ -51,7 +51,7 @@ not establish host issuance or authorization.
   edit or remove lifecycle state events or reserved labels. This guard is always
   on, including when the three coordinator rules are OFF. Ordinary task prose,
   status and assignment keep their existing routes. See `raw_lifecycle.py:46,80`
-  and `endpoint.py:1783`.
+  and `endpoint.py:1870`.
 - Canonical shape, native author/parent, scope, order and label agreement are
   checked by `lifecycle.py:358,418,467,602`. A consistent legacy record is not
   rejected merely because it lacks a new receipt.
@@ -139,7 +139,7 @@ Lifecycle update in progress; retry the same operation if interrupted.
 ```
 
 The current audit counts that transition as unclassifiable/questionable
-(`lifecycle_voids.py:1098,1132`). That can inflate a campaign estimate with the
+(`lifecycle_voids.py:1119,1153`). That can inflate a campaign estimate with the
 kit's own release rewrites. The revised audit must recognise **only a complete
 pair**: that exact reason, the same task and dimension, the same native author,
 and the immediately following canonical payload event of that operation. Native
@@ -192,7 +192,7 @@ retractions, native events or correction comments to recover capacity.
 `lifecycle_void_writes` gate. Abandonment is a recovery for an incomplete native
 correction and has its own documented reconciliation rules. All are host-only;
 there is no contributor raw-comments shortcut. See `admin.py:989,1032` and
-`lifecycle_voids.py:1224,1339`.
+`lifecycle_voids.py:1245,1360`.
 
 Under the established project/config locks, validate the entire request and
 current authority before effects. Write the native correction comment first,
@@ -316,19 +316,19 @@ separately. It is an acceptance gate for any later reader change in this design.
 | Release planning/query/batch preconditions | `lifecycle.py:1447,1547,1602,1688,1822`; use the same classified snapshot, including supersede planning. |
 | Ordinary fact and scope write preconditions | `lifecycle.py:1387,1881,1938`; a damaged correction context is not bypassed by recording another fact. |
 | Retry reconciliation | `lifecycle.py:1356`; `_operation_index` records blocked IDs/reasons rather than reconciling a voided event. |
-| Author audit and raw event inspection | `lifecycle.py:259`, `admin.py:857,871`, `lifecycle_voids.py:998`; audit retains raw attribution and separately reports effective corrections. A raw row is inspection evidence, not a trusted pass. |
-| Task brief | `briefing.py:722,877,1633`; exported host snapshot and lifecycle reason accompany the projected value. |
-| Work/ready/owned/queue/resume projections | `work.py:637,669,951,1078,1096,1118`; share snapshot; keep lifecycle reasons beside independent held/verification state. |
+| Author audit and raw event inspection | `lifecycle.py:259`, `admin.py:857,871`, `lifecycle_voids.py:1019`; audit retains raw attribution and separately reports effective corrections. A raw row is inspection evidence, not a trusted pass. |
+| Task brief | `briefing.py:747,919,1685`; exported host snapshot and lifecycle reason accompany the projected value. |
+| Work/ready/owned/queue/resume projections | `work.py:719,751,1041,1185,1204,1226`; share snapshot; keep lifecycle reasons beside independent held/verification state. |
 | Lane board | `lanes.py:287`; integration evidence comes from the same trusted scopes. |
 | Rendered refresh/view | `render.py:29,82,94`; retain Snapshot context and display reason next to unknown. |
-| Review/integration projection | `review_state.py:538,316`; current and historical integration reasons survive its reduction. |
+| Review/integration projection | `review_state.py:542,320`; current and historical integration reasons survive its reduction. |
 | Follow-on base admissibility | `review_workflow.py:2386,2422,2441`; compare trusted integration, native created_at, reverts and `marks.snapshot_eligible`. Git ancestry remains a reviewer check. |
 | Capability verification filter and integration cache | `capability_verification.py:212,220,235`; `is_lifecycle_row` retains relevant task/event rows, then `integrated_commits` consults corrections. A label prefilter is not the trust decision; memoization shares one view. |
-| HTTP task detail and lifecycle next action | `http_service.py:2569,2651`; EndpointBackend maps the authoritative brief into value/reason/note, then derives actions from that projected state. It must not reinstate a passed fact from a raw label. |
-| HTTP task/queue lists | `http_service.py:1451,3074`; `lifecycle_reasons` stays beside the row's lifecycle values, including next-action consumers. |
+| HTTP task detail and lifecycle next action | `http_service.py:2636,2720`; EndpointBackend maps the authoritative brief into value/reason/note, then derives actions from that projected state. It must not reinstate a passed fact from a raw label. |
+| HTTP task/queue lists | `http_service.py:1492,3146`; `lifecycle_reasons` stays beside the row's lifecycle values, including next-action consumers. |
 | Web lifecycle history/write UI data | `web_lifecycle.py:80,151,219,221,269`; task state/read/retry use the shared snapshot; history is not a second raw trust implementation. |
 | Browser fact display | `web/js/ui.js:50`; displays the server's fact note. Browser pages consume the server projection, not host files or an independent native fact evaluator. |
-| Endpoint lifecycle/merge/raw entry points | `endpoint.py:1524,1607,1718,1783`; host context is constructed at the trusted adapter; raw guard is structurally separate. |
+| Endpoint lifecycle/merge/raw entry points | `endpoint.py:1608,1691,1802,1870`; host context is constructed at the trusted adapter; raw guard is structurally separate. |
 | Strict development endpoint | `tools/strict_canonical_endpoint.py:400` calls `apply_native`; any use requiring host truth must supply the same protected project context. It is not authority for a caller-supplied context or a new production route. |
 | Offline list, owed evidence and release dry run | `lifecycle.py:2114,2247,2443,2502,2519`; consult and bind a named `--journal` family, or explicitly disclose unconsulted corrections. An export alone cannot manufacture host metadata. |
 | Structural raw namespace parser | `raw_lifecycle.py:46,80`; reserves incomplete/legacy event shapes to prevent later activation. It is a write guard, not a substitute for trusted lifecycle reading. |
@@ -401,21 +401,30 @@ That does not confer reviewed/integrated authority or bypass independent approva
 This is the group7 decision, not an added assignment restriction.
 
 Who may change an assignee remains explicit: contributors retain those native
-routes; coordinators also have the web assign/unassign route in .211 (source
-`ee2f15e774cd515fd8cb04438fd6c906e19e1ea4`). That web route is additional controlled
-coordination, not a restriction of the SSH contributor routes. It is not yet in
-the pinned base15 tree; verify its integration in the intended next release
-before describing that release as carrying it. A designated reviewer/coordinator
-alone does not gain a new right to rewrite historical assignment in this note.
+routes; coordinators also have the web assign/unassign route in .211, integrated
+in the current base (1015b is `334c72d384e4d25640cd3c387b891d47a137b2ac`). That web
+route is additional controlled coordination, not a restriction of SSH contributor
+routes. It writes an attributable native comment, **`Kind: task-assignment-v1`**,
+whose canonical body binds the authenticated assignment author, project, task,
+prior and new assignee, server UTC time and reason. `task_assignment.parse_comment`
+validates the exact shape/hash and native author/project/task binding
+(`task_assignment.py:87,113`). The comment is a reserved record kind on this kit
+(`reserved_comments.py:216`); it adds no protected sidecar family.
 
-The audit must report **assignee at recording time**, reconstructed from native
-assignment history where available, plus who assigned and the history/time basis.
-Otherwise report `unknown` with its cause. Keep today's assignee in a separate
-field. The questionable rule for an assignee-authorized fact uses the historical
-assignee, not today's; unknown historical assignment is an explicit evidence gap,
-never fabricated from the present task. Historical SSH authors remain attributed
-names, not authenticated people. Do not demote ordinary legacy lifecycle reads
-merely because this audit lacks assignment history.
+These notices are the named history source for **web assignments** in the audit's
+**assignee at recording time** field and its "who assigned" evidence. Reconstruct
+only transitions supported by the native history and applicable validated notice
+chain; record the event IDs and time/order basis. Current notice projection anchors
+the chain in the actual native assignee (`task_assignment.py:368,377`); a comment's
+canonical shape alone does not prove an actual holder transition. Raw SSH
+`--assignee` and `--claim` changes leave **no such notice**. Those transitions stay
+`unknown` unless native history establishes them; never backfill a web notice or
+invent attribution for them. Missing or ambiguous historical assignment remains
+an explicit unknown cause. Keep today's assignee in a separate field; the
+questionable rule for an assignee-authorized fact uses the historical assignee,
+not today's. Historical SSH authors remain attributed names, not authenticated
+people. Do not demote ordinary legacy fact reads because this audit lacks history.
+A designated reviewer/coordinator gains no right to rewrite historical assignment.
 
 Any future protected assignment-origin record needs a separate accepted scope,
 legacy-unknown behavior, gate and complete rollout/restore/rollback row. This
@@ -462,12 +471,13 @@ boundary; no undefined lineage ID or cross-installation signature is claimed.
 
 ### Release-specific rollback matrix
 
-The rollback target is the **current approved compatible kit**, not any kit that
-can start. At this inspection that is `15b2ad0a10b204c11612dfa1d153efdb92813b44`
-(release `orchestra-15b2ad0-20261015a`). The coordinator names `1015b` as the next
-target; bind its actual commit/release manifest and prove the rows below before
-claiming that target is available. A release name or today's date is not that
-proof. The authoritative operational matrix and recovery procedures are in
+The rollback target is the **release current at acceptance**, qualified for the
+stored families and record kinds below. At this revision it is
+`3a3cf318ce22f450803696acde07e9a6cda6f003`, release
+`orchestra-3a3cf31-20261015c`; the preceding `1015b` is
+`334c72d384e4d25640cd3c387b891d47a137b2ac`. Recheck the current acceptance release
+and its manifest before rollout; a release name alone is not compatibility proof.
+The authoritative operational matrix and recovery procedures are in
 [VOID/abandonment rollback](OPERATIONS.md#backups).
 
 | Reader/release | Actual reading and backup/restore boundary | Rollback decision |
@@ -476,7 +486,8 @@ proof. The authoritative operational matrix and recovery procedures are in
 | F0 `04ed25d`, no abandonment | Reads schema-v1 VOID/retract unchanged and can back up that family. | Rollback-clean for this family while no abandonment exists; other new families still need their own rows. |
 | F0 `04ed25d`, with abandonment | Reads lifecycle facts/issued VOIDs, but calls both the abandoned cut and its own abandonment comment incomplete. Backup refuses; restore rejects a backup containing the abandonment-store path. It can reopen an abandoned operation by exact retry. | Not rollback-clean. An older complete generation before those comments can restore into an unused destination; otherwise roll forward. Returning to the current kit makes a reopened VOID in-effect and its abandonment superseded, not damaged. |
 | `beca5d6` / `987cd50`, own-comment abandonment | Know the store but pair it with the cut comment, so the new own-comment proof mismatches: audit damaged/incomplete, the named event unknown, backup refused. Unrelated events/family writes retain their documented reading. | Not a target for this abandonment generation. Roll forward without deleting store, cut, own comment or family. With no abandonment, the documented family compatibility remains. |
-| Current `15b2ad0` / confirmed successor `1015b` | Understands own-comment proof, cut-abandonment recovery and reopened/superseded history; validates complete family/native generation before backup/restore. | Use this compatible generation as the target. Test the exact successor artifact before updating the target pin. A writer OFF does not remove stored evidence or make an older target clean. |
+| Current acceptance target `3a3cf31` / `orchestra-3a3cf31-20261015c` (prior `1015b`: `334c72d`) | Understands own-comment proof, cut-abandonment recovery and reopened/superseded history; validates complete family/native generation before backup/restore. Assignment notices also require the row below. | Bind and qualify the exact release current at acceptance, now 1015c. A writer OFF does not remove stored evidence or make an older target clean. |
+| `task-assignment-v1` native comments (.211) | Reserved kind on current kits. A pre-.211 kit such as `beca5d69bcc03965f9896412ec93aca0e2d664b5` reads and preserves these as ordinary native comments; it has no assignment-notice interpretation or notifications, and its raw comment path can accept forged lookalikes. Current validated notice chains remain anchored in the actual native holder, not merely a canonical comment. See `tests/test_web_task_assignment.py:469,491` and `task_assignment.py:377`. | An older target must tolerate and preserve the comments without treating them as malformed lifecycle/review records or positive assignment authority. Verify its exact reader/backup/restore behavior and raw-write exposure before rollback; retain unknown historical assignments where no notice/native history proves them. Never strip notices to force downgrade. |
 | Web integration marks | Current restore into a differently named project retains evidence bytes but does **not** preserve marked recorder eligibility; old kit can omit the mark family. | Keep the complete source backup and reconcile destination eligibility with a compatible kit. Re-granting web access is not rebinding old marks. See [mark recovery](OPERATIONS.md#web-integration-marks-restore-and-rollback). |
 | Holds/attestations/new review operations | A reader predating their closed review shapes can reject a chain. The baseline release-selection unreadable-chain defect above must not be mistaken for safe rollback behavior. | The target must understand those shapes and skip unreadable targets with a reason; reconcile through authorized review operations, never hand-edit history. |
 
@@ -548,7 +559,7 @@ This document changes no rule, store, fact or deployment.
 
 ## Appendix: direct lifecycle reader call inventory
 
-The following call sites are pinned to base15. Repeated calls in one function
+The following call sites are pinned to base `3a3cf31`. Repeated calls in one function
 are shown individually because different request paths can lose context.
 
 | Source call site | Containing function | Lifecycle reader |
@@ -556,14 +567,14 @@ are shown individually because different request paths can lose context.
 | `admin.py:857` | `lifecycle_authors_command` | `read_event_rows` |
 | `admin.py:861` | `lifecycle_authors_command` | `lifecycle_authors_report` |
 | `admin.py:880` | `lifecycle_audit_command` | `read_event_rows` |
-| `briefing.py:722` | `brief` | `project_facts` |
-| `briefing.py:1633` | `exported_rows` | `read_event_rows` |
+| `briefing.py:747` | `brief` | `project_facts` |
+| `briefing.py:1685` | `exported_rows` | `read_event_rows` |
 | `capability_verification.py:235` | `integrated_commits` | `integration_evidence` |
 | `coordination.py:528` | `apply_native` | `read_event_rows` |
 | `coordination.py:545` | `apply_native` | `read_event_rows` |
-| `endpoint.py:1524` | `execute.lifecycle_identity` | `read_event_rows` |
-| `endpoint.py:1607` | `execute.slot_identity` | `read_event_rows` |
-| `endpoint.py:1718` | `execute` | `host_snapshot` |
+| `endpoint.py:1608` | `execute.lifecycle_identity` | `read_event_rows` |
+| `endpoint.py:1691` | `execute.slot_identity` | `read_event_rows` |
+| `endpoint.py:1802` | `execute` | `host_snapshot` |
 | `lanes.py:287` | `read` | `integration_evidence` |
 | `lifecycle.py:274` | `lifecycle_authors_report` | `events_by_dimension` |
 | `lifecycle.py:275` | `lifecycle_authors_report` | `trusted_payloads` |
@@ -610,9 +621,9 @@ are shown individually because different request paths can lose context.
 | `lifecycle.py:2521` | `main` | `project_facts` |
 | `lifecycle_voids.py:72` | `event_binding` | `native_event` |
 | `lifecycle_voids.py:735` | `context` | `native_event` |
-| `lifecycle_voids.py:1012` | `audit` | `classified_events` |
+| `lifecycle_voids.py:1033` | `audit` | `classified_events` |
 | `render.py:82` | `render` | `project_facts` |
-| `review_state.py:538` | `scopes_for` | `integration_evidence` |
+| `review_state.py:542` | `scopes_for` | `integration_evidence` |
 | `review_workflow.py:2422` | `recorded_integrations` | `host_snapshot` |
 | `review_workflow.py:2441` | `recorded_integrations` | `integration_evidence` |
 | `web_lifecycle.py:80` | `task_state` | `project_facts` |
@@ -621,10 +632,10 @@ are shown individually because different request paths can lose context.
 | `web_lifecycle.py:219` | `apply` | `read_event_rows` |
 | `web_lifecycle.py:221` | `apply` | `_operation_index` |
 | `web_lifecycle.py:269` | `apply` | `read_event_rows` |
-| `work.py:669` | `queue` | `project_facts` |
-| `work.py:669` | `queue` | `integration_evidence` |
-| `work.py:1078` | `execute` | `host_snapshot` |
-| `work.py:1096` | `execute` | `read_event_rows` |
-| `work.py:1098` | `execute` | `host_snapshot` |
-| `work.py:1118` | `execute` | `read_event_rows` |
-| `work.py:1120` | `execute` | `host_snapshot` |
+| `work.py:751` | `queue` | `project_facts` |
+| `work.py:751` | `queue` | `integration_evidence` |
+| `work.py:1185` | `execute` | `host_snapshot` |
+| `work.py:1204` | `execute` | `read_event_rows` |
+| `work.py:1206` | `execute` | `host_snapshot` |
+| `work.py:1226` | `execute` | `read_event_rows` |
+| `work.py:1228` | `execute` | `host_snapshot` |
