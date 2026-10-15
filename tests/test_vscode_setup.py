@@ -768,7 +768,9 @@ class TheDialogAndThePageCase(unittest.TestCase):
     """Static checks of what the page offers, where node may not be installed at all."""
 
     def test_the_guide_says_what_the_credential_file_holds(self):
-        # After set-up step 6 it holds three lines (two comments and the header line), not one (N4).
+        # After set-up step 6 without its own certificate it holds three lines (two comments
+        # and the header line), not one (N4). With a certificate it holds the curl options too
+        # (kittrial-5bb.275).
         setup = SETUP_JS.read_text(encoding='utf-8')
         self.assertIn('It holds three lines: two comment lines (the server address and the certificate '
                       'fingerprint) and then ${headerLine()}.', setup)
@@ -835,7 +837,7 @@ class TheDialogAndThePageCase(unittest.TestCase):
 
     def test_the_settings_never_hold_the_secret_and_the_rewrite_never_prints_it(self):
         setup = SETUP_JS.read_text(encoding='utf-8')
-        rewrite = re.search(r'export function credentialFileCommand\(file, comments\) \{.*?\n\}', setup, re.S).group(0)
+        rewrite = re.search(r'export function credentialFileCommand\(file, comments.*?\n\}', setup, re.S).group(0)
         self.assertIn('grep -vE', rewrite)
         self.assertIn('chmod 600', rewrite)
         self.assertIn('Regex]::Replace', rewrite)

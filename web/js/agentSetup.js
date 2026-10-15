@@ -37,11 +37,42 @@ export function secretFile(name) {
   });
 }
 
-// The one line that file holds. The real secret is passed ONLY by the dialog that is
-// showing a freshly issued secret; every other caller gets the placeholder.
+// The one line that file holds when the service does not present its own certificate. The real
+// secret is passed ONLY by the dialog that is showing a freshly issued secret; every other
+// caller gets the placeholder.
 export const SECRET_PLACEHOLDER = '<your secret>';
 export function headerLine(secretValue = SECRET_PLACEHOLDER) {
   return `header = "Authorization: Bearer ${secretValue}"`;
+}
+
+// The curl option lines for the service's own certificate. curl does NOT expand %USERPROFILE% or
+// ~ inside a config file: a literal placeholder answers rc 2 (file does not exist), and a
+// Windows path with backslashes also answers rc 2. The rewrite command writes these lines with
+// the real expanded path; the Notepad body below shows a full path the person types themselves
+// (kittrial-5bb.275 rev2). ssl-no-revoke is kept as a safe option for Windows curl.exe; once
+// cacert names the real file it was NOT needed on curl.exe 8.21 (Schannel) with a certificate
+// that has no revocation point -- it is not claimed as required.
+export function certificateCurlLines(certFile, { windows = false } = {}) {
+  if (!certFile) return [];
+  const name = certFile.name;
+  if (windows) {
+    return [`cacert = "C:/Users/<your-name>/${name}"`, 'ssl-no-revoke'];
+  }
+  return [`cacert = /home/<your-name>/${name}`];
+}
+
+// What the credential file holds, in order: when the service presents its own certificate, the
+// curl options that make every `curl -K` accept it (so no --cacert ever appears on a command
+// line, and AGENT.md stays `-K FILE` only), then the header line. The paths here are the
+// Notepad body: the person types their own full path (see certificateCurlLines); the rewrite
+// command writes the expanded path on their machine.
+export function credentialFileBody(secretValue, certFile, { windows = false, hasCertificate = false } = {}) {
+  const lines = [];
+  if (hasCertificate && certFile) {
+    lines.push(...certificateCurlLines(certFile, { windows }));
+  }
+  lines.push(headerLine(secretValue == null ? SECRET_PLACEHOLDER : secretValue));
+  return lines.join('\n') + '\n';
 }
 
 // Where the service's own certificate is saved for the person who clicks the dialog's Save button:
@@ -68,32 +99,66 @@ export function credentialCommentLines(server, fingerprint) {
   return lines;
 }
 
-// The command that makes the credential file's content exactly those comment lines followed by
-// whatever it already held (its one `header = "Authorization: Bearer ..."` line). It is a rewrite,
-// not an append: any earlier comment line is removed first, so a second set-up replaces it instead
-// of adding a second copy, and each comment ends with a newline, so the dialog's Notepad path --
-// which saves no final newline -- cannot glue a comment onto the header line (the extension's rule
-// then matches nothing; kittrial-5bb.203 review 01a12408, item 3a). The POSIX form runs in a
-// subshell under `umask 077`, so the same-directory temporary file is created mode 600 from the
-// first byte -- it never holds the secret while it is group- or world-readable (review 01a12488,
-// item 3) -- and moves it over the original, so the secret is never printed and never reaches a
-// command line or a process argument list. The PowerShell form runs in its own scope (`& { ... }`)
-// so the `$c` that held the file's content does not stay in the session (review 01a12488, item 3).
-// Both forms leave the file ending with a newline, whatever the file held before (Notepad saves no
-// final newline; review 01a12488, item 4). If the credential file is a symlink, the move replaces
-// the symlink with a regular file and the old target keeps its own content (review 01a12488, item 3).
-const CREDENTIAL_COMMENT_PATTERN = "'^#[[:space:]]*server([[:space:]]+certificate[[:space:]]+sha256)?[[:space:]]*='";
-const POWERSHELL_COMMENT_PATTERN = "'(?m)^#[ \\t]*server([ \\t]+certificate[ \\t]+sha256)?[ \\t]*=[^\\r\\n]*\\r?\\n?'";
-export function credentialFileCommand(file, comments) {
-  const quoted = comments.map((line) => `'${line}'`).join(' ');
-  const powershellText = comments.map((line) => line.replace(/`/g, '``').replace(/\$/g, '`$').replace(/"/g, '`"'))
-    .join('`r`n') + '`r`n';
+// The command that makes the credential file's content exactly those managed lines followed by
+// whatever it already held (its one `header = "Authorization: Bearer ..."` line). Managed lines
+// are the comment lines and, when the service has its own certificate, the curl options. It is a
+// rewrite, not an append: any earlier managed line is removed first, so a second set-up replaces
+// it instead of adding a second copy, and each managed line ends with a newline, so the dialog's
+// Notepad path -- which saves no final newline -- cannot glue a line onto the next (the
+// extension's rule then matches nothing; kittrial-5bb.203 review 01a12408, item 3a).
+//
+// The curl options are written HERE with the real expanded path: curl does not expand
+// %USERPROFILE% or ~ inside a config file (kittrial-5bb.275 rev2). The PowerShell form uses
+// [Environment]::GetFolderPath('UserProfile') and turns the slashes forward; the POSIX form uses
+// $HOME expanded by the shell. The POSIX form runs in a subshell under `umask 077`, so the
+// same-directory temporary file is created mode 600 from the first byte -- it never holds the
+// secret while it is group- or world-readable (review 01a12488, item 3) -- and moves it over the
+// original, so the secret is never printed and never reaches a command line or a process argument
+// list. The PowerShell form runs in its own scope (`& { ... }`) so the `$c` that held the file's
+// content does not stay in the session (review 01a12488, item 3). Both forms leave the file
+// ending with a newline, whatever the file held before (Notepad saves no final newline; review
+// 01a12488, item 4). If the credential file is a symlink, the move replaces the symlink with a
+// regular file and the old target keeps its own content (review 01a12488, item 3).
+const CREDENTIAL_MANAGED_PATTERN =
+  "'(^#[[:space:]]*server([[:space:]]+certificate[[:space:]]+sha256)?[[:space:]]*=)|(^[[:space:]]*cacert[[:space:]]*=)|(^[[:space:]]*ssl-no-revoke[[:space:]]*$)'";
+const POWERSHELL_MANAGED_PATTERN =
+  "'(?m)^([ \\t]*#[ \\t]*server([ \\t]+certificate[ \\t]+sha256)?[ \\t]*=[^\\r\\n]*\\r?\\n?|[ \\t]*cacert[ \\t]*=[^\\r\\n]*\\r?\\n?|[ \\t]*ssl-no-revoke[ \\t]*\\r?\\n?)'";
+
+function powershellLiteral(text) {
+  return text.replace(/`/g, '``').replace(/\$/g, '`$').replace(/"/g, '`"');
+}
+
+export function credentialFileCommand(file, comments, { certFile = null, hasCertificate = false } = {}) {
+  // POSIX rewrite: managed lines as printf arguments. `cacert = $HOME/...` is written so the
+  // shell expands $HOME; curl does not expand ~ or $HOME inside a config file.
+  const posixManaged = comments.slice();
+  if (hasCertificate && certFile) {
+    posixManaged.push(`cacert = $HOME/${certFile.name}`);
+  }
+  const quoted = posixManaged.map((line) => (line.startsWith('cacert =')
+    ? `"${line.replace(/"/g, '\\"')}"`
+    : `'${line}'`)).join(' ');
+  // PowerShell rewrite: the cacert line is built on the person's machine so the path is real,
+  // with forward slashes inside the quotes. Built with double-quoted PowerShell strings and
+  // backtick escapes only -- a single-quoted fragment that opens with '/...' never terminates
+  // (kittrial-5bb.275 rev3). ssl-no-revoke is included as a safe option for Windows curl.exe
+  // (not claimed as required once cacert names the real file).
+  const psParts = comments.map((line) => '"' + powershellLiteral(line) + '`r`n"');
+  if (hasCertificate && certFile) {
+    // Emits: "cacert = `"" + ([Environment]::GetFolderPath('UserProfile') -replace '\\','/') + "/NAME.crt`"`r`n"
+    // The string must CLOSE after the escaped quote: `" is the quote character inside the
+    // string, then " ends it (kittrial-5bb.275 rev4, one character).
+    psParts.push('"cacert = `"" + ([Environment]::GetFolderPath(\'UserProfile\') -replace \'\\\\\',\'/\') + "/'
+      + certFile.name + '`"`r`n"');
+    psParts.push('"ssl-no-revoke`r`n"');
+  }
+  const psPrefix = psParts.join(' + ');
   const powershell = '& { $p="' + file.powershell + '"; $c=[IO.File]::ReadAllText($p); '
-    + '$c=[Text.RegularExpressions.Regex]::Replace($c,' + POWERSHELL_COMMENT_PATTERN + ",''); "
+    + '$c=[Text.RegularExpressions.Regex]::Replace($c,' + POWERSHELL_MANAGED_PATTERN + ",''); "
     + 'if ($c -and -not $c.EndsWith("`n")) { $c = $c + "`r`n" } '
-    + '[IO.File]::WriteAllText($p,"' + powershellText + '" + $c) }';
+    + '[IO.File]::WriteAllText($p, (' + psPrefix + ') + $c) }';
   const posix = `( umask 077; rm -f ${file.posix}.new; printf '%s\\n' ${quoted} > ${file.posix}.new && `
-    + `grep -vE ${CREDENTIAL_COMMENT_PATTERN} ${file.posix} >> ${file.posix}.new && `
+    + `grep -vE ${CREDENTIAL_MANAGED_PATTERN} ${file.posix} >> ${file.posix}.new && `
     + `chmod 600 ${file.posix}.new && mv ${file.posix}.new ${file.posix} || rm -f ${file.posix}.new )`;
   return Object.freeze({ powershell, posix });
 }
@@ -133,9 +198,16 @@ export function agentJson(payload) {
   return JSON.stringify({ server_url: payload.server, agent_id: payload.agentId, projects: payload.projects, name: payload.name }, null, 2) + '\n';
 }
 
-export function agentGuide(payload) {
+export function agentGuide(payload, { hasCertificate = false } = {}) {
   const file = payload.secretFile;
   const server = payload.server;
+  // What the credential file holds after set-up: the comment lines the rewrite put on top, the
+  // curl options that make every curl -K accept the service's own certificate (when there is
+  // one), and the header line. The commands stay curl -K FILE only -- the options travel in the
+  // file, never on the command line (kittrial-5bb.275).
+  const holds = hasCertificate
+    ? `It holds the comment lines set-up put on top, the curl options that make every curl -K work (cacert = the saved certificate's real path, written by the set-up rewrite; and on Windows ssl-no-revoke), and then ${headerLine()}.`
+    : `It holds three lines: two comment lines (the server address and the certificate fingerprint) and then ${headerLine()}.`;
   return [
     `# ${payload.name}`,
     '',
@@ -143,7 +215,7 @@ export function agentGuide(payload) {
     '',
     '## Your secret',
     '',
-    `Your owner keeps your secret in a curl config file in their user profile: ${file.windows} on Windows, ${file.posix} on macOS/Linux. It holds three lines: two comment lines (the server address and the certificate fingerprint) and then ${headerLine()}. Hand that file to curl with -K on every call. Apart from the set-up step that rewrote that one file in place to put the comment lines above the header line (nothing was shown), never open, print or copy it, and never put the secret on a command line, in this folder, in a commit or in any other file.`,
+    `Your owner keeps your secret in a curl config file in their user profile: ${file.windows} on Windows, ${file.posix} on macOS/Linux. ${holds} Hand that file to curl with -K on every call. Apart from the set-up step that rewrote that one file in place to put the comment lines above the header line (nothing was shown), never open, print or copy it, and never put the secret on a command line, in this folder, in a commit or in any other file.`,
     '',
     '## Every call',
     '',
@@ -196,9 +268,11 @@ export function resumePrompt(name) {
 // (GET /v1/service/certificate) or null when the service has none (plain http, the tunnel).
 export function setupPrompt(payload, { role = 'worker', certificate = null, bridgeServer = null } = {}) {
   const fingerprint = (certificate && certificate.sha256) || null;
+  const hasCertificate = Boolean(fingerprint);
   const address = bridgeServer || payload.server;
   const comments = credentialCommentLines(address, fingerprint);
-  const command = credentialFileCommand(payload.secretFile, comments);
+  const command = credentialFileCommand(payload.secretFile, comments,
+    { certFile: payload.certificateFile, hasCertificate });
   const roleWord = BRIDGE_ROLES.includes(role) ? role : 'worker';
   const steps = [
     `Set up this folder for the Orchestra agent "${payload.name}".`,
@@ -210,15 +284,17 @@ export function setupPrompt(payload, { role = 'worker', certificate = null, brid
     '~~~',
     `3. Create ${GUIDE_PATH} with exactly this content:`,
     '~~~markdown',
-    agentGuide(payload).trimEnd(),
+    agentGuide(payload, { hasCertificate }).trimEnd(),
     '~~~',
     `4. If this folder is a git repository and its .gitignore does not already list ${GITIGNORE_LINE}, add the line ${GITIGNORE_LINE} to .gitignore. Do not change any other file in this folder.`,
     `5. Your secret is not in this message. I keep it in ${payload.secretFile.windows} (on macOS/Linux ${payload.secretFile.posix}); you hand that file to curl with -K, as AGENT.md says. Never open, print or copy that file, and never write the secret to a file, a commit or a command line -- with the single exception of step 6: that one command reads the credential file only to rewrite that same file in place, and it shows nothing.`,
-    `6. Make the credential file ${payload.secretFile.windows} (macOS/Linux ${payload.secretFile.posix}) hold these comment lines as its FIRST lines, each on its own line ending with a newline, followed by whatever it already held (its header line):`,
+    `6. Make the credential file ${payload.secretFile.windows} (macOS/Linux ${payload.secretFile.posix}) hold these comment lines as its FIRST lines, each on its own line ending with a newline, followed by whatever it already held (its curl options and header line):`,
     '~~~',
     ...comments,
     '~~~',
-    '   Run exactly one of these commands. That command is the one exception to step 5: it reads the credential file only to rewrite that same file in place -- nothing is printed and the secret is copied nowhere else -- and it removes any earlier copy of these comment lines first, so running it a second time leaves exactly the same content:',
+    hasCertificate
+      ? '   Run exactly one of these commands. That command is the one exception to step 5: it reads the credential file only to rewrite that same file in place -- nothing is printed and the secret is copied nowhere else -- and it removes any earlier copy of these comment lines and curl options first. It WRITES the curl options with the real expanded path on this machine (curl does not expand %USERPROFILE% or ~ inside a config file): cacert = the saved certificate, and on Windows ssl-no-revoke. Running it a second time leaves exactly the same content:'
+      : '   Run exactly one of these commands. That command is the one exception to step 5: it reads the credential file only to rewrite that same file in place -- nothing is printed and the secret is copied nowhere else -- and it removes any earlier copy of these comment lines first, so running it a second time leaves exactly the same content.',
     `   - PowerShell: ${command.powershell}`,
     `   - macOS/Linux: ${command.posix}`,
     '   The first line is the address the extension reads, so nobody types it. If that credential file is a symlink, the rewrite replaces the symlink with a regular file and the old target keeps its own content: keep it a regular file. If the credential file does not exist yet, stop here and ask me for step 1 of the dialog first.',
