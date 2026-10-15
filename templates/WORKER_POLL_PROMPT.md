@@ -23,6 +23,7 @@ Each run, in this order:
 1. guidance get. Follow it within what your user allowed, then guidance ack --version VERSION for the version you read.
 2. Resume your saved actor (session resume), then work --mine. Review requests and newer comments on your own tasks come before anything else.
 3. Only if none of your own tasks needs action: ready --json, and claim exactly one task nobody holds (update TASK --claim --json). A task assigned to somebody else is held. A parent or coordination task is background, not an inbox.
+Before claiming: fetch and push the project's repository with code-host git access (ssh -T git@github.com, ssh -T git@bitbucket.org, ssh -T git@gitlab.com, ssh -T git@<office-host>; git ls-remote <repository URL>), not the Orchestra server; without it, record a checkpoint and claim nothing.
 4. Before you stop, write what you need to continue into the task's checkpoint (checkpoint TASK --file FILE), and declare the wait state beside it in the same payload's lane_state key (state; waiting_on, a role or an actor id; optional expect_by) at claim, at every checkpoint and when a wait begins. Nothing of it goes into this prompt.
 
 A task of yours with changes requested is your work until you deliver a revision: "nothing changed" never applies to it. Otherwise, if nothing changed since your last run, say so in one line and stop; stop without acting only when every task of yours is with the reviewer or the coordinator.

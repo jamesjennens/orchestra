@@ -139,7 +139,17 @@ def steps(handler, principal, project_id):
         ('%d members.' % len(members)) if len(members) > 1 else
         'You are the only member. That is fine if you work alone; otherwise add the others.',
         'owner', link=base + '/members',
-        note='An owner adds contributors, coordinators and viewers. Only a superuser can make someone an owner.'))
+        note=('An owner adds contributors, coordinators and viewers. Only a superuser can make someone an owner. '
+              'Git access to the code host comes first. Before claiming any task, the worker must be able to fetch '
+              "from and push to the project's repository: an SSH key or a token added to the person's OWN account "
+              "on the code host (GitHub, Bitbucket, GitLab, or the office's own host), with write access granted by "
+              'the project owner. Check it first: ssh -T git@github.com (GitHub), ssh -T git@bitbucket.org '
+              '(Bitbucket), ssh -T git@gitlab.com (GitLab), or ssh -T git@<office-host> for an office host - the '
+              'answer names the account; and git ls-remote <repository URL> - it lists the refs, so a checkout '
+              'without access fails here rather than in the middle of the work. This is access to the code host, '
+              'not to the Orchestra server: the Orchestra service is reached by the client configuration or the '
+              'agent credential, and having one says nothing about the other. An agent that does not have git '
+              'access records a checkpoint and claims nothing.')))
 
     repository = project.get('repository')
     # A value stored under an earlier rule that no longer passes is withheld by the
