@@ -371,6 +371,56 @@ r.read_owner_receipt(p)
         finally:
             path.chmod(0o600)
 
+    def test_another_owners_pending_edit_is_not_self_and_a_demoted_author_is_unknown(self):
+        admin = self.admin_token()
+        owner_a = self.owner_token
+        first = self.request('POST', self.base + '/requirements', dict(kind='requirement',
+            parent='job-1', title='Owner draft', description='Starting wording.'),
+            token=owner_a, key='second-owner-draft').data
+        route = self.base + '/requirements/' + first['id']
+        second = self.create_account(admin, 'second-owner', 'second-owner-password')
+        second_token = self.login('second-owner', 'second-owner-password')[0]
+        self.assertEqual(self.request('PUT', self.base + '/members/' + second,
+                                      {'role': 'owner'}, token=admin).status, 200)
+        edited = self.request('PATCH', route, dict(expected_revision=first['revision'],
+            expected_sha256=first['sha256'], description='Second owner wording.'),
+            token=second_token, key='second-owner-edit')
+        self.assertEqual(edited.status, 200, edited.data)
+        author = self.request('GET', route, token=owner_a).data['pending_author']
+        self.assertEqual(author['kind'], 'owner-account')
+        self.assertFalse(author['is_self'])
+        own = self.request('GET', route, token=second_token).data['pending_author']
+        self.assertTrue(own['is_self'])
+        # Demoting the exact author leaves the account text but no verified name.
+        self.assertEqual(self.request('PUT', self.base + '/members/' + second,
+                                      {'role': 'contributor'}, token=admin).status, 200)
+        demoted = self.request('GET', route, token=owner_a).data['pending_author']
+        self.assertEqual(demoted['kind'], 'unknown')
+        self.assertEqual(demoted['text'], '')
+
+    def test_clear_with_a_symlinked_receipts_directory_uses_the_get_sentence(self):
+        _, operation, path = self.failed()
+        expected = content_hash(json.loads(path.read_text()))
+        directory = self.path / requirements.JOURNAL
+        real = self.path / 'real-owner-requests'
+        directory.rename(real)
+        try:
+            directory.symlink_to(real, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            real.rename(directory)
+            self.skipTest('symlink creation is not permitted in this environment')
+        body = dict(original_operation_id=operation, expected_receipt_sha256=expected,
+                    reason='Nothing was written.')
+        answer = self.request('POST', self.base + '/requirements/recoveries/clear', body,
+                              token=self.owner_token, key='clear-symlink')
+        self.assertEqual(answer.status, 422, answer.data)
+        text = json.dumps(answer.data)
+        self.assertIn('Owner recovery receipts need host operator repair', text)
+        self.assertNotIn('Failed creation recovery could not be completed', text)
+        listing = self.request('GET', self.base + '/requirements/recoveries', token=self.owner_token)
+        self.assertEqual(listing.status, 422, listing.data)
+        self.assertIn('Owner recovery receipts need host operator repair', json.dumps(listing.data))
+
     def test_governed_recovery_routes_retain_the_enable_editing_advice(self):
         _, operation, path = self.failed()
         body = dict(original_operation_id=operation, expected_receipt_sha256=content_hash(json.loads(path.read_text())),

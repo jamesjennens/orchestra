@@ -89,11 +89,22 @@ label can still be finished. Before the state is written, the successor must sti
 be eligible. A pending predecessor reserves its successor against editing,
 withdrawal and supersession until the predecessor is finished or abandoned.
 If a prior writer's state appears after release, that native decision overrides
-release: the transition is pending again and remains finishable, provided the
-requirement was not changed after the release. If it was edited, accepted or
-withdrawn afresh in between, the late state cannot be finished from the web and
-the requirement reads unknown until the host operator repairs it. That needs a
-native writer that outlives both the process-group stop and the deadline. Damaged receipts
+release: the transition is pending again and remains finishable, whether or not
+the requirement was edited, accepted or withdrawn afresh in between. Any current
+human owner in simple mode, and the host operator's `admin.py requirement-reconcile`,
+can finish the exact saved decision, and an operator release is refused rather
+than reported as success once the state is known to have landed. Finishing writes
+the missing reason and label if they never landed; the recovery route is itself
+the native writer that outlives both the process-group stop and the deadline. When
+a later decision on the same requirement has completed, a late state of an earlier
+abandoned decision is superseded, not finishable: the requirement reads the later
+decision's status, the page offers no finish, and the owner's finish and the
+operator's complete are refused with a sentence naming the later decision. Only
+without a completed later decision does a late state beside a second conflicting
+state stay unknown and point at the same reconciliation, never at a requirement
+left with no pending transition and no command. Finishing a late state that would
+also withdraw a revision accepted after it names that revision and when it was
+accepted, and an owner must confirm it explicitly. Damaged receipts
 are identified separately and affect their own requirement only; unidentifiable
 files are operator diagnostics, never evidence that every requirement is pending.
 `admin.py requirement-reconcile` finds the terminal receipt by its operation ID.

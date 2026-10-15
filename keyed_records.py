@@ -317,8 +317,9 @@ def journal_dir(project, name):
         raise ValueError('Refusing %s: the path is a symlink; no native write was attempted.' % name)
     try:
         journal.mkdir(exist_ok=True)
-    except OSError as exc:
-        raise ValueError('Cannot create %s: %s' % (name, exc))
+    except OSError:
+        # Never quote the raw OSError: it names the server's absolute path.
+        raise ValueError('Cannot create %s; ask the host operator to reconcile it.' % name)
     if not journal.is_dir():
         raise ValueError('%s is not a directory; refusing to write a receipt.' % name)
     return journal
@@ -327,8 +328,8 @@ def journal_dir(project, name):
 def receipt_path(journal, identity, noun):
     receipt = journal / (identity + '.json')
     if receipt.is_symlink():
-        raise ValueError('Refusing %s receipt %s: it is a symlink; no native write was attempted.'
-                         % (noun, receipt.name))
+        raise ValueError('Refusing the %s receipt: it is a symlink; no native write was attempted.'
+                         % noun)
     return receipt
 
 

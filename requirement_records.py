@@ -689,7 +689,7 @@ def apply_native(payload, actor, run, project, operator=False, operators=None):
         require_unreserved_successor(Path(project), Path(project).name, payload['task'], transition_rows)
     pending, uncertain = pending_ids(Path(project), Path(project).name, transition_rows)
     if payload.get('task') in uncertain:
-        raise ValueError('Requirement transition receipt is damaged; ask the host operator to reconcile it')
+        raise ValueError(DAMAGED_RECEIPT)
     if payload.get('task') in pending:
         raise ValueError('Requirement transition is pending; finish or abandon it on the requirements page')
     spec = SPEC
@@ -739,10 +739,10 @@ def backfill(payload, actor, run, project, operators=None):
     """
     _require_configured_operator(actor, operators, 'backfill requirement records')
     validate_backfill(payload)
-    from requirement_terminal import pending_ids
+    from requirement_terminal import DAMAGED_RECEIPT, pending_ids
     pending, uncertain = pending_ids(Path(project), Path(project).name)
     if any(entry['task'] in uncertain for entry in payload['records']):
-        raise ValueError('Requirement transition receipt is damaged; ask the host operator to reconcile it')
+        raise ValueError(DAMAGED_RECEIPT)
     if any(entry['task'] in pending for entry in payload['records']):
         raise ValueError('Requirement transition is pending; finish or abandon it on the requirements page')
     identity = content_hash({'operation_id': payload['operation_id']})

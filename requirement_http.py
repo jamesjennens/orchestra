@@ -15,6 +15,7 @@ import keyed_records as core
 import requirement_governance as governance
 import requirement_owner_records as owner_records
 import requirement_records as records
+import requirement_terminal as terminal
 import record_json
 from coordination import atomic, identifier
 from requirements import canonical_bytes, content_hash, load_json
@@ -258,6 +259,10 @@ def release_creation(project_path, context, body, run, runner):
     """Retain an audited terminal receipt, then close the original uncertain intent."""
     from http_authority import OperationJournal, journal_path, stamp_write
     operation = body['original_operation_id']
+    if (project_path / JOURNAL).is_symlink():
+        # The same sentence the GET already gives: this is host repair, not a
+        # failed creation recovery.
+        raise ValueError('Owner recovery receipts need host operator repair')
     path = core.receipt_path(core.journal_dir(project_path, JOURNAL),
                              content_hash({'operation_id': operation}), 'requirement')
     journal = OperationJournal(journal_path(project_path)); entry = journal.lookup(operation)
@@ -339,13 +344,15 @@ def checked_body(body, action):
                'withdraw': {'expected_revision', 'expected_sha256', 'expected_state_sha256', 'reason'},
                'supersede': {'expected_revision', 'expected_sha256', 'expected_state_sha256', 'reason', 'successor'},
                'release': {'original_operation_id', 'expected_receipt_sha256', 'reason'},
-               'finish': {'original_operation_id', 'expected_receipt_sha256'},
+               'finish': {'original_operation_id', 'expected_receipt_sha256', 'confirm'},
                'abandon': {'original_operation_id', 'expected_receipt_sha256', 'reason'},
                'governance': {'mode', 'expected_revision', 'expected_sha256'}}
     if action not in allowed or not isinstance(body, dict) or set(body) - allowed[action]:
         raise ValueError('Unsupported requirements fields or action')
     if action in ('release', 'finish', 'abandon'):
         identifier(body.get('original_operation_id')); governance.digest(body.get('expected_receipt_sha256'))
+        if 'confirm' in body and body['confirm'] is not True:
+            raise ValueError('Finish confirmation must be true')
         if action != 'finish' and (not isinstance(body.get('reason'), str) or not body['reason'].strip() or not 1 <= len(body['reason']) <= 1000
                 or '\0' in body['reason']):
             raise ValueError('Explain why this transition should be abandoned (1 to 1000 characters)' if action == 'abandon'
@@ -555,7 +562,7 @@ def apply(project_path, context, action, body, operation_id, run, task=None):
         require_unreserved_successor(project_path, context.project, task, transition_rows)
         pending, uncertain = pending_ids(project_path, context.project, transition_rows)
         if task in uncertain:
-            raise ValueError('Requirement transition receipt is damaged; ask the host operator to reconcile it')
+            raise ValueError(terminal.DAMAGED_RECEIPT)
         if task in pending:
             raise ValueError('Requirement transition is pending; finish or abandon it on the requirements page before editing')
     if action == 'governance':
@@ -752,8 +759,9 @@ def read(project_path, project, args, run, operators=None):
     # tracker has no requirement/brd-section issue types, so its unreadable-row
     # membership probes must use the supported label filters.
     rows = record_json.classify(records.read_rows(run), run, labels)
-    from requirement_terminal import pending_ids, projection
-    pending, pending_error = pending_ids(project_path, project, rows)
+    from requirement_terminal import pending_ids, projection, scan
+    receipts, damaged = scan(project_path, project)
+    pending, pending_error = pending_ids(project_path, project, rows, receipts=receipts, damaged=damaged)
     items, decisions = [], []
     for row in rows:
         if not (records.TYPE_LABELS.intersection(row.get('labels') or [])
@@ -787,14 +795,53 @@ def read(project_path, project, args, run, operators=None):
                     governance.validate_evidence(project_path, project, state)
                     status = state['state']
                 if row['id'] in pending_error:
-                    raise ValueError('Requirement transition receipt is damaged; ask the host operator to reconcile it')
+                    raise ValueError(terminal.DAMAGED_RECEIPT)
                 if row['id'] in pending:
                     raise ValueError('Requirement transition is pending; finish or abandon it on the requirements page')
             except (ValueError, TypeError, KeyError):
-                status = 'unknown'
-                state_error = ('Requirement transition receipt is damaged; ask the host operator to reconcile it' if row['id'] in pending_error
-                               else 'Requirement transition is pending; finish or abandon it on the requirements page' if row['id'] in pending
-                               else 'Requirement status cannot be verified; ask the project owner to reconcile it')
+                # A late native decision that no longer binds the latest revision
+                # is still the decision; once its receipt is resolved (or while
+                # it is not the pending one) the requirement reads terminal.
+                # An ambiguous, incomplete or still-pending pair stays unknown
+                # and points at its recovery command.
+                state = reason = None
+                if row['id'] not in pending and row['id'] not in pending_error:
+                    try:
+                        landed = owner_records.landed_pair(row)
+                        if landed is not None:
+                            governance.validate_evidence(project_path, project, landed[0])
+                            state, reason = landed
+                            status = state['state']
+                    except (ValueError, TypeError, KeyError):
+                        state = reason = None
+                if state is None:
+                    # A later decision on this requirement has completed: the late
+                    # state of an earlier abandoned decision is superseded, so the
+                    # requirement reads the later decision's status rather than
+                    # staying unknown behind a command that can no longer be run.
+                    try:
+                        superseded = terminal.superseded_late_state(row, receipts)
+                        if superseded is not None:
+                            governance.validate_evidence(project_path, project, superseded['owner_state'])
+                    except (ValueError, TypeError, KeyError):
+                        superseded = None
+                    if superseded is not None:
+                        state = superseded['owner_state']
+                        reason = (owner_records.landed_reason(row, state)
+                                  or superseded['owner_state_reason'])
+                        status = state['state']
+                if state is None:
+                    status = 'unknown'
+                    state_error = (terminal.DAMAGED_RECEIPT if row['id'] in pending_error
+                                   else 'Requirement transition is pending; finish or abandon it on the requirements page' if row['id'] in pending
+                                   else 'Requirement status cannot be verified; ask the project owner to reconcile it')
+                    if (row['id'] not in pending and row['id'] not in pending_error
+                            and 'admin.py requirement-reconcile' not in state_error):
+                        states, _ = owner_records.recorded_states(row)
+                        if len(states) == 1:
+                            state_error = ('Requirement terminal evidence needs reconciliation; the host operator runs '
+                                           'admin.py requirement-reconcile --operation-id %s'
+                                           % next(iter(states.values()))['operation_id'])
             pending_draft = latest if latest['acceptance_state'] == 'draft' else None
             items.append({'id': row['id'], 'kind': kind, 'current': latest,
                           'accepted': accepted, 'pending_draft': pending_draft,
@@ -819,7 +866,7 @@ def read(project_path, project, args, run, operators=None):
                                   sha256=old['state']['record_sha256']) for old in items
                              if old.get('requirement_state') == 'superseded'
                              and old['state']['superseded_by']['id'] == item['id']]
-    recoveries = projection(project_path, project, rows, run)
+    recoveries = projection(project_path, project, rows, run, receipts=receipts, damaged=damaged)
     for item in items:
         item['pending_transition'] = next((r for r in recoveries['items'] if r['id'] == item['id']), None)
         item['completion'] = recoveries['completions'].get(item['id'])
