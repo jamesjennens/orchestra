@@ -16,6 +16,10 @@ from requirements import canonical_bytes, content_hash, load_json
 
 JOURNAL = '.requirement-owner-requests'
 NATIVE_TIMEOUT = 120
+# The largest UTC second `datetime` can render (9999-12-31T23:59:59Z). A stored
+# deadline beyond it is refused here, so no read can raise OverflowError while
+# formatting a retry time and no single receipt can poison every project read.
+MAX_WRITE_DEADLINE = 253402300799
 
 
 def write_window(service_now=None, endpoint_timeout=150):
@@ -24,12 +28,18 @@ def write_window(service_now=None, endpoint_timeout=150):
     if (isinstance(moment, bool) or not isinstance(moment, (int, float))
             or not math.isfinite(moment)):
         raise ValueError('Terminal service time cannot be verified')
+    if (isinstance(endpoint_timeout, bool) or not isinstance(endpoint_timeout, (int, float))
+            or not math.isfinite(endpoint_timeout) or endpoint_timeout <= 0
+            or endpoint_timeout > MAX_WRITE_DEADLINE):
+        raise ValueError('Terminal endpoint timeout must be a positive finite number')
     # Starting the full window again at effect time is conservative when the
     # endpoint spent time waiting for its locks. Native descendants have their
     # own timeout; the service also terminates their process group on timeout.
+    deadline = max(moment, time.time()) + endpoint_timeout + NATIVE_TIMEOUT
+    if deadline > MAX_WRITE_DEADLINE:
+        raise ValueError('Terminal write deadline is out of range')
     return dict(service_started_at=moment, endpoint_timeout=endpoint_timeout,
-                native_timeout=NATIVE_TIMEOUT,
-                abandon_after=max(moment, time.time()) + endpoint_timeout + NATIVE_TIMEOUT)
+                native_timeout=NATIVE_TIMEOUT, abandon_after=deadline)
 
 
 def seal(receipt):
@@ -41,6 +51,8 @@ def seal(receipt):
 
 def abandonment_wait(saved):
     until = saved['write_window']['abandon_after']
+    if until > MAX_WRITE_DEADLINE:
+        raise ValueError('Invalid terminal write deadline')
     if time.time() < until:
         retry = datetime.fromtimestamp(until, timezone.utc).isoformat(timespec='seconds')
         return 'The original writer may still be running. Reload and retry abandonment after %s.' % retry
@@ -100,7 +112,9 @@ def validate_receipt(receipt):
             or any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
                    for value in window.values())
             or window['endpoint_timeout'] <= 0 or window['native_timeout'] != NATIVE_TIMEOUT
-            or window['abandon_after'] < window['service_started_at'] + window['endpoint_timeout'] + NATIVE_TIMEOUT):
+            or window['abandon_after'] < window['service_started_at'] + window['endpoint_timeout'] + NATIVE_TIMEOUT
+            or window['abandon_after'] > MAX_WRITE_DEADLINE
+            or window['service_started_at'] > MAX_WRITE_DEADLINE):
         raise ValueError('Invalid terminal write deadline')
     state = owner.validate(receipt.get('owner_state'), state=True)
     reason = owner.validate_reason(receipt.get('owner_state_reason'))

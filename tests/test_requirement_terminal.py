@@ -539,10 +539,13 @@ class TerminalTests(unittest.TestCase):
         self.native.fail_comment_prefix = owner.STATE_PREFIX
         with self.assertRaises(ValueError):
             self.act(item)
-        self.after_writer(item)
-        saved = self.recovery(item)
-        self.recover(item, 'abandon', saved)
-        path = terminal.receipt_path(self.path, saved['operation_id'])
+        path = terminal.receipt_path(self.path, 'terminal-first')
+        saved = terminal.read_receipt(path)
+        clock = mock.patch('requirement_terminal.time.time',
+                           return_value=saved['write_window']['abandon_after'] + 1)
+        clock.start(); self.addCleanup(clock.stop)
+        self.recover(item, 'abandon', dict(operation_id='terminal-first',
+                                           expected_receipt_sha256=terminal.receipt_sha256(saved)))
         released = json.loads(path.read_text())
         flipped = dict(released, status='pending')  # the disposition is untouched
         with self.assertRaisesRegex(ValueError, 'status or history'):
@@ -576,6 +579,34 @@ class TerminalTests(unittest.TestCase):
                 'operator', self.native, self.path)
         self.assertEqual(self.native.rows, before)
         self.assertIn('requirement:withdrawn', self.native.row(item['id'])['labels'])
+
+
+    def test_absurd_abandon_after_is_refused_without_poisoning_reads(self):
+        item = self.accepted()
+        self.native.fail_comment_prefix = owner.STATE_PREFIX
+        with self.assertRaises(ValueError):
+            self.act(item)
+        path = terminal.receipt_path(self.path, 'terminal-first')
+        saved = json.loads(path.read_text())
+        saved['write_window']['abandon_after'] = 1e30
+        saved['terminal_sha256'] = terminal.seal(saved)['terminal_sha256']  # a re-sealed receipt
+        path.write_text(json.dumps(saved))
+        # The one file is damaged; no OverflowError escapes and the project read
+        # still answers with its own requirement.
+        view = http.read(self.path, 'alpha', ['list'], self.native)
+        self.assertEqual(view['total'], 1)
+        self.assertEqual(view['items'][0]['requirement_state'], 'unknown')
+        found, damaged = terminal.scan(self.path, 'alpha')
+        self.assertEqual(found, [])
+        self.assertEqual([entry['id'] for entry in damaged], [item['id']])
+        with self.assertRaisesRegex(ValueError, 'deadline'):
+            terminal.abandonment_wait(saved)
+        with self.assertRaisesRegex(ValueError, 'deadline'):
+            terminal.validate_receipt(saved)
+        with self.assertRaisesRegex(ValueError, 'endpoint timeout'):
+            terminal.write_window(endpoint_timeout=1e30)
+        with self.assertRaisesRegex(ValueError, 'deadline'):
+            terminal.write_window(time.time(), endpoint_timeout=terminal.MAX_WRITE_DEADLINE)
 
 
 if __name__ == '__main__':
