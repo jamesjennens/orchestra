@@ -657,7 +657,7 @@ def workflow(issue,scopes=None,operators=None,reverts=None,journal=None,invalid_
     return result
 
 def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes=None, journal=None,
-          reference_attention=False, verifiers=None,independent_approval=False,owners=None):
+          reference_attention=False, verifiers=None,independent_approval=False,owners=None,provenance_writes=True):
     """One page of the work queue.
 
     ``reverts`` and ``scopes`` are PER TASK: each is a mapping of task id to that
@@ -1069,7 +1069,8 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
     # separate from the review/handoff/HTTP queue fields and parses only displayed tasks.
     for item in result['items']:
         if item['task'] in task_rows:
-            item.update(checkpoint_queue_fields(rows,task_rows[item['task']],checkpoint_states.get(item['task'])))
+            item.update(checkpoint_queue_fields(rows,task_rows[item['task']],checkpoint_states.get(item['task']),
+                                                provenance_writes=provenance_writes))
     # The count of the QUEUE's items where the next move is the caller's, from the same
     # reconciled rows the sort used, so every page reports the same number
     # (kittrial-5bb.249 review, item 2a).
@@ -1121,7 +1122,7 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
 
 def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None,review_writes=None,
             independent_approval=False,coordinator_writes=False,owners=None,verified_web_authority=False,
-            lanes_scope='all'):
+            lanes_scope='all',provenance_writes=True):
     """``independent_approval``, ``coordinator_writes`` and ``owners`` are the slices
     6 and 7 settings and the project's actor -> principal map (kittrial-5bb.197),
     supplied by the endpoint; all default OFF/absent, so nothing changes for an
@@ -1158,7 +1159,8 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
                               journal=path,scope=lanes_scope)
         return queue(rows,actor,args,path/'.handoff-requests', operators=operators, journal=path,
                      reference_attention=True, verifiers=verifiers,
-                     independent_approval=independent_approval,owners=owners)
+                     independent_approval=independent_approval,owners=owners,
+                     provenance_writes=provenance_writes)
     if len(args) not in (1,2):raise ValueError('Use review TASK [--file payload.json] or handoff TASK --file payload.json')
     task=args[0]
     if action=='review' and len(args)==1:

@@ -97,6 +97,10 @@ class CheckpointSecondReviewTests(unittest.TestCase):
         self.assertEqual(b.direction_page(data,PROJECT,TASK)['total'],500)
         self.assertEqual(b.brief(data,PROJECT,TASK)['directions']['total'],500)
         with tempfile.TemporaryDirectory() as temp:
+            # kittrial-5bb.284: the paginated direction read honours the installation
+            # switch, so this test of the ENABLED installation declares it.
+            (Path(temp)/'deployment.private.json').write_text(
+                json.dumps({'checkpoint_provenance_writes':True}),encoding='utf-8')
             page=json.loads(b.execute(Path(temp),Path(temp),PROJECT,'alice/session','checkpoint',
                                       [TASK,'--directions','--limit','1','--offset','499'],{},
                                       lambda _: '\n'.join(json.dumps(r) for r in data)))

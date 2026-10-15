@@ -1074,8 +1074,9 @@ class EndpointReviewSwitchTests(unittest.TestCase):
         def fake_work(path, actor, action, args, attachments, runner, operators=None,
                       verifiers=None, review_writes=None, independent_approval=False,
                       coordinator_writes=False, owners=None, verified_web_authority=False,
-                      lanes_scope='all'):
+                      lanes_scope='all', provenance_writes=True):
             seen['review_writes'] = review_writes
+            seen['provenance_writes'] = provenance_writes
             seen['independent_approval'] = independent_approval
             seen['coordinator_writes'] = coordinator_writes
             seen['owners'] = owners
@@ -1092,6 +1093,15 @@ class EndpointReviewSwitchTests(unittest.TestCase):
         self.assertFalse(seen['review_writes'])
         seen, _ = self._run(True)
         self.assertTrue(seen['review_writes'])
+
+    def test_the_endpoint_reads_the_checkpoint_switch_from_the_deployment(self):
+        # kittrial-5bb.284: the direction readers need the checkpoint provenance switch,
+        # so the endpoint reads it from the same deployment file and passes it on. It is
+        # absent (OFF) on an installation that configures nothing.
+        seen, _ = self._run(False)
+        self.assertFalse(seen['provenance_writes'])
+        seen, _ = self._run(False, checkpoint_provenance_writes=True)
+        self.assertTrue(seen['provenance_writes'])
 
     def test_the_endpoint_reads_the_coordinator_rules_from_the_deployment(self):
         # kittrial-5bb.197: the two approval rules are OFF on an installation that

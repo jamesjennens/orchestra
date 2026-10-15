@@ -936,6 +936,11 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
         # failing every work/review action (kittrial-5bb.110 item 2).
         switch_warnings=[]
         review_writes=configured_review_writes(root,warnings=switch_warnings)
+        # kittrial-5bb.284: the direction readers must not report an outstanding direction
+        # that no reader could ever disposition. The installation switch is read here, once,
+        # exactly as review_workflow_writes is.
+        from briefing import checkpoint_writes_enabled
+        provenance_writes=checkpoint_writes_enabled(root)
         rules=configured_coordinator_rules(root,warnings=switch_warnings)
         run_warnings.extend(switch_warnings)
         # The principal rule of slice 7 and the party comparison of rule 3 both need the
@@ -980,6 +985,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                                 operators=operators,
                                 verifiers=configured_verifiers(root),
                                 review_writes=review_writes,
+                                provenance_writes=provenance_writes,
                                 independent_approval=rules['independent_approval'],
                                 coordinator_writes=rules['coordinator_writes'],
                                 owners=owners,
