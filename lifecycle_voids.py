@@ -408,9 +408,14 @@ def read_journal(project):
                 names.append(entry.name)
                 if len(names) > MAX_RECORDS:
                     raise ValueError('Lifecycle void journal exceeds its record bound')
+        from coordination import is_temporary
         for name in sorted(names):
-            # Atomic/probe temporaries confer no authority and are not records.
+            # Atomic/probe temporaries confer no authority and are not records. A
+            # shared atomic write leaves a UNIQUE temporary (``<name>.tmp-<pid>-<hex>``,
+            # kittrial-5bb.281) as well as the fixed ``<name>.tmp`` an older kit cut.
             if re.fullmatch(r'(?:[a-f0-9]{64}|\.writable-[a-f0-9]{32})\.tmp', name):
+                continue
+            if is_temporary(name):
                 continue
             try:
                 if not re.fullmatch('[a-f0-9]{64}\\.json', name):

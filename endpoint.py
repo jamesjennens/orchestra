@@ -784,6 +784,46 @@ def coordinator_payload(args,request):
         raise ValueError('Invalid attachment: the flag on the attachment does not match the request')
     return item['text']
 
+#: The endpoint's ONE table of read-only actions (kittrial-5bb.281 review item 2). An
+#: action named here holds the project's ``.coordination.lock`` SHARED; every action
+#: NOT named here holds it EXCLUSIVE, and a failure to classify is exclusive too. The
+#: value is a predicate ``(args, operation) -> bool`` because three actions decide from
+#: their arguments or their inner payload operation, not from the action name alone.
+#: ``history`` is read-only even though it may CREATE ``.history-snapshots/<digest>.json``:
+#: that cache is content-addressed and written through ``coordination.atomic``, whose
+#: temporary is now unique per writer, so a lost rename race to identical bytes is
+#: success and two first readers no longer collide (item 1). Every OTHER action must be
+#: proved read-only before it joins this table; the endpoint lock test walks every action
+#: and fails for a write that is not classified exclusive.
+def _read_only_always(args,operation):
+    return True
+
+READ_ONLY_ACTIONS={
+    'brief':_read_only_always,
+    'history':_read_only_always,
+    'requirements':_read_only_always,
+    'work':_read_only_always,
+    'bd':lambda args,operation:not is_mutating_invocation(args),
+    'web-lifecycle':lambda args,operation:operation=='read',
+    'web-merge-slot':lambda args,operation:operation=='check',
+}
+
+def coordination_lock_shared(request,action=None,args=None,operation=None):
+    """Whether THIS request may hold the project's ``.coordination.lock`` SHARED.
+
+    The one decision point for every lock site in ``execute`` (kittrial-5bb.281 review
+    item 2). An action outside :data:`READ_ONLY_ACTIONS` is exclusive, as is any request
+    that carries an ``operation_id``: an operation identity is a reservation in the
+    shared operation journal, and on main the exclusive project lock serialized it, so
+    keeping it exclusive makes concurrent reads that share one id behave as they did
+    there instead of answering "Operation identity reserved; outcome unknown".
+    """
+    action=action if action is not None else request.get('action','bd')
+    args=request.get('args',[]) if args is None else args
+    if request.get('operation_id'):return False
+    rule=READ_ONLY_ACTIONS.get(action)
+    return bool(rule(args,operation)) if rule is not None else False
+
 @contextlib.contextmanager
 def held_coordination_lock(path,shared=False):
     """Hold the project's ``.coordination.lock``, SHARED for a read and EXCLUSIVE for a write.
@@ -792,8 +832,9 @@ def held_coordination_lock(path,shared=False):
     request queued behind every other request in the project (kittrial-5bb.281). A
     shared lock still excludes a writer and is excluded by one, so a read can never
     observe a write half done - the invariant every read here was given the lock for;
-    it only lets two reads run at the same time. ``shared`` is decided by the action
-    and its arguments, never by the request body.
+    it only lets two reads run at the same time. ``shared`` comes from
+    :func:`coordination_lock_shared` alone, so one action cannot be classified one way
+    at one call site and another way at the next.
     """
     with (path/'.coordination.lock').open('a') as lock:
         fcntl.flock(lock,fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
@@ -949,7 +990,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             # of kittrial-5bb.97). One that was already recorded (`reconciled`) wrote nothing.
             if action=='handoff' and len(args)==2 and isinstance(result,dict) and result.get('reconciled') is False:runner.wrote=True
             return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False,indent=2)+'\n','stderr':warning_text(run_warnings)}
-        with held_coordination_lock(path,shared=(action=='work')):
+        with held_coordination_lock(path,shared=coordination_lock_shared(request,action,args)):
             return guarded_write(root,request,journal_path(path),work_effect,
                                authority_config=authority_config,
                                require_authority=require_authority,runner=runner)
@@ -960,7 +1001,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             stdout,warnings=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
             if warnings:run_warnings.append(warnings)
             return stdout
-        with held_coordination_lock(path,shared=True):
+        with held_coordination_lock(path,shared=coordination_lock_shared(request,'requirements',request.get('args',[]))):
             result=read_requirements(path,name,request.get('args',[]),run,configured_operators(root))
         return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
     if action=='owner-requirements':
@@ -1446,7 +1487,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                                                              independent_approval=rules['independent_approval'],
                                                              owners=owner_loader(path,'independent_approval')
                                                              if rules['independent_approval'] else None),'stderr':''.join(run_warnings)}
-        with held_coordination_lock(path,shared=action in ('brief','history')):
+        with held_coordination_lock(path,shared=coordination_lock_shared(request,action,args)):
             return guarded_write(root,request,journal_path(path),briefing_effect,
                                authority_config=authority_config,
                                require_authority=require_authority,runner=runner)
@@ -1515,7 +1556,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                                                mark_writes=enabled,operators=operators,owners=owners)
                 return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n',
                         'stderr':warning_text(run_warnings)}
-            with held_coordination_lock(path,shared=(operation=='read')):
+            with held_coordination_lock(path,shared=coordination_lock_shared(request,'web-lifecycle',args,operation)):
                 if operation=='read':
                     if authority_config is None:
                         raise web_lifecycle.LifecycleError(403,'Configured web authority required for lifecycle reads')
@@ -1576,7 +1617,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                                   owners=owner_loader(path,'independent_approval'),
                                   review_writes=configured_review_writes(root,warnings=run_warnings))
                 return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':warning_text(run_warnings)}
-            with held_coordination_lock(path,shared=(operation=='check')):
+            with held_coordination_lock(path,shared=coordination_lock_shared(request,'web-merge-slot',args,operation)):
                 if operation=='check':
                     if authority_config is None:raise SlotError(403,'Verified web authority required for the merge-slot read')
                     with file_lock(authority_config.lock):
@@ -1732,7 +1773,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                 dest=Path(tmp)/f'{i}.txt';dest.write_text(item['text'],encoding='utf-8')
                 final.extend([item['flag'],str(dest)])
             else: final.append(a)
-        with held_coordination_lock(path,shared=not is_mutating_invocation(args)):
+        with held_coordination_lock(path,shared=coordination_lock_shared(request,'bd',args)):
             # First the rows the write names (an existing id given to create, a write that names
             # none, the merge slot); then the guards that read what those rows carry.
             from review_workflow import listed_operator_actor, operator_owners

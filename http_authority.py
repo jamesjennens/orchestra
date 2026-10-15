@@ -2045,8 +2045,12 @@ def verified_web_authority(request, authority_config, capability, project):
     """Whether the configured service grants this capability in this exact project.
 
     A descriptor is never authority by itself. Mutations call this inside the
-    guarded effect, under the live authority lock; reads hold that lock too.
-    This helper does not infer a capability from an actor name or an SSH payload.
+    guarded effect, under the live authority lock; a PURE read - one with no
+    descriptor, no operation identity and no identity check - no longer takes that
+    lock, because it never reads the authority store (kittrial-5bb.281). Any request
+    that validates authority, reserves an operation identity or runs an identity
+    check still holds it. This helper does not infer a capability from an actor name
+    or an SSH payload.
     """
     descriptor = request.get('authority')
     if (authority_config is None or not isinstance(descriptor, dict)
