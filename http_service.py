@@ -6565,6 +6565,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                 item['state_history']=[without_operation(state) for state in item['state_history']]
             if isinstance(item.get('state_message'),str) and 'finish or abandon' in item['state_message']:
                 item['state_message']='A requirement transition is pending; ask a project owner to finish or abandon it.'
+            elif isinstance(item.get('state_message'),str) and 'admin.py requirement-reconcile' in item['state_message']:
+                item['state_message']='Requirement status cannot be verified; ask a project owner to reconcile it.'
             pending=item.get('pending_transition')
             if isinstance(pending,dict):
                 item['pending_transition']={'id':pending.get('id'),

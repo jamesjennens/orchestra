@@ -20,6 +20,8 @@ NATIVE_TIMEOUT = 120
 # deadline beyond it is refused here, so no read can raise OverflowError while
 # formatting a retry time and no single receipt can poison every project read.
 MAX_WRITE_DEADLINE = 253402300799
+DAMAGED_RECEIPT = ('Requirement transition receipt is damaged; the host operator runs '
+                   'admin.py requirement-reconcile for its operation ID.')
 
 
 def write_window(service_now=None, endpoint_timeout=150):
@@ -239,7 +241,7 @@ def apply(project_path, context, action, body, operation, run, task,
     pending, uncertain = pending_ids(project_path, context.project, rows)
     require_unreserved_successor(project_path, context.project, task, rows)
     if task in uncertain:
-        raise ValueError('Requirement transition receipt is damaged; ask the host operator to reconcile it')
+        raise ValueError(DAMAGED_RECEIPT)
     if task in pending and prior is None:
         raise ValueError('A requirement transition is pending; finish or abandon it on the requirements page')
     if prior and prior['status'] == 'released' and state != prior['owner_state']:
@@ -362,7 +364,7 @@ def scan(project_path, project):
             try: identifier(task)
             except (ValueError, TypeError): task = None
             damaged.append(dict(id=task, file_sha256=hashlib.sha256(entry.name.encode()).hexdigest(),
-                                message='Requirement transition receipt is damaged; ask the host operator to reconcile it'))
+                                message=DAMAGED_RECEIPT))
     return found, damaged
 
 

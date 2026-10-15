@@ -701,5 +701,44 @@ class TerminalTests(unittest.TestCase):
         self.assertEqual(len(self.native.writes()), writes)
 
 
+    def test_a_damaged_receipt_whose_state_landed_offers_the_operator_command(self):
+        item = self.accepted()
+        self.native.fail_comment_prefix = owner.REASON_PREFIX
+        with self.assertRaises(ValueError):
+            self.act(item)
+        path = terminal.receipt_path(self.path, 'terminal-first')
+        saved = json.loads(path.read_text())
+        saved['owner_state_reason']['reason'] = 'Altered after the write'
+        path.write_text(json.dumps(saved))
+        view = self.read(item)
+        self.assertEqual(view['requirement_state'], 'unknown')
+        self.assertIn('admin.py requirement-reconcile', view['state_message'])
+        found, damaged = terminal.scan(self.path, 'alpha')
+        self.assertEqual(found, [])
+        self.assertEqual([entry['id'] for entry in damaged], [item['id']])
+        self.assertIn('admin.py requirement-reconcile', damaged[0]['message'])
+
+    def test_a_written_state_with_no_receipt_offers_the_operator_command(self):
+        item = self.accepted()
+        self.native.fail_comment_prefix = owner.STATE_PREFIX
+        with self.assertRaises(ValueError):
+            self.act(item)
+        path = terminal.receipt_path(self.path, 'terminal-first')
+        saved = terminal.read_receipt(path)
+        path.unlink()
+        self.native.fail_comment_prefix = None
+        edited = http.apply(self.path, self.context, 'revise', dict(expected_revision=item['revision'],
+            expected_sha256=item['sha256'], description='Later accepted wording.'),
+            'lost-receipt-edit', self.native, item['id'])
+        http.apply(self.path, self.context, 'accept', dict(expected_revision=edited['revision'],
+            expected_sha256=edited['sha256']), 'lost-receipt-accept', self.native, item['id'])
+        self.native(['comments', 'add', item['id'], owner.body(saved['owner_state'], state=True), '--json'])
+        view = self.read(item)
+        self.assertEqual(view['requirement_state'], 'unknown')
+        self.assertIsNone(view['pending_transition'])
+        self.assertIn('admin.py requirement-reconcile --operation-id %s' % saved['owner_state']['operation_id'],
+                      view['state_message'])
+
+
 if __name__ == '__main__':
     unittest.main()

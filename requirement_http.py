@@ -15,6 +15,7 @@ import keyed_records as core
 import requirement_governance as governance
 import requirement_owner_records as owner_records
 import requirement_records as records
+import requirement_terminal as terminal
 import record_json
 from coordination import atomic, identifier
 from requirements import canonical_bytes, content_hash, load_json
@@ -559,7 +560,7 @@ def apply(project_path, context, action, body, operation_id, run, task=None):
         require_unreserved_successor(project_path, context.project, task, transition_rows)
         pending, uncertain = pending_ids(project_path, context.project, transition_rows)
         if task in uncertain:
-            raise ValueError('Requirement transition receipt is damaged; ask the host operator to reconcile it')
+            raise ValueError(terminal.DAMAGED_RECEIPT)
         if task in pending:
             raise ValueError('Requirement transition is pending; finish or abandon it on the requirements page before editing')
     if action == 'governance':
@@ -792,7 +793,7 @@ def read(project_path, project, args, run, operators=None):
                     governance.validate_evidence(project_path, project, state)
                     status = state['state']
                 if row['id'] in pending_error:
-                    raise ValueError('Requirement transition receipt is damaged; ask the host operator to reconcile it')
+                    raise ValueError(terminal.DAMAGED_RECEIPT)
                 if row['id'] in pending:
                     raise ValueError('Requirement transition is pending; finish or abandon it on the requirements page')
             except (ValueError, TypeError, KeyError):
@@ -813,9 +814,16 @@ def read(project_path, project, args, run, operators=None):
                         state = reason = None
                 if state is None:
                     status = 'unknown'
-                    state_error = ('Requirement transition receipt is damaged; ask the host operator to reconcile it' if row['id'] in pending_error
+                    state_error = (terminal.DAMAGED_RECEIPT if row['id'] in pending_error
                                    else 'Requirement transition is pending; finish or abandon it on the requirements page' if row['id'] in pending
                                    else 'Requirement status cannot be verified; ask the project owner to reconcile it')
+                    if (row['id'] not in pending and row['id'] not in pending_error
+                            and 'admin.py requirement-reconcile' not in state_error):
+                        states, _ = owner_records.recorded_states(row)
+                        if len(states) == 1:
+                            state_error = ('Requirement terminal evidence needs reconciliation; the host operator runs '
+                                           'admin.py requirement-reconcile --operation-id %s'
+                                           % next(iter(states.values()))['operation_id'])
             pending_draft = latest if latest['acceptance_state'] == 'draft' else None
             items.append({'id': row['id'], 'kind': kind, 'current': latest,
                           'accepted': accepted, 'pending_draft': pending_draft,
