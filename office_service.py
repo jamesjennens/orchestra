@@ -33,6 +33,7 @@ from urllib.parse import urlsplit
 from urllib.request import urlopen
 
 import admin
+import record_json
 from version import report
 
 
@@ -537,7 +538,11 @@ def _web_probe(served, expected):
         if status != 200:
             return False, 'the health address answered HTTP %s, not 200' % status
         try:
-            mark = json.loads(raw.decode('utf-8', 'replace')) if raw else {}
+            # Through the kit's guard, not bare json.loads: the answer can come from WHATEVER
+            # holds the port (that is what the mark below is for), and a deeply nested one must
+            # read as "not this service" rather than raising RecursionError (kittrial-5bb.168
+            # review item 2). A NestingError IS a ValueError, as caught here.
+            mark = record_json.loads(raw.decode('utf-8', 'replace')) if raw else {}
         except ValueError:
             mark = None
         if isinstance(mark, dict) and mark.get('service') == 'orchestra-office':

@@ -190,6 +190,29 @@ class PortTakenTests(unittest.TestCase):
         self.assertEqual(status, http_service.EXIT_CERTIFICATE_UNUSABLE)
         self.assertNotIn('Enter PEM pass phrase', said.getvalue() + out.getvalue())
         self.assertIn('the certificate or key cannot be used', said.getvalue())
+        # The passphrase hint is here because THIS key really is encrypted (review item 3).
+        self.assertIn('A key with a passphrase cannot be used here', said.getvalue())
+        self.assertEqual(len(said.getvalue().splitlines()), 1)
+
+    @unittest.skipUnless(shutil.which('openssl'), 'openssl is not installed; the pair is made with it')
+    def test_a_plain_certificate_failure_does_not_blame_a_passphrase(self):
+        """kittrial-5bb.168 review item 3: the hint used to be appended to EVERY certificate failure,
+        so a garbage certificate or a mismatched pair read as if a passphrase were the cause."""
+        openssl = shutil.which('openssl')
+        cert = str(Path(self.tmp) / 'cert.pem')
+        plain = str(Path(self.tmp) / 'plain.key')
+        subprocess.check_call([openssl, 'req', '-x509', '-newkey', 'rsa:2048', '-keyout', plain, '-out', cert,
+                               '-days', '30', '-nodes', '-subj', '/CN=localhost'],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        garbage = Path(self.tmp) / 'garbage.pem'
+        garbage.write_text('this is not a PEM certificate\n', encoding='utf-8')
+        said = io.StringIO()
+        with contextlib.redirect_stderr(said), contextlib.redirect_stdout(io.StringIO()):
+            status = http_service.main(['--state', str(Path(self.tmp) / 'state.json'), '--backend', 'inprocess',
+                                        '--cert', str(garbage), '--key', plain, '--port', '0'])
+        self.assertEqual(status, http_service.EXIT_CERTIFICATE_UNUSABLE)
+        self.assertIn('the certificate or key cannot be used', said.getvalue())
+        self.assertNotIn('passphrase', said.getvalue())
         self.assertEqual(len(said.getvalue().splitlines()), 1)
 
     def test_another_failure_to_start_is_reported_as_it_was(self):

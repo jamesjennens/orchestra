@@ -7739,6 +7739,21 @@ def failure_said(error):
     """The OS's own words for a failed start, one line and bounded, never a traceback."""
     return (getattr(error, 'strerror', None) or str(error) or type(error).__name__)[:200]
 
+
+def key_needs_a_passphrase(keyfile):
+    """Whether the key file holds an ENCRYPTED PEM block, so the refusal can say so.
+
+    Read only to WORD the one-line refusal: an encrypted PKCS#8 key carries ``BEGIN ENCRYPTED
+    PRIVATE KEY`` and a legacy one ``Proc-Type: 4,ENCRYPTED``, both in the first block. Nothing
+    from the file is printed, and a file that cannot be read is not this case - the loader's own
+    error is what the refusal reports (kittrial-5bb.168 review item 3).
+    """
+    try:
+        with open(keyfile, 'rb') as stream:
+            return b'ENCRYPTED' in stream.read(4096)
+    except OSError:
+        return False
+
 #: How long a client may take over each thing the service waits for from it: completing the
 #: TLS handshake, sending a request (its line and headers; then its body), and taking a
 #: response. Also how long an idle keep-alive connection is kept. Then the connection is closed.
@@ -8417,10 +8432,14 @@ def main(argv=None):
                   file=sys.stderr, flush=True)
             return EXIT_PORT_TAKEN
         if isinstance(failed, ssl.SSLError) or (args.cert and isinstance(failed, FileNotFoundError)):
-            print('orchestra-http: the certificate or key cannot be used: %s (a key with a passphrase cannot be '
-                  'used here, because this service never asks for one), so the web service did not start. The '
-                  'office supervisor names the file and what is wrong before it starts anything.'
-                  % failure_said(failed), file=sys.stderr, flush=True)
+            # Only when the key really is an encrypted one: the hint read as the cause for every
+            # certificate failure, a missing file and a mismatched pair included (kittrial-5bb.168
+            # review item 3).
+            hint = (' A key with a passphrase cannot be used here, because this service never asks for one.'
+                    if key_needs_a_passphrase(args.key) else '')
+            print('orchestra-http: the certificate or key cannot be used: %s, so the web service did not start.%s '
+                  'The office supervisor names the file and what is wrong before it starts anything.'
+                  % (failure_said(failed), hint), file=sys.stderr, flush=True)
             return EXIT_CERTIFICATE_UNUSABLE
         if args.port < 1024 and failed.errno in (errno.EACCES, errno.EPERM):
             print('orchestra-http: port %d cannot be bound: %s. A port below 1024 needs privilege; use a port '
