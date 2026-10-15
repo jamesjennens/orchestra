@@ -139,11 +139,15 @@ export function credentialFileCommand(file, comments, { certFile = null, hasCert
     ? `"${line.replace(/"/g, '\\"')}"`
     : `'${line}'`)).join(' ');
   // PowerShell rewrite: the cacert line is built on the person's machine so the path is real,
-  // with forward slashes inside the quotes. ssl-no-revoke is included as a safe option for
-  // Windows curl.exe (not claimed as required once cacert names the real file).
+  // with forward slashes inside the quotes. Built with double-quoted PowerShell strings and
+  // backtick escapes only -- a single-quoted fragment that opens with '/...' never terminates
+  // (kittrial-5bb.275 rev3). ssl-no-revoke is included as a safe option for Windows curl.exe
+  // (not claimed as required once cacert names the real file).
   const psParts = comments.map((line) => '"' + powershellLiteral(line) + '`r`n"');
   if (hasCertificate && certFile) {
-    psParts.push('"cacert = \\"" + ([Environment]::GetFolderPath(\'UserProfile\') -replace \'\\\\\',\'/\') + \'/' + certFile.name + '\\"`r`n"');
+    // Emits: "cacert = `"" + ([Environment]::GetFolderPath('UserProfile') -replace '\\','/') + "/NAME.crt`"`r`n"
+    psParts.push('"cacert = `" + ([Environment]::GetFolderPath(\'UserProfile\') -replace \'\\\\\',\'/\') + "/'
+      + certFile.name + '`"`r`n"');
     psParts.push('"ssl-no-revoke`r`n"');
   }
   const psPrefix = psParts.join(' + ');

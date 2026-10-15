@@ -1963,6 +1963,11 @@ console.log(JSON.stringify({
         self.assertIn('GetFolderPath', result['psRewriteWithCert'])
         self.assertIn('-replace', result['psRewriteWithCert'])
         self.assertIn('ssl-no-revoke', result['psRewriteWithCert'])
+        # kittrial-5bb.275 rev3: the cacert fragment must use double-quoted PowerShell strings
+        # and backtick escapes. A single-quoted '/...' fragment never terminates.
+        self.assertIn('`"', result['psRewriteWithCert'])
+        self.assertNotIn("+ '/.", result['psRewriteWithCert'])
+        self.assertNotIn("+ \\'/", result['psRewriteWithCert'])
         self.assertIn('cacert = $HOME/', result['posixRewriteWithCert'])
         self.assertIn('ssl-no-revoke', result['posixRewriteWithCert'])  # stripped if present
         self.assertNotIn('<your-name>', result['posixRewriteWithCert'])
@@ -1993,6 +1998,9 @@ console.log(JSON.stringify({
   pattern: /grep -vE/.test(command.posix),
   psExpands: command.powershell.includes("GetFolderPath('UserProfile')")
     && command.powershell.includes("-replace"),
+  // kittrial-5bb.275 rev3: double-quoted PowerShell strings with backtick escapes only.
+  psBacktickQuote: command.powershell.includes('`"'),
+  psNoSingleQuotedSlash: !command.powershell.includes("+ '/.") && !command.powershell.includes("+ \\'/"),
   posixExpandsHome: command.posix.includes('cacert = $HOME/'),
 }));
 """
@@ -2001,6 +2009,8 @@ console.log(JSON.stringify({
         result = json.loads(out.stdout)
         self.assertTrue(result['pattern'])
         self.assertTrue(result['psExpands'])
+        self.assertTrue(result['psBacktickQuote'])
+        self.assertTrue(result['psNoSingleQuotedSlash'])
         self.assertTrue(result['posixExpandsHome'])
         self.assertIn('ssl-no-revoke', result['powershell'])
         # Notepad bodies: the person types their own full path; no %USERPROFILE% or ~.
