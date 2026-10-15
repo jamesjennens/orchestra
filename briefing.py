@@ -461,7 +461,7 @@ DIRECTIONS_MAX=100
 # the check cannot be acted on, and they say why. A closed task lists none either way.
 DIRECTIONS_OFF_NOTE=('Direction dispositions need the installation switch checkpoint_provenance_writes, '
                      'which is off here; ordinary comments are not counted as outstanding directions while it is off.')
-DIRECTIONS_CLOSED_NOTE='A closed task lists no outstanding directions.'
+DIRECTIONS_CLOSED_NOTE='CLOSED TASK: it takes no new direction disposition, so none is listed.'
 
 def directions_counted(provenance_writes,status):
     """(counted, reason) for other actors' ordinary comments as outstanding directions.
@@ -876,13 +876,14 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
     # exactly when `reconciliation_needed` is true, and `reconciliation_reasons` names the
     # mismatching facts whenever there are any. The boolean itself is carried by `work`
     # rows and by the `review` read, which have no such bound.
-    if p is not None and not counted:
-        # The directions check is off (kittrial-5bb.284): say so once, AFTER the
-        # stale-checkpoint and taken-in-project prefixes, so no reader infers an
-        # instruction this installation cannot clear.
-        next_action=('DIRECTIONS CHECK OFF: '
-                     +(DIRECTIONS_OFF_NOTE if directions_off_reason=='switch-off' else DIRECTIONS_CLOSED_NOTE)
-                     +' '+next_action)
+    # kittrial-5bb.284 review B1: deliberately NO `next_action` prefix here. The
+    # `directions_check` block below already states why nothing is outstanding, so a
+    # prefix adds nothing but noise: it would rewrite the next action of every
+    # checkpointed brief on every installation (the switch is off everywhere) even
+    # when there is no comment to acknowledge, and because it was added last it would
+    # land in FRONT of STALE CHECKPOINT:, OUTSTANDING DIRECTIONS and CHECKPOINT FROM
+    # PROJECT, which would make docs/WORKER_GUIDE.md's "prefixed STALE CHECKPOINT:"
+    # sentence untrue.
     brief_review=dict(review,pending_requests=pending[:5],pending_total=len(pending),more='review '+task if len(pending)>5 else None,
                       prior_contributions=bounded_priors,prior_contributions_total=len(priors),
                       prior_contributions_more='review '+task if len(priors)>PRIOR_BRIEF_LIMIT else None,
@@ -923,10 +924,12 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
                        +[w for w in integration_warnings if w.startswith(RECONCILIATION_WARNING_PREFIX)]),
             'evidence':{'issue':'show '+task,'history':'history '+task,'checkpoint_entry':task+'-c'+str(c['id']) if c else None}}
     if p is not None and not counted:
-        # The brief states plainly that the directions check is off (kittrial-5bb.284):
+        # The brief states plainly WHY no direction is outstanding (kittrial-5bb.284):
         # a reader must not infer an unacknowledged instruction from a count that the
-        # installation cannot clear.
-        result['directions_check']={'state':'off','reason':directions_off_reason,
+        # installation cannot clear. `state` names the actual reason, so a closed task
+        # is never reported as the switch being off (review B1).
+        result['directions_check']={'state':'off' if directions_off_reason=='switch-off' else directions_off_reason,
+            'reason':directions_off_reason,
             'note':DIRECTIONS_OFF_NOTE if directions_off_reason=='switch-off' else DIRECTIONS_CLOSED_NOTE}
     if journal is not None:
         # The standing guidance channel (kittrial-5bb.99): every endpoint brief

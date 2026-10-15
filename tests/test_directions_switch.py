@@ -3,7 +3,9 @@
 A disposition can only be written through a checkpoint's ``directions`` field, and
 ``save_checkpoint`` refuses that field while ``checkpoint_provenance_writes`` is off (the
 default on every installation). These tests pin the readers' answer in both settings and for
-a closed task, on the canonical backend.
+a closed task. They are library fixtures built from the ``test_briefing`` helpers: they run
+no endpoint and no bd, so the canonical endpoint wiring (the endpoint reading the switch and
+passing it into ``work``/``brief``) is pinned by ``tests/test_review_workflow_additive.py``.
 """
 import unittest
 
@@ -36,7 +38,9 @@ class DirectionsSwitchTests(unittest.TestCase):
         self.assertEqual(read['directions']['reason'], 'switch-off')
         self.assertEqual(read['directions_check']['state'], 'off')
         self.assertIn('checkpoint_provenance_writes', read['directions_check']['note'])
-        self.assertIn('DIRECTIONS CHECK OFF', read['next_action'])
+        # Review B1: the block states the check, and no next_action prefix is added.
+        self.assertNotIn('DIRECTIONS CHECK OFF', read['next_action'])
+        self.assertNotIn('CLOSED TASK', read['next_action'])
         self.assertNotIn('OUTSTANDING DIRECTIONS', read['next_action'])
         self.assertEqual(b.checkpoint_queue_fields(data, data[0], provenance_writes=False)['unresolved_directions'], 0)
         self.assertEqual(b.checkpoint_queue_fields(data, data[0])['unresolved_directions'], 1)
@@ -50,11 +54,30 @@ class DirectionsSwitchTests(unittest.TestCase):
         read = b.brief(data, PROJECT, TASK)
         self.assertEqual(read['directions']['total'], 0)
         self.assertEqual(read['directions']['reason'], 'closed')
-        self.assertEqual(read['directions_check']['state'], 'off')
-        self.assertIn('closed', read['directions_check']['note'].lower())
+        # Review B1: a closed task is not reported as the switch being off, and it
+        # carries no next_action prefix either.
+        self.assertEqual(read['directions_check']['state'], 'closed')
+        self.assertEqual(read['directions_check']['reason'], 'closed')
+        self.assertIn('CLOSED TASK', read['directions_check']['note'])
+        self.assertNotIn('checkpoint_provenance_writes', read['directions_check']['note'])
+        self.assertNotIn('DIRECTIONS CHECK OFF', read['next_action'])
         self.assertEqual(b.checkpoint_queue_fields(data, data[0])['unresolved_directions'], 0)
         page = b.direction_page(data, PROJECT, TASK)
         self.assertEqual((page['total'], page['reason']), (0, 'closed'))
+
+    def test_nothing_to_acknowledge_leaves_next_action_unchanged(self):
+        """Review B1: a checkpointed task with no comment to acknowledge reads the same
+        next action off and on; the off state lives in the directions_check block."""
+        data = rows()
+        append_checkpoint(data, 'legacy', checkpoint(data))
+        off = b.brief(data, PROJECT, TASK, provenance_writes=False)
+        on = b.brief(data, PROJECT, TASK)
+        self.assertEqual(off['next_action'], on['next_action'])
+        self.assertNotIn('DIRECTIONS CHECK OFF', off['next_action'])
+        self.assertNotIn('CLOSED TASK', off['next_action'])
+        self.assertEqual(off['directions_check']['state'], 'off')
+        self.assertEqual(off['directions_check']['reason'], 'switch-off')
+        self.assertNotIn('directions_check', on)
 
     def test_switch_on_is_byte_for_byte_unchanged(self):
         data = fixture()
