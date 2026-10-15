@@ -339,7 +339,11 @@ class OrderTests(Members):
         self.assertEqual((built['order'], built['steps']), (['guidance', 'own-tasks', 'ready-list', 'held', 'checkpoint'], 5))
         numbered = re.findall(r'^(\d)\. (.{0,60})', guide, re.M)
         self.assertEqual([number for number, _ in numbered], ['1', '2', '3', '4', '5', '6', '7'])
-        self.assertTrue(numbered[0][1].startswith("The coordinator's standing guidance does not"), numbered[0])
+        self.assertTrue(numbered[0][1].startswith('Read GET https://office.example/v1/projects/PROJECT/guidance'), numbered[0])
+        for sentence in ('set_by and set_via', 'unknown legacy route',
+                         'Reading never acknowledges', '/guidance/ack',
+                         'exact version read', 'stable Idempotency-Key'):
+            self.assertIn(sentence, guide)
         self.assertTrue(numbered[1][1].startswith('Your own tasks: GET https://office.example/v1'), numbered[1])
         self.assertTrue(numbered[2][1].startswith('Only when none of your own tasks needs'), numbered[2])
         self.assertTrue(numbered[3][1].startswith('A task assigned to somebody else is held'), numbered[3])
@@ -523,7 +527,7 @@ class PageTests(Members):
         self.assertEqual(viewer['headings'], wanted)
         self.assertEqual(viewer['howText'], owner['howText'])
         for said in ('1. The coordinator\'s standing guidance', '3. Only when none of its own tasks needs action: the ready list',
-                     'In the web interface today: no.', 'comments add TASK --file note.md --json', 'Served by the kit as docs finding-work.'):
+                     'In the web interface today: yes.', 'comments add TASK --file note.md --json', 'Served by the kit as docs finding-work.'):
             with self.subTest(said=said):
                 self.assertIn(said, owner['howText'])
         self.assertNotIn('**', owner['howText'])                                 # rendered, not shown as marks
