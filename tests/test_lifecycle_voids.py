@@ -565,9 +565,9 @@ class HostCorrectionTests(unittest.TestCase):
         page, orphan = self.audit_row('abandon-cut')
         self.assertEqual((orphan['status'], orphan['superseded_by'], orphan['duplicate_host_entry'],
                           orphan['target_comment_id'], orphan['retry_operation_id'],
-                          orphan['retry_operator']),
+                          orphan['retry_operator'], orphan['operator_listed']),
                          ('superseded', 'abandon-other', True, comment['id'],
-                          'abandon-cut', 'op2'))
+                          'abandon-cut', 'op2', False))
         self.assertEqual((page['correction_status'], page['superseded_abandonment_count']),
                          ('complete', 1))
         self.assertIn(voids.ABANDON_FILE, voids.backup_files(self.project, self.rows))
@@ -578,6 +578,26 @@ class HostCorrectionTests(unittest.TestCase):
         self.assertEqual((retry['comment_id'], retry['superseded_by']),
                          (own['id'], 'abandon-other'))
         self.assertEqual(set(voids.read_journal(self.project)['abandons']), {'abandon-other'})
+
+    def test_the_audit_says_whether_a_rows_operator_is_a_listed_operator(self):
+        """kittrial-5bb.282: a native abandonment written straight to bd by someone who is not a
+        listed operator closes nothing, and once a proved record closes its cut it reads
+        ``superseded`` - the row now also SAYS that its operator is not one this installation
+        lists (True, False, or null when the caller passed no list)."""
+        cut, comment, payload, own = self.cut_abandonment(key='abandon-cut', actor='op2',
+                                                          operators=['op', 'op2'])
+        fresh = self.abandon_payload(cut, key='abandon-other', actor='op')
+        self.abandon(fresh, comment['id'], operators=['op'])
+        page, orphan = self.audit_row('abandon-cut')
+        self.assertEqual((orphan['status'], orphan['operator'], orphan['operator_listed']),
+                         ('superseded', 'op2', False))
+        # The proved record that closed the cut is by a listed operator: True.
+        other = next(c for c in page['corrections'] if c['operation_id'] == 'abandon-other')
+        self.assertEqual((other['operator'], other['operator_listed']), ('op', True))
+        # No list given: unknown, never a claim about the person.
+        unknown = voids.audit(voids.snapshot(self.rows, self.project))
+        row = next(c for c in unknown['corrections'] if c['operation_id'] == 'abandon-cut')
+        self.assertIsNone(row['operator_listed'])
 
     def assert_the_proof_refuses(self, key='abandon-cut'):
         state = self.reading()
