@@ -33,6 +33,7 @@ def _endpoint_module(case):
     except ImportError:
         stub = types.ModuleType('fcntl')
         stub.LOCK_EX = 1
+        stub.LOCK_SH = 2   # kittrial-5bb.281: reads take the coordination lock shared
         stub.flock = lambda *a, **k: None
         scoped = patch.dict(sys.modules, {'fcntl': stub})
         scoped.start()
