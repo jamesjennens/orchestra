@@ -12,6 +12,7 @@ and the concurrency of the first history-snapshot write.
 import contextlib
 import inspect
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -112,6 +113,8 @@ class SharedFileLockBoundTests(unittest.TestCase):
     same deadline as the exclusive lock.
     """
 
+    @unittest.skipIf(os.name == 'nt', 'msvcrt.locking has no shared lock: on Windows file_lock(shared=True) '
+                     'takes the exclusive lock, as its docstring states (coordinator guard, 1015d)')
     def test_a_shared_hold_allows_a_second_shared_hold(self):
         import threading
         from http_authority import file_lock
