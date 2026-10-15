@@ -807,6 +807,10 @@ READ_ONLY_ACTIONS={
     'bd':lambda args,operation:not is_mutating_invocation(args),
     'web-lifecycle':lambda args,operation:operation=='read',
     'web-merge-slot':lambda args,operation:operation=='check',
+    # kittrial-5bb.291 item 1: the roster read takes the project lock shared through
+    # the one table, not a hand-coded LOCK_SH at its own call site. task-assign is
+    # deliberately absent: it is a write and stays exclusive.
+    'assignment-roster':_read_only_always,
 }
 
 def coordination_lock_shared(request,action=None,args=None,operation=None):
@@ -1552,12 +1556,15 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                 result=assignment_apply(payload,actor,runner,path,eligible=lambda target:target in actors,
                                         operators=configured_operators(root),at=server_time())
                 return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':warning_text(warnings)}
-            with (path/'.coordination.lock').open('a') as lock:
-                fcntl.flock(lock,fcntl.LOCK_SH if action=='assignment-roster' else fcntl.LOCK_EX)
+            with held_coordination_lock(path,shared=coordination_lock_shared(request,action,args)):
                 if action=='assignment-roster':
                     if authority_config is None:raise AssignmentError(403,'Verified coordinate authority is required in this project.')
-                    with Path(authority_config.lock).open('a') as authority_lock:
-                        fcntl.flock(authority_lock,fcntl.LOCK_SH)
+                    # SHARED and bounded: two roster reads can hold it at once and a
+                    # writer is still excluded, with the same 60 s limit as the
+                    # exclusive wait (kittrial-5bb.291 item 5). The old flock(LOCK_SH)
+                    # was shared but waited forever.
+                    from http_authority import file_lock
+                    with file_lock(authority_config.lock, shared=True):
                         assignment_authority();actors=roster();offset=page['offset'];limit=page['limit']
                         result={'schema_version':1,'items':actors[offset:offset+limit],'total':len(actors),
                                 'more':offset+limit<len(actors),'offset':offset,
