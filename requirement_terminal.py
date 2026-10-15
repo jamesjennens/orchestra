@@ -170,6 +170,10 @@ def validate_receipt(receipt):
 def checked_current(project_path, context, row, body):
     if row is None or records.existing_kind(row) != 'requirement':
         raise ValueError('Select a readable requirement in this project')
+    if row.get('status') == 'closed':
+        # A native closed record is not a currently active requirement; it can
+        # neither be a terminal target nor a supersession successor.
+        raise ValueError('Select a currently active accepted requirement in this project')
     revisions = records.existing_revisions(row)
     record = records.latest_revision(revisions)
     if (record is None or record['revision'] != body['expected_revision']
@@ -192,6 +196,8 @@ def landed_current(project_path, context, row, body):
     """
     if row is None or records.existing_kind(row) != 'requirement':
         raise ValueError('Select a readable requirement in this project')
+    if row.get('status') == 'closed':
+        raise ValueError('Select a currently active accepted requirement in this project')
     record = records.existing_revisions(row).get(body['expected_revision'])
     if record is None or record['sha256'] != body['expected_sha256']:
         raise ValueError('Requirement changed; reload before trying again')
@@ -360,8 +366,9 @@ def scan(project_path, project):
     return found, damaged
 
 
-def pending_ids(project_path, project, rows=None):
-    receipts, damaged = scan(project_path, project)
+def pending_ids(project_path, project, rows=None, receipts=None, damaged=None):
+    if receipts is None or damaged is None:
+        receipts, damaged = scan(project_path, project)
     return {r['id'] for r in receipts if effective_pending(r, records.find(rows, r['id']) if rows is not None else None)}, {r['id'] for r in damaged if r['id'] is not None}
 
 
@@ -449,8 +456,9 @@ def recover(project_path, context, action, task, body, run, recovery_operation_i
                 recovery_operation_id=disposition['operation_id'], reconciled=False)
 
 
-def projection(project_path, project, rows, run):
-    receipts, damaged = scan(project_path, project)
+def projection(project_path, project, rows, run, receipts=None, damaged=None):
+    if receipts is None or damaged is None:
+        receipts, damaged = scan(project_path, project)
     items = []
     native_ids = None
     native_error = None
@@ -520,7 +528,7 @@ def projection(project_path, project, rows, run):
                 checked_current(project_path, context, target, dict(expected_revision=successor['revision'], expected_sha256=successor['sha256']))
                 if owner.state_ledger(target)[0] is not None:
                     raise ValueError('The supersession successor is no longer eligible; finish is unavailable.')
-                pending, broken = pending_ids(project_path, project, rows)
+                pending, broken = pending_ids(project_path, project, rows, receipts=receipts, damaged=damaged)
                 if successor['id'] in pending or successor['id'] in broken:
                     raise ValueError('The supersession successor is unavailable; finish after its recovery.')
             item['can_finish'] = True

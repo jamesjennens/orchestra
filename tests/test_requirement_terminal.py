@@ -1,6 +1,7 @@
 """Terminal states retain historical acceptance and recover exact native effects."""
 import copy
 import json
+import shutil
 import tempfile
 import time
 import unittest
@@ -635,6 +636,69 @@ class TerminalTests(unittest.TestCase):
                            self.native, item['id'])
             self.assertNotIn('.json', str(caught.exception))
             self.assertNotIn(str(self.path), str(caught.exception))
+
+
+    def test_written_state_before_the_deadline_does_not_offer_a_retry_time(self):
+        item = self.accepted()
+        self.native.fail_comment_prefix = owner.REASON_PREFIX
+        with self.assertRaises(ValueError):
+            self.act(item)
+        shown = self.recovery(item)
+        self.assertTrue(shown['can_finish'])
+        self.assertFalse(shown['can_abandon'])
+        self.assertNotIn('retry abandonment after', shown['abandon_unavailable'])
+        self.assertIn('A state was written', shown['abandon_unavailable'])
+
+    def test_abandon_stays_available_when_the_requirement_changed_while_pending(self):
+        item = self.accepted()
+        self.native.fail_comment_prefix = owner.STATE_PREFIX
+        with self.assertRaises(ValueError):
+            self.act(item)
+        self.after_writer(item)
+        # Model a change landed by another writer while this transition is
+        # pending: the exact request no longer matches the latest revision.
+        with mock.patch.object(terminal, 'pending_ids', return_value=(set(), set())):
+            http.apply(self.path, self.context, 'revise', dict(expected_revision=item['revision'],
+                expected_sha256=item['sha256'], description='Changed while pending.'),
+                'changed-while-pending', self.native, item['id'])
+        shown = self.recovery(item)
+        self.assertTrue(shown['can_abandon'])
+        self.assertFalse(shown['can_finish'])
+        released = self.recover(item, 'abandon', shown)
+        self.assertEqual(released['disposition'], 'released')
+
+    def test_scan_validates_each_owner_receipt_once_per_read(self):
+        items = [self.accepted(key) for key in ('first', 'second', 'third')]
+        for index, item in enumerate(items):
+            self.act(item, operation='terminal-%d' % index)
+        original = terminal.validate_receipt
+        seen = []
+        def counting(receipt):
+            seen.append(receipt['owner_state']['operation_id'])
+            return original(receipt)
+        with mock.patch.object(terminal, 'validate_receipt', counting):
+            view = http.read(self.path, 'alpha', ['list'], self.native)
+        self.assertEqual(view['total'], 3)
+        self.assertEqual(sorted(seen), ['terminal-0', 'terminal-1', 'terminal-2'])
+
+    def test_journal_creation_refusal_does_not_leak_the_server_path(self):
+        item = self.accepted()
+        shutil.rmtree(self.path / terminal.JOURNAL)
+        (self.path / terminal.JOURNAL).write_text('not a directory')
+        with self.assertRaisesRegex(ValueError, 'Cannot create') as caught:
+            self.act(item)
+        self.assertNotIn(str(self.path), str(caught.exception))
+        self.assertNotIn('Errno', str(caught.exception))
+
+    def test_a_natively_closed_successor_is_not_active(self):
+        first = self.accepted()
+        second = self.accepted('closed-successor')
+        self.native.row(second['id'])['status'] = 'closed'
+        reference = {key: second[key] for key in ('id', 'revision', 'sha256')}
+        writes = len(self.native.writes())
+        with self.assertRaisesRegex(ValueError, 'currently active'):
+            self.act(first, 'supersede', successor=reference)
+        self.assertEqual(len(self.native.writes()), writes)
 
 
 if __name__ == '__main__':

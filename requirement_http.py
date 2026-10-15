@@ -756,8 +756,9 @@ def read(project_path, project, args, run, operators=None):
     # tracker has no requirement/brd-section issue types, so its unreadable-row
     # membership probes must use the supported label filters.
     rows = record_json.classify(records.read_rows(run), run, labels)
-    from requirement_terminal import pending_ids, projection
-    pending, pending_error = pending_ids(project_path, project, rows)
+    from requirement_terminal import pending_ids, projection, scan
+    receipts, damaged = scan(project_path, project)
+    pending, pending_error = pending_ids(project_path, project, rows, receipts=receipts, damaged=damaged)
     items, decisions = [], []
     for row in rows:
         if not (records.TYPE_LABELS.intersection(row.get('labels') or [])
@@ -839,7 +840,7 @@ def read(project_path, project, args, run, operators=None):
                                   sha256=old['state']['record_sha256']) for old in items
                              if old.get('requirement_state') == 'superseded'
                              and old['state']['superseded_by']['id'] == item['id']]
-    recoveries = projection(project_path, project, rows, run)
+    recoveries = projection(project_path, project, rows, run, receipts=receipts, damaged=damaged)
     for item in items:
         item['pending_transition'] = next((r for r in recoveries['items'] if r['id'] == item['id']), None)
         item['completion'] = recoveries['completions'].get(item['id'])
