@@ -1771,7 +1771,24 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                 # bd's sentence. Only what bd_refusals recognises; anything else is handed on as it came.
                 refused=bd_refusals.refusal(p.returncode,p.stdout,p.stderr)
                 if refused is not None:return bd_refusals.envelope(*refused)
-                return {'returncode':p.returncode,'stdout':p.stdout,'stderr':p.stderr}
+                stdout=p.stdout
+                # `ready` is the listing a client uses to pick work: keep the merge slot and
+                # other internal records out of it, the same rule `work --claimable` already
+                # applies (kittrial-5bb.290). Only the JSON form is filtered; a text ready
+                # listing is left as bd wrote it.
+                if argv and argv[0]=='ready' and p.returncode==0 and stdout.lstrip()[:1] in ('[','{'):
+                    try:
+                        rows=json.loads(stdout)
+                    except ValueError:
+                        rows=None
+                    if isinstance(rows,list):
+                        from work import drop_internal_from_ready
+                        stdout=json.dumps(drop_internal_from_ready(rows))+'\n'
+                    elif isinstance(rows,dict) and isinstance(rows.get('items'),list):
+                        from work import drop_internal_from_ready
+                        rows=dict(rows);rows['items']=drop_internal_from_ready(rows['items'])
+                        stdout=json.dumps(rows)+'\n'
+                return {'returncode':p.returncode,'stdout':stdout,'stderr':p.stderr}
             runner=NativeRunner(bd_dispatch, project=path)
             def bd_effect():return runner(final)
             return guarded_write(root,request,journal_path(path),bd_effect,
