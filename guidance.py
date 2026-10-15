@@ -682,7 +682,7 @@ def read(path, args, actor=None, operators=None):
     return result
 
 
-def write_guidance(path, text, actor, now=None):
+def write_guidance(path, text, actor, now=None, *, before_write=None):
     """The operator write. Returns the new audit summary.
 
     Idempotent on unchanged text, but a missing or mismatched audit record is
@@ -793,6 +793,8 @@ def write_guidance(path, text, actor, now=None):
     # The text is written first: a crash before the metadata replace leaves the new
     # version already authoritative (readers derive it from the text) with stale
     # audit fields, which a set with the same text repairs (see above).
+    if before_write is not None:
+        before_write()
     write_text(target, text)
     atomic(meta_path, meta)
     audit_warning = None
@@ -823,7 +825,7 @@ def write_guidance(path, text, actor, now=None):
     return result
 
 
-def acknowledge(path, actor, version=None):
+def acknowledge(path, actor, version=None, *, before_write=None):
     """Record that one actor has read the current guidance version.
 
     The caller must name the version it read; a version that is no longer current
@@ -877,6 +879,8 @@ def acknowledge(path, actor, version=None):
     table[actor] = {'version': current, 'acknowledged_at': stamp}
     meta['acknowledged'] = table
     validate_meta(meta)
+    if before_write is not None:
+        before_write()
     atomic(path / META_NAME, meta)
     return {'acknowledged': True, 'version': current, 'acknowledged_at': stamp, 'reconciled': False}
 
@@ -979,7 +983,7 @@ def clears_view(path):
     return view
 
 
-def clear(path, actor):
+def clear(path, actor, *, before_write=None):
     """Operator host route: remove the guidance text and its audit record entirely.
 
     A small local record (``.guidance-clear.json``) keeps who cleared it, when and
@@ -1002,6 +1006,8 @@ def clear(path, actor):
     removed = []
     for target in (text, meta, meta.with_suffix('.tmp'), Path(path) / REPAIR_NAME):
         if target.exists() or target.is_symlink():
+            if before_write is not None:
+                before_write()
             try:
                 target.unlink()
             except OSError:
@@ -1096,6 +1102,13 @@ def _unreadable_status(path, reason, host):
 
 
 def status(path, actor, operators=None, host=False):
+    """The unchanged host/operator guard, before any status file is read."""
+    from keyed_records import require_configured_operator
+    require_configured_operator(actor, operators, 'read the guidance acknowledgement status')
+    return _status_snapshot(path, actor, operators, host)
+
+
+def _status_snapshot(path, actor, operators=None, host=False):
     """Which lanes have acknowledged which version.
 
     The endpoint form (``host=False``, the default) reports only versions, actor
@@ -1106,8 +1119,6 @@ def status(path, actor, operators=None, host=False):
     previous text and the history, and is the only place an operator sees the text
     of an unbound record (kittrial-5bb.99 review `small` 1).
     """
-    from keyed_records import require_configured_operator
-    require_configured_operator(actor, operators, 'read the guidance acknowledgement status')
     target, _ = _paths(path)
     try:
         text = read_text(path)

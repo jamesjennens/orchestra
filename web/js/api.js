@@ -207,7 +207,14 @@ export function createApi(transport) {
     projectCreations: () => call('GET', '/v1/project-creations'),
     setProjectGrant: (uid, limit) => mutate('PUT', `/v1/accounts/${uid}/project-grant`, { limit }),
     clearProjectGrant: (uid) => mutate('DELETE', `/v1/accounts/${uid}/project-grant`),
-    // The project's onboarding text, set by an owner (guidance stays with the operator).
+    // Guidance reads never acknowledge; acknowledgements name the exact displayed version.
+    guidance: (pid) => call('GET', `/v1/projects/${pid}/guidance`),
+    guidanceStatus: (pid, offset = 0, limit = 50) => call('GET', `/v1/projects/${pid}/guidance/status`, { params: { offset, limit } }),
+    ackGuidance: (pid, version) => mutate('POST', `/v1/projects/${pid}/guidance/ack`, { version }),
+    setGuidance: (pid, text) => mutate('PUT', `/v1/projects/${pid}/guidance`, { text }),
+    clearGuidance: (pid) => mutate('DELETE', `/v1/projects/${pid}/guidance`, {}),
+    memberOnboarding: (pid) => call('GET', `/v1/projects/${pid}/onboarding/read`),
+    // Coordinate edit routes withhold operator text; the member read returns the whole document.
     onboarding: (pid) => call('GET', `/v1/projects/${pid}/onboarding`),
     setOnboarding: (pid, text) => mutate('PUT', `/v1/projects/${pid}/onboarding`, { text }),
     clearOnboarding: (pid) => mutate('DELETE', `/v1/projects/${pid}/onboarding`),

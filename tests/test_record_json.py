@@ -309,6 +309,8 @@ class NoUnguardedParseTests(unittest.TestCase):
             'handoff.py': 1, 'http_authority.py': 1, 'http_service.py': 3, 'lane_state.py': 1, 'lifecycle.py': 2, 'recovery.py': 1, 'requirements.py': 1, 'requirement_records.py': 1, 'reserved_comments.py': 1,
             # The simple owner adapter guards bd's decision-create receipt too.
             'requirement_http.py': 2,
+            # Service-only guidance bodies are caller text, parsed through the nesting guard.
+            'web_guidance.py': 2,
             'web_merge_slot.py': 4,
             # Lifecycle host entry and restore identity are bounded untrusted text.
             'web_lifecycle_marks.py': 2,
