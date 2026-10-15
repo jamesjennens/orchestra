@@ -199,6 +199,19 @@ class NativeGuidanceHttpTests(RulesHelpers, unittest.TestCase):
             self.assertEqual(reply.status, 403, reply.data)
             self.assertEqual(self.docs(), before)
 
+    def test_read_configuration_faults_keep_the_safe_shared_error_category(self):
+        def configuration_fault(*args, **kwargs):
+            return dict(returncode=2, stdout='', fault='configuration',
+                        stderr='PermissionError: synthetic/private/deployment.private.json cannot be read')
+        for suffix in ('/guidance', '/guidance/status', '/onboarding/read', '/onboarding'):
+            with self.subTest(route=suffix), patch.object(self.h.backend, '_ask', side_effect=configuration_fault):
+                reply = self.call('GET', suffix)
+            self.assertEqual(reply.status, 503, reply.data)
+            self.assertEqual(reply.data['error']['code'], 'server_configuration')
+            self.assertEqual(reply.data['error']['message'], self.h.backend.CONFIGURATION_UNREADABLE)
+            self.assertNotIn('synthetic/private', json.dumps(reply.data))
+            self.assertNotIn('PermissionError', json.dumps(reply.data))
+
     def test_actual_endpoint_reads_share_project_and_authority_locks(self):
         import concurrent.futures
         import fcntl
