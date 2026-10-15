@@ -335,35 +335,36 @@ class NativeAssignmentTests(RulesHelpers,unittest.TestCase):
     def test_the_endpoint_refuses_a_roster_read_without_verified_authority(self):
         """Mutant M4 of the second .211 review: removing the endpoint's own authority
         check on the roster read used to be caught by no test (the web route's
-        coordinate check still refuses). This is that test: the endpoint alone, with
-        a missing or forged authority, must refuse before it lists anyone.
+        coordinate check still refuses). This is that test.
 
-        The request is built the way the HTTP service builds it (an AuthorityConfig
-        and an HTTP-shaped actor), so the actor-shape guard does not refuse it first
-        and the roster's own assignment_authority() is what is under test. With that
-        check removed the test fails: the roster would be listed.
+        The case that kills M4 is a descriptor that passes the generic guards but
+        fails the roster's own assignment_authority(): a live descriptor for a
+        member WITHOUT the coordinate capability. With assignment_authority()
+        removed the roster is listed and this test fails. (A missing descriptor is
+        refused earlier by the generic guard, rc 126/401, and does not test M4.)
+        authority_config and require_authority are keyword arguments of execute(),
+        not fields of the request.
         """
         from http_authority import AuthorityConfig
         harness, owner = self.web()
+        contributor, contributor_token = self.member(harness, owner, 'm4-no-coordinate',
+                                                     role='contributor')
         harness.store.save()
         config = AuthorityConfig(harness.backend.authority_store, harness.backend.authority_lock,
                                  harness.backend.actor_namespace)
         page = [json.dumps(dict(offset=0, limit=200))]
-        actor = harness.admin_user['id']
-        # No authority descriptor at all: the endpoint's own check refuses.
+        # A live block that names the capability the action needs (so the generic
+        # block-mismatch guard is satisfied) but whose user is only a contributor
+        # (so decide() denies it inside assignment_authority).
+        descriptor = dict(project='pp', capability='coordinate', via='session',
+                          user_id=contributor, store=str(harness.store.path))
         reply = fixture.endpoint.execute(self.root, dict(
-            project='pp', actor=actor, action='assignment-roster',
-            args=page, authority_config=config, require_authority=True))
+            project='pp', actor=contributor, action='assignment-roster',
+            args=page, authority=descriptor),
+            authority_config=config, require_authority=True)
         self.assertEqual(2, reply['returncode'], reply)
         self.assertEqual(403, reply.get('assignment_status'), reply)
-        # A forged capability/project binding is refused the same way.
-        forged = dict(project='pp', capability='tasks.write', via='session',
-                      user_id=actor, store=str(harness.store.path))
-        reply = fixture.endpoint.execute(self.root, dict(
-            project='pp', actor=actor, action='assignment-roster',
-            args=page, authority_config=config, require_authority=True, authority=forged))
-        self.assertEqual(2, reply['returncode'], reply)
-        self.assertEqual(403, reply.get('assignment_status'), reply)
+        self.assertNotIn('items', json.loads(reply.get('stdout') or '{}'))
 
     def test_forged_canonical_block_and_unconfigured_ssh_cannot_assign(self):
         from unittest.mock import patch
