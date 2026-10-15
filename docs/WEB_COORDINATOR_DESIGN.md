@@ -102,6 +102,8 @@ routes of `http_service.py`. The last column is this design, with its slice.
 | Recommend | `review` | there; refused from the author's own account | as today |
 | Approve | `review`, any name | a signed-in owner or superuser only; **never an agent**; their own work included | a coordinator, person or granted agent; never their own party's work (1a, 1b) |
 | Withdraw, request a review | `review` (behind the installation's `review-writes` switch) | there, behind the same switch | as today |
+| Record a verifier attestation (`attest`; `admin.py attest-delivery` reads the bundle) | `review` / the host command; a listed verifier or listed operator only, never the author's party | **refused with a sentence**: the three operations are host-only (kittrial-5bb.10 item 6) | stays on the host, by decision (see "Which actions get routes") |
+| Set or release an integration hold (`hold`, `release-hold`) | `review`; a listed operator only | **refused with the same sentence** | stays on the host, by decision (see "Which actions get routes") |
 | Merge slot: check, acquire, release | `coordination.py` | **none** | route and page, coordinator (2) |
 | Release a slot whose holder has gone | none: the kit has no forced release | **none** | an owner or superuser, audited (2) |
 | Lifecycle scope and the six facts | `lifecycle.py record` | **none** | route and page, coordinator (2) |
@@ -303,6 +305,7 @@ is settled by James's own words (nobody but him needs SSH), not asked again:
 | Retiring a project, removing an unfinished creation | not reversible from the web |
 | The rollout switches (`review-writes`, `checkpoint-provenance-writes`) | one per installation |
 | The operator and verifier lists | they stay the host route's; the web does not read them for a coordinator |
+| Verifier attestations and integration holds: `attest`, `hold`, `release-hold` | their authority IS those two lists, which the web cannot judge; a web capability (`reviews.approve` or `reviews.write`) would be a different authority than the one the operations need, and would hand host authority to any caller that holds it. The web route refuses the three with a sentence naming the host commands (kittrial-5bb.10 item 6; the decision recorded by kittrial-5bb.272). A stored hold still stops the web merge slot and every integration read: honouring a hold is a read, not one of the three writes |
 | `authorized_keys` | sshd's file; with nobody else on SSH there is one line in it |
 
 A fault that needs one of these needs James. That is the price of "nobody but

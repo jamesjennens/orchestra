@@ -974,55 +974,62 @@ def current_contribution_commits(rows):
     return result
 
 
-def review_chain_state(row):
+def review_chain_state(row, operators=None, journal=None):
     """The shared review projection of one row, or ``None`` when it cannot be read.
 
     Best effort, exactly like :func:`current_contribution_commits`: a row with no review
     chain, or a chain this read cannot parse, yields ``None`` and the caller treats the
     task as unheld rather than inventing a hold. Nothing here changes what is recorded.
 
-    It projects with ``records(row, None)`` - no operator voids and no revert journal -
-    which is safe for the two facts it is asked: a void can only REMOVE a chain record
-    (so ignoring voids can only ADD a hold, never clear one: fail-closed), an operator
-    void-record of a hold record is itself refused as part of the surviving contribution
-    history, and the revert journal never touches the ``holds``/``attestation`` records
-    this projection reads. Every authoritative write path still reads the full chain
-    with voids and journal.
+    It projects with the SAME operator voids and revert journal as ``review``, ``brief``
+    and ``work`` (``project(row, operators, journal)``; kittrial-5bb.272 review item 1).
+    The first revision read with ``records(row, None)`` and called that fail-closed -
+    "a void can only REMOVE a chain record, so ignoring voids can only ADD a hold, never
+    clear one" - which holds for a voided HOLD but not for a voided RELEASE-HOLD: a
+    release-hold the surviving chain no longer links (a later record forked around it)
+    IS voidable, and with the void applied the canonical readers read the hold back in
+    force while this read, ignoring the void, read it released (or read the forked chain
+    as unparseable and answered ``None``) - so the lifecycle facts would not refuse a
+    held contribution. Reading through the same projection as every canonical reader
+    removes the divergence; callers pass the operators and the project journal they
+    already hold, and a caller that passes none gets no voids applied (an unconfigured
+    allowlist authorizes nobody), which is the old behaviour.
     """
     try:
-        from review_workflow import records, projection
+        from review_workflow import project
     except ImportError:return None
     if not isinstance(row,dict) or not isinstance(row.get('id'),str):return None
     from coordination import is_merge_slot
     if row.get('issue_type') in ('event','gate') or is_merge_slot(row):return None
     try:
-        return projection(records(row,None))
+        return project(row,operators,journal)
     except (ValueError,KeyError,TypeError):return None
 
 
-def held_tasks(rows):
+def held_tasks(rows, operators=None, journal=None):
     """``{task: sentence}`` for tasks whose CURRENT contribution is held (kittrial-5bb.10).
 
     A hold, or a positively FAILED verifier attestation, makes a contribution not
     integration-ready, so the release selection skips the task with the sentence that
     names the open hold (or the failed attestation) and who can release it. Best effort:
     a chain this read cannot parse simply yields no entry, exactly as the delivery flag
-    read does.
+    read does. The operators and journal are the caller's, so the projection applies the
+    same voids and reverts as every canonical reader (kittrial-5bb.272 review item 1).
     """
     from review_workflow import integration_hold_sentence
     result={}
     for row in rows:
-        state=review_chain_state(row)
+        state=review_chain_state(row,operators,journal)
         if state is None:continue
         sentence=integration_hold_sentence(state)
         if sentence:result[row['id']]=sentence
     return result
 
 
-def held_issue_sentence(issue):
+def held_issue_sentence(issue, operators=None, journal=None):
     """The hold sentence for one task row, or ``None`` (kittrial-5bb.10 item 4)."""
     from review_workflow import integration_hold_sentence
-    state=review_chain_state(issue)
+    state=review_chain_state(issue,operators,journal)
     return None if state is None else integration_hold_sentence(state)
 
 
@@ -1105,10 +1112,11 @@ def release_selection(rows,scope,is_ancestor,previous_commit=None,subset=None,re
     if reverted is None:reverted=reverted_integrations(rows,operators,journal)
     if current_commits is None:current_commits=current_contribution_commits(rows)
     wanted=set(subset) if subset else None
+    # The same voids and journal as every canonical reader (kittrial-5bb.272 review item 1).
     # A held contribution is not integration-ready (kittrial-5bb.10 item 4): the release
     # selection skips the task with the sentence naming the open hold (or the failed
     # attestation) and who can release it, instead of offering it as a target.
-    held=held_tasks(rows)
+    held=held_tasks(rows,operators,journal)
     targets=[];skipped=[];flags=[];verifying=[];restoring=[]
     for entry in scoped_evidence(rows,('integrated','deployed','live-verified',LIVE)):
         task=entry['id'];scopes=entry['scopes']
@@ -1712,7 +1720,7 @@ def apply_release(payload,actor,run,operators=None,journal=None,lifecycle_author
     # (kittrial-5bb.10 item 4), before any plan or write: a held contribution is not
     # integration-ready, so a caller cannot release it by naming it. The selection already
     # skipped it; this is the explicit refusal.
-    held=held_tasks(rows)
+    held=held_tasks(rows,operators,journal)
     named=set()
     for target in payload.get('targets') or []:
         if isinstance(target,str):named.add(target)
@@ -1851,10 +1859,19 @@ def release_query(payload,actor,run,operators=None,journal=None):
             'live_releases':live}
 
 
-def require_unheld_fact(issue, dimension, task):
-    """The native hold gate, also used before web approval checks and receipt replay."""
+def require_unheld_fact(issue, dimension, task, operators=None, journal=None):
+    """The native hold gate, also used before web approval checks and receipt replay.
+
+    ``operators`` and ``journal`` are keyword arguments (as :func:`held_issue_sentence`
+    takes them, kittrial-5bb.272 review item 1): the gate judges the hold through the
+    SAME voids and revert journal the canonical readers use, so a voided release-hold
+    reads held here too. Callers that HAVE the deployment's operators or the project's
+    journal must pass them (never None where the caller holds them); a caller that has
+    neither - or a read that must not depend on configuration - passes none and gets no
+    voids applied.
+    """
     if dimension in ('reviewed','integrated'):
-        sentence=held_issue_sentence(issue)
+        sentence=held_issue_sentence(issue,operators,journal)
         if sentence:
             raise ValueError('Refusing to record %s for %s: %s. A held contribution is not '
                              'integration-ready; the hold must be released (or a corrected attestation '
@@ -1903,7 +1920,12 @@ def apply_native(payload, actor, run, operators=None, journal=None, lifecycle_au
             from review_workflow import require_independent_approval
             require_independent_approval(issue,payload['dimension'],payload['task'],
                                          operators=operators,owners=owners,journal=journal)
-    require_unheld_fact(issues.get(payload['task']), payload['dimension'], payload['task'])
+    # The hold gate (kittrial-5bb.10 item 4), through the shared projection: a held
+    # contribution is not integration-ready, so `reviewed`/`integrated` are refused with
+    # the hold's own sentence before any write, judged with the same voids and journal
+    # every canonical reader uses (kittrial-5bb.272 review item 1).
+    require_unheld_fact(issues.get(payload['task']), payload['dimension'], payload['task'],
+                        operators=operators, journal=journal)
     # A SINGLE fact must name the task's CURRENT scope: a fact recorded under an
     # older, previously recorded scope is refused here with main's rule (rev3 item
     # 2). Only the release operation may write a fact under an already-recorded
