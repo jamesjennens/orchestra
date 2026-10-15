@@ -161,6 +161,86 @@ export function createApi(transport) {
     }
   }
 
+  // Baseline names and request keys only, scoped to the freshly read account.
+  // Save before sending: a reload/new session must never recapture an uncertain
+  // cut under a fresh key. A failed retry retains its original intent too.
+  async function baselineIntents() {
+    const current = await call('GET', '/v1/sessions/current');
+    if (current.csrf_token) csrf = current.csrf_token;
+    const actor = current.user?.id;
+    if (current.via !== 'session' || current.credential || !/^usr_[a-f0-9]{16}$/.test(actor || ''))
+      throw new ApiError(403, 'baseline_session', 'Baseline cuts need a signed-in project owner.', null, null);
+    const storage = 'orchestra-baseline-retries-v1:' + actor;
+    let entries;
+    try {
+      const raw = sessionStorage.getItem(storage);
+      if (raw && raw.length > 32768) throw new Error();
+      entries = raw ? JSON.parse(raw) : [];
+      if (!Array.isArray(entries) || entries.length > 64) throw new Error();
+      const seen = new Set();
+      for (const entry of entries) {
+        if (!entry || Object.keys(entry).sort().join(',') !== 'key,name,project'
+            || !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,95}$/.test(entry.project || '')
+            || !/^[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?$/.test(entry.name || '')
+            || !/^[A-Za-z0-9_-]{8,128}$/.test(entry.key || '')) throw new Error();
+        const identity = entry.project + '/' + entry.name;
+        if (seen.has(identity)) throw new Error();
+        seen.add(identity);
+      }
+    } catch {
+      throw new ApiError(409, 'baseline_retry_storage', 'Saved baseline retries cannot be read. Ask the host operator to reconcile them before clearing tab storage.', null, null);
+    }
+    const save = () => {
+      try {
+        if (entries.length > 64) throw new Error();
+        sessionStorage.setItem(storage, JSON.stringify(entries));
+      } catch {
+        throw new ApiError(409, 'baseline_retry_storage', 'Baseline retry keys cannot be saved. Restore tab storage before cutting a baseline.', null, null);
+      }
+    };
+    return { entries, save };
+  }
+  let baselineQueue = Promise.resolve();
+  function cutBaseline(pid, body) {
+    const next = baselineQueue.then(() => performBaselineCut(pid, body));
+    baselineQueue = next.catch(() => {});
+    return next;
+  }
+  async function performBaselineCut(pid, body) {
+    if (!body || Object.keys(body).join(',') !== 'name' || typeof body.name !== 'string'
+        || !/^[A-Za-z0-9](?:[A-Za-z0-9_-]{0,62}[A-Za-z0-9])?$/.test(body.name))
+      throw new ApiError(422, 'baseline_name', 'Use a baseline name of 1 to 64 letters or digits, with internal hyphens or underscores.', null, null);
+    const name = body.name.toLowerCase();
+    const saved = await baselineIntents();
+    let entry = saved.entries.find(item => item.project === pid && item.name === name);
+    if (!entry) {
+      entry = { project: pid, name, key: newKey() };
+      saved.entries.push(entry);
+    }
+    saved.save();
+    let result;
+    try {
+      result = await call('POST', `/v1/projects/${encodeURIComponent(pid)}/requirements/baselines`,
+                          { body: { name }, key: entry.key });
+    } catch (caught) {
+      const error = caught instanceof ApiError ? caught : new ApiError(0, 'network',
+        'The baseline response was lost. Retry the same named cut.', null, null);
+      error.retry = () => cutBaseline(pid, { name });
+      throw error;
+    }
+    saved.entries.splice(saved.entries.indexOf(entry), 1);
+    try { saved.save(); }
+    catch {
+      throw new ApiError(503, 'baseline_retry_cleanup', 'The cut completed but its retry key could not be cleared. Retry the same named cut to reconcile it.', null, null);
+    }
+    return result;
+  }
+  async function pendingBaselineCuts(pid) {
+    const saved = await baselineIntents();
+    return saved.entries.filter(entry => entry.project === pid).map(entry =>
+      ({ name: entry.name, retry: () => cutBaseline(pid, { name: entry.name }) }));
+  }
+
   return {
     // session
     async login(username, password) {
@@ -278,6 +358,12 @@ export function createApi(transport) {
     requirements: (pid) => call('GET', `/v1/projects/${pid}/requirements`),
     requirement: (pid, rid) => call('GET', `/v1/projects/${pid}/requirements/${rid}`),
     brd: (pid) => call('GET', `/v1/projects/${pid}/brd`),
+    baselines: (pid) => call('GET', `/v1/projects/${pid}/requirements/baselines`),
+    baseline: (pid, name) => call('GET', `/v1/projects/${pid}/requirements/baselines/${encodeURIComponent(name)}`),
+    exportBrd: (pid, baseline) => call('GET', `/v1/projects/${pid}/brd/export`, { params: { baseline } }),
+    brdChanges: (pid, baseline) => call('GET', `/v1/projects/${pid}/brd/changes`, { params: { baseline } }),
+    cutBaseline,
+    pendingBaselineCuts,
     createRequirement: (pid, body) => mutate('POST', `/v1/projects/${pid}/requirements`, body),
     reviseRequirement: (pid, rid, body) => mutate('PATCH', `/v1/projects/${pid}/requirements/${rid}`, body),
     acceptRequirement: (pid, rid, body) => mutate('POST', `/v1/projects/${pid}/requirements/${rid}/accept`, body),

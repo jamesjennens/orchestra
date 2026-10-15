@@ -125,6 +125,31 @@ class ComparisonTests(unittest.TestCase):
         self.assertEqual(result['groups']['added'], ['demo.3'])
         self.assertEqual(compare(new, new)['total'], 0)
 
+    def test_context_changes_and_governance_are_separate_from_requirement_acceptance(self):
+        def observation(identity, title, kind='decision'):
+            row = dict(schema_version=1, kind=kind, id=identity, title=title, description='Observed wording', status='open')
+            row['sha256'] = content_hash(row)
+            return row
+        old = view(); old['decisions'] = [observation('demo.8', 'Before')]
+        old['questions'] = [observation('demo.9', 'Question', 'question')]
+        new = copy.deepcopy(old); new['decisions'] = [observation('demo.8', 'After'), observation('demo.10', 'New')]
+        new['questions'] = []; new['governance'] = {'mode': 'governed'}
+        result = compare(old, new)
+        self.assertEqual(result['total'], 0)
+        self.assertEqual(result['context_total'], 3)
+        self.assertEqual(result['groups']['accepted'], [])
+        self.assertEqual({row['id']: row['change'] for row in result['context']['decisions']}, {'demo.8': 'edited', 'demo.10': 'added'})
+        self.assertEqual(result['context']['questions'][0]['change'], 'removed')
+        self.assertEqual(result['governance']['before'], {'mode': 'simple'})
+        self.assertEqual(result['context']['decisions'][1]['before']['sha256'], old['decisions'][0]['sha256'])
+        document = render(new).decode()
+        self.assertEqual(document.count('Open native observation - not acceptance evidence.'), 2)
+        for row in new['decisions']:
+            self.assertIn(row['sha256'], document)
+        new['decisions'][0]['title'] = 'Unhashed edit'
+        with self.assertRaisesRegex(ValueError, 'Unverified'):
+            compare(old, new)
+
     def test_comparison_ignores_clocks_and_refuses_unverified_or_wrong_project(self):
         data = view(item(record()))
         other = copy.deepcopy(data)

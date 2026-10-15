@@ -19,6 +19,7 @@ from requirements import _unique_object, canonical_bytes, content_hash
 from requirement_brd import render
 
 DIRECTORY = '.requirements-baselines'
+RESTORE_MARKER = '.requirements-baselines-restore.json'
 PREFIX = DIRECTORY + '/'
 FILES = {'snapshot.json', 'BRD.md', 'receipt.json'}
 STAGE = re.compile(r'\.pending-[0-9a-f]{64}\Z')
@@ -55,6 +56,8 @@ def _directory(path, create=False):
 
 def _root(project_path, create=False):
     project_path = Path(project_path)
+    if os.path.lexists(project_path / RESTORE_MARKER):
+        raise ValueError('Requirements baseline restore is incomplete. Retry the exact verified restore before reading or cutting baselines.')
     if _directory(project_path) is None:
         raise ValueError(REPAIR)
     return _directory(project_path / DIRECTORY, create)
@@ -256,6 +259,13 @@ def _publish_pointer(base, snapshot, receipt_sha256):
             pass
 
 
+def _mark_write(run):
+    if hasattr(run, 'attempted_write'):
+        run.attempted_write = True
+    if hasattr(run, 'wrote'):
+        run.wrote = True
+
+
 def cut(project_path, context, name, operation_id, run, at, operators=None):
     """Caller holds project/effect locks and has freshly checked owner authority."""
     from requirement_http import OwnerContext
@@ -278,6 +288,7 @@ def cut(project_path, context, name, operation_id, run, at, operators=None):
         if any(snapshot[key] != value for key, value in dict(project=context.project, account_id=context.account_id,
                                                             name=name, operation_id=operation_id).items()):
             raise ValueError(CONFLICT)
+        _mark_write(run)
         _publish_pointer(base, snapshot, artifact['receipt_sha256'])
         return dict(name=name, receipt_sha256=artifact['receipt_sha256'], source_sha256=snapshot['source_sha256'],
                     snapshot_sha256=snapshot['sha256'], created=False)
@@ -309,12 +320,14 @@ def cut(project_path, context, name, operation_id, run, at, operators=None):
                                 schema.capture(project_path, context.project, run, operators), at, previous)
         # Verify both bounded artifacts BEFORE creating any sidecar path.
         schema.receipt(snapshot)
+        _mark_write(run)
         base = _root(project_path, create=True)
         stage = _directory(base / stage_name, create=True)
         if hasattr(run, 'wrote'):
             run.wrote = True
         _write_once(stage / 'snapshot.json', schema.json_bytes(snapshot))
     receipt = schema.receipt(snapshot)
+    _mark_write(run)
     _write_once(stage / 'BRD.md', render(snapshot['view']))
     _write_once(stage / 'receipt.json', schema.json_bytes(receipt))
     # Read back every exact file before publishing its directory or pointer.
@@ -331,6 +344,27 @@ def cut(project_path, context, name, operation_id, run, at, operators=None):
     _publish_pointer(base, snapshot, artifact['receipt_sha256'])
     return dict(name=name, receipt_sha256=artifact['receipt_sha256'], source_sha256=snapshot['source_sha256'],
                 snapshot_sha256=snapshot['sha256'], created=True)
+
+
+def recoverable(project_path, context, name, operation_id):
+    """Prove an unknown cut has a complete saved capture; never recapture it."""
+    name = schema.baseline_name(name); identifier(operation_id)
+    base = _root(project_path)
+    if base is None:
+        raise ValueError('No saved baseline capture was confirmed; keep the original operation unknown.')
+    if _directory(base / name) is not None:
+        snapshot = get(project_path, context.project, name)['snapshot']
+    else:
+        stage_name = '.pending-' + content_hash(dict(project=context.project,
+            account_id=context.account_id, operation_id=operation_id))
+        stage = _directory(base / stage_name)
+        if stage is None:
+            raise ValueError('No saved baseline capture was confirmed; keep the original operation unknown.')
+        snapshot = schema.decode_snapshot(_read(stage / 'snapshot.json', schema.MAX_SNAPSHOT_BYTES))
+    if any(snapshot[key] != value for key, value in dict(project=context.project,
+            account_id=context.account_id, name=name, operation_id=operation_id).items()):
+        raise ValueError(CONFLICT)
+    return snapshot
 
 
 def backup_files(project_path, project):
@@ -416,3 +450,71 @@ def restored_files(files, source, destination):
         result[PREFIX + 'source.json'] = binding
     validate_files(result, destination)
     return result
+
+
+def validate_backup(files, project=None):
+    """Bind the frozen family to the same live project as governance sidecars."""
+    if not any(isinstance(path, str) and path.startswith(PREFIX) for path in files):
+        return
+    governance.validate_files(files, project)
+    if governance.FILE not in files:
+        raise ValueError('Requirements baselines need their current governance history in the backup.')
+    binding = files.get(governance.SOURCE_FILE)
+    current_project = binding['project'] if binding else files[governance.FILE]['project']
+    validate_files(files, current_project)
+
+
+def restore_files(project_path, files, project):
+    """Fresh/identical restore, with all reads blocked until exact retry finishes.
+
+    Caller holds the canonical project lock. A different target or interrupted
+    source cannot overwrite installed immutable history. No recursive cleanup.
+    """
+    project_path = Path(project_path)
+    validate_files(files, project)
+    family = {key: value for key, value in files.items() if key.startswith(PREFIX)}
+    marker = project_path / RESTORE_MARKER
+    if _directory(project_path) is None:
+        raise ValueError(REPAIR)
+    if not family:
+        if os.path.lexists(project_path / DIRECTORY) or os.path.lexists(marker):
+            raise ValueError('A baseline family already exists at this restore destination. Reconcile it before restoring a backup without baselines.')
+        return False
+    # Validate all existing target directories and paths before our marker or
+    # file write. Partial restore files must be identical, never overwritten.
+    base = _directory(project_path / DIRECTORY)
+    names, stages = _entries(base)
+    expected = {key[len(PREFIX):].split('/')[0] for key in family if key.endswith('/snapshot.json')}
+    if stages or set(names) - expected:
+        raise ValueError(REPAIR)
+    encoded = {key: value['text'].encode('utf-8') if key.endswith('/BRD.md')
+               else schema.json_bytes(value) for key, value in family.items()}
+    for name in names:
+        _directory(base / name)
+    for key, raw in encoded.items():
+        target = project_path / key
+        if target.parent != project_path / DIRECTORY:
+            if base is None or _directory(target.parent) is None:
+                continue
+        prior = _read(target, len(raw), missing=True)
+        if prior is not None and prior != raw:
+            raise ValueError('The restore destination holds different immutable baseline data. Use a fresh destination.')
+    identity = dict(schema_version=1, project=project, files={
+        key: schema.byte_hash(raw) for key, raw in sorted(encoded.items())})
+    _write_once(marker, schema.json_bytes(identity))
+    base = _directory(project_path / DIRECTORY, create=True)
+    for name in sorted(expected):
+        _directory(base / name, create=True)
+    # Named files before source binding, binding before current; marker prevents
+    # a member observing an old passing pointer during any interrupted step.
+    for key in sorted(encoded, key=lambda key: (2 if key.endswith('/current.json') else 1 if key.endswith('/source.json') else 0, key)):
+        _write_once(project_path / key, encoded[key])
+    for key, raw in encoded.items():
+        if _read(project_path / key, len(raw)) != raw:
+            raise ValueError(REPAIR)
+    # A path/hash proof above is complete before the marker is removed.
+    try:
+        marker.unlink()
+    except OSError:
+        raise ValueError(REPAIR) from None
+    return True

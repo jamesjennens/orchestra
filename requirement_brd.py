@@ -8,7 +8,7 @@ import re
 import unicodedata
 
 from coordination import identifier
-from requirements import _validate_record
+from requirements import _validate_record, content_hash
 
 _MARKDOWN = re.compile(r'([\\`*_{}\[\]()#+.!|~\-])')
 
@@ -83,6 +83,9 @@ def render(view):
     lines = ['# Business requirements: ' + literal(project, single_line=True), '',
              'Generated from requirement records. Freezing this view does not accept a baseline or pending wording.', '',
              'Requirements mode: ' + literal(view.get('governance', {}).get('mode', 'unknown')), '']
+    if view.get('governance', {}).get('sha256'):
+        lines.extend(['Governance revision: ' + str(view['governance']['revision'])
+                      + ' | SHA-256: ' + literal(view['governance']['sha256']), ''])
     for kind, heading in (('brd-section', 'Purpose, users and scope'),
                           ('requirement', 'Requirements'), ('unreadable', 'Unverified records')):
         selected = [item for item in items.values() if item.get('kind') == kind]
@@ -141,6 +144,9 @@ def render(view):
             identifier(entry['id'])
             lines.extend(['### ' + literal(entry.get('title', entry['id']), single_line=True), '',
                           'Record: ' + literal(entry['id'], single_line=True), ''])
+            if 'sha256' in entry:
+                lines.extend(['Open native observation - not acceptance evidence.', '',
+                              'Observation SHA-256: ' + literal(entry['sha256']), ''])
             if 'revision' in entry:
                 lines.extend(['Revision: ' + str(entry['revision']), ''])
             if 'description' in entry:
@@ -182,8 +188,37 @@ def compare(before, after):
                     right.get('requirement_state'), right.get('state')):
                 categories.append(right['requirement_state'])
         if categories:
-            row = dict(id=identity, categories=categories, before=left_refs, after=right_refs)
+            row = dict(id=identity, categories=categories, before=left_refs, after=right_refs,
+                       before_state=left.get('state') if left else None,
+                       after_state=right.get('state') if right else None)
             changes.append(row)
             for key in categories:
                 groups[key].append(identity)
-    return dict(changes=changes, groups=groups, total=len(changes))
+    context = {}
+    for group in ('decisions', 'questions'):
+        def index(view):
+            entries = view.get(group, [])
+            if not isinstance(entries, list):
+                raise ValueError('Invalid comparison context')
+            indexed = {}
+            for entry in entries:
+                identity = identifier(entry.get('id'))
+                if identity in indexed or content_hash(entry) != entry.get('sha256'):
+                    raise ValueError('Unverified comparison context')
+                indexed[identity] = entry
+            return indexed
+        left, right = index(before), index(after)
+        rows = []
+        for identity in sorted(set(left) | set(right)):
+            old_entry, new_entry = left.get(identity), right.get(identity)
+            if old_entry == new_entry:
+                continue
+            rows.append(dict(id=identity, change='added' if old_entry is None else
+                'removed' if new_entry is None else 'edited',
+                before=old_entry, after=new_entry))
+        context[group] = rows
+    governance = None
+    if before.get('governance') != after.get('governance'):
+        governance = dict(before=before.get('governance'), after=after.get('governance'))
+    return dict(changes=changes, groups=groups, total=len(changes), context=context,
+                governance=governance, context_total=sum(len(rows) for rows in context.values()))
