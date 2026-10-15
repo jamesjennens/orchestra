@@ -2,6 +2,8 @@
 
 Repository URL: FILL_IN. Clone into your own directory; do not use another worker's checkout. Read AGENTS.md and README in that clone for code/build/test instructions. Follow task-specific branch/base requirements before editing.
 
+**Git access to the code host comes first.** Before claiming any task, the worker must be able to fetch from and push to the project's repository: an SSH key or a token added to the person's OWN account on the code host (GitHub, Bitbucket, GitLab, or the office's own host), with write access granted by the project owner. Check it first: `ssh -T git@github.com` (GitHub), `ssh -T git@bitbucket.org` (Bitbucket), `ssh -T git@gitlab.com` (GitLab), or `ssh -T git@<office-host>` for an office host - the answer names the account; and `git ls-remote <repository URL>` - it lists the refs, so a checkout without access fails here rather than in the middle of the work. A token is used in place of a key where the host or the office prefers one (for example over HTTPS with the host's credential helper). This is access to the code host, not to the Orchestra server: the Orchestra service is reached by the client configuration or the agent credential, and having one says nothing about the other. An agent that does not have git access records a checkpoint and claims nothing.
+
 Owners and acceptance/integration/deployment authority: FILL_IN.
 Coordination project: FILL_IN. Canonical service/endpoint: FILL_IN.
 

@@ -8,6 +8,8 @@ ssh beads-team python3 /home/beads/orchestra/worker.py --root /home/beads/beads-
 
 `worker.py start` allocates a durable actor and prints it with onboarding instructions. Run it for a new worker from that worker's dedicated local working directory; use one directory and checkout per actor, never another worker's directory or another project's checkout. Save the full actor privately in that directory alongside the exact client configuration supplied by the server-owned project entry, outside Git or in local ignored state. Use the installed client and printed project-specific endpoint/configuration; do not copy settings from another project. If the server-owned entry says the contributor key is confined to the endpoint, that configuration also carries `"forced_command": true`; keep it exactly as supplied, because the confined key refuses the `--root` an unconfined client sends (see [installation and recovery](OPERATIONS.md#confine-contributor-keys-with-a-forced-command)). The readable name need not be unique. See [session registration and retries](SESSIONS.md). `onboard` and `docs [NAME]` remain read-only for existing actors. Bootstrap uses the installed endpoint locally and cannot claim tasks or write task records. Normal contributions use `client.py` and their configured project endpoint, including any project-specific guard. SSH access retains the existing trusted-team security model; a confined contributor key narrows its reach to the endpoint without binding the key to an actor, which still self-declares.
 
+Git access to the code host comes first. Before claiming any task, the worker must be able to fetch from and push to the project's repository: an SSH key or a token added to the person's OWN account on the code host (GitHub, Bitbucket, GitLab, or the office's own host), with write access granted by the project owner. Check it first: `ssh -T git@github.com` (GitHub), `ssh -T git@bitbucket.org` (Bitbucket), `ssh -T git@gitlab.com` (GitLab), or `ssh -T git@<office-host>` for an office host - the answer names the account; and `git ls-remote <repository URL>` - it lists the refs, so a checkout without access fails here rather than in the middle of the work. A token is used in place of a key where the host or the office prefers one (for example over HTTPS with the host's credential helper). This is access to the code host, not to the Orchestra server: the Orchestra service is reached by the client configuration or the agent credential, and having one says nothing about the other. An agent that does not have git access records a checkpoint and claims nothing.
+
 With a configured client, the equivalent is:
 
 ```sh
@@ -67,10 +69,22 @@ share them. Use no other actor's directory or another project's checkout:
 REPLACE_WITH_SSH_BOOTSTRAP_COMMAND
 
 For first use, leave Actor and Client/config blank until start returns them; do not
-assume the checkout already exists. After successful start, save its actor,
-request ID and exact client configuration privately, then clone the repository
-into this worker's own checkout. If onboarding fails after registration, retain
-the actor and retry onboarding; do not run start again. Returning workers fill
+assume the checkout already exists. Git access to the code host comes first. Before
+claiming any task, the worker must be able to fetch from and push to the project's
+repository: an SSH key or a token added to the person's OWN account on the code host
+(GitHub, Bitbucket, GitLab, or the office's own host), with write access granted by the
+project owner. Check it first: ssh -T git@github.com (GitHub), ssh -T git@bitbucket.org
+(Bitbucket), ssh -T git@gitlab.com (GitLab), or ssh -T git@<office-host> for an office
+host - the answer names the account; and git ls-remote <repository URL> - it lists the
+refs, so a checkout without access fails here rather than in the middle of the work. A
+token is used in place of a key where the host or the office prefers one (for example
+over HTTPS with the host's credential helper). This is access to the code host, not to
+the Orchestra server: the Orchestra service is reached by the client configuration or
+the agent credential, and having one says nothing about the other. An agent that does
+not have git access records a checkpoint and claims nothing. After successful start,
+save its actor, request ID and exact client configuration privately, then clone the
+repository into this worker's own checkout. If onboarding fails after registration,
+retain the actor and retry onboarding; do not run start again. Returning workers fill
 Actor, Client/config and Checkout from private saved state and skip registration.
 
 If the coordinator explicitly supplied a task, use that task. Otherwise inspect

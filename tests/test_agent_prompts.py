@@ -323,5 +323,49 @@ class ServedPromptWordingTests(unittest.TestCase):
         self.assertNotIn('review feedback', agent)
 
 
+class CodeHostGitAccessPromptWordingTests(unittest.TestCase):
+    """A worker's or an agent's own git access to the code host is a stated first step
+    (kittrial-5bb.292): the prerequisite, the check with one example per common host, the
+    sentence that this is not access to the Orchestra server and the rule that an agent
+    without git access records a checkpoint and claims nothing. The recurring prompts are
+    bound to 2000 characters (kittrial-5bb.219), so they carry the rule in fewer words."""
+
+    PREREQUISITE = ("Before claiming any task, the worker must be able to fetch from and push to the project's "
+                    "repository: an SSH key or a token added to the person's OWN account on the code host (GitHub, "
+                    "Bitbucket, GitLab, or the office's own host), with write access granted by the project owner.")
+    HOST_CHECKS = ('ssh -T git@github.com', 'ssh -T git@bitbucket.org', 'ssh -T git@gitlab.com',
+                   'ssh -T git@<office-host>', 'git ls-remote <repository URL>')
+
+    def read(self, relative):
+        return ' '.join((ROOT / relative).read_text(encoding='utf-8').split())
+
+    def assert_the_check_and_the_rules(self, text):
+        for check in self.HOST_CHECKS:
+            self.assertIn(check, text)
+        self.assertIn('record a checkpoint and claim nothing', text)
+
+    def test_the_worker_prompt_states_code_host_access_before_first_use(self):
+        text = self.read('templates/WORKER_PROMPT.md')
+        self.assertIn('Git access to the code host comes first', text)
+        self.assertIn(self.PREREQUISITE, text)
+        for check in self.HOST_CHECKS:
+            self.assertIn(check, text)
+        self.assertIn('This is access to the code host, not to the Orchestra server', text)
+        self.assertIn('An agent that does not have git access records a checkpoint and claims nothing.', text)
+
+    def test_the_worker_poll_prompt_states_code_host_access_before_claiming(self):
+        text = self.read('templates/WORKER_POLL_PROMPT.md')
+        self.assertIn('Before claiming: fetch and push the project\'s repository with code-host git access', text)
+        self.assert_the_check_and_the_rules(text)
+        self.assertIn('not the Orchestra server', text)
+
+    def test_the_agent_poll_prompt_states_code_host_access_before_claiming(self):
+        text = self.read('templates/AGENT_POLL_PROMPT.md')
+        self.assertIn('Git access to the code host, not the Orchestra server', text)
+        self.assertIn('ssh -T git@github.com', text)
+        self.assertIn('git ls-remote <repository URL>', text)
+        self.assertIn('record a checkpoint and claim nothing', text)
+
+
 if __name__ == '__main__':
     unittest.main()

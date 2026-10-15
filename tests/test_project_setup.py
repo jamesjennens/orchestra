@@ -280,6 +280,22 @@ class InProcessSetupTests(test_http_agents.AgentHarness):
         self.assertIn('You are the only member', members['detail'])
         self.assertEqual(answer.data['remaining'], 3)        # optional is not counted as left to do
 
+    def test_the_members_step_states_the_code_host_prerequisite(self):
+        """kittrial-5bb.292: the dialog's first step carries a new worker's own git access to the
+        code host, the check to run and the checkpoint-and-claim-nothing rule, in the same words
+        the template and the prompts use."""
+        note = ' '.join(by_id(self.setup(self.token('olive')).data)['members']['note'].split())
+        self.assertIn('Git access to the code host comes first', note)
+        self.assertIn("Before claiming any task, the worker must be able to fetch from and push to the project's "
+                      "repository: an SSH key or a token added to the person's OWN account on the code host (GitHub, "
+                      "Bitbucket, GitLab, or the office's own host), with write access granted by the project owner.",
+                      note)
+        for check in ('ssh -T git@github.com', 'ssh -T git@bitbucket.org', 'ssh -T git@gitlab.com',
+                      'ssh -T git@<office-host>', 'git ls-remote <repository URL>'):
+            self.assertIn(check, note)
+        self.assertIn('This is access to the code host, not to the Orchestra server', note)
+        self.assertIn('An agent that does not have git access records a checkpoint and claims nothing.', note)
+
     def test_who_may_read_the_setup_route(self):
         self.add('carl', 'contributor'); self.add('vera', 'viewer')
         agent = self.request('POST', '/v1/agents', {'name': 'Kestrel', 'working_directory': '/home/olive/k',

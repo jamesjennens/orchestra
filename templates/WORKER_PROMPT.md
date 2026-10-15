@@ -20,10 +20,23 @@ Client/config:
 Actor:
 Assigned task:
 
-First use by a new worker: create the private working directory, then run the
-filled Bootstrap command there exactly once. Save the full returned actor,
-request ID and exact client configuration privately in that directory, in an
-untracked or ignored file. Do not commit, share, truncate or guess them. The start
+First use by a new worker: Git access to the code host comes first. Before
+claiming any task, the worker must be able to fetch from and push to the project's
+repository: an SSH key or a token added to the person's OWN account on the code host
+(GitHub, Bitbucket, GitLab, or the office's own host), with write access granted by the
+project owner. Check it first: ssh -T git@github.com (GitHub), ssh -T git@bitbucket.org
+(Bitbucket), ssh -T git@gitlab.com (GitLab), or ssh -T git@<office-host> for an office
+host - the answer names the account; and git ls-remote <repository URL> - it lists the
+refs, so a checkout without access fails here rather than in the middle of the work. A
+token is used in place of a key where the host or the office prefers one (for example
+over HTTPS with the host's credential helper). This is access to the code host, not to
+the Orchestra server: the Orchestra service is reached by the client configuration or
+the agent credential, and having one says nothing about the other. An agent that does
+not have git access records a checkpoint and claims nothing. Then create the private
+working directory, then run the filled Bootstrap command there exactly once. Save the
+full returned actor, request ID and exact client configuration privately in that
+directory, in an untracked or ignored file. Do not commit, share, truncate or guess
+them. The start
 output supplies the actor and client configuration; after it succeeds, clone the
 repository into this worker's own checkout and fill the blank fields above from
 that output and checkout. If onboarding fails after registration, keep this actor

@@ -141,3 +141,41 @@ class OnboardingDocumentWordingTests(unittest.TestCase):
         text = (Path(__file__).resolve().parents[1] / 'docs' / 'ONBOARDING.md').read_text(encoding='utf-8')
         self.assertIn('review requests on your own tasks', text)
         self.assertNotIn('review feedback', text)
+
+
+class CodeHostGitAccessWordingTests(unittest.TestCase):
+    """A new worker's own git access to the code host is a stated first step (kittrial-5bb.292).
+
+    The prerequisite, the check (one example per common host), the sentence that this is not
+    access to the Orchestra server and the checkpoint-and-claim-nothing rule are pinned in the
+    operator onboarding text, in its minimal prompt and in the project template."""
+
+    PREREQUISITE = ("Before claiming any task, the worker must be able to fetch from and push to the project's "
+                    "repository: an SSH key or a token added to the person's OWN account on the code host (GitHub, "
+                    "Bitbucket, GitLab, or the office's own host), with write access granted by the project owner.")
+    NOT_THE_ORCHESTRA_SERVER = ("This is access to the code host, not to the Orchestra server: the Orchestra service "
+                                "is reached by the client configuration or the agent credential, and having one says "
+                                "nothing about the other.")
+    CLAIMS_NOTHING = "An agent that does not have git access records a checkpoint and claims nothing."
+    HOST_CHECKS = ('ssh -T git@github.com', 'ssh -T git@bitbucket.org', 'ssh -T git@gitlab.com',
+                   'ssh -T git@<office-host>', 'git ls-remote <repository URL>')
+
+    def read(self, relative):
+        return ' '.join((Path(__file__).resolve().parents[1] / relative).read_text(encoding='utf-8').split())
+
+    def assert_code_host_access_first(self, text):
+        self.assertIn('Git access to the code host comes first', text)
+        self.assertIn(self.PREREQUISITE, text)
+        for check in self.HOST_CHECKS:
+            self.assertIn(check, text)
+        self.assertIn(self.NOT_THE_ORCHESTRA_SERVER, text)
+        self.assertIn(self.CLAIMS_NOTHING, text)
+
+    def test_the_onboarding_text_states_code_host_access_first(self):
+        self.assert_code_host_access_first(self.read('docs/ONBOARDING.md').split('## Minimal prompt', 1)[0])
+
+    def test_the_minimal_prompt_states_code_host_access_first(self):
+        self.assert_code_host_access_first(self.read('docs/ONBOARDING.md').split('## Minimal prompt', 1)[1])
+
+    def test_the_project_template_states_code_host_access_first(self):
+        self.assert_code_host_access_first(self.read('templates/PROJECT_ONBOARDING.md'))
