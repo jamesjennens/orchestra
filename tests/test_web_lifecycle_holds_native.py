@@ -148,3 +148,70 @@ class NativeHoldWebTests(RulesHelpers, unittest.TestCase):
                 folder = Path(os.environ['ORCHESTRA_LIFECYCLE_TEST_EXPORTS']);folder.mkdir(parents=True, exist_ok=True)
                 (folder/(kind+'-after.jsonl')).write_text(''.join(json.dumps(row)+'\n' for row in self.rows()))
                 (folder/(kind+'-messages.json')).write_text(json.dumps(messages, indent=2))
+
+    def test_a_voided_release_hold_still_refuses_the_web_lifecycle_route(self):
+        """kittrial-5bb.272 review item 1 (r3): the merge-forward threading.
+
+        The scenario of the lifecycle test, through the WEB route: a release-hold the
+        surviving chain no longer links (a repair revision recorded at the hold) is
+        voided by an operator, and the canonical readers read the hold back in force.
+        The four callers require_unheld_fact gained on main - the endpoint's identity
+        check and web_lifecycle's read, affordances and apply - pass the same operators
+        and journal, so the web lifecycle route refuses reviewed/integrated for the task
+        instead of ignoring the void."""
+        import recovery
+        from requirements import canonical_bytes
+        harness, token = self.web()
+        self.deployment(operators=['ops'], review_workflow_writes=True,
+                        web_lifecycle_mark_writes=True)
+        task = self.task('Voided release web', assignee='other-author')
+        contribution = json.loads(self.contribute(task, 'other-author')['stdout'])['comment_id']
+        approval = json.loads(self.approve(task, 'ops', contribution)['stdout'])['comment_id']
+        held = json.loads(self.post_review(task, 'ops', dict(
+            schema_version=1, operation='hold', operation_id='webv-hold', task=task,
+            previous=approval, contribution=contribution, reason='Held for the voided-release check'))['stdout'])['comment_id']
+        released = json.loads(self.post_review(task, 'ops', dict(
+            schema_version=1, operation='release-hold', operation_id='webv-release', task=task,
+            previous=held, contribution=contribution, hold=held, reason='Released before the fork'))['stdout'])['comment_id']
+        # The repair revision recorded at the hold forks the chain: the release-hold is
+        # no longer linked into the history the surviving records form. The endpoint's
+        # own write path refuses a stale previous - a raw native comment is how such a
+        # history actually comes to be, and what an operator reconciles with voids.
+        fork = dict(
+            schema_version=1, operation='contribute', operation_id='webv-fork', task=task,
+            previous=held, repository='ssh://git/example', commit='9' * 40, base_commit=BASE,
+            delivery={'kind': 'bundle', 'path': 'server:/fork.bundle', 'sha256': 'e' * 64},
+            summary='Repair revision recorded at the hold', supersedes=contribution)
+        self.assertEqual(self.r.bd('comments', 'add', task,
+                                   'Kind: contribution-review-v1\n' + canonical_bytes(fork).decode(),
+                                   actor='other-author').returncode, 0)
+        release_text = next(comment['text'] for row in self.rows() if row['id'] == task
+                            for comment in row.get('comments') or []
+                            if comment.get('id') == released)
+        void = dict(schema_version=1, operation='void-record', operation_id='webv-void', task=task,
+                    target=released, target_kind='contribution-review',
+                    target_sha256=recovery.digest(release_text), original=release_text,
+                    reason='Reconciling the forked repair', disposition='void', operator='ops')
+        self.assertEqual(self.r.bd('comments', 'add', task,
+                                   recovery.PREFIX + canonical_bytes(void).decode(),
+                                   actor='ops').returncode, 0)
+        # The web read shows the hold refusals again, and the fact write is refused.
+        # The scope is set first: the read's affordances answer the scope question
+        # before the hold one.
+        scope = dict(source_commit=COMMIT, integration_commit='e' * 40,
+                     release_id='voided-release-web', environment='vr-web')
+        self.assertEqual(self.lifecycle('other-author', 'lifecycle-scope', task, scope=scope)['returncode'], 0)
+        path = '/v1/projects/pp/tasks/' + task + '/lifecycle'
+        state = harness.request('GET', path, token=token)
+        self.assertEqual(state.status, 200, state.data)
+        for dimension in ('reviewed', 'integrated'):
+            self.assertIn('listed operator', state.data['hold_refusals'][dimension],
+                          state.data['hold_refusals'])
+            self.assertIn('listed operator', state.data['affordances'][dimension]['reason'],
+                          state.data['affordances'][dimension])
+        refused = harness.request('POST', path + '/facts/integrated',
+                                  dict(scope=scope, value='passed',
+                                       evidence=['after the void'], provenance='performed'),
+                                  token=token, key='webv-fact')
+        self.assertEqual(409, refused.status, refused.data)
+        self.assertIn('listed operator', refused.data['error']['message'])

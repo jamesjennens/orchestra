@@ -12,6 +12,7 @@ import json
 import os
 import record_json
 import re
+import secrets
 import time
 from pathlib import Path
 from requirements import content_hash, load_json
@@ -29,19 +30,93 @@ REQUIRED_SECTIONS = {'decision': ('Decision', 'Rationale', 'Alternatives Conside
 RELEASABLE = ('failed', 'released')
 
 
+#: The marker every shared temporary :func:`atomic` creates carries. A reader that
+#: enumerates a directory can tell a cut's leftover temporary from a record by it,
+#: whatever the writer's pid and random suffix (``lifecycle_voids.read_journal``).
+TEMP_MARK='.tmp-'
+#: How many distinct temporary names one writer tries before giving up.
+TEMP_ATTEMPTS=16
+
+def temporary_name(name):
+    """A unique temporary file name beside ``name``: ``<name>.tmp-<pid>-<16 hex>``.
+
+    Unique per writer, so two writers of one target never open, truncate or rename
+    away each other's temporary (kittrial-5bb.281 review item 1).
+    """
+    return '%s%s%d-%s'%(name,TEMP_MARK,os.getpid(),secrets.token_hex(8))
+
+def is_temporary(name):
+    """True for a name :func:`atomic` may leave behind after a cut; never a record."""
+    if not isinstance(name,str) or TEMP_MARK not in name:return False
+    head,_,tail=name.rpartition(TEMP_MARK)
+    pid,_,token=tail.partition('-')
+    return bool(head) and pid.isdigit() and bool(re.fullmatch('[0-9a-f]{16}',token))
+
+def _unique_temporary(path):
+    """Create and return ``(temporary path, fd)`` beside ``path`` with ``O_EXCL``.
+
+    Same directory, so ``os.replace`` stays one rename within one filesystem; a
+    planted symlink or a colliding name is refused, never followed or truncated.
+    """
+    for _ in range(TEMP_ATTEMPTS):
+        tmp=path.with_name(temporary_name(path.name))
+        try:
+            fd=os.open(tmp,os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,'O_NOFOLLOW',0),0o666)
+            return tmp,fd
+        except FileExistsError:
+            continue
+    raise OSError('Could not create a unique temporary file beside %s; nothing was written'%path)
+
+def _same_bytes(path,payload):
+    """Whether ``path`` already holds exactly ``payload`` (a lost-race target)."""
+    if path.is_symlink():return False
+    try:return path.read_text(encoding='utf-8')==payload
+    except (OSError,UnicodeError):return False
+
+def _discard(tmp):
+    try:tmp.unlink()
+    except OSError:pass
+
 def atomic(path, data, *, mode=None):
-    tmp=path.with_suffix('.tmp')
+    """Write ``path`` in one rename after fsyncing a temporary file beside it.
+
+    The temporary is UNIQUE per writer. It used to be ``path.with_suffix('.tmp')`` -
+    the same name for every writer of one target - so two concurrent first readers of
+    one history snapshot (``.history-snapshots/<digest>.json``, written here by
+    ``briefing.py``) truncated each other's file and one ``os.replace`` then failed
+    with ``FileNotFoundError``: an "outcome unknown" answer to a read under the
+    shared project lock (kittrial-5bb.281 review item 1). With unique names the race
+    is gone, and a lost rename race to a target that already holds exactly these
+    bytes is treated as success rather than an error.
+
+    ``mode`` is the private-family form: its temporary keeps the FIXED name and the
+    O_EXCL semantics, where an existing temporary path is evidence of a cut, never
+    followed or overwritten.
+    """
+    path=Path(path)
+    payload=json.dumps(data,ensure_ascii=False,sort_keys=True)
     if mode is None:
-        stream=tmp.open('w',encoding='utf-8')
+        tmp,fd=_unique_temporary(path)
     else:
         # A private family creates its temporary file privately from the first byte.
         # An existing temp path is evidence of a cut, never followed or overwritten.
+        tmp=path.with_suffix('.tmp')
         fd=os.open(tmp,os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,'O_NOFOLLOW',0),mode)
-        stream=os.fdopen(fd,'w',encoding='utf-8')
-    with stream:
-        json.dump(data,stream,ensure_ascii=False,sort_keys=True)
-        stream.flush();os.fsync(stream.fileno())
-    os.replace(tmp,path)
+    try:
+        with os.fdopen(fd,'w',encoding='utf-8') as stream:
+            stream.write(payload)
+            stream.flush();os.fsync(stream.fileno())
+        try:
+            os.replace(tmp,path)
+        except OSError:
+            # Another writer of the IDENTICAL bytes reached the target first: that is
+            # this write already made, so the race is won under either name. Anything
+            # else (a different target, a permission or type error) is re-raised.
+            if not _same_bytes(path,payload):raise
+            _discard(tmp)
+    except BaseException:
+        _discard(tmp)
+        raise
 
 
 def identifier(value):

@@ -195,6 +195,68 @@ class DocumentedCommandTests(AttestDeliveryCase):
         self.assertEqual(state['attestation']['author'], VERIFIER)
         self.assertEqual(state['attestation']['sha256'], digest)
 
+    def test_a_large_real_bundle_is_verified_across_hash_blocks(self):
+        # kittrial-5bb.272 item 2c, the check no review ran: a real bundle well past one
+        # hash block (BUNDLE_BLOCK_BYTES is 1 MiB). Random content does not compress, so
+        # the bundle really spans several blocks, and the observation must still count and
+        # hash exactly what is on disk - counted here independently, block by block.
+        repo = self.root / 'src-large'
+        repo.mkdir()
+        self.git('init', '-q', cwd=repo)
+        self.git('config', 'user.email', 't@example.invalid', cwd=repo)
+        self.git('config', 'user.name', 'Test', cwd=repo)
+        (repo / 'blob.bin').write_bytes(os.urandom(6 * 1024 * 1024 + 4096))
+        self.git('add', 'blob.bin', cwd=repo)
+        self.git('commit', '-q', '-m', 'large', cwd=repo)
+        sha = self.git('rev-parse', 'HEAD', cwd=repo).strip()
+        branch = self.git('rev-parse', '--abbrev-ref', 'HEAD', cwd=repo).strip()
+        bundle = self.root / 'large.bundle'
+        self.git('bundle', 'create', str(bundle), branch, cwd=repo)
+        digest = hashlib.sha256()
+        size = 0
+        with bundle.open('rb') as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+                digest.update(chunk)
+                size += len(chunk)
+        self.assertGreaterEqual(size, 3 * w.BUNDLE_BLOCK_BYTES)   # the block path is the only path
+        self.contribute(sha, digest.hexdigest())
+        result = json.loads(self.attest(bundle=bundle))
+        self.assertEqual((result['observation']['bytes'], result['observation']['sha256']),
+                         (size, digest.hexdigest()))
+        self.assertEqual(result['observation']['heads'][0]['commit'], sha)
+        self.assertEqual(w.project(self.issue)['verification'], 'verified')
+
+    def test_an_account_id_is_refused_by_the_verifiers_list_write(self):
+        # kittrial-5bb.272 review item 2: pinning an account id on the verifiers list
+        # as accepted behavior kept a misconfiguration silent. The operator allowlist
+        # has refused these since kittrial-5bb.70; the verifier list refuses them too
+        # now. The read path stays exact-match (a hand-planted id authorizes only
+        # itself), but the write never creates that state.
+        bundle, sha = self.make_bundle()
+        digest = hashlib.sha256(bundle.read_bytes()).hexdigest()
+        self.contribute(sha, digest)
+        deployment = self.root / 'deployment.private.json'
+        before = deployment.read_text(encoding='utf-8')
+        # An exact account id (usr_ + 16 hex, the web service's own shape): refused.
+        with self.assertRaisesRegex(ValueError, 'shape of an HTTP account or agent id'):
+            self.cli('verifiers', 'add', 'usr_4f7c1d2e3a4b5c6d', '--actor', OPERATOR,
+                     '--reason', 'a mistaken listing')
+        self.assertEqual(deployment.read_text(encoding='utf-8'), before)
+        # An agent label of an account id is refused before that: the identity rule
+        # admits no slash, so it never reaches the list write at all.
+        with self.assertRaisesRegex(ValueError, 'Invalid verifier identity|shape of an HTTP account or agent id'):
+            self.cli('verifiers', 'add', 'usr_4f7c1d2e3a4b5c6d/heron', '--actor', OPERATOR,
+                     '--reason', 'a mistaken listing')
+        self.assertEqual(deployment.read_text(encoding='utf-8'), before)
+        # A near miss is an ordinary name: 15 digits, or not hex at all.
+        self.cli('verifiers', 'add', 'usr_fred', '--actor', OPERATOR, '--reason', 'a person named fred')
+        self.assertIn('usr_fred', json.loads(deployment.read_text(encoding='utf-8'))['verifiers'])
+        # And the read half the reviewer kept: a hand-planted exact id still authorizes
+        # only itself - a real actor is refused - so removing it is the only fix.
+        self.configure(operators=[OPERATOR], verifiers=['usr_4f7c1d2e3a4b5c6d'])
+        with self.assertRaisesRegex(ValueError, 'only a listed verifier or a listed operator'):
+            self.attest(actor=VERIFIER, bundle=bundle)
+
     def test_a_wrong_checksum_cannot_be_recorded_as_verified(self):
         bundle, sha = self.make_bundle()
         digest = hashlib.sha256(bundle.read_bytes()).hexdigest()

@@ -176,7 +176,9 @@ def read(task, actor, run, project, *, coordinate=False, mark_writes=False,
     hold_refusals = {}
     for dimension in ('reviewed', 'integrated'):
         try:
-            lifecycle.require_unheld_fact(issue, dimension, task)
+            # The same voids and journal the canonical readers use
+            # (kittrial-5bb.272 review item 1): a voided release-hold reads held here too.
+            lifecycle.require_unheld_fact(issue, dimension, task, operators=operators, journal=project)
         except ValueError as error:
             hold_refusals[dimension] = str(error)
     from coordination import require_unheld_merge_task
@@ -191,7 +193,7 @@ def read(task, actor, run, project, *, coordinate=False, mark_writes=False,
             why = 'Set a lifecycle scope first'
         if why is None and dimension in ('reviewed', 'integrated'):
             try:
-                lifecycle.require_unheld_fact(issue, dimension, task)
+                lifecycle.require_unheld_fact(issue, dimension, task, operators=operators, journal=project)
             except ValueError as error:
                 why = str(error)
             if why is None:
@@ -231,7 +233,10 @@ def apply(body, actor, run, project, project_name, operation_id, *, authority,
     strict = payload['dimension'] in ('reviewed', 'integrated')
     if strict:
         try:
-            lifecycle.require_unheld_fact(issue, payload['dimension'], body['task'])
+            # The same voids and journal the canonical readers use
+            # (kittrial-5bb.272 review item 1): a voided release-hold reads held here too.
+            lifecycle.require_unheld_fact(issue, payload['dimension'], body['task'],
+                                          operators=operators, journal=project)
         except ValueError as error:
             raise LifecycleError(409, str(error)) from None
         approved_source(issue, payload['scope'], operators, owners, project, parties)

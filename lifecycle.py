@@ -974,55 +974,62 @@ def current_contribution_commits(rows):
     return result
 
 
-def review_chain_state(row):
+def review_chain_state(row, operators=None, journal=None):
     """The shared review projection of one row, or ``None`` when it cannot be read.
 
     Best effort, exactly like :func:`current_contribution_commits`: a row with no review
     chain, or a chain this read cannot parse, yields ``None`` and the caller treats the
     task as unheld rather than inventing a hold. Nothing here changes what is recorded.
 
-    It projects with ``records(row, None)`` - no operator voids and no revert journal -
-    which is safe for the two facts it is asked: a void can only REMOVE a chain record
-    (so ignoring voids can only ADD a hold, never clear one: fail-closed), an operator
-    void-record of a hold record is itself refused as part of the surviving contribution
-    history, and the revert journal never touches the ``holds``/``attestation`` records
-    this projection reads. Every authoritative write path still reads the full chain
-    with voids and journal.
+    It projects with the SAME operator voids and revert journal as ``review``, ``brief``
+    and ``work`` (``project(row, operators, journal)``; kittrial-5bb.272 review item 1).
+    The first revision read with ``records(row, None)`` and called that fail-closed -
+    "a void can only REMOVE a chain record, so ignoring voids can only ADD a hold, never
+    clear one" - which holds for a voided HOLD but not for a voided RELEASE-HOLD: a
+    release-hold the surviving chain no longer links (a later record forked around it)
+    IS voidable, and with the void applied the canonical readers read the hold back in
+    force while this read, ignoring the void, read it released (or read the forked chain
+    as unparseable and answered ``None``) - so the lifecycle facts would not refuse a
+    held contribution. Reading through the same projection as every canonical reader
+    removes the divergence; callers pass the operators and the project journal they
+    already hold, and a caller that passes none gets no voids applied (an unconfigured
+    allowlist authorizes nobody), which is the old behaviour.
     """
     try:
-        from review_workflow import records, projection
+        from review_workflow import project
     except ImportError:return None
     if not isinstance(row,dict) or not isinstance(row.get('id'),str):return None
     from coordination import is_merge_slot
     if row.get('issue_type') in ('event','gate') or is_merge_slot(row):return None
     try:
-        return projection(records(row,None))
+        return project(row,operators,journal)
     except (ValueError,KeyError,TypeError):return None
 
 
-def held_tasks(rows):
+def held_tasks(rows, operators=None, journal=None):
     """``{task: sentence}`` for tasks whose CURRENT contribution is held (kittrial-5bb.10).
 
     A hold, or a positively FAILED verifier attestation, makes a contribution not
     integration-ready, so the release selection skips the task with the sentence that
     names the open hold (or the failed attestation) and who can release it. Best effort:
     a chain this read cannot parse simply yields no entry, exactly as the delivery flag
-    read does.
+    read does. The operators and journal are the caller's, so the projection applies the
+    same voids and reverts as every canonical reader (kittrial-5bb.272 review item 1).
     """
     from review_workflow import integration_hold_sentence
     result={}
     for row in rows:
-        state=review_chain_state(row)
+        state=review_chain_state(row,operators,journal)
         if state is None:continue
         sentence=integration_hold_sentence(state)
         if sentence:result[row['id']]=sentence
     return result
 
 
-def held_issue_sentence(issue):
+def held_issue_sentence(issue, operators=None, journal=None):
     """The hold sentence for one task row, or ``None`` (kittrial-5bb.10 item 4)."""
     from review_workflow import integration_hold_sentence
-    state=review_chain_state(issue)
+    state=review_chain_state(issue,operators,journal)
     return None if state is None else integration_hold_sentence(state)
 
 
@@ -1105,10 +1112,11 @@ def release_selection(rows,scope,is_ancestor,previous_commit=None,subset=None,re
     if reverted is None:reverted=reverted_integrations(rows,operators,journal)
     if current_commits is None:current_commits=current_contribution_commits(rows)
     wanted=set(subset) if subset else None
+    # The same voids and journal as every canonical reader (kittrial-5bb.272 review item 1).
     # A held contribution is not integration-ready (kittrial-5bb.10 item 4): the release
     # selection skips the task with the sentence naming the open hold (or the failed
     # attestation) and who can release it, instead of offering it as a target.
-    held=held_tasks(rows)
+    held=held_tasks(rows,operators,journal)
     targets=[];skipped=[];flags=[];verifying=[];restoring=[]
     for entry in scoped_evidence(rows,('integrated','deployed','live-verified',LIVE)):
         task=entry['id'];scopes=entry['scopes']
@@ -1712,7 +1720,7 @@ def apply_release(payload,actor,run,operators=None,journal=None,lifecycle_author
     # (kittrial-5bb.10 item 4), before any plan or write: a held contribution is not
     # integration-ready, so a caller cannot release it by naming it. The selection already
     # skipped it; this is the explicit refusal.
-    held=held_tasks(rows)
+    held=held_tasks(rows,operators,journal)
     named=set()
     for target in payload.get('targets') or []:
         if isinstance(target,str):named.add(target)
@@ -1851,10 +1859,19 @@ def release_query(payload,actor,run,operators=None,journal=None):
             'live_releases':live}
 
 
-def require_unheld_fact(issue, dimension, task):
-    """The native hold gate, also used before web approval checks and receipt replay."""
+def require_unheld_fact(issue, dimension, task, operators=None, journal=None):
+    """The native hold gate, also used before web approval checks and receipt replay.
+
+    ``operators`` and ``journal`` are keyword arguments (as :func:`held_issue_sentence`
+    takes them, kittrial-5bb.272 review item 1): the gate judges the hold through the
+    SAME voids and revert journal the canonical readers use, so a voided release-hold
+    reads held here too. Callers that HAVE the deployment's operators or the project's
+    journal must pass them (never None where the caller holds them); a caller that has
+    neither - or a read that must not depend on configuration - passes none and gets no
+    voids applied.
+    """
     if dimension in ('reviewed','integrated'):
-        sentence=held_issue_sentence(issue)
+        sentence=held_issue_sentence(issue,operators,journal)
         if sentence:
             raise ValueError('Refusing to record %s for %s: %s. A held contribution is not '
                              'integration-ready; the hold must be released (or a corrected attestation '
@@ -1903,7 +1920,12 @@ def apply_native(payload, actor, run, operators=None, journal=None, lifecycle_au
             from review_workflow import require_independent_approval
             require_independent_approval(issue,payload['dimension'],payload['task'],
                                          operators=operators,owners=owners,journal=journal)
-    require_unheld_fact(issues.get(payload['task']), payload['dimension'], payload['task'])
+    # The hold gate (kittrial-5bb.10 item 4), through the shared projection: a held
+    # contribution is not integration-ready, so `reviewed`/`integrated` are refused with
+    # the hold's own sentence before any write, judged with the same voids and journal
+    # every canonical reader uses (kittrial-5bb.272 review item 1).
+    require_unheld_fact(issues.get(payload['task']), payload['dimension'], payload['task'],
+                        operators=operators, journal=journal)
     # A SINGLE fact must name the task's CURRENT scope: a fact recorded under an
     # older, previously recorded scope is refused here with main's rule (rev3 item
     # 2). Only the release operation may write a fact under an already-recorded
@@ -2016,10 +2038,12 @@ def release_planned_native_writes(page,verify_only,live_verified,labels):
 
     ``release_planned_writes`` counts the planned FACTS; this counts the processes
     they become, which is what ``expected_seconds`` is priced in. It is an UPPER
-    count for a rollback or a ``--live-verified`` roll-forward: a re-lived target
-    may already be at the release scope and already live there, so the endpoint
-    writes fewer facts than a page-level estimate assumes (kittrial-5bb.139 review
-    item 3).
+    count for a ``--live-verified`` roll-forward: a re-lived target may already be
+    at the release scope and already live there, so the endpoint writes fewer facts
+    than a page-level estimate assumes (kittrial-5bb.139 review item 3). For the
+    FIRST group of a rollback it is a LOWER count instead, because the negative
+    (supersede and scope) writes ride that request on top of these planned facts
+    and the caller adds them separately (kittrial-5bb.159 review item 2).
     """
     verifying=set(verify_only)
     return sum(release_target_native_writes(item['task'],verifying,live_verified,labels)
@@ -2050,13 +2074,36 @@ def release_default_chunk(page,verify_only,live_verified,labels=None,reserved=0)
     RELEASE_CHUNK_DEFAULT group (75 writes); a release to a further environment of
     already-labelled tasks pays five per target and a ``--live-verified`` one six or
     seven, so those use a smaller group instead of telling the operator to lower a
-    size the kit itself picked. ``reserved`` is the negative (supersede) write count
-    that rides the FIRST group, so it is paid out of the same budget.
+    size the kit itself picked. ``reserved`` is the negative (supersede and scope)
+    write count that rides the FIRST group; ``release_default_groups`` is what the
+    planner calls, so only the first group pays it (kittrial-5bb.159 review item 1).
     """
     if not page:return RELEASE_CHUNK_DEFAULT
     per_target=release_page_writes_per_target(page,verify_only,live_verified,labels or {})
     available=RELEASE_GROUP_WRITE_BUDGET-reserved
     return max(1,min(RELEASE_CHUNK_DEFAULT,available//per_target))
+
+
+def release_default_groups(page,verify_only,live_verified,labels,reserved):
+    """The kit's own default groups, the FIRST one paying the reserved writes.
+
+    ``reserved`` is the negative (supersede and scope) write count that rides only
+    the FIRST request, so only the first group is sized out of the budget left
+    after it; every later group is sized out of the FULL budget again. Sizing every
+    group from the reduced budget turned a large rollback into one-target groups
+    all the way down (kittrial-5bb.159 review item 1). Each group is clamped to
+    RELEASE_CHUNK_DEFAULT and to one target at the floor. With ``reserved == 0``
+    this returns exactly
+    ``_chunks(page, release_default_chunk(page, verify_only, live_verified, labels))``.
+    """
+    if not page:return []
+    first=release_default_chunk(page,verify_only,live_verified,labels,reserved=reserved)
+    later=release_default_chunk(page,verify_only,live_verified,labels)
+    groups=[];index=0
+    while index<len(page):
+        size=max(1,first if not groups else later)
+        groups.append(page[index:index+size]);index+=size
+    return groups
 
 
 def release_group_estimate(writes):
@@ -2276,9 +2323,12 @@ def main():
             page_verify_only=sorted(set(verify_only)&{item['task'] for item in page})
             # The negative facts (task-level supersede and per-scope supersede) ride
             # only the FIRST group of the FIRST page, so they are counted in that
-            # page's estimate and paid out of that page's write budget.
+            # page's estimate and paid out of that page's write budget. A scope-level
+            # supersede costs TWO processes, not one: its target value is rewritten
+            # through `pending` first, so 45 dropped tasks is 135 processes, not the
+            # 90 a one-process-per-receipt count assumed (kittrial-5bb.159 item 2).
             negatives_here=bool(supersede or supersede_scopes) and (not a.page_size or a.page==1)
-            negative_writes=(len(supersede)+len(supersede_scopes)) if negatives_here else 0
+            negative_writes=(len(supersede)+2*len(supersede_scopes)) if negatives_here else 0
             # The native label state from the same export: `_apply_fact` pays an
             # extra process for a fact the task already carries, so the estimate and
             # the derived group size count processes, not planned facts
@@ -2287,11 +2337,21 @@ def main():
                     if row.get('issue_type')!='event' and isinstance(row.get('id'),str)}
             explicit_chunk=a.chunk_size is not None
             per_target=release_page_writes_per_target(page,page_verify_only,data['live_verified'],labels)
-            chunk_size=(a.chunk_size if explicit_chunk
-                        else release_default_chunk(page,page_verify_only,data['live_verified'],labels,
-                                                   reserved=negative_writes))
-            chunk_size=max(1,min(int(chunk_size),RELEASE_TARGETS_MAX))
-            chunks=_chunks(page,chunk_size)
+            if explicit_chunk:
+                # An explicit --chunk-size is the caller's choice: one size for the
+                # whole page, still clamped to the wire bound.
+                chunk_size=max(1,min(int(a.chunk_size),RELEASE_TARGETS_MAX))
+                chunks=_chunks(page,chunk_size)
+            else:
+                # The kit's own default: only the FIRST group pays the reserved
+                # negative writes, so only it is sized from the reduced budget and
+                # every later group keeps the plain derived size (kittrial-5bb.159
+                # review item 1).
+                chunk_size=max(1,min(release_default_chunk(page,page_verify_only,
+                                                           data['live_verified'],labels),
+                                     RELEASE_TARGETS_MAX))
+                chunks=release_default_groups(page,page_verify_only,data['live_verified'],
+                                              labels,negative_writes)
             # The kit derives its own default group from the native-write budget, so
             # it no longer warns the operator to lower a size the kit picked; say why
             # the group is smaller than the historical default when it is
@@ -2309,10 +2369,25 @@ def main():
                         +(negative_writes if index==0 else 0))
                 group_estimates.append(release_group_estimate(writes))
             if max(group_estimates or [0.0])>RELEASE_CLIENT_TIMEOUT_SECONDS:
-                warnings.append('expected_seconds estimates %s s for one group of %d target(s), above the '
-                                'client timeout of %s s; lower --chunk-size so no single request can time '
-                                'out (kittrial-5bb.119 review item 3)'
-                                %(max(group_estimates),chunk_size,RELEASE_CLIENT_TIMEOUT_SECONDS))
+                if not explicit_chunk and negative_writes>RELEASE_GROUP_WRITE_BUDGET:
+                    # The reserved writes alone pass the budget, so no group size can
+                    # bring the first request inside the timeout: a group of one
+                    # target is the floor and this request cannot be split below it.
+                    # Advising a smaller --chunk-size here would be advice the
+                    # operator cannot follow (kittrial-5bb.159 review item 1).
+                    warnings.append('the supersede/scope writes alone are %d native bd process(es) '
+                                    '(%s s), above the client write budget of %d (%s s); the first '
+                                    'request carries them on top of its targets and cannot be split '
+                                    'below one target, so it will exceed the client timeout '
+                                    '(kittrial-5bb.159 review item 1)'
+                                    %(negative_writes,release_group_estimate(negative_writes),
+                                      RELEASE_GROUP_WRITE_BUDGET,
+                                      release_group_estimate(RELEASE_GROUP_WRITE_BUDGET)))
+                else:
+                    warnings.append('expected_seconds estimates %s s for one group of %d target(s), above the '
+                                    'client timeout of %s s; lower --chunk-size so no single request can time '
+                                    'out (kittrial-5bb.119 review item 3)'
+                                    %(max(group_estimates),chunk_size,RELEASE_CLIENT_TIMEOUT_SECONDS))
             # The supersede list rides the first group payload, so a rollback or a
             # hotfix deploy that drops tasks is one logical operation beside the rest
             # of the release. The field is only present when it is non-empty, so a
@@ -2340,11 +2415,14 @@ def main():
                     'chunks':[len(chunk) for chunk in chunks],'total_chunks':len(chunks),
                     'chunk_size':chunk_size,
                     # `planned_writes` and `planned_state_changes` are exact for a
-                    # plain release, but an UPPER count for a rollback or a
-                    # --live-verified roll-forward: a re-lived target may already be
-                    # at the release scope and already live there, so the endpoint
-                    # writes fewer facts than this page-level estimate assumes. The
-                    # error is on the safe side (kittrial-5bb.139 review item 3).
+                    # plain release, and an UPPER count for a --live-verified
+                    # roll-forward: a re-lived target may already be at the release
+                    # scope and already live there, so the endpoint writes fewer
+                    # facts than this page-level estimate assumes. For a rollback the
+                    # page-level planned-fact part is still an upper count, but the
+                    # FIRST group's total is a LOWER one: the negative writes added
+                    # here ride that one request on top of the planned facts
+                    # (kittrial-5bb.139 review item 3; kittrial-5bb.159 review item 2).
                     'planned_writes':release_planned_writes(page,page_verify_only,data['live_verified'])
                                      +negative_writes,
                     'planned_state_changes':
