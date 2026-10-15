@@ -59,29 +59,30 @@ class ServedTextTests(unittest.TestCase):
         self.assertIn('Only when none of its own tasks needs action: the ready list', heads[2])
         self.assertIn('assigned to somebody else is held', heads[3])
         for said in ('**exactly one** task that nobody holds', 'is not an inbox', 'Silence is not a handoff',
-                     'it cannot read the guidance yet', '**In the web interface today: no.**',
+                     'GET /v1/projects/PROJECT/guidance', '**In the web interface today: yes.**',
                      'set-guidance PROJECT --actor OPERATOR --file FILE', '`update TASK --assignee ACTOR --json`',
                      '`comments add TASK --file note.md --json`', 'kittrial-5bb.211', 'kittrial-5bb.212'):
             with self.subTest(said=said):
                 self.assertIn(said, ' '.join(text.split()))
         # Three ways to reach a worker, each with what the web can do today and a command.
         reach = text.split('## How to reach a worker', 1)[1].split('\n## ', 1)[0]
-        self.assertEqual(reach.count('**In the web interface today:'), 3)
+        self.assertEqual(reach.count('**In the web interface today: yes.**'), 3)
         self.assertEqual(reach.count('**The command today,**'), 3)
         # Written in what the page renders: no table, and no list whose items wrap.
         self.assertNotIn('\n|', text)
         self.assertIsNone(re.search(r'^\s*[-*]\s', text, re.M))
 
-    def test_what_the_text_says_is_not_there_is_not_there(self):
-        """The text says three things the web cannot do yet. When a route for one of them arrives, this
-        fails, and the text is to be corrected with it."""
+    def test_the_documented_guidance_comment_and_assignment_routes_exist(self):
+        """Check actual compiled routes: source fragments missed paths assembled with ID."""
         import http_service
-        source = Path(http_service.__file__).read_text(encoding='utf-8')
-        declared = re.findall(r"@route\('([A-Z]+)', r'([^']*)'", source)
-        self.assertGreater(len(declared), 50)
-        self.assertEqual([path for _, path in declared if 'guidance' in path], [])
-        self.assertEqual([path for _, path in declared if 'comments' in path], [])
-        self.assertEqual([path for _, path in declared if path.endswith("/assign'") or '/assignee' in path], [])
+        for method, path in [('GET', '/v1/projects/pp/guidance'),
+                             ('PUT', '/v1/projects/pp/guidance'),
+                             ('POST', '/v1/projects/pp/guidance/ack'),
+                             ('POST', '/v1/projects/pp/tasks/pp-1/comments'),
+                             ('POST', '/v1/projects/pp/tasks/pp-1/assign')]:
+            with self.subTest(method=method, path=path):
+                self.assertTrue(any(verb == method and pattern.fullmatch(path)
+                                    for verb, pattern, _, _, _ in http_service.ROUTES))
         self.assertEqual(http_service.ApiHandler.TASK_CHANGES, ('title', 'description', 'status', 'priority'))      # no assignee
 
     def test_a_prompt_is_the_fenced_block_up_to_the_last_fence(self):
@@ -169,10 +170,13 @@ class ServedTextTests(unittest.TestCase):
         doc = ' '.join((KIT / 'docs/FINDING_WORK.md').read_text(encoding='utf-8').split())
         prompt = onboarding.member_document(KIT, 'poll-prompt-agent')['prompt']
         guide = (KIT / 'web/js/agentSetup.js').read_text(encoding='utf-8')
-        self.assertIn('it cannot read the guidance yet. No route', doc)
-        self.assertIn('for owners and superusers only', doc)
-        self.assertIn('does not reach you over the web yet', prompt)
-        self.assertIn('does not reach you over this API yet', guide)
+        self.assertIn('GET /v1/projects/PROJECT/guidance', doc)
+        self.assertIn('editing it requires coordinate authority', doc)
+        self.assertIn('unknown legacy route', prompt)
+        self.assertIn('Reading never acknowledges', prompt)
+        self.assertIn('/v1/projects/PROJECT/guidance', guide)
+        self.assertIn('unknown legacy route', guide)
+        self.assertIn('Reading never acknowledges', guide)
         for text in (doc, prompt, guide):
             self.assertIn('Blocked and in-progress tasks', text)
             self.assertIn('reading acknowledges nothing', text.lower())
