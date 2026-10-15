@@ -86,6 +86,22 @@ class BaselineHttpTests(EndpointCase):
         self.assertIn(refused.status, (403, 422), refused.data)
         self.assertEqual(self.frozen(), before)
 
+    def test_superuser_demotion_inside_endpoint_cannot_bypass_owner_only_cached_replay(self):
+        # Project-admin capability still holds for this superuser after demotion;
+        # the canonical owner-only check must independently reject cached replay.
+        self.service.state['users'][self.account]['superuser'] = True
+        self.service.store.save()
+        first = self.cut(); self.assertEqual(first.status, 201, first.data)
+        frozen = self.frozen()
+        def demote():
+            self.service.state['memberships'][self.project][self.account] = 'contributor'
+            self.service.store.save()
+        self.backend.before_owner = demote
+        replay = self.cut()
+        self.assertIn(replay.status, (403, 422), replay.data)
+        self.assertEqual(self.frozen(), frozen)
+        self.assertEqual(store.list_baselines(self.path, self.project)['total'], 1)
+
     def test_governed_mode_refuses_new_cut_and_cached_cut(self):
         first = self.cut(); self.assertEqual(first.status, 201, first.data)
         before = self.frozen()
