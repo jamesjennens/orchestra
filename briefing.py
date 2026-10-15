@@ -453,6 +453,27 @@ RECORD_MAX=80000
 DIRECTION_STATES=('acknowledged','resolved','superseded')
 RESOLUTION_STATES=('resolved','superseded')
 DIRECTIONS_MAX=100
+# kittrial-5bb.284. A disposition can only be written through a checkpoint's `directions`
+# field, and save_checkpoint refuses that field while the installation switch
+# checkpoint_provenance_writes is off (the default everywhere). Counting an ordinary
+# comment as an outstanding direction then leaves every coordinator note outstanding for
+# ever and impossible for any worker to resolve, so the readers do not count them while
+# the check cannot be acted on, and they say why. A closed task lists none either way.
+DIRECTIONS_OFF_NOTE=('Direction dispositions need the installation switch checkpoint_provenance_writes, '
+                     'which is off here; ordinary comments are not counted as outstanding directions while it is off.')
+DIRECTIONS_CLOSED_NOTE='A closed task lists no outstanding directions.'
+
+def directions_counted(provenance_writes,status):
+    """(counted, reason) for other actors' ordinary comments as outstanding directions.
+
+    ``reason`` is None while the directions check applies, else 'switch-off' (the
+    installation cannot record a disposition) or 'closed' (a closed task lists none).
+    The library readers default to the pre-existing behaviour (counted); every server
+    caller passes the installation's checkpoint_provenance_writes value.
+    """
+    if status=='closed':return False,'closed'
+    if not provenance_writes:return False,'switch-off'
+    return True,None
 ZERO_HASH='0'*64
 
 def provenance_chain(digests):
@@ -590,15 +611,18 @@ def unincorporated(data,prov):
         else:unverified+=1
     return fresh+changed,fresh,changed,unverified
 
-def unresolved_directions(entries,direction_idx,owner):
+def unresolved_directions(entries,direction_idx,owner,counted=True):
     """Directions (other-actor comments) that are not yet resolved/superseded.
 
     A direction is outstanding when it is absent from the checkpoint's
     directions, only acknowledged, or its content changed since the recorded
     disposition (edit invalidates the earlier acknowledgement). Digest/cursor
     incorporation alone never resolves a direction; acknowledgement is distinct
-    from resolution and completion.
+    from resolution and completion. ``counted`` is False while the installation
+    cannot record a disposition (kittrial-5bb.284), so nothing is reported as an
+    outstanding direction that no reader could ever resolve.
     """
+    if not counted:return []
     outstanding=[]
     for e in entries:
         if e['kind']!='comment' or e['author']==owner:continue
@@ -664,7 +688,7 @@ def retained_provenance(state,upto=None):
     return dict(latest,digests=exact,older=trunc,verifiable=len(exact)+len(trunc),
                 complete=not trunc and len(exact)>=latest['covered'])
 
-def newer_activity_summary(data,prov,checkpoint_timestamp,owner,direction_idx=None,direction_data=None):
+def newer_activity_summary(data,prov,checkpoint_timestamp,owner,direction_idx=None,direction_data=None,counted=True):
     """Bounded, per-entry view of activity the current checkpoint did not incorporate.
 
     `prov` is the checkpoint's normalized provenance, so edited entries (same ID,
@@ -705,15 +729,16 @@ def newer_activity_summary(data,prov,checkpoint_timestamp,owner,direction_idx=No
             'verify':'checkpoint '+data['task']+' --verify',
             'note':note}
     if direction_idx is not None:
-        outstanding=unresolved_directions(data['entries'] if direction_data is None else direction_data,direction_idx,owner)
+        outstanding=unresolved_directions(data['entries'] if direction_data is None else direction_data,direction_idx,owner,counted)
         result['unresolved_directions']={'total':len(outstanding),
             'items':[{'entry_id':e['entry_id'],'timestamp':e['timestamp'],'author':clip(e['author'],96),
                       'state':(direction_idx.get(e['entry_id']) or {}).get('state','unacknowledged')} for e in outstanding[:NEWER_MAX]],
             'omitted':max(0,len(outstanding)-NEWER_MAX)}
+        if not counted:result['unresolved_directions']['check']='off'
     return result
 
 def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifiers=None,actor=None,full=False,
-          independent_approval=False,owners=None):
+          independent_approval=False,owners=None,provenance_writes=True):
     if type(offset) is not int or offset<BRIEF_ITEM_OFFSET_MIN or type(limit) is not int or not BRIEF_ITEM_LIMIT_MIN<=limit<=BRIEF_ITEM_LIMIT_MAX:
         raise ValueError('Invalid unresolved-item page: --items-offset must be >= %d and --items-limit must be %d..%d' % (BRIEF_ITEM_OFFSET_MIN,BRIEF_ITEM_LIMIT_MIN,BRIEF_ITEM_LIMIT_MAX))
     issue=task_row(rows,task);state=checkpoint_state(issue);current=state['current'];invalid=state['invalid']
@@ -803,13 +828,16 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
     # and it qualifies the next action even when the activity cursor is current.
     dir_out=None
     context=direction_context(issue,state);direction_data=direction_entries(data,context)
+    counted,directions_off_reason=directions_counted(provenance_writes,issue.get('status'))
     if p is not None:
         dispositions=chain_dispositions(state['history'])
-        outstanding=unresolved_directions(direction_data,dispositions,context[0])
+        outstanding=unresolved_directions(direction_data,dispositions,context[0],counted)
         dir_out={'total':len(outstanding),
                  'items':[{'entry_id':e['entry_id'],'timestamp':e['timestamp'],'author':clip(e['author'],96),
                            'state':(dispositions.get(e['entry_id']) or {}).get('state','unacknowledged')} for e in outstanding[:NEWER_MAX]],
                  'omitted':max(0,len(outstanding)-NEWER_MAX)}
+        if not counted:
+            dir_out['check']='off';dir_out['reason']=directions_off_reason
         if dir_out['total']:
             ids=', '.join(i['entry_id'] for i in dir_out['items'][:NEWER_MAX])
             ids+=(f' (+{dir_out["omitted"]} more)' if dir_out['omitted'] else '')
@@ -819,7 +847,7 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
         excluded_cursor=activity_cursor(excluded)
         stale=not cursor_matches(p['activity_cursor'],excluded,compatible=excluded_cursor)
         if stale:
-            newer=newer_activity_summary(excluded,retained_provenance(state),c.get('created_at'),context[0],dispositions,direction_data)
+            newer=newer_activity_summary(excluded,retained_provenance(state),c.get('created_at'),context[0],dispositions,direction_data,counted)
             if review['review_state'] not in review_next:
                 dirs=newer.get('unresolved_directions')
                 dir_note='' if not dirs else '; '+str(dirs['total'])+' outstanding direction(s) not yet resolved/superseded'
@@ -848,6 +876,13 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
     # exactly when `reconciliation_needed` is true, and `reconciliation_reasons` names the
     # mismatching facts whenever there are any. The boolean itself is carried by `work`
     # rows and by the `review` read, which have no such bound.
+    if p is not None and not counted:
+        # The directions check is off (kittrial-5bb.284): say so once, AFTER the
+        # stale-checkpoint and taken-in-project prefixes, so no reader infers an
+        # instruction this installation cannot clear.
+        next_action=('DIRECTIONS CHECK OFF: '
+                     +(DIRECTIONS_OFF_NOTE if directions_off_reason=='switch-off' else DIRECTIONS_CLOSED_NOTE)
+                     +' '+next_action)
     brief_review=dict(review,pending_requests=pending[:5],pending_total=len(pending),more='review '+task if len(pending)>5 else None,
                       prior_contributions=bounded_priors,prior_contributions_total=len(priors),
                       prior_contributions_more='review '+task if len(priors)>PRIOR_BRIEF_LIMIT else None,
@@ -887,6 +922,12 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
                        +['Newer activity also includes edits, deletions or changed task fields. Prose resolutions never silently clear explicit items.']
                        +[w for w in integration_warnings if w.startswith(RECONCILIATION_WARNING_PREFIX)]),
             'evidence':{'issue':'show '+task,'history':'history '+task,'checkpoint_entry':task+'-c'+str(c['id']) if c else None}}
+    if p is not None and not counted:
+        # The brief states plainly that the directions check is off (kittrial-5bb.284):
+        # a reader must not infer an unacknowledged instruction from a count that the
+        # installation cannot clear.
+        result['directions_check']={'state':'off','reason':directions_off_reason,
+            'note':DIRECTIONS_OFF_NOTE if directions_off_reason=='switch-off' else DIRECTIONS_CLOSED_NOTE}
     if journal is not None:
         # The standing guidance channel (kittrial-5bb.99): every endpoint brief
         # carries the current version; a direct library call with no project path
@@ -1150,7 +1191,7 @@ def verify_checkpoint(rows,project,task):
                     +'There is no shortcut that verifies never-recorded entries: publish a checkpoint to record '
                     'current evidence; reconcile history manually via history/show.')}
 
-def checkpoint_queue_fields(rows,row,state=None):
+def checkpoint_queue_fields(rows,row,state=None,provenance_writes=True):
     """Bounded queue fields; share the brief's linked state and full-row snapshot."""
     empty={'newer_activity_by_others':None,'newer_activity_own':None,
            'newer_activity_coverage':None,'unresolved_directions':None}
@@ -1163,14 +1204,15 @@ def checkpoint_queue_fields(rows,row,state=None):
         data=excluding_checkpoint(snapshot(rows,project,row['id']),c['id'],c.get('author'))
         dispositions=chain_dispositions(state['history'])
         context=direction_context(row,state);direction_data=direction_entries(data,context)
+        counted,_directions_off_reason=directions_counted(provenance_writes,row.get('status'))
         if cursor_matches(p['activity_cursor'],data):own=others=0;coverage='current'
         else:
             newer=newer_activity_summary(data,retained_provenance(state),c.get('created_at'),
-                                         context[0],dispositions,direction_data)
+                                         context[0],dispositions,direction_data,counted)
             own=newer['own_count'];others=newer['other_count'];coverage=newer['coverage']
         return {'newer_activity_by_others':others,'newer_activity_own':own,
                 'newer_activity_coverage':coverage,
-                'unresolved_directions':len(unresolved_directions(direction_data,dispositions,context[0]))}
+                'unresolved_directions':len(unresolved_directions(direction_data,dispositions,context[0],counted))}
     except (ValueError,TypeError,KeyError):return empty
 
 def snapshot_checkpoints(data):
@@ -1649,19 +1691,22 @@ def checkpoint_writes_enabled(root):
         return False
     return value
 
-def direction_page(rows,project,task,offset=0,limit=50):
+def direction_page(rows,project,task,offset=0,limit=50,provenance_writes=True):
     if offset<0 or not 1<=limit<=100:raise ValueError('Direction page requires --offset >= 0 and --limit 1..100')
     issue=task_row(rows,task);state=checkpoint_state(issue)
     if state['invalid']:raise ValueError('Malformed checkpoint entries require correction before reading directions')
     data=snapshot(rows,project,task);context=direction_context(issue,state)
-    entries=unresolved_directions(direction_entries(data,context),chain_dispositions(state['history']),context[0])
+    counted,directions_off_reason=directions_counted(provenance_writes,issue.get('status'))
+    entries=unresolved_directions(direction_entries(data,context),chain_dispositions(state['history']),context[0],counted)
     if offset>len(entries):raise ValueError('Direction offset exceeds total')
-    return {'task':task,'activity_cursor':activity_cursor(data),'total':len(entries),
+    page={'task':task,'activity_cursor':activity_cursor(data),'total':len(entries),
             'items':[{'id':e['entry_id'],'digest':entry_digests(data)[e['entry_id']],
                       'author':clip(e['author'],96),'timestamp':e['timestamp']} for e in entries[offset:offset+limit]],
             'next_offset':offset+limit if offset+limit<len(entries) else None,
             'coverage':'Current full digests for outstanding directions, including entries outside stored provenance windows. '
                        'Pages are fresh reads; compare activity_cursor across pages and restart if it changes.'}
+    if not counted:page['check']='off';page['reason']=directions_off_reason
+    return page
 
 def latest_checkpoint_read(rows,project,task,include_provenance=False):
     """The newest valid checkpoint record alone (kittrial-5bb.8): `checkpoint TASK --latest`.
@@ -1711,7 +1756,8 @@ def execute(root,path,project,actor,action,args,attachments,run,operators=None,v
             parser=Parser(add_help=False);parser.add_argument('task');parser.add_argument('--directions',action='store_true')
             parser.add_argument('--offset',type=int,default=0);parser.add_argument('--limit',type=int,default=50)
             page=parser.parse_args(args)
-            return json.dumps(direction_page(exported_rows(run),project,page.task,page.offset,page.limit),ensure_ascii=False,indent=2)+'\n'
+            return json.dumps(direction_page(exported_rows(run),project,page.task,page.offset,page.limit,
+                                             checkpoint_writes_enabled(root)),ensure_ascii=False,indent=2)+'\n'
         if len(args)==2 and args[1]=='--provenance':
             # Supported read path: return the bounded provenance and cursor that
             # save_checkpoint accepts verbatim — no private snapshot reconstruction.
@@ -1751,7 +1797,8 @@ def execute(root,path,project,actor,action,args,attachments,run,operators=None,v
         if action=='brief':
             result=brief(rows,project,a.task,a.items_offset,a.items_limit,operators=operators,journal=path,
                          verifiers=verifiers,actor=actor,full=a.full,
-                         independent_approval=independent_approval,owners=owners)
+                         independent_approval=independent_approval,owners=owners,
+                         provenance_writes=checkpoint_writes_enabled(root))
             return json.dumps(result,ensure_ascii=False,indent=2)+'\n' if a.json else format_brief(result)
         data=snapshot(rows,project,a.task);digest=content_hash(data);cache.mkdir(exist_ok=True)
         file=cache/(digest+'.json')
