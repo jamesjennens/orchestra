@@ -1777,8 +1777,11 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                 # applies (kittrial-5bb.290). Only the JSON form is filtered; a text ready
                 # listing is left as bd wrote it.
                 if argv and argv[0]=='ready' and p.returncode==0 and stdout.lstrip()[:1] in ('[','{'):
+                    # record_json.loads, not a bare json.loads: bd's answer is not trusted
+                    # input (a deeply nested one must not raise RecursionError), and
+                    # tests/test_record_json.py counts every bare parse per file.
                     try:
-                        rows=json.loads(stdout)
+                        rows=record_json.loads(stdout)
                     except ValueError:
                         rows=None
                     if isinstance(rows,list):
