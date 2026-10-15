@@ -72,8 +72,8 @@ class TerminalTests(unittest.TestCase):
         clock = mock.patch('requirement_terminal.time.time', return_value=saved['write_window']['abandon_after']+1)
         clock.start(); self.addCleanup(clock.stop)
 
-    def recover(self, item, action, saved, context=None):
-        body=dict(original_operation_id=saved['operation_id'], expected_receipt_sha256=saved['expected_receipt_sha256'])
+    def recover(self, item, action, saved, context=None, **extra):
+        body=dict(original_operation_id=saved['operation_id'], expected_receipt_sha256=saved['expected_receipt_sha256'], **extra)
         if action=='abandon': body['reason']='No state was written; retain the attempted intent.'
         return http.apply(self.path, context or self.context, action, body, 'recovery-'+action, self.native, item['id'])
 
@@ -463,7 +463,9 @@ class TerminalTests(unittest.TestCase):
         # R4T.py late: withdraw 503; another owner abandons after the deadline;
         # the owner edits and accepts a new revision; the original writer's
         # native state survives the process-group kill and lands later. Nothing
-        # may leave it unknown with no pending transition and no command.
+        # may leave it unknown with no pending transition and no command. It
+        # stays finishable, but the owner is told which later accepted revision
+        # finishing withdraws and must confirm it (the coordinator's T-c/T-e rule).
         item = self.accepted()
         self.native.fail_comment_prefix = owner.STATE_PREFIX
         with self.assertRaises(ValueError):
@@ -484,8 +486,20 @@ class TerminalTests(unittest.TestCase):
         self.assertIsNotNone(late)
         self.assertTrue(late['can_finish'])
         self.assertFalse(late['can_abandon'])
-        finished = self.recover(item, 'finish', late)
+        # The page and the HTTP answer name the accepted revision and its time.
+        accepted_revision = view['accepted']['revision']
+        self.assertGreater(accepted_revision, item['revision'])
+        self.assertEqual(late['undoes']['revision'], accepted_revision)
+        self.assertEqual(late['undoes']['accepted_at'], view['acceptance']['at'])
+        self.assertIn('accepted revision %d' % accepted_revision, late['message'])
+        self.assertIn(late['undoes']['accepted_at'], late['message'])
+        # Finishing without the confirmation is refused with that same sentence.
+        with self.assertRaisesRegex(ValueError, 'accepted revision %d' % accepted_revision):
+            self.recover(item, 'finish', late)
+        finished = self.recover(item, 'finish', late, confirm=True)
         self.assertEqual(finished['state'], pending['state'])
+        self.assertEqual(finished['undoes']['revision'], accepted_revision)
+        self.assertIn('accepted revision %d' % accepted_revision, finished['message'])
         self.assertEqual(finished['completion']['actor'], ACCOUNT)
         receipt = terminal.read_receipt(terminal.receipt_path(self.path, pending['operation_id']))
         self.assertEqual(receipt['status'], 'complete')
@@ -494,6 +508,44 @@ class TerminalTests(unittest.TestCase):
         view = self.read(item)
         self.assertEqual(view['requirement_state'], 'withdrawn')
         self.assertIsNone(view['pending_transition'])
+
+    def test_late_state_beside_a_later_completed_decision_is_superseded(self):
+        # T-d: the first withdrawal fails at its state write and is abandoned; a
+        # FRESH withdrawal completes; the first decision's late state then lands
+        # beside it. The later completed decision owns the requirement's status,
+        # the late state is recorded as superseded, and finishing it is refused
+        # with a sentence naming the later decision.
+        item = self.accepted()
+        self.native.fail_comment_prefix = owner.STATE_PREFIX
+        with self.assertRaises(ValueError):
+            self.act(item, operation='early-terminal')
+        self.after_writer(item)
+        early = self.recovery(item)
+        self.assertTrue(early['can_abandon'])
+        self.recover(item, 'abandon', early)
+        self.native.fail_comment_prefix = None
+        fresh = self.act(item, operation='fresh-terminal')
+        self.assertEqual(fresh['requirement_state'], 'withdrawn')
+        # The earlier decision's state survives the stop and lands after the
+        # later decision completed.
+        self.native(['comments', 'add', item['id'], owner.body(early['state'], state=True), '--json'])
+        view = self.read(item)
+        self.assertEqual(view['requirement_state'], 'withdrawn')
+        self.assertEqual(view['state']['operation_id'], 'fresh-terminal')
+        late = view['pending_transition']
+        self.assertIsNotNone(late)
+        self.assertFalse(late['can_finish'])
+        self.assertFalse(late['can_abandon'])
+        self.assertEqual(late['disposition'], 'superseded')
+        self.assertEqual(late['superseded_by']['operation_id'], 'fresh-terminal')
+        self.assertIn('later completed decision fresh-terminal', late['message'])
+        # The owner's finish and the operator's complete are both refused with
+        # the sentence naming the later decision.
+        with self.assertRaisesRegex(ValueError, 'later completed decision fresh-terminal'):
+            self.recover(item, 'finish', late)
+        with self.assertRaisesRegex(ValueError, 'later completed decision fresh-terminal'):
+            records.reconcile(self.path, early['operation_id'], 'configured-operator',
+                              'Force the earlier late decision complete.', 'complete', self.native)
 
     def test_operator_reconcile_can_finish_a_late_state_after_an_edit(self):
         item = self.accepted()

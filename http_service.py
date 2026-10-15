@@ -6615,7 +6615,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             'withdraw':('expected_revision','expected_sha256','expected_state_sha256','reason'),
             'supersede':('expected_revision','expected_sha256','expected_state_sha256','reason','successor'),
             'release':('original_operation_id','expected_receipt_sha256','reason'),
-            'finish':('original_operation_id','expected_receipt_sha256'),
+            'finish':('original_operation_id','expected_receipt_sha256','confirm'),
             'abandon':('original_operation_id','expected_receipt_sha256','reason'),
             'governance':('mode','expected_revision','expected_sha256')}[action],'Requirements')
         import requirement_http

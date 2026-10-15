@@ -344,13 +344,15 @@ def checked_body(body, action):
                'withdraw': {'expected_revision', 'expected_sha256', 'expected_state_sha256', 'reason'},
                'supersede': {'expected_revision', 'expected_sha256', 'expected_state_sha256', 'reason', 'successor'},
                'release': {'original_operation_id', 'expected_receipt_sha256', 'reason'},
-               'finish': {'original_operation_id', 'expected_receipt_sha256'},
+               'finish': {'original_operation_id', 'expected_receipt_sha256', 'confirm'},
                'abandon': {'original_operation_id', 'expected_receipt_sha256', 'reason'},
                'governance': {'mode', 'expected_revision', 'expected_sha256'}}
     if action not in allowed or not isinstance(body, dict) or set(body) - allowed[action]:
         raise ValueError('Unsupported requirements fields or action')
     if action in ('release', 'finish', 'abandon'):
         identifier(body.get('original_operation_id')); governance.digest(body.get('expected_receipt_sha256'))
+        if 'confirm' in body and body['confirm'] is not True:
+            raise ValueError('Finish confirmation must be true')
         if action != 'finish' and (not isinstance(body.get('reason'), str) or not body['reason'].strip() or not 1 <= len(body['reason']) <= 1000
                 or '\0' in body['reason']):
             raise ValueError('Explain why this transition should be abandoned (1 to 1000 characters)' if action == 'abandon'
@@ -812,6 +814,22 @@ def read(project_path, project, args, run, operators=None):
                             status = state['state']
                     except (ValueError, TypeError, KeyError):
                         state = reason = None
+                if state is None:
+                    # A later decision on this requirement has completed: the late
+                    # state of an earlier abandoned decision is superseded, so the
+                    # requirement reads the later decision's status rather than
+                    # staying unknown behind a command that can no longer be run.
+                    try:
+                        superseded = terminal.superseded_late_state(row, receipts)
+                        if superseded is not None:
+                            governance.validate_evidence(project_path, project, superseded['owner_state'])
+                    except (ValueError, TypeError, KeyError):
+                        superseded = None
+                    if superseded is not None:
+                        state = superseded['owner_state']
+                        reason = (owner_records.landed_reason(row, state)
+                                  or superseded['owner_state_reason'])
+                        status = state['state']
                 if state is None:
                     status = 'unknown'
                     state_error = (terminal.DAMAGED_RECEIPT if row['id'] in pending_error
