@@ -1468,6 +1468,24 @@ def attention_blocking_items(fields):
     return value if type(value) is int and value >= 0 else None
 
 
+def holder_move(status, task_id, assignee, review_state, open_requests, contribution_id,
+                redelivered=None, claimable_value=None):
+    """The HOLDER's move reading for a projection row, from the ONE shared decision.
+
+    A page shows a task's move for the actor who holds it, and the work row that names
+    the same reading is ``work --owner ACTOR``. This calls the same
+    ``work.move_decision`` the queue and the lane board use with the holder as the
+    subject, so an open task assigned to the holder with no checkpoint and no
+    contribution by them reads ``you``/``assignee`` on the page exactly as it does in
+    the queue (kittrial-5bb.288) and the two readings cannot drift apart.
+    """
+    from work import move_decision
+    pending = open_requests if type(open_requests) is int and open_requests >= 0 else 0
+    return move_decision(review_state, task_id, True, pending_items=pending,
+                         redelivered=bool(redelivered), assignee=assignee,
+                         closed=status == 'closed', claimable=claimable_value)
+
+
 def own_queue_tasks(queue, actor=None):
     """Split one current review snapshot by assignee, retaining unknown checkpoint state."""
     tasks=[]
@@ -1475,9 +1493,17 @@ def own_queue_tasks(queue, actor=None):
         if not isinstance(row,dict) or not row.get('assignee') or (actor is not None and row['assignee']!=actor):
             continue
         fields=row.get('attention') if isinstance(row.get('attention'),dict) else {}
+        move, move_text, move_role = holder_move(
+            row.get('status'), row.get('id'), row.get('assignee'), row.get('review_state'),
+            row.get('open_requests'), (row.get('contribution') or {}).get('id'),
+            fields.get('redelivered'), row.get('claimable'))
         tasks.append({'id':row.get('id'),'title':row.get('title'),'status':row.get('status'),
                       'assignee':row.get('assignee'),'review_state':row.get('review_state'),
                       'contribution_id':(row.get('contribution') or {}).get('id'),
+                      # The holder's own move reading, from the same decision as the
+                      # canonical `work --owner ACTOR` row (kittrial-5bb.288), so the
+                      # agents page and the bridge show what the queue row shows.
+                      'whose_move':move,'next':move_text,'next_actor':move_role,
                       'pending_change_requests':list(fields.get('pending_change_requests') or [])[:20],
                       # The canonical item count, so the move sentence says the same N as the
                       # `work` row it came from (kittrial-5bb.249).
@@ -4667,9 +4693,9 @@ class ApiHandler(BaseHTTPRequestHandler):
                     'create' if getattr(self.backend, 'PROJECT_CREATE', 'create') == 'create' else
                     'register' if principal.superuser and principal.via != 'credential' else 'operator-only')}
         if principal.credential_id:
-            credential = self.service.state['credentials'].get(principal.credential_id)
-            if credential and credential.get('agent_id'):
-                body['credential_expiry'] = self.service.agent_credential_expiry_view(credential)
+            expiry = self._credential_expiry_view(principal)
+            if expiry is not None:
+                body['credential_expiry'] = expiry
         # Additive (kittrial-5bb.118 part 2): whether this account may create a project
         # on the host from here, with its limit and how many it has. Only where the
         # backend has a host.
@@ -4685,6 +4711,21 @@ class ApiHandler(BaseHTTPRequestHandler):
     @route('DELETE', r'/v1/sessions/current')
     def sessions_delete(self, ctx):
         return 204, self.service.logout(ctx.principal, request_id=ctx.request_id)
+
+    def _credential_expiry_view(self, principal):
+        """The caller's own credential expiry, or ``None`` when it has none to show.
+
+        The same secret-free shape both ``GET /v1/sessions/current`` and
+        ``GET /v1/agents/me`` answer (kittrial-5bb.294 item 1). A worker credential has
+        no agent identity and no view, exactly as before; an agent credential reads its
+        own stored deadline, capped at 366 days from issuance on read (item 4). This
+        never looks at any other credential.
+        """
+        credential_id = getattr(principal, 'credential_id', None)
+        credential = self.service.state['credentials'].get(credential_id) if credential_id else None
+        if credential and credential.get('agent_id'):
+            return self.service.agent_credential_expiry_view(credential)
+        return None
 
     @route('POST', r'/v1/accounts')
     def accounts_create(self, ctx):
@@ -5837,8 +5878,18 @@ class ApiHandler(BaseHTTPRequestHandler):
     @route('GET', r'/v1/agents/me')
     def agents_me(self, ctx):
         agent = self.service.agent_for_credential(ctx.principal)
-        return 200, {'agent': agent, 'attention': self._agent_attention_view(agent),
-                     'generated_at': now_iso(self.service._now())}
+        body = {'agent': agent, 'attention': self._agent_attention_view(agent),
+                'generated_at': now_iso(self.service._now())}
+        # The calling credential's OWN expiry, in exactly the shape /v1/sessions/current
+        # answers (kittrial-5bb.294 item 1): the agent set-up prompt and the bridge
+        # extension read this route, and the read caps the stored expiry at 366 days from
+        # issuance (item 4). No new disclosure: it is the caller's credential only, never
+        # another credential's.
+        expiry = self._credential_expiry_view(ctx.principal)
+        if expiry is not None:
+            body['credential_expiry'] = expiry
+            body['expires_soon'] = bool(expiry.get('expires_soon'))
+        return 200, body
 
     @route('GET', r'/v1/agents/me/next')
     def agents_me_next(self, ctx):
@@ -6075,9 +6126,17 @@ class ApiHandler(BaseHTTPRequestHandler):
                 ctx.principal, ctx.params['aid'], ctx.params['cid'], project_id=project_id,
                 request_id=ctx.request_id)
             return result, result
+        # The route's own capability is the coarse gate; the precise extension authority
+        # is decided once, in Service.agent_extension_target: CAP_AGENTS (the agent's own
+        # account or a superuser) for the agent route, CAP_PROJECT_ADMIN (that project's
+        # owner or a superuser) for the project route, and any credential caller refused
+        # first there. The project route's gate is therefore the authenticated project
+        # READ the caller already needs to see the agent, never a second, shadowing copy
+        # of the precise check: each guard is load-bearing and pinned by its own route
+        # test (kittrial-5bb.294 item 3).
         return self._mutate_agent_credential(
             ctx, 'agents.credentials.extend', extend, project_id=project_id,
-            capability=CAP_AGENTS if project_id is None else CAP_PROJECT_ADMIN, replay_check=check)
+            capability=CAP_AGENTS if project_id is None else CAP_READ, replay_check=check)
 
     def _mutate_agent_credential(self, ctx, operation, fn, *, project_id=None,
                                  capability=CAP_AGENTS, **options):
@@ -6456,14 +6515,17 @@ class ApiHandler(BaseHTTPRequestHandler):
                                               redelivered=bool(task.get('redelivered')),
                                               way_back='`%s`' % (task_base + '/brief'))
                 details['whose_move'], details['next'] = move, move_text
-                if review != 'changes-requested':
+                if review != 'changes-requested' and not in_progress:
                     # The task asked for the two fields only where the kind is
                     # changes-requested (review item 2b): every other kind has a mover who is
                     # not this agent (an operator reconciles a review error or an unreadable
                     # checkpoint; a reviewer or the coordinator holds awaiting work), so it
                     # carries neither field instead of pairing `who: operator` with
                     # `whose_move: you` or contradicting the queue row's blocked/waiting
-                    # sentence.
+                    # sentence. `in-progress` is the agent's OWN undelivered, assigned task,
+                    # so it carries its move too (kittrial-5bb.288): a lane assigned a task
+                    # it never touched is told it is that lane's move, in the same words as
+                    # the canonical `work --owner ACTOR` row.
                     details.pop('whose_move', None)
                     details.pop('next', None)
                 if review == 'changes-requested':

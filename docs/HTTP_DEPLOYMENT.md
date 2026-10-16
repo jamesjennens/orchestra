@@ -3326,7 +3326,9 @@ and reset values retain their existing lifetimes. Changing the setting does not
 rewrite credentials already issued. Invalid values are refused before opening state.
 
 Each new agent key stores its monotone expiry and raw-clock deadline in the existing
-credential row. The current reader expires it on either clock. A key longer than the
+credential row, along with `agent_written_raw`, the raw clock of its most recent
+legitimate write (issuance, or the last extension). The current reader expires it on
+either clock and applies the 366-day write cap described below. A key longer than the
 older kit's fixed 30-day raw-age cap uses that reader's existing legacy stored-expiry
 path (no `issued_raw`); its actual raw issue time remains in `agent_issued_raw`.
 An older reader ignores the added deadline fields and honours the stored expiry;
@@ -3364,7 +3366,22 @@ warning and Extend existing credential. This action keeps the existing secret.
 Issuing a new secret is a separate action for the agent's own account or a
 superuser; it retains the existing scope confirmation/widening rules and the
 20 working / five retained dead credential bounds. Extension makes no new key.
-`GET /v1/sessions/current` adds `credential_expiry` for an agent credential.
+`GET /v1/sessions/current` adds `credential_expiry` for an agent credential, and so
+does `GET /v1/agents/me` for the calling credential itself (the same secret-free shape,
+plus its `expires_soon`). That new expiry field answers only the calling credential; the
+same `GET /v1/agents/me` answer's `agent.credentials` list already shows the agent's own
+sibling credentials, as it did before this field existed. The `401` at credential
+expiry and revocation names who can act - an owner can extend an agent credential
+before it expires, and after it expires the owner's account or a superuser issues a new
+secret - and names no other credential. A stored expiry is capped at 366 days from the
+most recent **legitimate write** - issuance, or the latest extension - **on read** in both
+the web service and the canonical endpoint, so a hand-edited store of years is not
+honoured; a record written before the write stamp existed falls back to its issuance
+stamp and still caps. The store is never rewritten by a read. The stamp lives in the same
+store as the expiry and is exactly as editable: this stops careless or stale edits, not a
+host user who can rewrite the state, and there is deliberately no HMAC tamper evidence.
+Rolling back to the released kit removes the cap entirely, because that kit does not
+know the write stamp.
 Project-owner credential rows expose only ID, expiry, working/revoked status and
 warning, never labels, hashes, scopes, directories, other grants or secrets.
 

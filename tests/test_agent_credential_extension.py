@@ -42,7 +42,9 @@ class ExtensionHttp(AgentLifetimeHttp):
         first = self.extend(token, aid, cid, key='same-key-extension')
         self.assertEqual(200, first.status, first.data)
         self.assertEqual(before['expires_at'] + DAY, credential['expires_at'])
-        allowed_changes = {'expires_at', 'agent_raw_expires_at'}
+        # agent_written_raw is the extension's legitimate-write stamp (kittrial-5bb.294
+        # item 4): it moves with the extension exactly as the two deadlines do.
+        allowed_changes = {'expires_at', 'agent_raw_expires_at', 'agent_written_raw'}
         self.assertEqual({k:v for k,v in before.items() if k not in allowed_changes},
                          {k:v for k,v in credential.items() if k not in allowed_changes})
         self.assertEqual(before_agents, self.service.state['agents'])

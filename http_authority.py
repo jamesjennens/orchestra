@@ -132,6 +132,7 @@ Windows workstation and a Linux office host.
 """
 import hashlib
 import json
+import math
 import os
 import re
 import sqlite3
@@ -376,6 +377,111 @@ ALL_CAPABILITIES = frozenset(ROLE_CAPABILITIES['owner'] | {CAP_PROJECT_CREATE,
                                                            CAP_ACCOUNTS_ADMIN,
                                                            CAP_AGENTS})
 
+#: The longest a credential's STORED expiry is honoured for after the most recent
+#: LEGITIMATE WRITE, ON READ (kittrial-5bb.294 item 4): 366 days, the same ceiling the
+#: ``--agent-credential-days`` setting allows. Issuance and every extension stamp the
+#: write in ``agent_written_raw``, so effective expiry is
+#: ``min(stored expiry, agent_written_raw + 366 days)``. A record written before the field
+#: existed falls back to its issuance stamp, so it still caps. A store whose expiry was
+#: hand-edited to years reads as capped here, so the web service and the canonical
+#: endpoint both refuse it once the last legitimate write is older than this, whatever the
+#: store says. The field sits in the same store as the expiry and is exactly as editable:
+#: this stops careless or stale edits, not a host user who can rewrite the state. A read
+#: never rewrites the store.
+CREDENTIAL_MAX_AGE_DAYS = 366
+CREDENTIAL_MAX_AGE_SECONDS = CREDENTIAL_MAX_AGE_DAYS * 86400
+
+#: The 401 at credential expiry names who can act (kittrial-5bb.294 item 2) and says
+#: nothing about any other credential: no id, secret, label or count. A revocation keeps
+#: reading as a revocation.
+CREDENTIAL_EXPIRED_MESSAGE = (
+    "Credential expired. An owner can extend an agent credential before it expires; "
+    "after it expires the owner's account or a superuser issues a new secret.")
+CREDENTIAL_REVOKED_MESSAGE = (
+    "Credential revoked. The owner's account or a superuser issues a new secret.")
+
+
+def credential_issued_raw(credential):
+    """The credential's raw issuance instant, or ``None`` when it carries no readable stamp.
+
+    ``agent_issued_raw`` is the agent key's real issue time (the older kit's fixed raw-age
+    cap makes it the field to read); ``issued_raw`` is the worker/default30 stamp. A
+    hand-edited non-number reads as no stamp rather than crashing a read.
+    """
+    for key in ('agent_issued_raw', 'issued_raw'):
+        value = credential.get(key)
+        if type(value) is bool or not isinstance(value, (int, float)):
+            continue
+        if not math.isfinite(value):
+            continue
+        return float(value)
+    return None
+
+
+def credential_written_raw(credential):
+    """The credential's most recent legitimate-write instant, or ``None``.
+
+    Issuance and every extension record this raw-clock stamp, so it is what the 366-day
+    read cap is measured from. A missing, hand-edited non-number or non-finite value
+    reads as no stamp: :func:`credential_expiry_cap` then falls back to the issuance
+    stamp rather than failing open.
+    """
+    value = credential.get('agent_written_raw')
+    if type(value) is bool or not isinstance(value, (int, float)):
+        return None
+    if not math.isfinite(value):
+        return None
+    return float(value)
+
+
+def credential_expiry_cap(credential):
+    """The latest instant a credential's stored expiry may be honoured, or ``None``.
+
+    Measured from the most recent LEGITIMATE WRITE (:func:`credential_written_raw`):
+    issuance, or the last extension. A record without that field - one written before it
+    existed - falls back to its issuance stamp so it still caps. ``None`` means neither
+    stamp is readable, so nothing is capped: a record from before either stamp existed
+    keeps the reader it always had.
+    """
+    written = credential_written_raw(credential)
+    if written is None:
+        written = credential_issued_raw(credential)
+    return None if written is None else written + CREDENTIAL_MAX_AGE_SECONDS
+
+
+def credential_age_expired(credential, moment):
+    """Whether a credential is past the 366-day read cap (kittrial-5bb.294 item 4).
+
+    The cap is measured from the most recent legitimate write, not the first issuance
+    (:func:`credential_expiry_cap`), so an owner's latest extension always buys the full
+    configured lifetime. ``moment`` is the caller's decision clock, which is never
+    earlier than the raw clock, so this can only ever refuse early: a hand-edited store
+    expiry of years is never honoured beyond the cap.
+    """
+    cap = credential_expiry_cap(credential)
+    if cap is None:
+        return False
+    try:
+        return float(moment) >= cap
+    except (TypeError, ValueError, OverflowError):
+        return True
+
+
+def credential_stored_expired(credential, moment):
+    """Whether the credential's own stored ``expires_at`` has passed; fail closed.
+
+    A missing, non-numeric or unreadable value counts as expired, exactly as the previous
+    ``credential.get('expires_at', 0) <= moment`` intent, without the ``TypeError`` a
+    hand-edited ``null`` used to raise.
+    """
+    expires = credential.get('expires_at', 0)
+    if type(expires) is bool or not isinstance(expires, (int, float)):
+        return True
+    try:
+        return float(moment) >= float(expires)
+    except (TypeError, ValueError, OverflowError):
+        return True
+
 
 class AuthorityDenied(Exception):
     """A clean, redacted authorization failure that carries its HTTP status."""
@@ -545,9 +651,16 @@ def decide(state, request, *, now=None, allow_self_user=None):
 
     if via == 'credential':
         credential = state.get('credentials', {}).get(request.get('credential_id'))
-        if not isinstance(credential, dict) or credential.get('revoked') or \
-                credential.get('expires_at', 0) <= moment:
-            raise deny(401, 'unauthenticated', 'Credential expired or revoked')
+        if not isinstance(credential, dict):
+            raise deny(401, 'unauthenticated', CREDENTIAL_EXPIRED_MESSAGE)
+        # Revocation and expiry are two answers, so the caller is told which one it met and
+        # who can act (kittrial-5bb.294 item 2). The stored expiry is capped at 366 days
+        # from issuance ON READ (item 4): a hand-edited store of years is not honoured.
+        if credential.get('revoked'):
+            raise deny(401, 'unauthenticated', CREDENTIAL_REVOKED_MESSAGE)
+        if credential_stored_expired(credential, moment) or \
+                credential_age_expired(credential, moment):
+            raise deny(401, 'unauthenticated', CREDENTIAL_EXPIRED_MESSAGE)
         issuer = state.get('users', {}).get(credential.get('user_id'))
         if not isinstance(issuer, dict) or issuer.get('disabled'):
             raise deny(401, 'unauthenticated', 'Authentication is no longer valid')
