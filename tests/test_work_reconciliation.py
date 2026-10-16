@@ -788,6 +788,28 @@ class ClaimableHttpTests(AgentHarness):
         self.assertFalse(ep._claims_the_row(['update', blocked, '--notes', 'in_progress', '--json']))
         self.assertFalse(ep._claims_the_row(['update', blocked, '--title', 'x', '--json']))
 
+    def test_the_web_claim_route_on_a_blocked_task_is_refused(self):
+        """kittrial-5bb.293 rev4 / mutant g4: the HTTP claim route is gated."""
+        blocked = self.new('blocked work')
+        opener = self.new('open dependency')
+        self.backend.state['tasks'][blocked]['dependencies'] = [
+            {'id': opener, 'dependency_type': 'blocks', 'status': 'open'}]
+        refused = self.claim(self.alex_agent[1], blocked)
+        self.assertEqual(409, refused.status, refused.data)
+        self.assertIn('open dependency', refused.data['error']['message'])
+        self.assertIn(opener, refused.data['error']['message'])
+
+    def test_work_claimable_leaves_out_a_blocked_task(self):
+        """kittrial-5bb.293 rev4 / mutant g5: the work queue's claimable is gated."""
+        blocked = self.new('blocked work')
+        opener = self.new('open dependency')
+        self.backend.state['tasks'][blocked]['dependencies'] = [
+            {'id': opener, 'dependency_type': 'blocks', 'status': 'open'}]
+        data = self.next_actions(self.alex_agent[1])
+        offered = [a['task'] for a in data['next_actions']]
+        self.assertNotIn(blocked, offered)
+        self.assertIn(opener, offered)
+
     def test_only_the_blocking_dependency_type_blocks(self):
         """kittrial-5bb.293 item 3b: a `related` dependency must not block a claim."""
         task = self.new('related to something open')

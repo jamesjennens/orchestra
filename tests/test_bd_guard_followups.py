@@ -182,6 +182,29 @@ class EndpointTests(unittest.TestCase):
                 self.assertEqual(self.run_bd(args)['returncode'], 0, args)
                 self.assertEqual(self.bd.writes, [], args)
 
+    def test_the_endpoint_raw_claim_on_a_blocked_task_is_refused(self):
+        """kittrial-5bb.293 rev4 / mutant g6: the ENDPOINT's own bd claim is gated.
+
+        Drives endpoint.execute with the real guard (and real bd via FakeBd) so the
+        check that runs before any native write is the one under test. Remove the
+        guard and this test fails."""
+        from work import dependency_ref
+        opener = 'pp-open-dep'
+        blocked = 'pp-blocked-work'
+        base = {'issue_type': 'task', 'status': 'open', 'labels': [], 'comments': [],
+                'title': 'a task', 'description': ''}
+        self.bd.rows = [
+            dict(base, id=opener, title='open dependency'),
+            dict(base, id=blocked, title='blocked work',
+                 dependencies=[{'id': opener, 'dependency_type': 'blocks', 'status': 'open'}]),
+        ]
+        said = self.refused(['update', blocked, '--claim', '--json'])
+        self.assertIn('open dependency', said)
+        self.assertIn(opener, said)
+        # A legitimate change is still allowed.
+        ok = self.run_bd(['update', opener, '--title', 'renamed', '--json'])
+        self.assertEqual(0, ok.get('returncode'), ok)
+
     def test_ready_json_leaves_the_merge_slot_out(self):
         """kittrial-5bb.290: ready agrees with work --claimable on the merge slot."""
         slot = {'id': 'pp-merge-slot', 'title': 'merge slot', 'status': 'open',
