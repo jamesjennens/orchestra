@@ -2979,27 +2979,42 @@ line separately and unconfined.
   calling credential, never from the body, so it can only ever change the caller's own
   record. The claim route
   (`POST /v1/projects/{id}/tasks/{task}/claim`) refuses a NEW claim while the agent
-  already holds that many tasks that are open or in progress with review state `none` or
-  `changes-requested`; the refusal is a `409` whose sentence names the limit and the held
-  tasks, with `claim_limit`, `held` and `held_readable` in its detail, and it carries the
-  same bounded `candidates` fall-through an ordinary held refusal carries. A delivered
+  already holds that many unblocked tasks that are open or in progress with review state
+  `none` or `changes-requested`, or while its total undelivered claims (including blocked
+  tasks) have reached the hard cap `claim_limit + 3`; the refusal is a `409` whose
+  sentence names the limit, the hard cap (`claim_limit + 3` including blocked tasks) and
+  the held tasks, with `claim_limit`, `hard_cap`, `held`, `blocked` and `held_readable`
+  in its detail, and it carries the
+  same bounded `candidates` fall-through an ordinary held refusal carries. Claims made
+  under a `<agent>/<label>` sub-label resolve to the owning `<agent>` record and count
+  together with `<agent>`'s own claims against its `claim_limit` and `hard_cap`. A
+  delivered
   task (awaiting review or beyond) does not count, and the agent's own re-claim of a task
   it already holds is not counted again. A person's own session actor is not limited.
-  A task whose latest checkpoint left an open blocker or dependency does not count: the
-  documented order sends a lane the checkpoint left stuck on to other work, and that
-  order has to be possible to follow. A PERSON assigning a task to an agent at its limit
-  is still allowed (`POST /v1/projects/{id}/tasks/{task}/assign`): that is the owner's
-  explicit choice, not the agent taking work. An AGENT assigning a task to itself
-  through that same route is a claim and takes the limit, because that IS the agent
-  taking work.
-  `GET /v1/agents/me` and `GET /v1/agents/me/next` report the limit, how many it holds,
-  how many are left and `raise_by` (who may raise it: the owner's account or a superuser,
-  on the My agents page); each agent record carries the limit. All of it comes from the
+  A task whose latest checkpoint left an open blocker or dependency does not count
+  against `claim_limit` itself: the documented order sends a lane the checkpoint left
+  stuck on to other work, and that order has to be possible to follow. Blocked tasks DO
+  count against the hard cap `claim_limit + 3`, so an agent cannot lift its own limit
+  without bound by writing blocker checkpoints on its own claims. A PERSON assigning a
+  task to an agent at its limit is still allowed
+  (`POST /v1/projects/{id}/tasks/{task}/assign`): that is the owner's explicit choice,
+  not the agent taking work. An AGENT assigning a task to itself (or to one of its
+  `<agent>/<label>` sub-labels) through that same route is a claim and takes the limit
+  and hard cap, because that IS the agent taking work.
+  `GET /v1/agents/me` and `GET /v1/agents/me/next` report the limit, `hard_cap`, how many
+  it holds (`held` and `blocked`), how many are left (`available`, bounded by both
+  `claim_limit` and the `claim_limit + 3` hard cap) and `raise_by` (who may raise it: the
+  owner's account or a superuser, on the My agents page); each agent record carries the
+  limit. All of it comes from the
   same one counted-held rule the gate applies, so the two answers cannot disagree. The
   held set is read from the same bounded `work`
   snapshot attention already reads, across every project the agent is granted, and it
   fails closed: a held
-  set that cannot be read refuses the claim rather than reading as "no limit". This is
+  set that cannot be read refuses the claim rather than reading as "no limit". A
+  per-agent lock (`Service.claim_gate(agent_id)`, keyed by the agent id) spans the
+  held-set read and the claim write so concurrent claims by the same agent serialize
+  while claims by different agents do not wait for each other; one service process is the
+  supported setup. This is
   the service's own gate, so it covers the web page, the client and any other client of
   the route; a `bd update --claim` run by hand on the host, outside this service, is not
   gated by it.
