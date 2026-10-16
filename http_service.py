@@ -57,7 +57,7 @@ from http_auth import (AGENT_SECRET_ENV, agent_secret_file, CAP_ACCOUNTS_ADMIN, 
                        CAP_TASKS, RESULT_RETENTION_SECONDS, HttpError, Service, Store,
                        address_group, authority_request, busy, conflict, forbidden, invalid, not_found,
                        not_implemented, now_iso, request_hash, unauthenticated,
-                       uncertain, unsupported, validate_agent_credential_days)
+                       uncertain, unsupported, validate_agent_credential_days, validate_claim_limit)
 from version import report as version_report
 
 KIT_VERSION = '0.1.0'
@@ -4207,9 +4207,9 @@ class ApiHandler(BaseHTTPRequestHandler):
     MEMBER_FIELDS = ('role',)
     CREDENTIAL_ISSUE_FIELDS = ('label', 'scopes', 'actor', 'allow_actor', 'allow_actor_reason')
     AGENT_CREATE_FIELDS = ('name', 'tool', 'working_directory', 'machine', 'notes',
-                           'projects', 'scopes', 'owner')
+                           'projects', 'scopes', 'owner', 'claim_limit')
     AGENT_UPDATE_FIELDS = ('name', 'tool', 'working_directory', 'machine', 'notes',
-                           'projects', 'enabled')
+                           'projects', 'enabled', 'claim_limit')
     AGENT_CREDENTIAL_FIELDS = ('label', 'scopes')
     ACCOUNT_CREATE_FIELDS = ('username', 'display_name')
 
@@ -5757,6 +5757,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         return 200, {
             'agent': agent,
             'attention': self._agent_attention_view(agent, attention),
+            # The agent's own claim limit and what holds it (kittrial-5bb.276), so an
+            # agent can see what is in the way without reading the queue itself.
+            'claim_limit': self._agent_claim_limit_view(agent, attention),
             'next_action': attention['actions'][0] if attention['actions'] else None,
             'next_actions': attention['actions'],
             'projects': projects,
@@ -5782,12 +5785,14 @@ class ApiHandler(BaseHTTPRequestHandler):
             self._require_grantable(ctx.principal, payload.get('projects'), (), owner_id=owner)
             self.service.check_agent_grant(ctx.principal, payload.get('projects'), owner_id=owner)
             refuse_unknown_fields(payload, self.AGENT_CREATE_FIELDS, 'An agent creation')
+            claim_limit_value = (validate_claim_limit(payload.get('claim_limit'))
+                                 if 'claim_limit' in payload else None)
             result = self.service.create_agent(
                 ctx.principal, name=payload.get('name'), tool=payload.get('tool'),
                 working_directory=payload.get('working_directory'),
                 machine=payload.get('machine'), notes=payload.get('notes'),
                 projects=payload.get('projects'), scopes=payload.get('scopes'),
-                request_id=ctx.request_id, owner=owner)
+                request_id=ctx.request_id, owner=owner, claim_limit=claim_limit_value)
             return result, _redact_agent_secret(result)
         def replay_check():
             owner = self.service.agent_creation_owner(ctx.principal, payload.get('owner', ctx.principal.user_id))
@@ -5917,6 +5922,92 @@ class ApiHandler(BaseHTTPRequestHandler):
             result = self.service.enable_agent(ctx.principal, ctx.params['aid'])
             return result, result
         return self._mutate(ctx, 'agents.enable', None, enable, capability=CAP_AGENTS)
+
+    #: How many claims one bulk release takes off an agent in one request. A
+    #: release is one canonical assignment each; the bound keeps one request from
+    #: walking a very large held set, and the answer says when it was cut.
+    CLAIM_RELEASE_LIMIT = 20
+
+    @route('POST', r'/v1/agents/(?P<aid>[^/]+)/release-claims')
+    def agents_release_claims(self, ctx):
+        """Release an agent's claimed, undelivered tasks from the web (kittrial-5bb.276).
+
+        The owner incident's second half: a claim could be released only on the host.
+        A single claim is released through the ordinary assignment route
+        (``POST /v1/projects/{pid}/tasks/{tid}/assign`` with ``assignee: null``); this
+        route releases every held, undelivered claim of one agent across every project
+        it is granted, so a person need not walk the queue. It uses the same canonical
+        ``tasks.assign`` each single release uses, under the caller's own authority, so
+        nothing here invents a second way to clear an assignee.
+
+        The caller must hold the coordinate capability in every project it is about to
+        release in (one check per project, before any write). A caller who may
+        administer the agent but not one of its projects is refused with that project
+        named, which is the move to ask its owner; no partial release is made under a
+        caller who may release in only some of them.
+
+        ``dry_run`` answers how many claims it would release, per project, and writes
+        nothing.
+        """
+        aid = ctx.params['aid']
+        payload = dict(ctx.payload or {})
+        refuse_unknown_fields(payload, ('dry_run',), 'An agent claim release')
+        dry_run = bool(payload.get('dry_run'))
+        if ctx.idempotency_key is None and not dry_run:
+            raise invalid('Send an Idempotency-Key: releasing claims writes')
+        # The record's ownership is judged before what the server can do with it,
+        # so a caller with no right to the agent keeps the service's own 404.
+        agent = self.service.get_agent(ctx.principal, aid)
+        if 'tasks.assign' not in self.backend.ROUTES:
+            raise not_implemented('Canonical task assignment is unavailable on this server')
+        actor = agent.get('actor') or agent.get('id')
+        from claim_limit import held_undelivered
+        projects = list(agent.get('projects') or [])
+        # Authority over every project first, so a caller who may release in only
+        # some of them cannot half-release the agent.
+        for project_id in projects:
+            try:
+                self.service.check_authority(ctx.principal, project_id, CAP_COORDINATE)
+            except HttpError as refusal:
+                raise conflict(
+                    'You cannot release claims in %s, so nothing was released: %s'
+                    % (project_id, refusal.message),
+                    {'project': project_id, 'released': []}) from None
+        planned, released, failed = [], [], []
+        truncated = False
+        for project_id in projects:
+            read = self.backend.agent_tasks(project_id, actor)
+            held = held_undelivered(read.get('tasks') or [])
+            if not read.get('complete'):
+                raise conflict('The agent\'s held tasks could not be read completely, so no claim '
+                               'was released.', {'project': project_id, 'held_readable': False})
+            if len(held) > self.CLAIM_RELEASE_LIMIT:
+                truncated = True
+            counts = {'project': project_id, 'held': len(held),
+                      'tasks': [row.get('id') for row in held]}
+            planned.append(counts)
+            for row in held[:self.CLAIM_RELEASE_LIMIT]:
+                if dry_run:
+                    continue
+                key = '%s/%s' % (ctx.idempotency_key, row.get('id'))
+                try:
+                    self.backend.invoke('tasks.assign', ctx.principal, project_id,
+                                        {'task_id': row.get('id'), 'expected_assignee': actor,
+                                         'assignee': None,
+                                         'reason': 'Owner released the agent\'s claims (%s)' % aid},
+                                        key, target=row.get('id'), authorize=ctx.authorize,
+                                        capability=CAP_COORDINATE)
+                except HttpError as refusal:
+                    # One row that cannot be released does not stop the rest; it is
+                    # reported by name with the canonical sentence.
+                    failed.append({'project': project_id, 'task': row.get('id'),
+                                   'message': refusal.message})
+                    continue
+                released.append({'project': project_id, 'task': row.get('id')})
+        return 200, {'operation': 'agents.claims.release', 'agent': aid,
+                     'released': released, 'failed': failed, 'planned': planned,
+                     'dry_run': dry_run, 'truncated': truncated,
+                     'candidate_total': sum(entry['held'] for entry in planned)}
 
     @route('POST', r'/v1/agents/(?P<aid>' + ID + r')/credentials')
     def agents_credential_issue(self, ctx):
@@ -6276,6 +6367,66 @@ class ApiHandler(BaseHTTPRequestHandler):
         cache[key] = result
         return result
 
+    def _refuse_claim_over_limit(self, ctx, task, claimant):
+        """Refuse a claim that would take an agent past its own limit (kittrial-5bb.276).
+
+        The limit is the claimed agent's own setting (``claim_limit`` on its record),
+        default one undelivered claim. A person is not limited. Re-claiming the task
+        the agent already holds changes nothing and is not counted again.
+
+        The held set comes from the same bounded ``work`` snapshot the agent's own
+        attention reads, so a claim costs no extra tracker read. It fails CLOSED: if
+        the set cannot be read completely, or the review state of a held row is not
+        known, the claim is refused with a distinct sentence instead of being let
+        through, because an unreadable count must never read as "no limit".
+        """
+        from claim_limit import check, held_undelivered
+        if not isinstance(claimant, str) or not claimant:
+            return
+        agents = self.service.state.get('agents') or {}
+        owner = None
+        for record in agents.values():
+            # The attribution label an agent's own writes carry is its id
+            # (http_auth.Service.agent_actor), not a field on the record.
+            if isinstance(record, dict) and self.service.agent_actor(record) == claimant:
+                owner = record
+                break
+        if owner is None:
+            # A person's own session actor: not limited unless the owner set a limit
+            # on their record, and no person record carries one.
+            return
+        limit = self._agent_claim_limit_view(owner, None)['limit']
+        if limit is None:
+            return
+        # The task being claimed is already this agent's own row when the backend
+        # would treat the claim as a no-op; only a NEW row counts.
+        if isinstance(task, dict) and task.get('assignee') == claimant:
+            return
+        project_id = ctx.params['pid']
+        try:
+            read = self.backend.agent_tasks(project_id, claimant)
+        except Exception as error:
+            # Any failure at all is an unknown held set, never "no limit": the claim
+            # is refused with a sentence that says the read failed, rather than
+            # turning a tracker error into an unlimited agent.
+            raise conflict(
+                'This agent\'s held tasks could not be read, so the claim is refused: %s'
+                % error, {'claim_limit': limit, 'held_readable': False}) from None
+        held = held_undelivered(read.get('tasks') or [])
+        other_projects = [pid for pid in (owner.get('projects') or []) if pid != project_id]
+        complete = bool(read.get('complete')) and not other_projects
+        sentence = check(limit, held, more=0 if complete else 1)
+        if sentence is None:
+            return
+        raise conflict(sentence, {'claim_limit': limit,
+                                  'held': [row.get('id') for row in held],
+                                  'held_readable': complete,
+                                  # The claim route reads this to attach the same
+                                  # bounded claimable-candidate fall-through an
+                                  # ordinary held refusal carries, so an agent at
+                                  # its limit is still handed somewhere to go.
+                                  'claim_limit_refusal': True})
+
     def _agent_attention(self, principal, agent, many=False):
         """Owner/agent-visible attention, computed at read time from bounded reads.
 
@@ -6510,6 +6661,22 @@ class ApiHandler(BaseHTTPRequestHandler):
         if state == 'unknown':
             return ('Incomplete work read: %s claimable task(s) observed; check project work for more.' % claimable)
         return ('Idle: %s claimable task(s), nothing in flight.' % claimable)
+
+    @staticmethod
+    @staticmethod
+    def _agent_claim_limit_view(agent, attention):
+        """The per-agent claim limit and what holds it (kittrial-5bb.276).
+
+        Exactly the value the claim route enforces, from the same helper and the
+        same held set the attention snapshot already counted, so /v1/agents/me/next
+        can never report a different limit or a different held set than the gate.
+        """
+        from claim_limit import default_limit
+        counts = (attention or {}).get('counts') or {}
+        held = int(counts.get('claimed') or 0)
+        return {'limit': default_limit(agent), 'held': held,
+                'available': max(0, default_limit(agent) - held),
+                'counts_task': counts.get('in_progress')}
 
     @staticmethod
     def _agent_attention_view(agent, attention=None):
@@ -7517,6 +7684,12 @@ class ApiHandler(BaseHTTPRequestHandler):
         payload['actor'] = actor
 
         def claim():
+            # The per-agent limit on claimed, undelivered tasks (kittrial-5bb.276)
+            # is judged here, before the write is sent, so one gate covers the web
+            # page, orchestra-client.py and any other client of this route. It is
+            # inside the mutation, after the idempotency reserve, so an exact retry
+            # still replays its stored answer instead of being refused again.
+            self._refuse_claim_over_limit(ctx, task, actor)
             try:
                 result = self.backend.invoke('tasks.claim', ctx.principal, ctx.params['pid'],
                                              payload, ctx.idempotency_key,
@@ -7538,12 +7711,26 @@ class ApiHandler(BaseHTTPRequestHandler):
                 # Advisory: claimability is not a reservation and the next claim is still
                 # atomic. When there is nothing to fall through to, the refusal is
                 # re-raised byte for byte, so every existing sentence and detail is kept.
+                limit_refusal = (isinstance(refusal.detail, dict)
+                                 and refusal.detail.get('claim_limit_refusal'))
                 candidates, truncated = [], False
                 if str((task or {}).get('status')) != 'closed':
                     candidates, truncated = self._claim_candidates(ctx.params['pid'], ctx.params['tid'])
-                if not candidates and held_by is None:
+                if not candidates and held_by is None and not limit_refusal:
                     raise
                 detail = dict(refusal.detail) if isinstance(refusal.detail, dict) else {}
+                if limit_refusal:
+                    # An agent at its limit keeps its own sentence (which names the
+                    # limit and the held tasks) and gains the candidates: the move
+                    # is to finish or release one of those, or to take another row
+                    # once it has.
+                    if candidates:
+                        detail['candidates'] = candidates
+                        if truncated:
+                            detail['candidates_truncated'] = True
+                            detail['candidates_notice'] = ('More claimable tasks remain; at most %d '
+                                                           'candidates are listed.' % CLAIM_CANDIDATES_LIMIT)
+                    raise conflict(refusal.message, detail) from None
                 if held_by is not None:
                     detail['held_by'] = held_by
                 if candidates:

@@ -12,6 +12,7 @@ from pathlib import Path
 KIT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(KIT))
 sys.path.insert(0, str(KIT / 'tests'))
+import claim_limit
 import test_http_agents
 import test_http_review_fixes as fixes
 
@@ -368,8 +369,12 @@ class InProcessTests(Shared, test_http_agents.AgentHarness):
         for project in projects[1:]:
             for name, role in (('olive', 'owner'), ('carl', 'contributor'), ('rita', 'contributor')):
                 self.request('PUT', '/v1/projects/%s/members/%s' % (project, self.ids[name]), {'role': role}, token=admin)
+        # Kite claims every task in one pass; the per-agent claim limit
+        # (kittrial-5bb.276) is exercised in tests/test_claim_limit.py.
         made = self.request('POST', '/v1/agents', {'name': 'Kite', 'working_directory': '/home/carl/kite',
-                                                   'projects': projects}, token=self.tokens['carl'])
+                                                   'projects': projects,
+                                                   'claim_limit': claim_limit.LIMIT_MAX},
+                            token=self.tokens['carl'])
         wide = self.request('POST', '/v1/agents', {'name': 'Wide', 'working_directory': '/home/rita/wide',
                                                    'projects': projects}, token=self.tokens['rita'])
         self.assertEqual((201, 201), (made.status, wide.status))
