@@ -19,6 +19,17 @@ from test_requirement_owner_records import OwnerNative, ACCOUNT
 
 
 class TerminalTests(unittest.TestCase):
+
+    def test_the_rollback_sentence_warns_that_a_two_finisher_receipt_reads_damaged(self):
+        """kittrial-5bb.295 r2 item 2: a completion naming two finishers (the actors list) reads as a
+        damaged receipt to kits before this release, so a rollback needs the pre-completion backup or an
+        operator reconcile on this release first - and the actors list is never stripped to fit an older
+        kit."""
+        text = (Path(__file__).resolve().parents[1]/'docs'/'REQUIREMENTS.md').read_text(encoding='utf-8')
+        self.assertIn('names two finishers', text)
+        self.assertIn('**damaged receipt** by kits before this release', text)
+        self.assertIn('`admin.py requirement-reconcile` on this release first', text)
+        self.assertIn('strip the `actors` list to make an older kit read the receipt', text)
     def setUp(self):
         temp = tempfile.TemporaryDirectory(); self.addCleanup(temp.cleanup)
         self.path = Path(temp.name)/'alpha'; self.path.mkdir()
@@ -87,6 +98,7 @@ class TerminalTests(unittest.TestCase):
         before=len(self.native.writes()); completed=self.recover(item,'finish',saved,context)
         self.assertEqual(completed['reason'],saved['reason']); self.assertEqual(completed['state'],saved['state'])
         self.assertEqual(completed['completion']['actor'],second)
+        self.assertEqual(completed['completion']['actors'],[ACCOUNT,second])
         self.assertTrue(completed['completion']['at'])
         self.assertEqual(len(self.native.writes()),before+2)
         again=self.recover(item,'finish',saved,context); self.assertEqual(again['state'],completed['state'])
@@ -95,6 +107,7 @@ class TerminalTests(unittest.TestCase):
         self.assertEqual([c['author'] for c in comments],[ACCOUNT,ACCOUNT])
         receipt=terminal.read_receipt(terminal.receipt_path(self.path,saved['operation_id']))
         self.assertEqual(receipt['completion'],completed['completion'])
+        self.assertEqual(receipt['completion']['actors'],[ACCOUNT,second])
         current=dict(operation_id=saved['operation_id'],expected_receipt_sha256=terminal.receipt_sha256(receipt))
         with self.assertRaisesRegex(ValueError,'already written'): self.recover(item,'abandon',current)
 
@@ -499,7 +512,10 @@ class TerminalTests(unittest.TestCase):
         finished = self.recover(item, 'finish', late, confirm=True)
         self.assertEqual(finished['state'], pending['state'])
         self.assertEqual(finished['undoes']['revision'], accepted_revision)
+        self.assertEqual(finished['undoes']['operation'], 'withdraw')
         self.assertIn('accepted revision %d' % accepted_revision, finished['message'])
+        self.assertIn('also withdrew', finished['message'])
+        self.assertNotIn('Confirm', finished['message'])
         self.assertEqual(finished['completion']['actor'], ACCOUNT)
         receipt = terminal.read_receipt(terminal.receipt_path(self.path, pending['operation_id']))
         self.assertEqual(receipt['status'], 'complete')
@@ -562,7 +578,8 @@ class TerminalTests(unittest.TestCase):
             expected_sha256=edited['sha256']), 'operator-late-accept', self.native, item['id'])
         saved = terminal.read_receipt(terminal.receipt_path(self.path, released['operation_id']))
         self.native(['comments', 'add', item['id'], owner.body(saved['owner_state'], state=True), '--json'])
-        self.assertTrue(self.read(item)['pending_transition']['can_finish'])
+        late = self.read(item)['pending_transition']
+        self.assertTrue(late['can_finish'])
         # An operator's release reconciliation must not claim the late state was
         # absent; the written decision is finished instead.
         with self.assertRaisesRegex(ValueError, 'already written'):
@@ -574,6 +591,14 @@ class TerminalTests(unittest.TestCase):
         self.assertEqual(result['state'], saved['owner_state'])
         self.assertEqual(result['completion']['via'], 'operator')
         self.assertEqual(result['completion']['actor'], 'configured-operator')
+        # N4: the receipt names the owner whose write landed AND the operator who
+        # completed it.
+        self.assertEqual(result['completion']['actors'], [ACCOUNT, 'configured-operator'])
+        # Item 3: the answer says what finishing did. It does not ask for a
+        # browser confirmation after the operator already completed it.
+        self.assertEqual(result['undoes']['revision'], late['undoes']['revision'])
+        self.assertIn('also withdrew accepted revision %d' % late['undoes']['revision'], result['message'])
+        self.assertNotIn('Confirm', result['message'])
         self.assertEqual(self.read(item)['requirement_state'], 'withdrawn')
 
     def test_write_window_deadline_restarts_at_the_endpoint_clock(self):
@@ -790,6 +815,65 @@ class TerminalTests(unittest.TestCase):
         self.assertIsNone(view['pending_transition'])
         self.assertIn('admin.py requirement-reconcile --operation-id %s' % saved['owner_state']['operation_id'],
                       view['state_message'])
+
+
+    def test_one_finisher_keeps_the_frozen_completion_fields(self):
+        # N4: a single-actor finish is unchanged, and a receipt written before the
+        # optional actor list existed still validates.
+        item = self.accepted()
+        done = self.act(item)
+        self.assertEqual(set(done['completion']),
+                         {'actor', 'at', 'operation_id', 'reason', 'via', 'pending_receipt_sha256'})
+        receipt = terminal.read_receipt(terminal.receipt_path(self.path, 'terminal-first'))
+        self.assertEqual(receipt['completion'], done['completion'])
+        self.assertIs(terminal.validate_receipt(receipt), receipt)
+        # When the list is present it must be at least two distinct identifiers
+        # ending with the actor that completed the transition.
+        other = 'usr_' + 'z' * 16
+        for actors in ([ACCOUNT], [ACCOUNT, ACCOUNT], [ACCOUNT, 'not an identifier!'], [other, ACCOUNT, other]):
+            bad = terminal.seal(dict(receipt, completion=dict(receipt['completion'], actors=actors)))
+            with self.subTest(actors=actors), self.assertRaisesRegex(ValueError, 'completion history'):
+                terminal.validate_receipt(bad)
+        good = terminal.seal(dict(receipt, completion=dict(receipt['completion'], actors=[other, ACCOUNT])))
+        terminal.validate_receipt(good)
+
+    def test_late_supersession_undo_sentence_says_supersedes(self):
+        # Item 4: finishing a late SUPERSESSION supersedes the later accepted
+        # revision; the sentence must not say it withdraws it.
+        item = self.accepted()
+        target = self.accepted('replacement')
+        reference = {key: target[key] for key in ('id', 'revision', 'sha256')}
+        self.native.fail_comment_prefix = owner.STATE_PREFIX
+        with self.assertRaises(ValueError):
+            self.act(item, 'supersede', successor=reference)
+        self.after_writer(item)
+        pending = self.recovery(item)
+        self.assertTrue(pending['can_abandon'])
+        self.recover(item, 'abandon', pending)
+        self.native.fail_comment_prefix = None
+        edited = http.apply(self.path, self.context, 'revise', dict(expected_revision=item['revision'],
+            expected_sha256=item['sha256'], description='Accepted after the release.'),
+            'supersede-late-edit', self.native, item['id'])
+        http.apply(self.path, self.context, 'accept', dict(expected_revision=edited['revision'],
+            expected_sha256=edited['sha256']), 'supersede-late-accept', self.native, item['id'])
+        self.native(['comments', 'add', item['id'], owner.body(pending['state'], state=True), '--json'])
+        late = self.read(item)['pending_transition']
+        self.assertIsNotNone(late)
+        self.assertTrue(late['can_finish'])
+        self.assertEqual(late['undoes']['operation'], 'supersede')
+        self.assertIn('also supersedes accepted revision %d' % late['undoes']['revision'], late['message'])
+        self.assertNotIn('withdraw', late['message'])
+        with self.assertRaisesRegex(ValueError, 'also supersedes accepted revision'):
+            self.recover(item, 'finish', late)
+        finished = self.recover(item, 'finish', late, confirm=True)
+        self.assertEqual(finished['undoes']['operation'], 'supersede')
+        self.assertIn('also superseded accepted revision %d' % late['undoes']['revision'], finished['message'])
+        self.assertNotIn('withdrew', finished['message'])
+        self.assertNotIn('Confirm', finished['message'])
+        receipt = terminal.read_receipt(terminal.receipt_path(self.path, pending['operation_id']))
+        self.assertEqual(receipt['status'], 'complete')
+        self.assertEqual(receipt['completion']['actor'], ACCOUNT)
+        self.assertNotIn('actors', receipt['completion'])
 
 
 if __name__ == '__main__':

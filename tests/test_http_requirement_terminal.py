@@ -324,6 +324,7 @@ class TerminalHttpTests(EndpointCase):
         self.assertTrue(late['can_finish'])
         self.assertEqual(late['undoes']['revision'],accepted.data['revision'])
         self.assertEqual(late['undoes']['sha256'],accepted.data['sha256'])
+        self.assertEqual(late['undoes']['operation'],'withdraw')
         self.assertIn('accepted revision %d'%accepted.data['revision'],late['message'])
         self.assertIn(late['undoes']['accepted_at'],late['message'])
         refused=self.recover_transition(item,late,key='finish-unconfirmed')
@@ -332,9 +333,34 @@ class TerminalHttpTests(EndpointCase):
         done=self.recover_transition(item,late,key='finish-confirmed',confirm=True)
         self.assertEqual(done.status,200,done.data)
         self.assertEqual(done.data['undoes']['revision'],accepted.data['revision'])
+        self.assertEqual(done.data['undoes']['operation'],'withdraw')
         self.assertIn('accepted revision %d'%accepted.data['revision'],done.data['message'])
+        # Item 3: the answer after finishing says what happened and does not ask
+        # the owner to confirm what already completed.
+        self.assertIn('also withdrew',done.data['message'])
+        self.assertNotIn('Confirm',done.data['message'])
         after=self.request('GET',self.base+'/requirements/'+item['id'],token=self.owner_token).data
         self.assertEqual(after['requirement_state'],'withdrawn')
+
+    def test_finish_route_refuses_a_confirm_that_is_not_exactly_true(self):
+        # Mutant c2 made the ROUTE accept `confirm` values that are merely equal
+        # to true (1); recover() only checks them when a later accepted revision
+        # makes the finish confirmable, so an unrelated, non-late finish must be
+        # refused by the route itself, before any native write.
+        item=self.accepted(); self.backend.native.fail_comment_prefix=owner.REASON_PREFIX
+        failed=self.transition(item,key='route-confirm'); self.assertEqual(failed.status,503,failed.data)
+        self.backend.native.fail_comment_prefix=None
+        saved=self.pending_transition(item); self.assertTrue(saved['can_finish'])
+        before=len(self.backend.native.writes()); rows=copy.deepcopy(self.backend.native.rows)
+        for index,value in enumerate((1,'true',0,False,None)):
+            refused=self.recover_transition(item,saved,key='route-confirm-bad-'+str(index),confirm=value)
+            self.assertEqual(refused.status,422,refused.data)
+            self.assertIn('Finish confirmation must be true',str(refused.data))
+            self.assertEqual(len(self.backend.native.writes()),before)
+            self.assertEqual(self.backend.native.rows,rows)
+        done=self.recover_transition(item,saved,key='route-confirm-ok',confirm=True)
+        self.assertEqual(done.status,200,done.data)
+        self.assertEqual(done.data['state'],saved['state'])
 
     def test_closed_fields_state_content_cas_and_draft_refuse_before_effect(self):
         item=self.accepted(); initial=copy.deepcopy(self.backend.native.rows)
@@ -483,3 +509,17 @@ class TerminalHttpTests(EndpointCase):
             (root/'web/js/views/owner_requirements.js').as_uri(),'http://127.0.0.1:'+str(self.port),self.project,
             token,finish['id'],abandon['id'],edit['id'])
         self.assertEqual(output.returncode,0,output.stderr);self.assertTrue(all(json.loads(output.stdout).values()))
+
+    def test_browser_undo_wording_follows_the_operation(self):
+        # Item 4 on the shipped page: the confirmation sentence after the undo
+        # message uses the verb of the operation actually happening.
+        from test_http_web import run_node_module
+        node=shutil.which('node')
+        if not node:self.skipTest('Node.js is required for page wording checks')
+        root=Path(__file__).resolve().parents[1]
+        script=(root/'tests/web_requirement_undo_wording.mjs').read_text(encoding='utf-8').replace(
+            "'./web_dom_shim.mjs'",repr((root/'tests/web_dom_shim.mjs').as_uri()))
+        output=run_node_module(self,node,script,'undo-wording-browser',(root/'web/js/api.js').as_uri(),
+            (root/'web/js/views/owner_requirements.js').as_uri())
+        self.assertEqual(output.returncode,0,output.stderr)
+        self.assertTrue(all(json.loads(output.stdout).values()))
