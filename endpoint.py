@@ -2070,13 +2070,33 @@ def contributor_help_text(unknown=None):
     return '\n'.join(lines)
 
 
+def client_out_of_date_sentence(name):
+    """One plain sentence for a command the CLIENT runs, sent to the endpoint by mistake.
+
+    An older ``client.py`` (before CLIENT_ACTIONS) passes ``guidance`` or ``feedback``
+    through as an action; the endpoint refused it with the contributor command list,
+    which lists those same commands -- a contradiction that sent one lane looking for
+    the cause for hours (kittrial-5bb.299). The answer now says the command is the
+    client's own, that this client is older than the installation's kit, and how to
+    update it. The endpoint still refuses; it never runs a client-side action.
+    """
+    from version import KIT_VERSION
+    return ('`%s` is run by the client itself, not by the server. This client is older than '
+            'the installation\'s kit (version %s). Update it by copying client.py from the kit.'
+            % (name, KIT_VERSION))
+
+
 def outside_contributor_interface(name):
     """Refuse ``name`` with the commands a contributor may run (kittrial-5bb.283).
 
     One place so the answer cannot drift from the table above, and so the refusal is what a test
     can call without a runtime: the caller is still refused - the endpoint refuses everything
-    outside the contributor interface - it is only told what it may run instead.
+    outside the contributor interface - it is only told what it may run instead. A name the
+    CURRENT client dispatches locally (CLIENT_ACTIONS) is answered with one plain out-of-date
+    sentence instead of the refusal-plus-list contradiction (kittrial-5bb.299).
     """
+    if name in CLIENT_ACTIONS:
+        raise ValueError(client_out_of_date_sentence(name))
     raise ValueError(contributor_help_text(None if name in ('help', '-h', '--help') else name))
 
 

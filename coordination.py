@@ -13,6 +13,7 @@ import os
 import record_json
 import re
 import secrets
+import stat
 import time
 from pathlib import Path
 from requirements import content_hash, load_json
@@ -117,6 +118,65 @@ def atomic(path, data, *, mode=None):
     except BaseException:
         _discard(tmp)
         raise
+
+
+#: How old a leftover atomic temporary must be before :func:`sweep_temporaries` may
+#: remove it. A live writer renames its temporary within one :func:`atomic` call, so a
+#: file this old is a cut's leftover, never a write still in progress.
+TEMPORARY_MIN_AGE_SECONDS=3600
+
+def sweep_temporaries(directory,*,min_age_seconds=TEMPORARY_MIN_AGE_SECONDS,now=None,dry_run=False):
+    """Remove leftover ``<name>.tmp-<pid>-<16 hex>`` files from ONE family directory.
+
+    A cut between :func:`_unique_temporary` and ``os.replace`` leaves a temporary
+    behind (kittrial-5bb.281 review S1) and nothing removed it. Every rule is
+    deliberately narrower than ``unlink``:
+
+    * only a name :func:`is_temporary` recognizes exactly - never a record, and never
+      the fixed ``<name>.tmp`` a private-family (``mode=``) writer uses;
+    * only a regular file, judged from ``os.stat(...,follow_symlinks=False)``, so a
+      planted symlink is never followed and never removed;
+    * only a file at least ``min_age_seconds`` old: a live writer renames its
+      temporary in the same call, so an old file is a cut's leftover;
+    * ``directory`` must itself be a real directory. A symlink is refused, so the
+      sweep can never be pointed out of the family the caller named. A directory that
+      does not exist (a family this kit never created) is not an error.
+
+    ``dry_run=True`` reports the candidates without removing them. Returns the sorted
+    names removed (or, in a dry run, the names that would be).
+    """
+    directory=Path(directory)
+    if directory.is_symlink():
+        raise ValueError('Refusing to sweep %s: the directory is a symlink'%directory)
+    if not directory.is_dir():
+        return []
+    if min_age_seconds<0:
+        raise ValueError('The sweep age bound must not be negative')
+    if now is None:now=time.time()
+    with os.scandir(directory) as scan:
+        names=[entry.name for entry in scan]
+    removed=[]
+    for name in sorted(names):
+        if not is_temporary(name):continue
+        candidate=directory/name
+        try:
+            info=os.stat(candidate,follow_symlinks=False)
+        except OSError:
+            continue
+        # A symlink (S_ISLNK) or a directory (S_ISDIR) that merely wears a temporary
+        # name is left alone; unlinking a symlink would remove only the link, but the
+        # sweep touches nothing that is not the temporary file itself.
+        if not stat.S_ISREG(info.st_mode):continue
+        if now-info.st_mtime<min_age_seconds:continue
+        if dry_run:
+            removed.append(name)
+            continue
+        try:
+            os.unlink(candidate)
+        except OSError:
+            continue
+        removed.append(name)
+    return sorted(removed)
 
 
 def identifier(value):
