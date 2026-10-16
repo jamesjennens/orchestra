@@ -5,6 +5,7 @@ import { setupHint } from './setup.js';
 import { mergeSlotPanel } from './merge_slot.js';
 import { guidancePanel } from './guidance.js';
 import { coordinationPanel } from './coordination.js';
+import { expiryLine, extensionButton } from '../credentialLifetime.js';
 
 const PAGE = 10;
 export const canWrite = (p) => ['owner', 'coordinator', 'contributor', 'superuser'].includes(p.role);
@@ -48,10 +49,18 @@ export async function overview(ctx, { pid }) {
       unusableBanner(project),
       h('p', null, h('a', { href: ctx.href(`/p/${pid}/settings`) }, 'Members, credentials and archive')));
   }
-  const state = { status: 'active', q: '', review: '', cursor: null, stack: [] };
+  const state = { status: 'active', q: '', review: '', cursor: null, stack: [], requirements: false };
   const tableHost = h('div', { class: 'panel' });
 
   const search = h('input', { type: 'search', id: 'task-search', placeholder: 'Search title, description or ID', 'aria-label': 'Search tasks' });
+  // A requirement record or BRD section is a visible row the server never calls claimable
+  // work (kittrial-5bb.277): it is left out of the default task view, and this filter shows
+  // it again marked as a requirement. Off by default, so the Tasks page reads as tasks.
+  const requirementFilter = h('input', { type: 'checkbox', id: 'show-requirements' });
+  const requirementToggle = h('label', { class: 'check', for: 'show-requirements' }, requirementFilter, 'Show requirements');
+  requirementFilter.addEventListener('change', () => {
+    state.requirements = requirementFilter.checked; state.cursor = null; state.stack = []; draw();
+  });
   const statusSeg = h('div', { class: 'seg', role: 'group', 'aria-label': 'Status' },
     [['active', 'Active'], ['closed', 'Closed'], ['', 'All']].map(([value, label]) => h('button', { type: 'button', 'aria-pressed': String(state.status === value), onclick: (e) => {
       state.status = value; state.cursor = null; state.stack = [];
@@ -72,7 +81,12 @@ export async function overview(ctx, { pid }) {
       tableHost.replaceChildren(errorState(error, draw));
       return;
     } finally { tableHost.removeAttribute('aria-busy'); }
-    const rows = page.items;
+    const allRows = page.items;
+    // Requirement records are marked by the server and, unless the filter asks for them,
+    // left out of the task view (kittrial-5bb.277). The count is kept so the page can say
+    // that rows were left out instead of reading as if the tracker held no work at all.
+    const hiddenRequirements = allRows.filter((t) => t.requirement_record).length;
+    const rows = state.requirements ? allRows : allRows.filter((t) => !t.requirement_record);
     const start = state.stack.length * PAGE;
     // The server says when some rows' review state is unknown (closed tasks with a
     // finished review, or rows past its bounded read); those show their status only.
@@ -86,13 +100,29 @@ export async function overview(ctx, { pid }) {
           '. Everything else is shown. Ask an operator of the server to repair ', unread === 1 ? 'it.' : 'them.',
           page.review_states_unavailable ? ' Until then review states are not shown here.' : '')
       : null;
+    // Rows left out of the default view (kittrial-5bb.277): say how many and how to see
+    // them, so an empty list is never mistaken for a project with no work. Said only for
+    // the unfiltered view: a person who filtered for a state asked for that answer. The
+    // count covers the rows the current page fetched, not the whole project.
+    const leftOut = !state.requirements && hiddenRequirements && !state.q && !state.review
+      ? h('p', { class: 'small muted', role: 'note' }, hiddenRequirements === 1
+        ? '1 requirement record is not shown here. Turn on “Show requirements” to see it. The count covers the rows on this page.'
+        : hiddenRequirements + ' requirement records are not shown here. Turn on “Show requirements” to see them. The count covers the rows on this page.')
+      : null;
     tableHost.replaceChildren(
       ...(unreadable ? [unreadable] : []),
+      leftOut,
       rows.length ? h('div', { class: 'table-wrap' }, h('table', null,
         h('caption', { class: 'visually-hidden' }, 'Tasks in ' + project.name),
         h('thead', null, h('tr', null, h('th', { scope: 'col' }, 'Task'), h('th', { scope: 'col' }, 'State'), h('th', { scope: 'col', class: 'hide-narrow' }, 'Assignee'), h('th', { scope: 'col', class: 'hide-narrow' }, 'Next action'), h('th', { scope: 'col', class: 'hide-narrow' }, 'Updated'))),
-        h('tbody', null, rows.map((t) => h('tr', { class: 'row-link', onclick: (e) => { if (e.target.tagName !== 'A') ctx.go(`/p/${pid}/t/${t.id}`); } },
-          h('td', null, h('a', { class: 'title', href: ctx.href(`/p/${pid}/t/${t.id}`) }, t.title || t.id), h('div', { class: 'sub' }, t.priority != null ? [priority(t.priority), ' · '] : null, h('span', { class: 'mono' }, t.id))),
+        h('tbody', null, rows.map((t) => h('tr', { class: 'row-link', 'data-requirement': t.requirement_record ? 'true' : null, onclick: (e) => { if (e.target.tagName !== 'A') ctx.go(`/p/${pid}/t/${t.id}`); } },
+          h('td', null,
+            // A requirement record is marked plainly and points at the Requirements page,
+            // never offered as ordinary work (kittrial-5bb.277).
+            t.requirement_record ? h('span', { class: 'chip', title: 'A requirement record, not claimable work' }, 'Requirement') : null,
+            h('a', { class: 'title', href: ctx.href(`/p/${pid}/t/${t.id}`) }, t.title || t.id),
+            h('div', { class: 'sub' }, t.priority != null ? [priority(t.priority), ' · '] : null, h('span', { class: 'mono' }, t.id),
+              t.requirement_record ? [' · ', h('a', { href: ctx.href(`/p/${pid}/requirements`) }, 'Edit on Requirements')] : null)),
           // A row the server could not read is listed, and says so (kittrial-5bb.169).
           h('td', null, t.unreadable ? h('span', { class: 'chip crit' }, 'Cannot be read') : t.review_state && t.review_state !== 'none' ? reviewChip(t.review_state) : statusChip(t.status)),
           h('td', { class: 'hide-narrow' }, t.assignee_name || h('span', { class: 'muted' }, 'Unclaimed')),
@@ -126,7 +156,7 @@ export async function overview(ctx, { pid }) {
     mergeSlotPanel(ctx, project),
     guidancePanel(ctx, project),
     strip,
-    h('div', { class: 'toolbar' }, search, statusSeg, reviewSel),
+    h('div', { class: 'toolbar' }, search, statusSeg, reviewSel, requirementToggle),
     tableHost);
 }
 
@@ -298,7 +328,7 @@ export async function settings(ctx, { pid }) {
       h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Agents in this project ', h('span', { class: 'nav-count' }, rows.length)),
         h('span', { class: 'small muted hide-narrow' }, 'A coordinating agent may approve other accounts’ work here; never its own account’s')),
       rows.length ? h('div', { class: 'table-wrap' }, h('table', null,
-        h('thead', null, h('tr', null, h('th', { scope: 'col' }, 'Agent'), h('th', { scope: 'col' }, 'Account'), h('th', { scope: 'col' }, 'Coordinator'), h('th', { scope: 'col' }, h('span', { class: 'visually-hidden' }, 'Actions')))),
+        h('thead', null, h('tr', null, h('th', { scope: 'col' }, 'Agent'), h('th', { scope: 'col' }, 'Account'), h('th', { scope: 'col' }, 'Coordinator'), h('th', { scope: 'col' }, 'Agent credentials'), h('th', { scope: 'col' }, h('span', { class: 'visually-hidden' }, 'Actions')))),
         h('tbody', null, rows.map((a) => {
           const grant = a.coordinator;
           const change = async (e, call, done) => {
@@ -312,6 +342,10 @@ export async function settings(ctx, { pid }) {
               [h('span', { class: 'chip ' + (grant.effective ? 'ok' : 'plain') }, grant.effective ? 'Coordinates' : 'Granted, no effect'),
                 h('div', { class: 'sub' }, 'by ', grant.granted_by_display_name || grant.granted_by, ' ', time(grant.granted_at),
                   grant.effective ? null : (NO_EFFECT[grant.no_effect_because] || NO_EFFECT['account-role']))]),
+            h('td', null, (a.credentials || []).map((c) => h('div', { class: 'stack', 'data-credential': c.id },
+              h('code', { class: 'small' }, c.id), expiryLine(c),
+              !project.archived && a.enabled && c.working ? extensionButton(a, c,
+                () => ctx.api.extendProjectAgentCredential(pid, a.id, c.id), drawAgents) : null))),
             h('td', null, project.archived ? null : grant ?
               h('button', { type: 'button', class: 'danger', 'aria-label': 'Remove the coordinator grant from ' + a.name,
                 onclick: (e) => change(e, () => ctx.api.revokeCoordinator(pid, a.id), `${a.name} no longer coordinates`) }, 'Remove grant') :

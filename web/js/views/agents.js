@@ -4,6 +4,7 @@
 import { h, time, toast, copyText, copyButton, confirmDialog } from '../dom.js';
 import { pageHead, empty, field, setFieldError, formValues, act, errorState } from '../ui.js';
 import * as setupText from '../agentSetup.js';
+import { expiryLine, extensionButton } from '../credentialLifetime.js';
 
 export const ATTENTION = {
   feedback: ['Has feedback to act on', 'warn'],
@@ -113,6 +114,9 @@ export function agentCard(ctx, raw, { compact = false } = {}) {
         h('span', { class: 'small prompt' }, resumePrompt(agent)),
         h('button', { type: 'button', class: 'ghost', 'aria-label': 'Copy the resume prompt', onclick: () => copy(resumePrompt(agent), 'Resume prompt') }, 'Copy')),
       compact ? null : h('p', { class: 'small muted resume-hint' }, 'Needs .orchestra/agent.json in the folder; use Set up folder first.')),
+    raw.created_by && raw.created_by !== raw.owner ? h('p', { class: 'small muted', 'data-created-by': raw.created_by },
+      'Created by ', raw.created_by_display_name || raw.created_by, '. That superuser saw the first secret. Issue a new secret if this matters to you.') : null,
+    credentialsOf(raw).some((c) => c.expires_soon && works(c)) ? h('div', { class: 'banner warn', role: 'status' }, 'A credential expires within seven days. Extend it under What it may do; its existing secret keeps working.') : null,
     compact ? null : scopesLine(raw),
     manages(ctx, raw) ? h('div', { class: 'copy-row' },
       h('button', { type: 'button', 'aria-label': 'Set up the folder for ' + agent.display_name, onclick: (event) => reopenSetup(ctx, raw.id, event.currentTarget) }, 'Set up folder')) : null,
@@ -197,6 +201,9 @@ export async function list(ctx) {
         h('span', null, c.label || c.id, ' ', h('span', { class: 'small muted' }, 'issued ', time(c.created_at), ' · allows ', scopeNames(c.scopes))),
         working ? (other.includes(c) ? h('span', { class: 'chip warn' }, known ? 'Allows something else' : 'Differs') : h('span', { class: 'chip ok' }, 'Works')) :
           h('span', { class: 'chip plain' }, c.revoked ? 'Revoked' : 'Expired'));
+      row.append(expiryLine(c));
+      if (working && agent.enabled !== false) row.append(extensionButton(
+        agent, c, () => ctx.api.extendAgentCredential(agent.id, c.id), load));
       if (working && agent.enabled !== false) row.append(h('button', { type: 'button', class: 'danger', 'aria-label': 'Revoke credential ' + (c.label || c.id), onclick: async (event) => {
         if (!(await confirmDialog({ title: 'Revoke this credential?', body: 'Anything still using its secret stops working immediately.', confirmLabel: 'Revoke', danger: true }))) return;
         try { await act(event.currentTarget, () => ctx.api.revokeAgentCredential(agent.id, c.id), { success: 'Credential revoked' }); } catch { return; }
@@ -243,7 +250,17 @@ export async function list(ctx) {
     return ctx.projects.filter((p) => !p.archived && ['owner', 'coordinator', 'contributor', 'superuser'].includes(p.role));
   }
   const projects = grantable();
+  let accounts = [];
+  let accountError = null;
+  if (ctx.me && ctx.me.superuser) {
+    try { accounts = (await ctx.api.accounts()).items.filter((u) => !u.disabled); } catch (error) { accountError = error; }
+  }
+  const ownerField = ctx.me && ctx.me.superuser ? field({ id: 'a-owner', type: 'select', label: 'Account that owns this agent', value: ctx.me.id,
+    options: accounts.length ? accounts.map((u) => [u.id, (u.display_name || u.username || u.id) + (u.id === ctx.me.id ? ' (you)' : '')]) : [[ctx.me.id, 'Your account']],
+    hint: 'A superuser may create for another account. You see its first secret; that account can issue a new one. Projects must be available to that account.' }) : null;
   const form = h('form', { class: 'form', novalidate: true },
+    ownerField,
+    accountError ? h('p', { class: 'banner', role: 'status' }, 'Could not load other accounts. Reload this page to choose another account; your draft stays here until creation succeeds.') : null,
     h('div', { class: 'form-row' },
       field({ id: 'a-name', label: 'Agent name', hint: 'How colleagues will see it, e.g. “Kestrel”.', required: true, maxlength: 40 }),
       field({ id: 'a-tool', label: 'Runs in', value: 'GitHub Copilot in VS Code' })),
@@ -251,7 +268,7 @@ export async function list(ctx) {
     h('fieldset', { class: 'checks' }, h('legend', null, 'Projects it can work on'),
       projects.length ? projects.map((p) => h('label', { class: 'check', for: 'ap-' + p.id }, h('input', { type: 'checkbox', id: 'ap-' + p.id, name: 'project', value: p.id }), p.name)) :
         h('p', { class: 'small muted' }, 'You need contributor access to a project first.'),
-      h('p', { class: 'small muted' }, 'It works as a contributor and can never do more than you can in that project.')),
+      h('p', { class: 'small muted' }, 'It works as a contributor and can never do more than its owning account can in that project.')),
     h('div', null, h('button', { type: 'submit', class: 'primary' }, 'Add agent')));
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
@@ -262,7 +279,7 @@ export async function list(ctx) {
     const chosen = [...form.querySelectorAll('input[name=project]:checked')].map((i) => i.value);
     // A name whose secret file would clash with another of your agents (409), or an
     // invalid name (422), is explained next to the name field in the server's words.
-    const created = await act(form.querySelector('button[type=submit]'), () => ctx.api.createAgent({ name, tool: v['a-tool'].trim(), working_directory: v['a-dir'].trim(), projects: chosen }), {
+    const created = await act(form.querySelector('button[type=submit]'), () => ctx.api.createAgent({ name, tool: v['a-tool'].trim(), working_directory: v['a-dir'].trim(), projects: chosen, ...(ownerField ? { owner: v['a-owner'] } : {}) }), {
       success: 'Agent added',
       onError: (e) => { if (e.status === 409 || e.status === 422) { setFieldError(form, 'a-name', e.message); return true; } return false; },
     }).catch(() => null);
@@ -394,15 +411,36 @@ function copyLine(label, text, { ariaLabel, what, note } = {}) {
     note ? h('p', { class: 'small muted' }, note) : null);
 }
 
-// Step 1's numbered instructions. `line` is the header line to paste: the one built
-// with the real secret (only from secretSection) or the placeholder line.
-function secretSteps(payload, line, { withSecret }) {
+// One line per curl error the person may see when the test fails (kittrial-5bb.275).
+export const CURL_ERROR_LINES = Object.freeze({
+  60: 'curl exit 60: the certificate is not in this machine’s trust store — save the service’s certificate and keep the cacert line in the credential file.',
+  35: 'curl exit 35: the TLS handshake failed (wrong address or a proxy speaking plain HTTP to the https port).',
+  26: 'curl exit 26: cannot read the config file — the file name is wrong or Notepad added .txt.',
+  401: 'HTTP 401: the secret or the header line is wrong.',
+});
+
+// Step 1's numbered instructions. `secretValue` is the real secret (only from
+// secretSection) or the placeholder. When the service has its own certificate, the
+// pasted body also carries the curl options (cacert, and ssl-no-revoke for Windows
+// curl.exe) and the person must save the certificate BEFORE the test
+// (kittrial-5bb.275).
+function secretSteps(payload, secretValue, { withSecret, hasCertificate = false }) {
   const file = payload.secretFile;
   const test = setupText.testCommands(payload);
+  const value = secretValue || setupText.SECRET_PLACEHOLDER;
+  const bodyWindows = hasCertificate
+    ? setupText.credentialFileBody(value, payload.certificateFile, { windows: true, hasCertificate: true }).trimEnd()
+    : setupText.headerLine(value);
+  const bodyPosix = hasCertificate
+    ? setupText.credentialFileBody(value, payload.certificateFile, { windows: false, hasCertificate: true }).trimEnd()
+    : null;
   return h('ol', { class: 'setup-substeps' },
+    hasCertificate ? h('li', null, 'Save the service’s certificate FIRST (the “Save certificate” button above), as ', h('code', { class: 'path' }, payload.certificateFile.windows), ' (macOS/Linux ', h('code', { class: 'path' }, payload.certificateFile.posix), '). Every curl below needs that file.') : null,
     h('li', null, 'Open Notepad (on macOS or Linux, a text editor).'),
-    h('li', null, copyLine(withSecret ? 'Paste this one line (it contains the secret):' : 'Paste this one line, with your secret in place of <your secret>:', line,
-      { ariaLabel: withSecret ? 'Copy the header line with the secret' : 'Copy the header line template', what: 'Header line' })),
+    h('li', null, copyLine(withSecret ? 'Paste this (it contains the secret):' : 'Paste this, with your secret in place of <your secret>:', bodyWindows,
+      { ariaLabel: withSecret ? 'Copy the credential file text with the secret' : 'Copy the credential file template', what: 'Credential file text', note: hasCertificate ? 'Type your own full path in place of <your-name> (PowerShell: echo $env:USERPROFILE; macOS/Linux: echo $HOME). The set-up rewrite writes the real expanded path for you.' : null })),
+    bodyPosix ? h('li', null, copyLine('On macOS or Linux the body is this instead:', bodyPosix,
+      { ariaLabel: 'Copy the macOS/Linux credential file text', what: 'Credential file text' })) : null,
     h('li', null,
       copyLine('File > Save As, set “Save as type” to “All files (*.*)”, and use this file name:', file.windows,
         { ariaLabel: 'Copy the Windows secret file name', what: 'File name', note: 'Windows file dialogs understand %USERPROFILE%. Keep the name exactly, with no .txt at the end.' }),
@@ -411,19 +449,20 @@ function secretSteps(payload, line, { withSecret }) {
     h('li', null,
       copyLine('Test it in PowerShell:', test.powershell, { ariaLabel: 'Copy the PowerShell test command', what: 'Command' }),
       copyLine('On macOS or Linux:', test.posix, { ariaLabel: 'Copy the macOS/Linux test command', what: 'Command' }),
-      h('p', { class: 'small muted' }, 'Success prints the agent’s details as JSON (its id and name). “The requested URL returned error: 401” means the secret or the header line is wrong. “cannot read config from …” (curl exit code 26) means the file name is wrong or Notepad added .txt.')),
+      h('p', { class: 'small muted' }, 'Success prints the agent’s details as JSON (its id and name).'),
+      ...Object.entries(CURL_ERROR_LINES).map(([code, text]) => h('p', { class: 'small muted', 'data-curl-error': code }, text))),
     h('li', null, 'Never put the secret on a command line, in the agent folder, in agent.json, in AGENT.md or in the setup prompt. Those only name the file above.'));
 }
 
 // The one-time secret, in its own box with its own copy button, and the step-1 line
 // built from it. This is the ONLY place a secret is rendered; nothing else in the
 // dialog receives it.
-function secretSection(secret, heading, payload) {
+function secretSection(secret, heading, payload, { hasCertificate = false } = {}) {
   return h('div', { class: 'setup-block' },
     h('div', { class: 'copy-row' }, h('h4', { class: 'small' }, heading), copyButton('Copy', secret, { ariaLabel: 'Copy the secret', what: 'Secret' })),
     h('div', { class: 'secret' }, secret),
     h('p', { class: 'small muted' }, 'It is not shown again. Store it now:'),
-    secretSteps(payload, setupText.headerLine(secret), { withSecret: true }));
+    secretSteps(payload, secret, { withSecret: true, hasCertificate }));
 }
 
 // Reopened dialog: no secret. The secret was shown once when its credential was
@@ -432,7 +471,7 @@ function secretSection(secret, heading, payload) {
 function scopeList(scopes) {
   return Array.isArray(scopes) && scopes.length ? ': ' + scopes.join(', ') : '';
 }
-function reissueSection(ctx, agent, payload) {
+function reissueSection(ctx, agent, payload, { hasCertificate = false } = {}) {
   const section = h('div', { class: 'setup-block' });
   if (agent.scopes === null || (agent.scopes_source === 'inferred' && agent.owner !== (ctx.me && ctx.me.id))) {
     // Nothing says what the agent may do, so the server refuses a plain renewal: the choice is on its card.
@@ -455,14 +494,14 @@ function reissueSection(ctx, agent, payload) {
       return;
     }
     // What the new credential may do is said with it: a renewal used to change that without a word (kittrial-5bb.208).
-    section.replaceChildren(secretSection(credential.secret, 'New secret (shown once)', payload),
+    section.replaceChildren(secretSection(credential.secret, 'New secret (shown once)', payload, { hasCertificate }),
       h('p', { class: 'small', 'data-scopes': (credential.scopes || []).join(' ') }, 'This credential carries' + (scopeList(credential.scopes) || ': nothing beyond reading') + '.'),
       olderCredentials(ctx, agent, credential.id));
   } }, 'Issue a new secret');
   section.append(
     h('p', { class: 'small muted' }, 'The secret was shown once, when the agent’s credential was issued, and cannot be shown again. If you stored it as below, nothing more is needed here. If it is lost, issue a new one.'),
     h('div', { class: 'copy-row' }, issue),
-    h('details', null, h('summary', null, 'How the secret is stored'), secretSteps(payload, setupText.headerLine(), { withSecret: false })));
+    h('details', null, h('summary', null, 'How the secret is stored'), secretSteps(payload, null, { withSecret: false, hasCertificate })));
   return section;
 }
 // The agent's other live credentials after a new one is issued: they still work
@@ -496,7 +535,8 @@ async function reopenSetup(ctx, agentId, button) {
 // service's own certificate (GET /v1/service/certificate) or null when it has none.
 function setupDialog(ctx, source, { secret = null, certificate = null } = {}) {
   const payload = setupText.secretlessPayload(source, location.origin);
-  const files = [['agent.json', setupText.agentJson(payload)], ['AGENT.md', setupText.agentGuide(payload)]];
+  const hasCertificate = Boolean(certificate);
+  const files = [['agent.json', setupText.agentJson(payload)], ['AGENT.md', setupText.agentGuide(payload, { hasCertificate })]];
   const folder = payload.workingDirectory;
   const where = folder ? h('code', { class: 'path' }, folder) : 'the agent’s folder';
   // The address the extension must use is the one this page is connected to, not the configured
@@ -573,14 +613,16 @@ function setupDialog(ctx, source, { secret = null, certificate = null } = {}) {
       h('ol', { class: 'setup-steps' },
         step(1, 'Store the secret',
           h('p', { class: 'small' }, 'The agent reads its secret from one small file in your user profile, never from its own folder: ', h('code', null, payload.secretFile.windows), '.'),
-          secret ? secretSection(secret, 'Secret (shown once)', payload) : reissueSection(ctx, source.agent || {}, payload)),
+          // Save the certificate BEFORE the test (kittrial-5bb.275): the test curl and every
+          // curl -K need the saved certificate to pass the certificate check.
+          certificateBlock,
+          secret ? secretSection(secret, 'Secret (shown once)', payload, { hasCertificate }) : reissueSection(ctx, source.agent || {}, payload, { hasCertificate })),
         step(2, 'Set up the folder',
           h('p', { class: 'setup-intro' }, SETUP_INTRO),
           h('p', { class: 'small' }, 'The folder gets two small files, ', h('code', null, setupText.CONFIG_PATH), ' and ', h('code', null, setupText.GUIDE_PATH),
             ', in ', where, '. Keep .orchestra/ out of Git. Neither file holds the secret; they only name the file from step 1.'),
           h('p', { class: 'small', 'data-writes': 'setup' }, SETUP_WRITES_LINE),
           roleChoice,
-          certificateBlock,
           h('section', { class: 'setup-block', 'aria-label': 'Save the setup files' }, save, status),
           promptSection,
           fileBlock(setupText.CONFIG_PATH, files[0][1], folder, setupText.CONFIG_PATH),

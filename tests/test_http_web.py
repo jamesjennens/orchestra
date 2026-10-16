@@ -19,6 +19,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import unittest
 from pathlib import Path
@@ -1667,16 +1668,19 @@ class AgentSetupDialogCase(unittest.TestCase):
         uses = [line.strip() for line in dialog.splitlines()
                 if re.search(r'\bsecret\b', self.unquoted(line))]
         self.assertIn('function setupDialog(ctx, source, { secret = null, certificate = null } = {}) {', code)
-        self.assertEqual(["secret ? secretSection(secret, 'Secret (shown once)', payload) : "
-                          "reissueSection(ctx, source.agent || {}, payload)),"], uses)
+        self.assertEqual(["secret ? secretSection(secret, 'Secret (shown once)', payload, { hasCertificate }) : "
+                          "reissueSection(ctx, source.agent || {}, payload, { hasCertificate })),"], uses)
         section = self.function_body(code, 'secretSection')
         self.assertIn("copyButton('Copy', secret", section)
         self.assertIn("h('div', { class: 'secret' }, secret)", section)
-        # Step 1's line is the only other thing built from the secret, and only here.
-        self.assertIn('secretSteps(payload, setupText.headerLine(secret), { withSecret: true })', section)
-        self.assertEqual(1, code.count('setupText.headerLine(secret)'))
+        # Step 1's body is the only other thing built from the secret, and only here.
+        self.assertIn('secretSteps(payload, secret, { withSecret: true, hasCertificate })', section)
+        self.assertEqual(1, code.count('secretSteps(payload, secret,'))
         steps = self.function_body(code, 'secretSteps')
-        self.assertIsNone(re.search(r'\bsecret\b|credential', self.unquoted(steps)))
+        # secretSteps builds the pasted body from the value it is handed; it never
+        # reads a credential record or a .secret property (kittrial-5bb.275).
+        self.assertIsNone(re.search(r'\.secret\b|\.credential\b|\bcredential\.', self.unquoted(steps)))
+        self.assertNotIn('created', steps)
 
     @staticmethod
     def unquoted(line):
@@ -1703,7 +1707,7 @@ class AgentSetupDialogCase(unittest.TestCase):
                 if not line.strip().startswith('body:')
                 and re.search(r'\bsecret\b', self.unquoted(line))]
         self.assertEqual(['if (!credential.secret) {',
-                          "section.replaceChildren(secretSection(credential.secret, 'New secret (shown once)', payload),"],
+                          "section.replaceChildren(secretSection(credential.secret, 'New secret (shown once)', payload, { hasCertificate }),"],
                          uses)
         # What the new credential carries is shown with it, and the confirmation says what a renewal keeps
         # (kittrial-5bb.208: the page sends no scope list, and the server used to answer the default four).
@@ -1721,7 +1725,7 @@ class AgentSetupDialogCase(unittest.TestCase):
         self.assertEqual(code.count('ctx.api.issueAgentCredential('), 2)
         self.assertIn('ctx.api.issueAgentCredential(agent.id, chosen)', code)
         # Without a fresh secret the steps show the placeholder line only.
-        self.assertIn('secretSteps(payload, setupText.headerLine(), { withSecret: false })', reissue)
+        self.assertIn('secretSteps(payload, null, { withSecret: false, hasCertificate })', reissue)
         older = self.function_body(code, 'olderCredentials')
         self.assertIsNone(re.search(r'\bsecret\b', self.unquoted(older)))
         self.assertIn('ctx.api.revokeAgentCredential(agent.id, c.id)', older)
@@ -1746,9 +1750,15 @@ class AgentSetupDialogCase(unittest.TestCase):
         self.assertIn("copyLine('Resume prompt:', resume", step3)
         steps = self.function_body(self.code(self.AGENTS_JS), 'secretSteps')
         for text in ('Open Notepad', 'Save as type', 'All files (*.*)', 'file.windows', 'file.posix',
-                     'test.posixChmod', 'test.powershell', 'test.posix', 'error: 401',
-                     'cannot read config from', 'exit code 26', '.txt'):
+                     'test.posixChmod', 'test.powershell', 'test.posix', '.txt'):
             self.assertIn(text, steps)
+        # kittrial-5bb.275: each curl error the person may see gets one line, and the
+        # certificate is saved BEFORE the test.
+        self.assertIn('Save the service’s certificate FIRST', steps)
+        self.assertIn("'data-curl-error': code", steps)
+        agents = self.AGENTS_JS.read_text(encoding='utf-8')
+        for line in ('curl exit 60', 'curl exit 35', 'curl exit 26', 'HTTP 401'):
+            self.assertIn(line, agents)
 
     def test_secret_file_slug_matches_the_server(self):
         from http_auth import agent_secret_file, agent_slug
@@ -1861,6 +1871,22 @@ console.log(JSON.stringify({
   certFile: m.certificateFile('Kestrel (agent of Olive)'),
   rewrite: m.credentialFileCommand(m.secretFile('Kestrel'),
     m.credentialCommentLines('https://office.example.invalid:7443', 'AB:CD')).posix,
+  // kittrial-5bb.275: the credential file the dialog builds carries the curl options when
+  // the service has its own certificate; both platform texts; commands stay -K only.
+  bodyNone: m.credentialFileBody('S3', m.certificateFile('Kestrel'), { hasCertificate: false }),
+  bodyWindows: m.credentialFileBody('S3', m.certificateFile('Kestrel'), { windows: true, hasCertificate: true }),
+  bodyPosix: m.credentialFileBody('S3', m.certificateFile('Kestrel'), { windows: false, hasCertificate: true }),
+  bodyPlaceholder: m.credentialFileBody(null, m.certificateFile('Kestrel'), { windows: true, hasCertificate: true }),
+  psRewriteWithCert: m.credentialFileCommand(m.secretFile('Kestrel'),
+    m.credentialCommentLines('https://office.example.invalid:7443', 'AB:CD'),
+    { certFile: m.certificateFile('Kestrel'), hasCertificate: true }).powershell,
+  posixRewriteWithCert: m.credentialFileCommand(m.secretFile('Kestrel'),
+    m.credentialCommentLines('https://office.example.invalid:7443', 'AB:CD'),
+    { certFile: m.certificateFile('Kestrel'), hasCertificate: true }).posix,
+  testHasCacert: /--cacert/.test(m.testCommands(p).posix + m.testCommands(p).powershell),
+  guideWithCert: m.agentGuide(p, { hasCertificate: true }),
+  guideWithCertIsKOnly: m.agentGuide(p, { hasCertificate: true }).includes('curl -fsS -K')
+    && !/curl[^\\n]*--cacert/.test(m.agentGuide(p, { hasCertificate: true })),
   paths: [m.destinationPath(p.workingDirectory, m.CONFIG_PATH), m.destinationPath('/home/j/x/', m.GUIDE_PATH),
           m.destinationPath('D:', m.CONFIG_PATH), m.destinationPath('', m.CONFIG_PATH)],
   ignore: [m.gitignoreAppend('node_modules'), m.gitignoreAppend('a\r\n'), m.gitignoreAppend('/.orchestra\n'),
@@ -1913,6 +1939,116 @@ console.log(JSON.stringify({
                           'windows': '%USERPROFILE%\\.orchestra-agent-kestrel-agent-of-olive.crt',
                           'powershell': '$env:USERPROFILE\\.orchestra-agent-kestrel-agent-of-olive.crt',
                           'posix': '~/.orchestra-agent-kestrel-agent-of-olive.crt'}, result['certFile'])
+        # kittrial-5bb.275 rev2: the Notepad body shows a full path the person types
+        # (curl does not expand %USERPROFILE% or ~ in a config file); the rewrite writes the
+        # real expanded path. Commands stay -K only.
+        self.assertEqual('header = "Authorization: Bearer S3"\n', result['bodyNone'])
+        self.assertEqual(
+            'cacert = "C:/Users/<your-name>/.orchestra-agent-kestrel.crt"\n'
+            'ssl-no-revoke\n'
+            'header = "Authorization: Bearer S3"\n',
+            result['bodyWindows'])
+        self.assertEqual(
+            'cacert = /home/<your-name>/.orchestra-agent-kestrel.crt\n'
+            'header = "Authorization: Bearer S3"\n',
+            result['bodyPosix'])
+        self.assertIn('header = "Authorization: Bearer <your secret>"', result['bodyPlaceholder'])
+        self.assertIn('ssl-no-revoke', result['bodyPlaceholder'])
+        self.assertIn('<your-name>', result['bodyPlaceholder'])
+        self.assertFalse(result['testHasCacert'])
+        self.assertTrue(result['guideWithCertIsKOnly'])
+        self.assertIn('cacert', result['guideWithCert'])
+        self.assertIn('ssl-no-revoke', result['guideWithCert'])
+        # The rewrite WRITES the curl options with the real expanded path.
+        self.assertIn('GetFolderPath', result['psRewriteWithCert'])
+        self.assertIn('-replace', result['psRewriteWithCert'])
+        self.assertIn('ssl-no-revoke', result['psRewriteWithCert'])
+        # kittrial-5bb.275 rev3/rev4: double-quoted PowerShell strings with backtick escapes
+        # only. The string must CLOSE after the escaped quote: "cacert = `" is a parse error
+        # (the `" is inside the string); it must be "cacert = `"" + (...).
+        self.assertIn('`"', result['psRewriteWithCert'])
+        self.assertIn('cacert = `""', result['psRewriteWithCert'])
+        self.assertNotIn('cacert = `" +', result['psRewriteWithCert'])
+        self.assertNotIn("+ '/.", result['psRewriteWithCert'])
+        self.assertNotIn("+ \\'/", result['psRewriteWithCert'])
+        self.assertIn('cacert = $HOME/', result['posixRewriteWithCert'])
+        self.assertIn('ssl-no-revoke', result['posixRewriteWithCert'])  # stripped if present
+        self.assertNotIn('<your-name>', result['posixRewriteWithCert'])
+        self.assertNotIn('%USERPROFILE%', result['posixRewriteWithCert'])
+        self.assertNotIn('cacert = $HOME/', result['rewrite'])  # no cert: no curl option written
+        self.assertNotIn('GetFolderPath', result['rewrite'])
+
+    @unittest.skipIf(os.name == 'nt', 'the POSIX rewrite command runs in a POSIX shell; '
+                     'Windows runs the PowerShell command, pinned by its own test')
+    def test_the_rewrite_writes_the_expanded_cacert_path(self):
+        # kittrial-5bb.275 rev2: curl does not expand %USERPROFILE% or ~ inside a config file.
+        # The rewrite command must write the REAL path on the person's machine. Run the POSIX
+        # rewrite's output and read the file it produces.
+        node = shutil.which('node')
+        if not node:
+            self.skipTest('node is not installed; the static checks above still apply')
+        script = r"""
+const m = await import(process.argv[1]);
+const file = m.secretFile('Kestrel');
+const cert = m.certificateFile('Kestrel');
+const command = m.credentialFileCommand(file,
+  m.credentialCommentLines('https://office.example.invalid:7443', 'AB:CD'),
+  { certFile: cert, hasCertificate: true });
+const bodyNone = m.credentialFileBody('S3', cert, { hasCertificate: false });
+const bodyWin = m.credentialFileBody('S3', cert, { windows: true, hasCertificate: true });
+const bodyPos = m.credentialFileBody('S3', cert, { windows: false, hasCertificate: true });
+console.log(JSON.stringify({
+  posix: command.posix, powershell: command.powershell,
+  bodyNone, bodyWin, bodyPos,
+  pattern: /grep -vE/.test(command.posix),
+  psExpands: command.powershell.includes("GetFolderPath('UserProfile')")
+    && command.powershell.includes("-replace"),
+  // kittrial-5bb.275 rev3/rev4: double-quoted PowerShell strings with backtick escapes only;
+  // the string must CLOSE after the escaped quote ("cacert = `"" + ...).
+  psBacktickQuote: command.powershell.includes('`"'),
+  psStringCloses: command.powershell.includes('cacert = `""'),
+  psNoSingleQuotedSlash: !command.powershell.includes("+ '/.") && !command.powershell.includes("+ \\'/"),
+  posixExpandsHome: command.posix.includes('cacert = $HOME/'),
+}));
+"""
+        out = run_node_module(self, node, script, self.SETUP_JS.as_uri())
+        self.assertEqual(0, out.returncode, out.stderr)
+        result = json.loads(out.stdout)
+        self.assertTrue(result['pattern'])
+        self.assertTrue(result['psExpands'])
+        self.assertTrue(result['psBacktickQuote'])
+        self.assertTrue(result['psStringCloses'])
+        self.assertTrue(result['psNoSingleQuotedSlash'])
+        self.assertTrue(result['posixExpandsHome'])
+        self.assertIn('ssl-no-revoke', result['powershell'])
+        # Notepad bodies: the person types their own full path; no %USERPROFILE% or ~.
+        self.assertIn('C:/Users/<your-name>/.orchestra-agent-kestrel.crt', result['bodyWin'])
+        self.assertNotIn('%USERPROFILE%', result['bodyWin'])
+        self.assertIn('/home/<your-name>/.orchestra-agent-kestrel.crt', result['bodyPos'])
+        self.assertNotIn('~', result['bodyPos'])
+        # Run the POSIX rewrite for real: $HOME must be expanded by the shell, and the
+        # header line must survive. (Not subprocess.run: reserved for run_node_module.)
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            cred = home / '.orchestra-agent-kestrel.curlrc'
+            cred.write_text('header = "Authorization: Bearer S3"\n', encoding='utf-8')
+            cred.chmod(0o644)  # rewrite must make it 600
+            env = dict(os.environ, HOME=str(home))
+            subprocess.check_output(['bash', '-c', result['posix']], env=env, text=True)
+            written = cred.read_text(encoding='utf-8')
+            self.assertIn('# server = https://office.example.invalid:7443', written)
+            self.assertIn('# server certificate sha256 = AB:CD', written)
+            self.assertIn('cacert = %s/.orchestra-agent-kestrel.crt' % home, written)
+            self.assertIn('header = "Authorization: Bearer S3"', written)
+            self.assertNotIn('$HOME', written)  # expanded, not literal
+            self.assertNotIn('<your-name>', written)
+            self.assertEqual(0o600, cred.stat().st_mode & 0o777)
+            # Running it a second time replaces the managed lines, not a second copy.
+            subprocess.check_output(['bash', '-c', result['posix']], env=env, text=True)
+            again = cred.read_text(encoding='utf-8')
+            self.assertEqual(1, again.count('cacert ='))
+            self.assertEqual(1, again.count('# server ='))
+            self.assertEqual(1, again.count('header ='))
 
 
 

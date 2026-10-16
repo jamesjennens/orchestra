@@ -377,6 +377,18 @@ class Client:
         return self.request('DELETE', '/v1/projects/%s/members/%s'
                             % (quote(project, safe=''), quote(user_id, safe='')), key=key)
 
+    # -- personal agents -------------------------------------------------------
+    def create_agent(self, name, *, owner=None, key=None, **fields):
+        body = dict(fields, name=name)
+        if owner is not None:
+            body['owner'] = owner
+        return self.request('POST', '/v1/agents', body, key=key)
+
+    def extend_agent_credential(self, agent_id, credential_id, *, project=None, key=None):
+        stem = '/v1/agents' if project is None else '/v1/projects/%s/agents' % quote(project, safe='')
+        return self.request('POST', '%s/%s/credentials/%s/extend' %
+                            (stem, quote(agent_id, safe=''), quote(credential_id, safe='')), {}, key=key)
+
     # -- worker credentials ----------------------------------------------------
     def issue_credential(self, project, label=None, scopes=None, actor=None, key=None):
         return self.request('POST', '/v1/projects/%s/worker-credentials' % quote(project, safe=''),
@@ -521,7 +533,9 @@ def _build_parser():
     parser = argparse.ArgumentParser(description='Orchestra office HTTP client')
     parser.add_argument('--base-url', default=os.environ.get('ORCHESTRA_HTTP_URL'),
                         help='service base URL (or ORCHESTRA_HTTP_URL)')
-    parser.add_argument('--token', help='bearer session or worker credential')
+    parser.add_argument('--token',
+                        help='bearer session or worker credential; pass it as --token=VALUE '
+                             'so a secret beginning with "-" is not read as an option')
     parser.add_argument('--ca-file', help='CA bundle for TLS verification')
     parser.add_argument('--insecure', action='store_true', help='skip TLS verification (tests only)')
     parser.add_argument('--use-cookie', action='store_true',
@@ -569,7 +583,10 @@ def _build_parser():
     call.add_argument('path')
     call.add_argument('--body', help='JSON request body')
     call.add_argument('--idempotency-key', help='reuse a key to reconcile an uncertain write')
-    call.add_argument('--credential', help='use this worker credential for the call')
+    call.add_argument('--credential',
+                      help='use this worker credential for the call; pass it as '
+                           '--credential=VALUE so a secret beginning with "-" is not read '
+                           'as an option')
     return parser
 
 

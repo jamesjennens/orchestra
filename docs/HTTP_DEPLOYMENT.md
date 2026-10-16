@@ -1302,7 +1302,7 @@ export ORCHESTRA_HTTP_URL=https://<HOSTNAME>
 export ORCHESTRA_PASSWORD='...'          # read from the environment, never an argv
 python3 http_client.py login --username <USERNAME>
 # the client prints the session token to stdout; keep it out of shell history/logs
-python3 http_client.py --token "$TOKEN" call GET /v1/projects
+python3 http_client.py --token="$TOKEN" call GET /v1/projects
 ```
 
 A project owner or superuser issues a project-scoped credential once; the secret
@@ -1681,6 +1681,9 @@ leaving the SSH path alone. No decision is built here beyond the service-only ru
 agent can write its first one from the brief alone.
 - `activity_cursor`: the cursor a checkpoint must carry. It is the same value the
   history route returns. (With `--backend inprocess` it is null and not needed.)
+- `next_action` and `review.next_actor` for every task (kittrial-5bb.291 item 3): the
+  same next-action sentence and caller-neutral role the work queue already carries, so
+  a reader of the brief alone knows whose move it is without a second read.
 - `checkpoint_template`: the record to send, for this task at this moment.
   - `send_to` and `method`: where it goes.
   - `body`: every field, with `previous` and `activity_cursor` already filled, the four
@@ -3222,7 +3225,9 @@ targets, unreadable state and missing authority refuse without an assignment eff
 Assignment changes the assignee. Unassigning an `in_progress` task with no
 contribution in flight also returns its native status to `open`. An undelivered
 ordinary task then appears in the available-work queue and another contributor
-can claim it. A task with delivered history retains the existing delivered-work
+can claim it. Unassigning a `blocked` task leaves it blocked: it has no holder and
+is not claimable (kittrial-5bb.291 item 4), so it stays out of the available-work
+queue until somebody reopens it. A task with delivered history retains the existing delivered-work
 claim guard; use assignment to name its next holder. With an in-flight contribution,
 unassignment retains its status and review items, and an awaiting-review or
 changes-requested contribution still requires the explicit displacement flag.
@@ -3311,3 +3316,66 @@ assignment notices in their work and lane views of the new project, while the
 original comments remain in task history. The assignment-roster read uses shared
 project and authority locks so concurrent readers do not queue behind an exclusive
 read lock; assignment effects retain their exclusive guards.
+
+## Agent credential lifetime
+
+The installation option `--agent-credential-days DAYS` sets future personal-agent
+credential issuance to 1 through 366 whole days, default 30. The office may choose 90;
+90 is a configuration choice, not a separate code path. Worker credentials, sessions
+and reset values retain their existing lifetimes. Changing the setting does not
+rewrite credentials already issued. Invalid values are refused before opening state.
+
+Each new agent key stores its monotone expiry and raw-clock deadline in the existing
+credential row. The current reader expires it on either clock. A key longer than the
+older kit's fixed 30-day raw-age cap uses that reader's existing legacy stored-expiry
+path (no `issued_raw`); its actual raw issue time remains in `agent_issued_raw`.
+An older reader ignores the added deadline fields and honours the stored expiry;
+it does not provide the new reader's per-key raw-deadline check for those keys.
+Default30 keys keep their original raw issuance stamp as well.
+
+Expiry timestamps must have a representable RFC3339 year from 1 through 9999;
+a clock or requested expiry beyond that range is refused before credential effects.
+
+
+### Extending an agent credential
+
+`POST /v1/agents/AGENT/credentials/CREDENTIAL/extend` extends a working key for its
+own account or a superuser. A current human project owner (or a superuser) uses
+`POST /v1/projects/PROJECT/agents/AGENT/credentials/CREDENTIAL/extend` for an agent
+still granted that project. Send an empty JSON object and keep the same
+Idempotency-Key when retrying an uncertain result. Coordinators, contributors,
+viewers, personal agents and worker credentials have no extension authority.
+A completed retry rechecks current authority, the grant, the target account and
+agent, key binding, revocation and expiry; losing any of these refuses the retry.
+No expired or revoked key is revived. A disabled account or agent cannot extend.
+
+The same credential keeps its ID, hash/secret, issuer, actor, scopes and grants.
+Its expiry becomes `max(existing expiry, now + configured agent lifetime)`;
+retries do not add lifetime intervals. No secret is returned, shown, replayed or
+written to the audit. The audit records caller, target, project and old/new expiry.
+Extension and its audit are saved before the keyed receipt. A failed state save
+rolls them back; a failure after saving retains the extension and the in-progress
+reservation, so reconcile the current credential instead of inventing a fresh key.
+The existing service-local HTTP receipt window applies (24 hours); an exact retry
+within it never performs another extension. This is not an indefinite retry contract.
+
+The Agents page and the owner's project settings show expiry, the final seven-day
+warning and Extend existing credential. This action keeps the existing secret.
+Issuing a new secret is a separate action for the agent's own account or a
+superuser; it retains the existing scope confirmation/widening rules and the
+20 working / five retained dead credential bounds. Extension makes no new key.
+`GET /v1/sessions/current` adds `credential_expiry` for an agent credential.
+Project-owner credential rows expose only ID, expiry, working/revoked status and
+warning, never labels, hashes, scopes, directories, other grants or secrets.
+
+### A superuser creating for another account
+
+A superuser may send `owner: ACCOUNT_ID` on `POST /v1/agents`, or choose a real,
+enabled account in the Agents page. Omission means the caller's own account.
+Ownership, name/file collision, the 100-agent bound, project membership and the
+credential's user/party all use the target account. This grants no membership or
+coordinator role. Other accounts cannot target a foreign owner. The first secret
+is shown once to the creating superuser; a retry returns secret-free metadata.
+The audit identifies creator and owner, and the owner's card says Created by NAME.
+The owning account can issue a new secret and revoke that first key if the creator
+having seen it matters. Legacy agents have no invented creator attribution.

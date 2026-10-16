@@ -627,8 +627,15 @@ _LOCAL = threading.local()
 
 
 @contextmanager
-def file_lock(path, timeout=60.0, poll=0.02):
-    """Cross-process exclusive lock on ``path`` (``fcntl`` or ``msvcrt``).
+def file_lock(path, timeout=60.0, poll=0.02, shared=False):
+    """Cross-process lock on ``path`` (``fcntl`` or ``msvcrt``).
+
+    Exclusive by default. ``shared=True`` takes the lock SHARED so two reads can
+    hold it at once and a writer is still excluded (kittrial-5bb.291 item 5: the
+    roster read needs the same 60 s bound as the exclusive wait, not an unlimited
+    shared wait and not an exclusive lock). On Windows ``msvcrt.locking`` has no
+    shared lock, so ``shared=True`` there takes the exclusive lock and this is
+    stated rather than pretended.
 
     Re-entrant *per thread* so nested persistence calls in one mutation cannot
     deadlock against themselves, while a second process (the canonical endpoint)
@@ -652,10 +659,13 @@ def file_lock(path, timeout=60.0, poll=0.02):
                 handle.seek(0)
                 if os.name == 'nt':
                     import msvcrt
+                    # msvcrt.locking is exclusive-only; a shared hold is the
+                    # exclusive lock on Windows (stated, not pretended).
                     msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
                 else:
                     import fcntl
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.flock(handle.fileno(),
+                                (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB)
                 break
             except OSError:
                 if time.monotonic() >= deadline:
@@ -957,9 +967,10 @@ class NativeRunner:
     """
 
     __slots__ = ('_dispatch', 'attempted_write', 'calls', 'wrote',
-                 'lifecycle_project', '_lifecycle_void_journal', '_web_lifecycle_mark_journal')
+                 'lifecycle_project', 'bounded_task_reads',
+                 '_lifecycle_void_journal', '_web_lifecycle_mark_journal')
 
-    def __init__(self, dispatch, project=None):
+    def __init__(self, dispatch, project=None, bounded_task_reads=False):
         self._dispatch = dispatch
         self.attempted_write = False
         self.calls = 0
@@ -968,6 +979,12 @@ class NativeRunner:
         #: (kittrial-5bb.97). It says nothing about refusals, which `attempted_write` decides.
         self.wrote = False
         self.lifecycle_project = project
+        #: Whether this runner is the pinned ``bin/bd`` host boundary and can answer
+        #: the bounded per-task reads a one-fact lifecycle write uses instead of a
+        #: full `export --all` (kittrial-5bb.289 item 2). The lifecycle routes set
+        #: it; a runner built anywhere else (or a bare callable) leaves it false and
+        #: keeps the full export's answer.
+        self.bounded_task_reads = bounded_task_reads
         self._lifecycle_void_journal = None
         self._web_lifecycle_mark_journal = None
 

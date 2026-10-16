@@ -15,7 +15,9 @@ import base64
 import builtins
 import io
 import json
+import ntpath
 import os
+import posixpath
 import shutil
 import subprocess
 import sys
@@ -76,6 +78,26 @@ def runtime(base, *projects):
         (root/'projects'/name/'.beads').mkdir(parents=True)
         (root/'projects'/name/'.beads'/'metadata.json').write_text('{}', encoding='utf-8')
     return root
+
+
+def line_path(path):
+    """The spelling a key line uses for a REAL host path (kittrial-5bb.269 item 7).
+
+    A key line's ``command=`` is POSIX sshd syntax judged with ``posixpath`` on every host,
+    so the spelling must be POSIX-absolute on every host. On POSIX it is the path itself. On
+    Windows the fixture's folder is written ``C:/...``, which ``posixpath`` does NOT read as
+    absolute, so every line fell out of "this kit and this root" and the two listing classes
+    skipped there. Drop the drive instead (``C:/Users/x`` -> ``/Users/x``): ``posixpath``
+    reads it as absolute, and ``ntpath`` resolves a drive-rooted path against the current
+    drive - the drive of the checkout the tests run from - so the file the line names is the
+    real one and ``os.path.realpath`` matches the kit's own path. A path with no drive, and a
+    UNC path, are returned unchanged; the pure-string form is pinned on every host.
+    """
+    as_posix = Path(path).as_posix()
+    drive, tail = ntpath.splitdrive(as_posix)
+    if len(drive) == 2 and drive[1] == ':' and tail.startswith('/'):
+        return tail
+    return as_posix
 
 
 def write_settings(root, value=None, operators=(OPERATOR,)):
@@ -1572,7 +1594,9 @@ class SettingsCommandTests(unittest.TestCase):
         elapsed = time.monotonic() - started
         self.assertEqual([], listing['would_be_refused'])
         self.assertEqual([1], listing['may_be_refused'])
-        self.assertEqual('other-command', listing['lines'][0]['kind'])
+        # kittrial-5bb.269 item 4: its own kind, never other-command.
+        self.assertEqual('over-long', listing['lines'][0]['kind'])
+        self.assertEqual({'over-long': 1}, listing['summary'])
         self.assertNotIn('wrapper', listing['lines'][0])
         # 2.0 s is generous on a loaded host yet far under the 5.8 s shlex alone costs;
         # a mutant that moves the bound after the token work dies on time AND on the
@@ -1747,9 +1771,15 @@ class SettingsCommandTests(unittest.TestCase):
                 admin.bound_keys_only_switch(self.root, 'on', OPERATOR)
 
 
-@unittest.skipIf(os.name == 'nt', 'these fixtures write the temporary folder (a Windows path) as the key line\'s --root and wrapper paths; key-line text is POSIX sshd syntax and is judged with posixpath, which correctly does not read C:/ or D:\\ paths as absolute - kittrial-5bb.265 r2 item 5. Build the fixtures as POSIX text to run here.')
+@unittest.skipIf(os.name == 'nt', 'the authorized-keys listing is a POSIX-host feature and its fixtures write\n             the temporary folder as the key line\'s --root and wrapper paths, which key-line text judges as POSIX\n             sshd syntax (posixpath does not read C:/ or D:\\ as absolute). kittrial-5bb.269 r2: line_path() let\n             this class run on Windows and CI went red (run 38727896986, 12 tests); a skipped test where the\n             feature cannot run is right, a red job is not. The POSIX runs are unchanged.')
 class ListingTests(unittest.TestCase):
-    """``authorized-keys-list`` names the lines the setting refuses."""
+    """``authorized-keys-list`` names the lines the setting refuses.
+
+    kittrial-5bb.269 item 7: the fixtures write the key line as POSIX text through
+    ``line_path`` - a POSIX-looking root and wrapper path IN THE LINE, with the real files
+    under the temporary folder where the code stats them - so the class runs on Windows too
+    (and no longer skips there).
+    """
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -1774,11 +1804,11 @@ class ListingTests(unittest.TestCase):
             marks.append('orchestra-projects=' + ','.join(projects))
         if principal is not None:
             marks.append('orchestra-principal=' + principal)
-        root_part = ''.join(' --root ' + Path(item).as_posix() for item in roots)
-        endpoint_part = ''.join(' --endpoint ' + Path(item).as_posix() for item in endpoints)
+        root_part = ''.join(' --root ' + line_path(item) for item in roots)
+        endpoint_part = ''.join(' --endpoint ' + line_path(item) for item in endpoints)
         return ('command="/usr/bin/python3 -E -s %s/ssh_forced_command.py%s%s%s%s",'
                 'restrict,no-pty,no-port-forwarding,no-agent-forwarding,no-X11-forwarding ssh-ed25519 %s %s'
-                % (kit.as_posix(), root_part, endpoint_part, extra, bound, body,
+                % (line_path(kit), root_part, endpoint_part, extra, bound, body,
                    ' '.join([comment] + marks)))
 
     def listing(self, text):
@@ -1793,6 +1823,17 @@ class ListingTests(unittest.TestCase):
                 self.line(principal=MINE),                               # 4 principal only
                 'ssh-ed25519 %s james@desk' % KEY_BODY,                  # 5 unrestricted
                 'command="/usr/bin/rsync --server" ssh-ed25519 %s backup' % KEY_BODY]  # 6 other-command
+
+    def test_the_line_spelling_drops_a_windows_drive_to_stay_posix_absolute(self):
+        """kittrial-5bb.269 item 7, pinned where Windows cannot be run: a Windows path in a
+        key line is written drive-rooted, so posixpath reads it as absolute (the old C:/...
+        spelling is why the class skipped on nt). No drive and a UNC path are unchanged."""
+        self.assertEqual('/Users/alex/rt', line_path('C:/Users/alex/rt'))
+        self.assertTrue(posixpath.isabs(line_path('C:/Users/alex/rt')))
+        self.assertEqual('/Users/alex/rt', line_path(Path('C:/Users/alex/rt')))
+        self.assertEqual('/srv/state', line_path('/srv/state'))
+        self.assertEqual('rel-endpoint/endpoint.py', line_path('rel-endpoint/endpoint.py'))
+        self.assertEqual('//server/share/x', line_path('//server/share/x'))
 
     def test_attention_carries_the_lines_outside_every_rule_with_reasons(self):
         """kittrial-5bb.218 finding 1: the unrestricted, other-command, no-restrict and
@@ -1923,7 +1964,7 @@ class ListingTests(unittest.TestCase):
         self.assertEqual(listing['would_be_refused'], [1, 2])
         # `other_kit` still flags the foreign endpoint for the operator; it is not the SETTING's answer.
         self.assertTrue(listing['lines'][0]['other_kit'])
-        self.assertEqual(listing['lines'][0]['endpoints'], [other.as_posix() + '/endpoint.py'])
+        self.assertEqual(listing['lines'][0]['endpoints'], [line_path(other) + '/endpoint.py'])
         note = next(note for note in listing['notes'] if note.startswith('bound_keys_only:'))
         self.assertNotIn('are not reached', note)
 
@@ -1938,9 +1979,9 @@ class ListingTests(unittest.TestCase):
         ]) + '\n'
         listing = self.listing(text)
         self.assertEqual(listing['would_be_refused'], [1])
-        self.assertEqual(listing['lines'][0]['root'], self.root.as_posix())     # the LAST one
+        self.assertEqual(listing['lines'][0]['root'], line_path(self.root))     # the LAST one
         self.assertFalse(listing['lines'][0]['other_root'])
-        self.assertEqual(listing['lines'][1]['root'], other_root.as_posix())
+        self.assertEqual(listing['lines'][1]['root'], line_path(other_root))
         self.assertTrue(listing['lines'][1]['other_root'])
         note = next(note for note in listing['notes'] if note.startswith('bound_keys_only:'))
         self.assertIn('Line 2 runs a command this preview cannot judge', note)
@@ -1961,6 +2002,95 @@ class ListingTests(unittest.TestCase):
         note = ' '.join(listing['notes'])
         self.assertIn('lines 1, 2, 3, 4, 5 are refused whether the setting is on or off', note)
         self.assertIn('the setting is not why they are refused', note)
+
+    def test_the_off_note_names_only_the_lines_that_lack_a_binding(self):
+        """kittrial-5bb.269 item 1: a BOUND line the wrapper refuses for another reason (a
+        relative --endpoint here) lacks neither a project nor a principal, so the OFF sentence
+        must not name it as lacking one, and must not need the sentence after it to correct
+        it. The other-reason sentence names that line with its own number."""
+        text = '\n'.join([
+            self.line(projects=['alpha'], principal=MINE),                        # 1 bound and served
+            self.line(projects=['alpha'], principal=MINE,
+                      endpoints=['rel-endpoint/endpoint.py']),                    # 2 bound, relative endpoint
+            self.line(),                                                          # 3 confined: lacks both
+        ]) + '\n'
+        listing = self.listing(text)
+        self.assertEqual(listing['would_be_refused'], [2, 3])
+        self.assertEqual([entry['kind'] for entry in listing['lines']], ['bound', 'bound', 'confined'])
+        off = next(note for note in listing['notes'] if note.startswith('would_be_refused:'))
+        self.assertIn('line 3 that lacks a project or a principal', off)
+        self.assertNotIn('line 2', off)                 # it does not need correcting
+        self.assertNotIn('lines 2, 3', off)
+        another = next(note for note in listing['notes']
+                       if note.startswith('line 2 is refused whether the setting'))
+        self.assertIn('for another reason', another)
+        self.assertIn('the setting is not why it is refused', another)
+
+    def test_the_on_note_names_each_cause_with_its_own_lines(self):
+        """kittrial-5bb.269 item 2: an ordinary unbound line must not be named as refused
+        "for another reason" because some other line is; when the set is mixed, both causes
+        are stated, each with its own numbers."""
+        write_settings(self.root, True)
+        text = '\n'.join([
+            self.line(),                                                          # 1 confined: lacks a binding
+            self.line(projects=['alpha'], principal=MINE,
+                      endpoints=['rel-endpoint/endpoint.py']),                    # 2 bound, another reason
+        ]) + '\n'
+        listing = self.listing(text)
+        self.assertEqual(listing['would_be_refused'], [1, 2])
+        on = next(note for note in listing['notes'] if note.startswith('bound_keys_only:'))
+        self.assertIn('line 1 that lacks a project or a principal', on)
+        self.assertIn('line 2 that the wrapper refuses for another reason', on)
+        self.assertNotIn('lines 1, 2', on)               # not all lines under one cause
+        self.assertNotIn('line 1 that the wrapper refuses', on)
+
+    def test_an_over_long_command_is_served_and_named_over_long_not_another_program(self):
+        """kittrial-5bb.269 items 4 and 6: neither this kit nor the wrapper bounds how many
+        --project flags a line may carry, so a line the kit PRINTED for some 230 projects is
+        longer than AUTHORIZED_KEY_COMMAND_MAX. The wrapper serves it (every project reaches
+        the endpoint); the listing names it in group two under its own kind - never as
+        "another program" - and reads no token of it."""
+        import shlex
+        names = ['p%023d' % number for number in range(1, 241)]      # ~230 projects, longest names
+        printed = admin.authorized_key_lines(line_path(self.root), line_path(self.kit), 'ssh-ed25519',
+                                             KEY_BODY, projects=names, principal=MINE, python=PYTHON)
+        line = printed['contributor']
+        command = line[len('command="'):line.index('",')]
+        self.assertGreater(len(command), admin.AUTHORIZED_KEY_COMMAND_MAX)
+        # The wrapper serves it, with the setting ON: nothing is refused, every --project
+        # reaches the endpoint. (execvpe is mocked: no process is replaced here.)
+        write_settings(self.root, True)
+        tokens = shlex.split(command)
+        at = next(index for index, token in enumerate(tokens)
+                  if token.endswith('/ssh_forced_command.py'))
+        said = io.StringIO()
+        with mock.patch.dict(os.environ, {'SSH_ORIGINAL_COMMAND': printed['endpoint']}), \
+                mock.patch.object(forced.os, 'execvpe', side_effect=OSError('not run in a test')) as executed, \
+                mock.patch.object(sys, 'stderr', said):
+            forced.main(tokens[at + 1:])
+        self.assertTrue(executed.called, said.getvalue())
+        self.assertEqual(executed.call_args.args[1].count('--key-project'), len(names))
+        # The listing names it: over-long, group two, not cut off, not another program.
+        listing = self.listing(line + '\n')
+        self.assertFalse(listing['truncated'])
+        self.assertEqual(listing['lines'][0]['kind'], 'over-long')
+        self.assertEqual(listing['may_be_refused'], [1])
+        self.assertEqual(listing['would_be_refused'], [])
+        self.assertEqual(listing['summary'], {'over-long': 1})
+        # Its tokens were not read, so it is also under attention beside the other unjudged
+        # lines (kittrial-5bb.269 item 4), with its own reason in words.
+        self.assertIn(1, listing['attention'])
+        notes = ' '.join(listing['notes'])
+        self.assertIn('did not read its tokens', notes)
+        self.assertIn('serves it as printed', notes)
+        self.assertIn('Neither this kit nor the wrapper bounds how many --project flags', notes)
+        # Item 4: its own reason only. The group-two sentence lists "another program" as one
+        # possible undecided shape; the over-long line's own sentence must not claim it, and
+        # no other-command sentence (which would name it as another program) may exist.
+        over_note = next(note for note in listing['notes']
+                         if note.startswith('line 1: a command longer than'))
+        self.assertNotIn('another program', over_note)
+        self.assertNotIn("not this kit's wrapper", notes)
 
     def test_the_preview_names_at_most_the_stated_number_of_lines(self):
         """Item 5: name at most N lines and say how many more."""
@@ -2149,7 +2279,15 @@ class DocumentationTests(unittest.TestCase):
                        'one',
                        'BOUND line of this kit',
                        'the setting is not why',
-                       'VALID `deployment.private.json` larger than 1 MiB'):
+                       'VALID `deployment.private.json` larger than 1 MiB',
+                       # The kittrial-5bb.269 additions: characters, not bytes; the over-long
+                       # kind and the missing project-count bound.
+                       'at most 512 characters',
+                       '(8192) characters',
+                       '`over-long`',
+                       'its tokens are not read',
+                       'Neither this kit nor the wrapper bounds how many `--project` flags',
+                       'a line the kit printed with very many'):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, text)
 
@@ -2157,6 +2295,28 @@ class DocumentationTests(unittest.TestCase):
         text = self.normalized('COORDINATORS_PER_PROJECT_DESIGN.md')
         self.assertIn('slice 4, the installation setting that accepts bound keys only (kittrial-5bb.196', text)
         self.assertIn('"Accept bound keys only" in', text)
+
+
+class WordingPinTests(unittest.TestCase):
+    """The wording fixes of kittrial-5bb.269 are pinned at the source, not only at run time."""
+
+    def source(self):
+        # The comment markers are dropped, so a sentence wrapped over comment lines reads whole.
+        return ' '.join((KIT/'admin.py').read_text(encoding='utf-8').replace('#:', ' ').split())
+
+    def test_the_project_name_form_docstring_matches_the_code(self):
+        """Item 3: the docstring said [a-z][a-z9]{1,23} while the code next to it uses
+        [a-z0-9]: the docstring says what the code does."""
+        text = self.source()
+        self.assertIn('[a-z][a-z0-9]{1,23}-shaped lowercase', text)
+        self.assertNotIn('[a-z][a-z9]{1,23}', text)
+
+    def test_the_command_max_comment_says_no_project_count_bound_exists(self):
+        """Item 6: this kit and the wrapper put NO bound on how many --project flags a line
+        may carry, so the constant says so (the listing and the docs say it too)."""
+        text = self.source()
+        self.assertIn('There is NO bound - in this kit or in the wrapper - on how many --project '
+                      'flags a line may carry', text)
 
 
 if __name__ == '__main__':

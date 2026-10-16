@@ -57,7 +57,7 @@ from http_auth import (AGENT_SECRET_ENV, agent_secret_file, CAP_ACCOUNTS_ADMIN, 
                        CAP_TASKS, RESULT_RETENTION_SECONDS, HttpError, Service, Store,
                        address_group, authority_request, busy, conflict, forbidden, invalid, not_found,
                        not_implemented, now_iso, request_hash, unauthenticated,
-                       uncertain, unsupported)
+                       uncertain, unsupported, validate_agent_credential_days)
 from version import report as version_report
 
 KIT_VERSION = '0.1.0'
@@ -3458,6 +3458,14 @@ def _canonical_payload(stdout):
     raise uncertain('Canonical command returned unparsable data; outcome may be unknown')
 
 
+#: The label prefix ``requirement_http.py`` puts on the owner's "Accept requirement"
+#: decision row (``owner-requirement-decision:<content hash>``, created with
+#: ``--type decision`` when the signed-in owner accepts a requirement's exact content
+#: in simple mode). ``next_action`` points that row at the Requirements page it is
+#: resolved from (kittrial-5bb.277 third review).
+REQUIREMENT_DECISION_LABEL = 'owner-requirement-decision:'
+
+
 def next_action(task):
     """Who acts next on a task, derived only from its status, assignee and review state."""
     state = task.get('review_state')
@@ -3482,6 +3490,31 @@ def next_action(task):
         return {'who': 'owner', 'text': 'Needs operator attention'}
     if task.get('assignee'):
         return {'who': 'assignee', 'text': 'Deliver a contribution'}
+    # The last offer is a claim, so it follows the same claimability predicate the
+    # queue, the agent attention list and the claim route use (kittrial-5bb.277 review
+    # item 2). A requirement record, an epic, a decision or another row the queue never
+    # offers says what it is for instead of inviting a claim the route refuses with 409.
+    from work import claimable, requirement_record
+    if not claimable(task.get('issue_type'), task.get('status'), task.get('assignee'),
+                     task.get('contribution_id'), state, labels=task.get('labels')):
+        if requirement_record(task.get('labels')):
+            return {'who': 'owner',
+                    'text': "Requirement record: edit it on the project's Requirements page"}
+        if str(task.get('issue_type') or 'task') == 'epic':
+            return {'who': 'owner', 'text': 'This is an epic, not a unit of work: work its tasks'}
+        if any(isinstance(label, str) and label.startswith(REQUIREMENT_DECISION_LABEL)
+               for label in (task.get('labels') or ())):
+            # The owner's "Accept requirement" row is a decision record made from the
+            # project's Requirements page. Name where it is resolved instead of only
+            # saying what it is not (kittrial-5bb.277 third review). The sentence is
+            # deliberately about the row and its page, not about who acted: the label
+            # alone does not evidence an actor, and a real-bd test writes a decoy
+            # decision row carrying it (tests/test_requirement_owner_real_bd.py).
+            return {'who': 'owner',
+                    'text': "Requirement decision: resolve it on the project's Requirements page"}
+        if str(task.get('issue_type') or 'task') == 'decision':
+            return {'who': 'owner', 'text': 'This is a decision record, not a unit of work'}
+        return {'who': 'owner', 'text': 'This row is not offered as claimable work'}
     return {'who': 'anyone', 'text': 'Claim this task'}
 
 
@@ -4204,7 +4237,7 @@ class ApiHandler(BaseHTTPRequestHandler):
     MEMBER_FIELDS = ('role',)
     CREDENTIAL_ISSUE_FIELDS = ('label', 'scopes', 'actor', 'allow_actor', 'allow_actor_reason')
     AGENT_CREATE_FIELDS = ('name', 'tool', 'working_directory', 'machine', 'notes',
-                           'projects', 'scopes')
+                           'projects', 'scopes', 'owner')
     AGENT_UPDATE_FIELDS = ('name', 'tool', 'working_directory', 'machine', 'notes',
                            'projects', 'enabled')
     AGENT_CREDENTIAL_FIELDS = ('label', 'scopes')
@@ -4283,11 +4316,25 @@ class ApiHandler(BaseHTTPRequestHandler):
         return body
 
     def _task_view(self, task, names):
-        """A task row plus presentation fields (assignee name, next action). Additive."""
+        """A task row plus presentation fields (assignee name, next action, requirement
+        marker and claimability). Additive: every field a route already returned stays.
+
+        The requirement marker and the claimability answer come from the same two
+        predicates the work queue, the agent attention list and the claim route use
+        (``work.requirement_record`` / ``work.claimable``), so a reader that sees the
+        tasks list cannot disagree with the queue about what is claimable work
+        (kittrial-5bb.277). The list route feeds its rows through here, so a web Tasks
+        page can mark a requirement record plainly instead of offering it as a task.
+        """
+        from work import claimable, requirement_record
         view = dict(task)
         assignee = view.get('assignee')
         view['assignee_name'] = names.get(assignee, assignee) if assignee else None
         view['next_action'] = next_action(view)
+        view['requirement_record'] = requirement_record(view.get('labels'))
+        view['claimable'] = claimable(view.get('issue_type'), view.get('status'), assignee,
+                                      view.get('contribution_id'), view.get('review_state'),
+                                      labels=view.get('labels'))
         return view
 
     def _task_views(self, tasks, project_id=None):
@@ -4619,6 +4666,10 @@ class ApiHandler(BaseHTTPRequestHandler):
                 'project_create': (
                     'create' if getattr(self.backend, 'PROJECT_CREATE', 'create') == 'create' else
                     'register' if principal.superuser and principal.via != 'credential' else 'operator-only')}
+        if principal.credential_id:
+            credential = self.service.state['credentials'].get(principal.credential_id)
+            if credential and credential.get('agent_id'):
+                body['credential_expiry'] = self.service.agent_credential_expiry_view(credential)
         # Additive (kittrial-5bb.118 part 2): whether this account may create a project
         # on the host from here, with its limit and how many it has. Only where the
         # backend has a host.
@@ -5821,18 +5872,23 @@ class ApiHandler(BaseHTTPRequestHandler):
             # caller cannot see keeps the service's own 404, exactly as the same body
             # without the unknown field does. Only then is a field the route does not
             # take refused, not dropped (kittrial-5bb.183 item 2).
-            self._require_grantable(ctx.principal, payload.get('projects'), ())
-            self.service.check_agent_grant(ctx.principal, payload.get('projects'))
+            owner = self.service.agent_creation_owner(ctx.principal, payload.get('owner', ctx.principal.user_id))
+            self._require_grantable(ctx.principal, payload.get('projects'), (), owner_id=owner)
+            self.service.check_agent_grant(ctx.principal, payload.get('projects'), owner_id=owner)
             refuse_unknown_fields(payload, self.AGENT_CREATE_FIELDS, 'An agent creation')
             result = self.service.create_agent(
                 ctx.principal, name=payload.get('name'), tool=payload.get('tool'),
                 working_directory=payload.get('working_directory'),
                 machine=payload.get('machine'), notes=payload.get('notes'),
                 projects=payload.get('projects'), scopes=payload.get('scopes'),
-                request_id=ctx.request_id)
+                request_id=ctx.request_id, owner=owner)
             return result, _redact_agent_secret(result)
+        def replay_check():
+            owner = self.service.agent_creation_owner(ctx.principal, payload.get('owner', ctx.principal.user_id))
+            self._require_grantable(ctx.principal, payload.get('projects'), (), owner_id=owner)
+            self.service.check_agent_grant(ctx.principal, payload.get('projects'), owner_id=owner)
         return self._mutate(ctx, 'agents.create', None, create, status=201,
-                            capability=CAP_AGENTS, replay_status=200)
+                            capability=CAP_AGENTS, replay_status=200, replay_check=replay_check)
 
     def _agent_items(self, principal, agents=None):
         items = []
@@ -5996,7 +6052,35 @@ class ApiHandler(BaseHTTPRequestHandler):
             return result, result
         return self._mutate_agent_credential(ctx, 'agents.credentials.revoke', revoke, status=204)
 
-    def _mutate_agent_credential(self, ctx, operation, fn, **options):
+    @route('POST', r'/v1/agents/(?P<aid>' + ID + r')/credentials/'
+                  r'(?P<cid>' + ID + r')/extend')
+    def agents_credential_extend(self, ctx):
+        return self._extend_agent_credential(ctx)
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/agents/(?P<aid>' + ID + r')/credentials/'
+                  r'(?P<cid>' + ID + r')/extend')
+    def project_agent_credential_extend(self, ctx):
+        return self._extend_agent_credential(ctx, ctx.params['pid'])
+
+    def _extend_agent_credential(self, ctx, project_id=None):
+        def check():
+            agent, _ = self.service.agent_extension_target(
+                ctx.principal, ctx.params['aid'], ctx.params['cid'], project_id)
+            for pid in ([project_id] if project_id is not None else agent.get('projects') or []):
+                self._require_usable(pid)
+            refuse_unknown_fields(dict(ctx.payload or {}), (), 'An agent credential extension')
+        def extend():
+            check()
+            result = self.service.extend_agent_credential(
+                ctx.principal, ctx.params['aid'], ctx.params['cid'], project_id=project_id,
+                request_id=ctx.request_id)
+            return result, result
+        return self._mutate_agent_credential(
+            ctx, 'agents.credentials.extend', extend, project_id=project_id,
+            capability=CAP_AGENTS if project_id is None else CAP_PROJECT_ADMIN, replay_check=check)
+
+    def _mutate_agent_credential(self, ctx, operation, fn, *, project_id=None,
+                                 capability=CAP_AGENTS, **options):
         """Save the credential and its route audit in one atomic JSON replacement.
 
         Issuance rolls back before a successful state save. Revocation stays effective
@@ -6006,7 +6090,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         with self.service.store.lock:
             agent = self.service.state['agents'].get(ctx.params['aid'])
             if not isinstance(agent, dict):
-                return self._mutate(ctx, operation, None, fn, capability=CAP_AGENTS, **options)
+                return self._mutate(ctx, operation, project_id, fn, capability=capability, **options)
             saved = [False]
             with self.service._agent_credential_transaction(
                     agent, rollback=operation != 'agents.credentials.revoke') as mark_saved:
@@ -6014,13 +6098,13 @@ class ApiHandler(BaseHTTPRequestHandler):
                     mark_saved()
                     saved[0] = True
                 try:
-                    return self._mutate(ctx, operation, None, fn, capability=CAP_AGENTS,
+                    return self._mutate(ctx, operation, project_id, fn, capability=capability,
                                         audit_success=False, state_saved=state_saved, **options)
                 except HttpError:
                     raise  # _mutate already releases a refused reservation and audits it
                 except Exception:
                     if not saved[0] and ctx.idempotency_key is not None:
-                        digest = self.service._idempotency_key(ctx.principal, None,
+                        digest = self.service._idempotency_key(ctx.principal, project_id,
                             '%s %s' % (operation, ctx.route_target), ctx.idempotency_key)
                         self.service.idempotency_release(digest)
                     raise
@@ -6772,6 +6856,33 @@ class ApiHandler(BaseHTTPRequestHandler):
                 raise conflict(merge_slot_sentence(row.get('id')))
             raise not_found('Task not found')
 
+    @staticmethod
+    def _refuse_requirement_record(row):
+        """A requirement record is a readable, visible row, never claimable work
+        (kittrial-5bb.277): it is NOT a record anchor and is NOT hidden (kittrial-5bb.276
+        needs a claimed requirement visible and releasable), so the claim route says what
+        it is and where it is edited and accepted rather than answering 404.
+
+        What is refused here is this route's claim, and only that: an explicit host claim
+        by a coordinator through the endpoint (`bd update ID --claim`) still works, and
+        live projects rely on it (kittrial-5bb.92 review item 1). That fact is kept in
+        ``docs/REQUIREMENTS.md`` and deliberately **not** in this sentence (kittrial-5bb.277
+        review item 3): the caller who reads a refusal is usually an agent, and naming the
+        host command here would hand it the exact way around the refusal. The sentence
+        names the Requirements page instead.
+        """
+        if not isinstance(row, dict):
+            return
+        from work import REQUIREMENT_RECORD_LABELS, requirement_record
+        if not requirement_record(row.get('labels')):
+            return
+        label = next((name for name in row.get('labels') or ()
+                      if name in REQUIREMENT_RECORD_LABELS), 'requirement')
+        raise conflict('This is a %s record, not a unit of work, so it cannot be claimed. '
+                       'It is not offered as claimable work here: edit it on the project\'s Requirements '
+                       'page (or requirement_records.py draft|revise), and an operator accepts it with '
+                       'admin.py requirement-apply.' % label)
+
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/references')
     def references_list(self, ctx):
         """The reference catalog (.41 slice 1), read-only at CAP_READ.
@@ -6816,6 +6927,54 @@ class ApiHandler(BaseHTTPRequestHandler):
                 or self.service.state.get('memberships',{}).get(pid,{}).get(ctx.principal.user_id)!='owner'):
             raise forbidden('Requirements editing needs the signed-in project owner')
 
+    def _requirements_state_only(self, ctx, result):
+        """A member who cannot finish the transition reads the state, not its handles.
+
+        A current owner still receives the exact operation id and receipt hash its
+        finish/abandon route needs; contributors and viewers receive the state,
+        reason and a sentence naming who can act.
+        """
+        pid=ctx.params['pid']
+        owner=(ctx.principal.via=='session' and not ctx.principal.agent_id
+               and self.service.state.get('memberships',{}).get(pid,{}).get(ctx.principal.user_id)=='owner')
+        if owner:
+            return result
+        def without_operation(record):
+            return {name:value for name,value in record.items() if name!='operation_id'} \
+                if isinstance(record,dict) else record
+        items=result.get('items',[result]) if isinstance(result,dict) else []
+        for item in items:
+            if not isinstance(item,dict):
+                continue
+            for name in ('state','reason'):
+                if isinstance(item.get(name),dict):
+                    item[name]=without_operation(item[name])
+            if isinstance(item.get('state_history'),list):
+                item['state_history']=[without_operation(state) for state in item['state_history']]
+            if isinstance(item.get('state_message'),str) and 'finish or abandon' in item['state_message']:
+                item['state_message']='A requirement transition is pending; ask a project owner to finish or abandon it.'
+            elif isinstance(item.get('state_message'),str) and 'admin.py requirement-reconcile' in item['state_message']:
+                item['state_message']='Requirement status cannot be verified; ask a project owner to reconcile it.'
+            pending=item.get('pending_transition')
+            if isinstance(pending,dict):
+                item['pending_transition']={'id':pending.get('id'),
+                    'state':without_operation(pending.get('state')),
+                    'reason':without_operation(pending.get('reason')),
+                    'message':'A requirement transition is pending; ask a project owner to finish or abandon it.'}
+            if isinstance(item.get('completion'),dict):
+                item['completion']={name:value for name,value in item['completion'].items()
+                                    if name not in ('operation_id','pending_receipt_sha256')}
+        recoveries=result.get('terminal_recoveries') if isinstance(result,dict) else None
+        if isinstance(recoveries,dict):
+            recoveries['items']=[{'id':entry.get('id'),'state':without_operation(entry.get('state')),
+                'reason':without_operation(entry.get('reason')),
+                'message':'A requirement transition is pending; ask a project owner to finish or abandon it.'}
+                for entry in recoveries.get('items',[]) if isinstance(entry,dict)]
+            recoveries['damaged']=[{'id':entry.get('id'),'message':entry.get('message')}
+                for entry in recoveries.get('damaged',[]) if isinstance(entry,dict)]
+            recoveries.pop('completions',None)
+        return result
+
     def _requirements_names(self, result):
         items=result.get('items', [result])
         accounts = [(item.get('state') or {}).get('account_id') for item in items]
@@ -6844,7 +7003,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             'withdraw':('expected_revision','expected_sha256','expected_state_sha256','reason'),
             'supersede':('expected_revision','expected_sha256','expected_state_sha256','reason','successor'),
             'release':('original_operation_id','expected_receipt_sha256','reason'),
-            'finish':('original_operation_id','expected_receipt_sha256'),
+            'finish':('original_operation_id','expected_receipt_sha256','confirm'),
             'abandon':('original_operation_id','expected_receipt_sha256','reason'),
             'governance':('mode','expected_revision','expected_sha256')}[action],'Requirements')
         import requirement_http
@@ -6903,6 +7062,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         self._requirements_backend(); self._project(ctx,CAP_READ)
         result=dict(self.backend.requirements_read(ctx.params['pid'],['list']))
         result['items']=[self._requirement_author(ctx,item) for item in result.get('items',[])]
+        result=self._requirements_state_only(ctx,result)
         self._requirements_names(result)
         result['can_edit']=(ctx.principal.via=='session' and not ctx.principal.agent_id
                             and self.service.state.get('memberships',{}).get(ctx.params['pid'],{}).get(ctx.principal.user_id)=='owner')
@@ -6917,6 +7077,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         self._requirements_backend(); self._project(ctx,CAP_READ)
         result=dict(self.backend.requirements_read(ctx.params['pid'],['get',ctx.params['rid']]))
         result=self._requirement_author(ctx,result)
+        result=self._requirements_state_only(ctx,result)
         self._requirements_names(result)
         result['governance']=self.backend.requirements_read(ctx.params['pid'],['governance'])
         result['can_edit']=(ctx.principal.via=='session' and not ctx.principal.agent_id
@@ -6974,6 +7135,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         self._requirements_backend(); self._project(ctx,CAP_READ)
         result=self.backend.requirements_read(ctx.params['pid'],['brd'])
         result['items']=[self._requirement_author(ctx,item) for item in result.get('items',[])]
+        result=self._requirements_state_only(ctx,result)
         self._requirements_names(result)
         return 200,result
 
@@ -7433,6 +7595,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         refuse_unknown_fields(payload, self.TASK_CLAIM_FIELDS, 'A task claim')
         task = self.backend.get_task(ctx.params['pid'], ctx.params['tid'])
         self._refuse_record_anchor(task, write=True)
+        # A requirement record is readable and visible, but never claimable work
+        # (kittrial-5bb.277). Refused here so no agent takes one as a task.
+        self._refuse_requirement_record(task)
         payload['task_id'] = ctx.params['tid']
         actor = self.service.bind_actor(ctx.principal, payload.pop('actor', None))
         payload['actor'] = actor
@@ -8574,6 +8739,8 @@ def main(argv=None):
                         help='log-ins one client address may have in flight at once, of the %d in all '
                              '(default %d; 1 to %d)' % (Service.LOGINS_AT_ONCE, Service.LOGINS_PER_ADDRESS,
                                                         Service.LOGINS_AT_ONCE))
+    parser.add_argument('--agent-credential-days', type=int, default=30, metavar='DAYS',
+                        help='future agent credential lifetime: 1 to 366 whole days (default 30; office may choose 90)')
     parser.add_argument('--approval-by-another-party', action='store_true',
                         help='nobody approves (or recommends) work of their own party: an account, its agents '
                              'and the worker credentials it issued. Off unless given')
@@ -8594,6 +8761,10 @@ def main(argv=None):
     web.add_argument('--no-web', action='store_true',
                      help='serve only the JSON API; do not serve the browser interface')
     args = parser.parse_args(argv)
+    try:
+        validate_agent_credential_days(args.agent_credential_days)
+    except ValueError as error:
+        parser.error(str(error))
 
     if args.list_unconfirmed_projects:
         # Read-only: the state document is read as JSON, without opening the store (which
@@ -8665,7 +8836,8 @@ def main(argv=None):
     trusted = list(args.trusted_proxy)
     if args.trust_proxy and 'localhost' not in trusted:
         trusted.append('localhost')
-    service = Service(store, public_url=args.public_url, approval_by_another_party=args.approval_by_another_party)
+    service = Service(store, public_url=args.public_url, approval_by_another_party=args.approval_by_another_party,
+                      agent_credential_days=args.agent_credential_days)
     service.LOGINS_PER_ADDRESS = args.logins_per_address
     backend = build_backend(service, args)
     for line in operator_allowlist_warnings(args.root if args.backend == 'endpoint' else None):

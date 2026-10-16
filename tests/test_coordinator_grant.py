@@ -874,12 +874,12 @@ class PageTests(Grants):
         self.assertEqual(seen['roles'], ['Viewer', 'Contributor', 'Coordinator', 'Owner'])
         self.assertIn('Agents in this project 2', seen['head'])
         self.assertEqual(sorted((row['coordinator'], row['buttons']) for row in seen['before']),
-                         [('none', ['Make coordinator']), ('none', ['Make coordinator'])])
+                         [('none', ['Extend existing credential', 'Make coordinator']), ('none', ['Extend existing credential', 'Make coordinator'])])
         self.assertEqual((seen['granted']['agent'], seen['granted']['coordinator'], seen['granted']['buttons']),
-                         (self.agent_id, 'true', ['Remove grant']))
+                         (self.agent_id, 'true', ['Extend existing credential', 'Remove grant']))
         self.assertIn('Coordinates', seen['granted']['text'])
         self.assertEqual((seen['refused']['agent'], seen['refused']['coordinator']), (worker_id, 'none'))
-        self.assertEqual((seen['removed']['coordinator'], seen['removed']['buttons']), ('none', ['Make coordinator']))
+        self.assertEqual((seen['removed']['coordinator'], seen['removed']['buttons']), ('none', ['Extend existing credential', 'Make coordinator']))
         self.assertIs(seen['coordinatorSeesPanel'], False)
         # kittrial-5bb.198: who coordinates, read only, for the owner and for a coordinator who is not one.
         before, granted, other = seen['coordinationBefore'], seen['coordinationGranted'], seen['coordinationOfCoordinator']

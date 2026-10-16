@@ -931,9 +931,18 @@ except ValueError as error:
                 fields=dict(body(first),successor={k:replacement[k] for k in ('id','revision','sha256')})
                 self.assertEqual(transition(first,'native-supersede','supersede',fields).status,200)
                 print('Native browser probe not run: Node.js unavailable',flush=True)
+            # The web detail read below is the VIEWER's (a non-owner): N10 strips
+            # the recovery handles from it. The endpoint read of the restored
+            # project has no HTTP principal at all, so it is the raw native state.
+            # Compare that raw state with the current owner's own web read, and
+            # separately prove the viewer is the one who loses the handle.
             detail=harness.request('GET',base+'/requirements/'+first['id'],token=viewer)
             self.assertEqual(detail.status,200,detail.data); self.assertEqual(detail.data['requirement_state'],'superseded')
             self.assertEqual(detail.data['accepted']['sha256'],first['sha256'])
+            self.assertNotIn('operation_id',detail.data['state'])
+            owner_detail=harness.request('GET',base+'/requirements/'+first['id'],token=token)
+            self.assertEqual(owner_detail.status,200,owner_detail.data)
+            self.assertIn('operation_id',owner_detail.data['state'])
             old=previous_read(first)
             if old is not None:
                 self.assertFalse(old['ok'],old); self.assertLess(len(old['message']),500)
@@ -949,7 +958,15 @@ except ValueError as error:
             self.assertEqual({p.name:p.read_bytes() for p in (cloned/http.JOURNAL).glob('*.json')},inner)
             restored=fixture.endpoint.execute(root,dict(project='terminalcopy',actor='reader',action='requirements',args=['get',first['id']]))
             self.assertEqual(restored['returncode'],0,restored); restored=json.loads(restored['stdout'])
-            self.assertEqual(restored['state'],detail.data['state']); self.assertEqual(restored['reason'],detail.data['reason'])
+            # The endpoint read is the raw state; the owner's web read matches it
+            # exactly. The viewer's read is the same state minus the recovery
+            # handle (N10): the endpoint is not an owner, so this compares like
+            # with like instead of expecting the handle to survive a non-owner read.
+            self.assertEqual(restored['state'],owner_detail.data['state']); self.assertEqual(restored['reason'],owner_detail.data['reason'])
+            self.assertEqual({name:value for name,value in restored['state'].items() if name!='operation_id'},
+                             detail.data['state'])
+            self.assertEqual({name:value for name,value in restored['reason'].items() if name!='operation_id'},
+                             detail.data['reason'])
             self.assertEqual(restored['accepted']['sha256'],first['sha256']); self.assertEqual(restored['requirement_state'],'superseded')
             self.assertEqual(self.rows(),before)
             if previous:
@@ -993,7 +1010,88 @@ except ValueError as error:
         finally:
             harness._stop_server(); harness.doCleanups()
 
+    def test_terminal_late_state_beside_a_fresh_completed_decision_is_superseded(self):
+        # T-d on the real pinned native writer: the first withdrawal fails at its
+        # state write and is abandoned (released); a FRESH withdrawal completes;
+        # the first decision's late state then lands. The later completed decision
+        # owns the requirement's status, the late state is recorded as superseded,
+        # and the owner's finish is refused with a sentence naming it.
+        import http_service
+        import requirement_owner_records as owner
+        import test_http_review_fixes as fixes
+        root=self.root
+        for key,value in fixture.admin.PROJECT_SETTINGS:
+            configured=self.bd('config','set',key,value)
+            self.assertEqual(configured.returncode,0,configured.stderr)
+        made=self.bd('create','Terminal T-d job','--type','epic','--json')
+        self.assertEqual(made.returncode,0,made.stderr); job=json.loads(made.stdout)['id']
+        class Harness(fixes.Harness):
+            def make_backend(self):
+                return http_service.EndpointBackend(sys.executable,str(KIT/'endpoint.py'),str(root),service=self.service)
+        harness=Harness(methodName='runTest'); harness.setUp()
+        try:
+            admin=harness.admin_token(); account=harness.create_account(admin,'td-owner','td-password-1')
+            token=harness.login('td-owner','td-password-1')[0]; base='/v1/projects/pp'
+            self.assertEqual(harness.request('POST','/v1/projects',{'project_id':'pp','name':'T-d fixture'},token=admin).status,201)
+            self.assertEqual(harness.request('PUT',base+'/members/'+account,{'role':'owner'},token=admin).status,200)
+            mode=harness.request('GET',base+'/requirements/governance',token=token).data
+            if mode['mode']!='simple':
+                changed=harness.request('PUT',base+'/requirements/governance',dict(mode='simple',
+                    expected_revision=mode['revision'],expected_sha256=mode['sha256']),token=token,key='td-simple')
+                self.assertEqual(changed.status,200,changed.data)
+            expected=lambda item: dict(expected_revision=item['revision'],expected_sha256=item['sha256'])
+            draft=harness.request('POST',base+'/requirements',dict(kind='requirement',parent=job,
+                title='Terminal T-d',description='Retained T-d.'),token=token,key='td-create')
+            self.assertEqual(draft.status,201,draft.data)
+            item=harness.request('POST',base+'/requirements/'+draft.data['id']+'/accept',expected(draft.data),
+                token=token,key='td-accept').data
+            self.install_fault_boundary()
+            self.fault('fail-one-terminal-state')
+            early=harness.request('POST',base+'/requirements/'+item['id']+'/withdraw',
+                dict(expected(item),expected_state_sha256=None,reason='T-d first attempt.'),
+                token=token,key='td-early')
+            self.assertEqual(early.status,503,early.data)
+            pending=harness.request('GET',base+'/requirements/'+item['id'],token=token).data['pending_transition']
+            self.assertTrue(pending['operation_id'])
+            # The saved server deadline is the only gate on abandoning the write
+            # that never landed; wait it out exactly as the shipped flow requires.
+            from requirement_terminal import read_receipt,receipt_path
+            import time
+            deadline=read_receipt(receipt_path(self.project,pending['operation_id']))['write_window']['abandon_after']
+            while time.time()<=deadline:
+                time.sleep(min(1,deadline-time.time()+0.05))
+            released=harness.request('POST',base+'/requirements/'+item['id']+'/transition/abandon',
+                dict(original_operation_id=pending['operation_id'],
+                     expected_receipt_sha256=pending['expected_receipt_sha256'],reason='T-d abandoned.'),
+                token=token,key='td-abandon')
+            self.assertEqual(released.status,200,released.data)
+            fresh=harness.request('POST',base+'/requirements/'+item['id']+'/withdraw',
+                dict(expected(item),expected_state_sha256=None,reason='T-d fresh attempt.'),
+                token=token,key='td-fresh')
+            self.assertEqual(fresh.status,200,fresh.data)
+            # The first decision's native state survives the process-group stop and
+            # lands late, under the same human author the endpoint would use.
+            landed=self.bd('comments','add',item['id'],owner.body(pending['state'],state=True),'--json',actor=account)
+            self.assertEqual(landed.returncode,0,landed.stderr)
+            detail=harness.request('GET',base+'/requirements/'+item['id'],token=token).data
+            self.assertEqual(detail['requirement_state'],'withdrawn')
+            self.assertEqual(detail['state']['operation_id'],fresh.data['operation_id'])
+            late=detail['pending_transition']; self.assertIsNotNone(late)
+            self.assertFalse(late['can_finish']); self.assertFalse(late['can_abandon'])
+            self.assertEqual(late['disposition'],'superseded')
+            self.assertEqual(late['superseded_by']['operation_id'],fresh.data['operation_id'])
+            self.assertIn('later completed decision '+fresh.data['operation_id'],late['message'])
+            refused=harness.request('POST',base+'/requirements/'+item['id']+'/transition/finish',
+                dict(original_operation_id=late['operation_id'],
+                     expected_receipt_sha256=late['expected_receipt_sha256']),
+                token=token,key='td-finish-refused')
+            self.assertEqual(refused.status,422,refused.data)
+            self.assertIn('later completed decision '+fresh.data['operation_id'],str(refused.data))
+        finally:
+            harness._stop_server(); harness.doCleanups()
+
 
 def load_tests(loader, tests, pattern):
     return unittest.TestSuite([NativeOwnerTests('test_owner_without_operator_grant_accepts_and_preserves_native_history'),
-                              NativeTerminalTests('test_terminal_routes_recovery_browser_restore_and_previous_reader')])
+                              NativeTerminalTests('test_terminal_routes_recovery_browser_restore_and_previous_reader'),
+                              NativeTerminalTests('test_terminal_late_state_beside_a_fresh_completed_decision_is_superseded')])

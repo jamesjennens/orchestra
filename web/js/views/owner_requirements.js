@@ -25,6 +25,13 @@ function terminalStatus(ctx, pid, item) {
 function transitionRecovery(ctx, pid, item) {
   const saved = item.pending_transition;
   if (!saved) return null;
+  if (saved.disposition === 'superseded') {
+    const later = saved.superseded_by || {};
+    return h('section', { class: 'panel stack' }, h('h2', null, 'Superseded transition'),
+      h('p', { role: 'status' }, saved.message),
+      later.operation_id ? h('p', { class: 'small' }, 'Superseded by the later completed decision ',
+        h('code', null, later.operation_id), later.completion_at ? ` · ${later.completion_at}` : '') : null);
+  }
   const message = h('p', { role: 'status' }, saved.message);
   const reason = h('textarea', { maxlength: 1000, rows: 2 });
   const confirm = h('input', { type: 'checkbox' });
@@ -36,7 +43,7 @@ function transitionRecovery(ctx, pid, item) {
     try {
       if (action === 'finish') {
         if (!confirm.checked || !saved.can_finish) throw new Error('Confirm the irreversible saved transition before finishing.');
-        await ctx.api.finishRequirementTransition(pid, item.id, body);
+        await ctx.api.finishRequirementTransition(pid, item.id, { ...body, confirm: true });
       }
       else {
         if (!reason.value.trim()) throw new Error('Explain why this transition should be abandoned.');
@@ -49,10 +56,13 @@ function transitionRecovery(ctx, pid, item) {
     saved.state?.superseded_by ? h('p', null, 'Replacement: ', h('a', { href: ctx.href(`/p/${pid}/requirements/${saved.state.superseded_by.id}`) }, displayText(saved.successor_title || 'Unavailable requirement'))) : null,
     h('p', { class: 'small' }, `Started by ${saved.author_name || 'Former project owner'} · ${saved.state.at}`),
     h('p', null, 'Finish retains the saved reason and replacement. This cannot be undone in the browser. Abandon is available only after the original writer has stopped and a complete read proves no state was written.'),
+    saved.undoes ? h('p', { role: 'status' }, saved.undo_message) : null,
     h('p', null, displayText(saved.reason?.reason)), message,
     !saved.can_finish ? h('p', null, saved.finish_unavailable || saved.message) : null,
     item.governance?.mode !== 'simple' ? h('a', { href: ctx.href(`/p/${pid}/requirements`) }, 'Open requirements to enable simple editing') : null,
-    h('label', null, confirm, ' I understand finishing this saved transition cannot be undone in the browser.'), finish,
+    h('label', null, confirm, saved.undoes
+      ? ' I understand finishing also withdraws the later accepted revision named above.'
+      : ' I understand finishing this saved transition cannot be undone in the browser.'), finish,
     h('label', null, 'Why abandon this transition?', reason),
     !saved.can_abandon ? h('p', null, saved.abandon_unavailable || saved.message) : null,
     h('button', { type: 'button', disabled: !saved.can_abandon, onclick: (event) => act(event, 'abandon') }, 'Abandon transition'));

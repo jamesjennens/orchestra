@@ -1,7 +1,9 @@
 """Terminal states retain historical acceptance and recover exact native effects."""
 import copy
 import json
+import shutil
 import tempfile
+import time
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -70,8 +72,8 @@ class TerminalTests(unittest.TestCase):
         clock = mock.patch('requirement_terminal.time.time', return_value=saved['write_window']['abandon_after']+1)
         clock.start(); self.addCleanup(clock.stop)
 
-    def recover(self, item, action, saved, context=None):
-        body=dict(original_operation_id=saved['operation_id'], expected_receipt_sha256=saved['expected_receipt_sha256'])
+    def recover(self, item, action, saved, context=None, **extra):
+        body=dict(original_operation_id=saved['operation_id'], expected_receipt_sha256=saved['expected_receipt_sha256'], **extra)
         if action=='abandon': body['reason']='No state was written; retain the attempted intent.'
         return http.apply(self.path, context or self.context, action, body, 'recovery-'+action, self.native, item['id'])
 
@@ -455,6 +457,339 @@ class TerminalTests(unittest.TestCase):
         self.assertEqual(view['state'],result['state']); self.assertEqual(view['requirement_state'],'withdrawn')
         mode=governance.current(beta,'beta'); governance.set_mode(beta,'beta','governed',ACCOUNT,'mode',mode['revision'],mode['sha256'])
         self.assertEqual(http.read(beta,'beta',['get',item['id']],self.native)['accepted']['sha256'],item['sha256'])
+
+
+    def test_late_state_after_release_and_a_later_edit_is_finishable(self):
+        # R4T.py late: withdraw 503; another owner abandons after the deadline;
+        # the owner edits and accepts a new revision; the original writer's
+        # native state survives the process-group kill and lands later. Nothing
+        # may leave it unknown with no pending transition and no command. It
+        # stays finishable, but the owner is told which later accepted revision
+        # finishing withdraws and must confirm it (the coordinator's T-c/T-e rule).
+        item = self.accepted()
+        self.native.fail_comment_prefix = owner.STATE_PREFIX
+        with self.assertRaises(ValueError):
+            self.act(item)
+        self.after_writer(item)
+        pending = self.recovery(item)
+        self.assertTrue(pending['can_abandon'])
+        self.recover(item, 'abandon', pending)
+        self.native.fail_comment_prefix = None
+        edited = http.apply(self.path, self.context, 'revise', dict(expected_revision=item['revision'],
+            expected_sha256=item['sha256'], description='Accepted after the release.'),
+            'late-edit', self.native, item['id'])
+        http.apply(self.path, self.context, 'accept', dict(expected_revision=edited['revision'],
+            expected_sha256=edited['sha256']), 'late-accept', self.native, item['id'])
+        self.native(['comments', 'add', item['id'], owner.body(pending['state'], state=True), '--json'])
+        view = self.read(item)
+        late = view['pending_transition']
+        self.assertIsNotNone(late)
+        self.assertTrue(late['can_finish'])
+        self.assertFalse(late['can_abandon'])
+        # The page and the HTTP answer name the accepted revision and its time.
+        accepted_revision = view['accepted']['revision']
+        self.assertGreater(accepted_revision, item['revision'])
+        self.assertEqual(late['undoes']['revision'], accepted_revision)
+        self.assertEqual(late['undoes']['accepted_at'], view['acceptance']['at'])
+        self.assertIn('accepted revision %d' % accepted_revision, late['message'])
+        self.assertIn(late['undoes']['accepted_at'], late['message'])
+        # Finishing without the confirmation is refused with that same sentence.
+        with self.assertRaisesRegex(ValueError, 'accepted revision %d' % accepted_revision):
+            self.recover(item, 'finish', late)
+        finished = self.recover(item, 'finish', late, confirm=True)
+        self.assertEqual(finished['state'], pending['state'])
+        self.assertEqual(finished['undoes']['revision'], accepted_revision)
+        self.assertIn('accepted revision %d' % accepted_revision, finished['message'])
+        self.assertEqual(finished['completion']['actor'], ACCOUNT)
+        receipt = terminal.read_receipt(terminal.receipt_path(self.path, pending['operation_id']))
+        self.assertEqual(receipt['status'], 'complete')
+        # The completed late decision is the requirement's terminal state, and
+        # its written successor decision can no longer be abandoned.
+        view = self.read(item)
+        self.assertEqual(view['requirement_state'], 'withdrawn')
+        self.assertIsNone(view['pending_transition'])
+
+    def test_late_state_beside_a_later_completed_decision_is_superseded(self):
+        # T-d: the first withdrawal fails at its state write and is abandoned; a
+        # FRESH withdrawal completes; the first decision's late state then lands
+        # beside it. The later completed decision owns the requirement's status,
+        # the late state is recorded as superseded, and finishing it is refused
+        # with a sentence naming the later decision.
+        item = self.accepted()
+        self.native.fail_comment_prefix = owner.STATE_PREFIX
+        with self.assertRaises(ValueError):
+            self.act(item, operation='early-terminal')
+        self.after_writer(item)
+        early = self.recovery(item)
+        self.assertTrue(early['can_abandon'])
+        self.recover(item, 'abandon', early)
+        self.native.fail_comment_prefix = None
+        fresh = self.act(item, operation='fresh-terminal')
+        self.assertEqual(fresh['requirement_state'], 'withdrawn')
+        # The earlier decision's state survives the stop and lands after the
+        # later decision completed.
+        self.native(['comments', 'add', item['id'], owner.body(early['state'], state=True), '--json'])
+        view = self.read(item)
+        self.assertEqual(view['requirement_state'], 'withdrawn')
+        self.assertEqual(view['state']['operation_id'], 'fresh-terminal')
+        late = view['pending_transition']
+        self.assertIsNotNone(late)
+        self.assertFalse(late['can_finish'])
+        self.assertFalse(late['can_abandon'])
+        self.assertEqual(late['disposition'], 'superseded')
+        self.assertEqual(late['superseded_by']['operation_id'], 'fresh-terminal')
+        self.assertIn('later completed decision fresh-terminal', late['message'])
+        # The owner's finish and the operator's complete are both refused with
+        # the sentence naming the later decision.
+        with self.assertRaisesRegex(ValueError, 'later completed decision fresh-terminal'):
+            self.recover(item, 'finish', late)
+        with self.assertRaisesRegex(ValueError, 'later completed decision fresh-terminal'):
+            records.reconcile(self.path, early['operation_id'], 'configured-operator',
+                              'Force the earlier late decision complete.', 'complete', self.native)
+
+    def test_operator_reconcile_can_finish_a_late_state_after_an_edit(self):
+        item = self.accepted()
+        self.native.fail_comment_prefix = owner.STATE_PREFIX
+        with self.assertRaises(ValueError):
+            self.act(item)
+        self.after_writer(item)
+        released = self.recover(item, 'abandon', self.recovery(item))
+        self.native.fail_comment_prefix = None
+        edited = http.apply(self.path, self.context, 'revise', dict(expected_revision=item['revision'],
+            expected_sha256=item['sha256'], description='Accepted after the release.'),
+            'operator-late-edit', self.native, item['id'])
+        http.apply(self.path, self.context, 'accept', dict(expected_revision=edited['revision'],
+            expected_sha256=edited['sha256']), 'operator-late-accept', self.native, item['id'])
+        saved = terminal.read_receipt(terminal.receipt_path(self.path, released['operation_id']))
+        self.native(['comments', 'add', item['id'], owner.body(saved['owner_state'], state=True), '--json'])
+        self.assertTrue(self.read(item)['pending_transition']['can_finish'])
+        # An operator's release reconciliation must not claim the late state was
+        # absent; the written decision is finished instead.
+        with self.assertRaisesRegex(ValueError, 'already written'):
+            records.reconcile(self.path, released['operation_id'], 'configured-operator',
+                              'No state was written.', 'failed', self.native)
+        result = records.reconcile(self.path, released['operation_id'], 'configured-operator',
+                                   'Finished the late decision after checking the native state.',
+                                   'complete', self.native)
+        self.assertEqual(result['state'], saved['owner_state'])
+        self.assertEqual(result['completion']['via'], 'operator')
+        self.assertEqual(result['completion']['actor'], 'configured-operator')
+        self.assertEqual(self.read(item)['requirement_state'], 'withdrawn')
+
+    def test_write_window_deadline_restarts_at_the_endpoint_clock(self):
+        now = time.time()
+        stale = now - 10000
+        window = terminal.write_window(stale, endpoint_timeout=150)
+        self.assertEqual(set(window), {'service_started_at', 'endpoint_timeout',
+                                       'native_timeout', 'abandon_after'})
+        self.assertGreaterEqual(window['abandon_after'],
+                                now + window['endpoint_timeout'] + window['native_timeout'])
+        self.assertGreater(window['abandon_after'],
+                           stale + window['endpoint_timeout'] + window['native_timeout'])
+
+    def test_terminal_hash_covers_status_not_only_the_disposition(self):
+        item = self.accepted()
+        self.native.fail_comment_prefix = owner.STATE_PREFIX
+        with self.assertRaises(ValueError):
+            self.act(item)
+        path = terminal.receipt_path(self.path, 'terminal-first')
+        saved = terminal.read_receipt(path)
+        clock = mock.patch('requirement_terminal.time.time',
+                           return_value=saved['write_window']['abandon_after'] + 1)
+        clock.start(); self.addCleanup(clock.stop)
+        self.recover(item, 'abandon', dict(operation_id='terminal-first',
+                                           expected_receipt_sha256=terminal.receipt_sha256(saved)))
+        released = json.loads(path.read_text())
+        flipped = dict(released, status='pending')  # the disposition is untouched
+        with self.assertRaisesRegex(ValueError, 'status or history'):
+            admin.validate_coordination_files({http.JOURNAL + '/' + path.name: flipped})
+
+    def test_no_label_is_projected_when_the_state_write_does_not_read_back(self):
+        item = self.accepted()
+        original = self.native.__call__
+        before_rows = copy.deepcopy(self.native.rows)
+        reads = []
+        def stale_confirmation(args):
+            if args[:1] == ['export']:
+                reads.append(len(reads))
+                if len(reads) == 2:
+                    return '\n'.join(json.dumps(row) for row in before_rows) + '\n'
+            return original(args)
+        before = len(self.native.writes('update'))
+        with self.assertRaisesRegex(ValueError, 'not confirmed'):
+            http.apply(self.path, self.context, 'withdraw', self.expected(item),
+                       'lost-confirmation', stale_confirmation, item['id'])
+        self.assertNotIn('requirement:withdrawn', self.native.row(item['id'])['labels'])
+        self.assertEqual(len(self.native.writes('update')), before)
+
+    def test_backfill_refuses_a_terminal_requirement(self):
+        item = self.accepted()
+        self.act(item)
+        before = copy.deepcopy(self.native.rows)
+        with self.assertRaisesRegex(ValueError, 'terminal requirement cannot be relabelled'):
+            records.backfill(dict(schema_version=1, operation_id='bf-terminal', records=[
+                dict(task=item['id'], kind='requirement', acceptance_state='draft')]),
+                'operator', self.native, self.path)
+        self.assertEqual(self.native.rows, before)
+        self.assertIn('requirement:withdrawn', self.native.row(item['id'])['labels'])
+
+
+    def test_absurd_abandon_after_is_refused_without_poisoning_reads(self):
+        item = self.accepted()
+        self.native.fail_comment_prefix = owner.STATE_PREFIX
+        with self.assertRaises(ValueError):
+            self.act(item)
+        path = terminal.receipt_path(self.path, 'terminal-first')
+        saved = json.loads(path.read_text())
+        saved['write_window']['abandon_after'] = 1e30
+        saved['terminal_sha256'] = terminal.seal(saved)['terminal_sha256']  # a re-sealed receipt
+        path.write_text(json.dumps(saved))
+        # The one file is damaged; no OverflowError escapes and the project read
+        # still answers with its own requirement.
+        view = http.read(self.path, 'alpha', ['list'], self.native)
+        self.assertEqual(view['total'], 1)
+        self.assertEqual(view['items'][0]['requirement_state'], 'unknown')
+        found, damaged = terminal.scan(self.path, 'alpha')
+        self.assertEqual(found, [])
+        self.assertEqual([entry['id'] for entry in damaged], [item['id']])
+        with self.assertRaisesRegex(ValueError, 'deadline'):
+            terminal.abandonment_wait(saved)
+        with self.assertRaisesRegex(ValueError, 'deadline'):
+            terminal.validate_receipt(saved)
+        with self.assertRaisesRegex(ValueError, 'endpoint timeout'):
+            terminal.write_window(endpoint_timeout=1e30)
+        with self.assertRaisesRegex(ValueError, 'deadline'):
+            terminal.write_window(time.time(), endpoint_timeout=terminal.MAX_WRITE_DEADLINE)
+
+
+    def test_symlinked_terminal_receipt_names_the_receipt_not_its_path(self):
+        item = self.accepted()
+        self.native.fail_comment_prefix = owner.STATE_PREFIX
+        with self.assertRaises(ValueError):
+            self.act(item)
+        path = terminal.receipt_path(self.path, 'terminal-first')
+        saved = terminal.read_receipt(path)
+        target = self.path / 'elsewhere.json'
+        target.write_bytes(path.read_bytes())
+        path.unlink()
+        try:
+            path.symlink_to(target)
+        except (OSError, NotImplementedError):
+            target.unlink()
+            self.skipTest('symlink creation is not permitted in this environment')
+        fields = dict(original_operation_id='terminal-first',
+                      expected_receipt_sha256=terminal.receipt_sha256(saved))
+        for action in ('finish', 'abandon'):
+            body = dict(fields)
+            if action == 'abandon':
+                body['reason'] = 'No state was written.'
+            with self.assertRaisesRegex(ValueError, 'the requirement receipt') as caught:
+                http.apply(self.path, self.context, action, body, 'symlink-' + action,
+                           self.native, item['id'])
+            self.assertNotIn('.json', str(caught.exception))
+            self.assertNotIn(str(self.path), str(caught.exception))
+
+
+    def test_written_state_before_the_deadline_does_not_offer_a_retry_time(self):
+        item = self.accepted()
+        self.native.fail_comment_prefix = owner.REASON_PREFIX
+        with self.assertRaises(ValueError):
+            self.act(item)
+        shown = self.recovery(item)
+        self.assertTrue(shown['can_finish'])
+        self.assertFalse(shown['can_abandon'])
+        self.assertNotIn('retry abandonment after', shown['abandon_unavailable'])
+        self.assertIn('A state was written', shown['abandon_unavailable'])
+
+    def test_abandon_stays_available_when_the_requirement_changed_while_pending(self):
+        item = self.accepted()
+        self.native.fail_comment_prefix = owner.STATE_PREFIX
+        with self.assertRaises(ValueError):
+            self.act(item)
+        self.after_writer(item)
+        # Model a change landed by another writer while this transition is
+        # pending: the exact request no longer matches the latest revision.
+        with mock.patch.object(terminal, 'pending_ids', return_value=(set(), set())):
+            http.apply(self.path, self.context, 'revise', dict(expected_revision=item['revision'],
+                expected_sha256=item['sha256'], description='Changed while pending.'),
+                'changed-while-pending', self.native, item['id'])
+        shown = self.recovery(item)
+        self.assertTrue(shown['can_abandon'])
+        self.assertFalse(shown['can_finish'])
+        released = self.recover(item, 'abandon', shown)
+        self.assertEqual(released['disposition'], 'released')
+
+    def test_scan_validates_each_owner_receipt_once_per_read(self):
+        items = [self.accepted(key) for key in ('first', 'second', 'third')]
+        for index, item in enumerate(items):
+            self.act(item, operation='terminal-%d' % index)
+        original = terminal.validate_receipt
+        seen = []
+        def counting(receipt):
+            seen.append(receipt['owner_state']['operation_id'])
+            return original(receipt)
+        with mock.patch.object(terminal, 'validate_receipt', counting):
+            view = http.read(self.path, 'alpha', ['list'], self.native)
+        self.assertEqual(view['total'], 3)
+        self.assertEqual(sorted(seen), ['terminal-0', 'terminal-1', 'terminal-2'])
+
+    def test_journal_creation_refusal_does_not_leak_the_server_path(self):
+        item = self.accepted()
+        shutil.rmtree(self.path / terminal.JOURNAL)
+        (self.path / terminal.JOURNAL).write_text('not a directory')
+        with self.assertRaisesRegex(ValueError, 'Cannot create') as caught:
+            self.act(item)
+        self.assertNotIn(str(self.path), str(caught.exception))
+        self.assertNotIn('Errno', str(caught.exception))
+
+    def test_a_natively_closed_successor_is_not_active(self):
+        first = self.accepted()
+        second = self.accepted('closed-successor')
+        self.native.row(second['id'])['status'] = 'closed'
+        reference = {key: second[key] for key in ('id', 'revision', 'sha256')}
+        writes = len(self.native.writes())
+        with self.assertRaisesRegex(ValueError, 'currently active'):
+            self.act(first, 'supersede', successor=reference)
+        self.assertEqual(len(self.native.writes()), writes)
+
+
+    def test_a_damaged_receipt_whose_state_landed_offers_the_operator_command(self):
+        item = self.accepted()
+        self.native.fail_comment_prefix = owner.REASON_PREFIX
+        with self.assertRaises(ValueError):
+            self.act(item)
+        path = terminal.receipt_path(self.path, 'terminal-first')
+        saved = json.loads(path.read_text())
+        saved['owner_state_reason']['reason'] = 'Altered after the write'
+        path.write_text(json.dumps(saved))
+        view = self.read(item)
+        self.assertEqual(view['requirement_state'], 'unknown')
+        self.assertIn('admin.py requirement-reconcile', view['state_message'])
+        found, damaged = terminal.scan(self.path, 'alpha')
+        self.assertEqual(found, [])
+        self.assertEqual([entry['id'] for entry in damaged], [item['id']])
+        self.assertIn('admin.py requirement-reconcile', damaged[0]['message'])
+
+    def test_a_written_state_with_no_receipt_offers_the_operator_command(self):
+        item = self.accepted()
+        self.native.fail_comment_prefix = owner.STATE_PREFIX
+        with self.assertRaises(ValueError):
+            self.act(item)
+        path = terminal.receipt_path(self.path, 'terminal-first')
+        saved = terminal.read_receipt(path)
+        path.unlink()
+        self.native.fail_comment_prefix = None
+        edited = http.apply(self.path, self.context, 'revise', dict(expected_revision=item['revision'],
+            expected_sha256=item['sha256'], description='Later accepted wording.'),
+            'lost-receipt-edit', self.native, item['id'])
+        http.apply(self.path, self.context, 'accept', dict(expected_revision=edited['revision'],
+            expected_sha256=edited['sha256']), 'lost-receipt-accept', self.native, item['id'])
+        self.native(['comments', 'add', item['id'], owner.body(saved['owner_state'], state=True), '--json'])
+        view = self.read(item)
+        self.assertEqual(view['requirement_state'], 'unknown')
+        self.assertIsNone(view['pending_transition'])
+        self.assertIn('admin.py requirement-reconcile --operation-id %s' % saved['owner_state']['operation_id'],
+                      view['state_message'])
 
 
 if __name__ == '__main__':

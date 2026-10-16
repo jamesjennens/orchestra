@@ -812,6 +812,10 @@ READ_ONLY_ACTIONS={
     'web-lifecycle':lambda args,operation:operation=='read',
     'web-merge-slot':lambda args,operation:operation=='check',
     'web-guidance':_web_guidance_read_only,
+    # kittrial-5bb.291 item 1: the roster read takes the project lock shared through
+    # the one table, not a hand-coded LOCK_SH at its own call site. task-assign is
+    # deliberately absent: it is a write and stays exclusive.
+    'assignment-roster':_read_only_always,
 }
 
 def coordination_lock_shared(request,action=None,args=None,operation=None):
@@ -1563,12 +1567,15 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                 result=assignment_apply(payload,actor,runner,path,eligible=lambda target:target in actors,
                                         operators=configured_operators(root),at=server_time())
                 return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':warning_text(warnings)}
-            with (path/'.coordination.lock').open('a') as lock:
-                fcntl.flock(lock,fcntl.LOCK_SH if action=='assignment-roster' else fcntl.LOCK_EX)
+            with held_coordination_lock(path,shared=coordination_lock_shared(request,action,args)):
                 if action=='assignment-roster':
                     if authority_config is None:raise AssignmentError(403,'Verified coordinate authority is required in this project.')
-                    with Path(authority_config.lock).open('a') as authority_lock:
-                        fcntl.flock(authority_lock,fcntl.LOCK_SH)
+                    # SHARED and bounded: two roster reads can hold it at once and a
+                    # writer is still excluded, with the same 60 s limit as the
+                    # exclusive wait (kittrial-5bb.291 item 5). The old flock(LOCK_SH)
+                    # was shared but waited forever.
+                    from http_authority import file_lock
+                    with file_lock(authority_config.lock, shared=True):
                         assignment_authority();actors=roster();offset=page['offset'];limit=page['limit']
                         result={'schema_version':1,'items':actors[offset:offset+limit],'total':len(actors),
                                 'more':offset+limit<len(actors),'offset':offset,
@@ -1597,7 +1604,9 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             stdout,warnings=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
             if warnings:run_warnings.append(warnings)
             return stdout
-        runner=NativeRunner(lifecycle_run,project=path)
+        # The web lifecycle write compares a fact against the task's LIVE bounded
+        # rows rather than a full export (kittrial-5bb.289 item 2).
+        runner=NativeRunner(lifecycle_run,project=path,bounded_task_reads=True)
         denied_status=[]
         try:
             if not isinstance(args,list) or len(args)!=1 or not isinstance(args[0],str):
@@ -1744,7 +1753,9 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             stdout,warnings=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
             if warnings:run_warnings.append(warnings)
             return stdout
-        runner=NativeRunner(run, project=path)
+        # The canonical lifecycle write compares a fact against the task's LIVE
+        # bounded rows rather than a full export (kittrial-5bb.289 item 2).
+        runner=NativeRunner(run, project=path, bounded_task_reads=True)
         # Slices 6 and 7 (kittrial-5bb.197): the three rules are read once, from the
         # installation's own file, and an installation that configures nothing reads
         # them all as OFF. A malformed value reads as OFF with a warning, as

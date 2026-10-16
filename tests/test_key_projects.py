@@ -14,6 +14,7 @@ import base64
 import hashlib
 import io
 import json
+import ntpath
 import os
 import re
 import subprocess
@@ -54,6 +55,25 @@ def runtime(base, *projects):
 def tree(folder):
     return {str(path.relative_to(folder)): (path.read_bytes() if path.is_file() else None)
             for path in sorted(Path(folder).rglob('*'))}
+
+
+def line_path(path):
+    """The spelling a key line uses for a REAL host path (kittrial-5bb.269 item 7).
+
+    A key line's ``command=`` is POSIX sshd syntax judged with ``posixpath`` on every host,
+    so the spelling must be POSIX-absolute on every host. On POSIX it is the path itself. On
+    Windows the fixture's folder is written ``C:/...``, which ``posixpath`` does NOT read as
+    absolute, so every line fell out of "this kit and this root" and the listing class
+    skipped there. Drop the drive instead (``C:/Users/x`` -> ``/Users/x``): ``posixpath``
+    reads it as absolute, and ``ntpath`` resolves a drive-rooted path against the current
+    drive - the drive of the checkout the tests run from - so the file the line names is the
+    real one. No drive and a UNC path are returned unchanged.
+    """
+    as_posix = Path(path).as_posix()
+    drive, tail = ntpath.splitdrive(as_posix)
+    if len(drive) == 2 and drive[1] == ':' and tail.startswith('/'):
+        return tail
+    return as_posix
 
 
 def actions_of_the_endpoint():
@@ -382,8 +402,12 @@ def fingerprint(body):
     return 'SHA256:' + base64.b64encode(hashlib.sha256(base64.b64decode(body)).digest()).decode().rstrip('=')
 
 
-@unittest.skipIf(os.name == 'nt', 'these fixtures write the temporary folder (a Windows path) as the key line\'s --root and wrapper paths; key-line text is POSIX sshd syntax and is judged with posixpath, which correctly does not read C:/ or D:\\ paths as absolute - kittrial-5bb.265 r2 item 5. Build the fixtures as POSIX text to run here.')
+@unittest.skipIf(os.name == 'nt', 'the authorized-keys listing is a POSIX-host feature and its fixtures write\n             the temporary folder as the key line\'s --root and wrapper paths, which key-line text judges as POSIX\n             sshd syntax (posixpath does not read C:/ or D:\\ as absolute). kittrial-5bb.269 r2: line_path() let\n             this class run on Windows and CI went red (run 38727896986, 12 tests); a skipped test where the\n             feature cannot run is right, a red job is not. The POSIX runs are unchanged.')
 class ListingTests(unittest.TestCase):
+    """kittrial-5bb.269 item 7: the fixtures write the key line as POSIX text through
+    ``line_path`` (a POSIX-looking root and wrapper path IN THE LINE, with the real files
+    under the temporary folder where the code stats them), so this class runs on Windows too.
+    """
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -400,8 +424,8 @@ class ListingTests(unittest.TestCase):
             (self.old/name).write_text('', encoding='utf-8')
 
     def line(self, kit=None, root=None, projects=(), body=KEY_BODY, comment='alex@laptop', more=''):
-        kit = (kit or self.kit).as_posix()
-        root = (root or self.root).as_posix()
+        kit = line_path(kit or self.kit)
+        root = line_path(root or self.root)
         bound = ''.join(' --project ' + name for name in projects)
         return ('command="/usr/bin/python3 -E -s %s/ssh_forced_command.py --root %s --endpoint %s/endpoint.py%s%s",'
                 'restrict,no-pty,no-port-forwarding,no-agent-forwarding,no-X11-forwarding ssh-ed25519 %s %s'
@@ -418,8 +442,8 @@ class ListingTests(unittest.TestCase):
         entry = self.one(self.line(projects=['alpha', 'beta'], comment='alex@laptop orchestra-projects=alpha,beta'))
         self.assertEqual(entry, {
             'key_type': 'ssh-ed25519', 'fingerprint': fingerprint(KEY_BODY), 'comment': 'alex@laptop orchestra-projects=alpha,beta',
-            'kind': 'bound', 'projects': ['alpha', 'beta'], 'principal': None, 'root': self.root.as_posix(),
-            'wrapper': self.kit.as_posix() + '/ssh_forced_command.py', 'endpoints': [self.kit.as_posix() + '/endpoint.py'],
+            'kind': 'bound', 'projects': ['alpha', 'beta'], 'principal': None, 'root': line_path(self.root),
+            'wrapper': line_path(self.kit) + '/ssh_forced_command.py', 'endpoints': [line_path(self.kit) + '/endpoint.py'],
             'other_kit': False, 'other_root': False, 'missing': False, 'unknown_arguments': [], 'names_release': False,
             'unknown_projects': [],
             # kittrial-5bb.250 r3: the two rule fields every command line now carries.
@@ -428,10 +452,10 @@ class ListingTests(unittest.TestCase):
 
     def test_an_over_long_command_is_group_two_without_token_work(self):
         # kittrial-5bb.265 r2: the raw-text bound fires before shlex, so a line of 200,000
-        # path components answers quickly and carries the group-two flags.
-        import time
+        # path components answers quickly and carries the group-two flags. kittrial-5bb.269
+        # item 4: its own kind is `over-long`, never `other-command`.
         entry = self.one(self.line().replace('ssh_forced_command.py', 'k/' * 100000 + 'ssh_forced_command.py'))
-        self.assertEqual('other-command', entry['kind'])
+        self.assertEqual('over-long', entry['kind'])
         self.assertTrue(entry['relative_path'])
         self.assertTrue(entry['foreign_invocation'])
         self.assertIsNone(entry.get('wrapper'))
@@ -467,11 +491,11 @@ class ListingTests(unittest.TestCase):
         """An earlier release's wrapper binds nothing: the design's Migration, step 6."""
         entry = self.one(self.line(kit=self.old, projects=['alpha']))
         self.assertEqual((entry['kind'], entry['other_kit'], entry['missing']), ('bound', True, False))
-        mixed = self.one(self.line(projects=['alpha']).replace('--endpoint %s' % self.kit.as_posix(),
-                                                               '--endpoint %s' % self.old.as_posix()))
+        mixed = self.one(self.line(projects=['alpha']).replace('--endpoint %s' % line_path(self.kit),
+                                                               '--endpoint %s' % line_path(self.old)))
         self.assertTrue(mixed['other_kit'])                                     # this wrapper, the other kit's endpoint
-        mixed = self.one(self.line(projects=['alpha']).replace('%s/ssh_forced_command.py' % self.kit.as_posix(),
-                                                               '%s/ssh_forced_command.py' % self.old.as_posix()))
+        mixed = self.one(self.line(projects=['alpha']).replace('%s/ssh_forced_command.py' % line_path(self.kit),
+                                                               '%s/ssh_forced_command.py' % line_path(self.old)))
         self.assertTrue(mixed['other_kit'])                                     # the other kit's wrapper, this endpoint
         gone = self.one(self.line(kit=self.base/'removed', projects=['alpha']))
         self.assertEqual((gone['other_kit'], gone['missing']), (True, True))

@@ -35,6 +35,7 @@ from urllib.request import urlopen
 import admin
 import record_json
 from version import report
+from http_auth import validate_agent_credential_days
 
 
 def private_root(raw):
@@ -88,7 +89,7 @@ def service_config(path):
         raise ValueError('Office service configuration must have schema_version 1')
     allowed = {'schema_version', 'http_host', 'http_state', 'cert', 'key',
                'trusted_proxies', 'public_url', 'endpoint_timeout', 'connections_per_address', 'logins_per_address',
-               'approval_by_another_party', PLAINTEXT_SETTING, HSTS_SETTING}
+               'approval_by_another_party', 'agent_credential_days', PLAINTEXT_SETTING, HSTS_SETTING}
     if set(config) - allowed:
         raise ValueError('Unknown office service setting: ' + ', '.join(sorted(set(config)-allowed)))
     for setting in ('cert', 'key'):
@@ -117,6 +118,8 @@ def service_config(path):
             raise ValueError('public_url must be an http or https URL with a host (got %r)' % (public_url,))
     if not isinstance(config.get('approval_by_another_party', False), bool):
         raise ValueError('approval_by_another_party must be true or false')
+    if 'agent_credential_days' in config:
+        validate_agent_credential_days(config['agent_credential_days'])
     plain = config.get(PLAINTEXT_SETTING, False)
     if not isinstance(plain, bool):
         raise ValueError(PLAINTEXT_SETTING + ' must be true or false')
@@ -601,6 +604,8 @@ def web_command(settings, root, port, release_python, release_script):
         command.extend(['--connections-per-address', settings['connections_per_address']])
     if 'logins_per_address' in settings:
         command.extend(['--logins-per-address', settings['logins_per_address']])
+    if 'agent_credential_days' in settings:
+        command.extend(['--agent-credential-days', validate_agent_credential_days(settings['agent_credential_days'])])
     if settings.get('approval_by_another_party') is True:
         command.append('--approval-by-another-party')
     if settings.get(HSTS_SETTING) is True:

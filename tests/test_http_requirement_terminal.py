@@ -43,8 +43,8 @@ class TerminalHttpTests(EndpointCase):
         self.assertEqual(view.status,200,view.data)
         return view.data['pending_transition']
 
-    def recover_transition(self,item,saved,action='finish',token=None,key='finish-transition'):
-        body=dict(original_operation_id=saved['operation_id'],expected_receipt_sha256=saved['expected_receipt_sha256'])
+    def recover_transition(self,item,saved,action='finish',token=None,key='finish-transition',**extra):
+        body=dict(original_operation_id=saved['operation_id'],expected_receipt_sha256=saved['expected_receipt_sha256'],**extra)
         if action=='abandon':body['reason']='No state was written.'
         return self.request('POST',self.base+'/requirements/'+item['id']+'/transition/'+action,body,
                             token=token or self.owner_token,key=key)
@@ -247,6 +247,94 @@ class TerminalHttpTests(EndpointCase):
         brd=self.request('GET',self.base+'/brd',token=token)
         self.assertNotIn(first['id'],brd.data['nonterminal_ids']); self.assertIn(second['id'],brd.data['nonterminal_ids'])
         self.assertEqual(self.request('GET',self.base+'/requirements/'+second['id'],token=token).data['supersedes'][0]['id'],first['id'])
+
+    def test_members_read_the_transition_state_without_its_recovery_handles(self):
+        item=self.accepted(); self.backend.native.fail_comment_prefix=owner.REASON_PREFIX
+        failed=self.transition(item); self.assertEqual(failed.status,503)
+        self.backend.native.fail_comment_prefix=None
+        pending=self.pending_transition(item)
+        self.assertTrue(pending['operation_id']); self.assertTrue(pending['expected_receipt_sha256'])
+        admin=self.admin_token(); viewer_id=self.create_account(admin,'viewer','viewer-password-1')
+        token=self.login('viewer','viewer-password-1')[0]
+        self.assertEqual(self.request('PUT',self.base+'/members/'+viewer_id,{'role':'viewer'},token=admin).status,200)
+        for route in (self.base+'/requirements', self.base+'/requirements/'+item['id']):
+            shown=self.request('GET',route,token=token)
+            self.assertEqual(shown.status,200,shown.data)
+            text=json.dumps(shown.data)
+            self.assertNotIn(pending['operation_id'],text)
+            self.assertNotIn(pending['expected_receipt_sha256'],text)
+            self.assertNotIn('expected_receipt_sha256',text)
+            self.assertNotIn('can_finish',text)
+            self.assertNotIn('finish or abandon it on the requirements page',text)
+        detail=self.request('GET',self.base+'/requirements/'+item['id'],token=token).data
+        self.assertEqual(detail['requirement_state'],'unknown')
+        self.assertEqual(detail['pending_transition']['state']['state'],'withdrawn')
+        self.assertIn('ask a project owner',detail['pending_transition']['message'])
+        self.assertEqual(self.pending_transition(item)['operation_id'],pending['operation_id'])
+        # The owner is not a non-owner: the same read keeps the exact handles the
+        # finish/abandon route needs (this is the N10 owner/non-owner boundary).
+        owner_detail=self.request('GET',self.base+'/requirements/'+item['id'],token=self.owner_token).data
+        self.assertEqual(owner_detail['pending_transition']['operation_id'],pending['operation_id'])
+        self.assertEqual(owner_detail['pending_transition']['state']['operation_id'],pending['operation_id'])
+        self.assertTrue(owner_detail['pending_transition']['can_finish'])
+
+    def test_late_state_beside_a_completed_later_decision_is_superseded(self):
+        # T-d over HTTP: an abandoned withdrawal's late state lands after a fresh
+        # withdrawal completed. The requirement reads the later decision's status,
+        # the page offers no Finish, and the finish route is refused naming it.
+        item=self.accepted(); self.backend.native.fail_comment_prefix=owner.STATE_PREFIX
+        failed=self.transition(item,key='early-withdraw'); self.assertEqual(failed.status,503,failed.data)
+        self.after_writer(item)
+        early=self.pending_transition(item); self.assertTrue(early['can_abandon'])
+        released=self.recover_transition(item,early,'abandon',key='early-abandon')
+        self.assertEqual(released.status,200,released.data)
+        self.backend.native.fail_comment_prefix=None
+        fresh=self.transition(item,key='fresh-withdraw'); self.assertEqual(fresh.status,200,fresh.data)
+        self.backend.native(['comments','add',item['id'],owner.body(early['state'],state=True),'--json'])
+        detail=self.request('GET',self.base+'/requirements/'+item['id'],token=self.owner_token).data
+        self.assertEqual(detail['requirement_state'],'withdrawn')
+        self.assertEqual(detail['state']['operation_id'],fresh.data['operation_id'])
+        late=detail['pending_transition']
+        self.assertIsNotNone(late); self.assertFalse(late['can_finish']); self.assertFalse(late['can_abandon'])
+        self.assertEqual(late['disposition'],'superseded')
+        self.assertEqual(late['superseded_by']['operation_id'],fresh.data['operation_id'])
+        self.assertIn('later completed decision '+fresh.data['operation_id'],late['message'])
+        refused=self.recover_transition(item,late,key='superseded-finish')
+        self.assertEqual(refused.status,422,refused.data)
+        self.assertIn('later completed decision '+fresh.data['operation_id'],str(refused.data))
+
+    def test_late_finish_after_a_later_accept_names_it_and_needs_confirmation(self):
+        # T-c/T-e over HTTP: the owner edits and accepts a later revision, then
+        # the released decision's state lands late. The finish stays available but
+        # names the accepted revision and is refused until the owner confirms.
+        item=self.accepted(); self.backend.native.fail_comment_prefix=owner.STATE_PREFIX
+        failed=self.transition(item,key='late-withdraw'); self.assertEqual(failed.status,503,failed.data)
+        self.after_writer(item)
+        saved=self.pending_transition(item); self.assertTrue(saved['can_abandon'])
+        self.assertEqual(self.recover_transition(item,saved,'abandon',key='late-abandon').status,200)
+        self.backend.native.fail_comment_prefix=None
+        draft=self.request('PATCH',self.base+'/requirements/'+item['id'],
+            dict(self.expected(item),description='Accepted after the release.'),token=self.owner_token,key='late-edit')
+        self.assertEqual(draft.status,200,draft.data)
+        accepted=self.request('POST',self.base+'/requirements/'+item['id']+'/accept',self.expected(draft.data),
+            token=self.owner_token,key='late-accept')
+        self.assertEqual(accepted.status,200,accepted.data)
+        self.backend.native(['comments','add',item['id'],owner.body(saved['state'],state=True),'--json'])
+        late=self.request('GET',self.base+'/requirements/'+item['id'],token=self.owner_token).data['pending_transition']
+        self.assertTrue(late['can_finish'])
+        self.assertEqual(late['undoes']['revision'],accepted.data['revision'])
+        self.assertEqual(late['undoes']['sha256'],accepted.data['sha256'])
+        self.assertIn('accepted revision %d'%accepted.data['revision'],late['message'])
+        self.assertIn(late['undoes']['accepted_at'],late['message'])
+        refused=self.recover_transition(item,late,key='finish-unconfirmed')
+        self.assertEqual(refused.status,422,refused.data)
+        self.assertIn('accepted revision %d'%accepted.data['revision'],str(refused.data))
+        done=self.recover_transition(item,late,key='finish-confirmed',confirm=True)
+        self.assertEqual(done.status,200,done.data)
+        self.assertEqual(done.data['undoes']['revision'],accepted.data['revision'])
+        self.assertIn('accepted revision %d'%accepted.data['revision'],done.data['message'])
+        after=self.request('GET',self.base+'/requirements/'+item['id'],token=self.owner_token).data
+        self.assertEqual(after['requirement_state'],'withdrawn')
 
     def test_closed_fields_state_content_cas_and_draft_refuse_before_effect(self):
         item=self.accepted(); initial=copy.deepcopy(self.backend.native.rows)
