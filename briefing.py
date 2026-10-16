@@ -378,18 +378,6 @@ def transition(previous,current,called_from='request',current_id=None):
         #      must say so rather than send the caller hunting for an item problem that
         #      may not exist.
         # Named ids are bounded like a field-name list so one sentence stays bounded.
-        def id_list(ids,limit=FIELD_NAME_COUNT):
-            """The ids of this pair, bounded the way a field-name list is.
-
-            A refusal must name what it compared, or a caller cannot act on it
-            (kittrial-5bb.287); it must also stay bounded, so a pathological record
-            cannot make one sentence unbounded. Every id is named when they fit, and
-            the rest are counted.
-            """
-            shown=sorted(ids)
-            if len(shown)<=limit:return ', '.join(shown)
-            return ', '.join(shown[:limit])+' (+%d more)'%(len(shown)-limit)
-
         dropped=id_list(old-now)
         carried=id_list((old|now)&resolved)
         not_open=id_list(resolved-old-now)
@@ -568,6 +556,16 @@ def directions_counted(provenance_writes,status):
     if status=='closed':return False,'closed'
     if not provenance_writes:return False,'switch-off'
     return True,None
+
+def directions_check_state(reason):
+    """The ``check`` label a direction reader carries when the check cannot apply.
+
+    ``off`` while the installation switch is off (the pre-existing label), and
+    ``closed`` for a closed task: a reader must not say the switch is off when it
+    is on and the task is simply closed (kittrial-5bb.284 review S3, folded into
+    kittrial-5bb.287). ``reason`` is ``directions_counted``'s second value.
+    """
+    return 'off' if reason=='switch-off' else reason
 ZERO_HASH='0'*64
 
 def provenance_chain(digests):
@@ -782,7 +780,7 @@ def retained_provenance(state,upto=None):
     return dict(latest,digests=exact,older=trunc,verifiable=len(exact)+len(trunc),
                 complete=not trunc and len(exact)>=latest['covered'])
 
-def newer_activity_summary(data,prov,checkpoint_timestamp,owner,direction_idx=None,direction_data=None,counted=True):
+def newer_activity_summary(data,prov,checkpoint_timestamp,owner,direction_idx=None,direction_data=None,counted=True,directions_reason='switch-off'):
     """Bounded, per-entry view of activity the current checkpoint did not incorporate.
 
     `prov` is the checkpoint's normalized provenance, so edited entries (same ID,
@@ -828,7 +826,7 @@ def newer_activity_summary(data,prov,checkpoint_timestamp,owner,direction_idx=No
             'items':[{'entry_id':e['entry_id'],'timestamp':e['timestamp'],'author':clip(e['author'],96),
                       'state':(direction_idx.get(e['entry_id']) or {}).get('state','unacknowledged')} for e in outstanding[:NEWER_MAX]],
             'omitted':max(0,len(outstanding)-NEWER_MAX)}
-        if not counted:result['unresolved_directions']['check']='off'
+        if not counted:result['unresolved_directions']['check']=directions_check_state(directions_reason)
     return result
 
 def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifiers=None,actor=None,full=False,
@@ -931,7 +929,7 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
                            'state':(dispositions.get(e['entry_id']) or {}).get('state','unacknowledged')} for e in outstanding[:NEWER_MAX]],
                  'omitted':max(0,len(outstanding)-NEWER_MAX)}
         if not counted:
-            dir_out['check']='off';dir_out['reason']=directions_off_reason
+            dir_out['check']=directions_check_state(directions_off_reason);dir_out['reason']=directions_off_reason
         if dir_out['total']:
             ids=', '.join(i['entry_id'] for i in dir_out['items'][:NEWER_MAX])
             ids+=(f' (+{dir_out["omitted"]} more)' if dir_out['omitted'] else '')
@@ -941,7 +939,7 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
         excluded_cursor=activity_cursor(excluded)
         stale=not cursor_matches(p['activity_cursor'],excluded,compatible=excluded_cursor)
         if stale:
-            newer=newer_activity_summary(excluded,retained_provenance(state),c.get('created_at'),context[0],dispositions,direction_data,counted)
+            newer=newer_activity_summary(excluded,retained_provenance(state),c.get('created_at'),context[0],dispositions,direction_data,counted,directions_off_reason)
             if review['review_state'] not in review_next:
                 dirs=newer.get('unresolved_directions')
                 dir_note='' if not dirs else '; '+str(dirs['total'])+' outstanding direction(s) not yet resolved/superseded'
@@ -1311,7 +1309,7 @@ def checkpoint_queue_fields(rows,row,state=None,provenance_writes=True):
         if cursor_matches(p['activity_cursor'],data):own=others=0;coverage='current'
         else:
             newer=newer_activity_summary(data,retained_provenance(state),c.get('created_at'),
-                                         context[0],dispositions,direction_data,counted)
+                                         context[0],dispositions,direction_data,counted,_directions_off_reason)
             own=newer['own_count'];others=newer['other_count'];coverage=newer['coverage']
         return {'newer_activity_by_others':others,'newer_activity_own':own,
                 'newer_activity_coverage':coverage,
@@ -1822,7 +1820,7 @@ def direction_page(rows,project,task,offset=0,limit=50,provenance_writes=True):
             'next_offset':offset+limit if offset+limit<len(entries) else None,
             'coverage':'Current full digests for outstanding directions, including entries outside stored provenance windows. '
                        'Pages are fresh reads; compare activity_cursor across pages and restart if it changes.'}
-    if not counted:page['check']='off';page['reason']=directions_off_reason
+    if not counted:page['check']=directions_check_state(directions_off_reason);page['reason']=directions_off_reason
     return page
 
 def latest_checkpoint_read(rows,project,task,include_provenance=False):
