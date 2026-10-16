@@ -1468,6 +1468,24 @@ def attention_blocking_items(fields):
     return value if type(value) is int and value >= 0 else None
 
 
+def holder_move(status, task_id, assignee, review_state, open_requests, contribution_id,
+                redelivered=None, claimable_value=None):
+    """The HOLDER's move reading for a projection row, from the ONE shared decision.
+
+    A page shows a task's move for the actor who holds it, and the work row that names
+    the same reading is ``work --owner ACTOR``. This calls the same
+    ``work.move_decision`` the queue and the lane board use with the holder as the
+    subject, so an open task assigned to the holder with no checkpoint and no
+    contribution by them reads ``you``/``assignee`` on the page exactly as it does in
+    the queue (kittrial-5bb.288) and the two readings cannot drift apart.
+    """
+    from work import move_decision
+    pending = open_requests if type(open_requests) is int and open_requests >= 0 else 0
+    return move_decision(review_state, task_id, True, pending_items=pending,
+                         redelivered=bool(redelivered), assignee=assignee,
+                         closed=status == 'closed', claimable=claimable_value)
+
+
 def own_queue_tasks(queue, actor=None):
     """Split one current review snapshot by assignee, retaining unknown checkpoint state."""
     tasks=[]
@@ -1475,9 +1493,17 @@ def own_queue_tasks(queue, actor=None):
         if not isinstance(row,dict) or not row.get('assignee') or (actor is not None and row['assignee']!=actor):
             continue
         fields=row.get('attention') if isinstance(row.get('attention'),dict) else {}
+        move, move_text, move_role = holder_move(
+            row.get('status'), row.get('id'), row.get('assignee'), row.get('review_state'),
+            row.get('open_requests'), (row.get('contribution') or {}).get('id'),
+            fields.get('redelivered'), row.get('claimable'))
         tasks.append({'id':row.get('id'),'title':row.get('title'),'status':row.get('status'),
                       'assignee':row.get('assignee'),'review_state':row.get('review_state'),
                       'contribution_id':(row.get('contribution') or {}).get('id'),
+                      # The holder's own move reading, from the same decision as the
+                      # canonical `work --owner ACTOR` row (kittrial-5bb.288), so the
+                      # agents page and the bridge show what the queue row shows.
+                      'whose_move':move,'next':move_text,'next_actor':move_role,
                       'pending_change_requests':list(fields.get('pending_change_requests') or [])[:20],
                       # The canonical item count, so the move sentence says the same N as the
                       # `work` row it came from (kittrial-5bb.249).
@@ -6370,14 +6396,17 @@ class ApiHandler(BaseHTTPRequestHandler):
                                               redelivered=bool(task.get('redelivered')),
                                               way_back='`%s`' % (task_base + '/brief'))
                 details['whose_move'], details['next'] = move, move_text
-                if review != 'changes-requested':
+                if review != 'changes-requested' and not in_progress:
                     # The task asked for the two fields only where the kind is
                     # changes-requested (review item 2b): every other kind has a mover who is
                     # not this agent (an operator reconciles a review error or an unreadable
                     # checkpoint; a reviewer or the coordinator holds awaiting work), so it
                     # carries neither field instead of pairing `who: operator` with
                     # `whose_move: you` or contradicting the queue row's blocked/waiting
-                    # sentence.
+                    # sentence. `in-progress` is the agent's OWN undelivered, assigned task,
+                    # so it carries its move too (kittrial-5bb.288): a lane assigned a task
+                    # it never touched is told it is that lane's move, in the same words as
+                    # the canonical `work --owner ACTOR` row.
                     details.pop('whose_move', None)
                     details.pop('next', None)
                 if review == 'changes-requested':

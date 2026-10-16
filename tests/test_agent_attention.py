@@ -177,15 +177,41 @@ class EndpointAttentionTests(fixes.EndpointCase):
         self.assertEqual(sorted(kinds(data)[-2:]), [('awaiting-integration', third), ('awaiting-review', first)])
         self.assertEqual([action['priority'] for action in data['next_actions']], [2, 4, 5, 5])
 
-    def test_only_changes_requested_carries_the_move_and_from_the_one_queue_helper(self):
+    def test_an_assigned_untouched_task_is_offered_as_the_agents_own_move(self):
+        """kittrial-5bb.288: a task assigned to the agent that it never touched is offered.
+
+        It is kind ``in-progress`` (the agent's own undelivered work), it carries the
+        same move reading as the canonical ``work --owner ACTOR`` row in the same words,
+        and the "cannot be told" sentence is gone for that case.
+        """
+        task = self.tasks[0]
+        self.claim(task)                          # the claim sets the agent's actor as assignee
+        actor = self.next()['agent']['actor']
+        data = self.next()
+        action = next(item for item in data['next_actions'] if item['task'] == task)
+        self.assertEqual(action['kind'], 'in-progress')
+        self.assertEqual(action['whose_move'], 'you')
+        self.assertNotIn(work.UNKNOWN_MOVE_TEXT, action['next'])
+        self.assertIn('no contribution has been delivered yet', action['next'])
+        # The words are the canonical work row's, with only the way back changed to the
+        # brief route a web agent can actually open.
+        row = next(r for r in work.queue(self.canonical_rows(), actor, ['--mine'])['items']
+                   if r['task'] == task)
+        route = '/v1/projects/%s/tasks/%s/brief' % (self.project, task)
+        self.assertEqual(action['whose_move'], row['whose_move'])
+        self.assertEqual(action['next'].replace('`%s`' % route, '`review %s`' % task), row['next'])
+
+    def test_the_move_rides_the_agents_own_actions_and_comes_from_the_one_queue_helper(self):
         """Item 2b: the two answers cannot disagree, so the fields are restricted.
 
-        The task asked for `whose_move`/`next` only where the kind is changes-requested. Every
-        other kind has a mover who is not the agent (an operator reconciles a review error or an
-        unreadable checkpoint; a reviewer or the coordinator holds awaiting work), so it carries
-        neither field: kind `checkpoint-error` can no longer pair `who: operator` with
+        The move rides the kinds whose mover IS the agent: `changes-requested` (a
+        revision is owed) and, since kittrial-5bb.288, `in-progress` (assigned or
+        claimed and not delivered yet). Every other kind has a mover who is not the
+        agent (an operator reconciles a review error or an unreadable checkpoint; a
+        reviewer or the coordinator holds awaiting work), so it carries neither field:
+        kind `checkpoint-error` can no longer pair `who: operator` with
         `whose_move: you`, and kind `blocked` no longer contradicts the queue's own sentence.
-        Where the kind IS changes-requested, the words are the canonical work ROW's, compared
+        Where a kind DOES carry the move, the words are the canonical work ROW's, compared
         against that row rather than against a second call to the helper (kittrial-5bb.253 item 1).
         """
         first, second, third, spare = self.tasks
@@ -202,7 +228,7 @@ class EndpointAttentionTests(fixes.EndpointCase):
         self.assertIn('review-error', kinds_seen)
         self.assertNotIn('changes-requested', kinds_seen)
         for action in data['next_actions']:
-            if action['kind'] == 'changes-requested':
+            if action['kind'] in ('changes-requested', 'in-progress'):
                 self.assertIn('whose_move', action)
             else:
                 with self.subTest(kind=action['kind']):
@@ -223,7 +249,7 @@ class EndpointAttentionTests(fixes.EndpointCase):
         self.assertEqual(action['whose_move'], row['whose_move'])
         self.assertEqual(action['next'].replace('`%s`' % route, '`review %s`' % first), row['next'])
         for other in data['next_actions']:
-            if other['kind'] != 'changes-requested':
+            if other['kind'] not in ('changes-requested', 'in-progress'):
                 with self.subTest(kind=other['kind']):
                     self.assertNotIn('whose_move', other)
                     self.assertNotIn('next', other)

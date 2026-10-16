@@ -157,6 +157,19 @@ WHOSE_MOVE = ('you', 'reviewer', 'coordinator', 'unknown')
 UNKNOWN_MOVE_TEXT = 'Whose move this is cannot be told from the review state shown here.'
 
 
+def move_subject(caller, owner=None):
+    """The actor whose move a work read answers for (kittrial-5bb.288).
+
+    ``--owner ACTOR`` asks about ACTOR's queue, so its per-row ``whose_move``/``next``
+    and its top-level ``your_move`` count are ACTOR's; ``--mine`` and an unfiltered
+    scan answer for the caller (there ``next_actor`` names the role instead). This is
+    the ONE place that decides it, so the count can never read 0 while a row assigned
+    to the subject -- an open task with no checkpoint and no contribution by them --
+    is in ``items``. It infers nothing: it only fixes whose queue is being read.
+    """
+    return caller if owner is None else owner
+
+
 def _caller_move(state, task, owned, named_reviewer=False, pending_items=0, redelivered=False,
                  way_back=None):
     """`(whose_move, next)`: the caller-relative half of the one whose-move decision.
@@ -453,11 +466,13 @@ def help_payload(action='work'):
             'item_identity': 'items[].task is the native task ID; items[].contribution_id is the '
                              'contribution comment ID, not a Git commit or latest_comment_id',
             'item_move': 'items[].whose_move is you, reviewer, coordinator or unknown, relative to the '
-                         'calling actor, derived only from the validated review state the row already '
-                         'shows; items[].next is one plain sentence saying the same in words, and '
-                         'quotes the blocker or dependency entry of the caller\'s own checkpoint when that '
-                         'checkpoint records one (no person is inferred; the move stays the caller\'s). '
-                         'Items where the move is the caller\'s sort first; top-level your_move '
+                         'actor the queue is read for: the caller on --mine and an unfiltered scan, and '
+                         'ACTOR on --owner ACTOR (kittrial-5bb.288). An open task assigned to that '
+                         'actor with no checkpoint and no contribution by them is their move. '
+                         'items[].next is one plain sentence saying the same in words, and '
+                         'quotes the blocker or dependency entry of that actor\'s own checkpoint when '
+                         'it records one (no person is inferred; the move stays theirs). '
+                         'Items where the move is that actor\'s sort first; top-level your_move '
                          'carries their count for the filtered queue. Nothing is inferred from a title, a '
                          'comment or an actor name.',
             'item_select': 'items[].next_actor is the next-action actor as a ROLE (assignee, reviewer, '
@@ -736,6 +751,11 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
     if scopes is not None and not isinstance(scopes,dict):
         raise ValueError('scopes must be a mapping of task id to that task\'s integration scopes')
     owner=actor if a.mine else a.owner
+    # kittrial-5bb.288: the move is the QUEUE's, not the connection's. `--owner ACTOR`
+    # is ACTOR's queue, so an open task assigned to ACTOR on which ACTOR never posted
+    # reads `whose_move` 'you' and counts in `your_move`; `--mine` answers for the
+    # caller; an unfiltered scan keeps the caller-relative answer and `next_actor`.
+    subject=move_subject(actor,owner)
     journal_requests=[];journal_errors=[]
     if request_dir and request_dir.is_dir():
         request_files=sorted(request_dir.glob('*.json'))
@@ -851,15 +871,16 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
             named=[request for request in (review.get('pending_review_requests') or [])
                    if author_key(request.get('reviewer'))==author_key(owner)]
             if not named and not (a.mine and notices['total']):continue
-        # The caller's own named review requests, so a row that is in the queue only
-        # because they were named says so (kittrial-5bb.94 item 4). Computed for the
-        # CALLING actor, not the --owner filter.
+        # The named review requests OF THE SUBJECT: on `--mine` the caller's own, and on
+        # `--owner ACTOR` ACTOR's (the queue that read answers for; kittrial-5bb.288), so a
+        # row that is in the queue only because they were named says so and their move is
+        # named (kittrial-5bb.94 item 4).
         review_requests=[{'request':request.get('request'),'reviewer':request.get('reviewer'),
                           'contribution':request.get('contribution'),'summary':request.get('summary'),
                           'author':request.get('author'),'timestamp':request.get('timestamp')}
                          for request in (review.get('pending_review_requests') or [])
-                         if actor is not None and author_key(request.get('reviewer'))==author_key(actor)]
-        review_request=bool(review_requests) and row.get('assignee')!=actor
+                         if subject is not None and author_key(request.get('reviewer'))==author_key(subject)]
+        review_request=bool(review_requests) and row.get('assignee')!=subject
         # The integration overlay's warnings (kittrial-5bb.52): the owner decision
         # keeps any-pass-wins, and a host-issued revert is always surfaced, so both
         # the disagreement and the revert warning travel with the row.
@@ -967,8 +988,10 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
         # Whose move it is, one plain sentence saying so, and the caller-neutral ROLE of
         # that same decision -- ONE call, so a row can never name one mover and deny
         # another (kittrial-5bb.6 review item 2). Derived from the validated review state
-        # this row already shows; no further read.
-        move,move_text,role=move_decision(state,row['id'],bool(actor) and row.get('assignee')==actor,
+        # this row already shows; no further read. `owned` is the SUBJECT's (kittrial-
+        # 5bb.288): an open task assigned to the subject with no contribution and no
+        # checkpoint by them reads `you` and counts in `your_move`.
+        move,move_text,role=move_decision(state,row['id'],bool(subject) and row.get('assignee')==subject,
                                           named_reviewer=review_request,pending_items=pending_items,
                                           redelivered=redelivered,assignee=row.get('assignee'),
                                           closed=row.get('status')=='closed',claimable=row_claimable)
@@ -1060,13 +1083,14 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
     # for all rows, so the move and `your_move` are the queue's, never the page's. The
     # heavier per-row checkpoint fields stay on the displayed page below.
     for item in items:
-        item['checkpoint_wait']=checkpoint_wait(task_rows.get(item['task'],{}),actor,
+        item['checkpoint_wait']=checkpoint_wait(task_rows.get(item['task'],{}),subject,
             checkpoint_states.get(item['task']),
             delivered=bool(item['contribution_id']) or item['review_state'] not in (None,'none'))
         # (kittrial-5bb.219 addition c, revised for kittrial-5bb.249 item 1 and kittrial-5bb.253
-        # item 2) Where the caller's own current checkpoint records a blocker or dependency,
-        # `next` quotes that blocker or dependency ENTRY itself (its raw text, escaped once) and
-        # says no person was inferred. The move stays the caller's: `whose_move` is not rewritten
+        # item 2) Where the SUBJECT's own current checkpoint (the caller's on --mine, the
+        # owner's on --owner; kittrial-5bb.288) records a blocker or dependency, `next` quotes
+        # that blocker or dependency ENTRY itself (its raw text, escaped once) and says no
+        # person was inferred. The move stays the subject's: `whose_move` is not rewritten
         # and the row stays in `your_move`.
         if item['checkpoint_wait'].get('active'):
             wait_text=waiting_move(checkpoint_wait_move_text(checkpoint_states.get(item['task'])))
