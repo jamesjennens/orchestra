@@ -2979,9 +2979,18 @@ line separately and unconfined.
   same bounded `candidates` fall-through an ordinary held refusal carries. A delivered
   task (awaiting review or beyond) does not count, and the agent's own re-claim of a task
   it already holds is not counted again. A person's own session actor is not limited.
+  A task whose latest checkpoint left an open blocker or dependency does not count: the
+  documented order sends a lane the checkpoint left stuck on to other work, and that
+  order has to be possible to follow. A PERSON assigning a task to an agent at its limit
+  is still allowed (`POST /v1/projects/{id}/tasks/{task}/assign`): that is the owner's
+  explicit choice, not the agent taking work. An AGENT assigning a task to itself
+  through that same route is a claim and takes the limit, because that IS the agent
+  taking work.
   `GET /v1/agents/me/next` and each agent record report the limit, how many it holds and
-  how many are left, so the agent can see what is in the way. The held set is read from
-  the same bounded `work` snapshot attention already reads, and it fails closed: a held
+  how many are left, all from the same one counted-held rule the gate applies, so the
+  two answers cannot disagree. The held set is read from the same bounded `work`
+  snapshot attention already reads, across every project the agent is granted, and it
+  fails closed: a held
   set that cannot be read refuses the claim rather than reading as "no limit". This is
   the service's own gate, so it covers the web page, the client and any other client of
   the route; a `bd update --claim` run by hand on the host, outside this service, is not

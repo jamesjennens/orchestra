@@ -961,6 +961,12 @@ class Service:
                  lookup_max=LOOKUP_MAX_PER_WINDOW, lookup_window=LOOKUP_WINDOW_SECONDS,
                  approval_by_another_party=False, agent_credential_days=_AGENT_LIFETIME_DEFAULT):
         self.store = store
+        #: One lock spanning the per-agent claim gate's held-set read and the claim
+        #: write (kittrial-5bb.276 revision). The held set is a separate endpoint
+        #: read, so without a lock two concurrent claims by one agent both read the
+        #: set before either wrote and both passed a limit of one. It is per service
+        #: process, which is where that service's concurrent HTTP requests are served.
+        self.claim_gate = threading.RLock()
         #: The installation's setting "nobody approves work of their own party" (slice 1a of
         #: docs/WEB_COORDINATOR_DESIGN.md, kittrial-5bb.199). OFF unless the operator turns it
         #: on: with it off every review rule is exactly what it was.

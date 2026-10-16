@@ -11,7 +11,9 @@ What one counted task is (the task states it in its own words): a claimed task
 whose status is ``open`` or ``in_progress`` and whose review state is ``none``
 or ``changes-requested``. Delivered work does not count: once a contribution is
 recorded the row is ``awaiting-review`` (or beyond), and the reviewer or the
-coordinator moves it, not the agent.
+coordinator moves it, not the agent. A task whose latest checkpoint left a
+blocker or a dependency is not the holder's move either, so it does not count
+(the owner's decision, 2026-10-16): see :func:`blocked`.
 
 Persons are not limited unless the owner sets a limit on their own record. The
 limit lives on the agent record as ``claim_limit``; the default for an agent is
@@ -102,6 +104,30 @@ def counted(task):
 def held_undelivered(tasks):
     """The subset of ``tasks`` that still counts against the limit, in order."""
     return [task for task in (tasks or []) if counted(task)]
+
+
+def blocked(task):
+    """Whether the task's latest checkpoint left a blocker or a dependency.
+
+    The owner's decision (2026-10-16, the kittrial-5bb.276 revision): a BLOCKED
+    task does not count against the limit. The documented order tells a lane whose
+    latest checkpoint left a blocker to claim other work instead of waiting, and
+    counting that task as held would make that order impossible to follow.
+
+    An unknown blocking count (``None``, or a row that did not carry the field) is
+    NOT read as blocked: the caller's own completeness check refuses an unreadable
+    held set, so reading unknown as blocked here can never be the way a claim slips
+    through.
+    """
+    if not isinstance(task, dict):
+        return False
+    value = task.get('blocking_items')
+    return type(value) is int and value > 0
+
+
+def held_against_limit(tasks):
+    """The rows that count against a limit: undelivered, and not blocked."""
+    return [task for task in held_undelivered(tasks) if not blocked(task)]
 
 
 def names(tasks, limit=NAMED_MAX):
