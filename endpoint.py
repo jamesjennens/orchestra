@@ -1526,8 +1526,9 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                 # authenticated caller, never submitted, so no caller can clear another
                 # actor's assignee. It is the same canonical assignment the owner's bulk
                 # release uses, so there is one way to clear an assignee. The canonical
-                # change check below refuses a task the caller does not hold, delivered
-                # work awaiting review or changes requested, and the merge slot.
+                # change check below refuses a task the caller does not hold, ANY delivered
+                # contribution (awaiting review, changes requested, approved or integrated),
+                # and the merge slot.
                 if not isinstance(args,list) or len(args)!=1 or not isinstance(args[0],str):
                     raise AssignmentError(422,'A claim release takes one closed JSON request.')
                 fields=record_json.loads(args[0])
@@ -1584,7 +1585,8 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             def effect():
                 actors={item['actor'] for item in roster()}
                 result=assignment_apply(payload,actor,runner,path,eligible=lambda target:target in actors,
-                                        operators=configured_operators(root),at=server_time())
+                                        operators=configured_operators(root),at=server_time(),
+                                        refuse_delivered=(action=='task-release'))
                 return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':warning_text(warnings)}
             with held_coordination_lock(path,shared=coordination_lock_shared(request,action,args)):
                 if action=='assignment-roster':

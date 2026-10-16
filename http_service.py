@@ -6955,10 +6955,13 @@ class ApiHandler(BaseHTTPRequestHandler):
         ``claim_limit`` at once.
 
         Refused: a task the caller does not hold (409); a record anchor (404) or the merge
-        slot (409, as every task write route); a task whose contribution awaits review or
-        has changes requested (409, the canonical check); a body field other than the
-        reason, a blank reason or one over :data:`CLAIM_RELEASE_REASON_MAX` (422); a
-        missing Idempotency-Key (422). On a backend without canonical assignment: 501.
+        slot (409, as every task write route); a task with ANY current contribution (409,
+        the canonical check: awaiting review, changes requested, approved or integrated);
+        a body field other than the reason, a blank reason or one over
+        :data:`CLAIM_RELEASE_REASON_MAX` (422); a missing Idempotency-Key (422). On a
+        backend without canonical assignment: 501. An exact retry of a committed release is
+        answered from the stored result, before the holder check, so a lost response
+        reconciles instead of reading the now-unassigned task as somebody else's.
         """
         self._project(ctx, CAP_TASKS)
         payload = dict(ctx.payload or {})
@@ -6974,13 +6977,19 @@ class ApiHandler(BaseHTTPRequestHandler):
         if 'tasks.release' not in self.backend.ROUTES:
             raise not_implemented('Canonical claim release is unavailable on this server')
         actor = self.service.bind_actor(ctx.principal, None)
-        task = self.backend.get_task(ctx.params['pid'], ctx.params['tid'])
-        self._refuse_record_anchor(task, write=True)
-        if not isinstance(task, dict) or (task.get('assignee') or None) != actor:
-            raise conflict('That task is not claimed by you; only its holder can release it')
         request = {'task_id': ctx.params['tid'], 'reason': reason.strip()}
 
         def release():
+            # These checks run INSIDE the mutation, after _mutate has answered an exact retry
+            # from the stored result (kittrial-5bb.301 review item 2). They used to run
+            # before it, so a retry after a lost response read the now-unassigned task as
+            # "not claimed by you" instead of replaying the committed release. A different
+            # body under the same key is still refused by the wrapper's key-reuse check,
+            # which runs before this.
+            task = self.backend.get_task(ctx.params['pid'], ctx.params['tid'])
+            self._refuse_record_anchor(task, write=True)
+            if not isinstance(task, dict) or (task.get('assignee') or None) != actor:
+                raise conflict('That task is not claimed by you; only its holder can release it')
             result = self.backend.invoke('tasks.release', ctx.principal, ctx.params['pid'], request,
                                          ctx.idempotency_key, target=ctx.route_target,
                                          authorize=ctx.authorize, capability=CAP_TASKS)

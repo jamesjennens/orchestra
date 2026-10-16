@@ -26,6 +26,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import claim_limit
+import task_assignment
 import test_http_agents
 import test_claim_held as held_stack
 import test_http_review_fixes as fixes
@@ -438,6 +439,84 @@ class RealStackClaimLimitTests(held_stack.RealStackTests):
         self.assertEqual(agent_id, self.held(first)[1], 'nothing was released')
 
 
+class ClaimReleaseDeliveredWorkUnitTests(unittest.TestCase):
+    """The canonical decision a release makes about delivered work (kittrial-5bb.301).
+
+    A release is a facade over the canonical assignment, so what it may release is decided
+    from the canonical review snapshot in ``task_assignment.check_change``. Every state that
+    means live delivered work must refuse it, not only awaiting review and changes
+    requested; an unreadable chain must fail closed. This runs without a service, so the
+    decision is pinned for each state a real stack would have to work hard to set up
+    (approved and integrated).
+    """
+
+    TASK = 'kittrial-5bb.301'
+
+    def payload(self, assignee='agent-x'):
+        return {'schema_version': 1, 'operation_id': 'op-release-unit-1', 'task': self.TASK,
+                'expected_assignee': assignee, 'assignee': None, 'reason': 'taking other work',
+                'allow_pending_review': False, 'allow_held_slot': False}
+
+    def row(self, assignee='agent-x', status='in_progress'):
+        return {'id': self.TASK, 'assignee': assignee, 'status': status,
+                'labels': [], 'comments': []}
+
+    def review(self, state, contribution=None):
+        return {'review_state': state, 'contribution': contribution}
+
+    def slot(self, holder=None, context=None):
+        return {'available': holder is None, 'holder': holder, 'context': context}
+
+    def check(self, review, *, slot=None, claim='agent-x'):
+        return task_assignment.check_change(self.payload(claim), self.row(claim), review,
+                                            slot or self.slot(), lambda target: True,
+                                            refuse_delivered=True)
+
+    def test_every_state_of_delivered_work_refuses_a_release(self):
+        contribution = {'comment_id': '01a00000-0000-7000-8000-000000000000'}
+        for state in ('awaiting-review', 'changes-requested', 'awaiting-integration',
+                      'held', 'integrated', 'reconciliation-needed', 'legacy-review-ready'):
+            with self.subTest(state=state):
+                with self.assertRaises(task_assignment.AssignmentError) as caught:
+                    self.check(self.review(state, contribution))
+                self.assertEqual(409, caught.exception.status)
+
+    def test_an_undelivered_or_withdrawn_claim_is_releasable(self):
+        for state, contribution in (('none', None), ('withdrawn', {'comment_id': 'c'}),
+                                    ('superseded', {'comment_id': 'c'})):
+            with self.subTest(state=state):
+                change = self.check(self.review(state, contribution))
+                self.assertTrue(change['changed'])
+                self.assertIsNone(change['assignee'])
+                self.assertFalse(change['displaced_pending_review'])
+
+    def test_an_unreadable_review_chain_fails_closed(self):
+        for review in (None, {'review_state': 'something-else', 'contribution': {'comment_id': 'c'}}):
+            with self.subTest(review=review):
+                with self.assertRaises(task_assignment.AssignmentError) as caught:
+                    self.check(review)
+                self.assertEqual(503, caught.exception.status)
+
+    def test_a_holder_that_holds_the_merge_slot_cannot_release(self):
+        context = {'holder': 'agent-x', 'task': self.TASK}
+        with self.assertRaises(task_assignment.AssignmentError) as caught:
+            self.check(self.review('none', None), slot=self.slot('agent-x', context))
+        self.assertEqual(409, caught.exception.status)
+        self.assertIn('merge slot', str(caught.exception).lower())
+
+    def test_a_self_release_notice_says_the_holder_released_it(self):
+        notice = task_assignment.make_notice(self.payload(), project='pp',
+                                             assigned_by='agent-x', at='2026-10-16T19:00:00Z')
+        self.assertEqual('You released this task: taking other work',
+                         task_assignment.holder_message(notice, 'agent-x'))
+        # Somebody else taking the same claim still reads as taken from its holder.
+        taken = dict(self.payload(assignee='agent-x'), assignee='coordinator-y')
+        other = task_assignment.make_notice(taken, project='pp', assigned_by='coordinator-y',
+                                            at='2026-10-16T19:00:00Z')
+        self.assertEqual('This task was taken from you by coordinator-y: taking other work',
+                         task_assignment.holder_message(other, 'agent-x'))
+
+
 class ClaimReleaseInProcessTests(test_http_agents.AgentHarness):
     """The release route's own body rules, on the disposable in-process backend.
 
@@ -627,6 +706,53 @@ class RealStackClaimReleaseTests(held_stack.RealStackTests):
         self.assertIsNone(record['to'])
         self.assertEqual('handing back for now', record['reason'])
         self.assertTrue(record['at'], 'the notice records when the release happened')
+
+    def test_a_lost_response_is_answered_from_the_stored_result(self):
+        """Same key and body after a committed release replays the stored 200 (item 2)."""
+        task = self.new('retry after a lost answer')
+        agent_id, secret = self.new_agent('Retrier')
+        self.assertEqual(200, self.claim(None, task, token=secret, key='claim-retry-1').status)
+        path = '%s/%s/release' % (self.tasks, task)
+        body = {'reason': 'taking other work'}
+        first = self.request('POST', path, body, token=secret, key='release-retry-1')
+        self.assertEqual(200, first.status, first.data)
+        again = self.request('POST', path, body, token=secret, key='release-retry-1')
+        self.assertEqual(200, again.status, again.data)
+        self.assertEqual(first.data, again.data, 'the stored answer, not a fresh write')
+        self.assertEqual(('open', None), self.held(task))
+
+    def test_the_same_key_with_another_body_is_a_key_reuse_refusal(self):
+        task = self.new('retry with another body')
+        agent_id, secret = self.new_agent('Reuser')
+        self.assertEqual(200, self.claim(None, task, token=secret, key='claim-reuse-1').status)
+        path = '%s/%s/release' % (self.tasks, task)
+        self.assertEqual(200, self.request('POST', path, {'reason': 'first reason'},
+                                           token=secret, key='release-reuse-1').status)
+        reused = self.request('POST', path, {'reason': 'a different reason'},
+                              token=secret, key='release-reuse-1')
+        self.assertEqual(409, reused.status, reused.data)
+        self.assertIn('reused with a different request', reused.data['error']['message'])
+        self.assertEqual(('open', None), self.held(task))
+
+    def test_a_holder_that_also_holds_the_merge_slot_cannot_release(self):
+        """Mutant R3: the slot refusal had no test, so a held slot was allowed."""
+        task = self.new('claim and the merge slot')
+        alex = self.tokens['alex']
+        self.assertEqual(200, self.claim('alex', task, key='claim-slot-1').status)
+        acquired = self.request('POST', '/v1/projects/pp/merge-slot/acquire',
+                                {'task_id': task, 'target': 'main'}, token=alex, key='acquire-slot-1')
+        self.assertEqual(200, acquired.status, acquired.data)
+        try:
+            refused = self.release(task, alex)
+            self.assertEqual(409, refused.status, refused.data)
+            self.assertIn('merge slot', str(refused.data['error']).lower())
+            self.assertEqual(('in_progress', self.ids['alex']), self.held(task),
+                             'the slot holder keeps its claim')
+        finally:
+            # The project has ONE merge slot; leave it free for the sibling tests.
+            freed = self.request('POST', '/v1/projects/pp/merge-slot/release', {},
+                                 token=alex, key='release-slot-1')
+            self.assertIn(freed.status, (200, 409), freed.data)
 
 
 if __name__ == '__main__':
