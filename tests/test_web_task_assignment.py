@@ -332,6 +332,65 @@ class NativeAssignmentTests(RulesHelpers,unittest.TestCase):
         approved=harness.request('POST','/v1/projects/pp/tasks/'+tid+'/reviews',dict(body,operation_id='other-party-approval-0001'),token=other_token)
         self.assertEqual(201,approved.status,approved.data)
 
+    def test_the_endpoint_refuses_a_roster_read_without_verified_authority(self):
+        """Mutant M4 of the second .211 review: removing the endpoint's own authority
+        check on the roster read (assignment_authority in the assignment-roster
+        branch of endpoint.execute) is caught by this test and by no other.
+
+        authority_config and require_authority are keyword arguments of execute(),
+        not request fields. The actor is a real logged-in CONTRIBUTOR's identity,
+        so the generic guard does not answer 401 'Session expired or revoked' or
+        'Live authority descriptor required'. Two cases, both refusals that list
+        nobody; the second is the one that reaches assignment_authority() and is
+        the M4 kill:
+
+        (a) A LIVE descriptor naming the capability the action needs is refused by
+            the generic decide() with 126/403 'Project role does not permit this
+            operation' -- the contributor lacks coordinate, and that check runs
+            before the roster branch.
+        (b) With no descriptor the generic guards have nothing to refuse (the
+            actor is not an HTTP id, so http_actor_denial is skipped and
+            block_mismatch_denial has no block to compare): the answer is the
+            roster's own returncode 2 / assignment_status 403. Remove
+            assignment_authority() and this case lists the roster and the test
+            fails.
+        """
+        from http_authority import AuthorityConfig, authority_request, CAP_COORDINATE
+        harness, owner = self.web()
+        contributor, contributor_token = self.member(harness, owner, 'm4-no-coordinate',
+                                                     role='contributor')
+        principal = harness.service.authenticate(contributor_token)
+        harness.service.store.save()
+        config = AuthorityConfig(harness.backend.authority_store, harness.backend.authority_lock,
+                                 harness.backend.actor_namespace)
+        page = [json.dumps(dict(offset=0, limit=200))]
+        actor = 'm4-no-coordinate/session'
+        # (a) live descriptor, capability the action needs: refused (the generic
+        # decide() or the roster's own check), never a 401, never a listing.
+        from http_authority import AuthorityDenied
+        descriptor = dict(authority_request(principal, 'pp', CAP_COORDINATE,
+                                            now=harness.service._expiry_now()),
+                          user_id=actor)
+        harness.service.store.save()
+        try:
+            live = fixture.endpoint.execute(self.root, dict(
+                project='pp', actor=actor, action='assignment-roster',
+                args=page, authority=descriptor),
+                authority_config=config, require_authority=True)
+            self.assertEqual(2, live['returncode'], live)
+            self.assertNotIn('items', json.loads(live.get('stdout') or '{}'))
+        except AuthorityDenied as denied:
+            # decide() raised inside the roster's own check: still a refusal.
+            self.assertNotIn('items', {})
+        # (b) no descriptor: the roster's own check refuses. THIS is the M4 kill.
+        bare = fixture.endpoint.execute(self.root, dict(
+            project='pp', actor=actor, action='assignment-roster',
+            args=page),
+            authority_config=config, require_authority=True)
+        self.assertEqual(2, bare['returncode'], bare)
+        self.assertEqual(403, bare.get('assignment_status'), bare)
+        self.assertNotIn('items', json.loads(bare.get('stdout') or '{}'))
+
     def test_forged_canonical_block_and_unconfigured_ssh_cannot_assign(self):
         from unittest.mock import patch
         harness,owner=self.web();old=harness.admin_user['id'];target,_=self.member(harness,owner,'binding-target')

@@ -549,6 +549,33 @@ class LifecycleTests(ProposalCase):
         with self.assertRaisesRegex(ValueError,'cannot be verified|unknown'):self.dispose(again,'incorporated',incorporation=linked)
         self.assertEqual(self.read('list')['total'],2)
 
+    def test_a_proposal_against_a_withdrawn_requirement_is_accepted_but_never_incorporated(self):
+        # N12: intake stays open for a withdrawn requirement's key (the proposal
+        # is a contribution, not a requirement edit), but incorporation into it
+        # stays refused with the sentence naming the current state.
+        import requirement_governance as governance
+        import requirement_http as http
+        from test_requirement_owner_records import ACCOUNT
+        governance.initialize(self.project,'demo',ACCOUNT,'create-demo')
+        requirement=self.requirement('R01',accepted=True)
+        row=self.native.row(requirement);record=rq.existing_revisions(row)[2]
+        context=http.OwnerContext('demo',ACCOUNT,governance.current(self.project,'demo'))
+        self.native.actor=ACCOUNT
+        http.apply(self.project,context,'withdraw',dict(expected_revision=2,
+            expected_sha256=record['sha256'],expected_state_sha256=None,reason='Retain history.'),
+            'proposal-withdrawn-first',self.native,requirement)
+        target={'kind':'requirement','requirement_key':'R01'}
+        submitted=self.submit(operation_id='proposal-against-withdrawn',target=target)
+        self.assertEqual(submitted['state'],'submitted')
+        self.assertEqual(self.get(submitted['key'])['target'],target)
+        self.claim(submitted['key'])
+        linked=self.incorporation(requirement,revision=2,acceptance_decision_id='dec-1')
+        before=len(self.native.writes())
+        with self.assertRaisesRegex(ValueError,
+                'Cannot incorporate into a requirement whose current state is withdrawn'):
+            self.dispose(submitted['key'],'incorporated',incorporation=linked)
+        self.assertEqual(len(self.native.writes()),before)
+
     def test_an_incorporation_stops_reading_accepted_when_different_content_is_accepted(self):
         # Review 01a10180 (accepted-after-different-content).
         requirement = self.requirement('R01')
