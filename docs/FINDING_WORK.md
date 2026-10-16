@@ -48,6 +48,21 @@ acknowledges nothing.
 This is the current-attention read (kittrial-5bb.114); it does not wait for activity or
 deliver a wake notification (the separate kittrial-5bb.207).
 
+A worker that does not want to be woken to find nothing runs `wait` instead of its own
+poll loop: it blocks and polls the same read once per interval (five minutes by default,
+never faster than one a minute; `--timeout` bounds the whole wait), and it returns as
+soon as a task whose move is the worker's appears or changes. It prints those tasks and a
+fingerprint; `--since FINGERPRINT` is the state the worker already acted on, so a restart
+that finds nothing new keeps blocking instead of returning the same tasks twice. Run
+`wait`; act on what it returns; run `wait` again. Its exit codes are 0 (something is your
+move), 1 (`--timeout` ran out), 2 (the arguments or the endpoint refused) and 3 (the
+service could not be reached). The coordinator has the same thing over the four things it
+wakes for - a delivery awaiting review, approved work awaiting integration, a checkpoint
+addressed to the coordinator, and a lane quiet on its own move or past a declared wait -
+as `wait --coordinator`: run `wait --coordinator`; act on what it returns; run
+`wait --coordinator` again. An agent with a web credential reads the same worker form,
+one read, at `GET /v1/agents/me/wait`, and blocks in the loop of whatever runs it.
+
 A task of yours with changes requested is your work until you deliver a revision, whatever
 else has or has not changed. Each item of `work --mine` carries `whose_move` and one plain
 sentence `next` saying whose move it is, and the tasks where the move is yours come first,

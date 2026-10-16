@@ -5797,6 +5797,56 @@ class ApiHandler(BaseHTTPRequestHandler):
             'generated_at': now_iso(self.service._now()),
         }
 
+    @route('GET', r'/v1/agents/me/wait')
+    def agents_me_wait(self, ctx):
+        """The agent's own move read for a blocking wait (kittrial-5bb.285).
+
+        The bridge extension (or any web agent) polls this route and blocks in ITS own
+        loop; the SSH client's ``client.py wait`` blocks in the client and polls the
+        endpoint's ``wait`` action. Both compute the same projection with
+        ``waiting.worker_view`` over the canonical rows, so one task's fingerprint means
+        the same fact on either route: the caller decides whether to sleep, the server
+        never does, and nothing is scheduled.
+
+        ONE cheap read per granted project (the same bounded current-work snapshot
+        ``/v1/agents/me/next`` already uses, reused within the request); the whose-move
+        decision is the ONE ``work.move_decision``, so this route cannot offer a task the
+        canonical queue would not call the agent's move.
+        """
+        import waiting
+        from work import move_decision
+        agent = self.service.agent_for_credential(ctx.principal)
+        actor = agent.get('actor') or agent.get('id')
+        rows = []
+        for project_id in agent.get('projects') or []:
+            if not self._agent_may_read(ctx.principal, project_id):
+                continue
+            read = self._agent_project_tasks(project_id)
+            for task in read.get('tasks') or []:
+                if not isinstance(task, dict):
+                    continue
+                state = task.get('review_state')
+                pending = task.get('pending_review_items')
+                if not isinstance(pending, int):
+                    pending = task.get('open_requests')
+                if not isinstance(pending, int):
+                    pending = 0
+                move, _text, next_actor_value = move_decision(
+                    state, task.get('id'), task.get('assignee') == actor,
+                    pending_items=pending, redelivered=bool(task.get('redelivered')),
+                    assignee=task.get('assignee'), closed=task.get('status') == 'closed',
+                    claimable=task.get('claimable') if isinstance(task.get('claimable'), bool) else None)
+                if move == 'you':
+                    rows.append(dict(task, task=task.get('id'), project=project_id,
+                                     whose_move=move, next_actor=next_actor_value))
+        view = waiting.worker_view(rows)
+        view['agent'] = agent.get('id')
+        view['generated_at'] = now_iso(self.service._now())
+        view['manual_cadence'] = ('Read this route again to see a change; it never blocks, '
+                                  'never sleeps and schedules nothing. --since is the caller\'s '
+                                  'own memory of the last fingerprint it acted on.')
+        return 200, view
+
     @route('POST', r'/v1/agents')
     def agents_create(self, ctx):
         payload = dict(ctx.payload or {})

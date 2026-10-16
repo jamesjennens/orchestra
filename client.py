@@ -273,6 +273,61 @@ def _emit(code,stdout,stderr,out):
         sys.stderr.write(stderr);return code
     sys.stdout.write(stdout);sys.stderr.write(stderr);return code
 
+def _wait_command(args,config,project,actor,out):
+    """``client.py wait``: block until something is the caller's move (kittrial-5bb.285).
+
+    The blocking is HERE, in the client, because the harness that wakes a model holds the
+    process; the endpoint is asked for one cheap read per poll (the ``wait`` action, one
+    ``work`` read, the shared project lock of kittrial-5bb.281) and never for a blocking
+    call, so the same read serves an agent over HTTP. The loop, the projection and the
+    fingerprint are in :mod:`waiting`; this function is only the transport around them.
+
+    The exit codes are the task's: 0 something is the caller's move (rows and fingerprint
+    on stdout), 1 the ``--timeout`` ran out, 2 the arguments or the endpoint refused, 3 the
+    service could not be reached. ``--since FINGERPRINT`` is the state the caller already
+    saw, so a restart whose read has not changed blocks instead of returning it again.
+    """
+    import waiting
+    try:
+        options = waiting.parse_client_args(args)
+    except ValueError as error:
+        sys.stderr.write('ValueError: %s\n' % error)
+        return waiting.EXIT_USAGE
+    endpoint_args = waiting.read_args(options)
+
+    def read():
+        try:
+            result = request(config,project,actor,endpoint_args,'wait')
+        except (RuntimeError,ValueError,OSError) as error:
+            # The transport said the service could not be reached: not a usage error.
+            raise waiting.WaitUnreachable(str(error)[:300]) from None
+        if not isinstance(result,dict):
+            raise waiting.WaitUnreachable('the service did not answer a wait read')
+        if result.get('returncode'):
+            detail = (result.get('stderr') or '').strip().split('\n')[-1:] or ['the endpoint refused the wait read']
+            raise waiting.WaitRefused(server_text(detail[-1])[:300])
+        try:
+            return json.loads(result.get('stdout') or '')
+        except (ValueError,TypeError) as error:
+            raise waiting.WaitUnreachable('Invalid wait response: %s' % str(error)[:200]) from None
+
+    code,view = waiting.run_wait(read,since=options.since,timeout=options.timeout,
+                                 interval=options.interval,
+                                 form='coordinator' if options.coordinator else 'worker')
+    text = json.dumps(view,ensure_ascii=True,indent=2)+'\n'
+    if out:
+        # The wait result is a result at every exit code, so --out writes it too; a
+        # failure to write it is the only usage error here.
+        try:
+            with open(out,'w',encoding='utf-8',newline='') as capture:
+                capture.write(text)
+        except OSError as error:
+            sys.stderr.write('ValueError: --out: %s\n' % error)
+            return waiting.EXIT_USAGE
+    else:
+        sys.stdout.write(text)
+    return code
+
 def _capability(args,out):
     """Client-side, read-only capability lookup over the caller's own checkout.
 
@@ -532,6 +587,7 @@ CONTRIBUTOR_COMMANDS = (
     ('history TASK', "the task's comments and review records, newest first"),
     ('checkpoint TASK --file FILE', 'record where you are on a task, for the next run'),
     ('work', 'the tasks whose move is yours, and the ones you may claim'),
+    ('wait', 'block until something is your move, then print it and its fingerprint'),
     ('ready', 'the tasks nobody holds that you may claim'),
     ('session register|resume|end', 'the actor session the endpoint keeps for you'),
     ('review TASK --file FILE', 'contribute a delivery, answer review items, or record a review'),
@@ -580,7 +636,7 @@ NEAREST_COMMANDS = {'briefing': 'brief TASK', 'workerguide': 'docs worker-guide'
 #: endpoint. The dispatch in main() is written in terms of this tuple, and a test holds every one of
 #: its names to a line of the table, so the help cannot fall behind the commands (kittrial-5bb.283).
 CLIENT_ACTIONS = ('brief','history','checkpoint','onboard','docs','session','handoff','review','work',
-                  'feedback','requirement','requirements','ref','capability','proposal','guidance',
+                  'wait','feedback','requirement','requirements','ref','capability','proposal','guidance',
                   'coordinator')
 
 
@@ -659,6 +715,11 @@ def main():
     if args[0] not in contributor_command_names():
         print(server_text(contributor_help_text(args[0])), file=sys.stderr)
         return 1
+    # wait blocks HERE, in the client, and polls the endpoint's wait read (kittrial-5bb.285);
+    # the endpoint is therefore asked per poll, never for one blocking call, so an agent over
+    # HTTP can use the same read.
+    if args[0]=='wait':
+        return _wait_command(args[1:],json.loads(Path(a.config).read_text()),a.project,a.actor,a.out)
     action='bd';path=None
     if args[:1]==['refresh']:action='refresh';args=[]
     elif args[:1]==['view']:
