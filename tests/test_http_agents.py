@@ -137,6 +137,11 @@ class AgentHarness(unittest.TestCase):
         self.assertEqual(201, created.status, created.data)
         return created.data['agent']['id'], created.data['credential']['secret'], created.data
 
+    def create_task(self, token, project, title):
+        """One open task in ``project``, as the harness's own fixture (kittrial-5bb.276)."""
+        return self.request('POST', '/v1/projects/%s/tasks' % project, {'title': title},
+                            token=token)
+
 
 class AgentRegistryTests(AgentHarness):
     def test_create_returns_one_time_secret_and_secretless_setup(self):

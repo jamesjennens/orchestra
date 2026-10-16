@@ -2968,6 +2968,33 @@ line separately and unconfined.
   caller approves (blocked when the latest checkpoint lists unresolved items). Rows past
   the bound still say "read the task brief" and "wait time unknown" and are not marked
   blocked. My work rows show "Blocked" and the open request ids where known.
+- **A per-agent limit on claimed, undelivered tasks.** Each personal agent carries
+  `claim_limit` on its record: a whole number from 1 to 50, default 1, editable by the
+  agent's owner on My agents and with `PATCH /v1/agents/{id}` (`422` outside the bounds,
+  naming the field and the range). The claim route
+  (`POST /v1/projects/{id}/tasks/{task}/claim`) refuses a NEW claim while the agent
+  already holds that many tasks that are open or in progress with review state `none` or
+  `changes-requested`; the refusal is a `409` whose sentence names the limit and the held
+  tasks, with `claim_limit`, `held` and `held_readable` in its detail, and it carries the
+  same bounded `candidates` fall-through an ordinary held refusal carries. A delivered
+  task (awaiting review or beyond) does not count, and the agent's own re-claim of a task
+  it already holds is not counted again. A person's own session actor is not limited.
+  A task whose latest checkpoint left an open blocker or dependency does not count: the
+  documented order sends a lane the checkpoint left stuck on to other work, and that
+  order has to be possible to follow. A PERSON assigning a task to an agent at its limit
+  is still allowed (`POST /v1/projects/{id}/tasks/{task}/assign`): that is the owner's
+  explicit choice, not the agent taking work. An AGENT assigning a task to itself
+  through that same route is a claim and takes the limit, because that IS the agent
+  taking work.
+  `GET /v1/agents/me/next` and each agent record report the limit, how many it holds and
+  how many are left, all from the same one counted-held rule the gate applies, so the
+  two answers cannot disagree. The held set is read from the same bounded `work`
+  snapshot attention already reads, across every project the agent is granted, and it
+  fails closed: a held
+  set that cannot be read refuses the claim rather than reading as "no limit". This is
+  the service's own gate, so it covers the web page, the client and any other client of
+  the route; a `bd update --claim` run by hand on the host, outside this service, is not
+  gated by it.
 - **Review respond step (slice 2a).** Canonically a requested change stays open until
   the contributor records a `respond` resolution for it, even after a newer revision
   arrives. The task page shows the task's assignee each open request with a "Resolved"

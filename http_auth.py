@@ -46,6 +46,7 @@ import threading
 import time
 from pathlib import Path
 
+import claim_limit
 from http_authority import (ALL_CAPABILITIES, CAP_ACCOUNTS_ADMIN, CAP_AGENTS, CAP_APPROVE,
                             CAP_CHECKPOINTS, CAP_FEEDBACK, CAP_PROJECT_ADMIN, CAP_PROPOSALS,
                             CAP_PROJECT_CREATE, CAP_PROJECT_HOST_CREATE, CAP_READ, CAP_REVIEWS, CAP_TASKS,
@@ -116,6 +117,11 @@ AGENT_MAX_CREDENTIALS = 20
 AGENT_DEAD_CREDENTIALS_KEPT = 5
 AGENT_DEFAULT_SCOPES = ('tasks', 'checkpoints', 'reviews', 'feedback')
 AGENT_CONFIG_PATH = '.orchestra/agent.json'
+#: The per-agent limit on claimed, undelivered tasks (kittrial-5bb.276). The
+#: default, the editable bounds and the wording live in ``claim_limit``, so the
+#: route, the owner's page and the gate cannot disagree about any of them.
+CLAIM_LIMIT_DEFAULT = claim_limit.DEFAULT_LIMIT
+
 AGENT_SECRET_ENV = 'ORCHESTRA_AGENT_SECRET'
 
 
@@ -917,6 +923,20 @@ class Store:
 
 
 # --------------------------------------------------------------------------- service
+def validate_claim_limit(value):
+    """The stored form of one owner-supplied per-agent claim limit.
+
+    ``None`` clears the setting back to the default; a whole number inside the
+    editable bounds is kept. Anything else names what was wrong, so the route can
+    answer 422 with the field and the bounds instead of storing a value that would
+    silently mean something else.
+    """
+    try:
+        return claim_limit.validate_limit(value)
+    except ValueError as error:
+        raise invalid(str(error)) from None
+
+
 def validate_agent_credential_days(value):
     """The installation's agent-only lifetime; changing it rewrites no credential."""
     if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= AGENT_CREDENTIAL_DAYS_MAX:
@@ -941,6 +961,12 @@ class Service:
                  lookup_max=LOOKUP_MAX_PER_WINDOW, lookup_window=LOOKUP_WINDOW_SECONDS,
                  approval_by_another_party=False, agent_credential_days=_AGENT_LIFETIME_DEFAULT):
         self.store = store
+        #: One lock spanning the per-agent claim gate's held-set read and the claim
+        #: write (kittrial-5bb.276 revision). The held set is a separate endpoint
+        #: read, so without a lock two concurrent claims by one agent both read the
+        #: set before either wrote and both passed a limit of one. It is per service
+        #: process, which is where that service's concurrent HTTP requests are served.
+        self.claim_gate = threading.RLock()
         #: The installation's setting "nobody approves work of their own party" (slice 1a of
         #: docs/WEB_COORDINATOR_DESIGN.md, kittrial-5bb.199). OFF unless the operator turns it
         #: on: with it off every review rule is exactly what it was.
@@ -2816,6 +2842,11 @@ class Service:
             # credentials, which all carry the same) or ``unknown``.
             'scopes': None if scopes is None else list(scopes),
             'scopes_source': source,
+            # The per-agent limit on claimed, undelivered tasks (kittrial-5bb.276): the
+            # stored setting, or its default when the owner has not set one. A read
+            # and the gate use this one value, so a page cannot show 1 while the
+            # service enforces 3.
+            'claim_limit': claim_limit.default_limit(agent),
             # The different scope lists its WORKING credentials carry, when they do not all carry
             # the same; else []. A read for whoever reads the agent record: its account, a
             # superuser, and the agent itself on /v1/agents/me. It says only that they differ:
@@ -3303,7 +3334,7 @@ class Service:
 
     def create_agent(self, principal, *, name, tool=None, working_directory=None,
                      machine=None, notes=None, projects=None, scopes=None,
-                     request_id=None, owner=None):
+                     request_id=None, owner=None, claim_limit=None):
         """Create an owner-bound agent and its first (one-time) credential."""
         if principal is None or principal.via == 'credential':
             raise forbidden('Session authority required to create an agent')
@@ -3333,6 +3364,10 @@ class Service:
                 'tool': tool, 'working_directory': working_directory,
                 'machine': machine, 'notes': notes, 'enabled': True,
                 'projects': granted, 'created_at': now_iso(self._now()),
+                # The per-agent claim limit (kittrial-5bb.276): one undelivered claim
+                # by default, editable by the owner.
+                'claim_limit': (CLAIM_LIMIT_DEFAULT if claim_limit is None
+                                else validate_claim_limit(claim_limit)),
                 'last_seen_at': None,
                 'scopes': list(made_with), 'scopes_source': 'set',
             }
@@ -3396,6 +3431,9 @@ class Service:
         with self.store.lock:
             self._refresh_authority(principal)
             agent = self._agent_owned(principal, agent_id)
+            # The limit is judged with the other fields, before any of them is applied.
+            if 'claim_limit' in payload:
+                validate_claim_limit(payload.get('claim_limit'))
             # Validate every field first and apply nothing until all of them pass, so a
             # refused change (an ungranted project, an over-long field, a clashing name)
             # leaves the live record exactly as it was. A rename in particular must not
@@ -3415,6 +3453,10 @@ class Service:
                     principal, payload.get('projects'), owner_id=agent['owner'])
             if 'enabled' in payload and payload.get('enabled') is not None:
                 changes['enabled'] = bool(payload.get('enabled'))
+            if 'claim_limit' in payload:
+                # Validated above; ``None`` clears it back to the default, which is what
+                # an owner who empties the field on My agents sends.
+                changes['claim_limit'] = validate_claim_limit(payload.get('claim_limit'))
             left = [pid for pid in (agent.get('projects') or []) if pid not in changes.get('projects', agent.get('projects') or [])]
             agent.update(changes)
             # An agent that leaves a project by THIS route leaves its coordinators too (review of

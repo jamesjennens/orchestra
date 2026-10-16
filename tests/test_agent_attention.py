@@ -17,6 +17,7 @@ from pathlib import Path
 KIT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(KIT))
 sys.path.insert(0, str(KIT / 'tests'))
+import claim_limit
 import http_service
 import test_http_agents
 import test_http_proposals
@@ -44,8 +45,12 @@ class EndpointAttentionTests(fixes.EndpointCase):
                                  token=self.admin)
             self.assertIn(added.status, (200, 201), added.data)
             self.people[name] = self.login(name, name + '-password-1')[0]
+        # These tests drive an agent holding several tasks at once; the per-agent claim
+        # limit (kittrial-5bb.276) is exercised in tests/test_claim_limit.py, so this
+        # fixture sets one wide enough not to change what is under test here.
         made = self.request('POST', '/v1/agents', {'name': 'Kestrel', 'working_directory': '/home/alex/kestrel',
-                                                   'projects': [self.project]}, token=self.people['alex'])
+                                                   'projects': [self.project], 'claim_limit': claim_limit.LIMIT_MAX},
+                            token=self.people['alex'])
         self.assertEqual(201, made.status, made.data)
         self.agent_id, self.secret = made.data['agent']['id'], made.data['credential']['secret']
         self.tasks = [self.create_task(self.people['blair'], self.project, 'task %d' % index).data['id']
@@ -628,7 +633,8 @@ class InProcessAttentionTests(test_http_agents.AgentHarness):
         self.create_account(admin, 'alex', 'alex-password-1')
         self.alex = self.login('alex', 'alex-password-1')[0]
         self.project = self.create_project(self.alex, 'Alpha')
-        self.agent_id, self.secret, _ = self.agent_secret(self.alex, projects=[self.project])
+        self.agent_id, self.secret, _ = self.agent_secret(self.alex, projects=[self.project],
+                                                          claim_limit=claim_limit.LIMIT_MAX)
 
     def task(self, title):
         created = self.request('POST', '/v1/projects/%s/tasks' % self.project, {'title': title}, token=self.alex)
@@ -819,8 +825,10 @@ class RefusedClaimTests(test_http_agents.AgentHarness):
                          {'role': 'contributor'}, token=admin)
         self.alex_token = self.login('alex', 'alex-password-1')[0]
         self.blair_token = self.login('blair', 'blair-password-1')[0]
-        self.A = self.agent_secret(self.alex_token, name='Kestrel', projects=[self.project])[1]
-        self.B = self.agent_secret(self.blair_token, name='Merlin', projects=[self.project])[1]
+        self.A = self.agent_secret(self.alex_token, name='Kestrel', projects=[self.project],
+                                   claim_limit=claim_limit.LIMIT_MAX)[1]
+        self.B = self.agent_secret(self.blair_token, name='Merlin', projects=[self.project],
+                                   claim_limit=claim_limit.LIMIT_MAX)[1]
         self.tasks = '/v1/projects/%s/tasks' % self.project
         self.reads = []
         original = self.backend.review_queue
