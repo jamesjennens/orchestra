@@ -150,7 +150,12 @@ the unreleased revision 2 cannot be held by any tracker: no released kit revisio
 reads or migrates that shape, and the receipt is a project journal file, not native
 tracker state, so the tracker cannot carry it either. Preserve them and resolve the
 operation by ID with `admin.py requirement-reconcile` from the native state; never
-hand-edit or re-seal them. Restore a pre-transition
+hand-edit or re-seal them. A completion that names two finishers (the
+`completion.actors` list) is read as a **damaged receipt** by kits before this release
+(1015d, d17011a and earlier), whose completion validator requires the exact older field
+set. Rolling back after such a completion needs the backup taken before it, or resolving
+that operation by ID with `admin.py requirement-reconcile` on this release first. Never
+strip the `actors` list to make an older kit read the receipt. Restore a pre-transition
 backup taken before the first attempted transition if a rollback is required,
 retaining the later backup separately. Named
 baselines and Markdown download/comparison are a separate later delivery.

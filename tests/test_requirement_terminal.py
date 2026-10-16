@@ -19,6 +19,17 @@ from test_requirement_owner_records import OwnerNative, ACCOUNT
 
 
 class TerminalTests(unittest.TestCase):
+
+    def test_the_rollback_sentence_warns_that_a_two_finisher_receipt_reads_damaged(self):
+        """kittrial-5bb.295 r2 item 2: a completion naming two finishers (the actors list) reads as a
+        damaged receipt to kits before this release, so a rollback needs the pre-completion backup or an
+        operator reconcile on this release first - and the actors list is never stripped to fit an older
+        kit."""
+        text = (Path(__file__).resolve().parents[1]/'docs'/'REQUIREMENTS.md').read_text(encoding='utf-8')
+        self.assertIn('names two finishers', text)
+        self.assertIn('**damaged receipt** by kits before this release', text)
+        self.assertIn('`admin.py requirement-reconcile` on this release first', text)
+        self.assertIn('strip the `actors` list to make an older kit read the receipt', text)
     def setUp(self):
         temp = tempfile.TemporaryDirectory(); self.addCleanup(temp.cleanup)
         self.path = Path(temp.name)/'alpha'; self.path.mkdir()
