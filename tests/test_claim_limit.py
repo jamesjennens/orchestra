@@ -15,6 +15,7 @@ default; an owner-set limit; the setting's validation and its read-back on the
 agent and on /v1/agents/me/next; and that a held set which cannot be read fails
 closed.
 """
+import json
 import sys
 import threading
 import unittest
@@ -25,6 +26,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import claim_limit
+import task_assignment
 import test_http_agents
 import test_claim_held as held_stack
 import test_http_review_fixes as fixes
@@ -596,6 +598,322 @@ class RealStackClaimLimitTests(held_stack.RealStackTests):
         shown = self.request('GET', '/v1/agents/me', token=secret)
         self.assertEqual(200, shown.status, shown.data)
         self.assertEqual(2, shown.data['claim_limit']['limit'])
+
+
+class ClaimReleaseDeliveredWorkUnitTests(unittest.TestCase):
+    """The canonical decision a release makes about delivered work (kittrial-5bb.301).
+
+    A release is a facade over the canonical assignment, so what it may release is decided
+    from the canonical review snapshot in ``task_assignment.check_change``. Every state that
+    means live delivered work must refuse it, not only awaiting review and changes
+    requested; an unreadable chain must fail closed. This runs without a service, so the
+    decision is pinned for each state a real stack would have to work hard to set up
+    (approved and integrated).
+    """
+
+    TASK = 'kittrial-5bb.301'
+
+    def payload(self, assignee='agent-x'):
+        return {'schema_version': 1, 'operation_id': 'op-release-unit-1', 'task': self.TASK,
+                'expected_assignee': assignee, 'assignee': None, 'reason': 'taking other work',
+                'allow_pending_review': False, 'allow_held_slot': False}
+
+    def row(self, assignee='agent-x', status='in_progress'):
+        return {'id': self.TASK, 'assignee': assignee, 'status': status,
+                'labels': [], 'comments': []}
+
+    def review(self, state, contribution=None):
+        return {'review_state': state, 'contribution': contribution}
+
+    def slot(self, holder=None, context=None):
+        return {'available': holder is None, 'holder': holder, 'context': context}
+
+    def check(self, review, *, slot=None, claim='agent-x'):
+        return task_assignment.check_change(self.payload(claim), self.row(claim), review,
+                                            slot or self.slot(), lambda target: True,
+                                            refuse_delivered=True)
+
+    def test_every_state_of_delivered_work_refuses_a_release(self):
+        contribution = {'comment_id': '01a00000-0000-7000-8000-000000000000'}
+        for state in ('awaiting-review', 'changes-requested', 'awaiting-integration',
+                      'held', 'integrated', 'reconciliation-needed', 'legacy-review-ready'):
+            with self.subTest(state=state):
+                with self.assertRaises(task_assignment.AssignmentError) as caught:
+                    self.check(self.review(state, contribution))
+                self.assertEqual(409, caught.exception.status)
+
+    def test_an_undelivered_or_withdrawn_claim_is_releasable(self):
+        for state, contribution in (('none', None), ('withdrawn', {'comment_id': 'c'}),
+                                    ('superseded', {'comment_id': 'c'})):
+            with self.subTest(state=state):
+                change = self.check(self.review(state, contribution))
+                self.assertTrue(change['changed'])
+                self.assertIsNone(change['assignee'])
+                self.assertFalse(change['displaced_pending_review'])
+
+    def test_an_unreadable_review_chain_fails_closed(self):
+        for review in (None, {'review_state': 'something-else', 'contribution': {'comment_id': 'c'}}):
+            with self.subTest(review=review):
+                with self.assertRaises(task_assignment.AssignmentError) as caught:
+                    self.check(review)
+                self.assertEqual(503, caught.exception.status)
+
+    def test_a_holder_that_holds_the_merge_slot_cannot_release(self):
+        context = {'holder': 'agent-x', 'task': self.TASK}
+        with self.assertRaises(task_assignment.AssignmentError) as caught:
+            self.check(self.review('none', None), slot=self.slot('agent-x', context))
+        self.assertEqual(409, caught.exception.status)
+        self.assertIn('merge slot', str(caught.exception).lower())
+
+    def test_a_self_release_notice_says_the_holder_released_it(self):
+        notice = task_assignment.make_notice(self.payload(), project='pp',
+                                             assigned_by='agent-x', at='2026-10-16T19:00:00Z')
+        self.assertEqual('You released this task: taking other work',
+                         task_assignment.holder_message(notice, 'agent-x'))
+        # Somebody else taking the same claim still reads as taken from its holder.
+        taken = dict(self.payload(assignee='agent-x'), assignee='coordinator-y')
+        other = task_assignment.make_notice(taken, project='pp', assigned_by='coordinator-y',
+                                            at='2026-10-16T19:00:00Z')
+        self.assertEqual('This task was taken from you by coordinator-y: taking other work',
+                         task_assignment.holder_message(other, 'agent-x'))
+
+
+class ClaimReleaseInProcessTests(test_http_agents.AgentHarness):
+    """The release route's own body rules, on the disposable in-process backend.
+
+    The in-process backend has no canonical ``tasks.assign`` (kittrial-5bb.276), so a
+    well-formed release answers 501 there and changes nothing. This class pins the
+    refusals the route makes BEFORE it asks the backend, and that it never pretends on
+    a backend that cannot carry a release out. What a carried-out release does is the
+    real-stack class below (kittrial-5bb.301).
+    """
+
+    def setUp(self):
+        super().setUp()
+        admin = self.admin_token()
+        self.create_account(admin, 'alex', 'alex-password-1')
+        self.alex = self.login('alex', 'alex-password-1')[0]
+        self.project = self.create_project(self.alex, 'Alpha')
+        self.task = self.create_task(self.alex, self.project, 'task-one').data['id']
+
+    def release(self, body, key='release-key-1'):
+        return self.request('POST', '/v1/projects/%s/tasks/%s/release' % (self.project, self.task),
+                            body, token=self.alex, key=key)
+
+    def test_a_release_takes_one_short_reason_and_nothing_else(self):
+        for body in ({}, {'reason': ''}, {'reason': '   '}, {'reason': 'x' * 121},
+                     {'reason': 'taking other work', 'assignee': None}):
+            with self.subTest(body=body):
+                answer = self.release(body)
+                self.assertEqual(422, answer.status, answer.data)
+                self.assertEqual('invalid_payload', answer.data['error']['code'])
+
+    def test_a_release_needs_an_idempotency_key(self):
+        answer = self.release({'reason': 'taking other work'}, key=None)
+        self.assertEqual(422, answer.status, answer.data)
+        self.assertIn('Idempotency-Key', answer.data['error']['message'])
+
+    def test_a_release_needs_the_canonical_assignment_route(self):
+        """No canonical assignment: say so (501), never pretend the claim was released."""
+        answer = self.release({'reason': 'taking other work'})
+        self.assertEqual(501, answer.status, answer.data)
+        self.assertEqual('not_implemented', answer.data['error']['code'])
+
+
+def borrow_real_stack_runtime(cls):
+    """This class uses the real stack's runtime, not its tests (see test_claim_held).
+
+    ``RealStackTests`` carries tests of its own; a class that only borrows its runtime must
+    not run them a second time, and must not leave the tasks it creates behind for them.
+    """
+    for name in dir(held_stack.RealStackTests):
+        if name.startswith('test_') and name not in cls.__dict__:
+            setattr(cls, name, None)
+    return held_stack.without_inherited_tests(cls)
+
+
+@unittest.skipIf(held_stack.rb.endpoint is None, 'endpoint imports fcntl (POSIX-only)')
+@unittest.skipIf(held_stack.rb.BD is None, 'no real bd binary (set ORCHESTRA_BD_BIN or put bd on PATH)')
+@borrow_real_stack_runtime
+class RealStackClaimReleaseTests(held_stack.RealStackTests):
+    """Releasing your own claim on the real service, the real endpoint and a real bd.
+
+    kittrial-5bb.301: the holder may release its own claimed, undelivered task with a
+    short reason. The task returns to open and unassigned, its checkpoint and open items
+    stay, the claim stops counting against ``claim_limit`` at once, and another agent may
+    then claim it. Another actor's claim, a delivered claim and an unheld task are
+    refused. The release is recorded as the canonical assignment notice: who, when, why.
+    """
+
+    def new_agent(self, name, token=None, **extra):
+        body = {'name': name, 'working_directory': '/home/x/' + name.lower().replace(' ', '-'),
+                'projects': ['pp']}
+        body.update(extra)
+        made = self.request('POST', '/v1/agents', body, token=token or self.tokens['alex'])
+        self.assertEqual(201, made.status, made.data)
+        return made.data['agent']['id'], made.data['credential']['secret']
+
+    def release(self, task, token, reason='releasing to take other work', key=None):
+        return self.request('POST', '%s/%s/release' % (self.tasks, task), {'reason': reason},
+                            token=token, key=key or ('release-%s' % task))
+
+    def deliver(self, task, token, operation_id):
+        copied = dict(fixes.CONTRIBUTION)
+        copied['commit'] = COMMIT
+        copied['base_commit'] = BASE
+        body = {'operation': 'contribute', 'schema_version': 1,
+                'operation_id': operation_id, 'previous': None, **copied}
+        answer = self.request('POST', '%s/%s/reviews' % (self.tasks, task), body, token=token)
+        self.assertEqual(201, answer.status, answer.data)
+        return answer.data.get('contribution') or {}
+
+    def test_an_agent_releases_its_own_claim_and_the_slot_is_free_at_once(self):
+        agent_id, secret = self.new_agent('Releaser')
+        first, second = self.new('to release'), self.new('next')
+        self.assertEqual(200, self.claim(None, first, token=secret, key='claim-rel-1').status)
+        self.assertEqual(('in_progress', agent_id), self.held(first))
+        refused = self.claim(None, second, token=secret, key='claim-rel-2')
+        self.assertEqual(409, refused.status, refused.data)
+        released = self.release(first, secret, reason='need to take other work')
+        self.assertEqual(200, released.status, released.data)
+        self.assertEqual(('open', None), self.held(first),
+                         'the task returns to open and unassigned')
+        self.assertEqual(200, self.claim(None, second, token=secret, key='claim-rel-3').status,
+                         'the release freed the claim slot at once')
+
+    def test_the_released_task_is_claimable_by_another_agent(self):
+        task = self.new('shared')
+        first_id, first_secret = self.new_agent('First')
+        second_id, second_secret = self.new_agent('Second')
+        self.assertEqual(200, self.claim(None, task, token=first_secret, key='claim-share-1').status)
+        self.assertEqual(200, self.release(task, first_secret).status)
+        self.assertIsNone(self.held(task)[1])
+        self.assertEqual(200, self.claim(None, task, token=second_secret, key='claim-share-2').status)
+        self.assertEqual(('in_progress', second_id), self.held(task))
+
+    def test_an_unheld_task_and_another_actors_claim_are_refused(self):
+        held = self.new('mine')
+        free = self.new('nobody holds this')
+        owner_id, owner_secret = self.new_agent('Owner agent')
+        other_id, other_secret = self.new_agent('Other agent')
+        self.assertEqual(200, self.claim(None, held, token=owner_secret, key='claim-mine-1').status)
+        refused = self.release(held, other_secret)
+        self.assertEqual(409, refused.status, refused.data)
+        self.assertIn('not claimed by you', refused.data['error']['message'])
+        self.assertEqual(('in_progress', owner_id), self.held(held))
+        unheld = self.release(free, other_secret)
+        self.assertEqual(409, unheld.status, unheld.data)
+        self.assertEqual(('open', None), self.held(free))
+
+    def test_a_delivered_claim_is_refused(self):
+        task = self.new('delivered')
+        agent_id, secret = self.new_agent('Deliverer')
+        self.assertEqual(200, self.claim(None, task, token=secret, key='claim-del-1').status)
+        self.deliver(task, secret, 'op-release-deliver-1')
+        refused = self.release(task, secret)
+        self.assertEqual(409, refused.status, refused.data)
+        self.assertEqual(('in_progress', agent_id), self.held(task),
+                         'delivered work is not a claim to release')
+
+    def test_the_released_client_releases_through_its_own_method(self):
+        """The client surface (http_client.Client.release_task) over the real service."""
+        from http_client import Client
+        task = self.new('via the client')
+        agent_id, secret = self.new_agent('Client agent')
+        self.assertEqual(200, self.claim(None, task, token=secret, key='claim-client-1').status)
+        worker = Client('http://127.0.0.1:%d' % self.port).use_credential(secret)
+        released = worker.release_task('pp', task, 'taking other work', key='release-client-1')
+        self.assertEqual(agent_id, released['previous_assignee'])
+        self.assertIsNone(released['assignee'])
+        self.assertTrue(released['reopened'])
+        self.assertEqual(('open', None), self.held(task))
+
+    def test_the_release_keeps_the_checkpoint_and_records_who_and_why(self):
+        task = self.new('checkpointed')
+        agent_id, secret = self.new_agent('Checker')
+        self.assertEqual(200, self.claim(None, task, token=secret, key='claim-cp-1').status)
+        before = self.request('GET', '%s/%s/brief' % (self.tasks, task), token=secret)
+        self.assertEqual(200, before.status, before.data)
+        made = self.request('POST', '%s/%s/checkpoints' % (self.tasks, task),
+                            {'schema_version': 1, 'previous': None,
+                             'activity_cursor': before.data.get('activity_cursor'),
+                             'source_commit': '', 'branch': '',
+                             'intent': 'check the release keeps a checkpoint',
+                             'acceptance': 'the open item survives the release',
+                             'summary': 'stopping here', 'next_action': 'release the claim',
+                             'open_items': [{'id': 'page-size', 'kind': 'blocker', 'source': 'test',
+                                             'text': 'which page size?'}],
+                             'resolved': []},
+                            token=secret)
+        self.assertIn(made.status, (200, 201), made.data)
+        self.assertEqual(200, self.release(task, secret, reason='handing back for now').status)
+        brief = self.request('GET', '%s/%s/brief' % (self.tasks, task), token=self.tokens['alex'])
+        self.assertEqual(200, brief.status, brief.data)
+        self.assertIn('which page size?', json.dumps(brief.data),
+                      'a release keeps the checkpoint and its open items')
+        # The notice is the canonical record: who released it, when, and why.
+        captured = self.bd('comments', task, '--json')
+        self.assertEqual(0, captured.returncode, captured.stderr)
+        comments = json.loads(captured.stdout)
+        if isinstance(comments, dict):
+            comments = comments.get('comments') or []
+        notices = [row.get('text') for row in comments
+                   if isinstance(row.get('text'), str)
+                   and row['text'].startswith('Kind: task-assignment-v1\n')]
+        self.assertTrue(notices, comments)
+        record = json.loads(notices[-1][len('Kind: task-assignment-v1\n'):])
+        self.assertEqual(agent_id, record['assigned_by'])
+        self.assertEqual(agent_id, record['from'])
+        self.assertIsNone(record['to'])
+        self.assertEqual('handing back for now', record['reason'])
+        self.assertTrue(record['at'], 'the notice records when the release happened')
+
+    def test_a_lost_response_is_answered_from_the_stored_result(self):
+        """Same key and body after a committed release replays the stored 200 (item 2)."""
+        task = self.new('retry after a lost answer')
+        agent_id, secret = self.new_agent('Retrier')
+        self.assertEqual(200, self.claim(None, task, token=secret, key='claim-retry-1').status)
+        path = '%s/%s/release' % (self.tasks, task)
+        body = {'reason': 'taking other work'}
+        first = self.request('POST', path, body, token=secret, key='release-retry-1')
+        self.assertEqual(200, first.status, first.data)
+        again = self.request('POST', path, body, token=secret, key='release-retry-1')
+        self.assertEqual(200, again.status, again.data)
+        self.assertEqual(first.data, again.data, 'the stored answer, not a fresh write')
+        self.assertEqual(('open', None), self.held(task))
+
+    def test_the_same_key_with_another_body_is_a_key_reuse_refusal(self):
+        task = self.new('retry with another body')
+        agent_id, secret = self.new_agent('Reuser')
+        self.assertEqual(200, self.claim(None, task, token=secret, key='claim-reuse-1').status)
+        path = '%s/%s/release' % (self.tasks, task)
+        self.assertEqual(200, self.request('POST', path, {'reason': 'first reason'},
+                                           token=secret, key='release-reuse-1').status)
+        reused = self.request('POST', path, {'reason': 'a different reason'},
+                              token=secret, key='release-reuse-1')
+        self.assertEqual(409, reused.status, reused.data)
+        self.assertIn('reused with a different request', reused.data['error']['message'])
+        self.assertEqual(('open', None), self.held(task))
+
+    def test_a_holder_that_also_holds_the_merge_slot_cannot_release(self):
+        """Mutant R3: the slot refusal had no test, so a held slot was allowed."""
+        task = self.new('claim and the merge slot')
+        alex = self.tokens['alex']
+        self.assertEqual(200, self.claim('alex', task, key='claim-slot-1').status)
+        acquired = self.request('POST', '/v1/projects/pp/merge-slot/acquire',
+                                {'task_id': task, 'target': 'main'}, token=alex, key='acquire-slot-1')
+        self.assertEqual(200, acquired.status, acquired.data)
+        try:
+            refused = self.release(task, alex)
+            self.assertEqual(409, refused.status, refused.data)
+            self.assertIn('merge slot', str(refused.data['error']).lower())
+            self.assertEqual(('in_progress', self.ids['alex']), self.held(task),
+                             'the slot holder keeps its claim')
+        finally:
+            # The project has ONE merge slot; leave it free for the sibling tests.
+            freed = self.request('POST', '/v1/projects/pp/merge-slot/release', {},
+                                 token=alex, key='release-slot-1')
+            self.assertIn(freed.status, (200, 409), freed.data)
 
 
 if __name__ == '__main__':
