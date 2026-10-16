@@ -87,7 +87,38 @@ def drop_internal_from_ready(rows):
     return shown
 
 
-def claimable(issue_type, status, assignee, contribution_id, review_state, record_anchor=False, labels=None):
+def open_dependency_ids(row, rows):
+    """The ids of ``row``'s dependencies whose task is not closed (kittrial-5bb.293).
+
+    A bd dependency (``bd dep``) whose other end is still open blocks the task: it
+    must not look claimable. ``parent-child`` is not a block. ``rows`` is the snapshot
+    the caller already holds; a dependency whose task is missing from it is unknown
+    and is NOT counted as open (the claim can still be refused atomically).
+    """
+    if not isinstance(row, dict):
+        return []
+    by_id = {r.get('id'): r for r in rows or [] if isinstance(r, dict) and r.get('id')}
+    open_ids = []
+    for dep in row.get('dependencies') or []:
+        if not isinstance(dep, dict) or dep.get('type') == 'parent-child':
+            continue
+        other = by_id.get(dep.get('depends_on_id'))
+        if isinstance(other, dict) and other.get('status') != 'closed':
+            open_ids.append(str(dep.get('depends_on_id')))
+    return open_ids
+
+
+def open_dependency_sentence(open_ids):
+    """One plain sentence naming the open dependency a claim is refused for."""
+    if not open_ids:
+        return None
+    names = ', '.join('`%s`' % i for i in open_ids[:5])
+    more = '' if len(open_ids) <= 5 else ' (and %d more)' % (len(open_ids) - 5)
+    return 'Task is blocked by an open dependency: %s%s. Close it first.' % (names, more)
+
+
+def claimable(issue_type, status, assignee, contribution_id, review_state, record_anchor=False,
+              labels=None, open_dependencies=None):
     """One bounded interpretation of claimable work (kittrial-5bb.6 deliverable b).
 
     Advisory only: claimability is not a reservation, and an atomic claim can still
@@ -100,6 +131,8 @@ def claimable(issue_type, status, assignee, contribution_id, review_state, recor
     or a requirement record by the `requirement`/`brd-section` LABEL (kittrial-5bb.277),
     which is never claimable whatever its status, assignee or contribution.
     """
+    if open_dependencies:
+        return False
     if str(issue_type or 'task') in CLAIMABLE_EXCLUDED_TYPES:
         return False
     if record_anchor:
@@ -961,9 +994,11 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
         # The one bounded claimability answer for this row (kittrial-5bb.6 deliverable b).
         # It is computed before the move because next_actor needs it: an unassigned,
         # undelivered row may name `anyone` only when somebody could actually take it.
+        row_open_deps=open_dependency_ids(row,rows)
         row_claimable=claimable(row.get('issue_type'),row.get('status'),row.get('assignee'),
                                 contribution.get('comment_id'),state,
-                                record_anchor=is_record_anchor(row),labels=row.get('labels'))
+                                record_anchor=is_record_anchor(row),labels=row.get('labels'),
+                                open_dependencies=row_open_deps)
         # Whose move it is, one plain sentence saying so, and the caller-neutral ROLE of
         # that same decision -- ONE call, so a row can never name one mover and deny
         # another (kittrial-5bb.6 review item 2). Derived from the validated review state

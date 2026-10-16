@@ -721,6 +721,11 @@ class InProcessBackend:
         claimant = payload.get('actor') or principal.actor
         if task['status'] != 'open':
             raise conflict('Task is not open')
+        from work import open_dependency_ids, open_dependency_sentence
+        snapshot = self._project_rows(project_id)
+        open_deps = open_dependency_ids(task, snapshot)
+        if open_deps:
+            raise conflict(open_dependency_sentence(open_deps) or 'Task is blocked by an open dependency')
         if task['assignee'] is not None and task['assignee'] == claimant:
             # One's own task, claimed again: answered as a real installation answers it (bd's
             # claim), 200 and nothing changed (kittrial-5bb.187). It was 409 here.
@@ -1292,7 +1297,10 @@ class InProcessBackend:
         still active. The project is read once; the route pages the result.
         """
         items = []
-        for task in self.read_tasks(project_id)['items']:
+        snapshot = self.read_tasks(project_id)['items']
+        from work import open_dependency_ids
+        for task in snapshot:
+            task = dict(task, open_dependencies=open_dependency_ids(task, snapshot))
             review = self._review_view(task)
             from review_state import active_work
             if not active_work(task.get('status'), review['state'], review['open_requests']):
@@ -1455,7 +1463,8 @@ def claimable_task(task, review):
     return claimable(task.get('issue_type'), task.get('status'), task.get('assignee'),
                      (contribution or {}).get('id'),
                      review.get('state') if isinstance(review, dict) else None,
-                     labels=task.get('labels'))
+                     labels=task.get('labels'),
+                     open_dependencies=task.get('open_dependencies') or None)
 
 
 def attention_blocking_items(fields):
@@ -2772,6 +2781,13 @@ class EndpointBackend:
                 # checkpoint from the brief alone (kittrial-5bb.113).
                 'next_action': data.get('next_action'),
                 'activity_cursor': data.get('activity_cursor'),
+                # kittrial-5bb.293 item 1: when a field is cut, the HTTP brief names the
+                # GET route that returns the full description and carries the link.
+                'read_whole': ({'route': 'GET /v1/projects/%s/tasks/%s' % (project_id, task),
+                                'link': '/v1/projects/%s/tasks/%s' % (project_id, task),
+                                'note': 'A field was cut. GET /v1/projects/%s/tasks/%s returns the '
+                                        'complete description.' % (project_id, task)}
+                               if data.get('read_whole') else None),
                 'warnings': data.get('warnings') or [],
                 # The canonical brief already bounds refs, authors and omissions;
                 # preserve its coverage/unknown counts rather than infer from time.
@@ -3464,9 +3480,13 @@ def next_action(task):
     # queue, the agent attention list and the claim route use (kittrial-5bb.277 review
     # item 2). A requirement record, an epic, a decision or another row the queue never
     # offers says what it is for instead of inviting a claim the route refuses with 409.
-    from work import claimable, requirement_record
+    from work import claimable, open_dependency_sentence, requirement_record
+    open_deps = task.get('open_dependencies') or []
     if not claimable(task.get('issue_type'), task.get('status'), task.get('assignee'),
-                     task.get('contribution_id'), state, labels=task.get('labels')):
+                     task.get('contribution_id'), state, labels=task.get('labels'),
+                     open_dependencies=open_deps):
+        if open_deps:
+            return {'who': 'owner', 'text': open_dependency_sentence(open_deps) or 'Blocked'}
         if requirement_record(task.get('labels')):
             return {'who': 'owner',
                     'text': "Requirement record: edit it on the project's Requirements page"}
@@ -4302,9 +4322,16 @@ class ApiHandler(BaseHTTPRequestHandler):
         view['assignee_name'] = names.get(assignee, assignee) if assignee else None
         view['next_action'] = next_action(view)
         view['requirement_record'] = requirement_record(view.get('labels'))
+        from work import open_dependency_ids
+        try:
+            snapshot = self._project_rows(task.get('project_id') or project_id or '')
+        except Exception:
+            snapshot = [task]
+        view['open_dependencies'] = open_dependency_ids(task, snapshot)
         view['claimable'] = claimable(view.get('issue_type'), view.get('status'), assignee,
                                       view.get('contribution_id'), view.get('review_state'),
-                                      labels=view.get('labels'))
+                                      labels=view.get('labels'),
+                                      open_dependencies=view['open_dependencies'] or None)
         return view
 
     def _task_views(self, tasks, project_id=None):
@@ -6738,6 +6765,19 @@ class ApiHandler(BaseHTTPRequestHandler):
             raise not_found('Task not found')
 
     @staticmethod
+    def _refuse_open_dependency(row, snapshot):
+        """A task blocked by an open dependency is not claimable (kittrial-5bb.293).
+
+        The claim route refuses it with one sentence naming the open dependency, the
+        same rule ``work.claimable()`` applies so ``work --claimable`` and
+        ``/v1/agents/me/next`` never offer it. ``ready`` already excludes blocked
+        tasks; this matches it."""
+        from work import open_dependency_ids, open_dependency_sentence
+        open_deps = open_dependency_ids(row, snapshot)
+        if open_deps:
+            raise conflict(open_dependency_sentence(open_deps) or 'Task is blocked by an open dependency')
+
+    @staticmethod
     def _refuse_requirement_record(row):
         """A requirement record is a readable, visible row, never claimable work
         (kittrial-5bb.277): it is NOT a record anchor and is NOT hidden (kittrial-5bb.276
@@ -7479,6 +7519,12 @@ class ApiHandler(BaseHTTPRequestHandler):
         # A requirement record is readable and visible, but never claimable work
         # (kittrial-5bb.277). Refused here so no agent takes one as a task.
         self._refuse_requirement_record(task)
+        # A task blocked by an open dependency is not claimable (kittrial-5bb.293).
+        try:
+            snapshot = self.backend.read_tasks(ctx.params['pid'])['items']
+        except Exception:
+            snapshot = [task]
+        self._refuse_open_dependency(task, snapshot)
         payload['task_id'] = ctx.params['tid']
         actor = self.service.bind_actor(ctx.principal, payload.pop('actor', None))
         payload['actor'] = actor
