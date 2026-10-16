@@ -215,3 +215,53 @@ class NativeHoldWebTests(RulesHelpers, unittest.TestCase):
                                   token=token, key='webv-fact')
         self.assertEqual(409, refused.status, refused.data)
         self.assertIn('listed operator', refused.data['error']['message'])
+
+    def test_an_unreadable_hold_chain_fails_closed_through_the_web(self):
+        """kittrial-5bb.297, the real-stack reproduction: a chain that carries a hold AND
+        cannot be parsed (a damaged write or a hostile edit leaves the kit's own prefix
+        with unparsable bytes) must stop what the hold exists to stop, on every web
+        surface: the lifecycle read reports it in hold_refusals and the affordances,
+        the fact write refuses 409, and the merge slot refuses the acquisition."""
+        import review_workflow as rw
+        harness, token = self.web()
+        self.deployment(operators=['ops'], review_workflow_writes=True,
+                        web_lifecycle_mark_writes=True)
+        task = self.task('Unreadable hold web', assignee='other-author')
+        contribution = json.loads(self.contribute(task, 'other-author')['stdout'])['comment_id']
+        approval = json.loads(self.approve(task, 'ops', contribution)['stdout'])['comment_id']
+        self.post_review(task, 'ops', dict(
+            schema_version=1, operation='hold', operation_id='unread-hold', task=task,
+            previous=approval, contribution=contribution, reason='Held before the damage'))
+        # The damage: the kit's own prefix with unparsable bytes, planted raw.
+        self.assertEqual(self.r.bd('comments', 'add', task,
+                                   rw.PREFIX + '{"broken": not json',
+                                   actor='other-author').returncode, 0)
+        # The scope is set first (the read's affordances answer the scope question
+        # before the hold one), then the web lifecycle read reports the unreadable
+        # chain instead of reading the task as unheld.
+        scope = dict(source_commit=COMMIT, integration_commit='d' * 40,
+                     release_id='unreadable-hold-web', environment='uh-web')
+        self.assertEqual(self.lifecycle('other-author', 'lifecycle-scope', task, scope=scope)['returncode'], 0)
+        path = '/v1/projects/pp/tasks/' + task + '/lifecycle'
+        state = harness.request('GET', path, token=token)
+        self.assertEqual(state.status, 200, state.data)
+        for dimension in ('reviewed', 'integrated'):
+            self.assertIn('cannot be read', state.data['hold_refusals'][dimension],
+                          state.data['hold_refusals'])
+            self.assertIn('cannot be read', state.data['affordances'][dimension]['reason'],
+                          state.data['affordances'][dimension])
+        # The fact write fails closed, and the merge slot refuses the acquisition.
+        refused = harness.request('POST', path + '/facts/integrated',
+                                  dict(scope=scope, value='passed',
+                                       evidence=['after the damage'], provenance='performed'),
+                                  token=token, key='unread-fact')
+        self.assertEqual(409, refused.status, refused.data)
+        self.assertIn('cannot be read', refused.data['error']['message'])
+        acquired = harness.request('POST', '/v1/projects/pp/merge-slot/acquire',
+                                   {'task_id': task, 'target': 'main'},
+                                   token=token, key='unread-slot')
+        self.assertEqual(409, acquired.status, acquired.data)
+        self.assertIn('cannot be read', acquired.data['error']['message'])
+        slot = harness.request('GET', '/v1/projects/pp/merge-slot', token=token)
+        self.assertEqual(200, slot.status, slot.data)
+        self.assertTrue(slot.data.get('available'), slot.data)

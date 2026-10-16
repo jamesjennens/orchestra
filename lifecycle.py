@@ -1008,6 +1008,34 @@ def review_chain_state(row, operators=None, journal=None):
     except (ValueError,KeyError,TypeError):return None
 
 
+def unreadable_hold_chain(row, operators=None, journal=None):
+    """Why ``row``'s review chain cannot be read (kittrial-5bb.297, fail closed), or None.
+
+    The fail-open of the design review of kittrial-5bb.252 DELIVERY2 item 3: a chain that
+    EXISTS but cannot be parsed may carry a hold this read cannot see, and the hold exists
+    to stop release selection, so every surface that selects or integrates treats such a
+    task as not integration-ready, with this reason naming the task and why. A row with no
+    chain comments at all has no holds to hide and is never flagged; neither is a missing
+    or non-task row. Read through the SAME voids and journal as every canonical reader
+    (kittrial-5bb.272 review item 1); nothing here changes what is recorded.
+    """
+    if not isinstance(row,dict) or not isinstance(row.get('id'),str):return None
+    from coordination import is_merge_slot
+    if row.get('issue_type') in ('event','gate') or is_merge_slot(row):return None
+    from review_workflow import PREFIX, project
+    comments=row.get('comments') or []
+    if not any(isinstance(comment,dict) and isinstance(comment.get('text'),str)
+               and comment['text'].startswith(PREFIX) for comment in comments):
+        return None                                     # no chain at all: no holds to hide
+    try:
+        project(row,operators,journal)
+        return None
+    except (ValueError,KeyError,TypeError) as error:
+        return ('the review chain of %s cannot be read (%s), so a hold it may carry cannot be seen; '
+                'an operator repairs the chain (voids reconcile it), and until then the task is not '
+                'integration-ready'%(row.get('id'),str(error)[:120]))
+
+
 def held_tasks(rows, operators=None, journal=None):
     """``{task: sentence}`` for tasks whose CURRENT contribution is held (kittrial-5bb.10).
 
@@ -1119,12 +1147,21 @@ def release_selection(rows,scope,is_ancestor,previous_commit=None,subset=None,re
     # selection skips the task with the sentence naming the open hold (or the failed
     # attestation) and who can release it, instead of offering it as a target.
     held=held_tasks(rows,operators,journal)
+    # kittrial-5bb.297, fail closed: a chain that exists but cannot be parsed may carry a
+    # hold this read cannot see, so such a target is skipped with the reason naming the
+    # task - and the skipped list is the release audit's report of it. A task with no
+    # chain at all is never flagged (no holds to hide).
+    unreadable={row.get('id'):reason for row in rows
+                if (reason:=unreadable_hold_chain(row,operators,journal)) is not None}
     targets=[];skipped=[];flags=[];verifying=[];restoring=[]
     for entry in scoped_evidence(rows,('integrated','deployed','live-verified',LIVE)):
         task=entry['id'];scopes=entry['scopes']
         if wanted is not None and task not in wanted:continue
         if task in held:
             skipped.append({'task':task,'reason':'held from integration: '+held[task]})
+            continue
+        if task in unreadable:
+            skipped.append({'task':task,'reason':'unreadable hold chain: '+unreadable[task]})
             continue
         chosen=None;reason=entry['untrusted'].get('integrated')
         for candidate in sorted(scopes,key=lambda c:((c.get('integrated') or {}).get('order') or -1,
@@ -1880,6 +1917,16 @@ def apply_release(payload,actor,run,operators=None,journal=None,lifecycle_author
         raise ValueError('Refusing a release that names %s: %s. A held contribution is not integration-ready; '
                          'the hold must be released (or a corrected attestation recorded) first.'
                          %(', '.join(refused[:5]),'; '.join('%s: %s'%(task,held[task]) for task in refused[:5])))
+    # kittrial-5bb.297, fail closed: naming a task whose chain cannot be read is refused
+    # the same way - a hold it may carry cannot be seen, so it is not integration-ready.
+    issues={row.get('id'):row for row in rows if isinstance(row,dict)}
+    unreadable_named={task:reason for task in named
+                      if (reason:=unreadable_hold_chain(issues.get(task),operators,journal)) is not None}
+    if unreadable_named:
+        raise ValueError('Refusing a release that names %s: %s.'
+                         %(', '.join(sorted(unreadable_named)[:5]),
+                           '; '.join('%s: %s'%(task,unreadable_named[task])
+                                     for task in sorted(unreadable_named)[:5])))
     if payload.get('rollback'):require_rollback_target_deployed(rows,payload['scope'])
     selected,plans,issues,evidence=_release_plan(rows,payload,operators,journal)
     superseded=_supersede_plan(rows,payload,issues,evidence)
@@ -2022,6 +2069,12 @@ def require_unheld_fact(issue, dimension, task, operators=None, journal=None):
             raise ValueError('Refusing to record %s for %s: %s. A held contribution is not '
                              'integration-ready; the hold must be released (or a corrected attestation '
                              'recorded) first.'%(dimension,task,sentence))
+        # kittrial-5bb.297, fail closed: a chain that exists but cannot be parsed may carry
+        # a hold this read cannot see, so the fact is refused with the reason naming the
+        # task and why. A task with no chain at all is not flagged.
+        unreadable=unreadable_hold_chain(issue,operators,journal)
+        if unreadable:
+            raise ValueError('Refusing to record %s for %s: %s.'%(dimension,task,unreadable))
 
 
 def apply_native(payload, actor, run, operators=None, journal=None, lifecycle_authors=False,

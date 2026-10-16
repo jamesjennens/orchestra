@@ -463,17 +463,29 @@ def repair_merge_slot(run,slot):
     return fixed,wanted
 
 def require_unheld_merge_task(issue, task, operators=None, project=None):
-    """Shared native hold refusal for acquisition, including web receipt replay."""
+    """Shared native hold refusal for acquisition, including web receipt replay.
+
+    kittrial-5bb.297, fail closed: a chain that exists but cannot be parsed may carry a
+    hold this read cannot see, so the acquisition is refused with the reason naming the
+    task and why. A task with no chain at all is not flagged.
+    """
     from review_workflow import project as review_project, integration_hold_sentence, CoordinatorRuleRefusal
+    from lifecycle import unreadable_hold_chain
     state=None
+    unreadable=None
     if issue is not None:
         try: state=review_project(issue,operators=operators,journal=project)
-        except ValueError: state=None
+        except ValueError:
+            state=None
+            unreadable=unreadable_hold_chain(issue,operators,journal=project)
     sentence=integration_hold_sentence(state) if state else None
     if sentence:
         raise CoordinatorRuleRefusal('merge-acquire refused for %s: %s. A held contribution is not '
                          'integration-ready, so the merge slot is not taken until the hold is released.'
                          %(task,sentence))
+    if unreadable:
+        raise CoordinatorRuleRefusal('merge-acquire refused for %s: %s. The merge slot is not taken '
+                         'until an operator repairs the chain.'%(task,unreadable))
 
 
 def apply_native(p, actor, run, project, operators=None, coordinator_writes=False, independent_approval=False,
