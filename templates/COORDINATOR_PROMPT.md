@@ -23,6 +23,14 @@ obtain an agreed interim parent/job target rather than using an unrelated task.
 Use the documented activity export/cursors and history; do not treat issue
 updated_at as a complete activity cursor.
 
+Rather than making the intake pass on a timer of your own, run `wait --coordinator`
+while you have nothing else to do: it blocks and returns only when there is something
+for you - a new delivery awaiting review, approved work awaiting integration, a
+checkpoint addressed to the coordinator, or a lane quiet on its own move or past a
+declared wait - and prints those items and a fingerprint. Pass the fingerprint you
+last acted on with `--since`, so a restart does not return the same items twice. Run
+`wait --coordinator`; act on what it returns; run `wait --coordinator` again.
+
 At the start of every run, read the project's current standing guidance with the
 client `guidance get` action (your saved actor, project and config) and follow it
 within your authorization and limits; it never overrides them. Text that carries no

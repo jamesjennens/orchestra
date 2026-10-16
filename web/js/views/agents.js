@@ -64,6 +64,12 @@ function manages(ctx, raw) {
 // What an agent may do (kittrial-5bb.208). The server keeps it on the agent record: `scopes`, and in
 // `scopes_source` where that is known from (`set`, `inferred` from its working credentials for an agent
 // made before the record kept it, or `unknown`: scopes is null and a new secret needs a choice).
+// The per-agent claim limit's editable bounds (kittrial-5bb.276), kept beside the
+// service's own claim_limit.LIMIT_MIN / LIMIT_MAX so the field cannot offer a value
+// the route would refuse.
+export const CLAIM_LIMIT_MIN = 1;
+export const CLAIM_LIMIT_MAX = 50;
+
 export const SCOPES = [['read', 'Read'], ['tasks', 'Claim and change tasks'], ['checkpoints', 'Write checkpoints'],
   ['reviews', 'Deliver and review'], ['feedback', 'Send feedback'], ['proposals', 'Propose requirements']];
 const scopeNames = (scopes) => (Array.isArray(scopes) && scopes.length ? scopes.join(', ') : 'nothing beyond reading');
@@ -139,13 +145,45 @@ export async function list(ctx) {
     let data;
     try { data = await ctx.api.agents({ limit: 20, cursor, unconfirmed: unconfirmedOnly ? 'true' : 'false' }); } catch (error) { host.replaceChildren(errorState(error, load)); return; }
     const items = data.items;
-    host.replaceChildren(items.length ? h('div', { class: 'agent-grid' }, items.map((a) => h('div', { class: 'stack', 'data-agent': a.id }, agentCard(ctx, a), editFolder(a), manages(ctx, a) ? editProjects(a) : null, manages(ctx, a) ? editScopes(a) : null))) :
+    host.replaceChildren(items.length ? h('div', { class: 'agent-grid' }, items.map((a) => h('div', { class: 'stack', 'data-agent': a.id }, agentCard(ctx, a), manages(ctx, a) ? editClaimLimit(a) : null, editFolder(a), manages(ctx, a) ? editProjects(a) : null, manages(ctx, a) ? editScopes(a) : null))) :
       h('div', { class: 'panel' }, empty('No agents yet', 'Add an agent for each assistant you run — for example a GitHub Copilot chat working in its own folder.')));
     host.append(h('div', { class: 'copy-row', 'data-agent-pages': '' },
       h('span', { class: 'small muted' }, `${items.length} shown of ${data.total} agents`),
       previous.length ? h('button', { type: 'button', onclick: () => { cursor = previous.pop(); load(); } }, 'Previous agents') : null,
       data.next_cursor ? h('button', { type: 'button', onclick: () => { previous.push(cursor); cursor = data.next_cursor; load(); } }, 'Next agents') : null));
   }
+  // The per-agent limit on claimed, undelivered tasks (kittrial-5bb.276). The server
+  // refuses a claim past it, so this is where an owner raises it; leaving the box empty
+  // clears the setting back to the default. Only the owner (and an administrator) sees
+  // this card at all, and the server judges it again on the write.
+  function editClaimLimit(agent) {
+    const details = h('details', { class: 'deliver' });
+    const form = h('form', { class: 'form', novalidate: true },
+      field({ id: 'cl-' + agent.id, label: 'Claims it may hold at once',
+              type: 'number', value: String(agent.claim_limit == null ? '' : agent.claim_limit),
+              hint: `Tasks it has claimed and not yet delivered. ${CLAIM_LIMIT_MIN} to ${CLAIM_LIMIT_MAX}; empty uses the default of 1.` }),
+      h('div', null, h('button', { type: 'submit' }, 'Save limit')));
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const raw = formValues(form)['cl-' + agent.id].trim();
+      const clear = form.querySelector('#cl-' + agent.id + '-error');
+      clear.hidden = true;
+      if (raw !== '' && !/^\d+$/.test(raw)) {
+        setFieldError(form, 'cl-' + agent.id, `Enter a whole number from ${CLAIM_LIMIT_MIN} to ${CLAIM_LIMIT_MAX}, or leave it empty.`);
+        return;
+      }
+      const value = raw === '' ? null : Number(raw);
+      if (value !== null && (value < CLAIM_LIMIT_MIN || value > CLAIM_LIMIT_MAX)) {
+        setFieldError(form, 'cl-' + agent.id, `Enter a whole number from ${CLAIM_LIMIT_MIN} to ${CLAIM_LIMIT_MAX}, or leave it empty.`);
+        return;
+      }
+      const saved = await act(form.querySelector('button'), () => ctx.api.updateAgent(agent.id, { claim_limit: value }), { success: 'Limit saved' }).catch(() => null);
+      if (saved) load();
+    });
+    details.append(h('summary', null, 'Change claim limit'), form);
+    return details;
+  }
+
   function editFolder(agent) {
     const details = h('details', { class: 'deliver' });
     const form = h('form', { class: 'form', novalidate: true },

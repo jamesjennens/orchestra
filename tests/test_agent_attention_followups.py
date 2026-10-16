@@ -7,6 +7,7 @@ import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+import claim_limit
 import test_agent_attention as a
 import http_service as h
 
@@ -283,7 +284,7 @@ for name in unittest.defaultTestLoader.getTestCaseNames(a.EndpointAttentionTests
 class InProcessFollowups(a.InProcessAttentionTests):
     def test_failed_project_retains_successful_project_actions(self):
         second=self.create_project(self.alex,'Beta')
-        self.agent_id,self.secret,_=self.agent_secret(self.alex,name='Two projects',projects=[self.project,second])
+        self.agent_id,self.secret,_=self.agent_secret(self.alex,name='Two projects',projects=[self.project,second],claim_limit=claim_limit.LIMIT_MAX)
         task=self.task('own successful work')
         self.assertEqual(200,self.request('POST','/v1/projects/%s/tasks/%s/claim'%(self.project,task),
                                          token=self.secret).status)

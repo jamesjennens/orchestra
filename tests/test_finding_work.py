@@ -22,6 +22,7 @@ import onboarding
 import test_agent_attention
 import test_bd_label_aliases as rb
 import test_claim_held as held_stack
+import claim_limit
 import test_http_agents
 import test_http_review_fixes as fixes
 from test_http_agents import BASE, BUNDLE, COMMIT
@@ -210,7 +211,8 @@ class Members(test_http_agents.AgentHarness):
             self.assertEqual(200, self.request('PUT', '/v1/projects/%s/members/%s' % (self.project, self.ids[name]),
                                                {'role': role}, token=self.alex).status)
             self.tokens[name] = self.login(name, name + '-password-1')[0]
-        self.agent_id, self.secret, _ = self.agent_secret(self.alex, projects=[self.project], name='Kestrel')
+        self.agent_id, self.secret, _ = self.agent_secret(self.alex, projects=[self.project], name='Kestrel',
+                                                          claim_limit=claim_limit.LIMIT_MAX)
 
     def task(self, title):
         made = self.request('POST', '/v1/projects/%s/tasks' % self.project, {'title': title}, token=self.alex)
@@ -397,7 +399,8 @@ class RealStackOrderTests(held_stack.RealStackTests):
                          'set ORCHESTRA_ATTENTION_SCALE=1 for the282-task native activity fixture')
     def test_flagged_task_is_not_hidden_by_282_owned_native_tasks(self):
         import time
-        made = self.request('POST', '/v1/agents', {'name': 'Scale reader', 'projects': ['pp']},
+        made = self.request('POST', '/v1/agents', {'name': 'Scale reader', 'projects': ['pp'],
+                                                    'claim_limit': claim_limit.LIMIT_MAX},
                             token=self.tokens['casey'])
         self.assertEqual(201, made.status, made.data)
         secret = made.data['credential']['secret']; actor = made.data['agent']['actor']
@@ -472,7 +475,8 @@ class RealStackOrderTests(held_stack.RealStackTests):
         self.assertIn('Review this <script> literally', json.dumps(history.data, ensure_ascii=False))
 
     def test_own_feedback_comes_before_free_work_and_a_held_task_is_not_offered(self):
-        made = self.request('POST', '/v1/agents', {'name': 'Kestrel', 'working_directory': '/home/x/kestrel', 'projects': ['pp']},
+        made = self.request('POST', '/v1/agents', {'name': 'Kestrel', 'working_directory': '/home/x/kestrel', 'projects': ['pp'],
+                                                    'claim_limit': claim_limit.LIMIT_MAX},
                             token=self.tokens['casey'])
         self.assertEqual(201, made.status, made.data)
         agent = made.data['credential']['secret']
