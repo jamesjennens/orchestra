@@ -721,11 +721,9 @@ class InProcessBackend:
         claimant = payload.get('actor') or principal.actor
         if task['status'] != 'open':
             raise conflict('Task is not open')
-        from work import open_dependency_ids, open_dependency_sentence
-        snapshot = self._project_rows(project_id)
-        open_deps = open_dependency_ids(task, snapshot)
-        if open_deps:
-            raise conflict(open_dependency_sentence(open_deps) or 'Task is blocked by an open dependency')
+        # The claim ROUTE gates the open dependency (kittrial-5bb.293 rev4): the
+        # backend does not repeat the check, so removing the route refusal is caught
+        # by the route test (mutant g4).
         if task['assignee'] is not None and task['assignee'] == claimant:
             # One's own task, claimed again: answered as a real installation answers it (bd's
             # claim), 200 and nothing changed (kittrial-5bb.187). It was 409 here.
@@ -4324,12 +4322,12 @@ class ApiHandler(BaseHTTPRequestHandler):
         view['next_action'] = next_action(view)
         view['requirement_record'] = requirement_record(view.get('labels'))
         from work import dependency_index, open_dependency_ids
-        # The snapshot the view already has (a list view) or an empty one (a
-        # single-task view: the other ends are read by the claim gate, which fails
-        # closed). No bare except (kittrial-5bb.293 item 3c). One index per snapshot
-        # (item 2a).
-        snapshot = tasks if isinstance(tasks, list) else []
-        view['open_dependencies'] = open_dependency_ids(task, snapshot, index=dependency_index(snapshot))
+        # A list view passes its snapshot; a single-task view passes none, and the
+        # dependency entries themselves carry the other end's status (bd show),
+        # so the block is visible with no extra read (kittrial-5bb.293 rev4).
+        snapshot = tasks if isinstance(tasks, list) else None
+        view['open_dependencies'] = open_dependency_ids(task, snapshot,
+            index=dependency_index(snapshot) if snapshot is not None else None)
         view['claimable'] = claimable(view.get('issue_type'), view.get('status'), assignee,
                                       view.get('contribution_id'), view.get('review_state'),
                                       labels=view.get('labels'),
@@ -6789,7 +6787,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         deps = []
         ids = []
         for d in row.get('dependencies') or []:
-            other_id, kind = dependency_ref(d)
+            other_id, kind, _ = dependency_ref(d)
             if kind in BLOCKING_DEPENDENCY_TYPES and other_id:
                 deps.append(d)
                 ids.append(other_id)

@@ -93,17 +93,20 @@ BLOCKING_DEPENDENCY_TYPES = frozenset({'blocks', 'blocked-by', 'depends'})
 
 
 def dependency_ref(dep):
-    """(other_id, type) from one dependency entry, in either native shape.
+    """(other_id, type, other_status) from one dependency entry, in either native shape.
 
-    ``bd export`` writes ``depends_on_id``/``type``; ``bd show`` writes expanded
-    issues keyed ``id``/``dependency_type`` (kittrial-5bb.293 rev3). Both are
-    accepted so every surface reads the same fact.
+    ``bd export`` writes ``depends_on_id``/``type`` and no status; ``bd show`` writes
+    expanded issues keyed ``id``/``dependency_type`` that DO carry the other end's
+    ``status`` (kittrial-5bb.293 rev3/rev4). All three are read so every surface
+    answers the same fact, and a single-task view can see the block without a
+    snapshot of the other end.
     """
     if not isinstance(dep, dict):
-        return None, None
+        return None, None, None
     other = dep.get('depends_on_id') or dep.get('id')
     kind = dep.get('type') or dep.get('dependency_type')
-    return other, kind
+    status = dep.get('status') or dep.get('depends_on_status')
+    return other, kind, status
 
 
 def dependency_index(rows):
@@ -123,14 +126,20 @@ def open_dependency_ids(row, rows, index=None):
     """
     if not isinstance(row, dict):
         return []
-    by_id = index if index is not None else dependency_index(rows)
+    by_id = index if index is not None else (dependency_index(rows) if rows is not None else None)
     open_ids = []
     for dep in row.get('dependencies') or []:
-        other_id, kind = dependency_ref(dep)
+        other_id, kind, dep_status = dependency_ref(dep)
         if kind not in BLOCKING_DEPENDENCY_TYPES:
             continue
-        other = by_id.get(other_id)
-        if isinstance(other, dict) and other.get('status') != 'closed':
+        other = by_id.get(other_id) if by_id is not None else None
+        if isinstance(other, dict):
+            status = other.get('status')
+        elif dep_status is not None:
+            status = dep_status
+        else:
+            continue
+        if status != 'closed':
             open_ids.append(str(other_id))
     return open_ids
 
