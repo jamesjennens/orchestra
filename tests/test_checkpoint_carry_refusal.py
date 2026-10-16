@@ -316,19 +316,21 @@ class ExamplePayloadHelpTests(unittest.TestCase):
 
 @unittest.skipIf(rb.endpoint is None, 'real bd checkpoint test needs POSIX endpoint imports')
 @unittest.skipIf(rb.BD is None, 'real bd not configured (ORCHESTRA_BD_BIN or bd on PATH)')
-class RealBdCarryRefusalTests(unittest.TestCase):
-    """The same mechanism against real native comments in a disposable runtime."""
+class RealBdCarryRefusalTests(rb.RealBdLabelAliasTests):
+    """The same mechanism against real native comments in a disposable runtime.
 
-    bd = rb.RealBdLabelAliasTests.bd
-    export_rows = rb.RealBdLabelAliasTests.export_rows
+    The scratch-Dolt fixture, and the class-scoped server it starts, are reused by
+    inheriting from `tests/test_bd_label_aliases.py`. Calling that class's
+    classmethods with a bare TestCase (`setUpClass.__func__(cls)`, as the first
+    revision of this file and `tests/test_checkpoint_real_bd.py` both do) leaves
+    `cls` without `_watch_signals` and the class errors in `setUpClass` before
+    either test runs. The fixture's own three label-alias tests are disabled here
+    so this module reports only its own two; they still run in their own module.
+    """
 
-    @classmethod
-    def setUpClass(cls):
-        rb.RealBdLabelAliasTests.setUpClass.__func__(cls)
-
-    @classmethod
-    def tearDownClass(cls):
-        rb.RealBdLabelAliasTests.tearDownClass.__func__(cls)
+    test_create_label_spellings_refuse_every_reserved_value = None
+    test_update_label_spellings_refuse_every_reserved_value = None
+    test_ordinary_labels_still_reach_real_bd = None
 
     def native(self, *args, actor='op'):
         """bd's global --actor is the audit actor; a comment author is separate."""
