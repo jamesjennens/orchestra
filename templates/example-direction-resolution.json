@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "task": "example-task",
+  "previous": "01a132d1-5143-76d6-8db2-1c043d0105b9",
+  "activity_cursor": "eyJraW5kIjoiYWN0aXZpdHkiLCJwcm9qZWN0IjoiZXhhbXBsZSIsInNoYTI1NiI6IjExMWQ4YjJhZjE0YzZkZDkxNTdjZGZmYjRmN2JlNWQyZDAyZjI4NjA4N2ZkMzUwMGViMDc3ZDhjOTZjM2I1MTYiLCJ0YXNrIjoiZXhhbXBsZS10YXNrIiwidiI6MX0",
+  "source_commit": "",
+  "branch": "",
+  "intent": "Describe the intended outcome.",
+  "acceptance": "Describe the acceptance criteria.",
+  "summary": "Describe the current verified position.",
+  "next_action": "Describe the next action and who should take it.",
+  "open_items": [
+    {
+      "id": "parts-4-5-not-built",
+      "kind": "dependency",
+      "text": "Part 5 is not built yet.",
+      "source": "task build list item 5"
+    }
+  ],
+  "resolved": [],
+  "directions": [
+    {
+      "id": "example-task-c01a13320-b9ed-7af7-a8ab-512af3e56bed",
+      "state": "resolved",
+      "digest": "391bb136cf16787b9b8864feacaae54c2860fff84c726c223cd92a2bc56e794c",
+      "note": "Answered: the coordinator's question is settled by the delivered revision.",
+      "evidence": "contribution 01a13314-444d-7a84-bebe-8a6330a4c43e"
+    }
+  ]
+}

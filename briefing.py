@@ -39,6 +39,10 @@ HISTORY_CURSOR_EXTRA={'order','entry_kind','scp'}
 HISTORY_CURSOR_KEYS=HISTORY_CURSOR_BASE|HISTORY_CURSOR_EXTRA
 FIELD_NAME_LIMIT=60
 FIELD_NAME_COUNT=8
+#: The minimal worked payload for disposing of ONE outstanding direction while carrying
+#: the open items (kittrial-5bb.287). The name is referenced by the `checkpoint` help and
+#: by docs/BRIEFINGS.md, so one name is spelled in one place.
+DIRECTION_EXAMPLE_FILE='example-direction-resolution.json'
 BRIEF_MISTAKEN_FLAGS={
     '--limit':'use --items-limit for the unresolved-item page size',
     '--offset':'use --items-offset for the unresolved-item page offset',
@@ -328,11 +332,101 @@ def validate_checkpoint(p,task,require_digests=True):
     problems=checkpoint_problems(p,task)
     if problems:raise ValueError(problems_message(problems))
 
-def transition(previous,current):
+def id_list(ids,limit=FIELD_NAME_COUNT):
+    """The ids of one refusal, bounded the way a field-name list is.
+
+    A refusal must name what it compared, or a caller cannot act on it
+    (kittrial-5bb.287); it must also stay bounded, so a pathological payload
+    cannot make one sentence unbounded. Every id in the delta is named when they
+    fit, and the rest are counted.
+    """
+    shown=sorted(ids)
+    if len(shown)<=limit:return ', '.join(shown)
+    return ', '.join(shown[:limit])+' (+%d more)'%(len(shown)-limit)
+
+def transition(previous,current,called_from='request',current_id=None):
+    """Follow one linked pair: every unresolved item is carried or resolved.
+
+    The rule itself is unchanged: the items open in the parent and absent now
+    must be exactly the ids the current record resolves. What changed
+    (kittrial-5bb.287) is the refusal: it names the ids it compared, and it says
+    which of its two callers is refusing. `save_checkpoint` refuses THIS REQUEST,
+    which the caller can fix by editing the payload; `checkpoint_state` refuses a
+    STORED PAIR while it walks the chain, which no caller can fix by editing a
+    payload - the task needs reconciliation by an operator before it reads or
+    writes again. Without the ids, three different caller mistakes (an item
+    dropped without a resolution, an item resolved and still carried, an id that
+    was never open) produced one identical sentence and six payload shapes could
+    not find the way out.
+
+    ``current_id`` is the comment id of the record being compared, and is named
+    only in the stored-pair refusal: a chain is read from records, so that
+    refusal can point the operator at the pair to reconcile.
+    """
     old={x['id'] for x in previous['open_items']} if previous else set()
     now={x['id'] for x in current['open_items']}
     resolved={x['id'] for x in current['resolved']}
-    if old-now!=resolved:raise ValueError('Carry every unresolved item forward or explicitly resolve/supersede it with reason and evidence')
+    if old-now!=resolved:
+        # Three different caller mistakes reach this one rule, and they used to share
+        # one sentence that named nothing (kittrial-5bb.287):
+        #   1. an id open in the parent that this record neither carries nor resolves;
+        #   2. an id this record RESOLVES and still carries in open_items, so the pair
+        #      (dropped, resolved) does not match;
+        #   3. an id this record resolves that is not open in the parent at all - the
+        #      parent already resolves it, or it was never an open item. A direction is
+        #      dispositioned with `directions` and never with `resolved`, so this case
+        #      must say so rather than send the caller hunting for an item problem that
+        #      may not exist.
+        # Named ids are bounded like a field-name list so one sentence stays bounded.
+        def id_list(ids,limit=FIELD_NAME_COUNT):
+            """The ids of this pair, bounded the way a field-name list is.
+
+            A refusal must name what it compared, or a caller cannot act on it
+            (kittrial-5bb.287); it must also stay bounded, so a pathological record
+            cannot make one sentence unbounded. Every id is named when they fit, and
+            the rest are counted.
+            """
+            shown=sorted(ids)
+            if len(shown)<=limit:return ', '.join(shown)
+            return ', '.join(shown[:limit])+' (+%d more)'%(len(shown)-limit)
+
+        dropped=id_list(old-now)
+        carried=id_list((old|now)&resolved)
+        not_open=id_list(resolved-old-now)
+        parts=[]
+        if old-now:
+            parts.append('open in the previous checkpoint and neither carried in open_items nor resolved: %s; '
+                         'resolve or supersede every id named here, or carry each forward unchanged' % (dropped,))
+        if (old|now)&resolved:
+            parts.append('%s in resolved and also in open_items; an item is resolved by omitting its id from '
+                         'open_items, or carried unchanged by leaving it out of resolved'
+                         % (('%s are'%carried) if len((old|now)&resolved)>1 else ('%s is'%carried)))
+        if resolved-old-now:
+            many=len(resolved-old-now)>1
+            parts.append('%s in resolved and not open in the previous or the current record: the previous '
+                         'checkpoint already resolves %s, or %s never an open item. A direction is '
+                         'dispositioned with directions, never with resolved; a genuinely unresolved item is '
+                         're-opened under a new id'
+                         % (('%s are'%not_open) if many else ('%s is'%not_open),
+                            'them' if many else 'it','they were' if many else 'it was'))
+        if not parts:
+            # Cannot happen while old-now != resolved with both sides read from the
+            # same two records; kept so the refusal is never empty.
+            parts.append('the items open in the previous checkpoint and the ids this record resolves differ')
+        if called_from=='chain':
+            parent=current.get('previous')
+            raise ValueError('Checkpoint history is unreadable: stored pair %s -> %s does not carry every '
+                             'unresolved item forward: %s. This is a stored pair, not this request: reconcile '
+                             'the history before reading, writing or briefing this task (an operator preserves '
+                             'the original evidence in a correction record and publishes a re-anchoring '
+                             'checkpoint)'
+                             % (parent if parent is not None else '(none)',
+                                current_id if current_id is not None else '(unknown)', '; '.join(parts)))
+        raise ValueError('Carry every unresolved item forward or explicitly resolve/supersede it with reason '
+                         'and evidence: '+'. '.join(parts)
+                         +'. Compared here: the previous checkpoint\'s open_items, this record\'s open_items '
+                         'and this record\'s resolved. No client update is required: the refusal names the ids '
+                         'in this request that do not match, and the same ids fix it')
     old_items={x['id']:x for x in previous['open_items']} if previous else {}
     if any(item['id'] in old_items and item!=old_items[item['id']] for item in current['open_items']):raise ValueError('Carry unresolved items unchanged; explicitly resolve/supersede changed items with new IDs')
 
@@ -361,7 +455,7 @@ def checkpoint_state(issue,normalize=True):
         if len(following)!=1:raise ValueError('Conflicting checkpoint branches; reconcile history before briefing')
         cid,p,c=following[0]
         if cid in visited:raise ValueError('Checkpoint cycle')
-        transition(current[0] if current else None,p)
+        transition(current[0] if current else None,p,'chain',cid)
         current=(p,c);parent=cid;visited.add(cid)
         history.append((cid,p))
         if normalize:provenance[cid]=normalize_provenance(p)
@@ -1146,7 +1240,7 @@ def save_checkpoint(rows,project,task,p,actor,run,provenance_writes=False):
     previous=str(current[1]['id']) if current else None
     if p['previous']!=previous:raise ValueError('Stale previous checkpoint; read brief again')
     if p['activity_cursor']!=activity_cursor(snap):raise ValueError('Activity changed; read/reconcile history and obtain a fresh activity cursor')
-    transition(current[0] if current else None,payload)
+    transition(current[0] if current else None,payload,'request')
     result=json.loads(run(['comments','add',task,PREFIX+canonical_bytes(payload).decode(),'--json']))
     answer={'comment_id':str(result['id']),'reconciled':False,'covered':payload.get('provenance',{}).get('covered',0),'bytes':size}
     if lane is not None:
@@ -1672,6 +1766,19 @@ def help_notes(action):
             'more a numbered list of the same sentences ("Invalid checkpoint (N problems): [1] ... [2] ..."), at '
             'most %d of them. A stale previous and a changed activity cursor are separate refusals.'
             % CHECKPOINT_PROBLEMS_MAX,
+            'The carry refusal names the ids it compared (kittrial-5bb.287): the ids open in the previous '
+            'checkpoint that this record neither carries nor resolves, the ids in `resolved` that are also in '
+            '`open_items`, and the ids in `resolved` that are not open items at all. An item is resolved by '
+            'OMITTING its id from `open_items` and adding it to `resolved`; naming it in `resolved` while still '
+            'carrying it does not resolve it. A direction is NEVER resolved by `resolved`: a direction is another '
+            'actor\'s ordinary comment, dispositioned with `directions` (installations with the provenance write '
+            'switch off cannot record one, so none is outstanding there). No client update is required: the '
+            'refusal names the ids in the request that do not match, and those ids are what fix it.',
+            'Minimal example payload that disposes of ONE outstanding direction while carrying the open items '
+            '(templates/%s): "open_items" repeats every unresolved id and text byte for byte, "resolved" is empty, '
+            'and "directions" holds the direction\'s id, its full digest from `checkpoint TASK --directions`, and '
+            'the disposition. Write it with `checkpoint TASK --file %s`.'
+            % (DIRECTION_EXAMPLE_FILE, DIRECTION_EXAMPLE_FILE),
             '--json is accepted in any position; the saved checkpoint is always returned as JSON on stdout.',
             '--provenance, --verify and --directions are read-only alternatives to --file; they change no checkpoint or direction disposition.',
             'checkpoint_provenance_writes is off by default: writers emit the older-kit shape until an operator enables new writes after a reader-first rollout.',
