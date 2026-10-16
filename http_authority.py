@@ -2373,6 +2373,7 @@ BLOCK_CAPABILITIES = {
            'comments': CAP_TASKS},         # tasks.comment; raw reserved guards still apply
     'checkpoint': CAP_CHECKPOINTS,         # checkpoints.add
     'task-assign': CAP_COORDINATE,         # dedicated assignee-only guarded operation
+    'task-release': CAP_TASKS,             # releasing your OWN claim (kittrial-5bb.301)
     'assignment-roster': CAP_COORDINATE,   # project-scoped existing assignment targets
     'coordinate': {'merge-check': CAP_READ, 'merge-acquire': CAP_COORDINATE,
                    'merge-release': CAP_COORDINATE, 'merge-create': CAP_PROJECT_ADMIN},

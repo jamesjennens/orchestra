@@ -1421,6 +1421,37 @@ in-process backend (the tests' and the local preview's) refused both cases alrea
 it refused a second claim by the SAME member too, and now answers it 200, unchanged,
 as a real installation does.
 
+### Releasing your own claim
+
+`POST /v1/projects/{id}/tasks/{task}/release` (body `{"reason": "..."}`, closed set)
+lets the caller release a claim it HOLDS and has not delivered (kittrial-5bb.301):
+the task returns to `open` and unassigned, its checkpoint and open items stay, and the
+claim stops counting against the holder's `claim_limit` at once, so the next claim is
+available immediately. The holder is the authenticated caller, never a submitted
+field, and the reason is at most 120 characters. The release is recorded as the
+canonical assignment notice, which names who released it, when and the reason -- the
+same notice `POST .../tasks/{task}/assign` with `assignee: null` writes, so clearing
+an assignee has one mechanism, not two.
+
+It is refused, changing nothing, when:
+
+- the caller does not hold the task: **409 "That task is not claimed by you; only its
+  holder can release it"**. Another actor's claim is never released this way; an
+  owner's bulk release of one agent's claims is
+  `POST /v1/agents/{id}/release-claims`;
+- the holder's contribution **awaits review or has changes requested**: **409**, from
+  the canonical assignment check, because that is delivered work, not a claim (set
+  `allow_pending_review` on the assign route if a coordinator must displace it);
+- the holder holds the **merge slot** for this task: **409**, from the canonical
+  check; the slot and its holder are retained;
+- the body carries a field other than `reason`, or the reason is blank or over 120
+  characters: **422**; no `Idempotency-Key`: **422**.
+
+An agent needs only its ordinary task authority (`tasks.write`) for this route; every
+other assignee change still requires coordinate authority, so no caller gains the
+power to take another actor's task. `POST .../assign` is unchanged for coordinators
+and owners. A backend without canonical task assignment answers **501**.
+
 ### The name a worker credential writes under
 
 A worker credential writes under the actor namespace its issuer chose (`actor` when it
@@ -3007,7 +3038,9 @@ line separately and unconfined.
   it already holds is not counted again. A person's own session actor is not limited.
   A task whose latest checkpoint left an open blocker or dependency does not count: the
   documented order sends a lane the checkpoint left stuck on to other work, and that
-  order has to be possible to follow. A PERSON assigning a task to an agent at its limit
+  order has to be possible to follow. A held task the agent releases
+  (`POST /v1/projects/{id}/tasks/{task}/release`, kittrial-5bb.301) stops counting at
+  once, which is the other half of the refusal's "Deliver or release one". A PERSON assigning a task to an agent at its limit
   is still allowed (`POST /v1/projects/{id}/tasks/{task}/assign`): that is the owner's
   explicit choice, not the agent taking work. An AGENT assigning a task to itself
   through that same route is a claim and takes the limit, because that IS the agent

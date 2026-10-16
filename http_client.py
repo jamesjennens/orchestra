@@ -432,6 +432,19 @@ class Client:
                             % (quote(project, safe=''), quote(task, safe='')),
                             {'actor': actor}, key=key)
 
+    def release_task(self, project, task, reason, key=None):
+        """Release the caller's own claimed, undelivered task, with a short reason.
+
+        The holder is the authenticated caller, so the client never sends an actor:
+        the server refuses a task the caller does not hold, a contribution awaiting
+        review or changes requested, and the merge slot (kittrial-5bb.301). A
+        checkpoint and its open items stay on the task, and the claim stops counting
+        against the caller's ``claim_limit`` at once.
+        """
+        return self.request('POST', '/v1/projects/%s/tasks/%s/release'
+                            % (quote(project, safe=''), quote(task, safe='')),
+                            {'reason': reason}, key=key)
+
     def add_comment(self, project, task, text, key=None):
         """Append literal text under the authenticated actor; no author override."""
         return self.request('POST', '/v1/projects/%s/tasks/%s/comments'
@@ -586,6 +599,11 @@ def _build_parser():
     assignment.add_argument('--allow-pending-review', action='store_true')
     assignment.add_argument('--allow-held-slot', action='store_true')
     assignment.add_argument('--idempotency-key', help='reuse exactly this key and request after an uncertain result')
+    release = sub.add_parser('release-task', help='release your own claimed, undelivered task with a reason')
+    release.add_argument('project')
+    release.add_argument('task')
+    release.add_argument('--reason', required=True)
+    release.add_argument('--idempotency-key', help='reuse exactly this key and request after an uncertain result')
     life = sub.add_parser('lifecycle', help='read or record task scope and lifecycle facts')
     life.add_argument('project');life.add_argument('task')
     life.add_argument('operation', choices=('read','scope','fact'))
@@ -640,6 +658,10 @@ def main(argv=None):
             result=client.assign_task(args.project,args.task,args.expected_assignee,args.assignee,args.reason,
                 allow_pending_review=args.allow_pending_review,allow_held_slot=args.allow_held_slot,
                 key=args.idempotency_key)
+            print(json.dumps(result,indent=2))
+            return 0
+        if args.command == 'release-task':
+            result=client.release_task(args.project,args.task,args.reason,key=args.idempotency_key)
             print(json.dumps(result,indent=2))
             return 0
         if args.command == 'merge-slot':
