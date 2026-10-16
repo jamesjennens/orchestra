@@ -3344,7 +3344,14 @@ warning and Extend existing credential. This action keeps the existing secret.
 Issuing a new secret is a separate action for the agent's own account or a
 superuser; it retains the existing scope confirmation/widening rules and the
 20 working / five retained dead credential bounds. Extension makes no new key.
-`GET /v1/sessions/current` adds `credential_expiry` for an agent credential.
+`GET /v1/sessions/current` adds `credential_expiry` for an agent credential, and so
+does `GET /v1/agents/me` for the calling credential itself (the same secret-free shape,
+plus its `expires_soon`; it is never another credential's). The `401` at credential
+expiry and revocation names who can act - an owner can extend an agent credential
+before it expires, and after it expires the owner's account or a superuser issues a new
+secret - and names no other credential. A stored expiry is capped at 366 days from
+issuance **on read** in both the web service and the canonical endpoint, so a
+hand-edited store of years is not honoured; the store is never rewritten.
 Project-owner credential rows expose only ID, expiry, working/revoked status and
 warning, never labels, hashes, scopes, directories, other grants or secrets.
 

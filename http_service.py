@@ -4637,9 +4637,9 @@ class ApiHandler(BaseHTTPRequestHandler):
                     'create' if getattr(self.backend, 'PROJECT_CREATE', 'create') == 'create' else
                     'register' if principal.superuser and principal.via != 'credential' else 'operator-only')}
         if principal.credential_id:
-            credential = self.service.state['credentials'].get(principal.credential_id)
-            if credential and credential.get('agent_id'):
-                body['credential_expiry'] = self.service.agent_credential_expiry_view(credential)
+            expiry = self._credential_expiry_view(principal)
+            if expiry is not None:
+                body['credential_expiry'] = expiry
         # Additive (kittrial-5bb.118 part 2): whether this account may create a project
         # on the host from here, with its limit and how many it has. Only where the
         # backend has a host.
@@ -4655,6 +4655,21 @@ class ApiHandler(BaseHTTPRequestHandler):
     @route('DELETE', r'/v1/sessions/current')
     def sessions_delete(self, ctx):
         return 204, self.service.logout(ctx.principal, request_id=ctx.request_id)
+
+    def _credential_expiry_view(self, principal):
+        """The caller's own credential expiry, or ``None`` when it has none to show.
+
+        The same secret-free shape both ``GET /v1/sessions/current`` and
+        ``GET /v1/agents/me`` answer (kittrial-5bb.294 item 1). A worker credential has
+        no agent identity and no view, exactly as before; an agent credential reads its
+        own stored deadline, capped at 366 days from issuance on read (item 4). This
+        never looks at any other credential.
+        """
+        credential_id = getattr(principal, 'credential_id', None)
+        credential = self.service.state['credentials'].get(credential_id) if credential_id else None
+        if credential and credential.get('agent_id'):
+            return self.service.agent_credential_expiry_view(credential)
+        return None
 
     @route('POST', r'/v1/accounts')
     def accounts_create(self, ctx):
@@ -5718,8 +5733,18 @@ class ApiHandler(BaseHTTPRequestHandler):
     @route('GET', r'/v1/agents/me')
     def agents_me(self, ctx):
         agent = self.service.agent_for_credential(ctx.principal)
-        return 200, {'agent': agent, 'attention': self._agent_attention_view(agent),
-                     'generated_at': now_iso(self.service._now())}
+        body = {'agent': agent, 'attention': self._agent_attention_view(agent),
+                'generated_at': now_iso(self.service._now())}
+        # The calling credential's OWN expiry, in exactly the shape /v1/sessions/current
+        # answers (kittrial-5bb.294 item 1): the agent set-up prompt and the bridge
+        # extension read this route, and the read caps the stored expiry at 366 days from
+        # issuance (item 4). No new disclosure: it is the caller's credential only, never
+        # another credential's.
+        expiry = self._credential_expiry_view(ctx.principal)
+        if expiry is not None:
+            body['credential_expiry'] = expiry
+            body['expires_soon'] = bool(expiry.get('expires_soon'))
+        return 200, body
 
     @route('GET', r'/v1/agents/me/next')
     def agents_me_next(self, ctx):

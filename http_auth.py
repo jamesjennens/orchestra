@@ -54,6 +54,9 @@ from http_authority import (ALL_CAPABILITIES, CAP_ACCOUNTS_ADMIN, CAP_AGENTS, CA
                             CREDENTIAL_FORBIDDEN_CAPABILITIES, CREDENTIAL_SCOPES, RANK,
                             ROLE_CAPABILITIES, ROLES, SCOPE_CAPABILITIES, SCHEMA_VERSION,
                             JOURNAL_MAX_SKEW_SECONDS, JOURNAL_SUSPECT_SETTLE_SECONDS,
+                            CREDENTIAL_EXPIRED_MESSAGE, CREDENTIAL_MAX_AGE_DAYS,
+                            CREDENTIAL_REVOKED_MESSAGE,
+                            credential_age_expired, credential_expiry_cap,
                             AuthorityDenied, authority_request, clock_advance,
                             clock_persist, clock_report, clock_state,
                             clock_trusted, decide, file_lock,
@@ -72,7 +75,8 @@ SESSION_IDLE_SECONDS = 30 * 60
 SESSION_ABSOLUTE_SECONDS = 12 * 60 * 60
 CREDENTIAL_TTL_SECONDS = 30 * 24 * 60 * 60
 AGENT_CREDENTIAL_DAYS_DEFAULT = 30
-AGENT_CREDENTIAL_DAYS_MAX = 366
+#: The same ceiling the shared read cap applies (kittrial-5bb.294 item 4): one source.
+AGENT_CREDENTIAL_DAYS_MAX = CREDENTIAL_MAX_AGE_DAYS
 _AGENT_LIFETIME_DEFAULT = object()
 RESET_TTL_SECONDS = 30 * 60
 IDEMPOTENCY_TTL_SECONDS = 24 * 60 * 60
@@ -1028,7 +1032,13 @@ class Service:
         key uses their existing legacy path (no issued_raw); this reader still enforces
         BOTH its stored monotone expiry and its explicit raw deadline. Default30 keys
         keep issued_raw too. New fields never change worker/session/reset expiry.
+
+        The stored expiry is additionally capped at 366 days from issuance ON READ
+        (kittrial-5bb.294 item 4): a hand-edited store of years is not honoured here, and
+        the same shared cap is applied by the canonical endpoint.
         """
+        if credential_age_expired(credential, moment):
+            return True
         if credential.get('agent_id') and 'agent_raw_expires_at' in credential:
             values = (credential.get('expires_at'), credential['agent_raw_expires_at'])
             try:
@@ -1593,11 +1603,15 @@ class Service:
             credential_id = self.state['credential_tokens'].get(digest)
             credential = self.state['credentials'].get(credential_id) if credential_id else None
             if credential is not None:
-                if credential['revoked'] or self._credential_expired(credential, moment):
-                    raise unauthenticated('Credential expired or revoked')
+                # Revocation and expiry answer separately, and the expiry sentence names who
+                # can act without naming any other credential (kittrial-5bb.294 item 2).
+                if credential['revoked']:
+                    raise unauthenticated(CREDENTIAL_REVOKED_MESSAGE)
+                if self._credential_expired(credential, moment):
+                    raise unauthenticated(CREDENTIAL_EXPIRED_MESSAGE)
                 user = self.state['users'].get(credential['user_id'])
                 if user is None or user['disabled']:
-                    raise unauthenticated('Credential expired or revoked')
+                    raise unauthenticated('Authentication is no longer valid')
                 if required_scope and required_scope not in credential['scopes']:
                     raise forbidden('Credential scope does not permit this operation')
                 credential['last_used'] = moment
@@ -1655,8 +1669,12 @@ class Service:
             return user
         if principal.via == 'credential':
             credential = self.state['credentials'].get(principal.credential_id)
-            if credential is None or credential['revoked'] or self._credential_expired(credential, moment):
-                raise unauthenticated('Credential expired or revoked')
+            if credential is None:
+                raise unauthenticated(CREDENTIAL_EXPIRED_MESSAGE)
+            if credential['revoked']:
+                raise unauthenticated(CREDENTIAL_REVOKED_MESSAGE)
+            if self._credential_expired(credential, moment):
+                raise unauthenticated(CREDENTIAL_EXPIRED_MESSAGE)
             user = self.state['users'].get(credential['user_id'])
             if user is None or user['disabled']:
                 raise unauthenticated('Authentication is no longer valid')
@@ -2190,16 +2208,48 @@ class Service:
             answer['actor_waived'] = dict(credential['actor_waived'])
         return answer
 
+    def credential_effective_expiry(self, credential):
+        """The stored deadline AS READ: capped at 366 days from issuance (kittrial-5bb.294 item 4).
+
+        The cap is the shared :func:`http_authority.credential_expiry_cap`. Records with no
+        readable issuance stamp, or no numeric deadline, are returned untouched, so the
+        older legacy reader keeps its meaning.
+        """
+        expires = credential.get('expires_at')
+        cap = credential_expiry_cap(credential)
+        if cap is None or type(expires) is bool or not isinstance(expires, (int, float)):
+            return expires
+        if not math.isfinite(expires):
+            return expires
+        return min(float(expires), cap)
+
+    def credential_effective_raw_expiry(self, credential):
+        """The raw deadline AS READ, capped at 366 days from issuance (kittrial-5bb.294 item 4)."""
+        raw = credential.get('agent_raw_expires_at')
+        cap = credential_expiry_cap(credential)
+        if cap is None or type(raw) is bool or not isinstance(raw, (int, float)):
+            return raw
+        if not math.isfinite(raw):
+            return raw
+        return min(float(raw), cap)
+
     def agent_credential_expiry_view(self, credential):
         """Secret-free expiry metadata, also safe for a project's owner controls."""
         moment = self._expiry_now()
         working = self._credential_live(credential, moment)
-        remaining = credential['expires_at'] - moment
+        expires = self.credential_effective_expiry(credential)
+        deadline = expires if isinstance(expires, (int, float)) and \
+            not isinstance(expires, bool) else None
+        remaining = deadline - moment if deadline is not None else None
         if credential.get('agent_id') and 'agent_raw_expires_at' in credential and working:
-            remaining = min(remaining, credential['agent_raw_expires_at'] - self._raw_now())
-        return {'id': credential['id'], 'expires_at': now_iso(credential['expires_at']),
+            raw = self.credential_effective_raw_expiry(credential)
+            if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+                raw_remaining = raw - self._raw_now()
+                remaining = raw_remaining if remaining is None else min(remaining, raw_remaining)
+        return {'id': credential['id'],
+                'expires_at': now_iso(deadline) if deadline is not None else None,
                 'working': bool(working), 'revoked': bool(credential.get('revoked')),
-                'expires_soon': bool(working and remaining <= 7 * 86400)}
+                'expires_soon': bool(working and remaining is not None and remaining <= 7 * 86400)}
 
     def credential_view(self, credential):
         view = {'id': credential['id'], 'project': credential['project_id'],
