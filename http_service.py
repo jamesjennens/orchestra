@@ -51,7 +51,8 @@ import project_coordination
 from coordination import MERGE_SLOT_SUFFIX, is_merge_slot, merge_slot_sentence
 from reserved_comments import (ANCHOR_READ_IDS_MAX, carries_record_label, hide_records,
                                is_record_anchor)
-from http_auth import (AGENT_SECRET_ENV, agent_secret_file, CAP_ACCOUNTS_ADMIN, CAP_AGENTS, CAP_APPROVE,
+from http_auth import (AGENT_SECRET_ENV, agent_secret_file, CAP_ACCOUNTS_ADMIN, CAP_AGENT_SELF, CAP_AGENTS,
+                       CAP_APPROVE,
                        CAP_CHECKPOINTS, CAP_FEEDBACK, CAP_PROPOSALS, CAP_COORDINATE,
                        CAP_PROJECT_ADMIN, CAP_PROJECT_CREATE, CAP_PROJECT_HOST_CREATE, CAP_READ, CAP_REVIEWS,
                        CAP_TASKS, RESULT_RETENTION_SECONDS, HttpError, Service, Store,
@@ -4266,6 +4267,9 @@ class ApiHandler(BaseHTTPRequestHandler):
                            'projects', 'scopes', 'owner', 'claim_limit')
     AGENT_UPDATE_FIELDS = ('name', 'tool', 'working_directory', 'machine', 'notes',
                            'projects', 'enabled', 'claim_limit')
+    #: The agent's OWN route (``PATCH /v1/agents/me``, kittrial-5bb.302) takes the one
+    #: field an agent may change on its own record: its claim limit, and only downward.
+    AGENT_ME_UPDATE_FIELDS = ('claim_limit',)
     AGENT_CREDENTIAL_FIELDS = ('label', 'scopes')
     ACCOUNT_CREATE_FIELDS = ('username', 'display_name')
 
@@ -5878,7 +5882,12 @@ class ApiHandler(BaseHTTPRequestHandler):
     @route('GET', r'/v1/agents/me')
     def agents_me(self, ctx):
         agent = self.service.agent_for_credential(ctx.principal)
-        body = {'agent': agent, 'attention': self._agent_attention_view(agent),
+        # The same bounded attention read ``/v1/agents/me/next`` makes, so this route can
+        # report the agent's own claim limit, what holds it and who may raise it
+        # (kittrial-5bb.302) from the one counted-held rule the claim gate applies.
+        attention = self._agent_attention(ctx.principal, agent)
+        body = {'agent': agent, 'attention': self._agent_attention_view(agent, attention),
+                'claim_limit': self._agent_claim_limit_view(agent, attention),
                 'generated_at': now_iso(self.service._now())}
         # The calling credential's OWN expiry, in exactly the shape /v1/sessions/current
         # answers (kittrial-5bb.294 item 1): the agent set-up prompt and the bridge
@@ -5890,6 +5899,32 @@ class ApiHandler(BaseHTTPRequestHandler):
             body['credential_expiry'] = expiry
             body['expires_soon'] = bool(expiry.get('expires_soon'))
         return 200, body
+
+    @route('PATCH', r'/v1/agents/me')
+    def agents_me_update(self, ctx):
+        """The agent's own claim limit: it may LOWER it, never raise it (kittrial-5bb.302).
+
+        One small body: ``claim_limit`` only, a whole number from 1 up to the value the
+        agent holds now. Raising it stays the owner's move, refused with a sentence that
+        names the owner's account or a superuser and the My agents page. The identity is
+        the caller's own credential, never a body field, so this route cannot touch
+        another agent's limit; the owner's route (``PATCH /v1/agents/{id}``) is unchanged.
+        """
+        payload = dict(ctx.payload or {})
+        refuse_unknown_fields(payload, self.AGENT_ME_UPDATE_FIELDS, 'An agent limit change')
+        if 'claim_limit' not in payload:
+            raise invalid('Nothing to change. An agent limit change takes: claim_limit')
+        value = payload.get('claim_limit')
+        metadata = {}
+
+        def lower():
+            result = self.service.lower_own_claim_limit(ctx.principal, value)
+            # Who changed what, on the committed audit event (kittrial-5bb.302 item 4).
+            metadata.update({'agent': result['agent']['id'], 'actor': ctx.principal.actor,
+                             'old_limit': result['old_limit'], 'new_limit': result['new_limit']})
+            return result, result
+        return self._mutate(ctx, 'agents.claim_limit.lower', None, lower,
+                            capability=CAP_AGENT_SELF, audit_metadata=metadata)
 
     @route('GET', r'/v1/agents/me/next')
     def agents_me_next(self, ctx):
@@ -6902,8 +6937,13 @@ class ApiHandler(BaseHTTPRequestHandler):
         the agent's move and holds no claim slot (revision, review items 2b/3b).
         An incomplete own read is a lower bound, so it reports no availability,
         exactly as the gate refuses, rather than reading as "no limit".
+
+        ``raise_by`` names who may RAISE the limit (kittrial-5bb.302): the owner's account
+        or a superuser, on the My agents page. An agent can only lower it itself, so a
+        client that follows the server shows the same names and page the refusal sentence
+        does.
         """
-        from claim_limit import default_limit
+        from claim_limit import RAISE_BY, default_limit
         attention = attention or {}
         counts = attention.get('counts') or {}
         limit = default_limit(agent)
@@ -6911,7 +6951,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         complete = not (attention.get('own_tasks_truncated') or counts.get('read_errors'))
         return {'limit': limit, 'held': held,
                 'available': max(0, limit - held) if complete else 0,
-                'counts_task': counts.get('in_progress')}
+                'counts_task': counts.get('in_progress'),
+                'raise_by': RAISE_BY}
 
     @staticmethod
     def _agent_attention_view(agent, attention=None):

@@ -389,6 +389,14 @@ class Client:
         return self.request('POST', '%s/%s/credentials/%s/extend' %
                             (stem, quote(agent_id, safe=''), quote(credential_id, safe='')), {}, key=key)
 
+    def set_my_claim_limit(self, value, key=None):
+        """Lower the CALLING agent's own claim limit (``PATCH /v1/agents/me``).
+
+        The caller must authenticate as the agent itself; ``value`` is a whole number
+        from 1 up to the limit that agent holds now. Raising it is the owner's move.
+        """
+        return self.request('PATCH', '/v1/agents/me', {'claim_limit': value}, key=key)
+
     # -- worker credentials ----------------------------------------------------
     def issue_credential(self, project, label=None, scopes=None, actor=None, key=None):
         return self.request('POST', '/v1/projects/%s/worker-credentials' % quote(project, safe=''),
@@ -547,6 +555,12 @@ def _build_parser():
                        help='environment variable holding the password (default ORCHESTRA_PASSWORD)')
     sub.add_parser('logout', help='revoke the current session')
     sub.add_parser('whoami', help='show the authenticated principal')
+    mine = sub.add_parser('my-claim-limit',
+                          help="lower the calling agent's own claim limit")
+    mine.add_argument('--claim-limit', type=int, required=True,
+                      help='the new limit: a whole number from 1 up to the current one')
+    mine.add_argument('--idempotency-key',
+                      help='reuse exactly this key and request after an uncertain result')
     slot = sub.add_parser('merge-slot', help='read or coordinate the project merge slot')
     slot.add_argument('project')
     slot.add_argument('operation', choices=('read', 'acquire', 'release', 'force-release', 'create'))
@@ -614,6 +628,10 @@ def main(argv=None):
             return 0
         if args.command == 'whoami':
             print(json.dumps(client.whoami(), indent=2))
+            return 0
+        if args.command == 'my-claim-limit':
+            print(json.dumps(client.set_my_claim_limit(args.claim_limit,
+                                                       key=args.idempotency_key), indent=2))
             return 0
         if args.command == 'assignment-roster':
             print(json.dumps(client.assignment_roster(args.project,args.limit,args.cursor),indent=2))

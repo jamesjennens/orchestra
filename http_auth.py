@@ -47,7 +47,7 @@ import time
 from pathlib import Path
 
 import claim_limit
-from http_authority import (ALL_CAPABILITIES, CAP_ACCOUNTS_ADMIN, CAP_AGENTS, CAP_APPROVE,
+from http_authority import (ALL_CAPABILITIES, CAP_ACCOUNTS_ADMIN, CAP_AGENT_SELF, CAP_AGENTS, CAP_APPROVE,
                             CAP_CHECKPOINTS, CAP_FEEDBACK, CAP_PROJECT_ADMIN, CAP_PROPOSALS,
                             CAP_PROJECT_CREATE, CAP_PROJECT_HOST_CREATE, CAP_READ, CAP_REVIEWS, CAP_TASKS,
                             CAP_COORDINATE, coordinator_grant,
@@ -186,8 +186,8 @@ def unauthenticated(message='Authentication required'):
     return HttpError(401, 'unauthenticated', message)
 
 
-def forbidden(message='Not permitted'):
-    return HttpError(403, 'forbidden', message)
+def forbidden(message='Not permitted', detail=None):
+    return HttpError(403, 'forbidden', message, detail)
 
 
 def not_found(message='Not found'):
@@ -3468,6 +3468,42 @@ class Service:
                 self._revoke_agent_credentials(agent)
             self.store.save()
             return self.agent_view(agent, principal)
+
+    def lower_own_claim_limit(self, principal, value):
+        """An agent credential lowers the claim limit on its OWN record (kittrial-5bb.302).
+
+        Lowering only: ``value`` must be a whole number from 1 up to the CURRENT effective
+        limit. Raising it stays the owner's or a superuser's move, refused with a sentence
+        that names both and the My agents page. The caller is answered its own record plus
+        ``old_limit`` and ``new_limit``, so the route can record who changed what. The
+        identity is the credential's own agent; no target id is taken, so this cannot
+        reach another agent's record.
+        """
+        if principal is None or principal.via != 'credential' or not principal.agent_id:
+            raise forbidden('An agent credential is required to change its own claim limit')
+        with self.store.lock:
+            self._refresh_authority(principal)
+            agent = self._agent(principal.agent_id)
+            current = claim_limit.default_limit(agent)
+            try:
+                wanted = claim_limit.validate_limit(value)
+            except ValueError as error:
+                raise invalid(str(error)) from None
+            if wanted is None:
+                # The owner's route clears a value back to the default; on the agent's own
+                # route the body must be the number it will hold, never an absence.
+                raise invalid('claim_limit: expected a whole number from %d to %d'
+                              % (claim_limit.LIMIT_MIN, current))
+            if wanted > current:
+                raise forbidden(claim_limit.raise_refusal(current, wanted),
+                                {'claim_limit': current, 'requested': wanted,
+                                 'raise_by': claim_limit.RAISE_BY})
+            agent['claim_limit'] = wanted
+            self.store.save()
+            return {'operation': 'agents.claim_limit.lower',
+                    'agent': self.agent_view(agent, principal),
+                    'old_limit': current, 'new_limit': wanted,
+                    'raise_by': claim_limit.RAISE_BY}
 
     def disable_agent(self, principal, agent_id):
         """Disable an agent and revoke every credential it holds, immediately."""
