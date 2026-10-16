@@ -52,7 +52,7 @@ class SweepTemporariesTests(unittest.TestCase):
                 'record.json.tmp',                               # the private (mode=) form
                 'record.json.tmp-12-0123456789abcdef',           # younger than the bound
                 'record.json.tmp-x-0123456789abcdef',            # not a pid
-                'record.json.tmp-12-0123456789ABCDEF',           # not lower-case hex
+                'record.json.tmp-13-0123456789ABCDEF',           # not lower-case hex
                 'record.json.tmp-12-0123456789abcde',            # 15 hex digits
                 '.tmp-1-0123456789abcdef',                       # no file name before the mark
                 'record.json.tmp-12-0123456789abcdef.extra')     # trailing text
