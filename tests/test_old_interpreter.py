@@ -39,8 +39,8 @@ RUN_UNDER_3_6 = ('ssh_forced_command.py', 'tools/office_release.py')
 STARTED_UNDER_3_6 = ('activity.py', 'bootstrap.py', 'export_requirements.py', 'publish_brd.py', 'requirement_impact.py',
                      'requirements.py')
 #: Library-only modules: imported by programs, never run as one. No ``__main__`` block.
-#: Four of them carry a shebang anyway (capability_verification.py, http_auth.py, http_authority.py,
-#: proposal_records.py) — a library can be copied beside a program — so only the ``__main__`` block is required.
+#: Five of them carry a shebang anyway (capability_verification.py, http_auth.py, http_authority.py,
+#: proposal_records.py, waiting.py) — a library can be copied beside a program — so only the ``__main__`` block is required.
 MODULES = ('actor_names.py', 'agent_prompts.py', 'artifacts.py', 'bd_refusals.py', 'briefing.py',
            'capability_misses.py', 'capability_records.py', 'capability_verification.py', 'credential_store.py',
            'endpoint_process.py', 'feedback.py', 'field_limits.py', 'guidance.py', 'handoff.py', 'host_reads.py', 'http_auth.py', 'http_authority.py',
@@ -48,7 +48,7 @@ MODULES = ('actor_names.py', 'agent_prompts.py', 'artifacts.py', 'bd_refusals.py
            'project_coordination.py', 'project_creation.py', 'project_setup.py', 'proposal_records.py', 'raw_lifecycle.py', 'record_json.py', 'recovery.py',
            'reference_records.py', 'render.py', 'requirement_governance.py', 'requirement_http.py',
            'requirement_owner_records.py', 'requirement_terminal.py', 'reserved_comments.py', 'review_recommendations.py',
-           'review_state.py', 'review_workflow.py', 'sessions.py', 'task_assignment.py', 'version.py', 'web_lifecycle.py', 'web_lifecycle_marks.py', 'web_merge_slot.py', 'work.py')
+           'review_state.py', 'review_workflow.py', 'sessions.py', 'task_assignment.py', 'version.py', 'waiting.py', 'web_lifecycle.py', 'web_lifecycle_marks.py', 'web_merge_slot.py', 'work.py')
 
 AS_VERSION = """
 import collections, runpy, sys

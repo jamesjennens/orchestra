@@ -40,11 +40,13 @@ fields of the move rows only. Ages and read times are deliberately NOT in it: a 
 moving is not a change, or every poll would wake the model. ``--since FINGERPRINT``
 sets the state the caller already saw, so a restart that finds the same state blocks
 instead of returning the same rows twice.
+
+It is a library, imported by the client (``client.py wait``) and by the endpoint's one
+read; it has no ``__main__`` block and is never started as a program.
 """
 import argparse
 import hashlib
 import json
-import sys
 import time
 
 #: The output schema. Additive fields may be added to it; a reader that does not know
@@ -354,12 +356,3 @@ def run_wait(read, since=None, timeout=None, interval=DEFAULT_INTERVAL,
         if nap <= 0:
             return EXIT_TIMEOUT, dict(view, polls=polls, timed_out=True)
         sleep(nap)
-
-
-def main(argv=None):
-    """``python waiting.py --help`` is not a thing; the module is a library."""
-    raise SystemExit('waiting.py is a library: client.py wait runs it')
-
-
-if __name__ == '__main__':
-    main(sys.argv[1:])
