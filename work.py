@@ -87,20 +87,32 @@ def drop_internal_from_ready(rows):
     return shown
 
 
-def open_dependency_ids(row, rows):
+#: The dependency types that block a claim. ``parent-child`` and ``related`` do not
+#: (kittrial-5bb.293 item 3b: only the blocking type blocks).
+BLOCKING_DEPENDENCY_TYPES = frozenset({'blocks', 'blocked-by', 'depends'})
+
+
+def dependency_index(rows):
+    """One id -> row map for a snapshot, so per-row checks do not rebuild it."""
+    return {r.get('id'): r for r in rows or [] if isinstance(r, dict) and r.get('id')}
+
+
+def open_dependency_ids(row, rows, index=None):
     """The ids of ``row``'s dependencies whose task is not closed (kittrial-5bb.293).
 
     A bd dependency (``bd dep``) whose other end is still open blocks the task: it
-    must not look claimable. ``parent-child`` is not a block. ``rows`` is the snapshot
-    the caller already holds; a dependency whose task is missing from it is unknown
-    and is NOT counted as open (the claim can still be refused atomically).
+    must not look claimable. Only the blocking types block (kittrial-5bb.293 item 3b):
+    ``parent-child`` and ``related`` do not. ``rows`` is the snapshot the caller
+    already holds; ``index`` is its :func:`dependency_index` (built once per snapshot,
+    item 2a). A dependency whose task is missing from the snapshot is unknown and is
+    NOT counted as open (the claim can still be refused atomically).
     """
     if not isinstance(row, dict):
         return []
-    by_id = {r.get('id'): r for r in rows or [] if isinstance(r, dict) and r.get('id')}
+    by_id = index if index is not None else dependency_index(rows)
     open_ids = []
     for dep in row.get('dependencies') or []:
-        if not isinstance(dep, dict) or dep.get('type') == 'parent-child':
+        if not isinstance(dep, dict) or dep.get('type') not in BLOCKING_DEPENDENCY_TYPES:
             continue
         other = by_id.get(dep.get('depends_on_id'))
         if isinstance(other, dict) and other.get('status') != 'closed':
@@ -791,6 +803,7 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
     from reserved_comments import is_record_anchor
     from review_workflow import author_key
     from coordination import is_merge_slot
+    dep_index=dependency_index(rows)
     malformed_named=[]
     unparseable_count=0
     for row in rows:
@@ -994,7 +1007,7 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
         # The one bounded claimability answer for this row (kittrial-5bb.6 deliverable b).
         # It is computed before the move because next_actor needs it: an unassigned,
         # undelivered row may name `anyone` only when somebody could actually take it.
-        row_open_deps=open_dependency_ids(row,rows)
+        row_open_deps=open_dependency_ids(row,rows,index=dep_index)
         row_claimable=claimable(row.get('issue_type'),row.get('status'),row.get('assignee'),
                                 contribution.get('comment_id'),state,
                                 record_anchor=is_record_anchor(row),labels=row.get('labels'),

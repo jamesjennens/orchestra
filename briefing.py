@@ -122,14 +122,12 @@ def entry_digests(data):
 def activity_cursor(data):
     # entry_digests is derived entirely from entries, not extra activity. Keep
     # the released hash shape so staged writes remain fresh on older readers.
-    compatible={k:v for k,v in data.items() if k!='entry_digests'}
-    recorded={'v':1,'kind':'activity','project':data['project'],'task':data['task'],'sha256':content_hash(compatible)}
-    # kittrial-5bb.293 item 2: the field lengths ride in the cursor so a later read
-    # can say what changed. Older cursors simply carry none and the reader says only
-    # that the fields changed.
-    if isinstance(data.get('field_sizes'),dict):
-        recorded['fields']=dict(data['field_sizes'])
-    return token(recorded)
+    # kittrial-5bb.293 item 2 (rev2): field_sizes is NOT part of the hashed snapshot
+    # and NOT in the cursor token -- a cursor written by 0133e8e reads fresh on this
+    # kit and the other way round. The lengths ride beside the cursor (the brief's
+    # field_changes carries them); state_sha256 already covers the three fields.
+    compatible={k:v for k,v in data.items() if k not in ('entry_digests','field_sizes')}
+    return token({'v':1,'kind':'activity','project':data['project'],'task':data['task'],'sha256':content_hash(compatible)})
 
 #: A project name as ``admin.validate_name`` accepts it.
 PROJECT_NAME=re.compile(r'[a-z][a-z0-9]{1,23}')
@@ -790,7 +788,7 @@ def retained_provenance(state,upto=None):
     return dict(latest,digests=exact,older=trunc,verifiable=len(exact)+len(trunc),
                 complete=not trunc and len(exact)>=latest['covered'])
 
-def field_changes_since(recorded_fields, current_fields):
+def field_changes_since(recorded_fields, current_fields, only_if_unexplained=False):
     """What changed in title/description/acceptance since a checkpoint (kittrial-5bb.293).
 
     ``recorded_fields`` is the ``fields`` map a checkpoint's activity cursor carried
@@ -801,9 +799,14 @@ def field_changes_since(recorded_fields, current_fields):
     if not isinstance(current_fields, dict):
         return []
     if not isinstance(recorded_fields, dict):
-        return [{'field': name, 'old_length': None, 'new_length': current_fields.get(name)}
-                for name in ('title', 'description', 'acceptance_criteria')
-                if current_fields.get(name) is not None]
+        # An older cursor carries no lengths: the caller reports a change ONLY when
+        # nothing else explains the stale flag, and then without old_length (rev2).
+        if not only_if_unexplained:
+            return []
+        # Never all three fields with old_length None: one summary entry instead
+        # (kittrial-5bb.293 item 2 rev2).
+        return [{'field': 'task_fields', 'old_length': None, 'new_length': None,
+                 'note': 'The task fields changed after this checkpoint; their lengths were not recorded.'}]
     changed = []
     for name in ('title', 'description', 'acceptance_criteria'):
         old_len = recorded_fields.get(name)
@@ -985,6 +988,13 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
             recorded_fields=(recorded or {}).get('fields') if isinstance(recorded,dict) else None
             changes=field_changes_since(recorded_fields, excluded.get('field_sizes'))
             newer=newer_activity_summary(excluded,retained_provenance(state),c.get('created_at'),context[0],dispositions,direction_data,counted,directions_off_reason,field_changes=changes)
+            if not recorded_fields and not changes and not newer.get('entries'):
+                # An older cursor carries no lengths and no entry explains the stale
+                # flag: the change is in the task fields (state_sha256). Report that
+                # without old_length, never all three fields with old_length None
+                # (kittrial-5bb.293 item 2 rev2).
+                changes=field_changes_since(None, excluded.get('field_sizes'), only_if_unexplained=True)
+                newer['field_changes']=changes
             if review['review_state'] not in review_next:
                 dirs=newer.get('unresolved_directions')
                 dir_note='' if not dirs else '; '+str(dirs['total'])+' outstanding direction(s) not yet resolved/superseded'

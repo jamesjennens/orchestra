@@ -28,7 +28,7 @@ import test_review_state as shared
 import test_work_queue
 import work
 from requirements import canonical_bytes
-from test_briefing import PROJECT, TASK, append_checkpoint, checkpoint, rows
+from test_briefing import PROJECT, TASK, append_checkpoint, checkpoint, rows, save_cp
 from test_http_agents import AgentHarness
 from test_lifecycle import NativeStore, payload, scope
 
@@ -627,16 +627,21 @@ class WorkerFeedbackBriefTests(unittest.TestCase):
     def test_a_field_change_after_the_checkpoint_is_newer_activity(self):
         data = rows()
         data[0]['description'] = 'original description'
-        append_checkpoint(data, 'cp-1', checkpoint(data))
+        # A checkpoint with provenance, so the comment itself is incorporated and the
+        # only thing left is the field change (kittrial-5bb.293 item 2 rev2).
+        save_cp(data, 'cp-1')
         # Change the description: it must appear as newer activity with the lengths.
         data[0]['description'] = 'a much longer replacement description'
         _review, brief, _item = surfaces(data)
         self.assertTrue((brief.get('checkpoint') or {}).get('newer_activity'), brief.get('checkpoint'))
         changes = (brief.get('newer') or {}).get('field_changes') or []
-        described = [c for c in changes if c.get('field') == 'description']
-        self.assertTrue(described, changes)
-        self.assertEqual(described[0]['new_length'], len('a much longer replacement description'))
-        self.assertEqual(described[0]['old_length'], len('original description'))
+        # The checkpoint's cursor is written by this kit and carries no lengths
+        # (cursor compatibility): one summary entry, never all three fields with
+        # old_length None (kittrial-5bb.293 item 2 rev2).
+        self.assertEqual(len(changes), 1, changes)
+        self.assertEqual(changes[0]['field'], 'task_fields')
+        self.assertIsNone(changes[0]['old_length'])
+        self.assertIn('changed', changes[0].get('note') or '')
 
 
 class QueueItemClaimableCompatTests(unittest.TestCase):
@@ -762,6 +767,23 @@ class ClaimableHttpTests(AgentHarness):
         data = self.next_actions(self.alex_agent[1])
         self.assertEqual(data['attention']['counts']['claimable'], 1)  # only the opener
         self.assertEqual([a['task'] for a in data['next_actions']], [opener])
+
+    def test_only_the_blocking_dependency_type_blocks(self):
+        """kittrial-5bb.293 item 3b: a `related` dependency must not block a claim."""
+        task = self.new('related to something open')
+        opener = self.new('open neighbour')
+        self.backend.state['tasks'][task]['dependencies'] = [
+            {'depends_on_id': opener, 'type': 'related'}]
+        ok = self.claim(self.alex_agent[1], task)
+        self.assertEqual(200, ok.status, ok.data)
+
+    def test_a_parent_child_dependency_does_not_block_the_task(self):
+        task = self.new('child work')
+        parent = self.new('open parent')
+        self.backend.state['tasks'][task]['dependencies'] = [
+            {'depends_on_id': parent, 'type': 'parent-child'}]
+        ok = self.claim(self.alex_agent[1], task)
+        self.assertEqual(200, ok.status, ok.data)
 
     def test_a_closed_dependency_does_not_block_the_task(self):
         blocked = self.new('blocked work')

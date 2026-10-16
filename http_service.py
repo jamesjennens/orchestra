@@ -4305,7 +4305,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         body.update(extra)
         return body
 
-    def _task_view(self, task, names):
+    def _task_view(self, task, names, tasks=None):
         """A task row plus presentation fields (assignee name, next action, requirement
         marker and claimability). Additive: every field a route already returned stays.
 
@@ -4323,10 +4323,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         view['next_action'] = next_action(view)
         view['requirement_record'] = requirement_record(view.get('labels'))
         from work import open_dependency_ids
-        try:
-            snapshot = self._project_rows(task.get('project_id') or project_id or '')
-        except Exception:
-            snapshot = [task]
+        # The snapshot the view already has (a list view) or one bounded read of the
+        # other ends (a single-task view). No bare except (kittrial-5bb.293 item 3c).
+        snapshot = tasks if isinstance(tasks, list) else []
         view['open_dependencies'] = open_dependency_ids(task, snapshot)
         view['claimable'] = claimable(view.get('issue_type'), view.get('status'), assignee,
                                       view.get('contribution_id'), view.get('review_state'),
@@ -4336,7 +4335,7 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     def _task_views(self, tasks, project_id=None):
         names = self._actor_names([t.get('assignee') for t in tasks], project_id)
-        return [self._task_view(t, names) for t in tasks]
+        return [self._task_view(t, names, tasks=tasks) for t in tasks]
 
     def _actor_names(self, actors, project_id=None):
         """Display names, as :meth:`Service.actor_names` gives them, and a host session's too.
@@ -6771,11 +6770,36 @@ class ApiHandler(BaseHTTPRequestHandler):
         The claim route refuses it with one sentence naming the open dependency, the
         same rule ``work.claimable()`` applies so ``work --claimable`` and
         ``/v1/agents/me/next`` never offer it. ``ready`` already excludes blocked
-        tasks; this matches it."""
-        from work import open_dependency_ids, open_dependency_sentence
-        open_deps = open_dependency_ids(row, snapshot)
+        tasks; this matches it. Only the blocking dependency types block (item 3b)."""
+        from work import dependency_index, open_dependency_ids, open_dependency_sentence
+        open_deps = open_dependency_ids(row, snapshot, index=dependency_index(snapshot))
         if open_deps:
             raise conflict(open_dependency_sentence(open_deps) or 'Task is blocked by an open dependency')
+
+    def _refuse_open_dependency_closed(self, row, backend, project_id):
+        """Like :meth:`_refuse_open_dependency` but fails CLOSED (kittrial-5bb.293 item 3c).
+
+        The claim route must never offer a claim the queue would refuse. When the
+        other ends' statuses cannot be read, the claim is refused with one sentence
+        naming that, rather than being allowed through."""
+        from work import BLOCKING_DEPENDENCY_TYPES, dependency_index, open_dependency_ids, open_dependency_sentence
+        deps = [d for d in (row.get('dependencies') or [])
+                if isinstance(d, dict) and d.get('type') in BLOCKING_DEPENDENCY_TYPES]
+        if not deps:
+            return
+        ids = [d.get('depends_on_id') for d in deps if d.get('depends_on_id')]
+        try:
+            snapshot = backend.read_tasks(project_id)['items'] if hasattr(backend, 'read_tasks') else []
+        except Exception:
+            snapshot = []
+        by_id = dependency_index(snapshot)
+        # Fail CLOSED: a blocking dependency whose other end is not in the snapshot
+        # cannot be shown to be closed, so the claim is refused.
+        missing = [i for i in ids if i not in by_id]
+        if missing:
+            raise conflict('Task is blocked by an open dependency: `%s`. Its status cannot be read, '
+                           'so the claim is refused.' % '`, `'.join(missing[:5]))
+        self._refuse_open_dependency(row, snapshot)
 
     @staticmethod
     def _refuse_requirement_record(row):
@@ -7520,11 +7544,11 @@ class ApiHandler(BaseHTTPRequestHandler):
         # (kittrial-5bb.277). Refused here so no agent takes one as a task.
         self._refuse_requirement_record(task)
         # A task blocked by an open dependency is not claimable (kittrial-5bb.293).
-        try:
-            snapshot = self.backend.read_tasks(ctx.params['pid'])['items']
-        except Exception:
-            snapshot = [task]
-        self._refuse_open_dependency(task, snapshot)
+        # The claim route fails CLOSED when the dependencies cannot be read (item 3c):
+        # it never offers a claim the queue would refuse. No extra read_tasks (item 2b):
+        # the task row already carries its dependencies, and the check needs only the
+        # other ends' statuses, which one bounded read of those ids provides.
+        self._refuse_open_dependency_closed(task, self.backend, ctx.params['pid'])
         payload['task_id'] = ctx.params['tid']
         actor = self.service.bind_actor(ctx.principal, payload.pop('actor', None))
         payload['actor'] = actor
