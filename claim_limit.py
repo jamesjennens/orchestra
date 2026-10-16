@@ -46,6 +46,22 @@ ACTIVE_REVIEW_STATES = (None, 'none', 'changes-requested')
 #: states above. ``closed`` is never held work, whatever its review state says.
 ACTIVE_STATUSES = ('open', 'in_progress')
 
+#: Who may RAISE a limit above the value its agent set for itself (kittrial-5bb.302):
+#: the owner's account or a superuser, on the My agents page. Named here so the refusal
+#: sentence and the read views say the same thing, and an agent can tell its owner where
+#: the setting is raised.
+RAISE_BY = "The owner's account or a superuser, on the My agents page"
+
+
+def raise_refusal(current, requested):
+    """The sentence a refused raise carries (kittrial-5bb.302).
+
+    An agent may only LOWER its own limit, so a value above the current one is refused
+    with who may raise it and where, not only that the value is too high.
+    """
+    return ('An agent may only lower its own claim limit: %d is above the current %d. '
+            '%s raises it.' % (requested, current, RAISE_BY))
+
 
 def default_limit(agent=None):
     """The effective limit for one agent record, as a nonnegative integer.

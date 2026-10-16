@@ -341,6 +341,11 @@ GRANT_LIMIT_DEFAULT = 5
 #: authenticated session may manage the agents it owns, while no worker/agent
 #: credential ever holds it (an agent cannot create or widen another identity).
 CAP_AGENTS = 'agents.manage'
+#: An agent credential's authority over its OWN record (kittrial-5bb.302): it may lower
+#: its own claim limit, and nothing else. Deliberately not project-scoped and never held
+#: by a session or a worker credential: the route that needs it takes no target agent id
+#: at all, so it can only ever reach the caller's own record.
+CAP_AGENT_SELF = 'agent.self'
 
 ROLES = ('viewer', 'contributor', 'coordinator', 'owner')
 RANK = {'viewer': 0, 'contributor': 1, 'coordinator': 2, 'owner': 3}
@@ -667,6 +672,18 @@ def decide(state, request, *, now=None, allow_self_user=None):
         if capability in (CAP_ACCOUNTS_ADMIN, CAP_PROJECT_CREATE, CAP_AGENTS, CAP_PROJECT_HOST_CREATE):
             raise deny(403, 'forbidden',
                        'A worker credential cannot perform administrative operations')
+        if capability == CAP_AGENT_SELF:
+            # An agent credential's authority over its OWN record only (kittrial-5bb.302).
+            # It is not project-scoped: the route it authorizes takes no project and no
+            # target agent id, so this can never reach another agent's record. A worker
+            # credential (no agent identity) and every session are refused.
+            if not credential.get('agent_id'):
+                raise deny(403, 'forbidden',
+                           'An agent credential is required to change its own claim limit')
+            agent = state.get('agents', {}).get(credential.get('agent_id'))
+            if not isinstance(agent, dict) or not agent.get('enabled'):
+                raise deny(401, 'unauthenticated', 'Agent is disabled')
+            return {'role': 'agent'}
         if credential.get('agent_id'):
             # An agent credential is a personal identity: it is refused the moment the
             # agent record is gone or disabled, and its project reach is the agent's
@@ -697,6 +714,11 @@ def decide(state, request, *, now=None, allow_self_user=None):
     if not isinstance(user, dict) or user.get('disabled'):
         raise deny(401, 'unauthenticated', 'Authentication is no longer valid')
 
+    if capability == CAP_AGENT_SELF:
+        # Only an agent credential holds this (kittrial-5bb.302). A person acts on an
+        # agent as its owner through PATCH /v1/agents/{id}, not as the agent itself.
+        raise deny(403, 'forbidden',
+                   'An agent credential is required to change its own claim limit')
     if allow_self_user is not None and user_id == allow_self_user:
         return {'role': 'self'}
     if capability == CAP_ACCOUNTS_ADMIN:
