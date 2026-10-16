@@ -616,7 +616,16 @@ def apply_native(p, actor, run, project, operators=None, coordinator_writes=Fals
         from review_workflow import project as review_project, integration_hold_sentence, CoordinatorRuleRefusal
         rows=read_event_rows(run)
         try: issue=task_row(rows,p['task'])
-        except ValueError: issue=None
+        except ValueError as error:
+            # kittrial-5bb.297 review item 4c: a malformed row used to give issue=None
+            # and the hold gate passed - a chain this row carries cannot be read, so
+            # the acquisition is refused until an operator repairs the row. A row
+            # that is merely missing or duplicated keeps its later handling.
+            if 'is malformed' in str(error):
+                raise CoordinatorRuleRefusal('merge-acquire refused for %s: %s. The merge slot is '
+                                             'not taken until an operator repairs the row.'
+                                             %(p['task'],str(error)[:200])) from error
+            issue=None
         require_unheld_merge_task(issue, p['task'], operators, project)
     context_path=project/'.merge-context.json'
     if op=='merge-create':

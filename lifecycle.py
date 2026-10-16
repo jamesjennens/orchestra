@@ -1023,10 +1023,24 @@ def unreadable_hold_chain(row, operators=None, journal=None):
     from coordination import is_merge_slot
     if row.get('issue_type') in ('event','gate') or is_merge_slot(row):return None
     from review_workflow import PREFIX, project
+    # The FAMILY, not the exact 'Kind: contribution-review-v1': a chain comment of a
+    # FUTURE version this kit cannot parse must read as an unreadable chain (a hold
+    # may hide in it), never as 'no chain at all' (kittrial-5bb.297 review item 4b).
+    family=PREFIX[:PREFIX.index('-v')]
     comments=row.get('comments') or []
-    if not any(isinstance(comment,dict) and isinstance(comment.get('text'),str)
-               and comment['text'].startswith(PREFIX) for comment in comments):
+    chain_comments=[comment for comment in comments
+                    if isinstance(comment,dict) and isinstance(comment.get('text'),str)
+                    and comment['text'].startswith(family)]
+    if not chain_comments:
         return None                                     # no chain at all: no holds to hide
+    if any(not comment['text'].startswith(PREFIX) for comment in chain_comments):
+        # A chain record of a version this kit does not know (review item 4b): the
+        # chain reader keys on the exact version and never sees it, so a hold may
+        # hide in it - unreadable, never 'no chain at all'.
+        return ('the review chain of %s holds a record of a contribution-review version this kit '
+                'cannot read, so a hold it may carry cannot be seen; an operator repairs the chain '
+                '(voids reconcile it), and until then the task is not integration-ready'
+                %row.get('id'))
     try:
         project(row,operators,journal)
         return None
@@ -2465,6 +2479,19 @@ def main():
             # caller-side journal. A dry run stays offline and views reverts locally
             # (pass --journal PROJECT for a host-accurate dry run).
             endpoint_reverts=None
+            # kittrial-5bb.297 review item 'operators-on-every-surface': the offline
+            # dry run consults the SAME configured operators the canonical readers
+            # use (from the config's runtime root), so an operator void that repairs
+            # an unreadable hold chain is seen here too. A config without a readable
+            # local root (a remote transport) degrades to no operators with a
+            # warning, exactly as an unreadable setting degrades elsewhere.
+            selection_operators=None
+            try:
+                from admin import configured_operators
+                selection_operators=configured_operators(Path(config['root']))
+            except Exception as exc:
+                warnings.append('operator voids not applied: the configured operators could not be '
+                                'read from %s (%s)'%(config.get('root'),str(exc)[:80]))
             if not a.dry_run:
                 query=dict(data,dimension=RELEASE_QUERY,targets=[],live_verified=False,
                            operation_id=(data['operation_id'][:RELEASE_OPERATION_MAX-6]+'/query'))
@@ -2492,6 +2519,7 @@ def main():
             if data['rollback']:
                 selection=rollback_selection(rows,data['scope'],is_ancestor,
                                              reverted=endpoint_reverts,journal=journal,
+                                             operators=selection_operators,
                                              current_commits=current_contribution_commits(rows))
                 targets=selection['targets'];supersede=list(selection['supersede'])
                 # The scope-level list of what the rollback moves past (rev4 item 2):
@@ -2506,6 +2534,7 @@ def main():
                                             subset=set(subset) if subset else None,
                                             current_commits=current_contribution_commits(rows),
                                             live_verified=data['live_verified'],journal=journal,
+                                            operators=selection_operators,
                                             reverted=endpoint_reverts)
                 targets=selection['targets'];supersede=list(selection['supersede'])
                 supersede_scopes=[]

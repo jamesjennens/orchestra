@@ -1739,15 +1739,21 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                     rows=read_event_rows(runner)
                     issue=next((row for row in rows if row.get('id')==payload['task']),None)
                     try:
+                        # kittrial-5bb.297 review item 'operators-on-every-surface':
+                        # the configured operators ALWAYS, not only when
+                        # independent_approval is on - an operator void that repairs
+                        # the chain must be seen here exactly as the canonical
+                        # readers see it, or the acquire stays refused while the
+                        # coordinate route and the release accept.
                         require_unheld_merge_task(issue,payload['task'],
-                            configured_operators(root) if rules['independent_approval'] else None,path)
+                                                  configured_operators(root),path)
                     except CoordinatorRuleRefusal:
                         denied_status.append(409)
                         raise
             rules=configured_coordinator_rules(root,warnings=run_warnings)
             def slot_effect():
                 result=slot_apply(payload,actor,runner,path,request.get('operation_id'),
-                                  operators=(configured_operators(root) if rules['independent_approval'] else None),
+                                  operators=configured_operators(root),
                                   coordinator_writes=rules['coordinator_writes'],
                                   independent_approval=rules['independent_approval'],
                                   owners=owner_loader(path,'independent_approval'),

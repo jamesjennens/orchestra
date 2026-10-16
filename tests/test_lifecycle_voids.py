@@ -1379,3 +1379,39 @@ class HostCorrectionTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class UnreadableHoldChainAuditTests(unittest.TestCase):
+    """kittrial-5bb.297 review item 'audit-reports-unreadable-chains': the audit's own
+    counted category for tasks whose hold chain cannot be read, with the reason,
+    whether or not the task has lifecycle events."""
+
+    def test_a_task_with_an_unreadable_chain_and_no_events_is_its_own_category(self):
+        import review_workflow as reviews
+        broken = dict(id='p-quiet', issue_type='task', title='quiet task', status='open',
+                      assignee='worker', comments=[], labels=[])
+        broken['comments'] = [dict(id='1', text=reviews.PREFIX + '{"broken": not json',
+                                   author='worker', created_at='2026-09-16T00:00:00Z')]
+        page = voids.audit(rows() + [broken], operators=['op'])
+        self.assertEqual(page['unreadable_hold_chain_count'], 1)
+        entry = page['unreadable_hold_chains'][0]
+        self.assertEqual(entry['task'], 'p-quiet')
+        self.assertIn('cannot be read', entry['reason'])
+        self.assertIn('p-quiet', entry['reason'])
+
+    def test_a_readable_chain_and_a_chain_future_version_and_no_chain(self):
+        # A task with no chain comments at all is not flagged, and neither is a
+        # readable one. A comment of a FUTURE chain version this kit cannot parse is
+        # flagged (review item 4b): it reads as an unreadable chain, never as 'no
+        # chain'.
+        import review_workflow as reviews
+        none_at_all = dict(id='p-none', issue_type='task', title='none', status='open',
+                           assignee='worker', comments=[], labels=[])
+        future = dict(id='p-future', issue_type='task', title='future', status='open',
+                      assignee='worker', comments=[], labels=[])
+        family = reviews.PREFIX[:reviews.PREFIX.index('-v')]
+        future['comments'] = [dict(id='1', text=family + '-v9\n{"anything',
+                                   author='worker', created_at='2026-09-16T00:00:00Z')]
+        page = voids.audit(rows() + [none_at_all, future], operators=['op'])
+        self.assertEqual(page['unreadable_hold_chain_count'], 1)
+        self.assertEqual(page['unreadable_hold_chains'][0]['task'], 'p-future')

@@ -1039,6 +1039,16 @@ def audit(rows, operators=None, owners=None, limit=50, offset=0):
     unclassifiable = sum(1 for row in native_events if row.get('id') not in classified)
     ordered = sorted(events, key=lambda e: (e['task'], e['dimension'],
                      e['order'] if e['order'] is not None else -1, e['id']))
+    # kittrial-5bb.297 review item 'audit-reports-unreadable-chains': a task whose
+    # hold chain cannot be read is its own counted category here, whether or not it
+    # has lifecycle events - the per-event reason below only reaches tasks that
+    # recorded facts, and the release dry run's skipped list only covers one
+    # environment's candidates. Same reason, same read (the deployment operators).
+    unreadable_chains = []
+    for row in issues.values():
+        reason = lifecycle.unreadable_hold_chain(row, operators)
+        if reason:
+            unreadable_chains.append(dict(task=row['id'], reason=reason))
     corrections=correction_audit(correction,operators)
     page_total=max(len(ordered),len(corrections))
     if offset > page_total:
@@ -1123,6 +1133,8 @@ def audit(rows, operators=None, owners=None, limit=50, offset=0):
         unclassifiable_total+=bool(item.get('classification_reason'))
         if offset<=index<offset+limit:items.append(item)
     return dict(items=items, total=len(ordered), offset=offset, limit=limit,
+                unreadable_hold_chains=unreadable_chains,
+                unreadable_hold_chain_count=len(unreadable_chains),
                 omitted_before=min(offset,len(ordered)), omitted_after=max(0, len(ordered) - offset - len(items)),
                 next_offset=offset+limit if offset+limit<page_total else None,
                 page_total=page_total,corrections=corrections[offset:offset+limit],

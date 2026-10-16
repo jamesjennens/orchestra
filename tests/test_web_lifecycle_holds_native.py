@@ -229,9 +229,9 @@ class NativeHoldWebTests(RulesHelpers, unittest.TestCase):
         task = self.task('Unreadable hold web', assignee='other-author')
         contribution = json.loads(self.contribute(task, 'other-author')['stdout'])['comment_id']
         approval = json.loads(self.approve(task, 'ops', contribution)['stdout'])['comment_id']
-        self.post_review(task, 'ops', dict(
+        hold_id = json.loads(self.post_review(task, 'ops', dict(
             schema_version=1, operation='hold', operation_id='unread-hold', task=task,
-            previous=approval, contribution=contribution, reason='Held before the damage'))
+            previous=approval, contribution=contribution, reason='Held before the damage'))['stdout'])['comment_id']
         # The damage: the kit's own prefix with unparsable bytes, planted raw.
         self.assertEqual(self.r.bd('comments', 'add', task,
                                    rw.PREFIX + '{"broken": not json',
@@ -265,3 +265,53 @@ class NativeHoldWebTests(RulesHelpers, unittest.TestCase):
         slot = harness.request('GET', '/v1/projects/pp/merge-slot', token=token)
         self.assertEqual(200, slot.status, slot.data)
         self.assertTrue(slot.data.get('available'), slot.data)
+        # kittrial-5bb.297 review item 'operators-on-every-surface': ONE operator void
+        # of the broken comment repairs the chain, and every surface sees it - the
+        # configured operators are passed always now, so the web acquire and the
+        # facts agree with the coordinate route instead of staying refused.
+        import recovery
+        from requirements import canonical_bytes
+        broken = next(comment for row_ in self.rows() if row_['id'] == task
+                      for comment in row_.get('comments') or []
+                      if (comment.get('text') or '').startswith(rw.PREFIX)
+                      and '"broken"' in comment['text'])
+        void = dict(schema_version=1, operation='void-record', operation_id='void-broken-web',
+                    task=task, target=broken['id'], target_kind='contribution-review',
+                    target_sha256=recovery.digest(broken['text']), original=broken['text'],
+                    reason='Repairing the damaged record', disposition='void', operator='ops')
+        self.assertEqual(self.r.bd('comments', 'add', task,
+                                   recovery.PREFIX + canonical_bytes(void).decode(),
+                                   actor='ops').returncode, 0)
+        # The chain now READS again - and it reads the hold that was hidden. The
+        # void also stales the approval recorded before it (a repaired history needs
+        # a fresh review), so the full repair is: re-approve, then release the hold.
+        # After that every surface allows.
+        reapproved = json.loads(self.post_review(task, 'ops', dict(
+            schema_version=1, operation='approve', operation_id='unread-reapprove',
+            task=task, previous=hold_id, contribution=contribution,
+            summary='Approved again on the repaired chain'))['stdout'])['comment_id']
+        cleared = self.post_review(task, 'ops', dict(
+            schema_version=1, operation='release-hold', operation_id='unread-release',
+            task=task, previous=reapproved, contribution=contribution, hold=hold_id,
+            reason='Cleared after the repair'))
+        self.assertEqual(cleared['returncode'], 0, cleared)
+        repaired = harness.request('GET', path, token=token)
+        self.assertEqual(200, repaired.status, repaired.data)
+        self.assertNotIn('cannot be read', json.dumps(repaired.data['hold_refusals']))
+        # The integrated fact needs the merge slot held first; the acquisition that
+        # was refused while the chain was unreadable now succeeds.
+        try:
+            acquired = harness.request('POST', '/v1/projects/pp/merge-slot/acquire',
+                                       {'task_id': task, 'target': 'main'},
+                                       token=token, key='unread-slot-2')
+            self.assertEqual(200, acquired.status, acquired.data)
+            self.assertTrue(acquired.data['result']['acquired'], acquired.data)
+            accepted = harness.request('POST', path + '/facts/integrated',
+                                       dict(scope=scope, value='passed',
+                                            evidence=['after the repair'], provenance='performed'),
+                                       token=token, key='unread-fact-2')
+            self.assertEqual(201, accepted.status, accepted.data)
+        finally:
+            # The slot is the project's one; leave it free for the sibling tests.
+            harness.request('POST', '/v1/projects/pp/merge-slot/release', {},
+                            token=token, key='unread-slot-release')
