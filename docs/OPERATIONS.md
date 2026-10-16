@@ -2996,6 +2996,46 @@ If a client times out, inspect the task before retrying a mutation: the write ma
 
 To retire the service, back up first, then `systemctl --user disable --now beads-team.service`. Preserve the runtime until recovery is no longer needed. Remove only the exact unit installed for that deployment and run `systemctl --user daemon-reload`. Linger is an account-wide setting: leave it enabled if other user services need it.
 
+### Leftover atomic temporaries
+
+Most coordination files are written with a temporary file beside the target and one
+`os.replace` (`coordination.atomic`). Since the 2026-10-13 kit a shared writer names its
+temporary uniquely - `<name>.tmp-<pid>-<16 hex>` - so two writers never truncate each
+other's file; a private family (mode 0600) keeps the fixed `<name>.tmp`. A crash between
+the temporary's creation and its rename leaves the temporary behind. Readers that list a
+family by `*.json`, or read one record by its exact path, never see it; the readers that
+enumerate every name are listed below.
+
+Remove the leftovers, older than an hour, from one project's own directory and families:
+
+```sh
+python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime \
+    sweep-temporaries example
+python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime \
+    sweep-temporaries example --dry-run          # name them, remove nothing
+python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime \
+    sweep-temporaries example --min-age-minutes 120
+```
+
+Only a name `coordination.is_temporary` recognizes exactly, only a regular file (a symlink
+or a directory that merely wears the name is left alone) and only one older than the bound;
+each directory it sweeps must be a real directory, so the sweep cannot be pointed outside
+the project. It sweeps the project directory itself (where the single-file records -
+`.sessions.json`, `.merge-context.json`, the guidance pair - leave their temporary) and
+each family subdirectory. `--min-age-minutes` refuses a bound under 5 minutes: a live writer
+renames its temporary within one write, and only an old file is a crash's leftover. The
+command reads no tracker, takes no lock and calls no `bd`, and it rewrites nothing. Deleting
+such a file by hand is equally safe: it is a temporary, never a record.
+
+**Which readers enumerate a family, and what a leftover temporary does to each:**
+
+| Family (reader) | What it does with `<name>.tmp-<pid>-<hex>` |
+| --- | --- |
+| `.lifecycle-voids` (`lifecycle_voids.read_journal`) | Enumerates every name and skips both the fixed `.tmp` and anything `is_temporary` recognizes, so a leftover is ignored and the family stays readable. |
+| `.web-lifecycle-marks` (`web_lifecycle_marks.read_journal`) | Enumerates every name and requires `[a-f0-9]{64}\.json`; ANY other name, a temporary included, makes the whole family read `invalid` (fail-closed). Its writer uses the private `mode=` form, so the unique shape this sweep removes is not produced there; the fixed `<name>.tmp` a cut there can leave is not a shape this sweep removes. |
+| `.coordination-requests`, `.handoffs`, `.handoff-requests`, `.handoff-recoveries`, `.requirement-requests`, `.requirement-backfills`, `.integration-reverts`, `.reference-requests`, `.proposal-requests`, `.capability-requests`, `.open-item-requests`, `.requirement-owner-requests`, `.owner-answers` | Read by one exact path, or listed through `*.json` (a temporary ends in hex, so `*.json` never matches it): a leftover is invisible to every one of them, including `admin.py backup`. |
+| `.history-snapshots` (`briefing.py`) | Read by the exact `<digest>.json` a cursor names; never enumerated. |
+
 ## Repeat validation
 
 Local checks: `python -m unittest discover -s tests -v`.
