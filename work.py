@@ -92,6 +92,20 @@ def drop_internal_from_ready(rows):
 BLOCKING_DEPENDENCY_TYPES = frozenset({'blocks', 'blocked-by', 'depends'})
 
 
+def dependency_ref(dep):
+    """(other_id, type) from one dependency entry, in either native shape.
+
+    ``bd export`` writes ``depends_on_id``/``type``; ``bd show`` writes expanded
+    issues keyed ``id``/``dependency_type`` (kittrial-5bb.293 rev3). Both are
+    accepted so every surface reads the same fact.
+    """
+    if not isinstance(dep, dict):
+        return None, None
+    other = dep.get('depends_on_id') or dep.get('id')
+    kind = dep.get('type') or dep.get('dependency_type')
+    return other, kind
+
+
 def dependency_index(rows):
     """One id -> row map for a snapshot, so per-row checks do not rebuild it."""
     return {r.get('id'): r for r in rows or [] if isinstance(r, dict) and r.get('id')}
@@ -112,11 +126,12 @@ def open_dependency_ids(row, rows, index=None):
     by_id = index if index is not None else dependency_index(rows)
     open_ids = []
     for dep in row.get('dependencies') or []:
-        if not isinstance(dep, dict) or dep.get('type') not in BLOCKING_DEPENDENCY_TYPES:
+        other_id, kind = dependency_ref(dep)
+        if kind not in BLOCKING_DEPENDENCY_TYPES:
             continue
-        other = by_id.get(dep.get('depends_on_id'))
+        other = by_id.get(other_id)
         if isinstance(other, dict) and other.get('status') != 'closed':
-            open_ids.append(str(dep.get('depends_on_id')))
+            open_ids.append(str(other_id))
     return open_ids
 
 

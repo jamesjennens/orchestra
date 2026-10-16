@@ -108,11 +108,12 @@ def snapshot(rows,project,task,exclude=None):
     # checkpoint/snapshot distinguish edited entries and late backdated arrivals
     # that a whole-snapshot hash or timestamp filter cannot separate.
     digests={e['entry_id']:content_hash(e) for e in entries}
-    # kittrial-5bb.293 item 2: the three fields a plan depends on, with their lengths,
-    # so a later read can say what changed after a checkpoint (old and new length).
-    field_sizes={k:len(str(issue.get(k) or '')) for k in ('title','description','acceptance_criteria')}
+    # kittrial-5bb.293 item 2 (rev3): field_sizes is NOT a key in the snapshot data at
+    # all -- the legacy whole-data cursor shape hashes every key, so excluding it in
+    # activity_cursor is not enough. It is computed beside the snapshot (the brief
+    # caller does it); state_sha256 already covers the three fields.
     return {'project':project,'task':task,'state_sha256':content_hash(state),
-            'field_sizes':field_sizes,'entries':entries,'entry_digests':digests}
+            'entries':entries,'entry_digests':digests}
 
 def entry_digests(data):
     """Digests for snapshots predating the embedded entry_digests field."""
@@ -986,14 +987,15 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
             except ValueError:
                 recorded=None
             recorded_fields=(recorded or {}).get('fields') if isinstance(recorded,dict) else None
-            changes=field_changes_since(recorded_fields, excluded.get('field_sizes'))
+            current_sizes={k:len(str(issue.get(k) or '')) for k in ('title','description','acceptance_criteria')}
+            changes=field_changes_since(recorded_fields, current_sizes)
             newer=newer_activity_summary(excluded,retained_provenance(state),c.get('created_at'),context[0],dispositions,direction_data,counted,directions_off_reason,field_changes=changes)
             if not recorded_fields and not changes and not newer.get('entries'):
                 # An older cursor carries no lengths and no entry explains the stale
                 # flag: the change is in the task fields (state_sha256). Report that
                 # without old_length, never all three fields with old_length None
                 # (kittrial-5bb.293 item 2 rev2).
-                changes=field_changes_since(None, excluded.get('field_sizes'), only_if_unexplained=True)
+                changes=field_changes_since(None, current_sizes, only_if_unexplained=True)
                 newer['field_changes']=changes
             if review['review_state'] not in review_next:
                 dirs=newer.get('unresolved_directions')

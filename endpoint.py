@@ -223,20 +223,32 @@ def _native_anchor_rows(root,path,actor,tokens):
     return resolved
 
 def _claims_the_row(args):
-    """True when the bd invocation claims the row or makes it in_progress (kittrial-5bb.293)."""
-    joined=' '.join(args or [])
-    return ('--claim' in (args or []) or '--claim=' in joined or
-            'in_progress' in (args or []) or '--status' in joined and 'in_progress' in joined or
-            '--assignee' in joined and '--status' in joined and 'in_progress' in joined)
+    """True when the bd invocation claims the row or makes it in_progress (kittrial-5bb.293).
+
+    Flags are matched by PARSED argument, not substring: a ``--notes`` text that
+    contains ``in_progress`` never triggers this (rev3).
+    """
+    args=list(args or [])
+    if '--claim' in args or any(a.startswith('--claim=') for a in args):
+        return True
+    for i,a in enumerate(args):
+        if a in ('--status','-s') and i+1<len(args) and args[i+1]=='in_progress':
+            return True
+        if a.startswith('--status=') and a.split('=',1)[1]=='in_progress':
+            return True
+    return False
 
 
 def _guard_open_dependency_on_claim(root,path,actor,row):
     """Refuse a claim on a task blocked by an open dependency (kittrial-5bb.293 item 3a)."""
-    from work import BLOCKING_DEPENDENCY_TYPES, dependency_index, open_dependency_ids, open_dependency_sentence
-    deps=[d for d in (row.get('dependencies') or [])
-          if isinstance(d,dict) and d.get('type') in BLOCKING_DEPENDENCY_TYPES]
+    from work import BLOCKING_DEPENDENCY_TYPES, dependency_index, dependency_ref, open_dependency_ids, open_dependency_sentence
+    deps=[]
+    ids=[]
+    for d in row.get('dependencies') or []:
+        other_id,kind=dependency_ref(d)
+        if kind in BLOCKING_DEPENDENCY_TYPES and other_id:
+            deps.append(d);ids.append(other_id)
     if not deps:return
-    ids=[d.get('depends_on_id') for d in deps if d.get('depends_on_id')]
     # Fail CLOSED: read the other ends in ONE native read; a missing one is open.
     completed=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','--actor',actor,
                              'show',*ids,'--json'],env=environment(root),

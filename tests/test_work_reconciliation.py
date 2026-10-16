@@ -768,6 +768,26 @@ class ClaimableHttpTests(AgentHarness):
         self.assertEqual(data['attention']['counts']['claimable'], 1)  # only the opener
         self.assertEqual([a['task'] for a in data['next_actions']], [opener])
 
+    def test_the_endpoint_raw_claim_is_refused_for_an_open_dependency(self):
+        """kittrial-5bb.293 item 3a / mutant g6: the endpoint's own bd claim is gated."""
+        import endpoint as ep
+        blocked = self.new('blocked work')
+        opener = self.new('open dependency')
+        self.backend.state['tasks'][blocked]['dependencies'] = [
+            {'depends_on_id': opener, 'type': 'blocks'}]
+        # The guard is the one the endpoint runs before any native write.
+        row = dict(self.backend.state['tasks'][blocked])
+        snapshot = list(self.backend.state['tasks'].values())
+        from work import dependency_index, open_dependency_ids
+        open_deps = open_dependency_ids(row, snapshot, index=dependency_index(snapshot))
+        self.assertEqual(open_deps, [opener])
+        # The parsed-flag matcher sees only a real --claim, never a --notes text.
+        self.assertTrue(ep._claims_the_row(['update', blocked, '--claim', '--json']))
+        self.assertTrue(ep._claims_the_row(['update', blocked, '--status', 'in_progress', '--json']))
+        self.assertTrue(ep._claims_the_row(['update', blocked, '-s', 'in_progress', '--json']))
+        self.assertFalse(ep._claims_the_row(['update', blocked, '--notes', 'in_progress', '--json']))
+        self.assertFalse(ep._claims_the_row(['update', blocked, '--title', 'x', '--json']))
+
     def test_only_the_blocking_dependency_type_blocks(self):
         """kittrial-5bb.293 item 3b: a `related` dependency must not block a claim."""
         task = self.new('related to something open')

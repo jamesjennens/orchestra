@@ -1298,9 +1298,10 @@ class InProcessBackend:
         """
         items = []
         snapshot = self.read_tasks(project_id)['items']
-        from work import open_dependency_ids
+        from work import dependency_index, open_dependency_ids
+        dep_index = dependency_index(snapshot)
         for task in snapshot:
-            task = dict(task, open_dependencies=open_dependency_ids(task, snapshot))
+            task = dict(task, open_dependencies=open_dependency_ids(task, snapshot, index=dep_index))
             review = self._review_view(task)
             from review_state import active_work
             if not active_work(task.get('status'), review['state'], review['open_requests']):
@@ -4322,11 +4323,13 @@ class ApiHandler(BaseHTTPRequestHandler):
         view['assignee_name'] = names.get(assignee, assignee) if assignee else None
         view['next_action'] = next_action(view)
         view['requirement_record'] = requirement_record(view.get('labels'))
-        from work import open_dependency_ids
-        # The snapshot the view already has (a list view) or one bounded read of the
-        # other ends (a single-task view). No bare except (kittrial-5bb.293 item 3c).
+        from work import dependency_index, open_dependency_ids
+        # The snapshot the view already has (a list view) or an empty one (a
+        # single-task view: the other ends are read by the claim gate, which fails
+        # closed). No bare except (kittrial-5bb.293 item 3c). One index per snapshot
+        # (item 2a).
         snapshot = tasks if isinstance(tasks, list) else []
-        view['open_dependencies'] = open_dependency_ids(task, snapshot)
+        view['open_dependencies'] = open_dependency_ids(task, snapshot, index=dependency_index(snapshot))
         view['claimable'] = claimable(view.get('issue_type'), view.get('status'), assignee,
                                       view.get('contribution_id'), view.get('review_state'),
                                       labels=view.get('labels'),
@@ -6782,12 +6785,16 @@ class ApiHandler(BaseHTTPRequestHandler):
         The claim route must never offer a claim the queue would refuse. When the
         other ends' statuses cannot be read, the claim is refused with one sentence
         naming that, rather than being allowed through."""
-        from work import BLOCKING_DEPENDENCY_TYPES, dependency_index, open_dependency_ids, open_dependency_sentence
-        deps = [d for d in (row.get('dependencies') or [])
-                if isinstance(d, dict) and d.get('type') in BLOCKING_DEPENDENCY_TYPES]
+        from work import BLOCKING_DEPENDENCY_TYPES, dependency_index, dependency_ref, open_dependency_ids, open_dependency_sentence
+        deps = []
+        ids = []
+        for d in row.get('dependencies') or []:
+            other_id, kind = dependency_ref(d)
+            if kind in BLOCKING_DEPENDENCY_TYPES and other_id:
+                deps.append(d)
+                ids.append(other_id)
         if not deps:
             return
-        ids = [d.get('depends_on_id') for d in deps if d.get('depends_on_id')]
         try:
             snapshot = backend.read_tasks(project_id)['items'] if hasattr(backend, 'read_tasks') else []
         except Exception:
