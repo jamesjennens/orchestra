@@ -1201,12 +1201,36 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
     if action in ('review','handoff'):
         # Structured output is already JSON; accept the flag consistently with brief/show/work.
         args=[token for token in args if token!='--json']
-    if action=='work':
+    if action in ('work','wait'):
         rows=record_json.loads_rows(run(['export','--all']))
         from reserved_comments import RECORD_ANCHOR_LABELS
         rows=record_json.classify(rows,run,sorted(RECORD_ANCHOR_LABELS)+['gt:slot'], ['event','gate'])
         from lifecycle import host_snapshot
         rows=host_snapshot(rows, run=run, project=path)
+        if action=='wait':
+            # The blocking wait's ONE read per poll (kittrial-5bb.285). The export is already
+            # in hand: the worker form needs no further read, and the coordinator form's lane
+            # board (kittrial-5bb.263) is derived from the SAME export, so a poll is one cheap
+            # read - never an export per form and never a read per task.
+            from waiting import parse_read_args as wait_read_args, worker_view, coordinator_view
+            parsed=wait_read_args(args)
+            if parsed.coordinator:
+                from lanes import read as lanes_read, LANES_LIMIT_MAX
+                from sessions import read_registry
+                lanes_payload=lanes_read(rows,actor,read_registry(path),
+                                         ['--idle-minutes',str(parsed.idle_minutes),
+                                          '--limit',str(LANES_LIMIT_MAX)],
+                                         operators=operators,journal=path,scope=lanes_scope)
+                queue_payload=queue(rows,actor,['--limit',str(WORK_LIMIT_MAX)],path/'.handoff-requests',
+                                    operators=operators,journal=path,reference_attention=False,
+                                    verifiers=verifiers,independent_approval=independent_approval,
+                                    owners=owners,provenance_writes=provenance_writes)
+                return coordinator_view(queue_payload.get('items') or [],lanes_payload)
+            queue_payload=queue(rows,actor,['--mine','--limit',str(WORK_LIMIT_MAX)],path/'.handoff-requests',
+                                operators=operators,journal=path,reference_attention=False,
+                                verifiers=verifiers,independent_approval=independent_approval,
+                                owners=owners,provenance_writes=provenance_writes)
+            return worker_view(queue_payload.get('items') or [])
         if args[:1]==['lanes']:
             # The lanes board (kittrial-5bb.263) reads the SAME export this action already
             # loaded, plus the project's session registry: one pass, no per-task comment
