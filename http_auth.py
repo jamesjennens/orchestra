@@ -54,6 +54,9 @@ from http_authority import (ALL_CAPABILITIES, CAP_ACCOUNTS_ADMIN, CAP_AGENTS, CA
                             CREDENTIAL_FORBIDDEN_CAPABILITIES, CREDENTIAL_SCOPES, RANK,
                             ROLE_CAPABILITIES, ROLES, SCOPE_CAPABILITIES, SCHEMA_VERSION,
                             JOURNAL_MAX_SKEW_SECONDS, JOURNAL_SUSPECT_SETTLE_SECONDS,
+                            CREDENTIAL_EXPIRED_MESSAGE, CREDENTIAL_MAX_AGE_DAYS,
+                            CREDENTIAL_REVOKED_MESSAGE,
+                            credential_age_expired, credential_expiry_cap,
                             AuthorityDenied, authority_request, clock_advance,
                             clock_persist, clock_report, clock_state,
                             clock_trusted, decide, file_lock,
@@ -72,7 +75,8 @@ SESSION_IDLE_SECONDS = 30 * 60
 SESSION_ABSOLUTE_SECONDS = 12 * 60 * 60
 CREDENTIAL_TTL_SECONDS = 30 * 24 * 60 * 60
 AGENT_CREDENTIAL_DAYS_DEFAULT = 30
-AGENT_CREDENTIAL_DAYS_MAX = 366
+#: The same ceiling the shared read cap applies (kittrial-5bb.294 item 4): one source.
+AGENT_CREDENTIAL_DAYS_MAX = CREDENTIAL_MAX_AGE_DAYS
 _AGENT_LIFETIME_DEFAULT = object()
 RESET_TTL_SECONDS = 30 * 60
 IDEMPOTENCY_TTL_SECONDS = 24 * 60 * 60
@@ -1028,7 +1032,16 @@ class Service:
         key uses their existing legacy path (no issued_raw); this reader still enforces
         BOTH its stored monotone expiry and its explicit raw deadline. Default30 keys
         keep issued_raw too. New fields never change worker/session/reset expiry.
+
+        The stored expiry is additionally capped at 366 days from the most recent
+        legitimate write ON READ (kittrial-5bb.294 item 4): issuance and every extension
+        stamp ``agent_written_raw``, so a hand-edited store of years is not honoured here
+        and an owner's latest extension always buys its full lifetime. A record without
+        the field falls back to its issuance stamp. The same shared cap is applied by the
+        canonical endpoint.
         """
+        if credential_age_expired(credential, moment):
+            return True
         if credential.get('agent_id') and 'agent_raw_expires_at' in credential:
             values = (credential.get('expires_at'), credential['agent_raw_expires_at'])
             try:
@@ -1057,7 +1070,7 @@ class Service:
         except (ValueError, OverflowError, OSError):
             raise invalid('Agent credential expiry is outside the representable timestamp range') from None
         result = {'expires_at': expires, 'agent_raw_expires_at': raw_expires,
-                  'agent_issued_raw': raw}
+                  'agent_issued_raw': raw, 'agent_written_raw': raw}
         if self.agent_credential_ttl <= self.credential_ttl:
             result['issued_raw'] = raw
         return result
@@ -1593,11 +1606,15 @@ class Service:
             credential_id = self.state['credential_tokens'].get(digest)
             credential = self.state['credentials'].get(credential_id) if credential_id else None
             if credential is not None:
-                if credential['revoked'] or self._credential_expired(credential, moment):
-                    raise unauthenticated('Credential expired or revoked')
+                # Revocation and expiry answer separately, and the expiry sentence names who
+                # can act without naming any other credential (kittrial-5bb.294 item 2).
+                if credential['revoked']:
+                    raise unauthenticated(CREDENTIAL_REVOKED_MESSAGE)
+                if self._credential_expired(credential, moment):
+                    raise unauthenticated(CREDENTIAL_EXPIRED_MESSAGE)
                 user = self.state['users'].get(credential['user_id'])
                 if user is None or user['disabled']:
-                    raise unauthenticated('Credential expired or revoked')
+                    raise unauthenticated('Authentication is no longer valid')
                 if required_scope and required_scope not in credential['scopes']:
                     raise forbidden('Credential scope does not permit this operation')
                 credential['last_used'] = moment
@@ -1655,8 +1672,12 @@ class Service:
             return user
         if principal.via == 'credential':
             credential = self.state['credentials'].get(principal.credential_id)
-            if credential is None or credential['revoked'] or self._credential_expired(credential, moment):
-                raise unauthenticated('Credential expired or revoked')
+            if credential is None:
+                raise unauthenticated(CREDENTIAL_EXPIRED_MESSAGE)
+            if credential['revoked']:
+                raise unauthenticated(CREDENTIAL_REVOKED_MESSAGE)
+            if self._credential_expired(credential, moment):
+                raise unauthenticated(CREDENTIAL_EXPIRED_MESSAGE)
             user = self.state['users'].get(credential['user_id'])
             if user is None or user['disabled']:
                 raise unauthenticated('Authentication is no longer valid')
@@ -2190,16 +2211,50 @@ class Service:
             answer['actor_waived'] = dict(credential['actor_waived'])
         return answer
 
+    def credential_effective_expiry(self, credential):
+        """The stored deadline AS READ, capped from the most recent legitimate write.
+
+        The cap is the shared :func:`http_authority.credential_expiry_cap`: 366 days from
+        ``agent_written_raw`` (issuance or the last extension), falling back to the
+        issuance stamp for a record written before the field existed (kittrial-5bb.294
+        item 4). Records with no readable stamp, or no numeric deadline, are returned
+        untouched, so the older legacy reader keeps its meaning.
+        """
+        expires = credential.get('expires_at')
+        cap = credential_expiry_cap(credential)
+        if cap is None or type(expires) is bool or not isinstance(expires, (int, float)):
+            return expires
+        if not math.isfinite(expires):
+            return expires
+        return min(float(expires), cap)
+
+    def credential_effective_raw_expiry(self, credential):
+        """The raw deadline AS READ, capped like :meth:`credential_effective_expiry`."""
+        raw = credential.get('agent_raw_expires_at')
+        cap = credential_expiry_cap(credential)
+        if cap is None or type(raw) is bool or not isinstance(raw, (int, float)):
+            return raw
+        if not math.isfinite(raw):
+            return raw
+        return min(float(raw), cap)
+
     def agent_credential_expiry_view(self, credential):
         """Secret-free expiry metadata, also safe for a project's owner controls."""
         moment = self._expiry_now()
         working = self._credential_live(credential, moment)
-        remaining = credential['expires_at'] - moment
+        expires = self.credential_effective_expiry(credential)
+        deadline = expires if isinstance(expires, (int, float)) and \
+            not isinstance(expires, bool) else None
+        remaining = deadline - moment if deadline is not None else None
         if credential.get('agent_id') and 'agent_raw_expires_at' in credential and working:
-            remaining = min(remaining, credential['agent_raw_expires_at'] - self._raw_now())
-        return {'id': credential['id'], 'expires_at': now_iso(credential['expires_at']),
+            raw = self.credential_effective_raw_expiry(credential)
+            if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+                raw_remaining = raw - self._raw_now()
+                remaining = raw_remaining if remaining is None else min(remaining, raw_remaining)
+        return {'id': credential['id'],
+                'expires_at': now_iso(deadline) if deadline is not None else None,
                 'working': bool(working), 'revoked': bool(credential.get('revoked')),
-                'expires_soon': bool(working and remaining <= 7 * 86400)}
+                'expires_soon': bool(working and remaining is not None and remaining <= 7 * 86400)}
 
     def credential_view(self, credential):
         view = {'id': credential['id'], 'project': credential['project_id'],
@@ -3456,6 +3511,11 @@ class Service:
 
         No secret is made or returned; identity, hash, scopes, actor, issuer and grants
         remain unchanged. Existing route transaction owns persistence and rollback.
+
+        The extension is a legitimate write, so it stamps ``agent_written_raw`` with this
+        raw instant (kittrial-5bb.294 item 4). The read cap then measures from here, not
+        from first issuance, and the new expiry is at most ``now + lifetime`` (lifetime is
+        capped at 366 days), so a legitimately extended key is never cut by its own write.
         """
         with self.store.lock:
             agent, credential = self.agent_extension_target(principal, agent_id, credential_id, project_id)
@@ -3476,7 +3536,8 @@ class Service:
                     now_iso(stamp)
             except (ValueError, OverflowError, OSError):
                 raise invalid('Agent credential expiry is outside the representable timestamp range') from None
-            credential.update(expires_at=expires, agent_raw_expires_at=raw_expires)
+            credential.update(expires_at=expires, agent_raw_expires_at=raw_expires,
+                              agent_written_raw=raw)
             if 'agent_issued_raw' not in credential:
                 credential['agent_issued_raw'] = credential.get('issued_raw', raw)
             # An older kit has a fixed raw-age cap: beyond that cap it must use its
