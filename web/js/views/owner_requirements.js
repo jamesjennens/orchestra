@@ -61,7 +61,8 @@ function transitionRecovery(ctx, pid, item) {
     !saved.can_finish ? h('p', null, saved.finish_unavailable || saved.message) : null,
     item.governance?.mode !== 'simple' ? h('a', { href: ctx.href(`/p/${pid}/requirements`) }, 'Open requirements to enable simple editing') : null,
     h('label', null, confirm, saved.undoes
-      ? ' I understand finishing also withdraws the later accepted revision named above.'
+      ? ' I understand finishing also ' + (saved.undoes.operation === 'supersede' ? 'supersedes' : 'withdraws')
+        + ' the later accepted revision named above.'
       : ' I understand finishing this saved transition cannot be undone in the browser.'), finish,
     h('label', null, 'Why abandon this transition?', reason),
     !saved.can_abandon ? h('p', null, saved.abandon_unavailable || saved.message) : null,

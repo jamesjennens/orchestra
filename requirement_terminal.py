@@ -22,6 +22,16 @@ NATIVE_TIMEOUT = 120
 MAX_WRITE_DEADLINE = 253402300799
 DAMAGED_RECEIPT = ('Requirement transition receipt is damaged; the host operator runs '
                    'admin.py requirement-reconcile for its operation ID.')
+#: The verb of the undo sentence, by the operation actually happening: a late
+#: withdrawal withdraws the later accepted revision, a late supersession
+#: supersedes it. ``[0]`` is used before the finish (still to confirm),
+#: ``[1]`` in the answer after it happened.
+UNDO_VERBS = {'withdraw': ('withdraws', 'withdrew'),
+              'supersede': ('supersedes', 'superseded')}
+COMPLETION_FIELDS = {'actor', 'at', 'operation_id', 'reason', 'via', 'pending_receipt_sha256'}
+#: ``actors`` is an optional addition beside the frozen completion fields: a
+#: record written before it existed has no such key and still validates.
+COMPLETION_OPTIONAL_FIELDS = {'actors'}
 
 
 def write_window(service_now=None, endpoint_timeout=150):
@@ -104,6 +114,37 @@ def read_receipt(path):
         raise ValueError('Owner terminal receipt cannot be verified; ask the host operator to reconcile it') from error
 
 
+def valid_completion_actors(value, finisher):
+    """Whether an optional ``completion['actors']`` names every finisher, in order.
+
+    When present it lists at least two distinct actor identifiers and ends with
+    the ``actor`` that completed the transition. A record written before the key
+    existed carries no list and is not checked here.
+    """
+    if not isinstance(value, list) or len(value) < 2:
+        return False
+    try:
+        for actor in value:
+            identifier(actor)
+    except (ValueError, TypeError):
+        return False
+    return len(set(value)) == len(value) and value[-1] == finisher
+
+
+def completion_finishers(finisher, writer):
+    """Every distinct actor that finished one transition, the earlier writer first.
+
+    ``finisher`` completed the transition; ``writer`` is the actor whose earlier
+    write of the same decision (state or reason) landed before the completion. A
+    single actor is returned once, so the caller stores no redundant list.
+    """
+    actors = []
+    for actor in (writer, finisher):
+        if actor is not None and actor not in actors:
+            actors.append(actor)
+    return actors
+
+
 def validate_receipt(receipt):
     core.validate_receipt(receipt)
     if seal(receipt)['terminal_sha256'] != receipt.get('terminal_sha256'):
@@ -157,13 +198,15 @@ def validate_receipt(receipt):
     completion = receipt.get('completion')
     if receipt['status'] == 'complete':
         if (not isinstance(completion, dict)
-                or set(completion) != {'actor', 'at', 'operation_id', 'reason', 'via', 'pending_receipt_sha256'}
+                or set(completion) - COMPLETION_OPTIONAL_FIELDS != COMPLETION_FIELDS
                 or not isinstance(completion['at'], str) or not completion['at'].strip()
                 or not isinstance(completion['reason'], str) or len(completion['reason']) > 1000
                 or completion['via'] not in ('owner', 'operator')):
             raise ValueError('Invalid terminal completion history')
         identifier(completion['actor']); identifier(completion['operation_id'])
         governance.digest(completion['pending_receipt_sha256'])
+        if 'actors' in completion and not valid_completion_actors(completion['actors'], completion['actor']):
+            raise ValueError('Invalid terminal completion history')
     elif completion is not None:
         raise ValueError('Unexpected terminal completion history')
     return receipt
@@ -305,12 +348,32 @@ def later_acceptance(row, saved):
     if number <= bound['revision']:
         return None
     evidence = owner.existing_acceptances(row).get(number) or {}
-    return dict(revision=number, sha256=record['sha256'], accepted_at=evidence.get('at'))
+    return dict(revision=number, sha256=record['sha256'], accepted_at=evidence.get('at'),
+                operation=saved['operation'])
+
+
+def undo_verb(undo, happened=False):
+    verbs = UNDO_VERBS.get(undo.get('operation'))
+    if verbs is None:
+        raise ValueError('Unknown terminal operation for the undo sentence')
+    return verbs[1 if happened else 0]
 
 
 def undo_message(undo):
-    return ('Finishing this saved transition also withdraws accepted revision %d, accepted at %s. '
-            'Confirm that you want to finish it.' % (undo['revision'], undo['accepted_at']))
+    """What finishing will also do, before it happens; the owner must confirm it."""
+    return ('Finishing this saved transition also %s accepted revision %d, accepted at %s. '
+            'Confirm that you want to finish it.'
+            % (undo_verb(undo), undo['revision'], undo['accepted_at']))
+
+
+def undo_done_message(undo):
+    """What finishing also did, for the answer after it happened.
+
+    The operator's ``requirement-reconcile --disposition complete`` finishes
+    without a browser confirm, so its answer must not ask for one.
+    """
+    return ('Finishing this saved transition also %s accepted revision %d, accepted at %s.'
+            % (undo_verb(undo, happened=True), undo['revision'], undo['accepted_at']))
 
 
 def apply(project_path, context, action, body, operation, run, task,
@@ -404,9 +467,16 @@ def apply(project_path, context, action, body, operation, run, task,
     if label not in (confirmed.get('labels') or []):
         run(['update', task, '--add-label', label, '--json'])
     if prior['status'] != 'complete':
+        finishers = completion_finishers(finished_by or context.account_id, prior['actor'])
         completion = dict(actor=finished_by or context.account_id, at=core.now(),
                           operation_id=recovery_operation_id or operation, reason=completion_reason,
                           via=completion_via, pending_receipt_sha256=receipt_sha256(prior))
+        # One owner's finish may write the state and fail; another actor then
+        # completes it. Name every actor that finished, not only the second, so
+        # the receipt is never read as if the first never acted. A single
+        # finisher needs no list, and an older record has none.
+        if len(finishers) > 1:
+            completion['actors'] = finishers
         completed = seal(dict(prior, status='complete', completion=completion))
         validate_receipt(completed); atomic(path, completed)
     else:
@@ -557,7 +627,7 @@ def recover(project_path, context, action, task, body, run, recovery_operation_i
                        completion_reason=body.get('reason', ''), completion_via=completion_via, late=late)
         if undo is not None:
             result['undoes'] = undo
-            result['message'] = undo_message(undo)
+            result['message'] = undo_done_message(undo)
         return result
     if written:
         raise ValueError('A terminal state was already written; finish this transition instead of abandoning')

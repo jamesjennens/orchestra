@@ -103,8 +103,11 @@ operator's complete are refused with a sentence naming the later decision. Only
 without a completed later decision does a late state beside a second conflicting
 state stay unknown and point at the same reconciliation, never at a requirement
 left with no pending transition and no command. Finishing a late state that would
-also withdraw a revision accepted after it names that revision and when it was
-accepted, and an owner must confirm it explicitly. Damaged receipts
+also affect a revision accepted after it names that revision and when it was
+accepted, words the undo for the operation actually happening (a late withdrawal
+withdraws it; a late supersession supersedes it) and an owner must confirm it
+explicitly; the answer after finishing states what happened instead of asking for
+that confirmation again. Damaged receipts
 are identified separately and affect their own requirement only; unidentifiable
 files are operator diagnostics, never evidence that every requirement is pending.
 `admin.py requirement-reconcile` finds the terminal receipt by its operation ID.
@@ -114,8 +117,10 @@ then either finishes the saved evidence (`--disposition complete`) or retains an
 abandonment disposition (`--disposition released`) after the same deadline and
 native absence proof. For terminal recovery, `failed` is an alias for `released`;
 neither permits reuse of the abandoned transition's original key. Use a new intent.
-Completion retains the finisher, time and operator `--reason`, separately from
-the immutable original decision author and reason. The service audit includes
+Completion retains every finisher, time and operator `--reason`, separately from
+the immutable original decision author and reason. A single finisher keeps the
+frozen completion fields; when one actor's finish wrote the state and failed and
+another completed it, the receipt also names both. The service audit includes
 the requirement, original operation and recovery operation. Operator audit entries
 are derived from verified durable receipt history, so a running service cannot
 overwrite them with an older in-memory audit tail. Receipt integrity covers
@@ -140,7 +145,12 @@ state was written. The preceding reader refuses terminal evidence, but its write
 not: editing and accepting can succeed and permanently damage terminal history.
 The preceding kit can also restore a backup with terminal records without warning,
 then read those records as unreadable. Use this release or a later compatible one
-for those backups. Do not strip evidence to make it readable. Restore a pre-transition
+for those backups. Do not strip evidence to make it readable. Receipts written by
+the unreleased revision 2 cannot be held by any tracker: no released kit revision
+reads or migrates that shape, and the receipt is a project journal file, not native
+tracker state, so the tracker cannot carry it either. Preserve them and resolve the
+operation by ID with `admin.py requirement-reconcile` from the native state; never
+hand-edit or re-seal them. Restore a pre-transition
 backup taken before the first attempted transition if a rollback is required,
 retaining the later backup separately. Named
 baselines and Markdown download/comparison are a separate later delivery.
