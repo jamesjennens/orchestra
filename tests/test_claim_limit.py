@@ -84,6 +84,16 @@ class ClaimLimitUnitTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 claim_limit.validate_limit(bad)
 
+    def test_a_refused_raise_names_who_may_raise_it_and_where(self):
+        """The sentence names the owner's account or a superuser and the My agents page."""
+        sentence = claim_limit.raise_refusal(2, 5)
+        self.assertIn('5', sentence)
+        self.assertIn('2', sentence)
+        self.assertIn("owner's account", sentence)
+        self.assertIn('superuser', sentence)
+        self.assertIn('My agents', sentence)
+        self.assertIn(claim_limit.RAISE_BY, sentence)
+
 
 class ClaimLimitTests(test_http_agents.AgentHarness):
     """The gate over the real HTTP claim route, per role."""
@@ -210,7 +220,8 @@ class ClaimLimitTests(test_http_agents.AgentHarness):
         agent_id, secret, _ = self.agent_secret(self.alex, name='Two projects',
                                                 projects=[self.project, other])
         shown = self.next_of(secret)['claim_limit']
-        self.assertEqual({'limit': 1, 'held': 0, 'available': 1, 'counts_task': 0}, shown)
+        self.assertEqual({'limit': 1, 'held': 0, 'available': 1, 'counts_task': 0,
+                          'raise_by': claim_limit.RAISE_BY}, shown)
         self.assertEqual(200, self.claim(self.tasks[0], secret).status,
                          'an agent on two projects holding nothing must be able to claim')
 
@@ -251,12 +262,149 @@ class ClaimLimitTests(test_http_agents.AgentHarness):
                                {'claim_limit': 2, 'surprise': 1}, token=self.alex)
         self.assertEqual(422, refused.status, refused.data)
 
+    # -- the agent's own limit (kittrial-5bb.302) ------------------------------
+    def my_limit(self, value, token):
+        """PATCH /v1/agents/me, the agent's own route."""
+        return self.request('PATCH', '/v1/agents/me', {'claim_limit': value}, token=token)
+
+    def test_an_agent_lowers_its_own_limit_and_can_then_hold_that_many(self):
+        agent_id, secret, _ = self.new_agent()
+        raised = self.request('PATCH', '/v1/agents/%s' % agent_id, {'claim_limit': 3},
+                              token=self.alex)
+        self.assertEqual(3, raised.data['claim_limit'])
+        lowered = self.my_limit(2, secret)
+        self.assertEqual(200, lowered.status, lowered.data)
+        self.assertEqual(2, lowered.data['agent']['claim_limit'])
+        self.assertEqual(3, lowered.data['old_limit'])
+        self.assertEqual(2, lowered.data['new_limit'])
+        self.assertIn('My agents', lowered.data['raise_by'])
+        self.assertEqual(200, self.claim(self.tasks[0], secret).status)
+        self.assertEqual(200, self.claim(self.tasks[1], secret).status)
+        third = self.claim(self.tasks[2], secret)
+        self.assertEqual(409, third.status, third.data)
+        self.assertIn('limit is 2', third.data['error']['message'])
+
+    def test_an_agent_may_not_raise_its_own_limit(self):
+        agent_id, secret, _ = self.new_agent()
+        refused = self.my_limit(2, secret)
+        self.assertEqual(403, refused.status, refused.data)
+        sentence = refused.data['error']['message']
+        self.assertIn("owner's account", sentence)
+        self.assertIn('superuser', sentence)
+        self.assertIn('My agents', sentence)
+        self.assertEqual(1, refused.data['error']['detail']['claim_limit'])
+        self.assertEqual(2, refused.data['error']['detail']['requested'])
+        # Nothing changed: the agent still holds the default of one.
+        shown = self.request('GET', '/v1/agents/%s' % agent_id, token=self.alex).data
+        self.assertEqual(1, shown['claim_limit'])
+        self.assertEqual(200, self.claim(self.tasks[0], secret).status)
+        self.assertEqual(409, self.claim(self.tasks[1], secret).status)
+
+    def test_the_agents_own_limit_is_bounded_and_leaves_its_record_alone(self):
+        agent_id, secret, _ = self.new_agent(claim_limit=4)
+        for bad in (0, claim_limit.LIMIT_MAX + 1, 'two', 1.5):
+            refused = self.my_limit(bad, secret)
+            self.assertEqual(422, refused.status, (bad, refused.data))
+            shown = self.request('GET', '/v1/agents/%s' % agent_id, token=self.alex).data
+            self.assertEqual(4, shown['claim_limit'], 'a refused change left the limit alone')
+        # ``null`` is the OWNER's way to clear a setting; the agent route takes the number.
+        refused = self.my_limit(None, secret)
+        self.assertEqual(422, refused.status, refused.data)
+
+    def test_the_agents_own_route_takes_only_claim_limit(self):
+        agent_id, secret, _ = self.new_agent(claim_limit=3)
+        refused = self.request('PATCH', '/v1/agents/me',
+                               {'claim_limit': 2, 'enabled': False}, token=secret)
+        self.assertEqual(422, refused.status, refused.data)
+        empty = self.request('PATCH', '/v1/agents/me', {}, token=secret)
+        self.assertEqual(422, empty.status, empty.data)
+        self.assertEqual(3, self.request('GET', '/v1/agents/%s' % agent_id,
+                                         token=self.alex).data['claim_limit'])
+
+    def test_a_person_and_a_worker_credential_may_not_use_the_agents_own_route(self):
+        agent_id, secret, _ = self.new_agent()
+        person = self.my_limit(1, self.alex)
+        self.assertEqual(403, person.status, person.data)
+        issued = self.request('POST', '/v1/projects/%s/worker-credentials' % self.project,
+                              {'label': 'w', 'actor': 'worker-a'}, token=self.alex)
+        self.assertEqual(201, issued.status, issued.data)
+        external = self.my_limit(1, issued.data['credential']['secret'])
+        self.assertEqual(403, external.status, external.data)
+        self.assertEqual(200, self.claim(self.tasks[0], self.alex).status,
+                         'a person is not limited and is untouched by this route')
+
+    def test_an_agent_cannot_change_another_agents_limit(self):
+        first_id, first_secret, _ = self.new_agent(name='Kestrel')
+        second = self.request('POST', '/v1/agents',
+                              {'name': 'Osprey', 'working_directory': '/home/alex/osprey',
+                               'projects': [self.project], 'claim_limit': 5}, token=self.alex)
+        self.assertEqual(201, second.status, second.data)
+        second_id = second.data['agent']['id']
+        refused = self.request('PATCH', '/v1/agents/%s' % second_id, {'claim_limit': 1},
+                               token=first_secret)
+        self.assertIn(refused.status, (403, 404), refused.data)
+        self.assertEqual(5, self.request('GET', '/v1/agents/%s' % second_id,
+                                         token=self.alex).data['claim_limit'])
+        # Its own route still only ever touches itself.
+        lowered = self.my_limit(1, first_secret)
+        self.assertEqual(200, lowered.status, lowered.data)
+        self.assertEqual(first_id, lowered.data['agent']['id'])
+
+    def test_a_granted_agent_still_cannot_change_another_agents_limit(self):
+        granted = self.request('POST', '/v1/agents',
+                               {'name': 'Coord', 'working_directory': '/home/alex/coord',
+                                'projects': [self.project], 'claim_limit': 3}, token=self.alex)
+        self.assertEqual(201, granted.status, granted.data)
+        granted_id = granted.data['agent']['id']
+        granted_secret = granted.data['credential']['secret']
+        made = self.request('PUT', '/v1/projects/%s/agents/%s/coordinator'
+                            % (self.project, granted_id), {}, token=self.alex)
+        self.assertIn(made.status, (200, 201), made.data)
+        other = self.request('POST', '/v1/agents',
+                             {'name': 'Osprey', 'working_directory': '/home/alex/osprey',
+                              'projects': [self.project], 'claim_limit': 4}, token=self.alex)
+        other_id = other.data['agent']['id']
+        refused = self.request('PATCH', '/v1/agents/%s' % other_id, {'claim_limit': 1},
+                               token=granted_secret)
+        self.assertIn(refused.status, (403, 404), refused.data)
+        self.assertEqual(4, self.request('GET', '/v1/agents/%s' % other_id,
+                                         token=self.alex).data['claim_limit'])
+
+    def test_the_agents_own_lowering_is_recorded_with_who_and_both_values(self):
+        agent_id, secret, _ = self.new_agent(claim_limit=4)
+        lowered = self.my_limit(2, secret)
+        self.assertEqual(200, lowered.status, lowered.data)
+        events = [event for event in self.service.state['audit']
+                  if event['action'] == 'agents.claim_limit.lower'
+                  and event['outcome'] == 'committed']
+        self.assertTrue(events, 'the change must be recorded')
+        event = events[-1]
+        self.assertEqual(agent_id, event['agent'])
+        self.assertEqual(4, event['old_limit'])
+        self.assertEqual(2, event['new_limit'])
+        self.assertTrue(event['credential_id'], 'who: the credential that made the change')
+
+    def test_both_of_the_agents_own_reads_report_the_limit_and_who_may_raise_it(self):
+        agent_id, secret, _ = self.new_agent(claim_limit=2)
+        me = self.request('GET', '/v1/agents/me', token=secret)
+        self.assertEqual(200, me.status, me.data)
+        self.assertEqual({'limit': 2, 'held': 0, 'available': 2, 'counts_task': 0,
+                          'raise_by': claim_limit.RAISE_BY}, me.data['claim_limit'])
+        self.assertEqual(200, self.claim(self.tasks[0], secret).status)
+        held = self.next_of(secret)['claim_limit']
+        self.assertEqual((2, 1, 1), (held['limit'], held['held'], held['available']))
+        self.assertEqual(claim_limit.RAISE_BY, held['raise_by'])
+        again = self.request('GET', '/v1/agents/me', token=secret).data['claim_limit']
+        self.assertEqual((2, 1, 1), (again['limit'], again['held'], again['available']))
+        self.assertEqual(claim_limit.RAISE_BY, again['raise_by'])
+
     # -- what the agent reads --------------------------------------------------
     def test_the_agent_is_told_its_limit_and_what_holds_it(self):
         agent_id, secret, _ = self.new_agent()
         idle = self.next_of(secret)
         self.assertEqual({'limit': 1, 'held': 0, 'available': 1,
-                          'counts_task': 0}, idle['claim_limit'])
+                          'counts_task': 0,
+                          'raise_by': claim_limit.RAISE_BY}, idle['claim_limit'])
         self.assertEqual(200, self.claim(self.tasks[0], secret).status)
         held = self.next_of(secret)['claim_limit']
         self.assertEqual(1, held['limit'])
@@ -435,6 +583,19 @@ class RealStackClaimLimitTests(held_stack.RealStackTests):
         self.assertEqual(409, refused.status, refused.data)
         self.assertIn('pp', refused.data['error']['message'])
         self.assertEqual(agent_id, self.held(first)[1], 'nothing was released')
+
+    def test_an_agent_lowers_its_own_limit_on_the_real_stack(self):
+        agent_id, secret = self.new_agent('Lowerer', claim_limit=3)
+        lowered = self.request('PATCH', '/v1/agents/me', {'claim_limit': 2}, token=secret)
+        self.assertEqual(200, lowered.status, lowered.data)
+        self.assertEqual(2, lowered.data['agent']['claim_limit'])
+        self.assertEqual((3, 2), (lowered.data['old_limit'], lowered.data['new_limit']))
+        refused = self.request('PATCH', '/v1/agents/me', {'claim_limit': 3}, token=secret)
+        self.assertEqual(403, refused.status, refused.data)
+        self.assertIn('My agents', refused.data['error']['message'])
+        shown = self.request('GET', '/v1/agents/me', token=secret)
+        self.assertEqual(200, shown.status, shown.data)
+        self.assertEqual(2, shown.data['claim_limit']['limit'])
 
 
 if __name__ == '__main__':
