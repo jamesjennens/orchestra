@@ -4084,6 +4084,37 @@ RECORD_JOURNALS=('.reference-requests','.proposal-requests','.capability-request
 #: validated by its reader's own validator, open_items.validate_owner_entry, exactly
 #: like `.integration-reverts`.
 OWNER_ANSWERS_JOURNAL='.owner-answers'
+#: Every directory inside one project this kit writes through the shared ``atomic`` form
+#: (a unique ``<name>.tmp-<pid>-<hex>`` temporary beside the target), so a cut can leave
+#: one behind. ``'.'`` is the project directory itself, where the single-file records
+#: leave their temporary (.sessions.json, .merge-context.json, the guidance pair); the
+#: rest are the one-file-per-key and cache families. A family whose writer uses the
+#: private ``mode=`` form (``.web-lifecycle-marks``) is named too; its fixed
+#: ``<name>.tmp`` does not match the sweep's shape, so sweeping it is a no-op.
+ATOMIC_SWEEP_DIRECTORIES=('.',)+RESERVATION_JOURNALS+( '.handoffs','.handoff-recoveries',
+    '.requirement-backfills','.integration-reverts','.lifecycle-voids',
+    '.web-lifecycle-marks','.history-snapshots',OWNER_ANSWERS_JOURNAL)
+
+def sweep_project_temporaries(root,name,*,dry_run=False,min_age_seconds=None):
+    """Sweep the project directory and every atomic family in it; never touches a live write.
+
+    The bound (``coordination.TEMPORARY_MIN_AGE_SECONDS`` by default) is what makes this
+    safe beside a running service: a writer renames its temporary within one write, so an
+    old file is a crash's leftover. Only the project's own directory and its family
+    subdirectories (``ATOMIC_SWEEP_DIRECTORIES``) are swept, and nothing is read or
+    rewritten. A directory that does not exist contributes nothing. Returns the names
+    removed per directory, keyed by ``'.'`` for the project directory.
+    """
+    from coordination import sweep_temporaries, TEMPORARY_MIN_AGE_SECONDS
+    path=project_dir(root,name)
+    if not (path/'.beads'/'metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
+    if min_age_seconds is None:min_age_seconds=TEMPORARY_MIN_AGE_SECONDS
+    swept={}
+    for directory in ATOMIC_SWEEP_DIRECTORIES:
+        swept[directory]=sweep_temporaries(path/directory,min_age_seconds=min_age_seconds,dry_run=dry_run)
+    return {'project':name,'dry_run':bool(dry_run),'min_age_seconds':min_age_seconds,
+            'directories':list(ATOMIC_SWEEP_DIRECTORIES),'swept':swept,
+            'removed_total':sum(len(names) for names in swept.values())}
 
 def validate_record_receipt(name,record):
     """Frozen slice-0 receipt schema for one record-journal entry.
@@ -9524,6 +9555,13 @@ def main():
     a.add_argument('project')
     a=sub.add_parser('reference-misses-clear',help='delete a project\'s reference lookup-miss log (telemetry; not backed up)')
     a.add_argument('project')
+    a=sub.add_parser('sweep-temporaries',help='remove leftover atomic temporaries '
+                     '(<name>.tmp-<pid>-<hex>: a crash between the temporary and its rename) from one '
+                     'project\'s own coordination families; the write path is unchanged')
+    a.add_argument('project')
+    a.add_argument('--dry-run',action='store_true',dest='dry_run',help='name the files without removing them')
+    a.add_argument('--min-age-minutes',type=int,dest='min_age_minutes',default=60,
+                   help='only remove a temporary at least this old (default 60; minimum 5)')
     a=sub.add_parser('reference-apply',help='accept a reference catalog entry, or a batch of them with items (operator allowlist, F3 evidence)')
     a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('proposal-review',help='record a coordinator disposition on a requirement proposal (operator allowlist)')
@@ -10144,6 +10182,17 @@ def main():
         if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
         which=capability_misses.REFERENCE if args.command=='reference-misses-clear' else capability_misses.CAPABILITY
         print(json.dumps(dict(capability_misses.clear(path,which),project=args.project)))
+    elif args.command=='sweep-temporaries':
+        # Only a crash's leftover temporary: a unique <name>.tmp-<pid>-<hex> named exactly as
+        # coordination.temporary_name makes it, only inside this project's own families, and
+        # only older than the bound. No tracker write, no coordination lock, no bd call and no
+        # allowlist; no family is read or rewritten.
+        if args.min_age_minutes<5:
+            raise ValueError('--min-age-minutes must be at least 5: a live writer renames its temporary within one '
+                             'write, and a shorter bound could remove a temporary that is still in use')
+        print(json.dumps(sweep_project_temporaries(root,args.project,dry_run=args.dry_run,
+                                                   min_age_seconds=args.min_age_minutes*60),
+                         sort_keys=True,indent=1))
     elif args.command=='capability-verify':
         import contextlib
         import fcntl
