@@ -2104,7 +2104,9 @@ def client_out_of_date_sentence(name):
     """
     from version import KIT_VERSION
     return ('`%s` is run by the client itself, not by the server. This client is older than '
-            'the installation\'s kit (version %s). Update it by copying client.py from the kit.'
+            'the installation\'s kit (version %s). Update it by copying client.py from the kit; '
+            'it carries its own wait logic, so wait needs no other kit file beside it (the '
+            'capability commands still need capabilities.py).'
             % (name, KIT_VERSION))
 
 
