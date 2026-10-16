@@ -5981,9 +5981,17 @@ class ApiHandler(BaseHTTPRequestHandler):
                 ctx.principal, ctx.params['aid'], ctx.params['cid'], project_id=project_id,
                 request_id=ctx.request_id)
             return result, result
+        # The route's own capability is the coarse gate; the precise extension authority
+        # is decided once, in Service.agent_extension_target: CAP_AGENTS (the agent's own
+        # account or a superuser) for the agent route, CAP_PROJECT_ADMIN (that project's
+        # owner or a superuser) for the project route, and any credential caller refused
+        # first there. The project route's gate is therefore the authenticated project
+        # READ the caller already needs to see the agent, never a second, shadowing copy
+        # of the precise check: each guard is load-bearing and pinned by its own route
+        # test (kittrial-5bb.294 item 3).
         return self._mutate_agent_credential(
             ctx, 'agents.credentials.extend', extend, project_id=project_id,
-            capability=CAP_AGENTS if project_id is None else CAP_PROJECT_ADMIN, replay_check=check)
+            capability=CAP_AGENTS if project_id is None else CAP_READ, replay_check=check)
 
     def _mutate_agent_credential(self, ctx, operation, fn, *, project_id=None,
                                  capability=CAP_AGENTS, **options):

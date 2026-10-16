@@ -377,11 +377,17 @@ ALL_CAPABILITIES = frozenset(ROLE_CAPABILITIES['owner'] | {CAP_PROJECT_CREATE,
                                                            CAP_ACCOUNTS_ADMIN,
                                                            CAP_AGENTS})
 
-#: The longest lifetime a credential's STORED expiry is honoured for, measured from its
-#: issuance, ON READ (kittrial-5bb.294 item 4): 366 days, the same ceiling the
-#: ``--agent-credential-days`` setting allows. A store whose expiry was hand-edited to
-#: years reads as capped here, so the web service and the canonical endpoint both refuse
-#: it once it is older than this, whatever the store says. The store is never rewritten.
+#: The longest a credential's STORED expiry is honoured for after the most recent
+#: LEGITIMATE WRITE, ON READ (kittrial-5bb.294 item 4): 366 days, the same ceiling the
+#: ``--agent-credential-days`` setting allows. Issuance and every extension stamp the
+#: write in ``agent_written_raw``, so effective expiry is
+#: ``min(stored expiry, agent_written_raw + 366 days)``. A record written before the field
+#: existed falls back to its issuance stamp, so it still caps. A store whose expiry was
+#: hand-edited to years reads as capped here, so the web service and the canonical
+#: endpoint both refuse it once the last legitimate write is older than this, whatever the
+#: store says. The field sits in the same store as the expiry and is exactly as editable:
+#: this stops careless or stale edits, not a host user who can rewrite the state. A read
+#: never rewrites the store.
 CREDENTIAL_MAX_AGE_DAYS = 366
 CREDENTIAL_MAX_AGE_SECONDS = CREDENTIAL_MAX_AGE_DAYS * 86400
 
@@ -412,22 +418,45 @@ def credential_issued_raw(credential):
     return None
 
 
+def credential_written_raw(credential):
+    """The credential's most recent legitimate-write instant, or ``None``.
+
+    Issuance and every extension record this raw-clock stamp, so it is what the 366-day
+    read cap is measured from. A missing, hand-edited non-number or non-finite value
+    reads as no stamp: :func:`credential_expiry_cap` then falls back to the issuance
+    stamp rather than failing open.
+    """
+    value = credential.get('agent_written_raw')
+    if type(value) is bool or not isinstance(value, (int, float)):
+        return None
+    if not math.isfinite(value):
+        return None
+    return float(value)
+
+
 def credential_expiry_cap(credential):
     """The latest instant a credential's stored expiry may be honoured, or ``None``.
 
-    ``None`` means no readable issuance stamp, so nothing is capped: a record from before
-    the stamp existed keeps the reader it always had.
+    Measured from the most recent LEGITIMATE WRITE (:func:`credential_written_raw`):
+    issuance, or the last extension. A record without that field - one written before it
+    existed - falls back to its issuance stamp so it still caps. ``None`` means neither
+    stamp is readable, so nothing is capped: a record from before either stamp existed
+    keeps the reader it always had.
     """
-    issued = credential_issued_raw(credential)
-    return None if issued is None else issued + CREDENTIAL_MAX_AGE_SECONDS
+    written = credential_written_raw(credential)
+    if written is None:
+        written = credential_issued_raw(credential)
+    return None if written is None else written + CREDENTIAL_MAX_AGE_SECONDS
 
 
 def credential_age_expired(credential, moment):
     """Whether a credential is past the 366-day read cap (kittrial-5bb.294 item 4).
 
-    ``moment`` is the caller's decision clock, which is never earlier than the raw
-    issuance clock, so this can only ever refuse early: a hand-edited store expiry of
-    years is never honoured beyond the cap.
+    The cap is measured from the most recent legitimate write, not the first issuance
+    (:func:`credential_expiry_cap`), so an owner's latest extension always buys the full
+    configured lifetime. ``moment`` is the caller's decision clock, which is never
+    earlier than the raw clock, so this can only ever refuse early: a hand-edited store
+    expiry of years is never honoured beyond the cap.
     """
     cap = credential_expiry_cap(credential)
     if cap is None:

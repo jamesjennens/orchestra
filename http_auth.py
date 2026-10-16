@@ -1033,9 +1033,12 @@ class Service:
         BOTH its stored monotone expiry and its explicit raw deadline. Default30 keys
         keep issued_raw too. New fields never change worker/session/reset expiry.
 
-        The stored expiry is additionally capped at 366 days from issuance ON READ
-        (kittrial-5bb.294 item 4): a hand-edited store of years is not honoured here, and
-        the same shared cap is applied by the canonical endpoint.
+        The stored expiry is additionally capped at 366 days from the most recent
+        legitimate write ON READ (kittrial-5bb.294 item 4): issuance and every extension
+        stamp ``agent_written_raw``, so a hand-edited store of years is not honoured here
+        and an owner's latest extension always buys its full lifetime. A record without
+        the field falls back to its issuance stamp. The same shared cap is applied by the
+        canonical endpoint.
         """
         if credential_age_expired(credential, moment):
             return True
@@ -1067,7 +1070,7 @@ class Service:
         except (ValueError, OverflowError, OSError):
             raise invalid('Agent credential expiry is outside the representable timestamp range') from None
         result = {'expires_at': expires, 'agent_raw_expires_at': raw_expires,
-                  'agent_issued_raw': raw}
+                  'agent_issued_raw': raw, 'agent_written_raw': raw}
         if self.agent_credential_ttl <= self.credential_ttl:
             result['issued_raw'] = raw
         return result
@@ -2209,11 +2212,13 @@ class Service:
         return answer
 
     def credential_effective_expiry(self, credential):
-        """The stored deadline AS READ: capped at 366 days from issuance (kittrial-5bb.294 item 4).
+        """The stored deadline AS READ, capped from the most recent legitimate write.
 
-        The cap is the shared :func:`http_authority.credential_expiry_cap`. Records with no
-        readable issuance stamp, or no numeric deadline, are returned untouched, so the
-        older legacy reader keeps its meaning.
+        The cap is the shared :func:`http_authority.credential_expiry_cap`: 366 days from
+        ``agent_written_raw`` (issuance or the last extension), falling back to the
+        issuance stamp for a record written before the field existed (kittrial-5bb.294
+        item 4). Records with no readable stamp, or no numeric deadline, are returned
+        untouched, so the older legacy reader keeps its meaning.
         """
         expires = credential.get('expires_at')
         cap = credential_expiry_cap(credential)
@@ -2224,7 +2229,7 @@ class Service:
         return min(float(expires), cap)
 
     def credential_effective_raw_expiry(self, credential):
-        """The raw deadline AS READ, capped at 366 days from issuance (kittrial-5bb.294 item 4)."""
+        """The raw deadline AS READ, capped like :meth:`credential_effective_expiry`."""
         raw = credential.get('agent_raw_expires_at')
         cap = credential_expiry_cap(credential)
         if cap is None or type(raw) is bool or not isinstance(raw, (int, float)):
@@ -3506,6 +3511,11 @@ class Service:
 
         No secret is made or returned; identity, hash, scopes, actor, issuer and grants
         remain unchanged. Existing route transaction owns persistence and rollback.
+
+        The extension is a legitimate write, so it stamps ``agent_written_raw`` with this
+        raw instant (kittrial-5bb.294 item 4). The read cap then measures from here, not
+        from first issuance, and the new expiry is at most ``now + lifetime`` (lifetime is
+        capped at 366 days), so a legitimately extended key is never cut by its own write.
         """
         with self.store.lock:
             agent, credential = self.agent_extension_target(principal, agent_id, credential_id, project_id)
@@ -3526,7 +3536,8 @@ class Service:
                     now_iso(stamp)
             except (ValueError, OverflowError, OSError):
                 raise invalid('Agent credential expiry is outside the representable timestamp range') from None
-            credential.update(expires_at=expires, agent_raw_expires_at=raw_expires)
+            credential.update(expires_at=expires, agent_raw_expires_at=raw_expires,
+                              agent_written_raw=raw)
             if 'agent_issued_raw' not in credential:
                 credential['agent_issued_raw'] = credential.get('issued_raw', raw)
             # An older kit has a fixed raw-age cap: beyond that cap it must use its
