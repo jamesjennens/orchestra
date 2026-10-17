@@ -245,7 +245,7 @@ def _guard_open_dependency_on_claim(root,path,actor,row):
     deps=[]
     ids=[]
     for d in row.get('dependencies') or []:
-        other_id,kind=dependency_ref(d)
+        other_id,kind,_=dependency_ref(d)
         if kind in BLOCKING_DEPENDENCY_TYPES and other_id:
             deps.append(d);ids.append(other_id)
     if not deps:return
