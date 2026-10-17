@@ -9,8 +9,12 @@ command running exactly once, the scheduler wiring, and the sentences in the doc
 the worker prompts that tell a new lane to build and test its waker.
 
 What runs here: the POSIX sh waker under sh, bash and dash, and the launchd plist
-through plistlib. What is reasoned only: wake.ps1 (no PowerShell on this host - the
-parse test skips with that reason) and launchd/systemd/cron/Task Scheduler themselves.
+through plistlib; on a Windows runner that has PowerShell, the same core contract
+through wake.ps1 (PowerShellWakeTests). Where the POSIX waker is not the script that
+runs - os.name == 'nt' - every class that executes wake.sh is skipped by
+posix_waker_only, and SkipLogicTests guards that marker. What is reasoned only:
+wake.ps1 on this host (no PowerShell, so the parse test and PowerShellWakeTests skip
+with that reason) and launchd/systemd/cron/Task Scheduler themselves.
 """
 import json
 import os
@@ -33,6 +37,31 @@ import worker
 SHELL = WAKE / 'wake.sh'
 POWERSHELL = WAKE / 'wake.ps1'
 README = WAKE / 'README.md'
+
+#: wake.sh is the POSIX waker; on Windows the example is wake.ps1, and a test that
+#: runs wake.sh there would be testing a script that host does not run. The review
+#: asked for this exact line, on every test that executes wake.sh (or a copy of it).
+POSIX_SKIP_REASON = 'wake.sh is the POSIX waker; Windows uses wake.ps1'
+
+
+def posix_waker_only(cls):
+    """Skip a class that executes wake.sh where sh is not the script that runs.
+
+    The condition is the review's: os.name == 'nt'. The two markers let SkipLogicTests
+    prove the decorator was applied - removing it from a driver class fails that test -
+    without this host pretending to be Windows.
+    """
+    cls.__posix_waker__ = True
+    cls.__posix_waker_skips_on_windows__ = os.name == 'nt'
+    return unittest.skipIf(os.name == 'nt', POSIX_SKIP_REASON)(cls)
+
+
+#: The PowerShell to run tools/wake/wake.ps1 with, if this host has one. Windows CI
+#: has powershell.exe; this Linux host has neither powershell.exe nor pwsh.
+POWERSHELL_EXE = shutil.which('powershell') or shutil.which('pwsh')
+#: The Windows arm runs only where wake.ps1 can be the script that runs: Windows plus
+#: a PowerShell. Everywhere else PowerShellWakeTests skips, with the reason it gives.
+WINDOWS_POWERSHELL = os.name == 'nt' and bool(POWERSHELL_EXE)
 
 #: What a secret of this service looks like. The example waker must carry none: the
 #: client config is its only credential input.
@@ -221,6 +250,7 @@ class ParseTests(unittest.TestCase):
         self.assertTrue(data['ProgramArguments'][2].endswith('wake.env'))
 
 
+@posix_waker_only
 class FingerprintTests(WakeCase):
     """The state file and the fingerprint: one wake per new fingerprint, never twice."""
 
@@ -306,6 +336,7 @@ class FingerprintTests(WakeCase):
         self.assertEqual(self.calls_made(), [], 'a state it cannot read is refused before any poll')
 
 
+@posix_waker_only
 class LockTests(WakeCase):
     """One instance at a time: a live holder means this run exits, a dead one is taken over."""
 
@@ -370,6 +401,7 @@ class LockTests(WakeCase):
 SETTING_NAMES = (('--state', 'WAKE_STATE'), ('--lock', 'WAKE_LOCK'), ('--log', 'WAKE_LOG'))
 
 
+@posix_waker_only
 class UnsafePathTests(WakeCase):
     """A configured path is refused before anything is created or removed.
 
@@ -500,6 +532,7 @@ class RecursiveRemovalTests(unittest.TestCase):
         self.assertEqual(offenders, [], 'recursive rm on a configured path:\n' + '\n'.join(offenders))
 
 
+@posix_waker_only
 class WakeCommandTests(WakeCase):
     """The wake command is the lane's setting, is required, and runs exactly once per wake."""
 
@@ -562,6 +595,7 @@ class WakeCommandTests(WakeCase):
                     self.assertNotIn(action, call)
 
 
+@posix_waker_only
 class ClientAnswerTests(WakeCase):
     """How a refused or unreachable client ends the run, and the configurable env file."""
 
@@ -627,6 +661,128 @@ class ClientAnswerTests(WakeCase):
                 self.assertEqual(done.returncode, 2, done.stderr)
                 self.assertIn(said, done.stderr)
         self.assertEqual(self.calls_made(), [])
+
+
+@unittest.skipUnless(WINDOWS_POWERSHELL, 'wake.ps1 is the Windows waker; this host has no Windows/PowerShell '
+                                        '(the coordinator ran it by hand on Windows 11 PowerShell 5.1)')
+class PowerShellWakeTests(WakeCase):
+    """The same core contract as FingerprintTests, driven through wake.ps1.
+
+    What runs here: on a Windows runner (os.name == 'nt' with powershell.exe present)
+    this runs tools/wake/wake.ps1 against the fake client: one wake per new
+    fingerprint, no wake for the same state, and the lock released afterwards. What is
+    reasoned only elsewhere: on a POSIX host this class skips with the reason above,
+    because wake.ps1 is not the script that runs there either.
+    """
+
+    def setUp(self):
+        super().setUp()
+        # wake.ps1 runs the command with cmd.exe, so the helper is a batch file. The
+        # path has no quotes in it and Echo writes the same "one" line the POSIX
+        # tests' default wake command writes.
+        self.wake_script = self.dir / 'wake-command.bat'
+        self.wake_script.write_text('@echo one>>"%~dp0wakes.txt"\r\n', encoding='utf-8', newline='')
+
+    def run_powershell(self, *extra):
+        args = [POWERSHELL_EXE, '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+                '-File', str(POWERSHELL),
+                '-Python', sys.executable,
+                '-Client', str(self.client),
+                '-Config', str(self.config),
+                '-Project', 'sample-project',
+                '-Actor', 'sample/actor',
+                '-Wake', str(self.wake_script),
+                '-State', str(self.state),
+                '-Lock', str(self.lock),
+                '-Log', str(self.log),
+                '-Timeout', '5']
+        args.extend(extra)
+        return subprocess.run(args, capture_output=True, text=True, timeout=120, env=self.env)
+
+    def log_lines_ps(self):
+        # Windows PowerShell 5.1's Add-Content -Encoding UTF8 writes a BOM; 7 does not.
+        if not self.log.exists():
+            return []
+        return self.log.read_text(encoding='utf-8-sig').splitlines()
+
+    def test_a_new_fingerprint_wakes_once_the_same_state_does_not_and_the_lock_is_released(self):
+        first = self.scenario_for(1)
+        done = self.run_powershell()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(self.wake_lines(), ['one'])
+        self.assertEqual(self.state_text(), first)
+        self.assertEqual(len(self.log_lines_ps()), 1, self.log_lines_ps())
+        self.assertIn('fingerprint=' + first, self.log_lines_ps()[0])
+        self.assertIn('items=1', self.log_lines_ps()[0])
+        self.assertIn('result=ok', self.log_lines_ps()[0])
+        self.assertFalse(self.lock.exists(), 'a finished run must release the wake.ps1 lock')
+
+        # The same fingerprint: the fake client sees --since and times out (exit 1),
+        # so wake.ps1 must end normally and never run the command again.
+        done = self.run_powershell()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(self.wake_lines(), ['one'], 'the same state must not wake the lane again')
+        self.assertEqual(len(self.log_lines_ps()), 1)
+        self.assertEqual(self.state_text(), first)
+        self.assertFalse(self.lock.exists())
+
+        second = self.scenario_for(2)
+        done = self.run_powershell()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(self.wake_lines(), ['one', 'one'], 'one wake per new fingerprint')
+        self.assertEqual(self.state_text(), second)
+        self.assertEqual(len(self.log_lines_ps()), 2)
+        self.assertIn('fingerprint=' + second, self.log_lines_ps()[1])
+        self.assertFalse(self.lock.exists())
+
+
+class SkipLogicTests(unittest.TestCase):
+    """The POSIX waker's tests are skipped on Windows, and this is how that is known.
+
+    This host is Linux, so no test here pretends to run Windows. The marker is checked
+    directly instead: posix_waker_only calls unittest.skipIf(os.name == 'nt', ...) and
+    records that it did, so removing the decorator from a class that executes wake.sh
+    fails test_every_wake_sh_driving_class_is_marked_posix_only.
+    """
+
+    #: Every class whose tests execute wake.sh, directly or through a copy. Listed from
+    #: the call sites: self.run_wake (and script_args/Popen for the two-run test) in
+    #: every class below, plus the direct subprocess.run of wake.sh in the env-file test
+    #: (ClientAnswerTests) and of a copy in the empty-environment-value test
+    #: (UnsafePathTests). ParseTests only parses the script with sh -n, and
+    #: SchedulerTests, TextTests and RecursiveRemovalTests only read it, so none of
+    #: those three executes it.
+    DRIVERS = (FingerprintTests, LockTests, UnsafePathTests, WakeCommandTests, ClientAnswerTests)
+
+    def test_every_wake_sh_driving_class_is_marked_posix_only(self):
+        for cls in self.DRIVERS:
+            with self.subTest(cls=cls.__name__):
+                self.assertTrue(getattr(cls, '__posix_waker__', False),
+                                '%s executes wake.sh and must carry posix_waker_only' % cls.__name__)
+                self.assertIs(cls.__posix_waker_skips_on_windows__, os.name == 'nt')
+
+    def test_the_marker_skips_exactly_as_the_review_asked(self):
+        self.assertEqual(POSIX_SKIP_REASON, 'wake.sh is the POSIX waker; Windows uses wake.ps1')
+        # The decorator's behaviour where its condition holds - what a Windows job gets,
+        # since the condition it was given is os.name == 'nt'. On Windows the marker
+        # sets both of these on every class above; here the condition is false, so the
+        # probe below shows the same skip mechanism with the condition true.
+        probe = unittest.skipIf(True, POSIX_SKIP_REASON)(type('Probe', (unittest.TestCase,), {}))
+        self.assertIs(probe.__unittest_skip__, True)
+        self.assertEqual(probe.__unittest_skip_why__, POSIX_SKIP_REASON)
+
+        # A class that does not execute wake.sh is not marked: the marker means the
+        # decorator was applied, not that a class happens to be named in a list.
+        self.assertFalse(getattr(ParseTests, '__posix_waker__', False))
+        self.assertFalse(getattr(PowerShellWakeTests, '__posix_waker__', False))
+
+    def test_the_windows_arm_skips_where_powershell_is_absent(self):
+        skipped = getattr(PowerShellWakeTests, '__unittest_skip__', False)
+        if WINDOWS_POWERSHELL:
+            self.assertIs(skipped, False, 'the Windows arm must run on Windows with PowerShell')
+        else:
+            self.assertIs(skipped, True, 'the Windows arm must skip where it cannot run')
+            self.assertIn('PowerShell', PowerShellWakeTests.__unittest_skip_why__)
 
 
 class SchedulerTests(unittest.TestCase):
