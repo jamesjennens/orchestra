@@ -324,6 +324,9 @@ CAP_APPROVE = 'reviews.approve'
 #: member or an agent can propose. Triage and decisions need CAP_APPROVE, which no
 #: credential ever holds.
 CAP_PROPOSALS = 'proposals.write'
+#: Propose or revise reference and capability records (.201 slice 5, kittrial-5bb.213).
+#: Contributors, coordinators and owners hold it, and the `tasks` credential scope grants it.
+CAP_RECORDS = 'records'
 #: What a project's coordinator may do beyond approving (slice 1b of docs/WEB_COORDINATOR_DESIGN.md,
 #: kittrial-5bb.209). Web merge-slot acquire/release use it; lifecycle facts follow separately.
 CAP_COORDINATE = 'coordinate'
@@ -353,6 +356,7 @@ RANK = {'viewer': 0, 'contributor': 1, 'coordinator': 2, 'owner': 3}
 SCOPE_CAPABILITIES = {
     'read': frozenset({CAP_READ}),
     'tasks': frozenset({CAP_TASKS}),
+    'records': frozenset({CAP_RECORDS}),
     'checkpoints': frozenset({CAP_CHECKPOINTS}),
     'reviews': frozenset({CAP_REVIEWS}),
     'feedback': frozenset({CAP_FEEDBACK}),
@@ -364,17 +368,18 @@ CREDENTIAL_SCOPES = tuple(sorted(SCOPE_CAPABILITIES))
 
 ROLE_CAPABILITIES = {
     'viewer': frozenset({CAP_READ}),
-    'contributor': frozenset({CAP_READ, CAP_TASKS, CAP_CHECKPOINTS, CAP_REVIEWS, CAP_FEEDBACK,
-                              CAP_PROPOSALS}),
+    'contributor': frozenset({CAP_READ, CAP_TASKS, CAP_RECORDS, CAP_CHECKPOINTS, CAP_REVIEWS,
+                              CAP_FEEDBACK, CAP_PROPOSALS}),
     # Between contributor and owner: approves and coordinates; does not administer the
     # project (members, worker credentials, archive and the audit stay the owner's).
-    'coordinator': frozenset({CAP_READ, CAP_TASKS, CAP_CHECKPOINTS, CAP_REVIEWS, CAP_FEEDBACK,
-                              CAP_PROPOSALS, CAP_APPROVE, CAP_COORDINATE}),
-    'owner': frozenset({CAP_READ, CAP_TASKS, CAP_CHECKPOINTS, CAP_REVIEWS, CAP_FEEDBACK,
-                        CAP_PROPOSALS, CAP_APPROVE, CAP_COORDINATE, CAP_PROJECT_ADMIN}),
+    'coordinator': frozenset({CAP_READ, CAP_TASKS, CAP_RECORDS, CAP_CHECKPOINTS, CAP_REVIEWS,
+                              CAP_FEEDBACK, CAP_PROPOSALS, CAP_APPROVE, CAP_COORDINATE}),
+    'owner': frozenset({CAP_READ, CAP_TASKS, CAP_RECORDS, CAP_CHECKPOINTS, CAP_REVIEWS,
+                        CAP_FEEDBACK, CAP_PROPOSALS, CAP_APPROVE, CAP_COORDINATE,
+                        CAP_PROJECT_ADMIN}),
 }
 #: What the coordinator grant adds to an agent's credential in the project of the grant.
-GRANT_CAPABILITIES = frozenset({CAP_APPROVE, CAP_COORDINATE})
+GRANT_CAPABILITIES = frozenset({CAP_APPROVE, CAP_COORDINATE, CAP_RECORDS})
 CREDENTIAL_FORBIDDEN_CAPABILITIES = frozenset({CAP_APPROVE, CAP_PROJECT_ADMIN,
                                                CAP_PROJECT_CREATE, CAP_ACCOUNTS_ADMIN,
                                                CAP_AGENTS})
@@ -2476,6 +2481,12 @@ BLOCK_CAPABILITIES = {
     'proposal': {'submit': CAP_PROPOSALS, 'revise': CAP_PROPOSALS,     # proposals.submit
                  'review': CAP_APPROVE,                               # proposals.dispose, triage
                  'decide': CAP_PROJECT_ADMIN},                        # proposals.dispose, the owner decision
+    'ref': {'propose': CAP_RECORDS, 'revise': CAP_RECORDS,
+            'accept': CAP_COORDINATE, 'retire': CAP_COORDINATE},
+    'capability': {'propose': CAP_RECORDS, 'revise': CAP_RECORDS,
+                   'propose-alias': CAP_RECORDS, 'verify': CAP_RECORDS,
+                   'accept': CAP_COORDINATE, 'retire': CAP_COORDINATE,
+                   'reject-alias': CAP_COORDINATE, 'web-verify': CAP_COORDINATE},
 }
 
 
@@ -2500,6 +2511,10 @@ def required_capability(request):
         if len(args) != 1:
             return None
         item = {'text': args[0]}
+    elif action in ('ref', 'capability'):
+        if len(args) < 2:
+            return None
+        return needed.get(args[0])
     elif action != 'review':
         return needed.get(args[0])
     else:
@@ -2630,7 +2645,9 @@ def run_guarded(request, journal_path, effect, authority_config=None,
             try:
                 identity_check()
             except ValueError as denied:
-                return _envelope(2, stderr=str(denied) + '\n')
+                status = getattr(denied, 'status', None)
+                return _envelope(2, stderr=str(denied) + '\n',
+                                 **({'records_status': status} if isinstance(status, int) else {}))
         journal = (OperationJournal(journal_path, **(journal_options or {}))
                    if operation_id else None)
         # The principal half of the identity comes from the request descriptor only

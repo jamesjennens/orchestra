@@ -2180,18 +2180,23 @@ At deploy time, list the projects that already use an `open-item` label: `python
   - Re-adding the operator restores both. There is no other repair yet: `void-record` accepts reference and capability records (kittrial-5bb.74), but not proposal or settings records. Until then the submitter can submit a new proposal that supersedes the stuck one.
 - **After a restore,** re-check `operators list` and `proposal-settings` before recording anything: both the allowlist and the actor map decide what counts.
 
-**Acceptance evidence trusts the comment's native author.** A reference entry reads
-accepted when its acceptance evidence comment was written by an actor on the operator
-allowlist. Over SSH a comment's author is the actor the caller declared, so what stops
-a contributor writing such a comment is the reserved-prefix guard (the shared slice 0),
-not the author field.
+**Acceptance evidence trusts the comment's native author.** A reference or capability entry
+reads accepted (or superseded) when its acceptance evidence comment was written by an actor on
+the operator allowlist, or through the web service by a member holding `coordinate` (`usr_<16hex>`
+or `agent_<16hex>`, see [HTTP deployment](HTTP_DEPLOYMENT.md#reference-and-capability-records-over-http)).
+Over SSH a comment's author is the actor the caller declared, so what stops a contributor
+writing such a comment is the reserved-prefix guard (the shared slice 0) and the endpoint's
+refusal of the `usr_`/`agent_` actor namespace without a verified web authority block, not the
+author field alone.
 
 - **Residual risk.** A `Kind: reference-acceptance-v1` comment written on a kit older
   than the shared slice 0, or during a rollback below it, under an operator's actor
   name, would read as a real acceptance. The same applies to the other record kinds.
 - **Why acceptance is not bound to the host receipt.** Reading an accepted entry must
   not depend on a local journal: a restore may lose `.reference-requests/`, and the
-  evidence comment has to remain the authority.
+  evidence comment has to remain the authority. Likewise, an acceptance, retirement or
+  capability verification written by a web coordinator stays live if that member's role or
+  agent grant is later removed; removing the role or grant stops their next write (`403`).
 - **Before the first use of the catalog on an installation,** and after any rollback
   below the shared slice 0, scan each project for record comments that no writer of
   this kit made. Save `bd export --all` for the project as `export.jsonl`, then run:
@@ -2707,6 +2712,21 @@ from `bd export --all`, as in the scan above.
   up (kittrial-5bb.92 review `order-check-limits-and-rollback`). No sidecar path is
   added, so backups restore on either kit, and rolling forward restores the repair with
   nothing to clean up.
+- **Web coordinator acceptance and capability attestation (kittrial-5bb.213).**
+  Acceptance evidence (`Kind: reference-acceptance-v1`, `Kind: capability-acceptance-v1`)
+  and capability verification attestations (`Kind: capability-verification-v1` with
+  `submitter.identity: "attested"` and a non-zero 40-hex `commit`) recorded by a web
+  coordinator (`usr_<16hex>` or `agent_<16hex>`) stay live if that coordinator is later
+  demoted or has their agent's coordinator grant removed (`acceptance_inert: false`,
+  `verification_state: "attested"`), while their next coordinator write or replay is
+  refused (`403`). Keeping an attestation's `attested` label after author demotion or
+  grant removal is safe because it is honestly labelled `attested` (`trusted: false`,
+  `checkout_validated: false`) and never clears a trusted host failure (`drifted`): only a
+  trusted `admin.py capability-verify --repo <PATH>` pass (`submitter.identity:
+  "verified"`) at an integrated commit clears an open failure. On rollback to a kit before
+  kittrial-5bb.213, an agent whose stored `scopes` or working credentials include
+  `'records'` reads as `scopes_source: "unknown"` (`scopes: null`) on that older kit until
+  an explicit scope list recognized by the older kit is set.
 - **Limits.** A record of a version this kit does not read (`Kind: reference-entry-v4`,
   `Kind: capability-entry-v2`) or of an unknown kind of the family cannot be a void
   target: the target must claim a prefix this kit reads for the declared kind (v1, and

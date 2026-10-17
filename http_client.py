@@ -561,6 +561,109 @@ class Client:
         return self.request('GET', '/v1/projects/%s/audit%s'
                             % (quote(project, safe=''), _query(limit, cursor)))
 
+    # -- reference and capability records -------------------------------------
+    def _write_record(self, method, path, body, key=None):
+        identity = key or new_idempotency_key()
+        try:
+            return self.request(method, path, body, key=identity)
+        except OSError:
+            raise UncertainOutcome(0, 'uncertain', 'Connection lost; reconcile the identical record request',
+                                   None, None, identity) from None
+
+    def list_references(self, project, *, tag=None, owner=None, state=None, due=None,
+                        authority=None, waiting=False, limit=None, cursor=None):
+        params = {}
+        if tag:
+            params['tag'] = tag if isinstance(tag, str) else ','.join(tag)
+        for name, val in (('owner', owner), ('state', state), ('due', due), ('authority', authority)):
+            if val:
+                params[name] = val
+        if waiting:
+            params['waiting'] = '1'
+        if limit is not None:
+            params['limit'] = str(limit)
+        if cursor is not None:
+            params['cursor'] = cursor
+        qs = ('?' + urlencode(params)) if params else ''
+        return self.request('GET', '/v1/projects/%s/references%s' % (quote(project, safe=''), qs))
+
+    def find_references(self, project, q, limit=5):
+        qs = '?' + urlencode({'q': q, 'limit': str(limit)})
+        return self.request('GET', '/v1/projects/%s/references/find%s' % (quote(project, safe=''), qs))
+
+    def get_reference(self, project, ref_key):
+        return self.request('GET', '/v1/projects/%s/references/%s'
+                            % (quote(project, safe=''), quote(ref_key, safe='')))
+
+    def propose_reference(self, project, body, key=None):
+        return self._write_record('POST', '/v1/projects/%s/references' % quote(project, safe=''), body, key)
+
+    def revise_reference(self, project, ref_key, body, key=None):
+        return self._write_record('PATCH', '/v1/projects/%s/references/%s'
+                                  % (quote(project, safe=''), quote(ref_key, safe='')), body, key)
+
+    def accept_reference(self, project, ref_key, body, key=None):
+        return self._write_record('POST', '/v1/projects/%s/references/%s/accept'
+                                  % (quote(project, safe=''), quote(ref_key, safe='')), body, key)
+
+    def retire_reference(self, project, ref_key, body, key=None):
+        return self._write_record('POST', '/v1/projects/%s/references/%s/retire'
+                                  % (quote(project, safe=''), quote(ref_key, safe='')), body, key)
+
+    def list_capabilities(self, project, *, tag=None, owner=None, state=None,
+                          pointers=False, waiting=False, limit=None, cursor=None):
+        params = {}
+        if tag:
+            params['tag'] = ','.join(tag) if isinstance(tag, (list, tuple)) else str(tag)
+        for name, val in (('owner', owner), ('state', state)):
+            if val:
+                params[name] = val
+        if pointers:
+            params['pointers'] = '1'
+        if waiting:
+            params['waiting'] = '1'
+        if limit is not None:
+            params['limit'] = str(limit)
+        if cursor is not None:
+            params['cursor'] = cursor
+        qs = ('?' + urlencode(params)) if params else ''
+        return self.request('GET', '/v1/projects/%s/capabilities%s' % (quote(project, safe=''), qs))
+
+    def find_capabilities(self, project, q, limit=5):
+        qs = '?' + urlencode({'q': q, 'limit': str(limit)})
+        return self.request('GET', '/v1/projects/%s/capabilities/find%s' % (quote(project, safe=''), qs))
+
+    def get_capability(self, project, cap_key):
+        return self.request('GET', '/v1/projects/%s/capabilities/%s'
+                            % (quote(project, safe=''), quote(cap_key, safe='')))
+
+    def propose_capability(self, project, body, key=None):
+        return self._write_record('POST', '/v1/projects/%s/capabilities' % quote(project, safe=''), body, key)
+
+    def revise_capability(self, project, cap_key, body, key=None):
+        return self._write_record('PATCH', '/v1/projects/%s/capabilities/%s'
+                                  % (quote(project, safe=''), quote(cap_key, safe='')), body, key)
+
+    def accept_capability(self, project, cap_key, body, key=None):
+        return self._write_record('POST', '/v1/projects/%s/capabilities/%s/accept'
+                                  % (quote(project, safe=''), quote(cap_key, safe='')), body, key)
+
+    def retire_capability(self, project, cap_key, body, key=None):
+        return self._write_record('POST', '/v1/projects/%s/capabilities/%s/retire'
+                                  % (quote(project, safe=''), quote(cap_key, safe='')), body, key)
+
+    def verify_capability(self, project, cap_key, body, key=None):
+        return self._write_record('POST', '/v1/projects/%s/capabilities/%s/verify'
+                                  % (quote(project, safe=''), quote(cap_key, safe='')), body, key)
+
+    def propose_capability_alias(self, project, cap_key, body, key=None):
+        return self._write_record('POST', '/v1/projects/%s/capabilities/%s/aliases'
+                                  % (quote(project, safe=''), quote(cap_key, safe='')), body, key)
+
+    def reject_capability_alias(self, project, cap_key, body, key=None):
+        return self._write_record('POST', '/v1/projects/%s/capabilities/%s/aliases/reject'
+                                  % (quote(project, safe=''), quote(cap_key, safe='')), body, key)
+
 
 def new_idempotency_key():
     """A fresh key; keep it to retry an uncertain mutation exactly."""
@@ -637,6 +740,37 @@ def _build_parser():
     life.add_argument('--dimension', choices=('implemented','tested','reviewed','integrated','deployed','live-verified'))
     life.add_argument('--file', help='UTF-8 JSON HTTP request body for scope or fact')
     life.add_argument('--idempotency-key', help='reuse exactly this key and body after an uncertain result')
+    ref = sub.add_parser('ref', help='read or mutate project reference records')
+    ref.add_argument('project')
+    ref.add_argument('operation', choices=('list', 'find', 'get', 'propose', 'revise', 'accept', 'retire'))
+    ref.add_argument('--key', dest='record_key', help='reference key for get/revise/accept/retire')
+    ref.add_argument('--q', help='search phrase for find')
+    ref.add_argument('--tag', action='append', default=[], help='filter by tag (repeatable)')
+    ref.add_argument('--owner')
+    ref.add_argument('--state')
+    ref.add_argument('--due')
+    ref.add_argument('--authority')
+    ref.add_argument('--waiting', action='store_true', help='only records waiting to be accepted')
+    ref.add_argument('--limit', type=int)
+    ref.add_argument('--cursor')
+    ref.add_argument('--file', help='UTF-8 JSON HTTP request body for mutations')
+    ref.add_argument('--idempotency-key', help='reuse exactly this key and body after an uncertain result')
+    cap = sub.add_parser('capability', help='read or mutate project capability records')
+    cap.add_argument('project')
+    cap.add_argument('operation', choices=(
+        'list', 'find', 'get', 'propose', 'revise', 'accept', 'retire', 'verify',
+        'propose-alias', 'reject-alias'))
+    cap.add_argument('--key', dest='record_key', help='capability key')
+    cap.add_argument('--q', help='search phrase for find')
+    cap.add_argument('--tag', action='append', default=[], help='filter by tag (repeatable)')
+    cap.add_argument('--owner')
+    cap.add_argument('--state')
+    cap.add_argument('--pointers', action='store_true', help='include pointers in list output')
+    cap.add_argument('--waiting', action='store_true', help='only records waiting to be accepted')
+    cap.add_argument('--limit', type=int)
+    cap.add_argument('--cursor')
+    cap.add_argument('--file', help='UTF-8 JSON HTTP request body for mutations')
+    cap.add_argument('--idempotency-key', help='reuse exactly this key and body after an uncertain result')
     call = sub.add_parser('call', help='issue one raw JSON request')
     call.add_argument('method')
     call.add_argument('path')
@@ -712,6 +846,71 @@ def main(argv=None):
                 result = client._write_lifecycle(args.project, args.task, args.operation, body,
                                                  args.idempotency_key, args.dimension)
             print(json.dumps(result, indent=2));return 0
+        if args.command == 'ref':
+            op = args.operation
+            if op == 'list':
+                result = client.list_references(
+                    args.project, tag=args.tag, owner=args.owner, state=args.state,
+                    due=args.due, authority=args.authority, waiting=args.waiting,
+                    limit=args.limit, cursor=args.cursor)
+            elif op == 'find':
+                if not args.q:
+                    parser.error('find requires --q')
+                result = client.find_references(args.project, args.q, args.limit or 5)
+            elif op == 'get':
+                if not args.record_key:
+                    parser.error('get requires --key')
+                result = client.get_reference(args.project, args.record_key)
+            else:
+                if not args.file:
+                    parser.error('%s requires --file' % op)
+                body = _lifecycle_body_file(args.file)
+                if op == 'propose':
+                    result = client.propose_reference(args.project, body, args.idempotency_key)
+                else:
+                    rk = args.record_key or body.pop('key', None)
+                    if not rk:
+                        parser.error('%s requires --key or key in body' % op)
+                    fn = getattr(client, op + '_reference')
+                    result = fn(args.project, rk, body, args.idempotency_key)
+            print(json.dumps(result, indent=2))
+            return 0
+        if args.command == 'capability':
+            op = args.operation
+            if op == 'list':
+                result = client.list_capabilities(
+                    args.project, tag=args.tag, owner=args.owner, state=args.state,
+                    pointers=args.pointers, waiting=args.waiting,
+                    limit=args.limit, cursor=args.cursor)
+            elif op == 'find':
+                if not args.q:
+                    parser.error('find requires --q')
+                result = client.find_capabilities(args.project, args.q, args.limit or 5)
+            elif op == 'get':
+                if not args.record_key:
+                    parser.error('get requires --key')
+                result = client.get_capability(args.project, args.record_key)
+            else:
+                if not args.file:
+                    parser.error('%s requires --file' % op)
+                body = _lifecycle_body_file(args.file)
+                if op == 'propose':
+                    result = client.propose_capability(args.project, body, args.idempotency_key)
+                else:
+                    rk = args.record_key or body.pop('key', None)
+                    if not rk:
+                        parser.error('%s requires --key or key in body' % op)
+                    method_map = {
+                        'revise': client.revise_capability,
+                        'accept': client.accept_capability,
+                        'retire': client.retire_capability,
+                        'verify': client.verify_capability,
+                        'propose-alias': client.propose_capability_alias,
+                        'reject-alias': client.reject_capability_alias,
+                    }
+                    result = method_map[op](args.project, rk, body, args.idempotency_key)
+            print(json.dumps(result, indent=2))
+            return 0
         if args.credential:
             client.use_credential(args.credential)
         body = json.loads(args.body) if args.body else None
