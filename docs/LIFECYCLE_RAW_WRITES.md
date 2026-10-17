@@ -7,7 +7,9 @@ lifecycle state events, including through `close` and `reopen`, or add, remove,
 replace or inherit their reserved labels.
 Raw `update` cannot change **any** row to or from `event`, including an ordinary
 task or event with no lifecycle content. Existing rows cannot be made ephemeral:
-native exports omit ephemeral rows. Ordinary event creation stays allowed;
+a plain native export (`bd export` without `--all`) omits ephemeral rows, so a
+lifecycle row would vanish from any read that uses one - this kit's own exports
+all pass `--all`, which keeps it (kittrial-5bb.260 F2). Ordinary event creation stays allowed;
 closing a task with facts stays allowed and its facts stay readable.
 Native status changes to `open`, `in_progress`, `blocked`, `deferred` and
 `closed`, `--defer` and `--persistent` also keep the task's facts readable.

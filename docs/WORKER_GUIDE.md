@@ -385,7 +385,9 @@ assertions and corrections. Creating a lifecycle-shaped event directly,
 changing any row to or from `event`, changing an existing lifecycle event or
 inheriting/replacing its labels is refused before native writes. Ordinary event
 creation stays allowed. An update that makes an existing row ephemeral is
-refused because it would disappear from native exports. To create a child
+refused because a plain native export (without `--all`) omits ephemeral rows,
+so the row would disappear from any read that uses one - the kit's own exports
+all pass `--all` and would still see it (kittrial-5bb.260 F2). To create a child
 under a scoped task, pass `--no-inherit-labels`: the child must not inherit
 the parent's lifecycle scope or facts. The boundary stays active independently of
 optional workflow rules. Ordinary prose and legacy `review-ready`/`reviewed`

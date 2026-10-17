@@ -1981,7 +1981,9 @@ replacement are refused before native writes, independently of optional policy
 rules. Ordinary event creation and task prose remain writable. Contributor raw
 updates cannot change a row to or from `event`, even without lifecycle content:
 that would change which tasks the readers include. Making an existing row
-ephemeral is also refused because native exports omit it. Create a child of a
+ephemeral is also refused because a plain native export (without `--all`) omits
+ephemeral rows, so the row would disappear from any read that uses one; the kit's
+own exports all pass `--all` and keep it (kittrial-5bb.260 F2). Create a child of a
 scoped task with `--no-inherit-labels`; inherited lifecycle labels are refused.
 Type membership alone never makes readable event content a trusted fact. Configured operators
 and structured host writers keep their existing routes and legacy readers.

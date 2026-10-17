@@ -318,6 +318,11 @@ def _bd_read(root,path,actor,argv,resolver_absence=False,strict=False):
     said=(p.stderr or '').strip()
     if not (p.stdout or '').strip():
         if p.returncode and 'no issue found' in said:
+            # kittrial-5bb.260 (mutants): this branch and the no-match-object branch
+            # below are REDUNDANT layers by design - one answer shape comes on stderr
+            # with no stdout, the other as the resolver's rc-1 object on stdout - and
+            # nothing pins them separately because they fail closed together in the
+            # native tests; a change to one must keep its sibling in step.
             return [],said                      # bd's own "that id does not exist" answer
         if p.returncode:
             return None,'bd could not read the tasks (%s)'%(said[-200:] or 'exit %d'%p.returncode)
@@ -336,6 +341,13 @@ def _bd_read(root,path,actor,argv,resolver_absence=False,strict=False):
     rows=[answer] if isinstance(answer,dict) else answer
     if not isinstance(rows,list):return None,'bd gave an unreadable answer'
     if strict and any(not isinstance(row,dict) or not isinstance(row.get('id'),str) for row in rows):
+        if resolver_answer and p.returncode==1:
+            # kittrial-5bb.260 F1: bd's exact no-match object at rc 1 is an ABSENCE, not
+            # a failed read - reading it as absence here (exactly as the create --id
+            # existence check below does) lets _resolve_rows name the token in its
+            # refusal instead of answering 'an incomplete answer'. The guarded write
+            # still refuses; only the sentence changes.
+            return [],said
         return None,'bd gave an incomplete answer'
     rows=[row for row in rows if isinstance(row,dict) and isinstance(row.get('id'),str)]
     if p.returncode and not rows and 'no issue found' not in said and not (resolver_absence and resolver_answer and p.returncode==1):
@@ -423,7 +435,11 @@ def _guard_named_rows(root,path,name,args,attachments,actor,strict=False):
     if not request['targets']:return
     rows,problem=_resolve_rows(root,path,actor,request['targets'],strict=strict)
     if problem:
-        advice=(' '+raw_lifecycle.ADVICE) if strict else ''
+        # kittrial-5bb.260 F1: a RESOLUTION problem (a mistyped or ambiguous id) gets no
+        # lifecycle advice - naming the token is the whole remedy for a typo; the advice
+        # stays on every other strict problem, where the dedicated lifecycle action is.
+        resolution=('does not name exactly one task' in problem or 'is not a task id' in problem)
+        advice=(' '+raw_lifecycle.ADVICE) if strict and not resolution else ''
         refusal=raw_lifecycle.Refusal if strict else ValueError
         raise refusal('Refusing %s: %s, so the rows this would write are not known. Name each task by its id. Nothing was written.%s'%(command,problem,advice))
     slot=name+MERGE_SLOT_SUFFIX
