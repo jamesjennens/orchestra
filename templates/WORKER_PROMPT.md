@@ -170,6 +170,15 @@ and whenever a wait begins, so `work lanes` shows the board and flags a wait tha
 too long. Do not merge, deploy, edit another
 worker's checkout or create tasks to stay busy. Leave the task open awaiting review.
 
+Build and test your waker before you rely on being woken. The kit's `tools/wake/`
+directory holds example poll-and-wake scripts for Linux, macOS and Windows: each runs
+`client.py wait --since FINGERPRINT` and then ONE wake command you fill in - the thing
+that starts a new turn of your harness. Copy the script for your platform into your own
+private directory, set its one wake command, and test it once: show that it woke you.
+Record in a checkpoint how you are woken. A lane must not end its turn to wait without a
+waker; if your harness cannot be woken, say so in one line instead of promising to wait.
+`docs finding-work` has the contract, the scheduler files and example wake commands.
+
 After delivery, use only the mode authorized for this worker:
 
 - **Loop-capable harness:** only if the harness and project explicitly allow it,

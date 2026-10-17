@@ -145,14 +145,24 @@ def guard(args, attachments, read):
         if parents and not (inherit and _parse_go_bool(inherit[-1]) is True):
             for parent in checked_rows(read, parents):
                 if any(reserved_label(v) for v in (parent.get('labels') or [])):
-                    refuse('inheriting lifecycle labels requires --no-inherit-labels')
+                    # kittrial-5bb.260 F1: the flag is the whole remedy, so the sentence
+                    # ends with the flag - no lifecycle advice on this one.
+                    raise Refusal('Reserved lifecycle namespace: inheriting lifecycle labels '
+                                  'requires --no-inherit-labels. Re-run with --no-inherit-labels.')
+
         return
 
     if not operands:
         refuse('the task to update is not named')
     ephemeral = [value for name, value in flags if name == '--ephemeral']
     if ephemeral and _parse_go_bool(ephemeral[-1]) is not False:
-        refuse('making an existing row ephemeral would hide it from native exports')
+        # kittrial-5bb.260 F2: the OLD reason was false - the kit's own exports all pass
+        # --all, which KEEPS ephemeral rows. The refusal stands (the coordinator's
+        # decision) with the true reason: a plain bd export omits the row, so a reader
+        # or tool that reads one would no longer find a lifecycle row there.
+        refuse('making an existing row ephemeral omits it from the plain native exports '
+               '(bd export without --all); this kit\'s own reads all pass --all and would '
+               'still see it, but a plain export\'s reader would not')
     references = write_targets(args, attachments)
     if references['refusal']:
         refuse('the affected rows cannot be resolved')

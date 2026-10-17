@@ -695,6 +695,53 @@ class ReleaseCommandTests(unittest.TestCase):
         self.assertEqual(store.facts('trial-b')['live'], 'superseded')
         self.assertEqual(store.facts('trial-b')['facts']['deployed']['value'], 'unknown')
 
+    def test_the_dry_run_applies_the_configured_operators_to_an_unreadable_chain(self):
+        # kittrial-5bb.297 review item (b): the offline dry run reads the configured
+        # operators from the config's runtime root, so an operator void that repairs
+        # a chain is applied - the skip says the hold it revealed, not 'unreadable'.
+        # Without a readable root the old tolerance holds: no operators, a warning,
+        # and the unreadable skip.
+        import recovery
+        from requirements import canonical_bytes
+        import review_workflow as rw
+        store = NativeStore().seed('trial-a')
+        add_review_chain(store, 'trial-a', approve=True, hold=True)
+        row = next(item for item in store.rows if item['id'] == 'trial-a')
+        broken = dict(id='broken-1', text=rw.PREFIX + '{"broken": not json', author=ACTOR,
+                      created_at='2026-09-16T00:00:00Z')
+        row['comments'].append(broken)
+        void = dict(schema_version=1, operation='void-record', operation_id='void-broken-dry',
+                    task='trial-a', target='broken-1', target_kind='contribution-review',
+                    target_sha256=recovery.digest(broken['text']), original=broken['text'],
+                    reason='Repairing', disposition='void', operator=OPERATOR)
+        row['comments'].append(dict(id='void-1', text=recovery.PREFIX + canonical_bytes(void).decode(),
+                                    author=OPERATOR, created_at='2026-09-16T00:01:00Z'))
+        client = types.ModuleType('client')
+        client.request = lambda *args, **kwargs: {'returncode': 0, 'stdout': '{}', 'stderr': ''}
+        with scratch() as root:
+            runtime = Path(root) / 'runtime'
+            runtime.mkdir()
+            (runtime / 'deployment.private.json').write_text(
+                json.dumps({'operators': [OPERATOR]}), encoding='utf-8')
+            config = Path(root) / 'client.json'
+            config.write_text(json.dumps({'root': str(runtime)}), encoding='utf-8')
+            export = Path(root) / 'issues.jsonl'
+            export.write_text(''.join(json.dumps(item) + '\n' for item in store.rows), encoding='utf-8')
+            request = Path(root) / 'release.json'
+            request.write_text(json.dumps(release_payload([], live_verified=True)), encoding='utf-8')
+            argv = ['lifecycle.py', 'release', '--config', str(config), '--project', 'example',
+                    '--actor', ACTOR, '--file', str(request), '--export', str(export),
+                    '--repo', str(root), '--journal', str(root), '--dry-run']
+            report = json.loads(self.run_cli(argv, client))
+            reasons = ' '.join(item['reason'] for item in report['skipped'])
+            self.assertIn('held from integration', reasons)
+            self.assertNotIn('unreadable hold chain', reasons)
+            # The old tolerance: a config without a root degrades to no operators.
+            config.write_text('{}', encoding='utf-8')
+            report = json.loads(self.run_cli(argv, client))
+            reasons = ' '.join(item['reason'] for item in report['skipped'])
+            self.assertIn('unreadable hold chain', reasons)
+
     def test_dry_run_prints_the_selection_and_never_contacts_the_endpoint(self):
         store = NativeStore().seed('trial-a').seed('trial-b', integration=MERGE_B, source=SOURCE_B)
         calls = []

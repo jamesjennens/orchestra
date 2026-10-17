@@ -55,8 +55,17 @@ class RawLifecycleTests(unittest.TestCase):
 
     def test_inheritance_replacement_and_legacy_labels(self):
         holder = row(labels=['reviewed:passed', 'review-ready'])
-        self.rejected(['create', 'child', '--parent=pp-task'], rows=[holder])
-        self.rejected(['create', 'child', '--parent=pp-task', '--no-inherit-labels=false'], rows=[holder])
+        # kittrial-5bb.260 F1: the inheritance refusal ends with the flag - the whole
+        # remedy - and carries no lifecycle advice.
+        for args in (['create', 'child', '--parent=pp-task'],
+                     ['create', 'child', '--parent=pp-task', '--no-inherit-labels=false']):
+            with self.subTest(args=args):
+                with self.assertRaises(ValueError) as refused:
+                    self.guard(args, rows=[holder])
+                sentence = str(refused.exception)
+                self.assertIn('inheriting lifecycle labels requires --no-inherit-labels.'
+                              ' Re-run with --no-inherit-labels.', sentence)
+                self.assertNotIn('lifecycle action', sentence)   # the flag is the whole remedy
         self.guard(['create', 'child', '--parent=pp-task', '--no-inherit-labels=true'], rows=[holder])
         self.rejected(['update', 'pp-task', '--set-labels=review-ready'], rows=[holder])
         for label in ('review-ready', 'reviewed', 'live:resolved-other'):

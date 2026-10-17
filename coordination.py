@@ -462,18 +462,31 @@ def repair_merge_slot(run,slot):
     if changes:run(['update',slot,*changes,'--json'])
     return fixed,wanted
 
+
 def require_unheld_merge_task(issue, task, operators=None, project=None):
-    """Shared native hold refusal for acquisition, including web receipt replay."""
-    from review_workflow import project as review_project, integration_hold_sentence, CoordinatorRuleRefusal
+    """Shared native hold refusal for acquisition, including web receipt replay.
+
+    kittrial-5bb.297, fail closed: a chain that exists but cannot be parsed may carry a
+    hold this read cannot see, so the acquisition is refused with the reason naming the
+    task and why. A task with no chain at all is not flagged.
+    """
+    from review_workflow import project as review_project, integration_hold_sentence, MergeHoldRefusal
+    from lifecycle import unreadable_hold_chain
     state=None
+    unreadable=None
     if issue is not None:
         try: state=review_project(issue,operators=operators,journal=project)
-        except ValueError: state=None
+        except ValueError:
+            state=None
+            unreadable=unreadable_hold_chain(issue,operators,journal=project)
     sentence=integration_hold_sentence(state) if state else None
     if sentence:
-        raise CoordinatorRuleRefusal('merge-acquire refused for %s: %s. A held contribution is not '
+        raise MergeHoldRefusal('merge-acquire refused for %s: %s. A held contribution is not '
                          'integration-ready, so the merge slot is not taken until the hold is released.'
                          %(task,sentence))
+    if unreadable:
+        raise MergeHoldRefusal('merge-acquire refused for %s: %s. The merge slot is not taken '
+                         'until an operator repairs the chain.'%(task,unreadable))
 
 
 def apply_native(p, actor, run, project, operators=None, coordinator_writes=False, independent_approval=False,
@@ -604,7 +617,16 @@ def apply_native(p, actor, run, project, operators=None, coordinator_writes=Fals
         from review_workflow import project as review_project, integration_hold_sentence, CoordinatorRuleRefusal
         rows=read_event_rows(run)
         try: issue=task_row(rows,p['task'])
-        except ValueError: issue=None
+        except ValueError as error:
+            # kittrial-5bb.297 review item 4c: a malformed row used to give issue=None
+            # and the hold gate passed - a chain this row carries cannot be read, so
+            # the acquisition is refused until an operator repairs the row. A row
+            # that is merely missing or duplicated keeps its later handling.
+            if 'is malformed' in str(error):
+                raise CoordinatorRuleRefusal('merge-acquire refused for %s: %s. The merge slot is '
+                                             'not taken until an operator repairs the row.'
+                                             %(p['task'],str(error)[:200])) from error
+            issue=None
         require_unheld_merge_task(issue, p['task'], operators, project)
     context_path=project/'.merge-context.json'
     if op=='merge-create':

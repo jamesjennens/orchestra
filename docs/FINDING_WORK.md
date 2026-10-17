@@ -203,6 +203,42 @@ A comment on a parent or coordination task, a message in another task, a change 
 document it read at an earlier run. If a lane has to learn something, it is one of the
 three above.
 
+## Waking your agent
+
+`wait` blocks only while something runs it. A lane that ends its turn and waits to be
+woken by nothing sits idle: the tracker does not call a chat window. The kit supplies
+the polling and a hook; the lane supplies the wake step, because only the lane knows
+what starts a new turn of its harness.
+
+The contract is one loop. Run `client.py wait --since FINGERPRINT` with the fingerprint
+the last wait printed, and when it returns something that is this lane's move run ONE
+wake command: the thing that starts a new turn of the harness. The command starts the
+turn and returns; the woken lane then reads its own tasks and does the work. A wake
+command must never run the work itself, or the waker becomes a second, unaccountable
+lane.
+
+`tools/wake/` in the kit holds example poll-and-wake scripts built on that contract: a
+POSIX sh script for Linux and macOS, with a systemd --user timer and service, a cron
+line and a launchd plist, and a PowerShell script for Windows with the Task Scheduler
+steps for at logon and every N minutes. Each keeps the last fingerprint in a state file
+beside it, wakes at most once per new fingerprint, holds a lock so one instance polls at
+a time, bounds a wait with a timeout, writes one log line per wake, reads no secret
+except the client config, and never runs the work. Copy the one for your platform into
+your own private directory, fill in its one wake command, and test it once.
+
+The wake command is whatever starts a turn of the harness that runs the lane. A CLI that
+takes a prompt is one: `agent-cli --prompt "New work is ready; run your next turn."`. A
+scheduled task that starts the harness is another. The VS Code bridge is one ready-made
+waker: it wakes its agent itself, so a lane using the bridge needs no script here.
+`tools/wake/README.md` has the settings, the scheduler commands and the examples. If no
+process can start the harness - a chat window nobody can start, a session that cannot be
+resumed - the lane says so in one line and stops instead of promising to wait. A lane
+must not end its turn to wait without a waker.
+
+Test the waker once before relying on it, and show that it woke the lane; a scheduler
+that was never seen to wake anything is not a waker. Record in a checkpoint how this
+lane is woken, and note when it was last seen to work.
+
 ## Prompts
 
 The kit serves the texts a worker is started and woken with, so that nobody retypes

@@ -308,8 +308,10 @@ def _bd_read(root,path,actor,argv,resolver_absence=False,strict=False):
     "ambiguous ID" on stderr, and no row has exactly ``p-ab``, so the create proceeds as it
     did before kittrial-5bb.135; any other non-zero exit still fails closed. The object means
     absent only at exactly rc 1 and only when ``resolver_absence`` asks for it: rc 0 with an
-    error object is a failed read, and no other guard read reads the object as absence
-    (kittrial-5bb.138 items ``rc0`` and ``absence-pins``).
+    error object is a failed read. A strict guard read also reads the object at rc 1 as an
+    absence (kittrial-5bb.260 F1), only so that its refusal can name the token: every strict
+    caller turns an absence into a refusal, so no write follows from it (kittrial-5bb.138
+    items ``rc0`` and ``absence-pins``).
     """
     try:
         p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','--actor',actor,*argv],env=environment(root),capture_output=True,text=True,encoding='utf-8',timeout=60)
@@ -318,6 +320,11 @@ def _bd_read(root,path,actor,argv,resolver_absence=False,strict=False):
     said=(p.stderr or '').strip()
     if not (p.stdout or '').strip():
         if p.returncode and 'no issue found' in said:
+            # kittrial-5bb.260 (mutants): this branch and the no-match-object branch
+            # below are REDUNDANT layers by design - one answer shape comes on stderr
+            # with no stdout, the other as the resolver's rc-1 object on stdout - and
+            # nothing pins them separately because they fail closed together in the
+            # native tests; a change to one must keep its sibling in step.
             return [],said                      # bd's own "that id does not exist" answer
         if p.returncode:
             return None,'bd could not read the tasks (%s)'%(said[-200:] or 'exit %d'%p.returncode)
@@ -336,6 +343,13 @@ def _bd_read(root,path,actor,argv,resolver_absence=False,strict=False):
     rows=[answer] if isinstance(answer,dict) else answer
     if not isinstance(rows,list):return None,'bd gave an unreadable answer'
     if strict and any(not isinstance(row,dict) or not isinstance(row.get('id'),str) for row in rows):
+        if resolver_answer and p.returncode==1:
+            # kittrial-5bb.260 F1: bd's exact no-match object at rc 1 is an ABSENCE, not
+            # a failed read - reading it as absence here (exactly as the create --id
+            # existence check below does) lets _resolve_rows name the token in its
+            # refusal instead of answering 'an incomplete answer'. The guarded write
+            # still refuses; only the sentence changes.
+            return [],said
         return None,'bd gave an incomplete answer'
     rows=[row for row in rows if isinstance(row,dict) and isinstance(row.get('id'),str)]
     if p.returncode and not rows and 'no issue found' not in said and not (resolver_absence and resolver_answer and p.returncode==1):
@@ -423,7 +437,11 @@ def _guard_named_rows(root,path,name,args,attachments,actor,strict=False):
     if not request['targets']:return
     rows,problem=_resolve_rows(root,path,actor,request['targets'],strict=strict)
     if problem:
-        advice=(' '+raw_lifecycle.ADVICE) if strict else ''
+        # kittrial-5bb.260 F1: a RESOLUTION problem (a mistyped or ambiguous id) gets no
+        # lifecycle advice - naming the token is the whole remedy for a typo; the advice
+        # stays on every other strict problem, where the dedicated lifecycle action is.
+        resolution=('does not name exactly one task' in problem or 'is not a task id' in problem)
+        advice=(' '+raw_lifecycle.ADVICE) if strict and not resolution else ''
         refusal=raw_lifecycle.Refusal if strict else ValueError
         raise refusal('Refusing %s: %s, so the rows this would write are not known. Name each task by its id. Nothing was written.%s'%(command,problem,advice))
     slot=name+MERGE_SLOT_SUFFIX
@@ -1742,6 +1760,17 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                         or (operation in ('create','force-release') and descriptor.get('via')!='session')):
                     denied_status.append(403)
                     raise SlotError(403,'Verified web authority required for this merge-slot operation in this project')
+            def hold_slot_operators(root, warnings):
+                # kittrial-5bb.297 review item (c): the web acquire reads the operator
+                # allowlist ALWAYS now, and a malformed value keeps the old tolerance
+                # (nobody, with a warning) instead of refusing an acquire that
+                # answered 200 before the fix.
+                try:
+                    return configured_operators(root)
+                except ConfigurationUnreadable as error:
+                    warnings.append('deployment operators unreadable, so operator voids are not '
+                                    'applied: '+str(error)[:160])
+                    return None
             def slot_identity():
                 slot_authority()
                 if operation=='acquire':
@@ -1750,15 +1779,21 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                     rows=read_event_rows(runner)
                     issue=next((row for row in rows if row.get('id')==payload['task']),None)
                     try:
+                        # kittrial-5bb.297 review item 'operators-on-every-surface':
+                        # the configured operators ALWAYS, not only when
+                        # independent_approval is on - an operator void that repairs
+                        # the chain must be seen here exactly as the canonical
+                        # readers see it, or the acquire stays refused while the
+                        # coordinate route and the release accept.
                         require_unheld_merge_task(issue,payload['task'],
-                            configured_operators(root) if rules['independent_approval'] else None,path)
+                                                  hold_slot_operators(root,run_warnings),path)
                     except CoordinatorRuleRefusal:
                         denied_status.append(409)
                         raise
             rules=configured_coordinator_rules(root,warnings=run_warnings)
             def slot_effect():
                 result=slot_apply(payload,actor,runner,path,request.get('operation_id'),
-                                  operators=(configured_operators(root) if rules['independent_approval'] else None),
+                                  operators=hold_slot_operators(root,run_warnings),
                                   coordinator_writes=rules['coordinator_writes'],
                                   independent_approval=rules['independent_approval'],
                                   owners=owner_loader(path,'independent_approval'),
@@ -1807,8 +1842,18 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
         # malformed `operators` value must not stop `coordinate`, and a damaged
         # registry must not stop the reads or a listed operator's operation
         # (kittrial-5bb.197 review request 01a12894, item 4).
-        coordinate_operators=(configured_operators(root)
-                              if (rules['coordinator_writes'] or rules['independent_approval']) else None)
+        # kittrial-5bb.297 review item 'operators-everywhere-really' (a): the operator
+        # allowlist is passed ALWAYS for the coordinate write's hold check (one
+        # operator void that repairs a chain is seen here exactly as the canonical
+        # readers see it), not only when a rule is on; the rules still gate what they
+        # gated. (c) A malformed value keeps the old tolerance: it reads as nobody
+        # WITH a warning, exactly as a malformed rules value does, so a broken
+        # setting never refuses a coordinate write that answered 200 before.
+        coordinate_operators=None
+        try:coordinate_operators=configured_operators(root)
+        except ConfigurationUnreadable as error:
+            run_warnings.append('deployment operators unreadable, so operator voids are not applied: '
+                               +str(error)[:160])
         def lifecycle_effect():
             if action=='lifecycle':result=apply_native(payload,actor,runner,
                                                        operators=configured_operators(root),journal=path,
@@ -1826,11 +1871,20 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                 from requirement_records import apply_native as requirement_apply
                 result=requirement_apply(payload,actor,runner,path)
             return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':warning_text(run_warnings)}
-        with (path/'.coordination.lock').open('a') as lock:
-            fcntl.flock(lock,fcntl.LOCK_EX)
-            return guarded_write(root,request,journal_path(path),lifecycle_effect,
-                               authority_config=authority_config,
-                               require_authority=require_authority,runner=runner)
+        # kittrial-5bb.297 review item 'rc2-scope-and-test-order': ONLY the coordinate
+        # merge-acquire refusal answers rc 2 (the answer shape the web merge-slot
+        # route returns). Every other CoordinatorRuleRefusal - a lifecycle write's
+        # rule refusal included - keeps raising exactly as before: no contract
+        # change beyond the one the item asked for.
+        from review_workflow import MergeHoldRefusal
+        try:
+            with (path/'.coordination.lock').open('a') as lock:
+                fcntl.flock(lock,fcntl.LOCK_EX)
+                return guarded_write(root,request,journal_path(path),lifecycle_effect,
+                                   authority_config=authority_config,
+                                   require_authority=require_authority,runner=runner)
+        except MergeHoldRefusal as error:
+            return {'returncode':2,'stdout':'','stderr':str(error)+'\n','refused':'coordinator-rule'}
     if action == 'feedback':
         from feedback import execute as feedback_execute
         args=request.get('args',[])

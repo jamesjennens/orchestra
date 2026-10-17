@@ -1,0 +1,13 @@
+[Unit]
+Description=Orchestra poll-and-wake for one lane (tools/wake)
+Documentation=file:%h/.orchestra/wake/README.md
+
+[Service]
+Type=oneshot
+# Copy this unit into ~/.config/systemd/user/ and keep wake.sh and wake.env in
+# this lane's own private directory. The wake command lives in wake.env, not in
+# this file, so a command with spaces needs no unit-file quoting.
+ExecStart=%h/.orchestra/wake/wake.sh --env-file %h/.orchestra/wake/wake.env
+# wake.sh bounds its own wait (WAKE_TIMEOUT, default 3600 s). Leave it room to end.
+TimeoutStartSec=3900
+Nice=10
