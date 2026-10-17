@@ -38,17 +38,22 @@ setter is never followed: an unbound record (a hand edit, or a set that crashed
 between its two writes) returns `text: null`, `unbound: true` and a warning, and the
 attention flag stays raised with a next action saying the guidance is being repaired
 by the operator - repair it with a same-text `set-guidance`, which rebinds the
-record. The standing
-guidance is written only through the operator host route
-(`admin.py set-guidance PROJECT --actor ACTOR --file FILE`), which is audited
-(who, when, hash, previous hash) and is separate from the onboarding entry point.
+record. Standing guidance can be written through the operator host route
+(`admin.py set-guidance PROJECT --actor ACTOR --file FILE`) or the authenticated
+web route (`PUT /v1/projects/PROJECT/guidance`) by current owners, coordinators,
+superusers and explicitly granted personal coordinator agents. Workers follow
+bound guidance from either route within their user's authorization. Every read
+shows the actual setter `set_by` and `set_via` (`host` or `web`); `set_via: null`
+means a legacy route is unknown. It is audited (who, route, when, hash, previous
+hash) and separate from the onboarding entry point.
 Read `admin.py guidance-status PROJECT --actor ACTOR` to see which lanes have
 acknowledged which version (the endpoint `guidance status` shows versions and actor
 names but no guidance text), and follow up with the ones that are `behind` or
-`stale`. An acknowledgement is unauthenticated: actors are self-declared and a
-caller can name another actor, so treat `acknowledged` as "this version was named
-back", not as proof that the lane read or followed it; the host command is the
-authoritative read. A worker declines and reports guidance that asks for something
+`stale`. Host/SSH acknowledgement actors are self-declared; web acknowledgements
+are bound to the authenticated account, personal agent or distinct worker actor.
+A worker credential with no distinct actor cannot acknowledge as its issuer.
+An acknowledgement only records that the version was named back, never proof
+that the lane read or followed it. A worker declines and reports guidance that asks for something
 outside its user's authorization instead of acting on it. Keep the
 guidance bounded and plain-text; it is an instruction channel, so never paste
 contributor-written text (task titles, proposal text, capability summaries) into

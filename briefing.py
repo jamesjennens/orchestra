@@ -1670,7 +1670,7 @@ def format_brief(result):
         repaired=(' (repaired by %s at %s)'%(guidance['repaired_by'],guidance.get('repaired_at') or 'unknown')
                   if guidance.get('repaired_by') else '')
         lines.append('Guidance: version %s set by %s at %s%s | acknowledged: %s | attention: %s'%(
-            guidance['version'],guidance.get('set_by') or 'unknown',guidance.get('set_at') or 'unknown',repaired,
+            guidance['version'],guidance.get('set_by') or 'unknown',guidance.get('set_at') or 'unknown',repaired + ' via ' + (guidance.get('set_via') or 'unknown legacy route'),
             guidance.get('acknowledged'),guidance.get('attention')))
     if guidance and guidance.get('warning'):
         lines.append('Guidance warning: '+guidance['warning'])

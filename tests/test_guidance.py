@@ -421,8 +421,16 @@ class GuidanceRecordTests(unittest.TestCase):
         self.operators(['operator-1', 'operator-2'])
         guidance.write_guidance(self.project, 'first', 'operator-1', now='2026-10-01T10:00:00+00:00')
         guidance.write_guidance(self.project, 'second', 'operator-1', now='2026-10-01T11:00:00+00:00')
-        self._damage(lambda meta: meta['history'].append({'version': 'bad', 'set_by': None, 'set_at': None,
-                                                          'previous_version': None}))
+        # This fixture models a pre-route record: same-text repair must retain its
+        # legacy shape. New host/web generations deliberately carry set_via; their
+        # strict older-kit boundary is covered in test_guidance_provenance separately.
+        def legacy(meta):
+            meta.pop('set_via', None)
+            for entry in meta['history']:
+                entry.pop('set_via', None)
+            meta['history'].append({'version': 'bad', 'set_by': None, 'set_at': None,
+                                    'previous_version': None})
+        self._damage(legacy)
         return guidance.write_guidance(self.project, 'second', 'operator-2', now='2026-10-02T09:00:00+00:00')
 
     def operators(self, names):
@@ -476,8 +484,8 @@ class GuidanceRecordTests(unittest.TestCase):
         self.assertFalse(repair.exists())
 
     def test_the_kit_before_this_one_reads_a_repaired_record_and_its_backup(self):
-        # kittrial-5bb.121 review P2: a repaired record must stay exactly the shape the
-        # previous kit validates, and the backup must carry nothing its restore refuses.
+        # A repaired LEGACY record stays exactly the shape the previous kit validates.
+        # This does not claim rollback compatibility for new set_via generations.
         self.repaired()
         meta = guidance.read_meta(self.project)
         self.assertLessEqual(set(meta), self.PREVIOUS_KIT_FIELDS)

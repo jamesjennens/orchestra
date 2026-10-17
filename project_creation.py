@@ -886,7 +886,7 @@ def registrable(root, name):
 #: started with the service's authority arguments AND the request carries a
 #: live-authority descriptor that passes for exactly the capability named here.
 SERVICE_ACTIONS = {'create-project': 'project.host-create', 'project-creations': 'accounts.admin',
-                   'set-onboarding': 'project.admin', 'owner-requirements': 'coordinate',
+                   'set-onboarding': 'coordinate', 'owner-requirements': 'coordinate',
                    'creation-standing': 'project.host-create'}
 #: Service actions a credential may carry (kittrial-5bb.278): a project's coordinator edits
 #: requirements on the web, and an agent holding that project's coordinator grant reaches

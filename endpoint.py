@@ -649,7 +649,7 @@ def reserved_actors(root,path,rows=False,own=()):
 #: ``host-coordination`` and ``host-projects`` are reads for the web interface (kittrial-5bb.198,
 #: host_reads.py): the operator list, the project's session names and the runtime's projects,
 #: which a bound key is not told.
-SERVICE_ONLY_ACTIONS=('create-project','project-creations','creation-standing','web-merge-slot','web-lifecycle',
+SERVICE_ONLY_ACTIONS=('create-project','project-creations','creation-standing','web-merge-slot','web-lifecycle','web-guidance',
                       'host-coordination','host-projects','assignment-roster','task-assign','task-release')
 
 def key_project_refusal(request,key_projects):
@@ -871,6 +871,10 @@ def coordinator_payload(args,request):
 def _read_only_always(args,operation):
     return True
 
+def _web_guidance_read_only(args,operation):
+    from web_guidance import READ_OPERATIONS
+    return operation in READ_OPERATIONS
+
 READ_ONLY_ACTIONS={
     'brief':_read_only_always,
     'history':_read_only_always,
@@ -882,6 +886,7 @@ READ_ONLY_ACTIONS={
     'bd':lambda args,operation:not is_mutating_invocation(args),
     'web-lifecycle':lambda args,operation:operation=='read',
     'web-merge-slot':lambda args,operation:operation=='check',
+    'web-guidance':_web_guidance_read_only,
     # kittrial-5bb.291 item 1: the roster read takes the project lock shared through
     # the one table, not a hand-coded LOCK_SH at its own call site. task-assign is
     # deliberately absent: it is a write and stays exclusive.
@@ -934,7 +939,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             raise ValueError('%s is available only to the web service'%answered)
     # Slot requests bind the block before project, tracker, or authority reads.
     # The shared table is the sole endpoint action/operation capability mapping.
-    if request.get('action') in ('coordinate','web-merge-slot','web-lifecycle','task-assign','assignment-roster','task-release'):
+    if request.get('action') in ('coordinate','web-merge-slot','web-lifecycle','web-guidance','task-assign','assignment-roster','task-release'):
         denied=block_mismatch_denial(request,authority_config)
         if denied is not None:return denied
     # Two actions exist only for the web service and name no existing project
@@ -1145,10 +1150,16 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
         if request.get('args',[]) not in ([],None):raise ValueError('Use setup-status without arguments')
         from admin import project_setup_status
         return {'returncode':0,'stdout':json.dumps(project_setup_status(root,name))+'\n','stderr':''}
+    if action=='web-guidance':
+        from web_guidance import request_operation, web_action
+        args=request.get('args',[])
+        operation=request_operation(request)
+        with held_coordination_lock(path,shared=coordination_lock_shared(request,action,args,operation)):
+            return web_action(path,name,request,authority_config,configured_operators(root))
     if action=='guidance':
         # The standing guidance channel (kittrial-5bb.99 slice 1, revised). The
-        # endpoint is read-only except for the caller's own acknowledgement: the only
-        # guidance writer is the operator host command `admin.py set-guidance`, and
+        # host/SSH guidance action is read-only except for the caller's acknowledgement.
+        # Authenticated web writes use the distinct service-only action above, and
         # this allowlist refuses every other subcommand, so adding a write route here
         # cannot pass unnoticed (review `tests`: the test enumerates the accepted
         # subcommands and fails on any not in the read+ack set). `ack` names the
@@ -1163,7 +1174,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
         if subcommand not in ('get','version','ack','status'):
             raise ValueError('Unknown guidance action %r: the endpoint can only read guidance (get, version), '
                              'acknowledge the version the caller read (ack), or, for an operator, read status. '
-                             'The only writer is the operator host command admin.py set-guidance.'%subcommand)
+                             'Host writes use admin.py set-guidance; authenticated web writes use the separate web service action.'%subcommand)
         if subcommand=='ack':
             version=_guidance_ack_version(args[1:])
             with (path/'.coordination.lock').open('a') as lock:
