@@ -77,7 +77,7 @@ EXIT_UNREACHABLE = 3
 #: fingerprint is taken and the two transports cannot disagree about one task.
 MOVE_FIELDS = ('task', 'review_state', 'whose_move', 'next_actor',
                'contribution_id', 'pending_review_items', 'open_items', 'blocking_items',
-               'checkpoint_at', 'newer_activity', 'redelivered')
+               'checkpoint_at', 'newer_activity', 'redelivered', 'guidance_version')
 
 #: The four things a coordinator wakes for, in the order the task names them.
 COORDINATOR_TRIGGERS = ('awaiting-review', 'awaiting-integration',

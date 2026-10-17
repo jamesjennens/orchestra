@@ -1303,7 +1303,15 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
                                 operators=operators,journal=path,reference_attention=False,
                                 verifiers=verifiers,independent_approval=independent_approval,
                                 owners=owners,provenance_writes=provenance_writes)
-            return worker_view(queue_payload.get('items') or [])
+            # The guidance acknowledgement is the caller's move too (kittrial-5bb.325): the
+            # shared block carries the one item, and it joins the rows this projection
+            # filters, so a worker waiting on `wait` WAKES for a new guidance version and
+            # the fingerprint changes with the version (and again when the ack clears it).
+            move_rows=list(queue_payload.get('items') or [])
+            guidance_item=(queue_payload.get('guidance') or {}).get('item')
+            if isinstance(guidance_item,dict):
+                move_rows.append(guidance_item)
+            return worker_view(move_rows)
         if args[:1]==['lanes']:
             # The lanes board (kittrial-5bb.263) reads the SAME export this action already
             # loaded, plus the project's session registry: one pass, no per-task comment
