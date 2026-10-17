@@ -200,10 +200,13 @@ class NoUnguardedParseTests(unittest.TestCase):
         'briefing.py': (3, 'bd comment-write receipt and the snapshot files the kit writes; exports use the guard'),
         'capabilities.py': (1, "a graph.json in the caller's own checkout; it catches RecursionError itself"),
         'capability_misses.py': (1, 'the telemetry file the kit writes; any failure starts a new log'),
-        'client.py': (12, "the endpoint's own answer, on the caller's machine, and the --config it reads there; "
-                         'kittrial-5bb.285 added two of the twelve: the wait read\'s answer from the endpoint and the '
+        'client.py': (13, "the endpoint's own answer, on the caller's machine, and the --config it reads there; "
+                         'kittrial-5bb.285 added two of the thirteen: the wait read\'s answer from the endpoint and the '
                          'wait command\'s own read of the config file (both the same kind of text as the other ten, '
-                         "and neither is a record comment or a caller's payload)"),
+                         "and neither is a record comment or a caller's payload). The thirteenth (kittrial-5bb.327 "
+                         "review 2) is the wait's own small state file: text this client wrote beside its config, "
+                         'read at most 64 KiB at a time and any unreadable, nested or corrupt value is caught and '
+                         'treated as absent'),
         'coordination.py': (7, 'bd output'),
         'endpoint.py': (6, 'bd output, and the project\'s .beads/metadata.json whose Dolt server coordinates '
                            'guard bd (kittrial-5bb.202 rev-3 item 2; the file is the host\'s own); the sixth '
@@ -245,6 +248,9 @@ class NoUnguardedParseTests(unittest.TestCase):
                                      'host-written file itself and refuses a file it cannot read, a deeply nested '
                                      'one included'),
         'version.py': (1, "the kit's own version file"),
+        'waiting.py': (1, "the wait's own small state file beside the caller's config (kittrial-5bb.327 "
+                          'review 2): text this kit wrote, read at most 64 KiB at a time, and any unreadable, '
+                          'nested or corrupt value is caught and treated as absent'),
         'work.py': (1, 'the request files the kit writes'),
         'worker.py': (2, "the endpoint's answer, on the caller's machine"),
         'worker_gate.py': (1, "the endpoint's answer, on the caller's machine"),

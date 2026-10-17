@@ -168,7 +168,9 @@ worker's checkout or create tasks to stay busy. Leave the task open awaiting rev
 Build and test your waker before you rely on being woken. The kit's `tools/wake/`
 directory holds example poll-and-wake scripts for Linux, macOS and Windows: each runs
 `client.py wait --since FINGERPRINT` and then ONE wake command you fill in - the thing
-that starts a new turn of your harness. Copy the script for your platform into your own
+that starts a new turn of your harness. When a wait times out with nothing new, run the
+`next_command` it prints instead of inventing another wait; `give_up: true` means
+checkpoint the task and stop. Copy the script for your platform into your own
 private directory, set its one wake command, and test it once: show that it woke you.
 Record in a checkpoint how you are woken. A lane must not end its turn to wait without a
 waker; if your harness cannot be woken, say so in one line instead of promising to wait.

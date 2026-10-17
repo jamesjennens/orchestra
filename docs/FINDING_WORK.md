@@ -53,15 +53,33 @@ poll loop: it blocks and polls the same read once per interval (five minutes by 
 never faster than one a minute; `--timeout` bounds the whole wait), and it returns as
 soon as a task whose move is the worker's appears or changes. It prints those tasks and a
 fingerprint; `--since FINGERPRINT` is the state the worker already acted on, so a restart
-that finds nothing new keeps blocking instead of returning the same tasks twice. Run
-`wait`; act on what it returns; run `wait` again. Its exit codes are 0 (something is your
-move), 1 (`--timeout` ran out), 2 (the arguments or the endpoint refused) and 3 (the
-service could not be reached). The coordinator has the same thing over the four things it
-wakes for - a delivery awaiting review, approved work awaiting integration, a checkpoint
-addressed to the coordinator, and a lane quiet on its own move or past a declared wait -
-as `wait --coordinator`: run `wait --coordinator`; act on what it returns; run
-`wait --coordinator` again. An agent with a web credential reads the same worker form,
+that finds nothing new keeps blocking instead of returning the same tasks twice. Without
+`--since` the client uses the fingerprint it remembers in a small local state file beside
+its config, and `--fresh` ignores that and returns the whole baseline again. On a wake the
+result also carries `changed`: per task the fields that changed old -> new, and the items
+added and removed since the last list it printed (additive; ignore it if you do not need
+it). Run `wait`; act on what it returns; run `wait` again. Its exit codes are 0 (something
+is your move), 1 (`--timeout` ran out), 2 (the arguments or the endpoint refused) and 3
+(the service could not be reached). The coordinator has the same thing over the four
+things it wakes for - a delivery awaiting review, approved work awaiting integration, a
+checkpoint addressed to the coordinator, and a lane quiet on its own move or past a
+declared wait - as `wait --coordinator`: run `wait --coordinator`; act on what it returns;
+run `wait --coordinator` again. An agent with a web credential reads the same worker form,
 one read, at `GET /v1/agents/me/wait`, and blocks in the loop of whatever runs it.
+
+An agent should not invent the next wait after an empty timeout. Pass `--idle-since TIME`
+(when the current idle spell began) and `--max-timeout SECONDS` (the longest single
+command the harness allows), and the timeout result carries `next_command`: run exactly
+that line, which names the same client, config, project and actor, the fingerprint, the
+same `--idle-since` and the backed-off `--timeout`. `next_timeout` starts at the base
+timeout, doubles after two empty returns in a row and is never above `--max-timeout`
+(3600 s by default), never below the base. `give_up` turns true after `--give-up-after`
+(12 h from `--idle-since` by default), and its `message` is `checkpoint and stop:
+nothing has been your move since TIME`: checkpoint the task and stop. A return with items
+is work and resets the schedule to the base timeout with a fresh `--idle-since`. A caller
+that passes none of the schedule flags keeps the same existing output fields and exit
+codes as before; the additive `changed` block and the remembered default for `--since`
+(with `--fresh` to ignore it) apply to every call.
 
 The wait logic is part of `client.py` itself: a `client.py` copied on its own, with no
 other kit file beside it, runs `wait` (only the `capability` commands also need
