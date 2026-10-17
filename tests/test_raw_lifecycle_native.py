@@ -96,7 +96,11 @@ class NativeLifecycleTests(fixture.RealBdLabelAliasTests):
 
     def test_native_target_resolution_multi_id_parent_substring_absence_and_ambiguity(self):
         # Isolate this resolver proof from random IDs in other tests, so `10`
-        # really resolves uniquely rather than merely hitting an ambiguity.
+        # really resolves uniquely rather than merely hitting an ambiguity. The
+        # nested teardown goes through test_bd_label_aliases.remove_scratch - the
+        # retrying helper of kittrial-5bb.209 - which is what the dolt-home write
+        # on SIGTERM raced (kittrial-5bb.260: the module used to exit 1 in 10 of
+        # 11 runs with TMPDIR on a memory disk before that helper landed).
         class ResolverFixture(NativeLifecycleTests):
             pass
         ResolverFixture.setUpClass()
@@ -117,7 +121,10 @@ class NativeLifecycleTests(fixture.RealBdLabelAliasTests):
                                  '--type=parent-child', '--json').returncode, 0)
         for args in (['update', other, fact['id'], '--status=open'], ['close', other, fact['id']],
                      ['update', fact['id'], '--parent', other],
-                     ['update', other, '--parent', fact['id']]):
+                     ['update', other, '--parent', fact['id']],
+                     # kittrial-5bb.260: a SUBSTRING spelling of the event id names the
+                     # event too - the guard judges the row bd finds, not the text.
+                     ['update', other, '--parent', fact['id'].rsplit('-', 1)[-1]]):
             self.no_write(args)
         # Explicit native IDs make the unique substring spellings reproducible.
         for suffix in ('7vv.2', '7vv.10'):
@@ -128,10 +135,26 @@ class NativeLifecycleTests(fixture.RealBdLabelAliasTests):
             resolved = self.bd('show', token, '--json')
             self.assertEqual(resolved.returncode, 0, resolved.stderr)
             self.assertEqual([r['id'] for r in json.loads(resolved.stdout)], [named])
-        self.no_write(['update', 'vv.2', '--assignee=worker-two'])
-        self.no_write(['close', '10'])
-        self.no_write(['update', 'vv.', '--title=ordinary'])
-        self.no_write(['update', 'pp-no-such-row', '--title=ordinary'])
+        # kittrial-5bb.260 F1: a resolution problem NAMES THE TOKEN and carries no
+        # lifecycle advice - the old sentence the docs promise, back for typos.
+        for args in (['update', 'vv.', '--title=ordinary'],
+                     ['update', 'pp-no-such-row', '--title=ordinary']):
+            with self.subTest(args=args):
+                before = self.export_rows()
+                with self.assertRaises(ValueError) as refused:
+                    endpoint.execute(self.root, dict(project='pp', actor='mallory',
+                                                     action='bd', args=args))
+                sentence = str(refused.exception)
+                self.assertIn('does not name exactly one task, so the rows this would '
+                              'write are not known. Name each task by its id. Nothing '
+                              'was written.', sentence)
+                self.assertNotIn('lifecycle action', sentence)
+                self.assertEqual(self.export_rows(), before)
+        # A token that resolves to exactly one EVENT row names no resolution problem:
+        # the event refusal answers, with its own sentence.
+        for args in (['update', 'vv.2', '--assignee=worker-two'], ['close', '10']):
+            with self.subTest(args=args):
+                self.no_write(args, regex='lifecycle namespace.*event|editing a lifecycle event')
         self.assertEqual(self.raw(['update', target, other, '--priority=2', '--json'])['returncode'], 0)
         self.assertEqual(self.raw(['update', other, '--parent', target, '--json'])['returncode'], 0)
 
@@ -148,15 +171,24 @@ class NativeLifecycleTests(fixture.RealBdLabelAliasTests):
             self.no_write(['create', 'ordinary new row', *flags, '--json'])
         for args in (['dep', target, '-b', fact['id']], ['dep', target, '--blocks='+fact['id']],
                      ['dep', 'relate', target, fact['id']], ['dep', 'unrelate', target, fact['id']],
-                     ['dep', 'remove', fact['id'], target]):
+                     ['dep', 'remove', fact['id'], target],
+                     # kittrial-5bb.260: the two remaining dep-add flag spellings are
+                     # asserted too - neither may link a new row to a lifecycle event.
+                     ['dep', 'add', target, '--blocked-by='+fact['id']],
+                     ['dep', 'add', target, '--depends-on='+fact['id']]):
             self.no_write(args)
         body = json.dumps(dict(issue_id=fact['id'], depends_on_id=target, type='blocks'))
         self.no_write(['dep', 'add', '@attachment:edges', '--json'],
                       attachments={'edges': {'flag': '--file', 'text': body}})
-        for flags in (['--status=open'], ['--assignee=worker-two'], ['--labels=a,b'],
-                      ['-la', '-lb']):
-            self.no_write(['update', fact['id'], *flags],
-                          regex='lifecycle action.*no native write|unrecognized flag.*no native write|configuration flags are operator-only')
+        # kittrial-5bb.260: each scalar write on a lifecycle event row is pinned to
+        # ITS OWN sentence - the old three-way alternation accepted any of them.
+        for flags, sentence in ((['--status=open'], 'editing a lifecycle event'),
+                                (['--assignee=worker-two'], 'editing a lifecycle event'),
+                                (['--labels=a,b'], 'unrecognized flag.*--labels=a,b.*no native write'),
+                                (['-la', '-lb'], 'configuration flags are operator-only')):
+            with self.subTest(flags=flags):
+                self.no_write(['update', fact['id'], *flags],
+                              regex=sentence)
 
     def test_status_defer_persistent_and_creation_references_preserve_fact_visibility(self):
         import lifecycle
@@ -183,8 +215,11 @@ class NativeLifecycleTests(fixture.RealBdLabelAliasTests):
             self.assertEqual(answer['returncode'], 0, answer)
             child = json.loads(answer['stdout'])
             self.assertFalse(any(raw_lifecycle.reserved_label(v) for v in child.get('labels', [])))
+        # kittrial-5bb.260 F1: the inheritance refusal ends with the flag, no advice.
         for flags in ([], ['--no-inherit-labels=false']):
-            self.no_write(['create', 'scoped parent child', '--parent', target, *flags])
+            self.no_write(['create', 'scoped parent child', '--parent', target, *flags],
+                          regex='inheriting lifecycle labels requires --no-inherit-labels.'
+                                ' Re-run with --no-inherit-labels.')
         answer = self.raw(['create', 'scoped parent child', '--parent', target,
                            '--no-inherit-labels', '-lordinary', '--json'])
         self.assertEqual(answer['returncode'], 0, answer)
@@ -250,8 +285,19 @@ class NativeLifecycleTests(fixture.RealBdLabelAliasTests):
         for flags in (['--priority=2'], ['--assignee=mallory'], ['--add-label=ordinary'], ['--notes=ordinary']):
             self.no_write(['update', fact['id'], *flags])
         self.no_write(['dep', 'remove', fact['id'], target])
-        self.no_write(['create', 'child', '--parent', target])
-        self.no_write(['create', 'child', '--parent', target, '--no-inherit-labels=false'])
+        # kittrial-5bb.260 F1: the inheritance refusal ends with the flag, no advice.
+        for args in (['create', 'child', '--parent', target],
+                     ['create', 'child', '--parent', target, '--no-inherit-labels=false']):
+            with self.subTest(args=args):
+                before = self.export_rows()
+                with self.assertRaises(ValueError) as refused:
+                    endpoint.execute(self.root, dict(project='pp', actor='mallory',
+                                                     action='bd', args=args))
+                sentence = str(refused.exception)
+                self.assertIn('inheriting lifecycle labels requires --no-inherit-labels.'
+                              ' Re-run with --no-inherit-labels.', sentence)
+                self.assertNotIn('lifecycle action', sentence)
+                self.assertEqual(self.export_rows(), before)
         self.no_write(['update', target, '--set-labels=review-ready'])
         allowed = self.raw(['create', 'child', '--parent', target, '--no-inherit-labels=true', '--json'])
         self.assertEqual(allowed['returncode'], 0, allowed)
@@ -352,6 +398,45 @@ class NativeLifecycleTests(fixture.RealBdLabelAliasTests):
             for command in ('reopen', 'close'):
                 answer = self.raw([command, fact['id'], '--json'], actor='op')
                 self.assertEqual(answer['returncode'], 0, answer)
+
+
+if __name__ == '__main__':
+    unittest.main()
+
+
+class NativeUpdateLabelSpellings(fixture.RealBdLabelAliasTests):
+    """kittrial-5bb.260: the ordinary label spellings were native-tested on create
+    only; these drive every accepted spelling through update --add-label on a real
+    bd and check the labels the row really carries afterwards."""
+
+    def test_every_accepted_add_label_spelling_updates_a_real_row(self):
+        created = json.loads(self.bd('create', 'ordinary update target', '--json').stdout)['id']
+
+        def labels_now():
+            return next(r for r in self.export_rows() if r['id'] == created).get('labels') or []
+
+        cases = [
+            (['--add-label', 'frontend,bug'], {'frontend', 'bug'}),      # comma list
+            (['--add-label', 'docs', '--add-label', 'ui'], {'docs', 'ui'}),  # repeated flag
+            (['--add-label', ' spaced , tight '], {' spaced ', ' tight '}),  # spaces kept verbatim
+            (['--add-label', 'MixedCase'], {'MixedCase'}),               # another case
+        ]
+        for flags, expected in cases:
+            with self.subTest(flags=flags):
+                result = endpoint.execute(self.root, {
+                    'project': 'pp', 'actor': 'mallory', 'action': 'bd',
+                    'args': ['update', created, *flags, '--json']})
+                self.assertEqual(result['returncode'], 0, result)
+                self.assertTrue(expected <= set(labels_now()), labels_now())
+        # A leading newline is NOT an accepted spelling: bd's own value parser
+        # refuses it, so the write fails and the row keeps its labels.
+        before = labels_now()
+        with self.assertRaises(Exception):
+            endpoint.execute(self.root, {
+                'project': 'pp', 'actor': 'mallory', 'action': 'bd',
+                'args': ['update', created, '--add-label', '\nnewline', '--json']})
+        self.assertEqual(labels_now(), before)
+        self.assertEqual(self.reserved_labels(), [])
 
 
 if __name__ == '__main__':
