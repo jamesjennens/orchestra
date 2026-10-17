@@ -1167,7 +1167,7 @@ class AgentReadCostTests(AgentHarness):
         nxt = self.request('GET', '/v1/agents/me/next', token=secret)
         self.assertEqual(200, nxt.status, nxt.data)
         self.assertEqual(5, len(self.backend.read_calls))
-        self.assertEqual({'limit', 'held', 'available', 'counts_task', 'raise_by'},
+        self.assertEqual({'limit', 'hard_cap', 'held', 'blocked', 'available', 'counts_task', 'raise_by'},
                          set(nxt.data['claim_limit']))
 
     def test_a_project_bigger_than_one_page_still_costs_one_read(self):

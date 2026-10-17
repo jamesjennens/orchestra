@@ -73,11 +73,39 @@ class ClaimLimitUnitTests(unittest.TestCase):
                          'a release still sees every undelivered claim')
         self.assertEqual(['a', 'c'],
                          [row['id'] for row in claim_limit.held_against_limit(rows)])
+        self.assertEqual(['b'],
+                         [row['id'] for row in claim_limit.held_blocked(rows)])
 
     def test_the_refusal_names_the_limit_and_what_holds_it(self):
         sentence = claim_limit.refusal(1, [{'id': 'kittrial-5bb.5'}])
         self.assertIn('limit is 1', sentence)
+        self.assertIn('hard cap 4 including blocked tasks', sentence)
         self.assertIn('kittrial-5bb.5', sentence)
+
+    def test_the_hard_cap_counts_blocked_tasks_and_names_them(self):
+        self.assertEqual(4, claim_limit.hard_cap(1))
+        self.assertEqual(5, claim_limit.hard_cap(2))
+        self.assertIsNone(claim_limit.hard_cap(None))
+        blocked = [{'id': 'b-%d' % i} for i in range(claim_limit.BLOCKED_SLACK)]
+        self.assertIsNone(claim_limit.check(1, [], blocked=blocked),
+                          'three blocked tasks with nothing active are still below hard_cap(1) == 4')
+        fourth_blocked = blocked + [{'id': 'b-3'}]
+        sentence = claim_limit.check(1, [], blocked=fourth_blocked)
+        self.assertIsNotNone(sentence)
+        self.assertIn('hard cap including blocked tasks is 4', sentence)
+        self.assertIn('limit is 1', sentence)
+        for row in fourth_blocked:
+            self.assertIn(row['id'], sentence)
+
+    def test_actor_holds_matches_exact_actor_and_sub_labels_only(self):
+        self.assertTrue(claim_limit.actor_holds('agent_0123456789abcdef', 'agent_0123456789abcdef'))
+        self.assertTrue(claim_limit.actor_holds('agent_0123456789abcdef/sub0', 'agent_0123456789abcdef'))
+        self.assertTrue(claim_limit.actor_holds('agent_0123456789abcdef/sub0/lane', 'agent_0123456789abcdef/'))
+        self.assertFalse(claim_limit.actor_holds('agent_0123456789abcdef-2', 'agent_0123456789abcdef'))
+        self.assertFalse(claim_limit.actor_holds('other/agent_0123456789abcdef', 'agent_0123456789abcdef'))
+        self.assertFalse(claim_limit.actor_holds(None, 'agent_0123456789abcdef'))
+        self.assertFalse(claim_limit.actor_holds('agent_0123456789abcdef', None))
+        self.assertFalse(claim_limit.actor_holds('', 'agent_0123456789abcdef'))
 
     def test_the_setting_is_validated_inside_its_bounds(self):
         self.assertEqual(3, claim_limit.validate_limit(3))
@@ -123,8 +151,9 @@ class ClaimLimitTests(test_http_agents.AgentHarness):
     def base(self, task):
         return '/v1/projects/%s/tasks/%s' % (self.project, task)
 
-    def claim(self, task, token):
-        return self.request('POST', self.base(task) + '/claim', {}, token=token)
+    def claim(self, task, token, actor=None):
+        body = {'actor': actor} if actor is not None else {}
+        return self.request('POST', self.base(task) + '/claim', body, token=token)
 
     def contribute(self, task, token):
         """Deliver one contribution and answer its record's comment id."""
@@ -153,9 +182,12 @@ class ClaimLimitTests(test_http_agents.AgentHarness):
         refused = self.claim(second, secret)
         self.assertEqual(409, refused.status, refused.data)
         self.assertIn('limit is 1', refused.data['error']['message'])
+        self.assertIn('hard cap 4 including blocked tasks', refused.data['error']['message'])
         self.assertIn(first, refused.data['error']['message'])
         self.assertEqual(1, refused.data['error']['detail']['claim_limit'])
+        self.assertEqual(4, refused.data['error']['detail']['hard_cap'])
         self.assertEqual([first], refused.data['error']['detail']['held'])
+        self.assertEqual([], refused.data['error']['detail']['blocked'])
         # The refused claim left the task exactly as it was.
         shown = self.request('GET', self.base(second), token=self.alex).data
         self.assertIsNone(shown['assignee'])
@@ -220,13 +252,107 @@ class ClaimLimitTests(test_http_agents.AgentHarness):
         self.assertEqual(200, self.claim(second, secret).status,
                          'the documented order claims other work while a checkpoint leaves a blocker')
 
+    def test_the_hard_cap_stops_an_agent_from_claiming_without_bound_by_blocking_its_own_tasks(self):
+        """kittrial-5bb.300: limit 1 has hard cap 4 (held + blocked)."""
+        agent_id, secret, _ = self.new_agent()
+        all_tasks = list(self.tasks)
+        for idx in range(3):
+            task = all_tasks[idx]
+            self.assertEqual(200, self.claim(task, secret).status)
+            made = self.request('POST', self.base(task) + '/checkpoints',
+                                {'previous': None, 'summary': 'stuck %d' % idx,
+                                 'open_items': [{'kind': 'blocker', 'text': 'blocker %d' % idx}]},
+                                token=secret)
+            self.assertIn(made.status, (200, 201), made.data)
+        # 3 blocked tasks held; the 4th claim brings total (held + blocked) to 4 == hard_cap(1).
+        fourth = all_tasks[3]
+        self.assertEqual(200, self.claim(fourth, secret).status)
+        # Even if the 4th task is also blocked, a 5th claim exceeds hard_cap(1) == 4.
+        made = self.request('POST', self.base(fourth) + '/checkpoints',
+                            {'previous': None, 'summary': 'stuck 3',
+                             'open_items': [{'kind': 'blocker', 'text': 'blocker 3'}]},
+                            token=secret)
+        self.assertIn(made.status, (200, 201), made.data)
+        fifth = self.claim(all_tasks[4], secret)
+        self.assertEqual(409, fifth.status, fifth.data)
+        self.assertIn('hard cap including blocked tasks is 4', fifth.data['error']['message'])
+        detail = fifth.data['error']['detail']
+        self.assertEqual(1, detail['claim_limit'])
+        self.assertEqual(4, detail['hard_cap'])
+        self.assertEqual(0, len(detail['held']))
+        self.assertEqual(4, len(detail['blocked']))
+        shown = self.next_of(secret)['claim_limit']
+        self.assertEqual({'limit': 1, 'hard_cap': 4, 'held': 0, 'blocked': 4,
+                          'available': 0, 'counts_task': 0,
+                          'raise_by': claim_limit.RAISE_BY}, shown)
+
+    def test_sub_label_claims_count_against_the_owning_agents_limit_and_views(self):
+        """kittrial-5bb.300 r2 (sub-label-bypass): <agent>/<label> counts against <agent>."""
+        agent_id, secret, _ = self.new_agent()
+        sub = agent_id + '/w1'
+        self.assertEqual(200, self.claim(self.tasks[0], secret, actor=sub).status)
+        second = self.claim(self.tasks[1], secret, actor=agent_id + '/w2')
+        self.assertEqual(409, second.status, second.data)
+        self.assertEqual([self.tasks[0]], second.data['error']['detail']['held'])
+        next_data = self.next_of(secret)
+        self.assertEqual(1, next_data['claim_limit']['held'])
+        self.assertEqual(0, next_data['claim_limit']['available'])
+        self.assertEqual(self.tasks[0], next_data['next_action']['task'])
+
+    def test_claim_gate_returns_one_lock_per_agent_and_normalizes_sub_labels(self):
+        """kittrial-5bb.300: Service.claim_gate(agent_id) identity and sub-label normalization."""
+        first_id, _, _ = self.new_agent(name='Gate A')
+        second_id = self.request('POST', '/v1/agents',
+                                 {'name': 'Gate B', 'working_directory': '/home/alex/gate-b',
+                                  'projects': [self.project]}, token=self.alex).data['agent']['id']
+        self.assertIs(self.service.claim_gate(first_id), self.service.claim_gate(first_id))
+        self.assertIs(self.service.claim_gate(first_id), self.service.claim_gate(first_id + '/w1'))
+        self.assertIsNot(self.service.claim_gate(first_id), self.service.claim_gate(second_id))
+
+    def test_two_different_agents_claims_do_not_wait_for_each_other(self):
+        """kittrial-5bb.300: Service.claim_gate(agent_id) is per-agent, not one global lock."""
+        first_id, first_secret, _ = self.new_agent(name='Slow')
+        second = self.request('POST', '/v1/agents',
+                              {'name': 'Fast', 'working_directory': '/home/alex/fast',
+                               'projects': [self.project]}, token=self.alex)
+        self.assertEqual(201, second.status, second.data)
+        second_secret = second.data['credential']['secret']
+
+        first_entered = threading.Event()
+        release_first = threading.Event()
+        original = self.backend.agent_tasks
+
+        def gated_agent_tasks(project_id, actor=None, queue=None):
+            if actor == first_id:
+                first_entered.set()
+                self.assertTrue(release_first.wait(2.0),
+                                'second agent must finish while first agent holds its own gate')
+            return original(project_id, actor=actor, queue=queue)
+
+        self.backend.agent_tasks = gated_agent_tasks
+        first_answer = {}
+        try:
+            t1 = threading.Thread(target=lambda: first_answer.setdefault(
+                'ans', self.claim(self.tasks[0], first_secret)))
+            t1.start()
+            self.assertTrue(first_entered.wait(10), 'first agent entered its claim gate')
+            second_answer = self.claim(self.tasks[1], second_secret)
+            self.assertEqual(200, second_answer.status, second_answer.data)
+            release_first.set()
+            t1.join(10)
+            self.assertEqual(200, first_answer['ans'].status, first_answer['ans'].data)
+        finally:
+            release_first.set()
+            self.backend.agent_tasks = original
+
     def test_an_agent_granted_two_projects_holding_nothing_can_claim(self):
         """The phantom held task is gone: the gate and /agents/me/next agree."""
         other = self.create_project(self.alex, 'Beta')
         agent_id, secret, _ = self.agent_secret(self.alex, name='Two projects',
                                                 projects=[self.project, other])
         shown = self.next_of(secret)['claim_limit']
-        self.assertEqual({'limit': 1, 'held': 0, 'available': 1, 'counts_task': 0,
+        self.assertEqual({'limit': 1, 'hard_cap': 4, 'held': 0, 'blocked': 0,
+                          'available': 1, 'counts_task': 0,
                           'raise_by': claim_limit.RAISE_BY}, shown)
         self.assertEqual(200, self.claim(self.tasks[0], secret).status,
                          'an agent on two projects holding nothing must be able to claim')
@@ -406,7 +532,8 @@ class ClaimLimitTests(test_http_agents.AgentHarness):
         self.assertNotIn('attention', me.data)
         self.assertEqual(200, self.claim(self.tasks[0], secret).status)
         held = self.next_of(secret)['claim_limit']
-        self.assertEqual((2, 1, 1), (held['limit'], held['held'], held['available']))
+        self.assertEqual((2, 5, 1, 0, 1),
+                         (held['limit'], held['hard_cap'], held['held'], held['blocked'], held['available']))
         self.assertEqual(claim_limit.RAISE_BY, held['raise_by'])
         again = self.request('GET', '/v1/agents/me', token=secret).data['claim_limit']
         # Still the record's own limit, whatever the agent now holds: the counted view is
@@ -417,13 +544,15 @@ class ClaimLimitTests(test_http_agents.AgentHarness):
     def test_the_agent_is_told_its_limit_and_what_holds_it(self):
         agent_id, secret, _ = self.new_agent()
         idle = self.next_of(secret)
-        self.assertEqual({'limit': 1, 'held': 0, 'available': 1,
-                          'counts_task': 0,
+        self.assertEqual({'limit': 1, 'hard_cap': 4, 'held': 0, 'blocked': 0,
+                          'available': 1, 'counts_task': 0,
                           'raise_by': claim_limit.RAISE_BY}, idle['claim_limit'])
         self.assertEqual(200, self.claim(self.tasks[0], secret).status)
         held = self.next_of(secret)['claim_limit']
         self.assertEqual(1, held['limit'])
+        self.assertEqual(4, held['hard_cap'])
         self.assertEqual(1, held['held'])
+        self.assertEqual(0, held['blocked'])
         self.assertEqual(0, held['available'])
 
     def test_the_owner_reads_the_limit_on_my_agents(self):
@@ -528,10 +657,24 @@ class RealStackClaimLimitTests(held_stack.RealStackTests):
         return made.data['agent']['id'], made.data['credential']['secret']
 
     def test_one_lock_serializes_two_concurrent_claims_by_one_agent(self):
-        for round_ in range(5):
+        """Kills L1, L3 via the [200, 409] race itself."""
+        for round_ in range(3):
             # A fresh agent each round: the round before leaves one task held.
             agent_id, secret = self.new_agent('Racer %d' % round_)
             left, right = self.new('race a %d' % round_), self.new('race b %d' % round_)
+            barrier = threading.Barrier(2, timeout=0.35)
+            original = self.backend.agent_tasks
+
+            def racing_agent_tasks(project_id, actor=None, queue=None):
+                rows = original(project_id, actor=actor, queue=queue)
+                if actor == agent_id:
+                    try:
+                        barrier.wait()
+                    except threading.BrokenBarrierError:
+                        pass
+                return rows
+
+            self.backend.agent_tasks = racing_agent_tasks
             answers = {}
 
             def go(slot, task):
@@ -540,16 +683,88 @@ class RealStackClaimLimitTests(held_stack.RealStackTests):
 
             threads = [threading.Thread(target=go, args=(0, left)),
                        threading.Thread(target=go, args=(1, right))]
-            for thread in threads:
-                thread.start()
-            for thread in threads:
-                thread.join(240)
+            try:
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(240)
+            finally:
+                self.backend.agent_tasks = original
             statuses = sorted(answer.status for answer in answers.values())
             held = [task for task in (left, right) if self.held(task)[1] == agent_id]
             self.assertEqual([200, 409], statuses,
                              {slot: (answer.status, answer.data)
                               for slot, answer in answers.items()})
             self.assertEqual(1, len(held), 'a limit of one holds exactly one task')
+
+    def test_one_lock_serializes_concurrent_self_assignments_on_assign_route(self):
+        """kittrial-5bb.300 r2 (assign-route-race-test): kills L4 (and L1) on /assign."""
+        for round_ in range(2):
+            agent_id, secret = self.new_agent('Assign Racer %d' % round_)
+            granted = self.request('PUT', '/v1/projects/pp/agents/%s/coordinator' % agent_id, {},
+                                   token=self.tokens['alex'])
+            self.assertIn(granted.status, (200, 201), granted.data)
+            left, right = self.new('asgn a %d' % round_), self.new('asgn b %d' % round_)
+            barrier = threading.Barrier(2, timeout=0.35)
+            original = self.backend.agent_tasks
+
+            def racing_agent_tasks(project_id, actor=None, queue=None):
+                rows = original(project_id, actor=actor, queue=queue)
+                if actor == agent_id:
+                    try:
+                        barrier.wait()
+                    except threading.BrokenBarrierError:
+                        pass
+                return rows
+
+            self.backend.agent_tasks = racing_agent_tasks
+            answers = {}
+            body = {'expected_assignee': None, 'assignee': agent_id, 'reason': 'self race',
+                    'allow_pending_review': False, 'allow_held_slot': False}
+
+            def go(slot, task):
+                answers[slot] = self.request('POST', '%s/%s/assign' % (self.tasks, task),
+                                             dict(body), token=secret,
+                                             key='assign-race-%d-%d' % (round_, slot))
+
+            threads = [threading.Thread(target=go, args=(0, left)),
+                       threading.Thread(target=go, args=(1, right))]
+            try:
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(240)
+            finally:
+                self.backend.agent_tasks = original
+            statuses = sorted(answer.status for answer in answers.values())
+            held = [task for task in (left, right) if self.held(task)[1] == agent_id]
+            self.assertEqual([200, 409], statuses,
+                             {slot: (answer.status, answer.data)
+                              for slot, answer in answers.items()})
+            self.assertEqual(1, len(held), 'self-assignment race on /assign holds at most one task')
+
+    def test_sub_label_cannot_bypass_claim_limit_on_real_stack(self):
+        """kittrial-5bb.300 r2 (sub-label-bypass): real-stack sub-label claim, /next, and release."""
+        agent_id, secret = self.new_agent('SubLabeler')
+        first, second = self.new('sub one'), self.new('sub two')
+        claimed = self.request('POST', '%s/%s/claim' % (self.tasks, first),
+                               {'actor': agent_id + '/w1'}, token=secret, key='sub-claim-1')
+        self.assertEqual(200, claimed.status, claimed.data)
+        self.assertEqual(agent_id + '/w1', self.held(first)[1])
+        refused = self.request('POST', '%s/%s/claim' % (self.tasks, second),
+                               {'actor': agent_id + '/w2'}, token=secret, key='sub-claim-2')
+        self.assertEqual(409, refused.status, refused.data)
+        self.assertIsNone(self.held(second)[1])
+        next_view = self.request('GET', '/v1/agents/me/next', token=secret)
+        self.assertEqual(200, next_view.status, next_view.data)
+        self.assertEqual(1, next_view.data['claim_limit']['held'])
+        self.assertEqual(0, next_view.data['claim_limit']['available'])
+        self.assertEqual(first, next_view.data['next_action']['task'])
+        released = self.request('POST', '/v1/agents/%s/release-claims' % agent_id, {},
+                                token=self.tokens['alex'], key='sub-release-1')
+        self.assertEqual(200, released.status, released.data)
+        self.assertEqual([first], [row['task'] for row in released.data['released']])
+        self.assertIsNone(self.held(first)[1])
 
     def test_an_agent_assigning_a_task_to_itself_is_gated_but_a_person_is_not(self):
         agent_id, secret = self.new_agent('Coord')
@@ -824,6 +1039,30 @@ class RealStackClaimReleaseTests(held_stack.RealStackTests):
                          'the task returns to open and unassigned')
         self.assertEqual(200, self.claim(None, second, token=secret, key='claim-rel-3').status,
                          'the release freed the claim slot at once')
+
+    def test_an_agent_releases_a_claim_held_under_a_sub_label(self):
+        """kittrial-5bb.300 r3 (merge-forward .301): releasing a claim held under <agent>/<label>."""
+        agent_id, secret = self.new_agent('SubReleaser')
+        _, other_secret = self.new_agent('OtherReleaser')
+        first, second = self.new('sub to release'), self.new('sub next')
+        sub = agent_id + '/w1'
+        claimed = self.request('POST', '%s/%s/claim' % (self.tasks, first),
+                               {'actor': sub}, token=secret, key='claim-sub-rel-1')
+        self.assertEqual(200, claimed.status, claimed.data)
+        self.assertEqual(('in_progress', sub), self.held(first))
+        refused = self.claim(None, second, token=secret, key='claim-sub-rel-2')
+        self.assertEqual(409, refused.status, refused.data)
+        other_refused = self.release(first, other_secret, reason='not mine')
+        self.assertEqual(409, other_refused.status, other_refused.data)
+        self.assertEqual(('in_progress', sub), self.held(first))
+        released = self.release(first, secret, reason='releasing sub-label claim')
+        self.assertEqual(200, released.status, released.data)
+        self.assertEqual(sub, released.data['previous_assignee'])
+        self.assertIsNone(released.data['assignee'])
+        self.assertEqual(('open', None), self.held(first),
+                         'the sub-label claim returns to open and unassigned')
+        self.assertEqual(200, self.claim(None, second, token=secret, key='claim-sub-rel-3').status,
+                         'releasing the sub-label claim freed the agent claim slot at once')
 
     def test_the_released_task_is_claimable_by_another_agent(self):
         task = self.new('shared')

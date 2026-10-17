@@ -2,6 +2,7 @@
 import argparse
 import json
 import record_json
+from claim_limit import actor_holds
 from lifecycle import integration_evidence, project_facts
 from review_state import RECONCILIATION_STATE, next_actor, active_work
 
@@ -367,14 +368,14 @@ def checkpoint_wait(row, actor, state, delivered=False):
     """
     result = dict(status='unknown', checkpoint=None, author=None, is_current=None,
                   active=None, items=[], total=None, omitted=None, next_action=None)
-    if row.get('assignee') != actor or not actor:
+    if not actor_holds(row.get('assignee'), actor):
         result.update(status='not-owned', active=False)
         return result
     if state is None or state['invalid']:
         return result
     comments = {str(c.get('id')): c for c in row.get('comments') or [] if isinstance(c, dict)}
     own = [(cid, p) for cid, p in state['history']
-           if comments.get(str(cid), {}).get('author') == actor]
+           if actor_holds(comments.get(str(cid), {}).get('author'), actor)]
     if not own:
         result.update(status='none', is_current=False, active=False, total=0, omitted=0)
         return result
@@ -864,7 +865,7 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
         work_state=review.get('work_state',state)
         from task_assignment import notices as assignment_notices
         notices=assignment_notices(row,journal.name if journal is not None else '',actor)
-        if owner is not None and row.get('assignee')!=owner:
+        if owner is not None and not actor_holds(row.get('assignee'), owner):
 
             # A first-class review request (kittrial-5bb.94 item 4) puts the task in
             # the NAMED reviewer's queue even though they are not its assignee.
@@ -880,7 +881,7 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
                           'author':request.get('author'),'timestamp':request.get('timestamp')}
                          for request in (review.get('pending_review_requests') or [])
                          if subject is not None and author_key(request.get('reviewer'))==author_key(subject)]
-        review_request=bool(review_requests) and row.get('assignee')!=subject
+        review_request=bool(review_requests) and not (subject and actor_holds(row.get('assignee'), subject))
         # The integration overlay's warnings (kittrial-5bb.52): the owner decision
         # keeps any-pass-wins, and a host-issued revert is always surfaced, so both
         # the disagreement and the revert warning travel with the row.
@@ -991,7 +992,7 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
         # this row already shows; no further read. `owned` is the SUBJECT's (kittrial-
         # 5bb.288): an open task assigned to the subject with no contribution and no
         # checkpoint by them reads `you` and counts in `your_move`.
-        move,move_text,role=move_decision(state,row['id'],bool(subject) and row.get('assignee')==subject,
+        move,move_text,role=move_decision(state,row['id'],bool(subject) and actor_holds(row.get('assignee'), subject),
                                           named_reviewer=review_request,pending_items=pending_items,
                                           redelivered=redelivered,assignee=row.get('assignee'),
                                           closed=row.get('status')=='closed',claimable=row_claimable)

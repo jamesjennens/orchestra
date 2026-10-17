@@ -961,12 +961,12 @@ class Service:
                  lookup_max=LOOKUP_MAX_PER_WINDOW, lookup_window=LOOKUP_WINDOW_SECONDS,
                  approval_by_another_party=False, agent_credential_days=_AGENT_LIFETIME_DEFAULT):
         self.store = store
-        #: One lock spanning the per-agent claim gate's held-set read and the claim
-        #: write (kittrial-5bb.276 revision). The held set is a separate endpoint
-        #: read, so without a lock two concurrent claims by one agent both read the
-        #: set before either wrote and both passed a limit of one. It is per service
-        #: process, which is where that service's concurrent HTTP requests are served.
-        self.claim_gate = threading.RLock()
+        #: Per-agent locks spanning the claim gate's held-set read and the claim write
+        #: (kittrial-5bb.276 revision; per-agent in kittrial-5bb.300). Keyed by the
+        #: agent id so concurrent claims by one agent serialize while unrelated agents'
+        #: claims do not wait for each other. One service process is the supported setup.
+        self._claim_gates_guard = threading.Lock()
+        self._claim_gates = {}
         #: The installation's setting "nobody approves work of their own party" (slice 1a of
         #: docs/WEB_COORDINATOR_DESIGN.md, kittrial-5bb.199). OFF unless the operator turns it
         #: on: with it off every review rule is exactly what it was.
@@ -999,6 +999,24 @@ class Service:
         self._lookups = {}
 
     # -- helpers ---------------------------------------------------------------
+    def claim_gate(self, agent_id):
+        """The per-agent lock spanning the claim gate's held-set read and write (kittrial-5bb.300).
+
+        Keyed by ``agent_id`` (the agent's stable id and actor namespace head), so two
+        concurrent claims or self-assignments by the SAME agent (including under a
+        ``<agent>/<label>`` sub-label) serialize while claims by unrelated agents proceed
+        concurrently without waiting for each other's tracker reads.
+        One service process is the supported setup; this lock is in-memory in that process.
+        """
+        key = str(agent_id or '')
+        if '/' in key:
+            key = key.split('/', 1)[0]
+        with self._claim_gates_guard:
+            gate = self._claim_gates.get(key)
+            if gate is None:
+                gate = self._claim_gates[key] = threading.RLock()
+            return gate
+
     @property
     def state(self):
         return self.store.state

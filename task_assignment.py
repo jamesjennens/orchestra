@@ -132,7 +132,8 @@ def parse_comment(comment, *, project, task):
 def holder_message(notice, actor):
     """A polling notice for either holder; no push or acknowledgement claim."""
     _validate_notice(notice)
-    if actor == notice['from'] and actor is not None:
+    from claim_limit import actor_holds
+    if actor is not None and (actor == notice['from'] or actor_holds(notice['from'], actor)):
         if notice['assigned_by'] == actor and notice['to'] is None:
             # The holder released its own claim (kittrial-5bb.301): say so, rather than
             # "taken from you by" the holder itself.
