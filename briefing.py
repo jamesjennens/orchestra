@@ -1093,14 +1093,15 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
         result['guidance']=brief_block(journal,actor)
     # kittrial-5bb.293 item 1: when a compact field is cut, say how to read the whole
     # over the route the caller uses. The endpoint names `show TASK`; the HTTP brief
-    # rewrites this to the GET route and carries the link.
+    # rewrites this to the GET route and carries the link. The block is present ONLY
+    # when a field was actually cut: an uncut brief then carries exactly the bytes it
+    # carried before this pointer existed, which is what keeps the long prior chain
+    # under the 6000-byte bound the follow-on test holds (kittrial-5bb.293 r6 item 2).
     if (result.get('title') or {}).get('omitted_chars') or \
             (result.get('intent') or {}).get('omitted_chars') or \
             (result.get('acceptance') or {}).get('omitted_chars'):
         result['read_whole'] = {'route': 'show %s' % task,
-                                'note': 'A field was cut. `show %s` carries the complete text.' % task}
-    else:
-        result['read_whole'] = None
+                                'note': 'The complete text: show %s.' % task}
     if full:
         # The explicit fuller-context read (kittrial-5bb.8): the compact brief stays
         # compact, and a caller that needs the whole text asks for it and is told how

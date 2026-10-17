@@ -2773,6 +2773,14 @@ class EndpointBackend:
                 lifecycle[dimension]['reason']=fact['reason']
                 lifecycle[dimension]['note']=fact['reason']
         dependencies = (data.get('dependencies') or {}).get('items') or []
+        # kittrial-5bb.293 item 1: when a field is cut, the HTTP brief names the GET
+        # route that returns the full description and carries the link. Like the
+        # canonical brief, the block is present ONLY when a field was actually cut,
+        # so an uncut brief carries no pointer bytes on either route.
+        read_whole = ({'route': 'GET /v1/projects/%s/tasks/%s' % (project_id, task),
+                       'link': '/v1/projects/%s/tasks/%s' % (project_id, task),
+                       'note': 'The complete text: GET /v1/projects/%s/tasks/%s.' % (project_id, task)}
+                      if data.get('read_whole') else None)
         return {**({'assignment_records':data['assignment_records']} if data.get('assignment_records') else {}),
                 'task': task, 'checkpoint': checkpoint, 'carry_open_items': carry,
                 'review': {'state': review.get('review_state') or 'none',
@@ -2821,13 +2829,9 @@ class EndpointBackend:
                 # checkpoint from the brief alone (kittrial-5bb.113).
                 'next_action': data.get('next_action'),
                 'activity_cursor': data.get('activity_cursor'),
-                # kittrial-5bb.293 item 1: when a field is cut, the HTTP brief names the
-                # GET route that returns the full description and carries the link.
-                'read_whole': ({'route': 'GET /v1/projects/%s/tasks/%s' % (project_id, task),
-                                'link': '/v1/projects/%s/tasks/%s' % (project_id, task),
-                                'note': 'A field was cut. GET /v1/projects/%s/tasks/%s returns the '
-                                        'complete description.' % (project_id, task)}
-                               if data.get('read_whole') else None),
+                # kittrial-5bb.293 item 1: the pointer block built above is carried
+                # only when a field was actually cut.
+                **({'read_whole': read_whole} if read_whole else {}),
                 'warnings': data.get('warnings') or [],
                 # The canonical brief already bounds refs, authors and omissions;
                 # preserve its coverage/unknown counts rather than infer from time.
