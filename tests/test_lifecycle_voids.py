@@ -1399,6 +1399,65 @@ class UnreadableHoldChainAuditTests(unittest.TestCase):
         self.assertIn('cannot be read', entry['reason'])
         self.assertIn('p-quiet', entry['reason'])
 
+    def test_an_ordinary_lookalike_comment_is_not_a_chain_record(self):
+        # kittrial-5bb.297 review item 'family-prefix-dos': an ordinary comment that
+        # merely looks like the reserved prefix is NOT a chain record, so a
+        # contributor cannot stop another task's release by writing one - only the
+        # reserved any-version pattern with its newline counts.
+        import lifecycle
+        lookalikes = ['Kind: contribution-reviewer note about the review\nnothing reserved',
+                      'Kind: contribution-review-v1 (quoting the docs) is not a record',
+                      'Kind: contribution-review is a family of records']
+        for text in lookalikes:
+            with self.subTest(text=text[:40]):
+                row = dict(id='p-look', issue_type='task', title='lookalike', status='open',
+                           assignee='worker', comments=[dict(id='1', text=text, author='worker',
+                                                             created_at='2026-09-16T00:00:00Z')],
+                           labels=[])
+                self.assertIsNone(lifecycle.unreadable_hold_chain(row, ['op']))
+        page = voids.audit(rows() + [dict(id='p-look', issue_type='task', title='lookalike',
+                                          status='open', assignee='worker', comments=[
+                                              dict(id='1', text=lookalikes[0], author='worker',
+                                                   created_at='2026-09-16T00:00:00Z')],
+                                          labels=[])], operators=['op'])
+        self.assertEqual(page['unreadable_hold_chain_count'], 0)
+
+    def test_a_voided_bad_record_no_longer_flags(self):
+        # kittrial-5bb.297 review item 'family-prefix-dos': the operator voids are
+        # applied BEFORE deciding, so the repair the refusal names works - a voided
+        # bad record (unparseable bytes, or a version this kit does not know) no
+        # longer flags the task.
+        import lifecycle
+        import recovery
+        from requirements import canonical_bytes
+        bad = dict(id='1', text='Kind: contribution-review-v1\n{"broken": not json',
+                   author='worker', created_at='2026-09-16T00:00:00Z')
+        future = dict(id='1', text='Kind: contribution-review-v9\n{"anything"',
+                      author='worker', created_at='2026-09-16T00:00:00Z')
+        for comment, voidable in ((bad, True), (future, False)):
+            with self.subTest(record=comment['text'][:36]):
+                row = dict(id='p-voided', issue_type='task', title='voided', status='open',
+                           assignee='worker', comments=[comment], labels=[])
+                self.assertIsNotNone(lifecycle.unreadable_hold_chain(row, ['op']))
+                void = dict(schema_version=1, operation='void-record', operation_id='void-1',
+                            task='p-voided', target='1', target_kind='contribution-review',
+                            target_sha256=recovery.digest(comment['text']),
+                            original=comment['text'], reason='Repairing',
+                            disposition='void', operator='op')
+                row['comments'].append(dict(id='2',
+                                            text=recovery.PREFIX + canonical_bytes(void).decode(),
+                                            author='op', created_at='2026-09-16T00:01:00Z'))
+                if voidable:
+                    self.assertIsNone(lifecycle.unreadable_hold_chain(row, ['op']),
+                                      'a voided bad record must not flag the task')
+                else:
+                    # A record of an unknown VERSION cannot be voided today: recovery's
+                    # check_void only accepts targets with the exact v1 prefix, so the
+                    # void is refused and the task stays flagged - fail closed is
+                    # right; letting recovery void the any-version family is proposed
+                    # as a follow-up, not built here.
+                    self.assertIsNotNone(lifecycle.unreadable_hold_chain(row, ['op']))
+
     def test_a_readable_chain_and_a_chain_future_version_and_no_chain(self):
         # A task with no chain comments at all is not flagged, and neither is a
         # readable one. A comment of a FUTURE chain version this kit cannot parse is

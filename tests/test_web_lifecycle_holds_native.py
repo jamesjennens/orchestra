@@ -315,3 +315,65 @@ class NativeHoldWebTests(RulesHelpers, unittest.TestCase):
             # The slot is the project's one; leave it free for the sibling tests.
             harness.request('POST', '/v1/projects/pp/merge-slot/release', {},
                             token=token, key='unread-slot-release')
+
+    def test_the_endpoint_coordinate_route_passes_the_operators_always(self):
+        """kittrial-5bb.297 review item 'operators-everywhere-really' (a): the coordinate
+        merge-acquire through the ENDPOINT refuses while the chain is unreadable even
+        with every coordinator rule off, and one operator void releases it - the route
+        passes the configured operators always, not only when a rule is on."""
+        import review_workflow as rw
+        import recovery
+        from requirements import canonical_bytes
+        harness, token = self.web()
+        # Every rule key popped: coordinator_writes, independent_approval and
+        # lifecycle_authors are all OFF; only the operator allowlist is configured.
+        self.deployment(operators=['ops'], review_workflow_writes=True)
+        task = self.task('Unreadable coordinate web', assignee='other-author')
+        contribution = json.loads(self.contribute(task, 'other-author')['stdout'])['comment_id']
+        approval = json.loads(self.approve(task, 'ops', contribution)['stdout'])['comment_id']
+        self.post_review(task, 'ops', dict(
+            schema_version=1, operation='hold', operation_id='coord-hold', task=task,
+            previous=approval, contribution=contribution, reason='Held before the damage'))
+        broken = dict(id=None, text=rw.PREFIX + '{"broken": not json')
+        made = self.r.bd('comments', 'add', task, broken['text'], actor='other-author')
+        self.assertEqual(made.returncode, 0, made.stderr)
+
+        def coordinate():
+            return self.endpoint('coordinate', 'ops', [json.dumps(
+                {'operation': 'merge-acquire', 'task': task, 'target': 'main'})])
+
+        refused = coordinate()
+        self.assertEqual(refused['returncode'], 2, refused)
+        self.assertIn('cannot be read', refused['stderr'])
+        # One operator void of the broken comment: the coordinate route, reading with
+        # the configured operators, now reads the chain (and the hold it carried, so
+        # the refusal names the hold - released, the acquisition succeeds).
+        row = next(row_ for row_ in self.rows() if row_['id'] == task)
+        target = next(comment for comment in row['comments'] if comment['text'] == broken['text'])
+        void = dict(schema_version=1, operation='void-record', operation_id='void-coord-web',
+                    task=task, target=target['id'], target_kind='contribution-review',
+                    target_sha256=recovery.digest(target['text']), original=target['text'],
+                    reason='Repairing the damaged record', disposition='void', operator='ops')
+        self.assertEqual(self.r.bd('comments', 'add', task,
+                                   recovery.PREFIX + canonical_bytes(void).decode(),
+                                   actor='ops').returncode, 0)
+        held = coordinate()
+        self.assertEqual(held['returncode'], 2, held)
+        self.assertIn('open integration hold', held['stderr'])
+        hold_id = next(comment['id'] for comment in self.rows() and
+                       next(r_ for r_ in self.rows() if r_['id'] == task)['comments']
+                       if comment['text'].startswith(rw.PREFIX)
+                       and '"operation":"hold"' in comment['text'])
+        self.post_review(task, 'ops', dict(
+            schema_version=1, operation='release-hold', operation_id='coord-release',
+            task=task, previous=hold_id, contribution=contribution, hold=hold_id,
+            reason='Cleared after the repair'))
+        acquired = coordinate()
+        self.assertEqual(acquired['returncode'], 0, acquired)
+        # The slot is the project's one; an owner force-releases it (the holder is
+        # the native actor 'ops') so the sibling tests find it free.
+        freed = harness.request('POST', '/v1/projects/pp/merge-slot/force-release',
+                                {'expected_holder': 'ops',
+                                 'reason': 'test cleanup: native coordinate acquisition'},
+                                token=token, key='coord-force-release')
+        self.assertEqual(200, freed.status, freed.data)
