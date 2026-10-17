@@ -34,6 +34,14 @@ DEFAULT_LIMIT = 1
 LIMIT_MIN = 1
 LIMIT_MAX = 50
 
+#: How many blocked tasks an agent may hold in addition to its ``claim_limit``
+#: before the hard cap refuses further claims (kittrial-5bb.300). A blocked task
+#: does not consume the active ``claim_limit`` slot so a stuck lane can follow
+#: the documented order onto other work, while ``claim_limit + BLOCKED_SLACK``
+#: bounds total undelivered claims (active plus blocked) so self-written blocker
+#: checkpoints cannot claim without bound.
+BLOCKED_SLACK = 3
+
 #: How many held tasks the refusal sentence names before it says how many more.
 NAMED_MAX = 5
 
@@ -84,6 +92,27 @@ def default_limit(agent=None):
     return value
 
 
+def hard_cap(limit):
+    """The hard ceiling on all undelivered claims (active plus blocked) for ``limit``."""
+    if limit is None:
+        return None
+    return limit + BLOCKED_SLACK
+
+
+def actor_holds(assignee, actor):
+    """Whether ``assignee`` is ``actor`` or a sub-label ``<actor>/<label>`` of it.
+
+    The bridge permits ``<agent>/<label>`` as a sub-label under ``<agent>``'s
+    credential (for example ``agent_.../sub0``). Every claim in that namespace
+    belongs to the same agent record and counts toward the same ``claim_limit``
+    and :func:`hard_cap`.
+    """
+    if not isinstance(assignee, str) or not assignee or not isinstance(actor, str) or not actor:
+        return False
+    base = actor.rstrip('/')
+    return bool(base) and (assignee == base or assignee.startswith(base + '/'))
+
+
 def validate_limit(value):
     """The stored form of one owner-supplied limit, or ``ValueError``.
 
@@ -128,9 +157,10 @@ def blocked(task):
     """Whether the task's latest checkpoint left a blocker or a dependency.
 
     The owner's decision (2026-10-16, the kittrial-5bb.276 revision): a BLOCKED
-    task does not count against the limit. The documented order tells a lane whose
-    latest checkpoint left a blocker to claim other work instead of waiting, and
-    counting that task as held would make that order impossible to follow.
+    task does not count against ``claim_limit`` itself. The documented order tells
+    a lane whose latest checkpoint left a blocker to claim other work instead of
+    waiting, and counting that task as active held work would make that order
+    impossible to follow. Blocked tasks still count toward :func:`hard_cap`.
 
     An unknown blocking count (``None``, or a row that did not carry the field) is
     NOT read as blocked: the caller's own completeness check refuses an unreadable
@@ -144,8 +174,13 @@ def blocked(task):
 
 
 def held_against_limit(tasks):
-    """The rows that count against a limit: undelivered, and not blocked."""
+    """The rows that count against ``claim_limit``: undelivered, and not blocked."""
     return [task for task in held_undelivered(tasks) if not blocked(task)]
+
+
+def held_blocked(tasks):
+    """The rows that are undelivered and blocked by their latest checkpoint."""
+    return [task for task in held_undelivered(tasks) if blocked(task)]
 
 
 def names(tasks, limit=NAMED_MAX):
@@ -153,12 +188,30 @@ def names(tasks, limit=NAMED_MAX):
     return [str(task.get('id')) for task in (tasks or [])[:limit] if task.get('id')]
 
 
-def refusal(limit, held, more=0):
-    """The sentence a refused claim carries: the limit, then what holds it.
+def refusal(limit, held, more=0, blocked=()):
+    """The sentence a refused claim carries: the limit, the hard cap, and what holds it.
 
-    It names the held tasks so the caller need not read the queue to find out
-    what is in the way, and says how many more there are when the list was cut.
+    It names the held tasks (and the blocked ones when the hard cap is what refused
+    the claim) so the caller need not read the queue to find out what is in the way,
+    and says how many more there are when the list was cut.
     """
+    cap = hard_cap(limit)
+    blocked = list(blocked or [])
+    if limit is not None and limit >= 1 and len(held) + max(0, more) < limit:
+        combined = list(held) + blocked
+        total = len(combined) + max(0, more)
+        shown = names(combined)
+        extra = max(0, len(combined) - len(shown)) + max(0, more)
+        if shown:
+            what = 'it holds %s' % ', '.join(shown)
+            if extra:
+                what += ' and %d more' % extra
+        else:
+            what = 'it holds %d undelivered task(s)' % total
+        return ('This agent already holds %d claimed undelivered task(s) (%d blocked) and its '
+                'hard cap including blocked tasks is %d (limit is %d, plus %d blocked): %s. '
+                'Deliver or release one before claiming another.'
+                % (total, len(blocked), cap, limit, BLOCKED_SLACK, what))
     shown = names(held)
     if shown:
         what = 'it holds %s' % ', '.join(shown)
@@ -166,20 +219,24 @@ def refusal(limit, held, more=0):
             what += ' and %d more' % more
     else:
         what = 'it holds %d undelivered task(s)' % (len(held) + more)
-    return ('This agent already holds %d claimed undelivered task(s) and its limit is %d: '
-            '%s. Deliver or release one before claiming another.' % (len(held) + more, limit, what))
+    return ('This agent already holds %d claimed undelivered task(s) and its limit is %d '
+            '(hard cap %d including blocked tasks): %s. Deliver or release one before claiming another.'
+            % (len(held) + more, limit, cap, what))
 
 
-def check(limit, held, more=0):
-    """Refuse a NEW claim while the limit is already reached.
+def check(limit, held, more=0, blocked=()):
+    """Refuse a NEW claim while the limit or the hard cap is already reached.
 
-    ``held`` is the agent's held and undelivered set in the project; ``more``
-    counts held rows that could not be listed. A limit already at its bound
-    refuses; a limit of zero refuses everything. Returns the refusal sentence, or
-    ``None`` when the claim may proceed.
+    ``held`` is the agent's active (unblocked) undelivered set across its projects;
+    ``blocked`` is its blocked undelivered set; ``more`` counts held rows that could
+    not be listed. Reaching ``limit`` on active tasks or ``hard_cap(limit)`` on all
+    undelivered tasks (active plus blocked) refuses; a limit of zero refuses
+    everything. Returns the refusal sentence, or ``None`` when the claim may proceed.
     """
     if limit is None:
         return None
-    if limit < 1 or len(held) + max(0, more) >= limit:
-        return refusal(limit, held, more)
+    blocked = list(blocked or [])
+    extra = max(0, more)
+    if limit < 1 or len(held) + extra >= limit or len(held) + len(blocked) + extra >= hard_cap(limit):
+        return refusal(limit, held, more, blocked=blocked)
     return None

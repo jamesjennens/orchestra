@@ -1533,20 +1533,27 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                     raise AssignmentError(422,'Assignment roster requires a nonnegative offset and limit 1-200.')
             elif action=='task-release':
                 # The holder releases its OWN claim (kittrial-5bb.301). The body carries
-                # only the task and the reason; expected_assignee is derived from the
-                # authenticated caller, never submitted, so no caller can clear another
-                # actor's assignee. It is the same canonical assignment the owner's bulk
-                # release uses, so there is one way to clear an assignee. The canonical
-                # change check below refuses a task the caller does not hold, ANY delivered
-                # contribution (awaiting review, changes requested, approved or integrated),
-                # and the merge slot.
+                # the task, the reason, and (when held under a <agent>/<label> sub-label,
+                # kittrial-5bb.300) the row's current assignee as expected_assignee, verified
+                # by claim_limit.actor_holds against the authenticated caller so no caller
+                # can clear another actor's assignee. It is the same canonical assignment the
+                # owner's bulk release uses, so there is one way to clear an assignee. The
+                # canonical change check below refuses a task the caller does not hold, ANY
+                # delivered contribution (awaiting review, changes requested, approved or
+                # integrated), and the merge slot.
                 if not isinstance(args,list) or len(args)!=1 or not isinstance(args[0],str):
                     raise AssignmentError(422,'A claim release takes one closed JSON request.')
                 fields=record_json.loads(args[0])
-                if not isinstance(fields,dict) or set(fields)!={'task_id','reason'}:
+                if (not isinstance(fields,dict)
+                        or not set(fields).issubset({'task_id','reason','expected_assignee'})
+                        or not {'task_id','reason'}.issubset(fields)):
                     raise AssignmentError(422,'A claim release takes one task id and one reason.')
+                from claim_limit import actor_holds
+                expected_assignee=fields.get('expected_assignee') if 'expected_assignee' in fields else actor
+                if not actor_holds(expected_assignee,actor):
+                    raise AssignmentError(409,'That task is not claimed by you; only its holder can release it')
                 payload={'schema_version':1,'operation_id':request.get('operation_id'),
-                         'task':fields['task_id'],'expected_assignee':actor,'assignee':None,
+                         'task':fields['task_id'],'expected_assignee':expected_assignee,'assignee':None,
                          'reason':fields['reason'],'allow_pending_review':False,
                          'allow_held_slot':False}
                 validate_request(payload)

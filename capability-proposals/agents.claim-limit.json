@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "operation_id": "capnew-5bb300-agents-claim-limit-0001",
+  "key": "agents.claim-limit",
+  "name": "Per-agent limit on claimed, undelivered tasks, blocked-task hard cap, and per-agent claim lock",
+  "aliases": [
+    "claim limit",
+    "agent claim limit",
+    "claim_gate",
+    "held_against_limit",
+    "hard_cap",
+    "actor_holds",
+    "blocked task claim limit",
+    "release agent claims"
+  ],
+  "summary": "Each personal agent carries an owner-editable claim_limit (1..50, default 1, lowerable by the agent via PATCH /v1/agents/me) enforced in tasks.claim and on an agent's self-assignment in tasks.assign under a per-agent reentrant lock (Service.claim_gate(agent_id)). A task counts against claim_limit while assigned to the agent's actor or a <agent>/<label> sub-label (claim_limit.actor_holds), open or in_progress, with review state none or changes-requested (or unknown, fail-closed), unless its newest valid checkpoint declares a blocker or dependency item. A hard cap of claim_limit + 3 (BLOCKED_SLACK = 3, hard_cap(limit)) counts all undelivered claims including blocked ones; a refused claim answers 409 conflict with held, blocked, claim_limit and hard_cap in detail. /v1/agents/me/next reports the counted view (limit, hard_cap, held, blocked, available, counts_task, raise_by) while /v1/agents/me answers the record view (limit, raise_by) with no work read, and the holder (POST /v1/projects/{id}/tasks/{task}/release) or owner (POST /v1/agents/{id}/release-claims) can release undelivered claims.",
+  "requirements": [],
+  "anchors": [
+    "docs/HTTP_DEPLOYMENT.md#personal-agents"
+  ],
+  "code": [
+    "claim_limit.py::default_limit",
+    "claim_limit.py::validate_limit",
+    "claim_limit.py::hard_cap",
+    "claim_limit.py::actor_holds",
+    "claim_limit.py::counted",
+    "claim_limit.py::held_undelivered",
+    "claim_limit.py::blocked",
+    "claim_limit.py::held_against_limit",
+    "claim_limit.py::held_blocked",
+    "claim_limit.py::refusal",
+    "claim_limit.py::check",
+    "http_auth.py::Service.claim_gate",
+    "http_service.py::ApiHandler._refuse_claim_over_limit",
+    "http_service.py::ApiHandler._agent_claim_limit_record_view",
+    "http_service.py::ApiHandler._agent_claim_limit_view",
+    "http_service.py::ApiHandler.task_release",
+    "http_service.py::ApiHandler.agents_release_claims"
+  ],
+  "tests": [
+    "tests/test_claim_limit.py"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "agents",
+    "http",
+    "tasks",
+    "claim"
+  ]
+}
