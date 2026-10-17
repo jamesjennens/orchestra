@@ -305,7 +305,7 @@ export function agentGuide(payload, { hasCertificate = false } = {}) {
     'At every run, in this order:',
     '',
     ...runSteps(server, file),
-    `6. If a call returns 401, the secret file is missing or wrong: stop and ask your owner to check ${file.windows}.`,
+    `6. If a call returns 401, the secret file is missing or wrong: stop and ask your owner to check ${file.windows}. If the VS Code extension or a tool reports a certificate error (such as a self-signed certificate), it is fixed by the VS Code setting orchestraBridge.caFile (set to ${payload.certificateFile.windows} on Windows or ${payload.certificateFile.posix} on macOS/Linux) or by running "Orchestra Bridge: Set up" / "Orchestra Bridge: Check now" to trust the server certificate fingerprint — never by installing the certificate in system certificate stores, launching VS Code with --use-system-ca, or setting environment variables such as NODE_EXTRA_CA_CERTS.`,
     '7. Stop and ask your owner if anything is unclear.',
     '',
     `The whole order, for every kind of worker, is the kit's document "How work is found": GET ${server}/v1/docs/finding-work`,

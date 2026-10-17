@@ -70,8 +70,8 @@ function manages(ctx, raw) {
 export const CLAIM_LIMIT_MIN = 1;
 export const CLAIM_LIMIT_MAX = 50;
 
-export const SCOPES = [['read', 'Read'], ['tasks', 'Claim and change tasks'], ['checkpoints', 'Write checkpoints'],
-  ['reviews', 'Deliver and review'], ['feedback', 'Send feedback'], ['proposals', 'Propose requirements']];
+export const SCOPES = [['read', 'Read (every agent can read)'], ['tasks', 'Claim and change tasks'], ['checkpoints', 'Write checkpoints'],
+  ['reviews', 'Deliver and review (needed to deliver at all)'], ['feedback', 'Send feedback'], ['proposals', 'Propose requirements']];
 const scopeNames = (scopes) => (Array.isArray(scopes) && scopes.length ? scopes.join(', ') : 'nothing beyond reading');
 const sameScopes = (a, b) => Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((s) => b.includes(s));
 const credentialsOf = (raw) => (Array.isArray(raw.credentials) ? raw.credentials.filter((c) => c && typeof c === 'object') : []);
@@ -249,21 +249,21 @@ export async function list(ctx) {
       } }, 'Revoke'));
       return row;
     });
-    // Ticked: what it has; with nothing known, reading alone. Only its own account may give it more.
-    const ticked = new Set(known ? has : ['read']);
+    // Ticked: what it has; every agent can read. Only its own account may give it more.
+    const ticked = new Set(known ? ['read', ...has] : ['read']);
     const form = h('form', { class: 'form', novalidate: true },
       h('fieldset', { class: 'checks' }, h('legend', null, 'What it may do'),
         SCOPES.map(([scope, label]) => h('label', { class: 'check', for: `sc-${agent.id}-${scope}` },
           h('input', { type: 'checkbox', id: `sc-${agent.id}-${scope}`, name: 'scope', value: scope, checked: ticked.has(scope) ? true : null,
-            disabled: !own && !has.includes(scope) ? true : null }), label)),
-        h('p', { class: 'small muted' }, own ? inferredWarning + 'Saving issues a new secret that carries exactly these, and a later new secret carries them too. A credential it already has keeps what it allows until you revoke it above.' :
-          'Only the agent’s own account may give it more than it has; you may take something away. Saving issues a new secret.')),
+            disabled: scope === 'read' || (!own && !has.includes(scope)) ? true : null }), label)),
+        h('p', { class: 'small muted' }, own ? inferredWarning + 'Every agent can read. Keep “Deliver and review” ticked so the agent can deliver its own work (whether it also reviews other people’s deliveries is set by its worker/reviewer role, not by removing this scope). To remove a scope from an existing agent, untick it, click “Save and issue a new secret”, and click “Revoke” on the older credential above. Saving issues a new secret that carries exactly these, and a later new secret carries them too. A credential it already has keeps what it allows until you revoke it above.' :
+          'Only the agent’s own account may give it more than it has; you may take something away (except Read, which every agent has). To remove a scope, untick it, click “Save and issue a new secret”, and click “Revoke” on the older credential above. Saving issues a new secret.')),
       h('p', { class: 'error', role: 'alert', hidden: true }),
       h('div', null, h('button', { type: 'submit' }, 'Save and issue a new secret')));
     form.addEventListener('submit', async (event) => {
       event.preventDefault();
       const problem = form.querySelector('p[role=alert]');
-      const chosen = [...form.querySelectorAll('input')].filter((i) => i.getAttribute('name') === 'scope' && i.checked && !i.disabled).map((i) => i.value);
+      const chosen = [...form.querySelectorAll('input')].filter((i) => i.getAttribute('name') === 'scope' && i.checked && (i.value === 'read' ? (own || !known || has.includes('read')) : !i.disabled)).map((i) => i.value);
       problem.hidden = chosen.length > 0;
       problem.textContent = chosen.length ? '' : 'Tick at least one.';
       if (!chosen.length) return;
@@ -684,6 +684,31 @@ function wireWizard(ctx, container, payload, { hasCertificate = false, pageMode 
   let checkVerified = false;
   let lastKeepAliveAt = 0;
 
+  const idleWarningBanner = h('p', {
+    class: 'small banner warn',
+    role: 'status',
+    'data-wizard-idle-warning': 'true',
+    hidden: true,
+  });
+  let keepAliveHandle = null;
+  if (ctx && ctx.api && typeof ctx.api.keepAliveWhileVisible === 'function') {
+    keepAliveHandle = ctx.api.keepAliveWhileVisible({
+      onWarning(detail) {
+        const raw = typeof detail === 'number' ? detail : (detail && detail.remainingSeconds);
+        const secs = typeof raw === 'number' && raw > 0 ? raw : 120;
+        const mins = Math.max(1, Math.round(secs / 60));
+        idleWarningBanner.textContent = `Your session will expire in about ${mins} minute(s) from inactivity — continue set-up to stay signed in.`;
+        idleWarningBanner.hidden = false;
+      },
+    });
+  }
+  function stopKeepAlive() {
+    if (keepAliveHandle && typeof keepAliveHandle.stop === 'function') {
+      try { keepAliveHandle.stop(); } catch { /* ignore */ }
+    }
+    keepAliveHandle = null;
+  }
+
   function touchKeepAlive() {
     const now = Date.now();
     if (now - lastKeepAliveAt < 60000) return;
@@ -714,7 +739,7 @@ function wireWizard(ctx, container, payload, { hasCertificate = false, pageMode 
   const whenWorkedTexts = [
     `What you will see when it worked: Running the test command prints this agent’s JSON ("id": "${payload.agentId}", "name": "${payload.name}") with no curl error, and Check & Next confirms the connection.`,
     'What you will see when it worked: With Orchestra Bridge 0.14 or later in VS Code, Step 3’s “Orchestra Bridge: Set up” writes .orchestra/agent.json and .orchestra/AGENT.md (and .gitignore) directly into the open workspace folder from GET /v1/agents/me. With an older extension, “Save to agent folder…” (or the setup prompt) writes both files into the folder.',
-    `What you will see when it worked: In VS Code, “Orchestra Bridge: Set up” writes the workspace settings (and with Orchestra Bridge 0.14 or later writes .orchestra/agent.json and .orchestra/AGENT.md into the open workspace folder and checks working_directory), the VS Code status bar shows Orchestra, and the connection status below changes to Connected.`,
+    `What you will see when it worked: In VS Code, “Orchestra Bridge: Set up” walks you through choosing the agent, confirming the server, trusting the certificate by fingerprint, testing the connection, writing .orchestra/agent.json and .orchestra/AGENT.md into the open workspace folder, checking working_directory, and turning watching on; the connection status below changes to Connected.`,
   ];
 
   // Add step-specific Bridge 0.14+ vs older extension guidance and "What you will see when it worked".
@@ -741,17 +766,17 @@ function wireWizard(ctx, container, payload, { hasCertificate = false, pageMode 
       const bridgeStep3 = h('div', { class: 'setup-block', 'data-bridge-note': 'step3' },
         h('p', { class: 'small' },
           h('strong', null, 'Orchestra Bridge 0.14 or later: '),
-          'when you run “Orchestra Bridge: Set up” in VS Code (',
+          'open this folder in VS Code and run “Orchestra Bridge: Set up” (',
           h('kbd', { 'data-os-shortcut': 'palette' }, currentOs === 'macos' ? 'Cmd+Shift+P' : 'Ctrl+Shift+P'),
-          '), the extension reads ', h('code', null, '# server = …'),
-          ' from your credential file, writes ', h('code', null, setupText.CONFIG_PATH), ' and ', h('code', null, setupText.GUIDE_PATH),
+          '); it walks you through the rest — chooses the agent from the credential files found, confirms the server, trusts the certificate by fingerprint (and reads the certificate from the setup bundle), tests the connection, writes ',
+          h('code', null, setupText.CONFIG_PATH), ' and ', h('code', null, setupText.GUIDE_PATH),
           ' (and adds ', h('code', null, setupText.GITIGNORE_LINE),
-          ' to an existing .gitignore) directly into the open workspace folder from GET /v1/agents/me, and compares the open workspace folder with this agent’s recorded working_directory (offering to record the open folder via PATCH /v1/agents/me if they differ).'),
+          ' to an existing .gitignore) directly into the open workspace folder from GET /v1/agents/me, compares the open workspace folder with this agent’s recorded working_directory (offering to record the open folder via PATCH /v1/agents/me if they differ), and turns watching on.'),
         h('p', { class: 'small muted' },
           h('strong', null, 'Older Orchestra Bridge extension (before 0.14): '),
-          'an older installed extension writes only the VS Code workspace settings and does not write ',
+          'update the extension first (this site serves it), or use the fallback: an older installed extension writes only the VS Code workspace settings and does not write ',
           h('code', null, setupText.CONFIG_PATH), ' or ', h('code', null, setupText.GUIDE_PATH),
-          '. Use “Back” to return to Step 2 and click “Save to agent folder…” (which remembers the last folder you picked) or “Or let the agent do it” to write those two files.'));
+          ' — click “Back” to return to Step 2 and click “Save to agent folder…” (which remembers the last folder you picked) or “Or let the agent do it” to write those two files.'));
       stepNode.append(bridgeStep3);
     }
     stepNode.append(h('p', { class: 'small banner info', 'data-when-worked': String(stepNum) }, whenWorkedTexts[idx]));
@@ -801,6 +826,7 @@ function wireWizard(ctx, container, payload, { hasCertificate = false, pageMode 
     bodyNode.replaceChildren(
       existingChildren[0] || null,
       wizardBar,
+      idleWarningBanner,
       ...existingChildren.slice(1),
     );
   }
@@ -854,6 +880,7 @@ function wireWizard(ctx, container, payload, { hasCertificate = false, pageMode 
     'data-action': 'wizard-done',
     onclick: () => {
       stopStep3Poll();
+      stopKeepAlive();
       if (pageMode && ctx && typeof ctx.go === 'function') ctx.go('/agents');
       else { container.close(); container.remove(); }
     },
@@ -971,6 +998,7 @@ function wireWizard(ctx, container, payload, { hasCertificate = false, pageMode 
   }
   container.addEventListener('close', () => {
     stopStep3Poll();
+    stopKeepAlive();
     if (typeof document !== 'undefined' && typeof document.removeEventListener === 'function') {
       document.removeEventListener('visibilitychange', onVisibilityChange);
     }
@@ -1005,7 +1033,7 @@ function wireWizard(ctx, container, payload, { hasCertificate = false, pageMode 
   }
   applyOsFilter();
   showStep(currentStep);
-  return { showStep, applyOsFilter, stopStep3Poll, syncStep3Poll };
+  return { showStep, applyOsFilter, stopStep3Poll, syncStep3Poll, stopKeepAlive };
 }
 
 // `source` is the create response ({agent, setup, ...}) or {agent} from GET
@@ -1021,7 +1049,7 @@ function setupDialog(ctx, source, { secret = null, certificate = null } = {}) {
   // public address, which may be a name that does not resolve from this person's network.
   const bridgeServer = location.origin;
   PAYLOAD_META.set(payload, { certificate, bridgeServer });
-  let role = 'worker';
+  let role = (source && source.agent && source.agent.role === 'reviewer') ? 'reviewer' : 'worker';
   const prompt = setupText.setupPrompt(payload, { role, certificate, bridgeServer });
   const promptText = (chosen) => setupText.setupPrompt(payload, { role: chosen, certificate, bridgeServer });
 
@@ -1061,10 +1089,19 @@ function setupDialog(ctx, source, { secret = null, certificate = null } = {}) {
   // The role this window's agent takes (the extension's worker or reviewer: the prompt names it so
   // the person chooses the same in the extension's own set-up), and — when the service has its own
   // certificate — its fingerprint with a Save button and what comparing it does and does not prove.
-  const roleChoice = h('label', { class: 'small', for: 'setup-role' }, 'What this agent does in this window: ',
-    h('select', { id: 'setup-role', onchange: (event) => { role = event.target.value; drawPrompt(promptText(role)); } },
-      h('option', { value: 'worker' }, 'works on tasks and answers reviews'),
-      h('option', { value: 'reviewer' }, 'reviews other agents’ deliveries')));
+  const roleChoice = h('div', { class: 'stack' },
+    h('label', { class: 'small', for: 'setup-role' }, 'What this agent does in this window: ',
+      h('select', { id: 'setup-role', value: role, onchange: (event) => {
+        role = event.target.value;
+        drawPrompt(promptText(role));
+        if (ctx && ctx.api && typeof ctx.api.updateAgent === 'function' && payload.agentId) {
+          ctx.api.updateAgent(payload.agentId, { role }).catch(() => {});
+        }
+      } },
+        h('option', { value: 'worker' }, 'works on tasks and answers reviews'),
+        h('option', { value: 'reviewer' }, 'reviews other agents’ deliveries'))),
+    h('p', { class: 'small muted', 'data-role-note': 'true' },
+      'A worker keeps the “Deliver and review” scope (needed to deliver its own work and answer review items on its own tasks), while its /v1/agents/me/next and wake omit other people’s deliveries awaiting review (to-review and review-recommended). Choose reviewer when this window should also be offered other people’s deliveries to review.'));
   const certificateBlock = certificate ? h('section', { class: 'setup-block', 'aria-label': 'The service’s own certificate' },
     h('div', { class: 'copy-row' }, h('h4', { class: 'small' }, 'The service’s own certificate'),
       copyButton('Copy', certificate.sha256, { ariaLabel: 'Copy the certificate fingerprint', what: 'Fingerprint' }),
@@ -1108,9 +1145,21 @@ function setupDialog(ctx, source, { secret = null, certificate = null } = {}) {
           fileBlock(setupText.GUIDE_PATH, files[1][1], folder, setupText.GUIDE_PATH),
           source.setup && source.setup.setup_snippet ? h('details', null, h('summary', null, 'Shell commands instead (optional)'), h('pre', { class: 'json' }, source.setup.setup_snippet)) : null),
         step(3, 'Start the agent',
-          h('p', { class: 'small' }, 'Open ', where, ' in VS Code (File > Open Folder…), open the agent’s chat, and paste the resume prompt. Do this after steps 1 and 2.'),
+          h('p', { class: 'small' }, 'Open ', where, ' in VS Code (File > Open Folder…) and run “Orchestra Bridge: Set up”; it walks you through the rest (chooses this agent from your credential file, confirms the server, trusts the certificate by fingerprint, tests the connection, writes .orchestra/agent.json and .orchestra/AGENT.md, and turns watching on). Then open the agent’s chat and paste the resume prompt.'),
           h('p', { class: 'small', 'data-once': 'true' }, SETUP_ONCE_LINE),
+          h('p', { class: 'small muted', 'data-screen-reader-tip': 'true' },
+            'Tip: if VS Code makes sounds while the agent works, click the screen reader button in the bottom right of VS Code to switch it off.'),
           folder ? copyLine('Folder:', folder, { ariaLabel: 'Copy the agent folder path', what: 'Folder path' }) : null,
+          copyLine('VS Code command:', 'Orchestra Bridge: Set up', { ariaLabel: 'Copy the Orchestra Bridge Set up command', what: 'VS Code command' }),
+          hasCertificate ? h('div', { class: 'setup-block', 'data-bridge-cafile': 'true' },
+            h('p', { class: 'small' },
+              'Certificate trust before prompting the agent: Orchestra Bridge 0.14 or later reads the certificate from the site’s setup bundle during “Orchestra Bridge: Set up” so no setting is needed. With an older extension (before 0.14), BEFORE prompting the agent, either run “Orchestra Bridge: Check now” and compare the fingerprint, or set ',
+              h('code', null, 'orchestraBridge.caFile'),
+              ' in VS Code to the same certificate path your credential file uses (never install the certificate in system certificate stores, launch VS Code with --use-system-ca, or set NODE_EXTRA_CA_CERTS):'),
+            copyLine('orchestraBridge.caFile (Windows):', payload.certificateFile.windows,
+              { ariaLabel: 'Copy the Windows orchestraBridge.caFile path', what: 'orchestraBridge.caFile path', os: 'windows' }),
+            copyLine('orchestraBridge.caFile (macOS/Linux):', payload.certificateFile.posix,
+              { ariaLabel: 'Copy the macOS/Linux orchestraBridge.caFile path', what: 'orchestraBridge.caFile path', os: 'posix' })) : null,
           copyLine('Resume prompt:', resume, { ariaLabel: 'Copy the resume prompt', what: 'Resume prompt' })))),
     h('div', { class: 'dialog-foot' }, h('button', { type: 'button', class: 'primary', onclick: () => { dialog.close(); dialog.remove(); } }, 'Done')));
   dialog.addEventListener('close', () => dialog.remove());

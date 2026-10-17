@@ -1863,7 +1863,7 @@ console.log(JSON.stringify({
   promptNamesFile: m.setupPrompt(p).includes('%USERPROFILE%\\.orchestra-agent-kestrel.curlrc'),
   placeholder: m.headerLine(), real: m.headerLine('S3'),
   tests: m.testCommands(p),
-  promptWritesSettings: /settings\.json|orchestraBridge|caFile/.test(withCert),
+  promptWritesSettings: /\.vscode\/settings\.json|settings\.json|VSCODE_SETTINGS_PATH|mergeSettings/.test(withCert),
   promptCarriesPem: withCert.includes('MIIB'),
   promptAddressLine: withCert.includes('# server = https://office.example.invalid:7443'),
   promptFingerprintLine: withCert.includes('# server certificate sha256 = AB:CD'),
@@ -2195,12 +2195,21 @@ globalThis.window = {
 let agentLastSeen = null;
 let agentCalls = 0;
 let certCalls = 0;
+let keepAliveStarts = 0;
+let keepAliveStops = 0;
+let keepAliveOnWarning = null;
+const updatedRoles = [];
 const ctx = {
   me: { id: 'u1', username: 'olive', display_name: 'Olive', superuser: false },
   href: (p) => '#' + p,
   go: () => {},
   query: new URLSearchParams('agent=agent_1'),
   api: {
+    keepAliveWhileVisible: (opts = {}) => {
+      keepAliveStarts++;
+      keepAliveOnWarning = opts.onWarning || null;
+      return { stop: () => { keepAliveStops++; } };
+    },
     certificate: async () => { certCalls++; return { certificate: '-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n', sha256: 'AA:BB' }; },
     agent: async (id) => {
       agentCalls++;
@@ -2208,6 +2217,10 @@ const ctx = {
                working_directory: 'C:\\Users\\olive\\kestrel', projects: ['p1'],
                last_seen_at: agentLastSeen, scopes: ['read'], scopes_source: 'set',
                credentials: [{ id: 'c1', label: 'initial', revoked: false, working: true, scopes: ['read'] }] };
+    },
+    updateAgent: async (id, patch) => {
+      updatedRoles.push([id, patch]);
+      return { id, ...patch };
     },
     issueAgentCredential: async () => ({
       credential: { id: 'c2', secret: 'FRESH-SECRET-999', scopes: ['read'] },
@@ -2284,10 +2297,18 @@ const afterFailedNext = {
 // Step 1 Next when last_seen_at is set: advances to Step 2
 agentLastSeen = '2026-10-17T14:00:00Z';
 await nextBtn.dispatch('click');
+const roleNoteEl = firstAttr(steps[1], 'data-role-note', 'true');
+const roleSelect = steps[1].all((e) => e.attributes.id === 'setup-role')[0];
+roleSelect.value = 'reviewer';
+await roleSelect.dispatch('change');
+roleSelect.value = 'worker';
+await roleSelect.dispatch('change');
 const onStep2 = {
   stepHidden: steps.map((s) => s.hidden),
   progress: progress.textContent,
   backHidden: backBtn.hidden,
+  hasRoleNote: Boolean(roleNoteEl) && roleNoteEl.textContent.includes('Deliver and review') && roleNoteEl.textContent.includes('/v1/agents/me/next'),
+  updatedRoles,
   activeIntervals: intervals.filter((i) => !i.cleared).length,
 };
 
@@ -2299,6 +2320,9 @@ await saveBtn.dispatch('click');
 // Advance to Step 3:
 agentLastSeen = null;
 await nextBtn.dispatch('click');
+const step3CaFileBlock = firstAttr(steps[2], 'data-bridge-cafile', 'true');
+const screenReaderTipEl = firstAttr(steps[2], 'data-screen-reader-tip', 'true');
+const step3Text = steps[2].textContent;
 const onStep3 = {
   stepHidden: steps.map((s) => s.hidden),
   progress: progress.textContent,
@@ -2306,6 +2330,13 @@ const onStep3 = {
   donePrimary: doneBtn.className === 'primary',
   hasBridgeNoteStep2: Boolean(firstAttr(steps[1], 'data-bridge-note', 'step2')),
   hasBridgeNoteStep3: Boolean(firstAttr(steps[2], 'data-bridge-note', 'step3')),
+  hasBridgeCaFile: Boolean(step3CaFileBlock),
+  hasScreenReaderTip: Boolean(screenReaderTipEl) && screenReaderTipEl.textContent.includes('screen reader button in the bottom right of VS Code'),
+  step3HasBridgeSetup: step3Text.includes('Orchestra Bridge: Set up'),
+  step3HasCaFile: step3Text.includes('orchestraBridge.caFile')
+    && step3Text.includes('--use-system-ca')
+    && step3Text.includes('NODE_EXTRA_CA_CERTS'),
+  step3HasBefore014: step3Text.includes('before 0.14'),
   activeIntervals: intervals.filter((i) => !i.cleared).length,
 };
 
@@ -2325,8 +2356,16 @@ await secondTimer.fn();
 const onlineStatus = firstAttr(steps[2], 'data-online-status', 'true').textContent;
 const timerClearedOnSuccess = secondTimer.cleared;
 
+// Verify keepAliveWhileVisible warning banner and stop on Done/close (01a14b46):
+const idleBanner = firstAttr(dialog, 'data-wizard-idle-warning', 'true');
+const idleHiddenBefore = idleBanner ? idleBanner.hidden : true;
+if (keepAliveOnWarning) keepAliveOnWarning(180);
+const idleVisibleAfter = idleBanner ? !idleBanner.hidden && idleBanner.textContent.includes('3 min') : false;
+await doneBtn.dispatch('click');
+
 const savedStateRaw = globalThis.sessionStorage.getItem('orchestra.agentSetup.v1');
 console.log(JSON.stringify({
+  scopes: views.SCOPES,
   initialStepHidden, initialProgress, initialBackHidden, initialOs,
   winVisibility, linuxVisibility, placeholderOutsideFallback, workedBlocks,
   afterFailedNext, onStep2,
@@ -2335,6 +2374,7 @@ console.log(JSON.stringify({
   onStep3,
   hiddenPollSkipped: callsAfterHidden === callsBeforeHidden && timerClearedOnHidden,
   onlineStatus, timerClearedOnSuccess,
+  keepAlive: { starts: keepAliveStarts, stops: keepAliveStops, idleHiddenBefore, idleVisibleAfter },
   savedState: JSON.parse(savedStateRaw),
   secretInStorage: savedStateRaw.includes('FRESH-SECRET-999'),
 }));
@@ -2344,6 +2384,8 @@ console.log(JSON.stringify({
                               self.AGENTS_JS.as_uri())
         self.assertEqual(0, out.returncode, out.stderr)
         res = json.loads(out.stdout)
+        self.assertIn(['read', 'Read (every agent can read)'], res['scopes'])
+        self.assertIn(['reviews', 'Deliver and review (needed to deliver at all)'], res['scopes'])
         self.assertEqual([False, True, True], res['initialStepHidden'])
         self.assertEqual('Step 1 of 3: Store the secret', res['initialProgress'])
         self.assertTrue(res['initialBackHidden'])
@@ -2361,6 +2403,9 @@ console.log(JSON.stringify({
         self.assertEqual([True, False, True], res['onStep2']['stepHidden'])
         self.assertEqual('Step 2 of 3: Set up the folder', res['onStep2']['progress'])
         self.assertFalse(res['onStep2']['backHidden'])
+        self.assertTrue(res['onStep2']['hasRoleNote'])
+        self.assertEqual([['agent_1', {'role': 'reviewer'}], ['agent_1', {'role': 'worker'}]],
+                         res['onStep2']['updatedRoles'])
         self.assertEqual(0, res['onStep2']['activeIntervals'])
         # Remembered directory handle passed via startIn on second call:
         self.assertFalse(res['pickerStartInFirst'])
@@ -2372,10 +2417,17 @@ console.log(JSON.stringify({
         self.assertTrue(res['onStep3']['donePrimary'])
         self.assertTrue(res['onStep3']['hasBridgeNoteStep2'])
         self.assertTrue(res['onStep3']['hasBridgeNoteStep3'])
+        self.assertTrue(res['onStep3']['hasBridgeCaFile'])
+        self.assertTrue(res['onStep3']['hasScreenReaderTip'])
+        self.assertTrue(res['onStep3']['step3HasBridgeSetup'])
+        self.assertTrue(res['onStep3']['step3HasCaFile'])
+        self.assertTrue(res['onStep3']['step3HasBefore014'])
         self.assertEqual(1, res['onStep3']['activeIntervals'])
         self.assertTrue(res['hiddenPollSkipped'])
         self.assertIn('Connected: Kestrel has reached Orchestra', res['onlineStatus'])
         self.assertTrue(res['timerClearedOnSuccess'])
+        self.assertEqual({'starts': 1, 'stops': 1, 'idleHiddenBefore': True, 'idleVisibleAfter': True},
+                         res['keepAlive'])
         self.assertEqual({'agentId': 'agent_1', 'step': 3, 'os': 'windows', 'role': 'worker'},
                          res['savedState'])
         self.assertFalse(res['secretInStorage'])

@@ -925,6 +925,9 @@ class Store:
 
 
 # --------------------------------------------------------------------------- service
+AGENT_ROLES = ('worker', 'reviewer')
+
+
 def validate_claim_limit(value):
     """The stored form of one owner-supplied per-agent claim limit.
 
@@ -937,6 +940,17 @@ def validate_claim_limit(value):
         return claim_limit.validate_limit(value)
     except ValueError as error:
         raise invalid(str(error)) from None
+
+
+def validate_agent_role(value):
+    """The stored form of an agent's role ('worker' or 'reviewer', or None to clear)."""
+    if value is None or value == '':
+        return None
+    if isinstance(value, str):
+        clean = value.strip()
+        if clean in AGENT_ROLES:
+            return clean
+    raise invalid("role must be 'worker' or 'reviewer'")
 
 
 def validate_agent_credential_days(value):
@@ -2876,6 +2890,8 @@ class Service:
         if agent.get('created_by'):
             view['created_by'] = agent['created_by']
             view['created_by_display_name'] = self._owner_name(agent['created_by'])
+        if agent.get('role') in AGENT_ROLES:
+            view['role'] = agent['role']
         if owner_sees_path:
             view['working_directory'] = agent.get('working_directory')
         else:
@@ -3358,7 +3374,7 @@ class Service:
 
     def create_agent(self, principal, *, name, tool=None, working_directory=None,
                      machine=None, notes=None, projects=None, scopes=None,
-                     request_id=None, owner=None, claim_limit=None):
+                     request_id=None, owner=None, claim_limit=None, role=None):
         """Create an owner-bound agent and its first (one-time) credential."""
         if principal is None or principal.via == 'credential':
             raise forbidden('Session authority required to create an agent')
@@ -3368,6 +3384,7 @@ class Service:
                                              AGENT_DIRECTORY_MAX)
         machine = self._agent_text(machine, 'machine', AGENT_MACHINE_MAX)
         notes = self._agent_text(notes, 'notes', AGENT_NOTES_MAX)
+        clean_role = validate_agent_role(role)
         with self.store.lock:
             self._refresh_authority(principal)
             owner_id = self.agent_creation_owner(principal, principal.user_id if owner is None else owner)
@@ -3395,6 +3412,8 @@ class Service:
                 'last_seen_at': None,
                 'scopes': list(made_with), 'scopes_source': 'set',
             }
+            if clean_role is not None:
+                agent['role'] = clean_role
             self.state['agents'][agent_id] = agent
             credential, secret = self._issue_agent_credential_locked(principal, agent, expiry=expiry)
             self._audit_agent_credential(principal, agent, credential, 'agents.credentials.issued',
@@ -3458,6 +3477,8 @@ class Service:
             # The limit is judged with the other fields, before any of them is applied.
             if 'claim_limit' in payload:
                 validate_claim_limit(payload.get('claim_limit'))
+            if 'role' in payload:
+                validate_agent_role(payload.get('role'))
             # Validate every field first and apply nothing until all of them pass, so a
             # refused change (an ungranted project, an over-long field, a clashing name)
             # leaves the live record exactly as it was. A rename in particular must not
@@ -3483,6 +3504,12 @@ class Service:
                 changes['claim_limit'] = validate_claim_limit(payload.get('claim_limit'))
             left = [pid for pid in (agent.get('projects') or []) if pid not in changes.get('projects', agent.get('projects') or [])]
             agent.update(changes)
+            if 'role' in payload:
+                clean_role = validate_agent_role(payload.get('role'))
+                if clean_role is None:
+                    agent.pop('role', None)
+                else:
+                    agent['role'] = clean_role
             # An agent that leaves a project by THIS route leaves its coordinators too (review of
             # kittrial-5bb.209): the grant stayed in the state, unseen by the project's owner, and
             # took effect again when the project was put back, with no owner's decision.
@@ -3504,7 +3531,8 @@ class Service:
         effective limit; raising stays the owner's or a superuser's move, refused with a
         sentence naming both and the My agents page). ``working_directory`` records the
         folder the agent runs in, validated with :meth:`_agent_text` as 1 to
-        :data:`AGENT_DIRECTORY_MAX` printable characters. Every requested field is validated
+        :data:`AGENT_DIRECTORY_MAX` printable characters. ``role`` records whether the
+        agent runs as ``'worker'`` or ``'reviewer'``. Every requested field is validated
         before any is applied, so a refused field leaves the record untouched. The identity
         is the credential's own agent; no target id is taken, so this cannot reach another
         agent's record.
@@ -3513,6 +3541,7 @@ class Service:
             raise forbidden('An agent credential is required to change its own record')
         has_limit = 'claim_limit' in payload
         has_dir = 'working_directory' in payload
+        has_role = 'role' in payload
         new_dir = None
         if has_dir:
             new_dir = self._agent_text(payload.get('working_directory'),
@@ -3520,6 +3549,9 @@ class Service:
             if new_dir is None:
                 raise invalid('working_directory must be 1-%d printable characters'
                               % AGENT_DIRECTORY_MAX)
+        new_role = None
+        if has_role:
+            new_role = validate_agent_role(payload.get('role'))
         with self.store.lock:
             self._refresh_authority(principal)
             agent = self._agent(principal.agent_id)
@@ -3545,13 +3577,20 @@ class Service:
                                     {'claim_limit': current, 'requested': wanted,
                                      'raise_by': claim_limit.RAISE_BY})
             old_dir = agent.get('working_directory')
+            old_role = agent.get('role')
             if has_limit:
                 agent['claim_limit'] = wanted
             if has_dir:
                 agent['working_directory'] = new_dir
+            if has_role:
+                if new_role is None:
+                    agent.pop('role', None)
+                else:
+                    agent['role'] = new_role
             self.store.save()
-            operation = ('agents.claim_limit.lower' if has_limit and not has_dir
-                         else 'agents.working_directory.set' if has_dir and not has_limit
+            operation = ('agents.claim_limit.lower' if has_limit and not has_dir and not has_role
+                         else 'agents.working_directory.set' if has_dir and not has_limit and not has_role
+                         else 'agents.role.set' if has_role and not has_limit and not has_dir
                          else 'agents.me.update')
             result = {'operation': operation,
                       'agent': self.agent_view(agent, principal)}
@@ -3561,6 +3600,8 @@ class Service:
             if has_dir:
                 result.update({'old_working_directory': old_dir,
                                'new_working_directory': new_dir})
+            if has_role:
+                result.update({'old_role': old_role, 'new_role': new_role})
             return result
 
     def disable_agent(self, principal, agent_id):
