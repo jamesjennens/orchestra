@@ -5997,15 +5997,20 @@ def copy_sqlite_consistently(source, destination):
         return 'the sqlite3 CLI could not copy the records file: %s'%((done.stderr or done.stdout or '').strip()[:120])
     import sqlite3
     if hasattr(sqlite3.Connection,'backup'):
-        from coordination import atomic
+        # kittrial-5bb.331 review item 'windows-sqlite-handle': EVERY connection is
+        # closed in finally - an open handle keeps the file locked on Windows, long
+        # after this function returns, failing the caller's clean-up with WinError 32.
         holder=sqlite3.connect(str(source))
-        target=sqlite3.connect(str(destination))
         try:
-            holder.backup(target)
+            target=sqlite3.connect(str(destination))
+            try:
+                holder.backup(target)
+            finally:
+                target.close()
         except sqlite3.Error as error:
             return 'the consistent SQLite copy failed: %s'%str(error)[:120]
         finally:
-            holder.close();target.close()
+            holder.close()
         return None
     return ('no consistent SQLite copy is available on this host: no sqlite3 CLI and this '
             'Python lacks Connection.backup (the office server runs Python 3.6)')

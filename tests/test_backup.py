@@ -941,11 +941,20 @@ class HttpStateBackupTests(unittest.TestCase):
         copied_json = self.root / 'backups' / admin.HTTP_STATE_JSON
         copied_records = self.root / 'backups' / admin.HTTP_STATE_RECORDS
         self.assertEqual(copied_json.read_text(encoding='utf-8'), live.read_text(encoding='utf-8'))
-        self.assertEqual(oct(copied_json.stat().st_mode & 0o777), '0o600')
-        self.assertEqual(oct(copied_records.stat().st_mode & 0o777), '0o600')
+        # kittrial-5bb.331 review item 'posix-mode-asserts': Windows has no POSIX
+        # modes (0600 reads as 0666 there); the mode assertions run on POSIX only,
+        # everything else in this test runs everywhere.
+        if os.name != 'nt':
+            self.assertEqual(oct(copied_json.stat().st_mode & 0o777), '0o600')
+            self.assertEqual(oct(copied_records.stat().st_mode & 0o777), '0o600')
+        # The reader is closed (review item 'windows-sqlite-handle'): an open handle
+        # locks the file on Windows and fails the fixture clean-up.
         import sqlite3
-        rows = sqlite3.connect(str(copied_records)).execute(
-            'SELECT token, user FROM sessions').fetchall()
+        reader = sqlite3.connect(str(copied_records))
+        try:
+            rows = reader.execute('SELECT token, user FROM sessions').fetchall()
+        finally:
+            reader.close()
         self.assertEqual(rows, [('tok-1', 'usr_x')])
 
     def test_an_absent_state_records_absent(self):
@@ -964,10 +973,15 @@ class HttpStateBackupTests(unittest.TestCase):
         finally:
             writer.close()
         self.assertEqual(entry['status'], 'complete')
+        # Closed explicitly (review item 'windows-sqlite-handle'): an open handle
+        # locks the copy on Windows and fails the fixture clean-up with WinError 32.
         copied = sqlite3.connect(str(self.root / 'backups' / admin.HTTP_STATE_RECORDS))
-        tokens = sorted(row[0] for row in copied.execute('SELECT token FROM sessions'))
-        self.assertEqual(tokens, ['tok-1', 'tok-2'])
-        self.assertTrue(copied.execute('PRAGMA integrity_check').fetchone()[0])
+        try:
+            tokens = sorted(row[0] for row in copied.execute('SELECT token FROM sessions'))
+            self.assertEqual(tokens, ['tok-1', 'tok-2'])
+            self.assertTrue(copied.execute('PRAGMA integrity_check').fetchone()[0])
+        finally:
+            copied.close()
 
     def test_a_degraded_copy_makes_the_whole_run_incomplete(self):
         degraded = {'status': 'degraded', 'reason': 'no consistent SQLite copy'}
@@ -998,8 +1012,10 @@ class HttpStateBackupTests(unittest.TestCase):
         self.assertIn('INVALIDATED', sentence)
         self.assertEqual(live.read_text(encoding='utf-8'),
                          (self.root / 'backups' / admin.HTTP_STATE_JSON).read_text(encoding='utf-8'))
-        self.assertEqual(oct(live.stat().st_mode & 0o777), '0o600')
-        self.assertEqual(oct(Path(str(live) + '.records.sqlite3').stat().st_mode & 0o777), '0o600')
+        # POSIX-only mode assertions (review item 'posix-mode-asserts').
+        if os.name != 'nt':
+            self.assertEqual(oct(live.stat().st_mode & 0o777), '0o600')
+            self.assertEqual(oct(Path(str(live) + '.records.sqlite3').stat().st_mode & 0o777), '0o600')
 
     def test_restore_refuses_without_a_pair_and_targets_the_default(self):
         with self.assertRaisesRegex(ValueError, 'no HTTP state pair'):
