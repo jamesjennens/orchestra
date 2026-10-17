@@ -20,6 +20,7 @@ import datetime
 import difflib
 import hashlib
 import json
+import os
 import re
 import shlex
 import subprocess
@@ -344,6 +345,12 @@ class _InlineWait:
     DEFAULT_MAX_TIMEOUT = 3600
     DEFAULT_GIVE_UP_AFTER = 12 * 60 * 60
     DOUBLING_AFTER = 2
+    WAIT_STATE_SCHEMA = 'wait-state-v1'
+    WAIT_STATE_NAME = '.orchestra-wait-state.json'
+    MAX_STATE_ITEMS = 100
+    MAX_STATE_TEXT = 200
+    MAX_STATE_LIST = 20
+    MAX_STATE_BYTES = 64 * 1024
     _INSTANT = re.compile(r'^(\d{4})-(\d{2})-(\d{2})[Tt ](\d{2}):(\d{2}):(\d{2})'
                           r'(?:\.(\d{1,6}))?(?:[Zz]|([+-])(\d{2}):?(\d{2}))$')
     _INSTANT_ADVICE = ('Invalid wait: --idle-since takes an ISO-8601 time with an offset '
@@ -416,6 +423,142 @@ class _InlineWait:
                     and value.startswith(_InlineWait.FINGERPRINT)
                     and all(character in '0123456789abcdef'
                             for character in value[len(_InlineWait.FINGERPRINT):]))
+
+    @staticmethod
+    def state_path(config_path, project=None, actor=None, form='worker'):
+        """The client's small wait cache beside its config (Python 3.6 syntax)."""
+        if not config_path:
+            return None
+        directory = os.path.dirname(os.path.abspath(config_path))
+        identity = '\x00'.join(str(value or '') for value in (project, actor, form))
+        suffix = hashlib.sha256(identity.encode('utf-8')).hexdigest()[:16]
+        stem, extension = os.path.splitext(_InlineWait.WAIT_STATE_NAME)
+        return os.path.join(directory, '%s-%s%s' % (stem, suffix, extension))
+
+    @staticmethod
+    def _state_value(value, depth=0):
+        if value is None or isinstance(value, (bool, int, float)):
+            return value
+        if isinstance(value, str):
+            return value[:_InlineWait.MAX_STATE_TEXT]
+        if isinstance(value, (list, tuple)):
+            if depth >= 4:
+                return str(value)[:_InlineWait.MAX_STATE_TEXT]
+            return [_InlineWait._state_value(item, depth + 1)
+                    for item in list(value)[:_InlineWait.MAX_STATE_LIST]]
+        text = str(value)
+        return text[:_InlineWait.MAX_STATE_TEXT]
+
+    @staticmethod
+    def _state_row(row):
+        return dict((name, _InlineWait._state_value(row[name])) for name in sorted(row))
+
+    @staticmethod
+    def read_state(path):
+        """The state last written at ``path``, or ``None`` (a bad file is absent)."""
+        if not path:
+            return None
+        try:
+            with open(path, 'r', encoding='utf-8') as handle:
+                text = handle.read(_InlineWait.MAX_STATE_BYTES + 1)
+            if len(text) > _InlineWait.MAX_STATE_BYTES:
+                return None
+            value = json.loads(text)
+        except (OSError, ValueError, TypeError, UnicodeError, RecursionError):
+            return None
+        if not isinstance(value, dict) or value.get('schema') != _InlineWait.WAIT_STATE_SCHEMA:
+            return None
+        remembered = value.get('fingerprint')
+        if not _InlineWait.is_fingerprint(remembered):
+            remembered = None
+        items = value.get('items')
+        if not isinstance(items, list):
+            items = []
+        items = [_InlineWait._state_row(item) for item in items[:_InlineWait.MAX_STATE_ITEMS]
+                 if isinstance(item, dict)]
+        return {'schema': _InlineWait.WAIT_STATE_SCHEMA,
+                'fingerprint': remembered, 'items': items}
+
+    @staticmethod
+    def write_state(path, fingerprint, items):
+        """Write the cache atomically; a failure is ignored so a wait never fails."""
+        if not path or not _InlineWait.is_fingerprint(fingerprint) or not isinstance(items, list):
+            return False
+        payload = {'schema': _InlineWait.WAIT_STATE_SCHEMA, 'fingerprint': fingerprint,
+                   'items': [_InlineWait._state_row(item)
+                             for item in items[:_InlineWait.MAX_STATE_ITEMS]
+                             if isinstance(item, dict)]}
+
+        def encoded(value):
+            return json.dumps(value, ensure_ascii=True, sort_keys=True,
+                              separators=(',', ':'))
+
+        try:
+            text = encoded(payload)
+        except (ValueError, TypeError):
+            return False
+        if len(text) > _InlineWait.MAX_STATE_BYTES:
+            payload['items'] = []
+            try:
+                text = encoded(payload)
+            except (ValueError, TypeError):
+                return False
+            if len(text) > _InlineWait.MAX_STATE_BYTES:
+                return False
+        temporary = '%s.%d.tmp' % (path, os.getpid())
+        try:
+            with open(temporary, 'w', encoding='utf-8') as handle:
+                handle.write(text)
+                handle.write('\n')
+            os.replace(temporary, path)
+        except (OSError, ValueError, TypeError, UnicodeError):
+            try:
+                if os.path.exists(temporary):
+                    os.remove(temporary)
+            except OSError:
+                pass
+            return False
+        return True
+
+    @staticmethod
+    def _item_key(row):
+        for name in ('task', 'lane'):
+            if row.get(name) is not None:
+                return str(row.get(name))
+        return _InlineWait.digest(row)
+
+    @staticmethod
+    def _keyed_items(items):
+        keyed = {}
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
+            key = _InlineWait._item_key(item)
+            if key in keyed:
+                number = 2
+                while '%s#%d' % (key, number) in keyed:
+                    number += 1
+                key = '%s#%d' % (key, number)
+            keyed[key] = _InlineWait._state_row(item)
+        return keyed
+
+    @staticmethod
+    def changed_items(old_items, new_items):
+        """Changed fields old -> new, and the items added and removed (item 6)."""
+        old = _InlineWait._keyed_items(old_items)
+        new = _InlineWait._keyed_items(new_items)
+        tasks = []
+        for key in sorted(set(old) & set(new)):
+            fields = []
+            for name in sorted(set(old[key]) | set(new[key])):
+                before, after = old[key].get(name), new[key].get(name)
+                if before != after:
+                    fields.append({'field': name, 'old': before, 'new': after})
+            if fields:
+                tasks.append({'task': key, 'fields': fields})
+        return {'tasks': tasks,
+                'added': sorted(set(new) - set(old)),
+                'removed': sorted(set(old) - set(new))}
 
     @staticmethod
     def parse_instant(text):
@@ -603,6 +746,7 @@ class _InlineWait:
         parser.add_argument('--interval', type=int, default=_InlineWait.DEFAULT_INTERVAL)
         parser.add_argument('--timeout', type=float, default=None)
         parser.add_argument('--since')
+        parser.add_argument('--fresh', action='store_true')
         parser.add_argument('--idle-since')
         parser.add_argument('--max-timeout', type=float, default=None, dest='max_timeout')
         parser.add_argument('--give-up-after', type=float,
@@ -639,12 +783,16 @@ class _InlineWait:
     def run_wait(read, since=None, timeout=None, interval=DEFAULT_INTERVAL,
                  clock=None, sleep=None, form=None, idle_since=None, max_timeout=None,
                  give_up_after=DEFAULT_GIVE_UP_AFTER, command_prefix='client.py',
-                 idle_minutes=DEFAULT_IDLE_MINUTES, now=None):
+                 idle_minutes=DEFAULT_IDLE_MINUTES, now=None, state_file=None, fresh=False):
         clock = time.monotonic if clock is None else clock
         sleep = time.sleep if sleep is None else sleep
         form = form or 'worker'
         started = clock()
         polls = 0
+        state = _InlineWait.read_state(state_file)
+        previous = state.get('items') if state else []
+        remembered = None if fresh or state is None else state.get('fingerprint')
+        resumed = since if since is not None else remembered
         scheduled = idle_since is not None and timeout is not None
         if scheduled:
             idle_started = _InlineWait.parse_instant(idle_since)
@@ -681,6 +829,17 @@ class _InlineWait:
                                      % idle_since)
             return dict(view, **fields)
 
+        def remember(view):
+            if state_file is not None:
+                _InlineWait.write_state(state_file, view.get('fingerprint'),
+                                        view.get('items') or [])
+
+        def with_changes(view):
+            if state_file is None:
+                return view
+            return dict(view, changed=_InlineWait.changed_items(
+                previous, view.get('items') or []))
+
         while True:
             polls += 1
             try:
@@ -702,22 +861,30 @@ class _InlineWait:
                     'fingerprint': None, 'items': [],
                     'error': 'the service cannot be reached: it did not answer a wait read',
                     'polls': polls}
-            if since is None:
+            if resumed is None:
                 if view.get('items'):
-                    return _InlineWait.EXIT_WORK, with_schedule(
-                        dict(view, polls=polls), clock() - started, reset=True)
-            elif view.get('fingerprint') != since:
-                return _InlineWait.EXIT_WORK, with_schedule(
+                    answer = with_changes(with_schedule(
+                        dict(view, polls=polls), clock() - started, reset=True))
+                    remember(answer)
+                    return _InlineWait.EXIT_WORK, answer
+            elif view.get('fingerprint') != resumed:
+                answer = with_changes(with_schedule(
                     dict(view, polls=polls), clock() - started,
-                    reset=bool(view.get('items')))
+                    reset=bool(view.get('items'))))
+                remember(answer)
+                return _InlineWait.EXIT_WORK, answer
             elapsed = clock() - started
             if timeout is not None and elapsed >= timeout:
-                return _InlineWait.EXIT_TIMEOUT, with_schedule(
-                    dict(view, polls=polls, timed_out=True), elapsed, reset=False)
+                answer = with_schedule(dict(view, polls=polls, timed_out=True), elapsed,
+                                       reset=False)
+                remember(answer)
+                return _InlineWait.EXIT_TIMEOUT, answer
             nap = interval if timeout is None else min(interval, max(0.0, timeout - elapsed))
             if nap <= 0:
-                return _InlineWait.EXIT_TIMEOUT, with_schedule(
-                    dict(view, polls=polls, timed_out=True), elapsed, reset=False)
+                answer = with_schedule(dict(view, polls=polls, timed_out=True), elapsed,
+                                       reset=False)
+                remember(answer)
+                return _InlineWait.EXIT_TIMEOUT, answer
             sleep(nap)
 
 def _emit(code,stdout,stderr,out):
@@ -791,14 +958,17 @@ def _wait_command(args,config,project,actor,out,config_path=None):
         except (ValueError,TypeError) as error:
             raise wait.WaitUnreachable('Invalid wait response: %s' % str(error)[:200]) from None
 
+    form = 'coordinator' if options.coordinator else 'worker'
     code,view = wait.run_wait(read,since=options.since,timeout=options.timeout,
                               interval=options.interval,
-                              form='coordinator' if options.coordinator else 'worker',
+                              form=form,
                               idle_since=options.idle_since,
                               max_timeout=options.max_timeout,
                               give_up_after=options.give_up_after,
                               command_prefix=_wait_client_prefix(config_path,project,actor),
-                              idle_minutes=options.idle_minutes)
+                              idle_minutes=options.idle_minutes,
+                              state_file=wait.state_path(config_path,project,actor,form),
+                              fresh=options.fresh)
     text = json.dumps(view,ensure_ascii=True,indent=2)+'\n'
     if out:
         # The wait result is a result at every exit code, so --out writes it too; a

@@ -3,8 +3,8 @@
 The owner watched a worker re-arm a 20-minute wait every time it timed out with nothing
 to do. The fix is stateless on the server: a wait that times out with the fingerprint
 unchanged carries ``next_timeout``, the ``next_command`` to run next and ``give_up``; a
-return with items resets the schedule. No state file and no daemon exist, so "two empty
-returns in a row" has to be derivable from the flags the client is given:
+return with items resets the schedule. The BACKOFF needs no memory: "two empty returns
+in a row" has to be derivable from the flags the client is given:
 
     the client assumes the idle spell named by ``--idle-since`` was spent in waits of
     the schedule's own durations, counts how many of them fit in the elapsed time (the
@@ -14,10 +14,15 @@ So the first two empty waits are the base ``--timeout``, the third is double, an
 up to ``--max-timeout`` (default cap 3600 s). After ``--give-up-after`` seconds of that
 spell (12 h by default) the wait says to checkpoint and stop.
 
-Every loop here is driven by a fake clock: nothing in this file sleeps.
+The client DOES keep one small local cache, beside its config, for the two review
+points of this task (``StateFileTests``): the last item list, so a wake can print the
+``changed`` block, and the last fingerprint, so a call without ``--since`` resumes
+instead of re-reading the baseline (``--fresh`` ignores it). Every loop here is driven
+by a fake clock: nothing in this file sleeps.
 """
 import io
 import json
+import os
 import shlex
 import sys
 import tempfile
@@ -293,26 +298,38 @@ class ClientWiringTests(unittest.TestCase):
     """``client.py wait`` prints a runnable next_command with its own client prefix."""
 
     def invoke(self, argv, request, wall=START):
+        # A fresh config directory per call keeps the wait's local state isolated, exactly
+        # as a new worker machine starts. A test that needs two calls to share state uses
+        # ``_invoke_at`` with its own directory.
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / 'config.json'
+            config.write_text('{}', encoding='utf-8')
+            code, out, err, _config, _state = self._invoke_at(config, argv, request, wall)
+        return code, out, err, str(config)
+
+    def _invoke_at(self, config, argv, request, wall=START):
         # The fake clock advances only when the wait sleeps, so a bounded wait ends and
         # its elapsed time is deterministic; ``wall`` is the wall-clock instant it starts.
         ticks = {'now': 0.0}
 
         def sleep(seconds):
             ticks['now'] += seconds
-        with tempfile.TemporaryDirectory() as directory:
-            config = Path(directory) / 'config.json'
-            config.write_text('{}', encoding='utf-8')
-            with mock.patch.object(sys, 'argv', ['client.py', '--config', str(config),
-                                                 '--project', 'example', '--actor', A,
-                                                 '--', *argv]), \
-                    mock.patch.object(client, 'request', request), \
-                    mock.patch('waiting.time.monotonic', lambda: ticks['now']), \
-                    mock.patch('waiting.time.sleep', sleep), \
-                    mock.patch('waiting.time.time', lambda: wall), \
-                    mock.patch('sys.stdout', new_callable=io.StringIO) as output, \
-                    mock.patch('sys.stderr', new_callable=io.StringIO) as error:
-                code = client.main()
-        return code, output.getvalue(), error.getvalue(), str(config)
+        with mock.patch.object(sys, 'argv', ['client.py', '--config', str(config),
+                                             '--project', 'example', '--actor', A,
+                                             '--', *argv]), \
+                mock.patch.object(client, 'request', request), \
+                mock.patch('waiting.time.monotonic', lambda: ticks['now']), \
+                mock.patch('waiting.time.sleep', sleep), \
+                mock.patch('waiting.time.time', lambda: wall), \
+                mock.patch('sys.stdout', new_callable=io.StringIO) as output, \
+                mock.patch('sys.stderr', new_callable=io.StringIO) as error:
+            code = client.main()
+        form = 'coordinator' if '--coordinator' in argv else 'worker'
+        state = waiting.state_path(str(config), 'example', A, form)
+        saved = None
+        if state and os.path.isfile(state):
+            saved = Path(state).read_text(encoding='utf-8')
+        return code, output.getvalue(), error.getvalue(), str(config), saved
 
     def test_the_timeout_prints_the_full_next_wait_command(self):
         payload = empty()
@@ -389,6 +406,232 @@ class ClientWiringTests(unittest.TestCase):
         self.assertEqual(sorted(body), ['fingerprint', 'form', 'items', 'polls', 'schema',
                                        'timed_out'])
         self.assertTrue(body['timed_out'])
+
+    def test_an_old_caller_gets_the_changed_block_and_the_state_beside_its_config(self):
+        """Review items 6 and 7 from the real dispatch: additive on a wake, remembered."""
+        payload = moved('t1')
+
+        def request(_config, _project, _actor, args, action='bd', path=None):
+            return {'returncode': 0, 'stdout': json.dumps(payload), 'stderr': ''}
+
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / 'config.json'
+            config.write_text('{}', encoding='utf-8')
+            code, out, err, _config, _saved = self._invoke_at(
+                config, ['wait', '--interval', '60'], request)
+            self.assertEqual(code, waiting.EXIT_WORK, err)
+            self.assertEqual(err, '')
+            body = json.loads(out)
+            # The old view's keys are all there; `changed` is the one additive block.
+            self.assertEqual(sorted(body), ['changed', 'fingerprint', 'form', 'items',
+                                            'polls', 'schema'])
+            self.assertEqual(body['changed']['added'], ['t1'])
+            self.assertNotIn('next_timeout', body)
+            state = waiting.state_path(str(config), 'example', A, 'worker')
+            self.assertEqual(os.path.dirname(state), str(config.parent))
+            self.assertTrue(os.path.isfile(state))
+            stored = json.loads(Path(state).read_text(encoding='utf-8'))
+            self.assertEqual(stored['fingerprint'], payload['fingerprint'])
+            # Without --since the remembered fingerprint is used: unchanged, it blocks.
+            code, out, _err, _config, _saved = self._invoke_at(
+                config, ['wait', '--interval', '60', '--timeout', '0'], request)
+            self.assertEqual(code, waiting.EXIT_TIMEOUT)
+            self.assertTrue(json.loads(out)['timed_out'])
+            # --fresh ignores it and returns the whole baseline again.
+            code, out, _err, _config, _saved = self._invoke_at(
+                config, ['wait', '--interval', '60', '--timeout', '0', '--fresh'], request)
+            self.assertEqual(code, waiting.EXIT_WORK)
+            self.assertEqual(json.loads(out)['items'], payload['items'])
+
+
+class StateFileTests(unittest.TestCase):
+    """Review items 6 and 7: the small local cache, the changed block and --fresh.
+
+    The server stays stateless. The client keeps, beside its config, the last fingerprint
+    it printed and the last item list; the path is derived from ``--config`` (never a
+    hard-coded ``~/.orchestra``) and one file belongs to one caller identity.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.config = Path(self._tmp.name) / '.orchestra' / 'client.json'
+        self.config.parent.mkdir()
+        self.config.write_text('{"endpoint": "/not/read"}', encoding='utf-8')
+        self.state = waiting.state_path(str(self.config), 'example', A, 'worker')
+
+    def read(self):
+        return json.loads(Path(self.state).read_text(encoding='utf-8'))
+
+    def test_the_state_file_is_beside_the_config_and_derived_from_its_path(self):
+        self.assertEqual(os.path.dirname(self.state), str(self.config.parent))
+        self.assertTrue(self.state.startswith(str(self.config.parent) + os.sep))
+        self.assertNotEqual(
+            waiting.state_path(str(self.config), 'example', A, 'coordinator'), self.state)
+        self.assertNotEqual(
+            waiting.state_path(str(self.config), 'other', A, 'worker'), self.state)
+        self.assertNotEqual(
+            waiting.state_path(str(self.config), 'example', 'session-b', 'worker'), self.state)
+        self.assertIsNone(waiting.state_path(None, 'example', A))
+        self.assertIsNone(waiting.state_path('', 'example', A))
+
+    def test_a_wake_writes_a_small_state_beside_the_config(self):
+        payload = moved('t1')
+        code, view, _clock = run_timeout([payload], timeout=60, state_file=self.state)
+        self.assertEqual(code, waiting.EXIT_WORK)
+        stored = self.read()
+        self.assertEqual(sorted(stored), ['fingerprint', 'items', 'schema'])
+        self.assertEqual(stored['schema'], waiting.WAIT_STATE_SCHEMA)
+        self.assertEqual(stored['fingerprint'], payload['fingerprint'])
+        self.assertEqual([row['task'] for row in stored['items']], ['t1'])
+        self.assertLess(os.path.getsize(self.state), 4096)
+
+    def test_the_state_carries_no_config_value_or_secret(self):
+        self.config.write_text('{"secret": "SECRET-VALUE"}', encoding='utf-8')
+        run_timeout([moved('t1')], timeout=60, state_file=self.state)
+        self.assertNotIn('SECRET-VALUE', Path(self.state).read_text(encoding='utf-8'))
+
+    def test_the_first_call_without_since_returns_the_whole_baseline(self):
+        code, view, _clock = run_timeout([moved('t1')], timeout=60, state_file=self.state)
+        self.assertEqual(code, waiting.EXIT_WORK)
+        self.assertEqual([row['task'] for row in view['items']], ['t1'])
+        self.assertEqual(view['changed'], {'tasks': [], 'added': ['t1'], 'removed': []})
+
+    def test_the_next_call_without_since_uses_the_remembered_fingerprint(self):
+        payload = moved('t1')
+        run_timeout([payload], timeout=60, state_file=self.state)
+        code, view, _clock = run_timeout([payload], timeout=60, state_file=self.state)
+        self.assertEqual(code, waiting.EXIT_TIMEOUT)
+        self.assertTrue(view['timed_out'])
+        self.assertNotIn('changed', view)
+
+    def test_fresh_ignores_the_remembered_fingerprint_and_returns_the_baseline(self):
+        payload = moved('t1')
+        run_timeout([payload], timeout=60, state_file=self.state)
+        code, view, _clock = run_timeout([payload], timeout=60, state_file=self.state,
+                                         fresh=True)
+        self.assertEqual(code, waiting.EXIT_WORK)
+        self.assertEqual([row['task'] for row in view['items']], ['t1'])
+        self.assertEqual(view['changed'], {'tasks': [], 'added': [], 'removed': []})
+        self.assertEqual(self.read()['fingerprint'], payload['fingerprint'])
+
+    def test_fresh_without_a_state_file_is_the_baseline_too(self):
+        code, view, _clock = run_timeout([moved('t1')], timeout=60, state_file=self.state,
+                                         fresh=True)
+        self.assertEqual(code, waiting.EXIT_WORK)
+        self.assertEqual(view['changed']['added'], ['t1'])
+
+    def test_a_wake_reports_each_changed_field_old_to_new(self):
+        before = waiting.worker_view([{'task': 't1', 'whose_move': 'you',
+                                       'review_state': 'awaiting-review',
+                                       'pending_review_items': 1}])
+        after = waiting.worker_view([{'task': 't1', 'whose_move': 'you',
+                                      'review_state': 'changes-requested',
+                                      'pending_review_items': 2}])
+        run_timeout([before], timeout=60, state_file=self.state)
+        code, view, _clock = run_timeout([after], timeout=60, state_file=self.state)
+        self.assertEqual(code, waiting.EXIT_WORK)
+        changed = view['changed']
+        self.assertEqual(changed['added'], [])
+        self.assertEqual(changed['removed'], [])
+        self.assertEqual(len(changed['tasks']), 1)
+        self.assertEqual(changed['tasks'][0]['task'], 't1')
+        fields = dict((entry['field'], (entry['old'], entry['new']))
+                      for entry in changed['tasks'][0]['fields'])
+        self.assertEqual(fields, {'pending_review_items': (1, 2),
+                                  'review_state': ('awaiting-review', 'changes-requested')})
+
+    def test_a_wake_reports_the_items_added_and_removed(self):
+        before = waiting.worker_view([{'task': 't1', 'whose_move': 'you'},
+                                      {'task': 't2', 'whose_move': 'you'}])
+        after = waiting.worker_view([{'task': 't2', 'whose_move': 'you'},
+                                     {'task': 't3', 'whose_move': 'you'}])
+        run_timeout([before], timeout=60, state_file=self.state)
+        code, view, _clock = run_timeout([after], timeout=60, state_file=self.state)
+        self.assertEqual(code, waiting.EXIT_WORK)
+        self.assertEqual(view['changed'], {'tasks': [], 'added': ['t3'], 'removed': ['t1']})
+
+    def test_a_row_without_a_task_is_keyed_by_its_lane(self):
+        changed = waiting.changed_items(
+            [{'lane': 'lane-a', 'state': 'waiting-on-coordinator'}],
+            [{'lane': 'lane-a', 'state': 'idle'}])
+        self.assertEqual(changed, {
+            'tasks': [{'task': 'lane-a',
+                       'fields': [{'field': 'state', 'old': 'waiting-on-coordinator',
+                                   'new': 'idle'}]}],
+            'added': [], 'removed': []})
+
+    def test_the_changed_block_is_additive_to_the_existing_keys(self):
+        payload = moved('t1')
+        run_timeout([payload], timeout=60, state_file=self.state)
+        code, view, _clock = run_timeout([payload], timeout=60, state_file=self.state,
+                                         fresh=True)
+        self.assertEqual(code, waiting.EXIT_WORK)
+        self.assertEqual(sorted(view), ['changed', 'fingerprint', 'form', 'items', 'polls',
+                                        'schema'])
+
+    def test_a_corrupt_state_file_is_treated_as_absent_and_rewritten(self):
+        Path(self.state).write_text('{not json', encoding='utf-8')
+        code, view, _clock = run_timeout([moved('t1')], timeout=60, state_file=self.state)
+        self.assertEqual(code, waiting.EXIT_WORK)
+        self.assertEqual(view['changed']['added'], ['t1'])
+        self.assertEqual(self.read()['fingerprint'], moved('t1')['fingerprint'])
+
+    def test_a_foreign_or_wrong_shaped_state_file_is_treated_as_absent(self):
+        for raw in ('[]', '{"schema": "other", "fingerprint": "x", "items": []}',
+                    '{"schema": "wait-state-v1", "fingerprint": "bad", "items": "nope"}',
+                    '[' * 10000 + ']' * 10000):
+            with self.subTest(state=raw[:40]):
+                Path(self.state).write_text(raw, encoding='utf-8')
+                code, view, _clock = run_timeout([moved('t1')], timeout=60,
+                                                 state_file=self.state)
+                self.assertEqual(code, waiting.EXIT_WORK)
+                self.assertEqual(view['changed']['added'], ['t1'])
+
+    def test_an_oversized_state_file_is_treated_as_absent(self):
+        Path(self.state).write_bytes(b'x' * (waiting.MAX_STATE_BYTES + 1))
+        code, view, _clock = run_timeout([moved('t1')], timeout=60, state_file=self.state)
+        self.assertEqual(code, waiting.EXIT_WORK)
+        self.assertEqual(view['changed']['added'], ['t1'])
+
+    def test_an_unreadable_state_path_does_not_break_the_wait(self):
+        Path(self.state).mkdir()  # open() raises, os.replace() raises: both are ignored
+        code, view, _clock = run_timeout([moved('t1')], timeout=60, state_file=self.state)
+        self.assertEqual(code, waiting.EXIT_WORK)
+        self.assertEqual([row['task'] for row in view['items']], ['t1'])
+
+    def test_a_timeout_also_remembers_the_last_fingerprint_it_printed(self):
+        payload = empty()
+        code, _view, _clock = run_timeout([payload], timeout=0, state_file=self.state)
+        self.assertEqual(code, waiting.EXIT_TIMEOUT)
+        self.assertEqual(self.read()['fingerprint'], payload['fingerprint'])
+
+    def test_the_state_keeps_at_most_the_cap_of_items(self):
+        rows = [{'task': 't%03d' % index, 'whose_move': 'you'}
+                for index in range(waiting.MAX_STATE_ITEMS + 20)]
+        run_timeout([waiting.worker_view(rows)], timeout=60, state_file=self.state)
+        self.assertEqual(len(self.read()['items']), waiting.MAX_STATE_ITEMS)
+
+    def test_an_oversized_write_keeps_the_fingerprint_and_drops_the_list(self):
+        rows = [dict((name, 'x' * 200) for name in waiting.MOVE_FIELDS)
+                for _index in range(waiting.MAX_STATE_ITEMS)]
+        for index, row in enumerate(rows):
+            row.update(task='t%03d' % index, whose_move='you')
+        payload = waiting.worker_view(rows)
+        code, _view, _clock = run_timeout([payload], timeout=60, state_file=self.state)
+        self.assertEqual(code, waiting.EXIT_WORK)
+        stored = self.read()
+        self.assertEqual(stored['fingerprint'], payload['fingerprint'])
+        self.assertEqual(stored['items'], [])
+        self.assertLessEqual(os.path.getsize(self.state), waiting.MAX_STATE_BYTES + 1)
+        # The fingerprint survived, so a call without --since still resumes from it.
+        code, _view, _clock = run_timeout([payload], timeout=0, state_file=self.state)
+        self.assertEqual(code, waiting.EXIT_TIMEOUT)
+
+    def test_without_a_state_file_the_old_view_is_unchanged(self):
+        code, view, _clock = run_timeout([moved('t1')], timeout=60)
+        self.assertEqual(code, waiting.EXIT_WORK)
+        self.assertEqual(sorted(view), ['fingerprint', 'form', 'items', 'polls', 'schema'])
 
 
 if __name__ == '__main__':

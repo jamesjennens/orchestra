@@ -48,6 +48,7 @@ import argparse
 import datetime
 import hashlib
 import json
+import os
 import re
 import time
 
@@ -75,6 +76,20 @@ IDLE_MINUTES_MIN, IDLE_MINUTES_MAX = 1, 10080
 DEFAULT_MAX_TIMEOUT = 3600
 DEFAULT_GIVE_UP_AFTER = 12 * 60 * 60
 DOUBLING_AFTER = 2
+
+#: The client's small local cache (kittrial-5bb.327 review items 6 and 7): beside its
+#: config file the client keeps the last fingerprint it printed and the last item list,
+#: so a call without ``--since`` resumes from that fingerprint instead of re-reading the
+#: baseline, and a wake can say which task fields changed and which items were added or
+#: removed. The SERVER stays stateless; this file is the caller's own memory. It is
+#: bounded (see MAX_STATE_ITEMS) and holds only the work fields already printed, never a
+#: config value or a credential.
+WAIT_STATE_SCHEMA = 'wait-state-v1'
+WAIT_STATE_NAME = '.orchestra-wait-state.json'
+MAX_STATE_ITEMS = 100
+MAX_STATE_TEXT = 200
+MAX_STATE_LIST = 20
+MAX_STATE_BYTES = 64 * 1024
 
 #: An idle-since instant is ISO-8601 WITH an offset (``2026-10-17T15:00:00-04:00``, ``...Z``).
 #: A naive value is refused: it would need the caller's zone, which the server does not know.
@@ -194,6 +209,184 @@ def is_fingerprint(value):
     return bool(isinstance(value, str) and len(value) == len(FINGERPRINT) + 64
                 and value.startswith(FINGERPRINT)
                 and all(character in '0123456789abcdef' for character in value[len(FINGERPRINT):]))
+
+
+def state_path(config_path, project=None, actor=None, form='worker'):
+    """Where the client keeps the wait's small local state (review items 6 and 7).
+
+    The path is derived from the caller's ``--config`` path - never a hard-coded
+    ``~/.orchestra`` - so it lives in the SAME DIRECTORY as the config file, on Windows
+    and POSIX alike (``os.path`` joins the components). One file per caller identity
+    (project, actor and form) keeps a worker's list from being compared with a
+    coordinator's, or one project's with another's; the identity is a short hash and is
+    not itself stored in the file. ``None`` when the caller has no config path.
+    """
+    if not config_path:
+        return None
+    directory = os.path.dirname(os.path.abspath(config_path))
+    identity = '\x00'.join(str(value or '') for value in (project, actor, form))
+    suffix = hashlib.sha256(identity.encode('utf-8')).hexdigest()[:16]
+    stem, extension = os.path.splitext(WAIT_STATE_NAME)
+    return os.path.join(directory, '%s-%s%s' % (stem, suffix, extension))
+
+
+def _state_value(value, depth=0):
+    """One item value as the state may carry it: JSON-safe, bounded text, bounded lists.
+
+    Nesting is cut at four levels (a value deeper than that becomes its text), so no
+    payload can make this recursion expensive or deep.
+    """
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return value[:MAX_STATE_TEXT]
+    if isinstance(value, (list, tuple)):
+        if depth >= 4:
+            return str(value)[:MAX_STATE_TEXT]
+        return [_state_value(item, depth + 1) for item in list(value)[:MAX_STATE_LIST]]
+    text = str(value)
+    return text[:MAX_STATE_TEXT]
+
+
+def _state_row(row):
+    """One item reduced to the work fields the printed view already carries.
+
+    Nothing else is stored: no config, no credential, no actor or host record, only task
+    ids and the stable fields of the row. Text and lists are bounded so the file stays
+    small and cannot grow with an unusual payload.
+    """
+    return dict((name, _state_value(row[name])) for name in sorted(row))
+
+
+def read_state(path):
+    """The state last written at ``path``, or ``None``.
+
+    A missing, unreadable, corrupt or foreign file is treated as ABSENT: a wait works
+    from the caller's flags alone (a call without ``--since`` then returns the whole
+    baseline) and the next return rewrites it. Nothing here may break a wait: the text is
+    bounded before it is parsed and a recursive payload is caught rather than raised.
+    """
+    if not path:
+        return None
+    try:
+        with open(path, 'r', encoding='utf-8') as handle:
+            text = handle.read(MAX_STATE_BYTES + 1)
+        if len(text) > MAX_STATE_BYTES:
+            return None
+        value = json.loads(text)
+    except (OSError, ValueError, TypeError, UnicodeError, RecursionError):
+        return None
+    if not isinstance(value, dict) or value.get('schema') != WAIT_STATE_SCHEMA:
+        return None
+    remembered = value.get('fingerprint')
+    if not is_fingerprint(remembered):
+        remembered = None
+    items = value.get('items')
+    if not isinstance(items, list):
+        items = []
+    items = [_state_row(item) for item in items[:MAX_STATE_ITEMS] if isinstance(item, dict)]
+    return {'schema': WAIT_STATE_SCHEMA, 'fingerprint': remembered, 'items': items}
+
+
+def write_state(path, fingerprint, items):
+    """Write the small cache after a return; a failure is ignored.
+
+    The file is written to a temporary name in the same directory and moved into place,
+    so a concurrent reader never sees a half-written file. It is capped at
+    ``MAX_STATE_BYTES``: a larger item list is dropped and only the fingerprint kept (the
+    next wake then reports the whole list as added), so this client can always read back
+    what it wrote. A directory this process cannot write (or a path occupied by a
+    directory) leaves the caller with no cache, which is exactly the first-run behaviour:
+    the wait itself never fails because of it.
+    """
+    if not path or not is_fingerprint(fingerprint) or not isinstance(items, list):
+        return False
+    payload = {'schema': WAIT_STATE_SCHEMA, 'fingerprint': fingerprint,
+               'items': [_state_row(item) for item in items[:MAX_STATE_ITEMS]
+                         if isinstance(item, dict)]}
+
+    def encoded(value):
+        return json.dumps(value, ensure_ascii=True, sort_keys=True,
+                          separators=(',', ':'))
+
+    try:
+        text = encoded(payload)
+    except (ValueError, TypeError):
+        return False
+    if len(text) > MAX_STATE_BYTES:
+        payload['items'] = []
+        try:
+            text = encoded(payload)
+        except (ValueError, TypeError):
+            return False
+        if len(text) > MAX_STATE_BYTES:
+            return False
+    temporary = '%s.%d.tmp' % (path, os.getpid())
+    try:
+        with open(temporary, 'w', encoding='utf-8') as handle:
+            handle.write(text)
+            handle.write('\n')
+        os.replace(temporary, path)
+    except (OSError, ValueError, TypeError, UnicodeError):
+        try:
+            if os.path.exists(temporary):
+                os.remove(temporary)
+        except OSError:
+            pass
+        return False
+    return True
+
+
+def _item_key(row):
+    """The name a changed block uses for one item: its task, else its lane, else its digest."""
+    for name in ('task', 'lane'):
+        if row.get(name) is not None:
+            return str(row.get(name))
+    return digest(row)
+
+
+def _keyed_items(items):
+    """The items of one view by key, in their printed order; a duplicate key gets ``#2``."""
+    keyed = {}
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        key = _item_key(item)
+        if key in keyed:
+            number = 2
+            while '%s#%d' % (key, number) in keyed:
+                number += 1
+            key = '%s#%d' % (key, number)
+        keyed[key] = _state_row(item)
+    return keyed
+
+
+def changed_items(old_items, new_items):
+    """What a wake changed (review item 6): changed fields old -> new, added, removed.
+
+    ``old_items`` is the item list the previous call printed (from the state file) and
+    ``new_items`` this wake's list. Items are matched by ``task`` (a lane row by its
+    ``lane``); a duplicate key in the printed order gets ``#2`` and so on. ``tasks``
+    carries one entry per matched item with at least one field whose value differs, each
+    as ``{field, old, new}``; ``added`` and ``removed`` are the keys in only one list. A
+    first call with no stored list compares against an empty list, so the whole baseline
+    is reported as added. The block is additive: no existing key, exit code or ordering
+    guarantee changes.
+    """
+    old = _keyed_items(old_items)
+    new = _keyed_items(new_items)
+    tasks = []
+    for key in sorted(set(old) & set(new)):
+        fields = []
+        for name in sorted(set(old[key]) | set(new[key])):
+            before, after = old[key].get(name), new[key].get(name)
+            if before != after:
+                fields.append({'field': name, 'old': before, 'new': after})
+        if fields:
+            tasks.append({'task': key, 'fields': fields})
+    return {'tasks': tasks,
+            'added': sorted(set(new) - set(old)),
+            'removed': sorted(set(old) - set(new))}
 
 
 def parse_instant(text):
@@ -425,6 +618,7 @@ def parse_client_args(args):
     parser.add_argument('--interval', type=int, default=DEFAULT_INTERVAL)
     parser.add_argument('--timeout', type=float, default=None)
     parser.add_argument('--since')
+    parser.add_argument('--fresh', action='store_true')
     parser.add_argument('--idle-since')
     parser.add_argument('--max-timeout', type=float, default=None, dest='max_timeout')
     parser.add_argument('--give-up-after', type=float, default=DEFAULT_GIVE_UP_AFTER,
@@ -467,7 +661,7 @@ def read_args(options):
 def run_wait(read, since=None, timeout=None, interval=DEFAULT_INTERVAL,
              clock=None, sleep=None, form=None, idle_since=None, max_timeout=None,
              give_up_after=DEFAULT_GIVE_UP_AFTER, command_prefix='client.py',
-             idle_minutes=DEFAULT_IDLE_MINUTES, now=None):
+             idle_minutes=DEFAULT_IDLE_MINUTES, now=None, state_file=None, fresh=False):
     """Block, polling ``read`` every ``interval`` seconds, until something is the move.
 
     ``read`` is called once per poll and returns one view (the payload of
@@ -487,12 +681,26 @@ def run_wait(read, since=None, timeout=None, interval=DEFAULT_INTERVAL,
     and a return with items resets the schedule. ``now`` is the epoch of this call's
     start for tests; ``command_prefix`` is how the caller invokes the client. A caller
     that passes neither ``idle_since`` nor ``timeout`` sees exactly the old view.
+
+    ``state_file`` is the client's small local cache (review items 6 and 7): its last
+    fingerprint and last item list. When it has a fingerprint and the caller gave no
+    ``since``, that fingerprint is the state the caller resumes from, so a restarted
+    session does not re-read the baseline; ``fresh`` ignores it and asks for the baseline
+    again. A wake also carries ``changed`` - the field-by-field difference from the
+    stored list, plus the items added and removed - inside the existing output. A
+    missing, unreadable or corrupt file is treated as absent and rewritten by the next
+    return; a write that fails leaves the wait itself unaffected. ``state_file=None``
+    keeps the old, cacheless behaviour.
     """
     clock = time.monotonic if clock is None else clock
     sleep = time.sleep if sleep is None else sleep
     form = form or 'worker'
     started = clock()
     polls = 0
+    state = read_state(state_file)
+    previous = state.get('items') if state else []
+    remembered = None if fresh or state is None else state.get('fingerprint')
+    resumed = since if since is not None else remembered
     # The schedule is on only when the caller names the instant its idle spell began AND
     # bounds this wait: an unbounded wait never returns empty, so there is no next command
     # to print. Callers that pass neither new flag keep the old output exactly.
@@ -537,6 +745,17 @@ def run_wait(read, since=None, timeout=None, interval=DEFAULT_INTERVAL,
                                  % idle_since)
         return dict(view, **fields)
 
+    def remember(view):
+        """Store this return's fingerprint and item list, if the client keeps a cache."""
+        if state_file is not None:
+            write_state(state_file, view.get('fingerprint'), view.get('items') or [])
+
+    def with_changes(view):
+        """The view plus the changed block, when the client keeps a cache."""
+        if state_file is None:
+            return view
+        return dict(view, changed=changed_items(previous, view.get('items') or []))
+
     while True:
         polls += 1
         try:
@@ -555,21 +774,30 @@ def run_wait(read, since=None, timeout=None, interval=DEFAULT_INTERVAL,
                                       'fingerprint': None, 'items': [],
                                       'error': 'the service cannot be reached: it did not answer a wait read',
                                       'polls': polls}
-        if since is None:
+        if resumed is None:
             if view.get('items'):
-                return EXIT_WORK, with_schedule(dict(view, polls=polls),
-                                                clock() - started, reset=True)
-        elif view.get('fingerprint') != since:
+                answer = with_changes(with_schedule(dict(view, polls=polls),
+                                                    clock() - started, reset=True))
+                remember(answer)
+                return EXIT_WORK, answer
+        elif view.get('fingerprint') != resumed:
             # Work resets the schedule; a change with no item for this caller is activity
             # but not work, so the idle spell (and the backoff) continues.
-            return EXIT_WORK, with_schedule(dict(view, polls=polls), clock() - started,
-                                            reset=bool(view.get('items')))
+            answer = with_changes(with_schedule(dict(view, polls=polls),
+                                                clock() - started,
+                                                reset=bool(view.get('items'))))
+            remember(answer)
+            return EXIT_WORK, answer
         elapsed = clock() - started
         if timeout is not None and elapsed >= timeout:
-            return EXIT_TIMEOUT, with_schedule(dict(view, polls=polls, timed_out=True),
-                                               elapsed, reset=False)
+            answer = with_schedule(dict(view, polls=polls, timed_out=True), elapsed,
+                                   reset=False)
+            remember(answer)
+            return EXIT_TIMEOUT, answer
         nap = interval if timeout is None else min(interval, max(0.0, timeout - elapsed))
         if nap <= 0:
-            return EXIT_TIMEOUT, with_schedule(dict(view, polls=polls, timed_out=True),
-                                               elapsed, reset=False)
+            answer = with_schedule(dict(view, polls=polls, timed_out=True), elapsed,
+                                   reset=False)
+            remember(answer)
+            return EXIT_TIMEOUT, answer
         sleep(nap)

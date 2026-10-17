@@ -56,13 +56,26 @@ and `give_up`:
   `--idle-since` by default): checkpoint the task and stop, and do not run the wait
   again. The `message` is `checkpoint and stop: nothing has been your move since TIME`;
 - a return with items is work: the schedule resets, and its `next_command` starts again
-  at the base `--timeout` with a fresh `--idle-since`.
+  at the base `--timeout` with a fresh `--idle-since`;
+- on a wake (exit 0) the result also carries `changed`, so a wake says what changed:
+  per task the fields that changed `old` -> `new`, and the items `added` and `removed`
+  since the list the client last printed. The block is additive; ignore it if you do not
+  need it.
 
-The count is stateless on purpose: no state file and no daemon exist, so the client
-recomputes the number of empty returns your idle spell implies from `--idle-since` and
-the schedule's own durations. Set `--idle-since` to when the spell began (the moment you
-last had work or started waiting), not to the moment the first wait started. A caller
-that passes none of the new flags sees the same output and exit codes as before.
+The changed block and the remembered fingerprint come from one small local state file
+beside your config (the same directory as the `--config` file; only the last fingerprint
+and last item list, no config value or credential). A call without `--since` uses the
+remembered fingerprint, so a restarted session does not re-read the whole baseline;
+`--fresh` ignores it and returns the baseline again. A corrupt or unreadable state file
+is treated as absent and rewritten, so it never breaks a wait.
+
+The backoff count is stateless on purpose: no daemon exists and the server remembers
+nothing, so the client recomputes the number of empty returns your idle spell implies
+from `--idle-since` and the schedule's own durations. Set `--idle-since` to when the
+spell began (the moment you last had work or started waiting), not to the moment the
+first wait started. A caller that passes none of the schedule flags keeps the same
+existing output fields and exit codes as before; the additive `changed` block and the
+remembered default for `--since` apply to every call.
 
 ## Preflight before claiming implementation
 
