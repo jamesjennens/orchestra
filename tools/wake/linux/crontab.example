@@ -1,0 +1,13 @@
+# Orchestra poll-and-wake for one lane (tools/wake/linux/crontab.example).
+#
+# Install this with `crontab -e`, replacing the two REPLACE values if this lane
+# does not keep its waker in ~/.orchestra/wake. Keep the line on ONE line: cron
+# needs the five time fields and then the command.
+#
+# The script holds a lock, so ticks that fire while a wait is still running exit
+# instead of polling twice; --timeout 240 keeps one cron run shorter than the
+# five-minute tick. The wake command itself is in wake.env, so cron never parses
+# it. cron runs this under /bin/sh with HOME set, so $HOME expands.
+#
+# m    h  dom mon dow   command
+*/5 * * * *  $HOME/.orchestra/wake/wake.sh --env-file $HOME/.orchestra/wake/wake.env --timeout 240 >>$HOME/.orchestra/wake/cron.out 2>&1
