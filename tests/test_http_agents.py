@@ -1075,6 +1075,48 @@ class AgentPaginationTests(AgentHarness):
                          len([action for action in nxt.data['next_actions']
                               if action['kind'] == 'claimable-task']))
 
+    def test_worker_role_keeps_reviews_scope_for_own_delivery_while_omitting_other_peoples_reviews(self):
+        admin = self.admin_token()
+        self.create_account(admin, 'blair', 'blair-password-1')
+        blair, blair_user = self.login('blair', 'blair-password-1')
+        self.request('PUT', '/v1/projects/%s/members/%s' % (self.project, blair_user['id']),
+                     {'role': 'contributor'}, token=self.alex)
+        _, other_secret, _ = self.agent_secret(blair, name='Osprey', projects=[self.project])
+        other_task = self.create_task('other-delivery')
+        own_task = self.create_task('own-slice')
+        self.assertEqual(200, self.request('POST', '/v1/projects/%s/tasks/%s/claim'
+                                           % (self.project, other_task), token=other_secret).status)
+        self.review(other_task, 'contribute', other_secret, commit=COMMIT, base_commit=BASE,
+                    bundle_sha256=BUNDLE, summary='other agent delivery')
+        self.assertEqual(200, self.request('POST', '/v1/projects/%s/tasks/%s/claim'
+                                           % (self.project, own_task), token=self.secret).status)
+        # By default (or with ?role=reviewer), /v1/agents/me/next includes to-review for the other delivery.
+        as_reviewer = self.request('GET', '/v1/agents/me/next?role=reviewer', token=self.secret)
+        self.assertEqual(200, as_reviewer.status, as_reviewer.data)
+        self.assertIn('to-review', [a['kind'] for a in as_reviewer.data['next_actions']])
+        self.assertEqual(1, as_reviewer.data['attention']['counts']['to_review'])
+        # With ?role=worker, or when the agent's stored role is 'worker', other people's deliveries
+        # awaiting review are omitted from /v1/agents/me/next while the agent keeps CAP_REVIEWS.
+        as_worker_query = self.request('GET', '/v1/agents/me/next?role=worker', token=self.secret)
+        self.assertEqual(200, as_worker_query.status, as_worker_query.data)
+        self.assertNotIn('to-review', [a['kind'] for a in as_worker_query.data['next_actions']])
+        self.assertNotIn('review-recommended', [a['kind'] for a in as_worker_query.data['next_actions']])
+        self.assertEqual(0, as_worker_query.data['attention']['counts']['to_review'])
+        self.assertEqual('in-progress', as_worker_query.data['next_action']['kind'])
+        self.assertEqual(own_task, as_worker_query.data['next_action']['task'])
+        # Storing role='worker' on the agent record via PATCH /v1/agents/{id} or PATCH /v1/agents/me
+        # makes plain GET /v1/agents/me/next behave as a worker too, and still lets it deliver its own work.
+        patched = self.request('PATCH', '/v1/agents/me', {'role': 'worker'}, token=self.secret)
+        self.assertEqual(200, patched.status, patched.data)
+        self.assertEqual('worker', patched.data['agent']['role'])
+        as_worker_stored = self.request('GET', '/v1/agents/me/next', token=self.secret)
+        self.assertEqual(200, as_worker_stored.status, as_worker_stored.data)
+        self.assertNotIn('to-review', [a['kind'] for a in as_worker_stored.data['next_actions']])
+        self.assertEqual('in-progress', as_worker_stored.data['next_action']['kind'])
+        # And the worker still has 'reviews' scope so it can deliver its own task.
+        self.review(own_task, 'contribute', self.secret, commit=COMMIT, base_commit=BASE,
+                    bundle_sha256=BUNDLE, summary='worker own delivery')
+
 
 class CountingBackend(InProcessBackend):
     """In-process backend that counts canonical task reads, the cost proxy for the
@@ -1889,7 +1931,7 @@ class AgentsPageTests(RenewalScopeTests):
         self.assertEqual(first['Kestrel']['line'], 'May: read.')
         self.assertNotIn('These scopes are inferred', first['Kestrel']['panelText'])
         self.assertNotIn('These scopes are inferred', first['Lone']['panelText'])
-        self.assertEqual(first['Kestrel']['boxes'], {'read': [True, False], 'tasks': [False, False], 'checkpoints': [False, False],
+        self.assertEqual(first['Kestrel']['boxes'], {'read': [True, True], 'tasks': [False, False], 'checkpoints': [False, False],
                                                      'reviews': [False, False], 'feedback': [False, False], 'proposals': [False, False]})
         self.assertEqual([(row['working'], row['differs'], row['buttons'], 'Expired' in row['text']) for row in first['Kestrel']['rows']],
                          [('false', 'false', [], True), ('true', 'false', ['Extend existing credential', 'Revoke'], False)])
@@ -1928,7 +1970,7 @@ class AgentsPageTests(RenewalScopeTests):
         self.assertIn('1 working credential allows something else than that.', seen['afterWiden']['line'])
         # 6. A superuser: what the agent does not have cannot be ticked, and is not sent when it is.
         self.assertEqual({name: disabled for name, (_, disabled) in seen['admin']['boxes'].items()},
-                         {'read': False, 'tasks': False, 'checkpoints': True, 'reviews': True, 'feedback': True, 'proposals': True})
+                         {'read': True, 'tasks': False, 'checkpoints': True, 'reviews': True, 'feedback': True, 'proposals': True})
         self.assertEqual(seen['afterNarrow']['scopes'], 'read')
         self.assertEqual(seen['adminUnknown'], {'boxes': {}, 'ownerChoice': 1, 'save': False})
         self.assertEqual(seen['adminInferredSetup'], {'needed': 1, 'issue': False})

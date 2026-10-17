@@ -534,7 +534,7 @@ console.log(JSON.stringify({
   addressComment: worker.includes('# server = ' + server),
   fingerprintComment: worker.includes('# server certificate sha256 = AB:CD:EF'),
   noFingerprintWithoutCertificate: !plain.includes('# server certificate'),
-  writesSettings: /settings\.json|orchestraBridge|caFile/.test(worker),
+  writesSettings: /\.vscode\/settings\.json|settings\.json|VSCODE_SETTINGS_PATH|mergeSettings/.test(worker),
   carriesPem: worker.includes('MIIB'),
   roleWorker: worker.includes('role is worker'),
   roleReviewer: reviewer.includes('role is reviewer'),
@@ -841,9 +841,14 @@ class TheDialogAndThePageCase(unittest.TestCase):
         agents = AGENTS_JS.read_text(encoding='utf-8')
         setup = SETUP_JS.read_text(encoding='utf-8')
         for source, name in ((agents, 'agents.js'), (setup, 'agentSetup.js')):
-            for gone in ('orchestraBridge', 'caFile', 'VSCODE_SETTINGS_PATH', 'mergeSettings',
+            for gone in ('VSCODE_SETTINGS_PATH', 'mergeSettings',
                          'SETTINGS_REFUSED_SENTENCE', 'bridgeSettings'):
                 self.assertNotIn(gone, source, '%s still mentions %s' % (name, gone))
+            # kittrial-5bb.329 (01a14b60): Step 3 and AGENT.md name orchestraBridge.caFile
+            # and warn against system certificate stores, --use-system-ca, and NODE_EXTRA_CA_CERTS.
+            self.assertIn('orchestraBridge.caFile', source, name)
+            self.assertIn('--use-system-ca', source, name)
+            self.assertIn('NODE_EXTRA_CA_CERTS', source, name)
         # The save path writes the two .orchestra files and the .gitignore line, and nothing else.
         save = re.search(r'async function saveSetupFiles\(files\) \{.*?\n\}', agents, re.S).group(0)
         self.assertNotIn('.vscode', save)
