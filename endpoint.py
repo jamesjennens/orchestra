@@ -578,7 +578,7 @@ def reserved_actors(root,path,rows=False,own=()):
 #: host_reads.py): the operator list, the project's session names and the runtime's projects,
 #: which a bound key is not told.
 SERVICE_ONLY_ACTIONS=('create-project','project-creations','creation-standing','web-merge-slot','web-lifecycle',
-                      'host-coordination','host-projects','assignment-roster','task-assign')
+                      'host-coordination','host-projects','assignment-roster','task-assign','task-release')
 
 def key_project_refusal(request,key_projects):
     """Refuse, for a key bound to projects, a request that is not for one of them.
@@ -862,7 +862,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             raise ValueError('%s is available only to the web service'%answered)
     # Slot requests bind the block before project, tracker, or authority reads.
     # The shared table is the sole endpoint action/operation capability mapping.
-    if request.get('action') in ('coordinate','web-merge-slot','web-lifecycle','task-assign','assignment-roster'):
+    if request.get('action') in ('coordinate','web-merge-slot','web-lifecycle','task-assign','assignment-roster','task-release'):
         denied=block_mismatch_denial(request,authority_config)
         if denied is not None:return denied
     # Two actions exist only for the web service and name no existing project
@@ -1505,8 +1505,8 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             return guarded_write(root,request,journal_path(path),briefing_effect,
                                authority_config=authority_config,
                                require_authority=require_authority,runner=runner)
-    if action in ('assignment-roster','task-assign'):
-        from http_authority import CAP_COORDINATE, read_state, server_time
+    if action in ('assignment-roster','task-assign','task-release'):
+        from http_authority import CAP_COORDINATE, CAP_TASKS, read_state, server_time
         from task_assignment import AssignmentError, eligible_roster, standing_allowed, validate_request, apply as assignment_apply
         from sessions import read_registry
         args=request.get('args', [])
@@ -1520,6 +1520,34 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                         or type(page['offset']) is not int or page['offset']<0
                         or type(page['limit']) is not int or not 1<=page['limit']<=200):
                     raise AssignmentError(422,'Assignment roster requires a nonnegative offset and limit 1-200.')
+            elif action=='task-release':
+                # The holder releases its OWN claim (kittrial-5bb.301). The body carries
+                # the task, the reason, and (when held under a <agent>/<label> sub-label,
+                # kittrial-5bb.300) the row's current assignee as expected_assignee, verified
+                # by claim_limit.actor_holds against the authenticated caller so no caller
+                # can clear another actor's assignee. It is the same canonical assignment the
+                # owner's bulk release uses, so there is one way to clear an assignee. The
+                # canonical change check below refuses a task the caller does not hold, ANY
+                # delivered contribution (awaiting review, changes requested, approved or
+                # integrated), and the merge slot.
+                if not isinstance(args,list) or len(args)!=1 or not isinstance(args[0],str):
+                    raise AssignmentError(422,'A claim release takes one closed JSON request.')
+                fields=record_json.loads(args[0])
+                if (not isinstance(fields,dict)
+                        or not set(fields).issubset({'task_id','reason','expected_assignee'})
+                        or not {'task_id','reason'}.issubset(fields)):
+                    raise AssignmentError(422,'A claim release takes one task id and one reason.')
+                from claim_limit import actor_holds
+                expected_assignee=fields.get('expected_assignee') if 'expected_assignee' in fields else actor
+                if not actor_holds(expected_assignee,actor):
+                    raise AssignmentError(409,'That task is not claimed by you; only its holder can release it')
+                payload={'schema_version':1,'operation_id':request.get('operation_id'),
+                         'task':fields['task_id'],'expected_assignee':expected_assignee,'assignee':None,
+                         'reason':fields['reason'],'allow_pending_review':False,
+                         'allow_held_slot':False}
+                validate_request(payload)
+                if not request.get('operation_id') or payload['operation_id']!=request['operation_id']:
+                    raise AssignmentError(422,'A claim release requires the same stable operation identity in its envelope and body.')
             else:
                 if not isinstance(args,list) or len(args)!=1 or not isinstance(args[0],str):
                     raise AssignmentError(422,'Assignment takes one closed JSON request.')
@@ -1528,7 +1556,14 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                 if not request.get('operation_id') or payload['operation_id']!=request['operation_id']:
                     raise AssignmentError(422,'Assignment requires the same stable operation identity in its envelope and body.')
             def assignment_authority():
-                if not verified_web_authority(request,authority_config,CAP_COORDINATE,name):
+                # A claim release needs only the ordinary task authority: it can only
+                # clear the caller's own assignee (kittrial-5bb.301). Every other
+                # assignee-only change still needs coordinate authority, so nobody gains
+                # the power to take another actor's task.
+                if action=='task-release':
+                    if not verified_web_authority(request,authority_config,CAP_TASKS,name):
+                        raise AssignmentError(403,'Verified task authority is required in this project.')
+                elif not verified_web_authority(request,authority_config,CAP_COORDINATE,name):
                     raise AssignmentError(403,'Verified coordinate authority is required in this project.')
                 for denied in (http_actor_denial(request,authority_config),
                                descriptor_actor_denial(request,authority_config,
@@ -1557,7 +1592,8 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             def effect():
                 actors={item['actor'] for item in roster()}
                 result=assignment_apply(payload,actor,runner,path,eligible=lambda target:target in actors,
-                                        operators=configured_operators(root),at=server_time())
+                                        operators=configured_operators(root),at=server_time(),
+                                        refuse_delivered=(action=='task-release'))
                 return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':warning_text(warnings)}
             with held_coordination_lock(path,shared=coordination_lock_shared(request,action,args)):
                 if action=='assignment-roster':
@@ -2075,7 +2111,9 @@ def client_out_of_date_sentence(name):
     """
     from version import KIT_VERSION
     return ('`%s` is run by the client itself, not by the server. This client is older than '
-            'the installation\'s kit (version %s). Update it by copying client.py from the kit.'
+            'the installation\'s kit (version %s). Update it by copying client.py from the kit; '
+            'it carries its own wait logic, so wait needs no other kit file beside it (the '
+            'capability commands still need capabilities.py).'
             % (name, KIT_VERSION))
 
 

@@ -1549,8 +1549,8 @@ class EndpointBackend:
     flight is surfaced as an uncertain outcome, never as success.
     """
 
-    ROUTES = InProcessBackend.ROUTES + ('tasks.assign', 'merge-slot.acquire', 'merge-slot.release',
-                                      'merge-slot.force-release', 'merge-slot.create')
+    ROUTES = InProcessBackend.ROUTES + ('tasks.assign', 'tasks.release', 'merge-slot.acquire',
+                                      'merge-slot.release', 'merge-slot.force-release', 'merge-slot.create')
     #: Routes with no canonical command yet, and why. Fails closed rather than
     #: pretending the service store is canonical.
     UNRESOLVED = {
@@ -1808,7 +1808,7 @@ class EndpointBackend:
         reply = self._endpoint(action, project, actor, args, attachments,
                                operation_id=operation_id, authority=authority,
                                require_authority=require_authority, route=route, extra=extra)
-        if (action in ('assignment-roster','task-assign') and isinstance(reply, dict)
+        if (action in ('assignment-roster','task-assign','task-release') and isinstance(reply, dict)
                 and reply.get('returncode') == 2 and reply.get('assignment_status') in (403, 404, 409, 422, 503)):
             status = reply['assignment_status']
             error = HttpError(status, 'unavailable' if status == 503 else 'forbidden' if status == 403
@@ -2227,6 +2227,14 @@ class EndpointBackend:
         require — including ``schema_version`` and ``operation_id`` — and no
         operation-inappropriate nulls.
         """
+        if route == 'tasks.release':
+            # The canonical release action derives the holder from the authenticated
+            # caller; the route sends the task, the reason and the row's current assignee
+            # when held under a sub-label (kittrial-5bb.301, kittrial-5bb.300).
+            body = {'task_id': payload['task_id'], 'reason': payload['reason']}
+            if payload.get('expected_assignee') is not None:
+                body['expected_assignee'] = payload['expected_assignee']
+            return 'task-release', project_id, [json.dumps(body, ensure_ascii=False)], {}
         if route == 'tasks.assign':
             from task_assignment import REQUEST_FIELDS
             fields={k:payload[k] for k in REQUEST_FIELDS if k not in ('operation_id','task','schema_version')}
@@ -4234,6 +4242,13 @@ class ApiHandler(BaseHTTPRequestHandler):
     #: review, project PATCH, onboarding and proposals routes already refuse the same way.
     TASK_CREATE_FIELDS = ('title', 'description', 'priority', 'attachments', 'actor')
     TASK_CLAIM_FIELDS = ('actor',)
+    #: What a claim release takes from the caller's own body (kittrial-5bb.301): a short
+    #: reason, and nothing else. The holder is derived from the authenticated caller, never
+    #: submitted, so no caller can release somebody else's claim by naming them.
+    TASK_RELEASE_FIELDS = ('reason',)
+    #: The longest reason a release may carry. Short by design: it is a note to the next
+    #: holder, not a message.
+    CLAIM_RELEASE_REASON_MAX = 120
     CHECKPOINT_BODY_FIELDS = EndpointBackend.CHECKPOINT_FIELDS + ('actor',)
     MEMBER_FIELDS = ('role',)
     CREDENTIAL_ISSUE_FIELDS = ('label', 'scopes', 'actor', 'allow_actor', 'allow_actor_reason')
@@ -5767,12 +5782,14 @@ class ApiHandler(BaseHTTPRequestHandler):
     @route('GET', r'/v1/agents/me')
     def agents_me(self, ctx):
         agent = self.service.agent_for_credential(ctx.principal)
-        # The same bounded attention read ``/v1/agents/me/next`` makes, so this route can
-        # report the agent's own claim limit, what holds it and who may raise it
-        # (kittrial-5bb.302) from the one counted-held rule the claim gate applies.
-        attention = self._agent_attention(ctx.principal, agent)
-        body = {'agent': agent, 'attention': self._agent_attention_view(agent, attention),
-                'claim_limit': self._agent_claim_limit_view(agent, attention),
+        # The agent record only (kittrial-5bb.303): this route is a polled whoami, so it
+        # makes NO work read. The counted limit/held/available view needs the bounded
+        # current-work snapshot, so it stays on ``/v1/agents/me/next``, which already
+        # reads it; here the limit and who may raise it come from the record and one
+        # constant (kittrial-5bb.276/302).
+        body = {'agent': agent,
+                'claim_limit': self._agent_claim_limit_record_view(agent),
+                'links': {'self': '/v1/agents/me', 'next': '/v1/agents/me/next'},
                 'generated_at': now_iso(self.service._now())}
         # The calling credential's OWN expiry, in exactly the shape /v1/sessions/current
         # answers (kittrial-5bb.294 item 1): the agent set-up prompt and the bridge
@@ -6831,6 +6848,18 @@ class ApiHandler(BaseHTTPRequestHandler):
         return ('Idle: %s claimable task(s), nothing in flight.' % claimable)
 
     @staticmethod
+    def _agent_claim_limit_record_view(agent):
+        """The limit and who may raise it, from the agent record only (kittrial-5bb.303).
+
+        No work read: ``claim_limit`` is on the record and ``raise_by`` is one constant.
+        The counted ``held``/``available`` view needs the bounded current-work snapshot,
+        so it is answered only where that snapshot is already read, on
+        ``GET /v1/agents/me/next`` (:meth:`_agent_claim_limit_view`).
+        """
+        from claim_limit import RAISE_BY, default_limit
+        return {'limit': default_limit(agent), 'raise_by': RAISE_BY}
+
+    @staticmethod
     def _agent_claim_limit_view(agent, attention):
         """The per-agent claim limit and what holds it (kittrial-5bb.276/.300).
 
@@ -6846,7 +6875,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         exactly as the gate refuses, rather than reading as "no limit".
 
         ``raise_by`` names who may RAISE the limit (kittrial-5bb.302): the owner's account
-        or a superuser, on the My agents page. An agent can only lower it itself, so a
+        or a superuser on the My agents page. An agent can only lower it itself, so a
         client that follows the server shows the same names and page the refusal sentence
         does.
         """
@@ -6991,6 +7020,71 @@ class ApiHandler(BaseHTTPRequestHandler):
             return write()
         return self._mutate(ctx,'tasks.assign',ctx.params['pid'],assign,capability=CAP_COORDINATE,
                             serialize=False,canonical=True,audit_metadata={'task':ctx.params['tid']})
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/release')
+    def task_release(self, ctx):
+        """Release the caller's own claimed, undelivered task (kittrial-5bb.301).
+
+        The owner's own worker held three tasks and could not take other work, because
+        it could not release one of its own claims: only the owner's account or a
+        superuser could clear an assignee (kittrial-5bb.276). This route lets the HOLDER
+        release its own claim with a short reason. The holder is the authenticated
+        caller, never a submitted field, so no caller can release another actor's claim
+        by naming it.
+
+        It builds the same canonical assignment with ``assignee: null`` that every other
+        release uses, so it invents no second way to clear an assignee; the canonical
+        ``task-release`` action permits the ordinary task authority for exactly this
+        operation and nothing else (see endpoint.py). The release is recorded as the
+        canonical assignment notice: who, when and the reason. A checkpoint and its open
+        items stay on the task, and the claim stops counting against the holder's
+        ``claim_limit`` at once.
+
+        Refused: a task the caller does not hold (409); a record anchor (404) or the merge
+        slot (409, as every task write route); a task with ANY current contribution (409,
+        the canonical check: awaiting review, changes requested, approved or integrated);
+        a body field other than the reason, a blank reason or one over
+        :data:`CLAIM_RELEASE_REASON_MAX` (422); a missing Idempotency-Key (422). On a
+        backend without canonical assignment: 501. An exact retry of a committed release is
+        answered from the stored result, before the holder check, so a lost response
+        reconciles instead of reading the now-unassigned task as somebody else's.
+        """
+        self._project(ctx, CAP_TASKS)
+        payload = dict(ctx.payload or {})
+        refuse_unknown_fields(payload, self.TASK_RELEASE_FIELDS, 'A claim release')
+        reason = payload.get('reason')
+        if not isinstance(reason, str) or not reason.strip():
+            raise invalid('A claim release needs a short reason')
+        if len(reason) > self.CLAIM_RELEASE_REASON_MAX:
+            raise invalid('A claim release reason is at most %d characters'
+                          % self.CLAIM_RELEASE_REASON_MAX)
+        if ctx.idempotency_key is None:
+            raise invalid('Send an Idempotency-Key: releasing a claim writes')
+        if 'tasks.release' not in self.backend.ROUTES:
+            raise not_implemented('Canonical claim release is unavailable on this server')
+        actor = self.service.bind_actor(ctx.principal, None)
+        request = {'task_id': ctx.params['tid'], 'reason': reason.strip()}
+
+        def release():
+            # These checks run INSIDE the mutation, after _mutate has answered an exact retry
+            # from the stored result (kittrial-5bb.301 review item 2). They used to run
+            # before it, so a retry after a lost response read the now-unassigned task as
+            # "not claimed by you" instead of replaying the committed release. A different
+            # body under the same key is still refused by the wrapper's key-reuse check,
+            # which runs before this.
+            task = self.backend.get_task(ctx.params['pid'], ctx.params['tid'])
+            self._refuse_record_anchor(task, write=True)
+            assignee = (task.get('assignee') or None) if isinstance(task, dict) else None
+            if not isinstance(task, dict) or not claim_limit.actor_holds(assignee, actor):
+                raise conflict('That task is not claimed by you; only its holder can release it')
+            result = self.backend.invoke('tasks.release', ctx.principal, ctx.params['pid'],
+                                         dict(request, expected_assignee=assignee),
+                                         ctx.idempotency_key, target=ctx.route_target,
+                                         authorize=ctx.authorize, capability=CAP_TASKS)
+            return result, result
+        return self._mutate(ctx, 'tasks.release', ctx.params['pid'], release, capability=CAP_TASKS,
+                            serialize=False, canonical=True,
+                            audit_metadata={'task': ctx.params['tid']})
 
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/comments')
     def tasks_comment(self, ctx):

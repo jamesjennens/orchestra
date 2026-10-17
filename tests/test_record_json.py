@@ -303,7 +303,9 @@ class NoUnguardedParseTests(unittest.TestCase):
             # record_json.loads_rows (the row bound); the web merge-slot payload adds a fifth guarded parse; lifecycle adds a sixth.
             # kittrial-5bb.290: ready's JSON listing is parsed through the guard (the
             # seventh) so a deeply nested bd answer cannot raise RecursionError.
-            'briefing.py': 3, 'coordination.py': 3, 'endpoint.py': 9, 'export_requirements.py': 1, 'feedback.py': 3, 'guidance.py': 3,
+            # kittrial-5bb.301 revision: endpoint.py's tenth guards the closed release
+            # request body (a task id and a reason) that a worker transports.
+            'briefing.py': 3, 'coordination.py': 3, 'endpoint.py': 10, 'export_requirements.py': 1, 'feedback.py': 3, 'guidance.py': 3,
             # Requirements request bodies use the guard and reject duplicate fields.
             # lane_state.py reads the body of a reserved Kind: lane-state-v1 record comment
             # (kittrial-5bb.263): any actor's comments can carry one, so it is parsed through

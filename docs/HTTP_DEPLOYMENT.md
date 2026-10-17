@@ -1401,6 +1401,38 @@ in-process backend (the tests' and the local preview's) refused both cases alrea
 it refused a second claim by the SAME member too, and now answers it 200, unchanged,
 as a real installation does.
 
+### Releasing your own claim
+
+`POST /v1/projects/{id}/tasks/{task}/release` (body `{"reason": "..."}`, closed set)
+lets the caller release a claim it HOLDS (including under one of its `<agent>/<label>`
+sub-labels, kittrial-5bb.300) and has not delivered (kittrial-5bb.301):
+the task returns to `open` and unassigned, its checkpoint and open items stay, and the
+claim stops counting against the holder's `claim_limit` at once, so the next claim is
+available immediately. The holder is the authenticated caller, never a submitted
+field, and the reason is at most 120 characters. The release is recorded as the
+canonical assignment notice, which names who released it, when and the reason -- the
+same notice `POST .../tasks/{task}/assign` with `assignee: null` writes, so clearing
+an assignee has one mechanism, not two.
+
+It is refused, changing nothing, when:
+
+- the caller does not hold the task: **409 "That task is not claimed by you; only its
+  holder can release it"**. Another actor's claim is never released this way; an
+  owner's bulk release of one agent's claims is
+  `POST /v1/agents/{id}/release-claims`;
+- the holder's contribution **awaits review or has changes requested**: **409**, from
+  the canonical assignment check, because that is delivered work, not a claim (set
+  `allow_pending_review` on the assign route if a coordinator must displace it);
+- the holder holds the **merge slot** for this task: **409**, from the canonical
+  check; the slot and its holder are retained;
+- the body carries a field other than `reason`, or the reason is blank or over 120
+  characters: **422**; no `Idempotency-Key`: **422**.
+
+An agent needs only its ordinary task authority (`tasks.write`) for this route; every
+other assignee change still requires coordinate authority, so no caller gains the
+power to take another actor's task. `POST .../assign` is unchanged for coordinators
+and owners. A backend without canonical task assignment answers **501**.
+
 ### The name a worker credential writes under
 
 A worker credential writes under the actor namespace its issuer chose (`actor` when it
@@ -2995,18 +3027,24 @@ line separately and unconfined.
   against `claim_limit` itself: the documented order sends a lane the checkpoint left
   stuck on to other work, and that order has to be possible to follow. Blocked tasks DO
   count against the hard cap `claim_limit + 3`, so an agent cannot lift its own limit
-  without bound by writing blocker checkpoints on its own claims. A PERSON assigning a
+  without bound by writing blocker checkpoints on its own claims. A held task the agent
+  releases (`POST /v1/projects/{id}/tasks/{task}/release`, kittrial-5bb.301, including a
+  claim held under one of its `<agent>/<label>` sub-labels) stops counting at once, which
+  is the other half of the refusal's "Deliver or release one". A PERSON assigning a
   task to an agent at its limit is still allowed
   (`POST /v1/projects/{id}/tasks/{task}/assign`): that is the owner's explicit choice,
   not the agent taking work. An AGENT assigning a task to itself (or to one of its
   `<agent>/<label>` sub-labels) through that same route is a claim and takes the limit
   and hard cap, because that IS the agent taking work.
-  `GET /v1/agents/me` and `GET /v1/agents/me/next` report the limit, `hard_cap`, how many
-  it holds (`held` and `blocked`), how many are left (`available`, bounded by both
-  `claim_limit` and the `claim_limit + 3` hard cap) and `raise_by` (who may raise it: the
-  owner's account or a superuser, on the My agents page); each agent record carries the
-  limit. All of it comes from the
-  same one counted-held rule the gate applies, so the two answers cannot disagree. The
+  `GET /v1/agents/me/next` reports the limit, `hard_cap`, how many it holds (`held` and
+  `blocked`), how many are left (`available`, bounded by both `claim_limit` and the
+  `claim_limit + 3` hard cap) and `raise_by` (who may raise it: the owner's account or a
+  superuser on the My agents page), from the same one counted-held rule the gate applies,
+  so the answer cannot disagree with the claim route. `GET /v1/agents/me` is a polled
+  whoami and stays cheap (kittrial-5bb.303): it answers from the agent record only
+  (identity, `claim_limit`, `raise_by`, the calling credential's expiry) and makes no work
+  read, so `held`, `blocked` and `available` are read from `/v1/agents/me/next`; each
+  agent record carries the limit. The
   held set is read from the same bounded `work`
   snapshot attention already reads, across every project the agent is granted, and it
   fails closed: a held

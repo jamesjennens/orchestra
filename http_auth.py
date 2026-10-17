@@ -3509,9 +3509,13 @@ class Service:
                 raise invalid(str(error)) from None
             if wanted is None:
                 # The owner's route clears a value back to the default; on the agent's own
-                # route the body must be the number it will hold, never an absence.
-                raise invalid('claim_limit: expected a whole number from %d to %d'
-                              % (claim_limit.LIMIT_MIN, current))
+                # route the body must be the number it will hold, never an absence. Name the
+                # field's own range (1..50), not the current value: a null is a malformed
+                # value, and the older sentence read "1 to <current>" (kittrial-5bb.303).
+                raise invalid('claim_limit: expected a whole number from %d to %d; an agent '
+                              'may only lower its own limit, so it must also be at most the '
+                              'current %d' % (claim_limit.LIMIT_MIN, claim_limit.LIMIT_MAX,
+                                              current))
             if wanted > current:
                 raise forbidden(claim_limit.raise_refusal(current, wanted),
                                 {'claim_limit': current, 'requested': wanted,
